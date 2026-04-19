@@ -247,6 +247,26 @@ fn test_policy_fixtures() {
     eprintln!("Passed {count} policy fixtures");
 }
 
+/// Documented-behavior regression guard. Every fixture in
+/// `tests/fixtures/documented_commands.toml` represents a behavioral contract
+/// tirith has published (README/TIRITH.md/docs) or committed to in response to
+/// a closed issue. If a refactor silently breaks one of those contracts, this
+/// test fails — which is how the three regressions behind #26/#29/#30(#78)
+/// were supposed to have been caught.
+#[test]
+fn test_documented_commands_fixtures() {
+    let fixtures = load_fixtures("documented_commands.toml");
+    let count = fixtures.len();
+    assert!(
+        count > 0,
+        "documented_commands.toml is the project's doc-contract guard — must never be empty"
+    );
+    for fixture in &fixtures {
+        run_fixture(fixture);
+    }
+    eprintln!("Passed {count} documented-command fixtures");
+}
+
 #[test]
 fn test_rendered_fixtures() {
     let fixtures = load_fixtures("rendered.toml");

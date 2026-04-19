@@ -87,6 +87,10 @@ This avoids `bind -x` enter interception in environments where PTY handling is f
 
 If using PSReadLine, ensure the tirith hook loads after PSReadLine initialization. The hook overrides `PSConsoleHostReadLine` to intercept pastes.
 
+## Fish: clipboard paste scope
+
+The fish hook intercepts pastes through `fish_clipboard_paste` (covering Ctrl+V and Ctrl+Y emacs/custom bindings), which is what the vast majority of fish users hit. It does **not** currently wrap fish's terminal-level bracketed-paste path (`__fish_paste`). If you rely on terminal-initiated bracketed paste and want it scanned too, use a shell with enter-mode support (bash 5+/zsh) for those sessions, or track the request in [issue #4](https://github.com/sheeki03/tirith/issues/4).
+
 ## Latency
 
 tirith's Tier 1 fast path (no URLs detected) targets <2ms. If you notice latency:

