@@ -34,6 +34,14 @@ pub struct Segment {
     pub args: Vec<String>,
     /// The separator that preceded this segment (e.g., `|`, `&&`).
     pub preceding_separator: Option<String>,
+    /// Byte range of the *trimmed* segment content within the original input.
+    /// `input[segment.byte_range.clone()] == segment.raw` holds.
+    ///
+    /// Added for issue #29 to let downstream rules carve out byte spans of
+    /// specific segments (e.g. args to `tirith diff/score/why`). Callers that
+    /// construct `Segment` directly for tests can set any range — production
+    /// code goes through `push_segment` which derives it from `input`.
+    pub byte_range: std::ops::Range<usize>,
 }
 
 /// Tokenize a command string according to shell type.
@@ -50,6 +58,7 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut preceding_sep = None;
+    let mut search_cursor: usize = 0;
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
     let mut i = 0;
@@ -103,21 +112,39 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
             '|' => {
                 if i + 1 < len && chars[i + 1] == '|' {
                     // ||
-                    push_segment(&mut segments, &current, preceding_sep.take());
+                    push_segment(
+                        &mut segments,
+                        &current,
+                        preceding_sep.take(),
+                        input,
+                        &mut search_cursor,
+                    );
                     current.clear();
                     preceding_sep = Some("||".to_string());
                     i += 2;
                     continue;
                 } else if i + 1 < len && chars[i + 1] == '&' {
                     // |& (bash: pipe stderr too)
-                    push_segment(&mut segments, &current, preceding_sep.take());
+                    push_segment(
+                        &mut segments,
+                        &current,
+                        preceding_sep.take(),
+                        input,
+                        &mut search_cursor,
+                    );
                     current.clear();
                     preceding_sep = Some("|&".to_string());
                     i += 2;
                     continue;
                 } else {
                     // |
-                    push_segment(&mut segments, &current, preceding_sep.take());
+                    push_segment(
+                        &mut segments,
+                        &current,
+                        preceding_sep.take(),
+                        input,
+                        &mut search_cursor,
+                    );
                     current.clear();
                     preceding_sep = Some("|".to_string());
                     i += 1;
@@ -126,7 +153,13 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
             }
             // && operator
             '&' if i + 1 < len && chars[i + 1] == '&' => {
-                push_segment(&mut segments, &current, preceding_sep.take());
+                push_segment(
+                    &mut segments,
+                    &current,
+                    preceding_sep.take(),
+                    input,
+                    &mut search_cursor,
+                );
                 current.clear();
                 preceding_sep = Some("&&".to_string());
                 i += 2;
@@ -134,7 +167,13 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
             }
             // Semicolon
             ';' => {
-                push_segment(&mut segments, &current, preceding_sep.take());
+                push_segment(
+                    &mut segments,
+                    &current,
+                    preceding_sep.take(),
+                    input,
+                    &mut search_cursor,
+                );
                 current.clear();
                 preceding_sep = Some(";".to_string());
                 i += 1;
@@ -142,7 +181,13 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
             }
             // Newline
             '\n' => {
-                push_segment(&mut segments, &current, preceding_sep.take());
+                push_segment(
+                    &mut segments,
+                    &current,
+                    preceding_sep.take(),
+                    input,
+                    &mut search_cursor,
+                );
                 current.clear();
                 preceding_sep = Some("\n".to_string());
                 i += 1;
@@ -155,7 +200,13 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
         }
     }
 
-    push_segment(&mut segments, &current, preceding_sep.take());
+    push_segment(
+        &mut segments,
+        &current,
+        preceding_sep.take(),
+        input,
+        &mut search_cursor,
+    );
     segments
 }
 
@@ -171,6 +222,7 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut preceding_sep = None;
+    let mut search_cursor: usize = 0;
     // Collect (byte_offset, char) pairs so byte slicing stays valid for multi-byte UTF-8.
     let indexed: Vec<(usize, char)> = input.char_indices().collect();
     let len = indexed.len();
@@ -223,7 +275,13 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
             }
             // Pipe
             '|' => {
-                push_segment(&mut segments, &current, preceding_sep.take());
+                push_segment(
+                    &mut segments,
+                    &current,
+                    preceding_sep.take(),
+                    input,
+                    &mut search_cursor,
+                );
                 current.clear();
                 preceding_sep = Some("|".to_string());
                 i += 1;
@@ -231,7 +289,13 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
             }
             // Semicolon
             ';' => {
-                push_segment(&mut segments, &current, preceding_sep.take());
+                push_segment(
+                    &mut segments,
+                    &current,
+                    preceding_sep.take(),
+                    input,
+                    &mut search_cursor,
+                );
                 current.clear();
                 preceding_sep = Some(";".to_string());
                 i += 1;
@@ -246,7 +310,13 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                         .next()
                         .is_none_or(|c| c.is_whitespace())
                 {
-                    push_segment(&mut segments, &current, preceding_sep.take());
+                    push_segment(
+                        &mut segments,
+                        &current,
+                        preceding_sep.take(),
+                        input,
+                        &mut search_cursor,
+                    );
                     current.clear();
                     preceding_sep = Some("-and".to_string());
                     i += 4;
@@ -257,7 +327,13 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                         .next()
                         .is_none_or(|c| c.is_whitespace())
                 {
-                    push_segment(&mut segments, &current, preceding_sep.take());
+                    push_segment(
+                        &mut segments,
+                        &current,
+                        preceding_sep.take(),
+                        input,
+                        &mut search_cursor,
+                    );
                     current.clear();
                     preceding_sep = Some("-or".to_string());
                     i += 3;
@@ -267,7 +343,13 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                 i += 1;
             }
             '\n' => {
-                push_segment(&mut segments, &current, preceding_sep.take());
+                push_segment(
+                    &mut segments,
+                    &current,
+                    preceding_sep.take(),
+                    input,
+                    &mut search_cursor,
+                );
                 current.clear();
                 preceding_sep = Some("\n".to_string());
                 i += 1;
@@ -280,7 +362,13 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
         }
     }
 
-    push_segment(&mut segments, &current, preceding_sep.take());
+    push_segment(
+        &mut segments,
+        &current,
+        preceding_sep.take(),
+        input,
+        &mut search_cursor,
+    );
     segments
 }
 
@@ -288,6 +376,7 @@ fn tokenize_cmd(input: &str) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut preceding_sep = None;
+    let mut search_cursor: usize = 0;
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
     let mut i = 0;
@@ -319,12 +408,24 @@ fn tokenize_cmd(input: &str) -> Vec<Segment> {
             // Pipe
             '|' => {
                 if i + 1 < len && chars[i + 1] == '|' {
-                    push_segment(&mut segments, &current, preceding_sep.take());
+                    push_segment(
+                        &mut segments,
+                        &current,
+                        preceding_sep.take(),
+                        input,
+                        &mut search_cursor,
+                    );
                     current.clear();
                     preceding_sep = Some("||".to_string());
                     i += 2;
                 } else {
-                    push_segment(&mut segments, &current, preceding_sep.take());
+                    push_segment(
+                        &mut segments,
+                        &current,
+                        preceding_sep.take(),
+                        input,
+                        &mut search_cursor,
+                    );
                     current.clear();
                     preceding_sep = Some("|".to_string());
                     i += 1;
@@ -334,12 +435,24 @@ fn tokenize_cmd(input: &str) -> Vec<Segment> {
             // & and &&
             '&' => {
                 if i + 1 < len && chars[i + 1] == '&' {
-                    push_segment(&mut segments, &current, preceding_sep.take());
+                    push_segment(
+                        &mut segments,
+                        &current,
+                        preceding_sep.take(),
+                        input,
+                        &mut search_cursor,
+                    );
                     current.clear();
                     preceding_sep = Some("&&".to_string());
                     i += 2;
                 } else {
-                    push_segment(&mut segments, &current, preceding_sep.take());
+                    push_segment(
+                        &mut segments,
+                        &current,
+                        preceding_sep.take(),
+                        input,
+                        &mut search_cursor,
+                    );
                     current.clear();
                     preceding_sep = Some("&".to_string());
                     i += 1;
@@ -347,7 +460,13 @@ fn tokenize_cmd(input: &str) -> Vec<Segment> {
                 continue;
             }
             '\n' => {
-                push_segment(&mut segments, &current, preceding_sep.take());
+                push_segment(
+                    &mut segments,
+                    &current,
+                    preceding_sep.take(),
+                    input,
+                    &mut search_cursor,
+                );
                 current.clear();
                 preceding_sep = Some("\n".to_string());
                 i += 1;
@@ -359,15 +478,54 @@ fn tokenize_cmd(input: &str) -> Vec<Segment> {
             }
         }
     }
-    push_segment(&mut segments, &current, preceding_sep.take());
+    push_segment(
+        &mut segments,
+        &current,
+        preceding_sep.take(),
+        input,
+        &mut search_cursor,
+    );
     segments
 }
 
-fn push_segment(segments: &mut Vec<Segment>, raw: &str, preceding_sep: Option<String>) {
+/// Push a tokenized segment into `segments`, trimming leading/trailing
+/// whitespace and locating the trimmed content in `input` to populate
+/// `byte_range`.
+///
+/// `search_cursor` is advanced past the pushed segment so subsequent
+/// searches skip already-consumed bytes (handles duplicate segments like
+/// `foo | foo` correctly).
+fn push_segment(
+    segments: &mut Vec<Segment>,
+    raw: &str,
+    preceding_sep: Option<String>,
+    input: &str,
+    search_cursor: &mut usize,
+) {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return;
     }
+
+    // The tokenizer copies input bytes verbatim into the accumulator, so
+    // `trimmed` must appear as a substring of `input` at or after
+    // `*search_cursor`. If it doesn't, callers constructed `raw` in an
+    // unexpected way — fall back to a range that preserves invariants.
+    let byte_range = match input.get(*search_cursor..).and_then(|s| s.find(trimmed)) {
+        Some(rel_pos) => {
+            let start = *search_cursor + rel_pos;
+            let end = start + trimmed.len();
+            *search_cursor = end;
+            start..end
+        }
+        None => {
+            // Shouldn't happen in normal flow; emit a zero-width placeholder
+            // rooted at the cursor so downstream code still gets a valid
+            // Range<usize> and doesn't panic on slicing.
+            let cursor = (*search_cursor).min(input.len());
+            cursor..cursor
+        }
+    };
 
     let words = split_words(trimmed);
     // Skip leading environment variable assignments (VAR=VALUE)
@@ -393,6 +551,7 @@ fn push_segment(segments: &mut Vec<Segment>, raw: &str, preceding_sep: Option<St
         command,
         args,
         preceding_separator: preceding_sep,
+        byte_range,
     });
 }
 
@@ -703,5 +862,127 @@ mod tests {
         // byte/char index mismatch panic in &input[i..] slicing.
         let input = " ?]BB\u{07E7}\u{07E7} -\n-\r-and-~\0\u{c}-and-~\u{1d}";
         let _ = tokenize(input, ShellType::PowerShell);
+    }
+
+    // -----------------------------------------------------------------------
+    // Segment.byte_range — prerequisite for #29 inert-arg-range carveout.
+    // Invariant: input[segment.byte_range.clone()] == segment.raw for every
+    // segment, in every shell tokenizer. The range is the *trimmed* span, not
+    // the raw accumulator span (the push_segment docstring explains why).
+    // -----------------------------------------------------------------------
+
+    fn assert_byte_ranges_match_raw(input: &str, segs: &[Segment]) {
+        for (i, seg) in segs.iter().enumerate() {
+            assert_eq!(
+                &input[seg.byte_range.clone()],
+                seg.raw,
+                "segment {i} byte_range {:?} does not match raw {:?} in input {:?}",
+                seg.byte_range,
+                seg.raw,
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_byte_range_posix_simple_pipe() {
+        let input = "foo bar | baz";
+        let segs = tokenize(input, ShellType::Posix);
+        assert_eq!(segs.len(), 2);
+        assert_byte_ranges_match_raw(input, &segs);
+        assert_eq!(&input[segs[0].byte_range.clone()], "foo bar");
+        assert_eq!(&input[segs[1].byte_range.clone()], "baz");
+    }
+
+    #[test]
+    fn test_byte_range_posix_leading_trailing_whitespace() {
+        // push_segment trims; byte_range must match the trimmed content.
+        let input = "  foo bar  | baz  ";
+        let segs = tokenize(input, ShellType::Posix);
+        assert_eq!(segs.len(), 2);
+        assert_byte_ranges_match_raw(input, &segs);
+        assert_eq!(segs[0].byte_range, 2..9); // "foo bar"
+        assert_eq!(segs[1].byte_range, 13..16); // "baz"
+    }
+
+    #[test]
+    fn test_byte_range_posix_duplicate_segments() {
+        // search_cursor must advance so duplicates don't all match at the
+        // first position.
+        let input = "foo | foo | foo";
+        let segs = tokenize(input, ShellType::Posix);
+        assert_eq!(segs.len(), 3);
+        assert_byte_ranges_match_raw(input, &segs);
+        assert_eq!(segs[0].byte_range, 0..3);
+        assert_eq!(segs[1].byte_range, 6..9);
+        assert_eq!(segs[2].byte_range, 12..15);
+    }
+
+    #[test]
+    fn test_byte_range_posix_with_quoted_pipe() {
+        // Quoted pipe stays inside its segment; byte_range covers both quotes.
+        let input = r#"echo "a | b" | grep x"#;
+        let segs = tokenize(input, ShellType::Posix);
+        assert_eq!(segs.len(), 2);
+        assert_byte_ranges_match_raw(input, &segs);
+        assert_eq!(segs[0].raw, r#"echo "a | b""#);
+    }
+
+    #[test]
+    fn test_byte_range_posix_multibyte_content() {
+        // Multi-byte UTF-8 chars in a segment — raw must still be a byte-exact
+        // substring of input, not a char-index slice.
+        let input = "echo 日本語 | grep x";
+        let segs = tokenize(input, ShellType::Posix);
+        assert_eq!(segs.len(), 2);
+        assert_byte_ranges_match_raw(input, &segs);
+        assert_eq!(segs[0].raw, "echo 日本語");
+    }
+
+    #[test]
+    fn test_byte_range_powershell_simple_pipe() {
+        let input = "Get-Process | Where-Object { $_.Name -eq 'x' }";
+        let segs = tokenize(input, ShellType::PowerShell);
+        assert!(segs.len() >= 2);
+        assert_byte_ranges_match_raw(input, &segs);
+    }
+
+    #[test]
+    fn test_byte_range_cmd_pipe() {
+        let input = "dir | findstr foo";
+        let segs = tokenize(input, ShellType::Cmd);
+        assert_eq!(segs.len(), 2);
+        assert_byte_ranges_match_raw(input, &segs);
+    }
+
+    #[test]
+    fn test_byte_range_fish_delegates_to_posix() {
+        // Fish tokenization goes through tokenize_posix; byte_range behavior is identical.
+        let input = "echo hi | cat";
+        let segs = tokenize(input, ShellType::Fish);
+        assert_eq!(segs.len(), 2);
+        assert_byte_ranges_match_raw(input, &segs);
+    }
+
+    #[test]
+    fn test_byte_range_empty_input() {
+        let segs = tokenize("", ShellType::Posix);
+        assert!(segs.is_empty());
+    }
+
+    #[test]
+    fn test_byte_range_whitespace_only() {
+        let segs = tokenize("   \t  ", ShellType::Posix);
+        assert!(segs.is_empty());
+    }
+
+    #[test]
+    fn test_byte_range_sequence_operators() {
+        let input = "ls && echo done";
+        let segs = tokenize(input, ShellType::Posix);
+        assert_eq!(segs.len(), 2);
+        assert_byte_ranges_match_raw(input, &segs);
+        assert_eq!(segs[0].byte_range, 0..2); // "ls"
+        assert_eq!(segs[1].byte_range, 6..15); // "echo done"
     }
 }
