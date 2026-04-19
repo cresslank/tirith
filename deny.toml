@@ -12,6 +12,13 @@ ignore = [
     # rust-s3 → rustls 0.21. Transitive dep pinned by rust-s3; tirith does
     # not use CRL revocation checking. The 0.103.x copy is already updated.
     "RUSTSEC-2026-0049",
+    # rustls-webpki name-constraints advisories — transitive chain is
+    # rust-s3 → aws-creds → attohttpc → rustls → rustls-webpki.
+    # tirith does not use name-constraint validation in this path, and the
+    # dependency is pinned transitively until rust-s3 moves forward.
+    "RUSTSEC-2026-0097",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
 ]
 
 [licenses]
