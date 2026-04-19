@@ -325,6 +325,18 @@ tirith init --shell fish | source   # in ~/.config/fish/config.fish
 
 Bash uses enter mode by default with automatic fallback to preexec on failure. See [troubleshooting](docs/troubleshooting.md#unexpected-tirith-exit-codes) for details on error handling and SSH fallback behavior.
 
+#### Enforcement by shell
+
+| Shell | Behavior |
+|---|---|
+| bash **enter mode** | **Reliable blocking.** Binds Enter; can stop a command before bash commits to running it. |
+| bash **preexec + `TIRITH_BASH_PREEXEC_ENFORCE=1`** | **Conditional blocking.** Uses `shopt -s extdebug`; blocks when bash's `history` can provide a trustworthy whole-line view. Downgrades to warn-only with a pointer at enter mode when history is filtered (`HISTCONTROL=ignorespace/ignoredups/ignoreboth`, any `HISTIGNORE`, or `set +o history`) or an alias / command substitution / `eval` makes the typed line drift from `BASH_COMMAND`. |
+| bash **preexec** (default, no enforce flag) | Warn-only. Prints a DETECTED banner on risky commands; does not block. |
+| zsh, fish, powershell | Reliable blocking via native preexec hooks. |
+| nushell | Warn-only (does not currently support command interception). |
+
+If you need guaranteed line-level blocking on bash, use enter mode. Use preexec enforce for "blocks when possible; tells you honestly when it can't."
+
 **Nix / Home-Manager:** tirith must be in your `$PATH` — the shell hooks call `tirith` by name at runtime. Adding it to `initContent` alone is not enough.
 
 ```nix

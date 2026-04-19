@@ -130,10 +130,163 @@ _tirith_persist_safe_mode() {
   fi
 }
 
+# ─── Preexec helpers (shared by warn-only and Phase 1 enforcement paths) ───
+
+# Read the most recent history entry as "<index>|<cmd>" on stdout. Returns 1
+# with empty stdout when history is unavailable, disabled, or malformed.
+# HISTTIMEFORMAT is neutralised with a function-local empty value so bash
+# restores the user's outer setting on return.
+_tirith_read_history_entry() {
+  local HISTTIMEFORMAT=''
+  local raw
+  raw="$(builtin history 1 2>/dev/null)" || return 1
+  [[ -z "$raw" ]] && return 1
+  if [[ "$raw" =~ ^[[:space:]]*([0-9]+)[[:space:]]+(.*)$ ]]; then
+    printf '%s|%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    return 0
+  fi
+  return 1
+}
+
+# Collapse runs of whitespace and trim spacing around shell operators.
+# Used to bridge cosmetic spacing differences (`>/dev/null` vs `> /dev/null`)
+# between BASH_COMMAND and the history line in enforcement mode.
+_tirith_normalize_spacing() {
+  local s="$1"
+  s="$(printf '%s' "$s" | tr -s '[:space:]' ' ')"
+  s="${s# }"
+  s="${s% }"
+  local op
+  for op in '|' '&' ';' '>' '<'; do
+    while [[ "$s" == *" $op"* ]]; do s="${s//" $op"/$op}"; done
+    while [[ "$s" == *"$op "* ]]; do s="${s//"$op "/$op}"; done
+  done
+  printf '%s' "$s"
+}
+
+# Escape POSIX-ERE metacharacters so the result can be embedded literally into
+# a bash =~ regex pattern.
+_tirith_regex_escape() {
+  local s="$1" out="" i c
+  for ((i=0; i<${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      '\'|'.'|'*'|'+'|'?'|'|'|'('|')'|'['|']'|'{'|'}'|'^'|'$')
+        out+='\'"$c" ;;
+      *)
+        out+="$c" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# Return 0 when $1 (BASH_COMMAND) corresponds to one of the simple commands
+# in $2 (history_line). Uses three steps:
+#
+#   1. Literal word-boundary match of BASH_COMMAND in history_line.
+#   2. Whitespace-normalised retry (bridges `ls -l >/dev/null` vs
+#      `ls -l > /dev/null`).
+#   3. Command-name fallback: the first token of BASH_COMMAND (the program
+#      name) must appear as a bounded token somewhere in history_line. This
+#      bridges bash's internal rewriting of redirection FDs (`>&2` typed,
+#      `1>&2` in BASH_COMMAND) while still catching alias expansion (the
+#      alias's output command name won't appear in the typed line).
+_tirith_cmd_is_in_line() {
+  local needle="$1" haystack="$2"
+  [[ -z "$needle" || -z "$haystack" ]] && return 1
+  [[ "$haystack" == "$needle" ]] && return 0
+
+  local esc boundary
+  boundary='(^|[[:space:]|&;<>()])'
+  esc="$(_tirith_regex_escape "$needle")"
+  if [[ "$haystack" =~ ${boundary}${esc}([[:space:]|&\;<>()]|$) ]]; then
+    return 0
+  fi
+
+  local n_needle n_haystack
+  n_needle="$(_tirith_normalize_spacing "$needle")"
+  n_haystack="$(_tirith_normalize_spacing "$haystack")"
+  [[ "$n_haystack" == "$n_needle" ]] && return 0
+  esc="$(_tirith_regex_escape "$n_needle")"
+  if [[ "$n_haystack" =~ ${boundary}${esc}([[:space:]|&\;<>()]|$) ]]; then
+    return 0
+  fi
+
+  local first_token="${needle%%[[:space:]]*}"
+  [[ -z "$first_token" ]] && return 1
+  esc="$(_tirith_regex_escape "$first_token")"
+  if [[ "$haystack" =~ ${boundary}${esc}([[:space:]|&\;<>()]|$) ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# Install-time gate for Phase 1 enforcement. Hostile history configurations
+# cannot provide a trustworthy whole-line view, so the hook stays in
+# warn-only rather than claim protection it cannot deliver.
+_tirith_history_is_trustworthy_for_enforcement() {
+  case ":${HISTCONTROL:-}:" in
+    *:ignorespace:*|*:ignoredups:*|*:ignoreboth:*) return 1 ;;
+  esac
+  [[ -n "${HISTIGNORE:-}" ]] && return 1
+  if ! shopt -oq history 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
+# Enable `extdebug` if (and only if) tirith is the one turning it on. Tracks
+# ownership via _TIRITH_OWNS_EXTDEBUG so a future phase can safely clean up
+# at shell exit; it is deliberately left on for the rest of the session once
+# enabled, because disabling it inside the DEBUG trap would break the
+# `return 1` skip semantic bash relies on.
+_tirith_enable_extdebug() {
+  if shopt -q extdebug; then
+    return 0
+  fi
+  shopt -s extdebug
+  _TIRITH_OWNS_EXTDEBUG=1
+}
+
+# Idempotent DEBUG-trap installer. Chains through any pre-existing user DEBUG
+# trap via a trampoline so warn-only + enforcement do not clobber the user's
+# own instrumentation. Second and later calls are no-ops.
+_tirith_debug_trampoline() {
+  if [[ -n "${_TIRITH_PREV_DEBUG_TRAP:-}" ]]; then
+    eval "$_TIRITH_PREV_DEBUG_TRAP" || true
+  fi
+  _tirith_preexec
+}
+
+_tirith_install_debug_trap() {
+  local current
+  current="$(trap -p DEBUG 2>/dev/null)"
+  [[ "$current" == *"_tirith_debug_trampoline"* ]] && return 0
+
+  _TIRITH_PREV_DEBUG_TRAP="$(trap -p DEBUG 2>/dev/null | sed "s/^trap -- '//;s/' DEBUG\$//")"
+  trap '_tirith_debug_trampoline' DEBUG
+}
+
+# Cache-then-degrade: flip the session to warn-only mode and re-export the
+# effective protection string so a subsequent `tirith doctor` sees the truth.
+# Callers that already know a history index should pin the cache BEFORE
+# invoking this helper so the current line's remaining DEBUG fires stay
+# blocked (extdebug stays on for the life of the session).
+_tirith_session_degrade_to_warn_only() {
+  local reason="$1"
+  _TIRITH_PREEXEC_ENFORCE=0
+  _TIRITH_WARN_ONLY_USE_BASH_COMMAND=1
+  _TIRITH_PREEXEC_WARNED=1   # suppress the generic warn-only banner
+  export TIRITH_BASH_EFFECTIVE_PROTECTION="warn-only"
+  if [[ $- == *i* ]]; then
+    _tirith_output "$reason"
+  fi
+}
+
 # ─── Preexec function (used by both preexec mode and degrade fallback) ───
 
 _tirith_preexec() {
-  [[ "${_TIRITH_BASH_INTERNAL:-0}" == "1" ]] && return
+  [[ "${_TIRITH_BASH_INTERNAL:-0}" == "1" ]] && return 0
 
   # Once-per-shell warn-only banner for interactive preexec users.
   if [[ -z "${_TIRITH_PREEXEC_WARNED:-}" ]] \
@@ -144,31 +297,95 @@ _tirith_preexec() {
     _tirith_output "  For guaranteed blocking use enter mode (export TIRITH_BASH_MODE=enter)"
   fi
 
-  local cmd="$BASH_COMMAND"
-  local history_line
-
-  # In DEBUG-trap mode, bash exposes each simple command in a pipeline via
-  # BASH_COMMAND. Prefer the latest history entry when available so we can scan
-  # the full typed line once instead of missing multi-part commands like
-  # `curl ... | bash`.
-  history_line="$(history 1 2>/dev/null | sed 's/^ *[0-9]* *//')"
-  if [[ -n "$history_line" ]]; then
-    cmd="$history_line"
+  local bash_cmd="$BASH_COMMAND"
+  local entry history_index="" history_line=""
+  if entry="$(_tirith_read_history_entry)"; then
+    history_index="${entry%%|*}"
+    history_line="${entry#*|}"
   fi
 
-  # Only run once per command line (guard against DEBUG firing multiple times)
-  [[ "${_tirith_last_cmd:-}" == "$cmd" ]] && return
-  _tirith_last_cmd="$cmd"
+  # Cross-path pinned-verdict check. Any degrade-and-block path writes the
+  # current history index plus rc into (_tirith_last_key, _tirith_last_rc)
+  # BEFORE flipping the session state. Honour that pin here regardless of
+  # enforce-vs-warn-only branching, so the remaining DEBUG fires on the same
+  # typed line stay blocked even though the session is now warn-only.
+  if [[ -n "$history_index" ]] \
+     && [[ "${_tirith_last_key:-}" == "$history_index" ]]; then
+    return "${_tirith_last_rc:-0}"
+  fi
 
-  # Warn-only: the command has already been committed by the DEBUG trap, so we
-  # can only print a notice. Pass --warn-only so tirith renders block verdicts
-  # as "DETECTED (shell hook cannot block in preexec mode…)" instead of the
-  # misleading "BLOCKED" banner (issue #77). Exit code is still 1 for blocks,
-  # which `|| true` masks because bash preexec physically cannot abort here.
   local _tirith_prev_internal="${_TIRITH_BASH_INTERNAL:-0}"
+  local rc
+
+  if [[ "${_TIRITH_PREEXEC_ENFORCE:-0}" == "1" ]]; then
+    # ─── Enforcement path ────────────────────────────────────────────
+    # Helper failed (no history entry available): cannot enforce whole-line
+    # semantics, so block the current DEBUG fire and downgrade the session.
+    if [[ -z "$history_index" ]]; then
+      _tirith_session_degrade_to_warn_only \
+        "tirith: bash history is unavailable in this shell (history disabled or buffer empty), cannot enforce whole-line semantics; falling back to warn-only. For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter)."
+      return 1
+    fi
+
+    # Drift check: BASH_COMMAND must appear inside history_line.
+    if ! _tirith_cmd_is_in_line "$bash_cmd" "$history_line"; then
+      _tirith_last_key="$history_index"
+      _tirith_last_rc=1
+      _tirith_session_degrade_to_warn_only \
+        "tirith: bash history no longer matches BASH_COMMAND (likely HISTCONTROL/HISTIGNORE filtering, an alias, or a shell transformation outside Phase 1 scope); cannot enforce whole-line semantics; falling back to warn-only. For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter)."
+      return 1
+    fi
+
+    # Cache miss (a hit was handled by the top-level pinned-verdict check
+    # above). Fresh whole-line scan.
+    _TIRITH_BASH_INTERNAL=1
+    command tirith check --shell posix -- "$history_line"
+    rc=$?
+    _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
+
+    case "$rc" in
+      0|2)
+        _tirith_last_key="$history_index"
+        _tirith_last_rc=0
+        return 0
+        ;;
+      1)
+        _tirith_last_key="$history_index"
+        _tirith_last_rc=1
+        return 1
+        ;;
+      *)
+        _tirith_last_key="$history_index"
+        _tirith_last_rc=1
+        _tirith_session_degrade_to_warn_only \
+          "tirith: preexec enforcement failed unexpectedly (exit $rc), blocking this command and disabling enforcement for this shell"
+        return 1
+        ;;
+    esac
+  fi
+
+  # ─── Warn-only path ──────────────────────────────────────────────
+  # When the session has been degraded (install-time hostile-config or
+  # runtime drift), history_line can no longer be trusted to correspond to
+  # the current simple command, so scan BASH_COMMAND instead. Otherwise
+  # prefer history_line so composite rules (pipe-to-interpreter, etc.) fire
+  # on the full typed line.
+  local scan_target
+  if [[ "${_TIRITH_WARN_ONLY_USE_BASH_COMMAND:-0}" == "1" ]]; then
+    scan_target="$bash_cmd"
+  elif [[ -n "$history_line" ]]; then
+    scan_target="$history_line"
+  else
+    scan_target="$bash_cmd"
+  fi
+
+  [[ "${_tirith_last_cmd:-}" == "$scan_target" ]] && return 0
+  _tirith_last_cmd="$scan_target"
+
   _TIRITH_BASH_INTERNAL=1
-  command tirith check --shell posix --warn-only -- "$cmd" || true
+  command tirith check --shell posix --warn-only -- "$scan_target" || true
   _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
+  return 0
 }
 
 # ─── Degrade function ───
@@ -192,7 +409,7 @@ _tirith_degrade_to_preexec() {
     _TIRITH_BINDS_INSTALLED=0
   fi
 
-  trap '_tirith_preexec' DEBUG
+  _tirith_install_debug_trap
   _TIRITH_BASH_MODE="preexec"
   _tirith_persist_safe_mode
   if [[ $- == *i* ]]; then
@@ -276,12 +493,41 @@ fi
 # sourcing is a no-op and must not leak status vars into child processes.
 if [[ $- == *i* ]]; then
   export TIRITH_BASH_EFFECTIVE_MODE="$_TIRITH_BASH_MODE"
-  # Phase 0: preexec is always warn-only; enter mode blocks. Phase 1 will
-  # refine this when enforcement lands.
   if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
     export TIRITH_BASH_EFFECTIVE_PROTECTION="blocks"
   else
     export TIRITH_BASH_EFFECTIVE_PROTECTION="warn-only"
+  fi
+fi
+
+# ─── Phase 1: preexec enforcement opt-in (TIRITH_BASH_PREEXEC_ENFORCE) ───
+#
+# Users who set TIRITH_BASH_PREEXEC_ENFORCE to a truthy value get real
+# blocking in preexec mode via `shopt -s extdebug` + `return 1` from the
+# DEBUG trap. Enforcement requires a trustworthy whole-line view, so hostile
+# history configs are rejected at install time: HISTCONTROL containing
+# ignorespace/ignoredups/ignoreboth, any HISTIGNORE, or `set +o history`
+# downgrade the session to warn-only with a pointer at enter mode.
+_TIRITH_PREEXEC_ENFORCE=0
+_TIRITH_OWNS_EXTDEBUG=0
+_TIRITH_WARN_ONLY_USE_BASH_COMMAND=0
+
+_tirith_env_is_truthy() {
+  case "${1:-}" in
+    1|true|TRUE|True|yes|YES|Yes|on|ON|On) return 0 ;;
+  esac
+  return 1
+}
+
+if [[ "$_TIRITH_BASH_MODE" == "preexec" ]] \
+   && [[ $- == *i* ]] \
+   && _tirith_env_is_truthy "${TIRITH_BASH_PREEXEC_ENFORCE:-}"; then
+  if _tirith_history_is_trustworthy_for_enforcement; then
+    _TIRITH_PREEXEC_ENFORCE=1
+    _tirith_enable_extdebug
+    export TIRITH_BASH_EFFECTIVE_PROTECTION="blocks"
+  else
+    _tirith_output "tirith: cannot enable preexec enforcement in this shell (HISTCONTROL/HISTIGNORE or disabled history prevent trustworthy whole-line view). Running in warn-only. For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter)."
   fi
 fi
 
@@ -609,10 +855,6 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
     fi
   fi
 
-elif [[ "$_TIRITH_BASH_MODE" == "preexec" ]] && [[ $- == *i* ]]; then
-  # Only install DEBUG trap in interactive shells.
-  # Non-interactive sourcing (bash -c, BASH_ENV, scripts) is a clean no-op.
-  trap '_tirith_preexec' DEBUG
 fi
 
 # Exit summary: show session warnings on shell exit
@@ -629,3 +871,11 @@ else
   trap '_tirith_exit_summary' EXIT
 fi
 unset _tirith_prev_exit_trap
+
+# Install the DEBUG trap as the absolute last step so no more internal hook
+# code fires it during sourcing. The enter-mode path installs its own bind-x
+# earlier; the degrade path installs DEBUG on demand inside
+# `_tirith_degrade_to_preexec`.
+if [[ "$_TIRITH_BASH_MODE" == "preexec" ]] && [[ $- == *i* ]]; then
+  _tirith_install_debug_trap
+fi

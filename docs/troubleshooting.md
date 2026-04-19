@@ -50,9 +50,62 @@ hash -r
 
 tirith supports two bash integration modes:
 - **enter mode** (default outside SSH): Binds to Enter key via `bind -x`. Intercepts commands and paste before execution. Includes startup health gate and runtime self-healing that auto-degrade to preexec if failures are detected.
-- **preexec mode**: Uses `DEBUG` trap (tirith owns this trap). Compatible with more environments but warn-only — cannot block commands. No paste interception.
+- **preexec mode**: Uses `DEBUG` trap. Warn-only by default. Can be upgraded to real blocking via `shopt -s extdebug` + `return 1` from the DEBUG trap; opt in with `TIRITH_BASH_PREEXEC_ENFORCE=1`.
 
 Set via: `export TIRITH_BASH_MODE=enter` or `export TIRITH_BASH_MODE=preexec` (set before `tirith init` in your shell rc)
+
+### Preexec enforcement (`TIRITH_BASH_PREEXEC_ENFORCE`)
+
+Set `export TIRITH_BASH_PREEXEC_ENFORCE=1` in your `.bashrc` (before `tirith init`) to get real blocking in preexec mode. Values `1`, `true`, `yes`, `on` all enable it; unset or `0` keeps today's warn-only behavior.
+
+Enforcement needs a trustworthy whole-line view of each typed command, which bash provides through `history 1`. A few common bash settings break that guarantee, and the hook refuses to engage enforcement in those shells — it stays in warn-only and prints the reason once at startup. Specifically:
+
+| Setting | Effect | Why enforcement cannot use it |
+|---|---|---|
+| `HISTCONTROL` containing `ignorespace`, `ignoredups`, or `ignoreboth` | Bash skips or merges history entries | `history 1` may return a stale line that no longer matches `BASH_COMMAND` |
+| `HISTIGNORE=...` | Matching commands are dropped from history | Same: a drifted entry would let composite rules like `curl \| sh` slip |
+| `set +o history` | No entries recorded at all | Nothing to check against |
+
+If any of these are set when the hook loads, you'll see:
+
+```
+tirith: cannot enable preexec enforcement in this shell (HISTCONTROL/HISTIGNORE or disabled history prevent trustworthy whole-line view). Running in warn-only. For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter).
+```
+
+Either remove the hostile setting, use enter mode, or accept warn-only.
+
+#### What Phase 1 handles vs what it doesn't
+
+Phase 1 enforcement uses a narrow-but-honest drift check: bash's `BASH_COMMAND` (the current simple command) must word-boundary-match somewhere inside `history 1` (the typed line). Cosmetic spacing differences — `ls -l >/dev/null` vs `ls -l > /dev/null` — are bridged by a whitespace-normalised retry and a command-name fallback, so they do **not** trigger drift.
+
+The following are explicitly **not** handled in Phase 1; any shell that relies on them triggers a runtime drift detection and downgrades the session to warn-only with a clear message:
+
+- Alias expansion (`alias ll='ls -l'`; typing `ll ...` expands to `ls -l ...` which no longer matches the typed line)
+- Process substitution (`diff <(...) <(...)`)
+- Command substitution (`foo "$(bar)"`)
+- `eval`'d strings
+
+If you use any of these heavily, prefer enter mode for guaranteed blocking.
+
+#### Known residual: late drift on filtered shells
+
+If the install-time check passed but drift develops mid-session (e.g. the user switched to `HISTCONTROL=ignorespace` after sourcing), the hook detects it on the next DEBUG fire and downgrades. One narrow residual: if a pipeline's *first* simple command happens to word-boundary-match the stale history line AND that stale line's verdict is allow, the first segment runs before drift is noticed on a later segment. The later segment is then blocked and the session is downgraded. In a pipe-to-interpreter attack (`curl evil | sh`), `curl` may fetch the payload but `sh` does not run it; the downstream sink is still blocked.
+
+This is narrower than the pre-Phase-1 "preexec is always warn-only" bypass but is genuinely a residual. Use enter mode if you need guaranteed line-level blocking.
+
+#### `extdebug` side effects
+
+When enforcement is enabled, the hook enables `shopt -s extdebug`. This:
+
+- Changes the default behavior of `BASH_ARGC` / `BASH_ARGV` (they become populated by default).
+- Makes `declare -F` include source file and line numbers.
+- Interacts with `set -E` (errtrace) so `ERR` traps are inherited by shell functions.
+
+If any of these matter for your workflow, set `TIRITH_BASH_PREEXEC_ENFORCE=0` or use enter mode. Once enabled, `extdebug` stays on for the life of the shell session, even if the session later degrades to warn-only (disabling it inside the DEBUG trap would break the `return 1` skip semantic).
+
+### Chained DEBUG traps
+
+If you have your own `DEBUG` trap installed before sourcing the tirith hook, the hook wraps it in a trampoline and both run on every command. Your trap's return value is ignored by the trampoline; tirith's return value is authoritative. If your trap depends on caller-local state, the wrap may not reproduce behavior perfectly — opt out with `TIRITH_BASH_PREEXEC_ENFORCE=0` in that case.
 
 ### Checking live state with `tirith doctor`
 
