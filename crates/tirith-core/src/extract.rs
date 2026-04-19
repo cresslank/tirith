@@ -69,6 +69,57 @@ pub struct ByteFinding {
     pub description: String,
 }
 
+impl ByteScanResult {
+    /// Return a filtered view where findings whose offset falls inside `ignore`
+    /// are removed, and the `has_*` flags are re-derived from the survivors so
+    /// downstream tier-1/tier-3 gates stay consistent.
+    ///
+    /// Used by issue #29's exec-context carveout: bytes inside the inert arg
+    /// span of `tirith diff/score/why/...` commands shouldn't trigger Unicode-
+    /// style rules. `has_invalid_utf8` is a whole-input property and is left
+    /// unchanged.
+    pub fn with_ignored_range(mut self, ignore: &std::ops::Range<usize>) -> Self {
+        self.details.retain(|d| !ignore.contains(&d.offset));
+        // Re-derive flags from surviving details. Matched on description
+        // prefixes that correspond to each branch in `scan_bytes`.
+        self.has_ansi_escapes = false;
+        self.has_control_chars = false;
+        self.has_bidi_controls = false;
+        self.has_zero_width = false;
+        self.has_unicode_tags = false;
+        self.has_variation_selectors = false;
+        self.has_invisible_math_operators = false;
+        self.has_invisible_whitespace = false;
+        self.has_hangul_fillers = false;
+        self.has_confusable_text = false;
+        for d in &self.details {
+            let desc = d.description.as_str();
+            if desc.ends_with("escape sequence") || desc == "trailing escape byte" {
+                self.has_ansi_escapes = true;
+            } else if desc.starts_with("control character") {
+                self.has_control_chars = true;
+            } else if desc.starts_with("bidi control") {
+                self.has_bidi_controls = true;
+            } else if desc.starts_with("zero-width character") {
+                self.has_zero_width = true;
+            } else if desc.starts_with("unicode tag") {
+                self.has_unicode_tags = true;
+            } else if desc.starts_with("variation selector") {
+                self.has_variation_selectors = true;
+            } else if desc.starts_with("invisible math operator") {
+                self.has_invisible_math_operators = true;
+            } else if desc.starts_with("invisible whitespace") {
+                self.has_invisible_whitespace = true;
+            } else if desc.starts_with("hangul filler") {
+                self.has_hangul_fillers = true;
+            } else if desc.starts_with("confusable") || desc.starts_with("text confusable") {
+                self.has_confusable_text = true;
+            }
+        }
+        self
+    }
+}
+
 /// Tier 1: Fast scan for URL-like content. Returns true if full analysis needed.
 pub fn tier1_scan(input: &str, context: ScanContext) -> bool {
     match context {
@@ -384,6 +435,56 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
         let sink_context = is_sink_context(segment, &segments);
         let resolved = resolve_segment_command(segment);
 
+        // Issue #29 Arm A: narrow skip — only suppress URL extraction for the
+        // *arg span* of a first-segment tirith inspection subcommand, NOT the
+        // whole segment. Leading env assignments and wrapper text must still
+        // be analyzed (`FOO=https://evil.com tirith diff safe` must still
+        // flag FOO). `resolved` can come through a sudo/env/command/time
+        // wrapper, so we locate where the word "tirith" actually lives in
+        // `segment.args` (or as `segment.command`) before looking for the
+        // inspection subcommand.
+        let inspection_skip_args_from: Option<usize> = if seg_idx == 0 {
+            resolved.as_ref().and_then(|cmd| {
+                if cmd.name != "tirith" {
+                    return None;
+                }
+                // Locate the tirith word within the tokenized segment.
+                let start_from: usize =
+                    if segment.command.as_deref().map(command_base_name).as_deref()
+                        == Some("tirith")
+                    {
+                        0
+                    } else if let Some(at) = segment
+                        .args
+                        .iter()
+                        .position(|a| command_base_name(a) == "tirith")
+                    {
+                        at + 1
+                    } else {
+                        return None;
+                    };
+                // Skip flags (e.g. `--quiet`) after the tirith word to land
+                // on the subcommand token.
+                let mut i = start_from;
+                while i < segment.args.len() {
+                    let clean = strip_quotes(&segment.args[i]);
+                    if clean.starts_with('-') {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                let sub_arg = segment.args.get(i)?;
+                if is_tirith_inspection_subcommand(&command_base_name(sub_arg)) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
         // Extract standard URLs from command + args plus leading env-assignment values.
         // Keep the raw-text expansion targeted so output/auth false-positive suppression
         // still applies to the command/arg path.
@@ -391,7 +492,14 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
         if let Some(ref cmd) = segment.command {
             url_sources.push(cmd.as_str());
         }
-        for arg in &segment.args {
+        for (arg_idx, arg) in segment.args.iter().enumerate() {
+            // For tirith inspection subcommands, stop at the subcommand word —
+            // args from there on are the inert arg span (issue #29).
+            if let Some(skip_from) = inspection_skip_args_from {
+                if arg_idx >= skip_from {
+                    break;
+                }
+            }
             url_sources.push(arg.as_str());
         }
         for (name, value) in tokenize::leading_env_assignments(&segment.raw) {
@@ -678,9 +786,88 @@ fn resolve_named_command<'a>(command: &str, args: &'a [String]) -> Option<Resolv
         "env" => resolve_env_command(args),
         "command" => resolve_command_wrapper(args),
         "time" => resolve_time_wrapper(args),
+        "sudo" | "doas" => resolve_sudo_wrapper(args),
         "tirith" => resolve_tirith_command(args),
         _ => Some(ResolvedCommand { name, args }),
     }
+}
+
+/// Resolve through a `sudo`/`doas` wrapper to the real command.
+///
+/// Handles common sudo flag shapes:
+/// - `sudo cmd args…`                                  → cmd with args
+/// - `sudo -u user cmd args…` / `sudo --user=user cmd` → cmd after the flag(s)
+/// - `sudo -E -H cmd args…`                            → cmd after flags
+/// - `sudo VAR=val cmd args…`                          → env assignment, cmd after
+///
+/// Unknown flags that take a value are NOT special-cased exhaustively; we only
+/// honor the common value-taking short/long flags. This is intentionally
+/// conservative: if we can't unambiguously resolve the command, we return None
+/// (so URL extraction / #29 carveout falls back to the literal first token).
+fn resolve_sudo_wrapper(args: &[String]) -> Option<ResolvedCommand<'_>> {
+    // Short flags that take a value:
+    //   -u user, -g group, -p prompt, -C fd, -D dir,
+    //   -U list-user, -r role, -t type
+    //
+    // Deliberately NOT on this list (boolean flags in sudo(8)):
+    //   -S  read password from stdin
+    //   -A  use askpass helper
+    //   -B  ring bell on prompt
+    //   -h  short for --help (NOT --host; --host only comes as long form here)
+    //   -E -H -K -L -l -n -P -s -V -v
+    //
+    // Putting booleans in the value-taking list was the bug behind the
+    // `sudo -S tirith diff ...` regression: treating `-S` as value-taking
+    // skipped `tirith` and the inspection carveout never engaged.
+    const SUDO_VALUE_FLAGS: &[&str] = &["-u", "-g", "-p", "-C", "-D", "-U", "-r", "-t"];
+    // Long flags that take a value unless combined with `=`.
+    const SUDO_LONG_VALUE_FLAGS: &[&str] = &[
+        "--user",
+        "--group",
+        "--prompt",
+        "--close-from",
+        "--chdir",
+        "--other-user",
+        "--role",
+        "--type",
+        "--host",
+    ];
+
+    let mut i = 0;
+    let mut after_dashdash = false;
+    while i < args.len() {
+        let clean = strip_quotes(&args[i]);
+        if !after_dashdash && clean == "--" {
+            after_dashdash = true;
+            i += 1;
+            continue;
+        }
+        // Env-style assignments before the command (sudo VAR=val cmd)
+        if !after_dashdash && tokenize::is_env_assignment(&clean) {
+            i += 1;
+            continue;
+        }
+        if !after_dashdash && clean.starts_with("--") {
+            let name_part = clean.split_once('=').map(|(n, _)| n).unwrap_or(&clean);
+            if !clean.contains('=') && SUDO_LONG_VALUE_FLAGS.contains(&name_part) {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if !after_dashdash && clean.starts_with('-') {
+            if SUDO_VALUE_FLAGS.contains(&clean.as_str()) {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        // First non-flag, non-assignment argument is the wrapped command.
+        return resolve_named_command(&clean, &args[i + 1..]);
+    }
+    None
 }
 
 fn resolve_env_command(args: &[String]) -> Option<ResolvedCommand<'_>> {
@@ -778,6 +965,103 @@ fn resolve_tirith_command(args: &[String]) -> Option<ResolvedCommand<'_>> {
             args,
         }),
     }
+}
+
+/// Whether a tirith subcommand is an "inspection" command — i.e. one whose
+/// purpose is to describe/score a suspicious input that the user deliberately
+/// typed (not execute it). For these, we suppress URL extraction and the
+/// exec-context byte-scan carveout (issue #29).
+///
+/// **List is deliberately narrow** — only the "here's a suspicious input, tell
+/// me about it" commands that the regression targets. Subcommands like
+/// `doctor`, `init`, `setup`, `version`, etc. are intentionally NOT on the
+/// list; if a real false positive surfaces there later, add it WITH a
+/// motivating fixture.
+fn is_tirith_inspection_subcommand(sub: &str) -> bool {
+    matches!(sub, "diff" | "score" | "why" | "receipt" | "explain")
+}
+
+/// Resolve the first segment of `input` as a potential tirith inspection
+/// subcommand. When matched, returns the byte range (within `input`) of the
+/// arg span that follows the subcommand word — i.e. the inert region that
+/// should be skipped by URL extraction and Unicode-style byte scans.
+///
+/// Returns `None` for:
+/// - non-tirith commands
+/// - `tirith run` (a sink — URL analysis still applies)
+/// - tirith subcommands not on the narrow inspection list
+/// - inputs where the first segment doesn't tokenize cleanly
+///
+/// Resolves through `env`, `command`, `time`, and `sudo`-style wrappers by
+/// delegating to `resolve_named_command`. Leading flags like
+/// `tirith --quiet diff URL` are handled — the subcommand word is the first
+/// non-flag argument.
+///
+/// Only the FIRST segment's arg span is returned; later pipeline segments
+/// (`tirith diff foo | grep bar`) are still analyzed normally.
+pub fn tirith_inert_arg_range(input: &str, shell: ShellType) -> Option<std::ops::Range<usize>> {
+    let segments = tokenize::tokenize(input, shell);
+    let first = segments.first()?;
+
+    // Resolve the segment's command through wrappers — must end at "tirith".
+    let resolved = resolve_segment_command(first)?;
+    if resolved.name != "tirith" {
+        return None;
+    }
+
+    // Find the first non-flag arg (the subcommand). Start from args[0] because
+    // resolve_tirith_command already strips wrapper prefixes.
+    let mut sub_idx = 0;
+    while sub_idx < resolved.args.len() {
+        let clean = strip_quotes(&resolved.args[sub_idx]);
+        if clean.starts_with('-') {
+            sub_idx += 1;
+            continue;
+        }
+        break;
+    }
+    let sub_arg = resolved.args.get(sub_idx)?;
+    let subcommand = command_base_name(sub_arg);
+    if !is_tirith_inspection_subcommand(&subcommand) {
+        return None;
+    }
+
+    // The inert range is everything after the subcommand word within this
+    // segment. Locate the subcommand token inside the segment's byte range
+    // by scanning for a whitespace-delimited match, not a raw substring find.
+    // Otherwise `tirith --config=diff diff URL` would match the `diff` inside
+    // `--config=diff` and the inert range would start too early.
+    let seg_slice = input.get(first.byte_range.clone())?;
+    let sub_rel = find_subcommand_token(seg_slice, sub_arg.as_str())?;
+    let inert_start = first.byte_range.start + sub_rel + sub_arg.len();
+    let inert_end = first.byte_range.end;
+    if inert_start >= inert_end {
+        return None;
+    }
+    Some(inert_start..inert_end)
+}
+
+/// Find the byte offset within `haystack` where the subcommand token `needle`
+/// begins — only matching when preceded by start-of-string or whitespace.
+/// Prevents `--config=diff` from matching `diff` in `tirith --config=diff diff URL`.
+fn find_subcommand_token(haystack: &str, needle: &str) -> Option<usize> {
+    let bytes = haystack.as_bytes();
+    let n = needle.len();
+    let mut search_from = 0;
+    while let Some(rel) = haystack.get(search_from..)?.find(needle) {
+        let abs = search_from + rel;
+        let preceded_by_ws_or_start =
+            abs == 0 || matches!(bytes.get(abs - 1), Some(b) if b.is_ascii_whitespace());
+        // Also require that the match end is a word boundary (whitespace or EOS),
+        // so `differ` doesn't match `diff`.
+        let followed_by_ws_or_end = abs + n == bytes.len()
+            || matches!(bytes.get(abs + n), Some(b) if b.is_ascii_whitespace());
+        if preceded_by_ws_or_start && followed_by_ws_or_end {
+            return Some(abs);
+        }
+        search_from = abs + 1;
+    }
+    None
 }
 
 /// Check if a segment is in a "sink" context (executing/downloading).

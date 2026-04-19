@@ -3,8 +3,29 @@ use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 /// Check raw bytes for terminal deception (paste-time).
 pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
+    check_bytes_with_ignore(input, &[])
+}
+
+/// Like [`check_bytes`] but skips bytes whose offset falls inside any of the
+/// supplied ignore ranges when deciding whether to emit a finding and when
+/// assembling its evidence.
+///
+/// Added for issue #29's exec-context carveout: the arg span of
+/// `tirith diff/score/why/receipt/explain` commands is treated as inert, and
+/// any Unicode-style finding that would otherwise be emitted purely from in-
+/// range bytes is suppressed. Rules emitted from this function with
+/// `Evidence::Text` (`UnicodeTags`) also have to be suppressed at scan time,
+/// not post-hoc on offsets — that's why the ignore is threaded in here rather
+/// than post-filtered by the caller. See the plan file for rationale.
+pub fn check_bytes_with_ignore(
+    input: &[u8],
+    ignore_ranges: &[std::ops::Range<usize>],
+) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let scan = extract::scan_bytes(input);
+    let mut scan = extract::scan_bytes(input);
+    for range in ignore_ranges {
+        scan = scan.with_ignored_range(range);
+    }
 
     if scan.has_ansi_escapes {
         findings.push(Finding {
@@ -148,24 +169,31 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
     }
 
     if scan.has_unicode_tags {
-        let decoded = decode_unicode_tags(input);
-        findings.push(Finding {
-            rule_id: RuleId::UnicodeTags,
-            severity: Severity::Critical,
-            title: "Unicode Tags (hidden ASCII) detected".to_string(),
-            description: "Content contains Unicode Tag characters (U+E0000–U+E007F) that encode hidden ASCII text invisible to the user".to_string(),
-            evidence: vec![Evidence::Text {
-                detail: if decoded.is_empty() {
-                    "Hidden text could not be decoded".to_string()
-                } else {
-                    format!("Hidden text: \"{}\"", truncate(&decoded, 200))
-                },
-            }],
-            human_view: None,
-            agent_view: None,
+        // Decode excluding bytes in ignore ranges so the hidden-text evidence
+        // doesn't leak content from the inert arg span.
+        let decoded = decode_unicode_tags(input, ignore_ranges);
+        // If every unicode tag byte was in an ignore range, the decoder returns
+        // empty even though scan.has_unicode_tags was true due to byte-wise
+        // filtering timing. Skip emission in that case.
+        if !decoded.is_empty() || has_unicode_tag_outside_ranges(input, ignore_ranges) {
+            findings.push(Finding {
+                rule_id: RuleId::UnicodeTags,
+                severity: Severity::Critical,
+                title: "Unicode Tags (hidden ASCII) detected".to_string(),
+                description: "Content contains Unicode Tag characters (U+E0000–U+E007F) that encode hidden ASCII text invisible to the user".to_string(),
+                evidence: vec![Evidence::Text {
+                    detail: if decoded.is_empty() {
+                        "Hidden text could not be decoded".to_string()
+                    } else {
+                        format!("Hidden text: \"{}\"", truncate(&decoded, 200))
+                    },
+                }],
+                human_view: None,
+                agent_view: None,
                 mitre_id: None,
                 custom_rule_id: None,
-        });
+            });
+        }
     }
 
     if scan.has_variation_selectors {
@@ -286,13 +314,19 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
 
 /// Decode Unicode Tag characters (U+E0000–U+E007F) to their hidden ASCII message.
 /// Each tag character encodes one ASCII byte: codepoint - 0xE0000 = ASCII value.
-fn decode_unicode_tags(input: &[u8]) -> String {
+///
+/// Byte offsets in `ignore_ranges` are skipped — used by #29 to avoid decoding
+/// content from the inert arg span of tirith inspection commands.
+fn decode_unicode_tags(input: &[u8], ignore_ranges: &[std::ops::Range<usize>]) -> String {
     let Ok(s) = std::str::from_utf8(input) else {
         eprintln!("tirith: warning: unicode tag decode failed: input is not valid UTF-8");
         return String::new();
     };
     let mut decoded = String::new();
-    for ch in s.chars() {
+    for (byte_off, ch) in s.char_indices() {
+        if ignore_ranges.iter().any(|r| r.contains(&byte_off)) {
+            continue;
+        }
         let cp = ch as u32;
         if (0xE0001..=0xE007F).contains(&cp) {
             let ascii = (cp - 0xE0000) as u8;
@@ -302,6 +336,24 @@ fn decode_unicode_tags(input: &[u8]) -> String {
         }
     }
     decoded
+}
+
+/// Returns true iff `input` contains at least one Unicode Tag byte at an
+/// offset that falls OUTSIDE every ignore range.
+fn has_unicode_tag_outside_ranges(input: &[u8], ignore_ranges: &[std::ops::Range<usize>]) -> bool {
+    let Ok(s) = std::str::from_utf8(input) else {
+        return false;
+    };
+    for (byte_off, ch) in s.char_indices() {
+        if ignore_ranges.iter().any(|r| r.contains(&byte_off)) {
+            continue;
+        }
+        let cp = ch as u32;
+        if (0xE0001..=0xE007F).contains(&cp) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Check for hidden multiline content in string input.
