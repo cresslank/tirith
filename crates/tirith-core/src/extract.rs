@@ -414,13 +414,26 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
             .is_some_and(|cmd| matches!(cmd.name.as_str(), "docker" | "podman" | "nerdctl"));
         if sink_context && !is_docker_cmd {
             if let Some(cmd) = resolved.as_ref() {
+                // scp/rsync arguments are either (a) remote specs (handled via
+                // parse_scp_remote_spec below) or (b) local file paths — never
+                // schemeless domain candidates. Skip the schemeless heuristic
+                // for these commands entirely; scheme-full URLs (http://...)
+                // are still caught earlier via URL_REGEX. See issue #26:
+                // `scp test.asdf testhost:/home/user/` previously flagged both
+                // the local file "test.asdf" (via `.asdf` TLD shape) and the
+                // remote spec "testhost:/home/user/" (via bare host:path).
+                let is_remote_copy = matches!(cmd.name.as_str(), "scp" | "rsync");
                 for (arg_idx, arg) in cmd.args.iter().enumerate() {
                     // Skip args that are output-file flag values
                     if is_output_flag_value(&cmd.name, cmd.args, arg_idx) {
                         continue;
                     }
                     let clean = strip_quotes(arg);
-                    if is_remote_copy_target(&cmd.name, &clean) {
+                    if is_remote_copy {
+                        // Validate the spec shape when present, so downstream
+                        // policy can consume it later, but don't emit schemeless
+                        // for either remote specs or local files.
+                        let _ = parse_scp_remote_spec(&clean, shell);
                         continue;
                     }
                     if looks_like_schemeless_host(&clean) && !URL_REGEX.is_match(&clean) {
@@ -825,18 +838,129 @@ fn is_source_command(cmd: &str) -> bool {
     )
 }
 
-fn is_remote_copy_target(cmd: &str, arg: &str) -> bool {
-    if !matches!(cmd, "scp" | "rsync") {
-        return false;
+/// Parsed scp/rsync remote spec of shape `[user@]host:path`. Not currently
+/// consumed beyond the parser existence check (which validates the shape),
+/// but this is what downstream policy consumers (e.g. network_deny for remote
+/// scp targets) will want — writing an actual parser instead of a substring
+/// check makes the drive-letter guard verifiable and the logic auditable.
+///
+/// Shell-aware: the Windows drive-letter guard is narrow on Posix/Fish
+/// (single-letter SSH aliases like `scp file x:/tmp/` are legitimate there),
+/// wider on PowerShell/Cmd. See issue #26.
+/// Parsed scp/rsync remote spec of shape `[user@]host:path`. Returned by
+/// [`parse_scp_remote_spec`] so callers (e.g. `network_deny` enforcement) can
+/// route on the host without re-parsing. `path` is kept as the literal
+/// remainder after the first `:`, no normalization.
+pub struct ScpRemoteSpec {
+    pub user: Option<String>,
+    pub host: String,
+    pub path: String,
+}
+
+/// Parse `[user@]host:path` from an scp/rsync argument.
+///
+/// Accepts:
+/// - `host:path` (bare host — the shape that regressed in #26)
+/// - `user@host:path` (original covered shape)
+///
+/// Rejects (returns None):
+/// - tokens without `:` → plain local path
+/// - tokens starting with `-` → flag
+/// - tokens containing `://` → URL scheme
+/// - tokens where `:` is preceded by `/` → absolute local path with `:` in name
+/// - tokens where host part is empty
+/// - tokens where host part contains `/` → not a hostname
+/// - Windows drive-letter shapes (see below)
+///
+/// Windows drive-letter guard — intentionally narrow so it doesn't break
+/// legitimate one-letter SSH aliases (e.g. `scp file x:/tmp/`):
+/// - `X:\...` (single letter + `:` + `\`) — reject ALWAYS; backslash after a
+///   drive letter is never a scp remote path.
+/// - `X:/...` (single letter + `:` + `/`) — reject ONLY for PowerShell/Cmd;
+///   on POSIX this collides with legitimate one-letter aliases.
+/// - `X:foo` (single letter + `:` + anything else) — ACCEPT; ambiguous with
+///   the `x:relative-path` alias form; back-compat wins over over-rejection.
+pub fn parse_scp_remote_spec(arg: &str, shell: ShellType) -> Option<ScpRemoteSpec> {
+    if arg.is_empty() || arg.starts_with('-') || arg.contains("://") {
+        return None;
     }
 
+    // Two accepted shapes:
+    //   1. `user@host[:path]` — `user@` present, colon optional.
+    //      Strict scp syntax requires the colon, but tirith historically
+    //      treated bare `user@host` as a remote target too (see #60 test
+    //      `test_scp_user_at_host_not_treated_as_schemeless_url`) to suppress
+    //      a false positive on `looks_like_schemeless_host`. Preserve that.
+    //   2. `host:path` — no `@`, colon required. This is the shape that
+    //      regressed in #26.
     if let Some(at_pos) = arg.find('@') {
         let before_at = &arg[..at_pos];
         let after_at = &arg[at_pos + 1..];
-        return !before_at.contains(':') && !after_at.contains('/') && !after_at.contains(':');
+        if before_at.is_empty() || after_at.is_empty() || before_at.contains(':') {
+            return None;
+        }
+        let (host, path) = match after_at.find(':') {
+            Some(colon_pos) => {
+                // `:` preceded by `/` in after_at means a colon inside a path, not
+                // a host:path boundary. Unusual but safe to reject.
+                if colon_pos > 0 && after_at.as_bytes()[colon_pos - 1] == b'/' {
+                    return None;
+                }
+                (
+                    &after_at[..colon_pos],
+                    after_at[colon_pos + 1..].to_string(),
+                )
+            }
+            None => (after_at, String::new()),
+        };
+        if !is_valid_scp_host(host) {
+            return None;
+        }
+        return Some(ScpRemoteSpec {
+            user: Some(before_at.to_string()),
+            host: host.to_string(),
+            path,
+        });
     }
 
-    false
+    // No `@` — must have `host:path` with an explicit colon.
+    let colon_pos = arg.find(':')?;
+    if colon_pos > 0 && arg.as_bytes()[colon_pos - 1] == b'/' {
+        return None;
+    }
+    let host = &arg[..colon_pos];
+    let after_colon = &arg[colon_pos + 1..];
+    if !is_valid_scp_host(host) {
+        return None;
+    }
+
+    // Windows drive-letter guard — narrow by design (issue #26 / #60 refinement).
+    // Only kicks in when host is a single ASCII letter AND `user@` is absent.
+    if host.len() == 1 && host.chars().next().unwrap().is_ascii_alphabetic() {
+        let first_after = after_colon.chars().next();
+        match first_after {
+            Some('\\') => return None, // X:\... always a drive path
+            Some('/') if matches!(shell, ShellType::PowerShell | ShellType::Cmd) => {
+                return None; // X:/... on Windows shells
+            }
+            _ => {} // X:foo or X:/ on Posix/Fish → accepted as ambiguous/alias form
+        }
+    }
+
+    Some(ScpRemoteSpec {
+        user: None,
+        host: host.to_string(),
+        path: after_colon.to_string(),
+    })
+}
+
+fn is_valid_scp_host(host: &str) -> bool {
+    !host.is_empty()
+        && !host.contains('/')
+        && !host.contains(':')
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// Check if a git command is in a sink context (only subcommands that download).
@@ -1638,6 +1762,141 @@ mod tests {
             .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
             .collect();
         assert!(schemeless.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // #26: scp/rsync `host:/path` must not trip schemeless_to_sink.
+    // -----------------------------------------------------------------------
+
+    fn scp_has_schemeless(cmd: &str, shell: ShellType) -> bool {
+        extract_urls(cmd, shell)
+            .iter()
+            .any(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+    }
+
+    #[test]
+    fn test_scp_plain_host_path_not_schemeless() {
+        // The reporter's exact command shape.
+        assert!(!scp_has_schemeless(
+            "scp test.asdf testhost:/home/user/",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_scp_plain_host_relative_path_not_schemeless() {
+        assert!(!scp_has_schemeless(
+            "scp file.txt host:dir/",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_rsync_plain_host_path_not_schemeless() {
+        assert!(!scp_has_schemeless(
+            "rsync -av src host:/dest/",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_scp_one_letter_alias_posix_accepted() {
+        // `x:/tmp/` on POSIX is a legitimate single-letter SSH alias.
+        // The drive-letter guard must NOT reject this.
+        assert!(!scp_has_schemeless("scp file x:/tmp/", ShellType::Posix));
+    }
+
+    #[test]
+    fn test_scp_windows_backslash_always_rejected() {
+        // `C:\...` is never an scp remote — any shell.
+        assert!(parse_scp_remote_spec("C:\\Users\\me\\file", ShellType::Posix).is_none());
+        assert!(parse_scp_remote_spec("C:\\Users\\me\\file", ShellType::PowerShell).is_none());
+        assert!(parse_scp_remote_spec("C:\\Users\\me\\file", ShellType::Cmd).is_none());
+        assert!(parse_scp_remote_spec("D:\\backup", ShellType::Posix).is_none());
+    }
+
+    #[test]
+    fn test_scp_windows_forward_slash_shell_scoped() {
+        // `C:/Users/me/file` is a drive path on PowerShell/Cmd, but on POSIX
+        // it collides with the legitimate one-letter alias form — accept there.
+        assert!(parse_scp_remote_spec("C:/Users/me/file", ShellType::PowerShell).is_none());
+        assert!(parse_scp_remote_spec("C:/Users/me/file", ShellType::Cmd).is_none());
+        assert!(parse_scp_remote_spec("C:/Users/me/file", ShellType::Posix).is_some());
+        assert!(parse_scp_remote_spec("C:/Users/me/file", ShellType::Fish).is_some());
+    }
+
+    #[test]
+    fn test_scp_windows_ambiguous_drive_letter_accepted() {
+        // `C:foo` is ambiguous — keep back-compat with `x:relative-path` aliases
+        // by accepting it in every shell. Over-rejecting here is what broke #26
+        // in the first place, in spirit: narrow guards beat blanket bans.
+        for shell in [
+            ShellType::Posix,
+            ShellType::Fish,
+            ShellType::PowerShell,
+            ShellType::Cmd,
+        ] {
+            assert!(
+                parse_scp_remote_spec("C:foo", shell).is_some(),
+                "C:foo should parse as remote in shell {shell:?}"
+            );
+            assert!(
+                parse_scp_remote_spec("D:backup/x.txt", shell).is_some(),
+                "D:backup/x.txt should parse as remote in shell {shell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scp_rejects_url_scheme() {
+        assert!(parse_scp_remote_spec("http://evil.com/a.sh", ShellType::Posix).is_none());
+        assert!(parse_scp_remote_spec("https://a.b/c", ShellType::Posix).is_none());
+    }
+
+    #[test]
+    fn test_scp_rejects_flag_and_absolute_local() {
+        assert!(parse_scp_remote_spec("-P", ShellType::Posix).is_none());
+        assert!(parse_scp_remote_spec("--port=22", ShellType::Posix).is_none());
+        // `/tmp:weird` — colon preceded by `/`, absolute local path
+        assert!(parse_scp_remote_spec("/tmp:weird", ShellType::Posix).is_none());
+    }
+
+    #[test]
+    fn test_scp_accepts_user_at_host_forms() {
+        // Back-compat with the original covered shape.
+        assert!(parse_scp_remote_spec("user@server.com:file.txt", ShellType::Posix).is_some());
+        assert!(parse_scp_remote_spec("user@host:/path", ShellType::Posix).is_some());
+    }
+
+    #[test]
+    fn test_scp_rejects_missing_parts() {
+        assert!(parse_scp_remote_spec("", ShellType::Posix).is_none());
+        assert!(parse_scp_remote_spec(":path", ShellType::Posix).is_none()); // empty host
+        assert!(parse_scp_remote_spec("@host:path", ShellType::Posix).is_none()); // empty user
+        assert!(parse_scp_remote_spec("user@:path", ShellType::Posix).is_none());
+        // empty host
+    }
+
+    #[test]
+    fn test_scp_rejects_host_with_slash() {
+        // Host must not contain `/`.
+        assert!(parse_scp_remote_spec("foo/bar:baz", ShellType::Posix).is_none());
+    }
+
+    #[test]
+    fn test_parse_scp_remote_spec_fields_populated() {
+        // Exercise the parser's structured output so downstream consumers
+        // of user/host/path can rely on the fields rather than just the
+        // Option presence check.
+        let spec = parse_scp_remote_spec("user@server.com:/path", ShellType::Posix).unwrap();
+        assert_eq!(spec.user.as_deref(), Some("user"));
+        assert_eq!(spec.host, "server.com");
+        assert_eq!(spec.path, "/path");
+
+        let spec = parse_scp_remote_spec("host:/dest/", ShellType::Posix).unwrap();
+        assert_eq!(spec.user, None);
+        assert_eq!(spec.host, "host");
+        assert_eq!(spec.path, "/dest/");
     }
 
     #[test]
