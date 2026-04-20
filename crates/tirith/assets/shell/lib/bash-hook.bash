@@ -405,8 +405,15 @@ _tirith_preexec() {
     scan_target="$bash_cmd"
   fi
 
-  [[ "${_tirith_last_cmd:-}" == "$scan_target" ]] && return 0
-  _tirith_last_cmd="$scan_target"
+  # Within-line dedupe: skip when this exact scan target was already sent
+  # to tirith on the SAME typed line (DEBUG can fire multiple times for one
+  # simple command via subshell expansion). Combine the per-line id with
+  # the scan target so identical commands on separate prompts each get a
+  # fresh DETECTED banner — the prompt boundary advances line_id and
+  # naturally invalidates the dedupe.
+  local dedupe_key="${line_id}|${scan_target}"
+  [[ "${_tirith_last_cmd:-}" == "$dedupe_key" ]] && return 0
+  _tirith_last_cmd="$dedupe_key"
 
   _TIRITH_BASH_INTERNAL=1
   command tirith check --shell posix --warn-only -- "$scan_target" || true

@@ -570,6 +570,41 @@ fn mid_session_ignorespace_does_not_bypass_via_stale_cache() {
 }
 
 #[test]
+fn warn_only_does_not_dedupe_identical_commands_across_prompts() {
+    // Regression for the P3 manual-review finding: in warn-only mode the
+    // hook used to dedupe against `_tirith_last_cmd` regardless of which
+    // prompt it came from, so running the same command twice in a row only
+    // produced a single tirith invocation. With the per-typed-line cache
+    // key folded in, each prompt should get its own scan even if the
+    // command text is identical.
+    //
+    // Ran under install-time-hostile HISTCONTROL=ignorespace so the path
+    // exercised is the install-time-degraded warn-only branch (the same
+    // one the reviewer reproduced).
+    let (_out, _err, invocations, _tmp) = run_with_sentinels(
+        r#"
+ echo repeated_cmd
+ echo repeated_cmd
+"#,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+            ("HISTCONTROL", "ignorespace"),
+        ],
+    );
+
+    let scan_count = invocations
+        .iter()
+        .filter(|i| i.contains("--warn-only") && i.contains("repeated_cmd"))
+        .count();
+    assert!(
+        scan_count >= 2,
+        "warn-only must scan each prompt's repeated command (got {scan_count}); \
+         invocations: {invocations:#?}"
+    );
+}
+
+#[test]
 fn install_time_hostile_config_uses_bash_command_for_warn_only() {
     // Regression for the P2 review finding: when enforcement is refused at
     // install time because history is hostile, the warn-only scan target must
