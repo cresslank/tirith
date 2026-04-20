@@ -1,8 +1,51 @@
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use crate::policy::{ApprovalRule, Policy};
 use crate::verdict::Verdict;
+
+/// Approval/warn-ack temp files older than this are considered abandoned
+/// (e.g. a `tirith check --approval-check` invoked from a terminal without
+/// a hook on the receiving end, per issue #80) and removed opportunistically
+/// on the next write. A live hook normally reads + deletes its own file
+/// within seconds, so an hour is a safe bound that won't race.
+const STALE_APPROVAL_TTL: Duration = Duration::from_secs(3600);
+
+/// Best-effort cleanup of leaked approval/warn-ack temp files in `$TEMP`.
+/// Called before each fresh write so a leak from a prior CLI test doesn't
+/// accumulate forever. Errors are silently ignored — this is housekeeping,
+/// not a hard requirement.
+fn cleanup_stale_temp_files() {
+    let dir = std::env::temp_dir();
+    let now = SystemTime::now();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".env") {
+            continue;
+        }
+        if !(name.starts_with("tirith-approval-") || name.starts_with("tirith-warnack-")) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age > STALE_APPROVAL_TTL {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
 
 /// Approval metadata extracted from a verdict + policy.
 #[derive(Debug, Clone)]
@@ -65,6 +108,7 @@ pub fn apply_approval(verdict: &mut Verdict, metadata: &ApprovalMetadata) {
 /// Per ADR-7: file is created with O_EXCL + O_CREAT (via tempfile crate),
 /// mode 0600 on Unix, and `.keep()` is called before returning.
 pub fn write_approval_file(metadata: &ApprovalMetadata) -> Result<PathBuf, std::io::Error> {
+    cleanup_stale_temp_files();
     let mut tmp = tempfile::Builder::new()
         .prefix("tirith-approval-")
         .suffix(".env")
@@ -114,6 +158,7 @@ pub fn write_approval_file(metadata: &ApprovalMetadata) -> Result<PathBuf, std::
 
 /// Write a "no approval required" temp file for the common case.
 pub fn write_no_approval_file() -> Result<PathBuf, std::io::Error> {
+    cleanup_stale_temp_files();
     let mut tmp = tempfile::Builder::new()
         .prefix("tirith-approval-")
         .suffix(".env")
@@ -142,6 +187,7 @@ pub fn write_warn_ack_file(
     finding_count: usize,
     max_severity: &crate::verdict::Severity,
 ) -> Result<PathBuf, std::io::Error> {
+    cleanup_stale_temp_files();
     let mut tmp = tempfile::Builder::new()
         .prefix("tirith-warnack-")
         .suffix(".env")
@@ -458,5 +504,69 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_approval_file_cleans_up_stale_leaks() {
+        // Regression for issue #80: a `tirith check --approval-check` invoked
+        // from a terminal (or any caller that doesn't consume the temp file)
+        // used to leak `tirith-approval-*.env` into $TEMP forever. The next
+        // write must opportunistically remove leaked files older than the
+        // TTL — and must NOT touch fresh files (a concurrent hook may still
+        // be reading them) or unrelated files.
+        use std::fs::File;
+        use std::time::{Duration, SystemTime};
+
+        let dir = std::env::temp_dir();
+
+        // Make the test names unique-enough that parallel runs of this test
+        // suite do not interfere.
+        let suffix = format!("{}-{}", std::process::id(), rand_token());
+        let stale = dir.join(format!("tirith-approval-stale-{suffix}.env"));
+        let fresh = dir.join(format!("tirith-approval-fresh-{suffix}.env"));
+        let unrelated = dir.join(format!("tirith-other-{suffix}.env"));
+
+        File::create(&stale).expect("stale create");
+        File::create(&fresh).expect("fresh create");
+        File::create(&unrelated).expect("unrelated create");
+
+        // Backdate the stale file past the TTL.
+        let two_hours_ago = SystemTime::now() - Duration::from_secs(7200);
+        File::options()
+            .write(true)
+            .open(&stale)
+            .and_then(|f| f.set_modified(two_hours_ago))
+            .expect("backdate stale");
+
+        let meta = ApprovalMetadata {
+            requires_approval: true,
+            timeout_secs: 0,
+            fallback: "block".to_string(),
+            rule_id: "test".to_string(),
+            description: "test".to_string(),
+        };
+        let new_path = write_approval_file(&meta).expect("write should succeed");
+
+        assert!(!stale.exists(), "stale leak should be cleaned up");
+        assert!(fresh.exists(), "fresh file (within TTL) must be left alone");
+        assert!(
+            unrelated.exists(),
+            "unrelated file (wrong prefix) must be left alone"
+        );
+        assert!(new_path.exists(), "new approval file must exist");
+
+        // Cleanup
+        let _ = std::fs::remove_file(&fresh);
+        let _ = std::fs::remove_file(&unrelated);
+        let _ = std::fs::remove_file(&new_path);
+    }
+
+    fn rand_token() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{nanos:x}")
     }
 }
