@@ -44,6 +44,9 @@ jobs:
   test:
     name: Test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    # The full workspace test suite completes well under this locally; fail
+    # runner wedges instead of leaving CI stuck in-progress for an hour.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +65,8 @@ jobs:
   msrv:
     name: MSRV (1.83)
     runs-on: ubuntu-latest
+    # Match the main test job: treat prolonged runner hangs as failures.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
