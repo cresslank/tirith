@@ -366,9 +366,11 @@ Use `tirith setup <tool>` for one-command configuration:
 ```bash
 tirith setup claude-code --with-mcp   # Claude Code + MCP server
 tirith setup codex                    # OpenAI Codex
+tirith setup copilot-cli              # GitHub Copilot CLI (run from repo root)
 tirith setup cursor                   # Cursor
-tirith setup gemini-cli --with-mcp   # Gemini CLI + MCP server
-tirith setup pi-cli                  # Pi CLI
+tirith setup gemini-cli --with-mcp    # Gemini CLI + MCP server
+tirith setup kiro                     # Kiro CLI (formerly Amazon Q)
+tirith setup pi-cli                   # Pi CLI
 tirith setup vscode                   # VS Code
 tirith setup windsurf                 # Windsurf
 ```
