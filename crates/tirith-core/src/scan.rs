@@ -98,7 +98,7 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     let mut truncation_reason = None;
     let mut skipped_count = 0;
 
-    // Apply caller-provided safety cap (not a license gate)
+    // Caller-provided safety cap; not a license gate.
     if let Some(max) = config.max_files {
         if files.len() > max {
             skipped_count = files.len() - max;
@@ -112,10 +112,12 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
 
     let mut file_results = Vec::new();
     for file_path in &files {
-        if let Some(result) = scan_single_file(file_path) {
-            file_results.push(result);
-        } else {
-            skipped_count += 1;
+        // Panic in any rule is bounded to its file; the rest of the walk
+        // continues. Single-file callers (CLI, MCP, `policy test`) bypass
+        // this guard on purpose so panics still surface honestly there.
+        match catch_panic_scanning(file_path, || scan_single_file(file_path)) {
+            Some(Some(result)) => file_results.push(result),
+            Some(None) | None => skipped_count += 1,
         }
     }
 
@@ -130,7 +132,8 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
 
 /// Scan a single file and return its results.
 pub fn scan_single_file(file_path: &Path) -> Option<FileScanResult> {
-    // Read file content with size cap (10 MiB)
+    // 10 MiB cap — large enough for any realistic config/source file but
+    // small enough that a hostile `.git/objects/pack-*.pack` won't blow us up.
     const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
     let metadata = match std::fs::metadata(file_path) {
@@ -183,7 +186,6 @@ pub fn scan_single_file(file_path: &Path) -> Option<FileScanResult> {
 
     let verdict = engine::analyze(&ctx);
 
-    // Apply paranoia filter to scan findings
     let policy = crate::policy::Policy::discover(cwd.as_deref());
     let mut findings = verdict.findings;
     engine::filter_findings_by_paranoia_vec(&mut findings, policy.paranoia);
@@ -193,6 +195,35 @@ pub fn scan_single_file(file_path: &Path) -> Option<FileScanResult> {
         findings,
         is_config_file: is_config,
     })
+}
+
+/// Wrap `f` in `catch_unwind` for the directory-walk code path. On panic,
+/// log a skip message to stderr and return `None`; the caller then bumps
+/// `skipped_count` so the rest of the walk continues.
+///
+/// **Contract notes:**
+/// - The default Rust panic hook fires *before* unwinding, so the panic
+///   payload + backtrace will already be on stderr before our skip line.
+///   We deliberately don't install a custom panic hook — that would mutate
+///   process-global state and affect every other caller.
+/// - Only effective in `panic = "unwind"` builds (the workspace default).
+///   `panic = "abort"` builds bypass `catch_unwind` entirely.
+/// - `AssertUnwindSafe` is asserted because the closure type does not
+///   auto-impl `UnwindSafe`. Today the closure captures only `&Path` and
+///   a function pointer, both trivially safe; if a future refactor expands
+///   the closure body to capture mutable state, that state must remain
+///   unused after the panic to keep the assertion sound.
+fn catch_panic_scanning<T>(file_path: &Path, f: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            eprintln!(
+                "tirith: scan: internal error scanning {} (skipped — see panic message above)",
+                file_path.display()
+            );
+            None
+        }
+    }
 }
 
 /// Scan content from stdin (no file path).
@@ -215,7 +246,6 @@ pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
 
     let verdict = engine::analyze(&ctx);
 
-    // Apply paranoia filter to scan findings
     let policy = crate::policy::Policy::discover(cwd.as_deref());
     let mut findings = verdict.findings;
     engine::filter_findings_by_paranoia_vec(&mut findings, policy.paranoia);
@@ -500,6 +530,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn catch_panic_scanning_returns_some_on_clean_run() {
+        let path = Path::new("dummy");
+        let result = catch_panic_scanning(path, || 42_i32);
+        assert_eq!(result, Some(42));
+    }
+
+    /// Serializes any test that mutates the global panic hook. Without this,
+    /// a parallel test that panics during the hook-swap window inherits the
+    /// empty hook, and concurrent hook swaps race each other's restore.
+    /// Tolerates poisoning so a single panic doesn't cascade.
+    static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn catch_panic_scanning_returns_none_on_panic() {
+        let _lock = PANIC_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = Path::new("dummy");
+        // Suppress the default panic-hook output for this test only — we're
+        // intentionally inducing a panic and don't want it cluttering stderr.
+        // The hook is restored before the lock guard drops.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result: Option<i32> = catch_panic_scanning(path, || {
+            panic!("simulated rule panic");
+        });
+        std::panic::set_hook(prev);
+        assert!(result.is_none(), "panic must produce None, got {result:?}");
+    }
+
+    #[test]
     fn test_binary_extension_skip() {
         assert!(is_binary_extension("image.png"));
         assert!(is_binary_extension("archive.tar.gz"));
@@ -579,7 +638,7 @@ mod tests {
 
         let result = scan_single_file(&file_path).expect("scan should succeed");
 
-        // VariationSelector is now Medium — should survive default paranoia filtering
+        // VariationSelector is Medium, so it must survive the default paranoia filter.
         let policy = crate::policy::Policy::discover(Some(tmp.path().to_str().unwrap()));
         let mut findings = result.findings;
         crate::engine::filter_findings_by_paranoia_vec(&mut findings, policy.paranoia);
