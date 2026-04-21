@@ -1011,7 +1011,9 @@ fn print_human(info: &DoctorInfo) {
     use tirith_core::license::KeyFormatStatus;
     match tirith_core::license::key_format_status() {
         KeyFormatStatus::LegacyUnsigned => {
-            println!("  license key:  WARNING: Using unsigned license key. Signed tokens will be required in a future release.");
+            println!(
+                "  license key:  WARNING: Using unsigned legacy license key. Official v0.3.0+ releases require signed tokens, so this key is ignored for tier verification."
+            );
         }
         KeyFormatStatus::LegacyInvalid => {
             println!("  license key:  WARNING: Invalid legacy license format. Key will not be recognized.");

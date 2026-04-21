@@ -51,7 +51,7 @@ Ed25519 signatures verify tier claims in license tokens. Key rotation is support
 
 - The public verification key is committed to source; the private signing key is held in release infrastructure only.
 - Tier checks are honor-system for self-built binaries — users who build from source can patch out checks. Official releases enforce signed tokens.
-- v0.2.x releases accept both signed and legacy unsigned tokens (transition period). v0.3.0+ releases require signed tokens only (`SignedOnly` enforcement mode).
+- Historical v0.2.x releases accepted both signed and legacy unsigned tokens during the transition period. v0.3.0+ releases require signed tokens only (`SignedOnly` enforcement mode).
 - All detection rules run regardless of tier (ADR-13). Tiers gate enrichment depth (rendered scanning, cloaking detection, checkpoints, audit reports), not security detection coverage.
 
 ## Bypass Mechanism

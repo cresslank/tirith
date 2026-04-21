@@ -427,10 +427,18 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          set -euo pipefail
           for dir in npm/darwin-arm64 npm/darwin-x64 npm/linux-x64 npm/linux-arm64 npm/win32-x64; do
             echo "Publishing $(basename $dir)..."
             cd "$dir"
-            npm publish --access public --provenance || echo "Already published or failed: $(basename $dir)"
+            set +e
+            output=$(npm publish --access public --provenance 2>&1)
+            status=$?
+            set -e
+            echo "$output"
+            if [ $status -ne 0 ] && ! echo "$output" | grep -qiE "previously published version|previously published versions|cannot publish over the previously published"; then
+              exit $status
+            fi
             cd -
           done
 
@@ -438,8 +446,16 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          set -euo pipefail
           cd npm/tirith
-          npm publish --access public --provenance || echo "Already published or failed: tirith"
+          set +e
+          output=$(npm publish --access public --provenance 2>&1)
+          status=$?
+          set -e
+          echo "$output"
+          if [ $status -ne 0 ] && ! echo "$output" | grep -qiE "previously published version|previously published versions|cannot publish over the previously published"; then
+            exit $status
+          fi
 
   publish-scoop:
     name: Update Scoop Bucket

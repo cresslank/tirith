@@ -41,7 +41,7 @@ impl std::fmt::Display for Tier {
 ///
 /// - `Legacy`: both signed and unsigned accepted (development/testing)
 /// - `SignedPreferred`: both accepted, but `tirith doctor` warns on unsigned (v0.2.x transition)
-/// - `SignedOnly`: unsigned tokens rejected → Community (v0.3.0+ paid release)
+/// - `SignedOnly`: unsigned tokens rejected in official v0.3.0+ builds
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum EnforcementMode {
@@ -338,10 +338,10 @@ fn decode_license_info_at(key: &str, now: DateTime<Utc>) -> Option<LicenseInfo> 
 /// 2. `~/.config/tirith/license.key` file
 /// 3. Fallback: `Tier::Pro`
 ///
-/// Tier verification uses Ed25519-signed tokens. Legacy unsigned tokens are
-/// accepted during the transition period (v0.2.x) but will be rejected in
-/// v0.3.0+. Runtime feature gating has been collapsed to an always-on Pro
-/// baseline; tier parsing remains for compatibility with existing tokens.
+/// Tier verification uses Ed25519-signed tokens. Legacy unsigned tokens were
+/// accepted during the v0.2.x transition period but are rejected in v0.3.0+.
+/// Runtime feature gating has been collapsed to an always-on Pro baseline;
+/// tier parsing remains for compatibility with existing tokens.
 ///
 /// Invalid, expired, or missing keys silently fall back to Pro
 /// (no panic, no error exit).
