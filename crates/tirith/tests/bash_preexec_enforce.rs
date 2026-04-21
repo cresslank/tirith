@@ -141,8 +141,10 @@ fn run_with_sentinels(
 fn enforce_blocks_bare_command_with_rc1() {
     let (_out, _err, invocations, sentinel_dir) = run_with_sentinels(
         r#"
-# Each command is a separate prompt cycle so history advances normally.
-printf BLOCK_TOKEN-one >/dev/null && touch {sentinels}/should_not_exist
+# Drive the block via a command that would create the sentinel if it ever
+# executed. Avoid `blocked && touch ...` here because Linux bash can leave the
+# interactive preexec path waiting after extdebug skips the left-hand side.
+sh -c 'touch {sentinels}/should_not_exist' BLOCK_TOKEN-one
 echo clean_post_block && touch {sentinels}/clean_ran
 "#,
         &[
@@ -191,12 +193,12 @@ printf BLOCK_TOKEN-pipe | sh -c 'touch {sentinels}/pipe_leaked'
 
 #[test]
 fn enforce_blocks_whole_sequence() {
-    // `ls ; printf BLOCK` — when the second segment blocks, the whole line
-    // must skip. Use `printf` rather than a real `curl` so an unexpected
-    // execution fails fast instead of hanging on network resolution.
+    // `touch ; sh -c ... BLOCK` — when the second segment blocks, the whole
+    // typed line must skip. Avoid `blocked && touch ...` here because that
+    // control-flow shape is the one hanging on Linux CI under extdebug.
     let (_out, _err, invocations, sentinel_dir) = run_with_sentinels(
         r#"
-ls / >/dev/null && touch {sentinels}/ls_ran; printf BLOCK_TOKEN-seq >/dev/null && touch {sentinels}/curl_ran
+touch {sentinels}/ls_ran; sh -c 'touch {sentinels}/curl_ran' BLOCK_TOKEN-seq
 "#,
         &[
             ("TIRITH_BASH_MODE", "preexec"),
