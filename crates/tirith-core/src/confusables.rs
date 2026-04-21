@@ -1,8 +1,8 @@
+//! Unicode confusable character lookup using data embedded by `build.rs`.
+
 use once_cell::sync::Lazy;
-/// Unicode confusable character lookup using embedded data from build.rs.
 use std::collections::HashMap;
 
-// Include generated confusable table
 include!(concat!(env!("OUT_DIR"), "/confusables_gen.rs"));
 
 /// Map from confusable char to the ASCII char it resembles.

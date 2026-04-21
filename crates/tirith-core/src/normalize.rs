@@ -1,5 +1,7 @@
-// Per-component normalization: decode only unreserved characters (RFC 3986 §2.3).
-// Unreserved: A-Z, a-z, 0-9, '-', '.', '_', '~'
+//! Per-URL-component normalization: decode only unreserved characters
+//! (RFC 3986 §2.3 — `A-Z`, `a-z`, `0-9`, `-`, `.`, `_`, `~`). Reserved
+//! characters stay percent-encoded so that downstream rules see the same
+//! shape regardless of encoding variation.
 
 /// Check if a byte value represents an unreserved character.
 fn is_unreserved(byte: u8) -> bool {
@@ -35,7 +37,7 @@ fn decode_unreserved_once(input: &str) -> (String, bool) {
                     i += 3;
                     continue;
                 } else {
-                    // Normalize hex to uppercase but keep encoded
+                    // Keep the triplet encoded but normalize hex to uppercase.
                     result.push(b'%');
                     result.push(bytes[i + 1].to_ascii_uppercase());
                     result.push(bytes[i + 2].to_ascii_uppercase());
@@ -43,7 +45,7 @@ fn decode_unreserved_once(input: &str) -> (String, bool) {
                     continue;
                 }
             }
-            // Invalid percent-triplet, leave as-is
+            // Invalid percent-triplet, leave as-is.
             result.push(bytes[i]);
             i += 1;
         } else {
@@ -61,8 +63,9 @@ pub fn normalize_path(raw: &str) -> NormalizedComponent {
     let mut current = raw.to_string();
     let mut rounds = 0;
 
-    // Always run at least one pass (for hex case normalization),
-    // then continue if unreserved chars were decoded (up to 3 rounds).
+    // Always run one pass so hex case gets normalized even when no unreserved
+    // bytes are decoded; stop early on fixpoint, but cap at 3 rounds so a
+    // pathological input can't spin forever.
     loop {
         let (decoded, did_decode) = decode_unreserved_once(&current);
         current = decoded;
@@ -72,8 +75,6 @@ pub fn normalize_path(raw: &str) -> NormalizedComponent {
         }
     }
 
-    // Detect double-encoding: look for %25XX patterns in the final result
-    // This indicates a percent-encoded percent sign that decoded to %XX
     let double_encoded = detect_double_encoding(&current);
 
     NormalizedComponent {
@@ -167,16 +168,14 @@ mod tests {
 
     #[test]
     fn test_double_encoding_detected() {
-        // %252F decodes to %2F after one round (unreserved part of %25 = '%')
-        // Actually %25 is '%' which is NOT unreserved, so it stays as %25
-        // %252F stays as %252F -> but we detect the %25 pattern
+        // %25 is '%' which is NOT unreserved, so %252F stays as-is after
+        // decoding — but the lingering %25 prefix is what flags double-encoding.
         let result = normalize_path("%252F");
         assert!(result.double_encoded);
     }
 
     #[test]
     fn test_single_level_not_double_encoded() {
-        // %2F is normal, not double-encoded
         let result = normalize_path("%2F");
         assert!(!result.double_encoded);
     }
@@ -220,7 +219,7 @@ mod tests {
     fn test_no_encoding() {
         let result = normalize_path("/path/to/file");
         assert_eq!(result.normalized, "/path/to/file");
-        // One pass always runs (for hex case normalization), even with no encodings
+        // One pass runs even when nothing was encoded (for hex case normalization).
         assert_eq!(result.rounds, 1);
     }
 
@@ -233,9 +232,6 @@ mod tests {
 
     #[test]
     fn test_multiple_rounds() {
-        // %2541 -> round 1: %25 stays (not unreserved), 41 stays as part of %2541
-        // Actually %2541: %25 = '%' (not unreserved, stays), then '4', '1'
-        // So it stays %2541 but we detect double encoding
         let result = normalize_path("%2541");
         assert!(result.double_encoded);
     }

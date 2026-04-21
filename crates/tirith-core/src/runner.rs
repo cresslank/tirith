@@ -64,12 +64,10 @@ fn is_valid_version_suffix(s: &str) -> bool {
 }
 
 pub fn run(opts: RunOptions) -> Result<RunResult, String> {
-    // Check TTY requirement
     if !opts.no_exec && !opts.interactive {
         return Err("tirith run requires an interactive terminal or --no-exec flag".to_string());
     }
 
-    // Download with redirect chain collection
     let mut redirects: Vec<String> = Vec::new();
     let redirect_list = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let redirect_list_clone = redirect_list.clone();
@@ -101,7 +99,7 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
 
     const MAX_BODY: u64 = 10 * 1024 * 1024; // 10 MiB
 
-    // Check Content-Length hint first (fast rejection)
+    // Fast-reject via Content-Length before we pay to read the body.
     if let Some(len) = response.content_length() {
         if len > MAX_BODY {
             return Err(format!(
@@ -111,7 +109,6 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         }
     }
 
-    // Read with cap using std::io::Read::take
     use std::io::Read;
     let mut buf = Vec::new();
     response
@@ -126,12 +123,10 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     }
     let content = buf;
 
-    // Compute SHA256
     let mut hasher = Sha256::new();
     hasher.update(&content);
     let sha256 = format!("{:x}", hasher.finalize());
 
-    // Verify hash if pinned
     if let Some(ref expected) = opts.expected_sha256 {
         let expected_lower = expected.to_lowercase();
         if sha256 != expected_lower {
@@ -141,7 +136,6 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         }
     }
 
-    // Cache
     let cache_dir = crate::policy::data_dir()
         .ok_or("cannot determine data directory")?
         .join("cache");
@@ -173,21 +167,19 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         }
     };
 
-    // Analyze
     let interpreter = script_analysis::detect_interpreter(&content_str);
     let analysis = script_analysis::analyze(&content_str, interpreter);
 
-    // Enforce interpreter policy only when we might execute.
+    // Interpreter allowlist is only enforced when we might execute. With
+    // --no-exec the user has already committed to inspecting the script.
     if !opts.no_exec && !is_allowed_interpreter(interpreter) {
         return Err(format!(
             "interpreter '{interpreter}' is not in the allowed list",
         ));
     }
 
-    // Detect git repo and branch
     let (git_repo, git_branch) = detect_git_info();
 
-    // Create receipt
     let receipt = Receipt {
         url: opts.url.clone(),
         final_url: Some(final_url),

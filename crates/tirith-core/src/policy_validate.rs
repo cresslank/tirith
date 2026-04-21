@@ -34,7 +34,7 @@ impl std::fmt::Display for IssueLevel {
 pub fn validate(yaml: &str) -> Vec<PolicyIssue> {
     let mut issues = Vec::new();
 
-    // Phase 1: serde structural parse
+    // Structural parse first — fail early if the YAML shape is wrong.
     let policy: crate::policy::Policy = match serde_yaml::from_str(yaml) {
         Ok(p) => p,
         Err(e) => {
@@ -47,7 +47,6 @@ pub fn validate(yaml: &str) -> Vec<PolicyIssue> {
         }
     };
 
-    // Phase 2: semantic validation
     validate_paranoia(&policy, &mut issues);
     validate_severity_overrides(&policy, &mut issues);
     validate_allowlist_blocklist_overlap(&policy, &mut issues);
@@ -59,7 +58,7 @@ pub fn validate(yaml: &str) -> Vec<PolicyIssue> {
     validate_action_overrides(&policy, &mut issues);
     validate_escalation_rules(&policy, &mut issues);
 
-    // Phase 3: check for unknown top-level and nested fields
+    // Typo guard: flag fields that aren't part of the Policy schema.
     validate_unknown_fields(yaml, &mut issues);
 
     issues

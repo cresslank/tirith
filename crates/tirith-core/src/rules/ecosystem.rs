@@ -156,18 +156,15 @@ fn check_web3_address_in_url(url: &UrlLike, findings: &mut Vec<Finding>) {
 }
 
 fn check_git_typosquat(url: &UrlLike, findings: &mut Vec<Finding>) {
-    // Check if a git clone URL references a popular repo with a typosquatted name
     if let Some(path) = url.path() {
         if let Some(host) = url.host() {
             let host_lower = host.to_lowercase();
-            // Only check on known git hosting platforms
             if !(host_lower == "github.com"
                 || host_lower == "gitlab.com"
                 || host_lower == "bitbucket.org")
             {
                 return;
             }
-            // Extract owner/repo from path like /owner/repo or /owner/repo.git
             let segments: Vec<&str> = path
                 .trim_start_matches('/')
                 .trim_end_matches(".git")
@@ -176,11 +173,11 @@ fn check_git_typosquat(url: &UrlLike, findings: &mut Vec<Finding>) {
             if segments.len() >= 2 {
                 let owner = segments[0].to_lowercase();
                 let repo = segments[1].to_lowercase();
-                // Check against popular repos
                 for &(pop_owner, pop_repo) in crate::data::POPULAR_REPOS {
                     let po = pop_owner.to_lowercase();
                     let pr = pop_repo.to_lowercase();
-                    // Check if either owner or repo is within edit distance 1
+                    // Flag when owner matches but repo is one edit off (or vice versa) —
+                    // single-edit typosquats where the other half is a verbatim match.
                     if (owner == po && levenshtein(&repo, &pr) == 1)
                         || (repo == pr && levenshtein(&owner, &po) == 1)
                     {

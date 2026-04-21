@@ -67,7 +67,8 @@ pub fn detect_interpreter(content: &str) -> &str {
             if let Some(prog) = parts.first() {
                 let base = prog.rsplit('/').next().unwrap_or(prog);
                 if base == "env" {
-                    // Skip flags (-S, -i, etc.) and VAR=val assignments
+                    // Walk past `env` flags (-S, -i, …) and `VAR=val`
+                    // assignments to reach the actual interpreter name.
                     for part in parts.iter().skip(1) {
                         if part.starts_with('-') || part.contains('=') {
                             continue;
@@ -80,7 +81,7 @@ pub fn detect_interpreter(content: &str) -> &str {
             }
         }
     }
-    "sh" // default
+    "sh"
 }
 
 #[cfg(test)]

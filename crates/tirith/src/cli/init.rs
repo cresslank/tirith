@@ -34,7 +34,6 @@ fn check_path_shadow() -> Option<String> {
 }
 
 pub fn run(shell: Option<&str>) -> i32 {
-    // Warn if another `tirith` binary (e.g. pip-installed Python package) shadows us on PATH.
     if let Some(warning) = check_path_shadow() {
         eprintln!("{warning}");
     }
@@ -213,7 +212,6 @@ fn detect_shell_from_parent() -> Option<&'static str> {
 /// 5. ../../shell relative to binary (workspace dev layout)
 /// 6. Fallback: materialize embedded hooks to data dir
 pub fn find_hook_dir() -> Option<PathBuf> {
-    // 1. Explicit env var override
     if let Ok(dir) = std::env::var("TIRITH_SHELL_DIR") {
         let p = PathBuf::from(&dir);
         if p.join("lib").exists() {
@@ -223,13 +221,11 @@ pub fn find_hook_dir() -> Option<PathBuf> {
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(bin_dir) = exe.parent() {
-            // 2. Homebrew layout: ../share/tirith/shell
             let brew_dir = bin_dir.join("../share/tirith/shell");
             if brew_dir.join("lib").exists() {
                 return Some(brew_dir.canonicalize().unwrap_or(brew_dir));
             }
 
-            // 3. System package layout: /usr/share/tirith/shell
             #[cfg(unix)]
             {
                 let sys_dir = PathBuf::from("/usr/share/tirith/shell");
@@ -238,13 +234,11 @@ pub fn find_hook_dir() -> Option<PathBuf> {
                 }
             }
 
-            // 4. cargo install layout: ../shell
             let cargo_dir = bin_dir.join("../shell");
             if cargo_dir.join("lib").exists() {
                 return Some(cargo_dir.canonicalize().unwrap_or(cargo_dir));
             }
 
-            // 5. Workspace dev layout: ../../shell
             let dev_dir = bin_dir.join("../../shell");
             if dev_dir.join("lib").exists() {
                 return Some(dev_dir.canonicalize().unwrap_or(dev_dir));
@@ -252,13 +246,11 @@ pub fn find_hook_dir() -> Option<PathBuf> {
         }
     }
 
-    // 6. Fallback: materialize embedded hooks to data dir
     materialize_hooks()
 }
 
 /// Find the shell hooks directory without materializing (read-only variant for diagnostics).
 pub fn find_hook_dir_readonly() -> Option<PathBuf> {
-    // 1. Explicit env var override
     if let Ok(dir) = std::env::var("TIRITH_SHELL_DIR") {
         let p = PathBuf::from(&dir);
         if p.join("lib").exists() {
@@ -268,13 +260,11 @@ pub fn find_hook_dir_readonly() -> Option<PathBuf> {
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(bin_dir) = exe.parent() {
-            // 2. Homebrew layout: ../share/tirith/shell
             let brew_dir = bin_dir.join("../share/tirith/shell");
             if brew_dir.join("lib").exists() {
                 return Some(brew_dir.canonicalize().unwrap_or(brew_dir));
             }
 
-            // 3. System package layout: /usr/share/tirith/shell
             #[cfg(unix)]
             {
                 let sys_dir = PathBuf::from("/usr/share/tirith/shell");
@@ -283,13 +273,11 @@ pub fn find_hook_dir_readonly() -> Option<PathBuf> {
                 }
             }
 
-            // 4. cargo install layout: ../shell
             let cargo_dir = bin_dir.join("../shell");
             if cargo_dir.join("lib").exists() {
                 return Some(cargo_dir.canonicalize().unwrap_or(cargo_dir));
             }
 
-            // 5. Workspace dev layout: ../../shell
             let dev_dir = bin_dir.join("../../shell");
             if dev_dir.join("lib").exists() {
                 return Some(dev_dir.canonicalize().unwrap_or(dev_dir));
@@ -297,7 +285,7 @@ pub fn find_hook_dir_readonly() -> Option<PathBuf> {
         }
     }
 
-    // 6. Check if hooks were previously materialized (but don't create them)
+    // Check if hooks were previously materialized, but do not create them.
     if let Some(data_dir) = tirith_core::policy::data_dir() {
         let shell_dir = data_dir.join("shell");
         if shell_dir.join("lib").exists() {
@@ -402,7 +390,7 @@ mod tests {
 
     #[test]
     fn normalize_shell_name_no_false_positive_on_gnu() {
-        // "gnu" contains "nu" but is not nushell — exact match required
+        // "gnu" contains "nu" but is not nushell — require exact match.
         assert_eq!(normalize_shell_name("gnu"), None);
     }
 

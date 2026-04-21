@@ -23,10 +23,6 @@ use tirith_core::tokenize::ShellType;
 #[cfg(unix)]
 use tirith_core::verdict::{upgraded_action_from_findings, Evidence, RuleId, Severity};
 
-// ---------------------------------------------------------------------------
-// Paths
-// ---------------------------------------------------------------------------
-
 fn socket_path() -> PathBuf {
     tirith_core::policy::state_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -39,10 +35,7 @@ fn pid_path() -> PathBuf {
         .join("daemon.pid")
 }
 
-// ---------------------------------------------------------------------------
-// Wire protocol (newline-delimited JSON)
-// ---------------------------------------------------------------------------
-
+/// Wire protocol: one DaemonRequest per line (newline-delimited JSON).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DaemonRequest {
     pub command: String,
@@ -69,7 +62,6 @@ pub struct DaemonResponse {
     pub exit_code: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    // Verdict metadata for faithful JSON reconstruction
     #[serde(default)]
     pub bypass_honored: bool,
     #[serde(default)]
@@ -89,10 +81,6 @@ pub struct DaemonResponse {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub raw_action: Option<String>,
 }
-
-// ---------------------------------------------------------------------------
-// Client helper — used by check.rs to delegate to the daemon
-// ---------------------------------------------------------------------------
 
 /// Try to connect to the daemon and run a check. Returns `None` if the daemon
 /// is unavailable (caller should fall back to local analysis).
@@ -154,12 +142,8 @@ pub fn try_daemon_check(
     _cwd: Option<&str>,
     _interactive: bool,
 ) -> Option<DaemonResponse> {
-    None // Daemon not yet supported on this platform
+    None
 }
-
-// ---------------------------------------------------------------------------
-// Server
-// ---------------------------------------------------------------------------
 
 #[cfg(unix)]
 fn handle_request(req: &DaemonRequest) -> DaemonResponse {
@@ -197,8 +181,8 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
         _ => ScanContext::Exec,
     };
 
-    // Honor client-side bypass BEFORE analysis — matches the local engine
-    // fast-path that returns at tier 2 with no findings or extracted URLs.
+    // Match the local engine fast-path: when bypass is honored we short-circuit
+    // at tier 2 with no findings/URLs and zero timings (no analysis ran).
     if req.bypass_requested {
         let policy = tirith_core::policy::Policy::discover(req.cwd.as_deref());
         let bypass_allowed = if req.interactive {
@@ -207,8 +191,6 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
             policy.allow_bypass_env_noninteractive
         };
         if bypass_allowed {
-            // Match the local fast-bypass Verdict shape: tier 0/1/2 reached,
-            // tier3 absent, with zero timings (daemon didn't run analysis).
             return DaemonResponse {
                 action: Action::Allow,
                 findings: vec![],
@@ -256,17 +238,17 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
     );
     verdict.findings.extend(runtime_findings);
 
-    // --- Network-aware enrichment (daemon-only, too slow for sync path) ---
+    // Daemon-only: network-aware enrichment is too slow for the sync path.
     enrich_with_network_checks(&mut verdict.findings);
 
-    // Recalculate action after enrichment may have added higher-severity findings.
+    // Enrichment may have added higher-severity findings, so recompute action.
     verdict.action = upgraded_action_from_findings(&verdict.findings, verdict.action);
 
-    // Snapshot raw findings/action AFTER enrichment but BEFORE paranoia filtering.
+    // Snapshot AFTER enrichment but BEFORE paranoia filtering so the client
+    // receives the full detection set (ADR-13).
     let raw_findings = Some(verdict.findings.clone());
     let raw_action_str = Some(format!("{:?}", verdict.action));
 
-    // Apply paranoia filter
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
 
     DaemonResponse {
@@ -292,7 +274,7 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
 fn enrich_with_network_checks(findings: &mut Vec<Finding>) {
     let mut new_findings = Vec::new();
 
-    // 1. Resolve shortened URLs and update the finding description.
+    // Resolve shortened URLs inline and surface blocklist hits on destinations.
     for finding in findings.iter_mut() {
         if finding.rule_id != RuleId::ShortenedUrl {
             continue;
@@ -333,7 +315,7 @@ fn enrich_with_network_checks(findings: &mut Vec<Finding>) {
         }
     }
 
-    // 2. DNS blocklist check on all URL hosts in findings (non-shortened too).
+    // Also run DNS blocklist on every URL host in any finding.
     let mut checked_hosts = std::collections::HashSet::new();
     for finding in findings.iter() {
         for evidence in &finding.evidence {
@@ -388,15 +370,13 @@ fn extract_host_from_url(url: &str) -> Option<String> {
 
 #[cfg(unix)]
 fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
-    // Ensure parent directory exists
     if let Some(parent) = sock.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    // Remove stale socket
+    // Clean up any stale socket from a previous unclean shutdown.
     let _ = std::fs::remove_file(sock);
 
-    // Write PID file
     if let Err(e) = std::fs::write(pid, std::process::id().to_string()) {
         eprintln!("tirith: failed to write PID file: {e}");
         return 1;
@@ -431,7 +411,6 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
             std::process::id()
         );
 
-        // Spawn a signal handler for graceful shutdown
         let shutdown = async {
             #[cfg(unix)]
             {
@@ -454,23 +433,22 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
 
         tokio::pin!(shutdown);
 
-        // Spawn periodic threat DB update task.
-        // Uses its own timer independent of the per-CLI-process UPDATE_ATTEMPTED guard.
-        // Coordinates with concurrent `tirith check` processes via the same lockfile
-        // and next-check-at state file.
+        // Periodic threat DB update. Uses its own timer independent of the
+        // per-CLI-process UPDATE_ATTEMPTED guard, and coordinates with concurrent
+        // `tirith check` processes via the same lockfile + next-check-at state.
         let threatdb_update_handle = tokio::spawn(async {
-            // Initial delay: wait 60s before first check to let daemon stabilize
+            // Initial delay so daemon stabilizes before the first check.
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             loop {
-                // Check if update is due (on a blocking thread since it does I/O)
+                // spawn_blocking because the check does filesystem I/O.
                 let should_spawn =
                     tokio::task::spawn_blocking(daemon_should_spawn_update)
                         .await
                         .unwrap_or(false);
 
                 if should_spawn {
-                    // Spawn as a detached child process (same as check.rs path)
-                    // so the daemon doesn't block on download.
+                    // Detached child so the daemon doesn't block on download,
+                    // matching the check.rs path.
                     let _ = tokio::task::spawn_blocking(|| {
                         if let Ok(exe) = std::env::current_exe() {
                             let _ = std::process::Command::new(exe)
@@ -484,7 +462,6 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
                     .await;
                 }
 
-                // Re-check every 15 minutes
                 tokio::time::sleep(tokio::time::Duration::from_secs(15 * 60)).await;
             }
         });
@@ -501,20 +478,20 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
                         Ok((stream, _addr)) => {
                             tokio::spawn(async move {
                                 let (reader, mut writer) = stream.into_split();
-                                // Cap request size to 1 MiB to prevent OOM from malicious clients
+                                // Cap request size to 1 MiB to prevent OOM from malicious clients.
                                 let mut buf_reader = BufReader::new(reader.take(1024 * 1024));
                                 let mut line = String::new();
 
                                 match buf_reader.read_line(&mut line).await {
-                                    Ok(0) => return, // EOF
+                                    Ok(0) => return,
                                     Err(_) => return,
                                     Ok(_) => {}
                                 }
 
                                 let resp = match serde_json::from_str::<DaemonRequest>(line.trim()) {
                                     Ok(req) => {
-                                        // Run blocking analysis on a dedicated thread to avoid
-                                        // stalling the accept loop (engine + network checks block).
+                                        // Engine + network checks block, so offload
+                                        // to spawn_blocking to keep accept loop responsive.
                                         tokio::task::spawn_blocking(move || handle_request(&req))
                                             .await
                                             .unwrap_or_else(|_| DaemonResponse {
@@ -554,16 +531,11 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
         0
     });
 
-    // Cleanup
     let _ = std::fs::remove_file(sock);
     let _ = std::fs::remove_file(pid);
 
     exit
 }
-
-// ---------------------------------------------------------------------------
-// Threat DB periodic update (daemon-only)
-// ---------------------------------------------------------------------------
 
 /// Check whether a background threat DB update should be spawned.
 /// Called from the daemon's periodic timer task (blocking context).
@@ -588,42 +560,37 @@ fn daemon_should_spawn_update() -> bool {
     if let Ok(content) = std::fs::read_to_string(&next_check_path) {
         if let Ok(next_ts) = content.trim().parse::<u64>() {
             if now < next_ts {
-                return false; // not yet due
+                return false;
             }
         }
     }
 
-    // Check spawned-at dedup (same as check.rs path)
+    // Dedup against recent spawns from other processes (30s window).
     let spawned_at_path = state.join("threatdb-spawned-at");
     if let Ok(content) = std::fs::read_to_string(&spawned_at_path) {
         if let Ok(spawned_ts) = content.trim().parse::<u64>() {
             if now.saturating_sub(spawned_ts) < 30 {
-                return false; // another process spawned recently
+                return false;
             }
         }
     }
 
-    // Write spawned-at
     let _ = std::fs::create_dir_all(&state);
     let _ = std::fs::write(&spawned_at_path, now.to_string());
 
     true
 }
 
-// ---------------------------------------------------------------------------
-// Process helpers
-// ---------------------------------------------------------------------------
-
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
-    // kill(pid, 0) checks if the process exists without sending a signal
+    // kill(pid, 0) probes existence without actually sending a signal.
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
 #[cfg(not(unix))]
 fn process_alive(_pid: u32) -> bool {
-    // On non-Unix, conservatively assume alive if PID file exists.
-    // A more robust check would use OpenProcess on Windows.
+    // Conservatively assume alive if the PID file exists — a proper Windows
+    // implementation should use OpenProcess.
     true
 }
 
@@ -631,10 +598,6 @@ fn process_alive(_pid: u32) -> bool {
 fn kill_process(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) == 0 }
 }
-
-// ---------------------------------------------------------------------------
-// CLI subcommands
-// ---------------------------------------------------------------------------
 
 #[cfg(unix)]
 pub fn start() -> i32 {
@@ -650,15 +613,15 @@ pub fn start() -> i32 {
                 }
             }
         }
-        // Stale PID file — clean up
+        // Stale PID — previous daemon died without cleaning up.
         let _ = std::fs::remove_file(&pid);
         let _ = std::fs::remove_file(&sock);
     }
 
     eprintln!("tirith: starting daemon on {}", sock.display());
 
-    // Run the server in the foreground. In production a process supervisor
-    // (systemd, launchd, etc.) handles daemonisation; we keep the code simple.
+    // Runs in the foreground; production deployments rely on a process
+    // supervisor (systemd/launchd) for daemonisation.
     run_server(&sock, &pid)
 }
 
@@ -699,7 +662,6 @@ pub fn stop() -> i32 {
 
     if kill_process(pid_num) {
         eprintln!("tirith: sent SIGTERM to daemon (PID {pid_num})");
-        // Give it a moment to clean up
         std::thread::sleep(std::time::Duration::from_millis(200));
         let _ = std::fs::remove_file(&pid);
         let _ = std::fs::remove_file(&sock);

@@ -43,7 +43,8 @@ static CREDENTIAL_REDACT_PATTERNS: Lazy<Vec<CredRedactEntry>> = Lazy::new(|| {
     }
     if let Some(pk_patterns) = cred_file.private_key_pattern {
         for pk in pk_patterns {
-            // Use redact_regex (full PEM block) if available, fall back to header-only regex
+            // `redact_regex` covers the full PEM block (header+body+footer);
+            // fall back to the header-only regex when the TOML entry omits it.
             let redact_pattern = pk.redact_regex.as_deref().unwrap_or(&pk.regex);
             if let Ok(re) = Regex::new(redact_pattern) {
                 entries.push(CredRedactEntry {
@@ -87,13 +88,13 @@ static BUILTIN_PATTERNS: Lazy<Vec<(&'static str, Regex)>> = Lazy::new(|| {
 /// Redact sensitive content from a string using built-in and credential patterns.
 pub fn redact(input: &str) -> String {
     let mut result = input.to_string();
-    // Apply built-in patterns first (existing behavior, labeled redaction)
+    // Built-ins first: they produce labeled replacements like `[REDACTED:Foo]`.
     for (label, regex) in BUILTIN_PATTERNS.iter() {
         result = regex
             .replace_all(&result, format!("[REDACTED:{label}]"))
             .into_owned();
     }
-    // Apply credential patterns (prefix-preserving, catches patterns not in builtins)
+    // Credential patterns run afterwards and preserve a short prefix.
     for entry in CREDENTIAL_REDACT_PATTERNS.iter() {
         result = entry
             .regex
@@ -252,7 +253,8 @@ fn redact_evidence(ev: &mut crate::verdict::Evidence, custom_patterns: &[String]
         Evidence::ByteSequence { description, .. } => {
             *description = redact_with_custom(description, custom_patterns);
         }
-        // HostComparison and HomoglyphAnalysis contain domain names / char analysis, not user content
+        // HostComparison and HomoglyphAnalysis hold domain names / char analysis,
+        // not user content — nothing to redact.
         _ => {}
     }
 }
@@ -463,11 +465,9 @@ mod tests {
 
         redact_finding(&mut finding, &[]);
 
-        // description redacted
         assert!(finding.description.contains("[REDACTED:OpenAI API Key]"));
         assert!(!finding.description.contains("sk-abcdef"));
 
-        // evidence redacted
         match &finding.evidence[0] {
             Evidence::EnvVar { value_preview, .. } => {
                 assert!(value_preview.contains("[REDACTED:OpenAI API Key]"));
@@ -488,7 +488,6 @@ mod tests {
             _ => panic!("expected CommandPattern"),
         }
 
-        // human_view / agent_view redacted
         assert!(finding
             .human_view
             .as_ref()

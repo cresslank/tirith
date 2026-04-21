@@ -50,7 +50,7 @@ pub fn extract_packages(segments: &[Segment]) -> Vec<PackageRef> {
             None => continue,
         };
 
-        // Strip leading path (e.g., /usr/bin/pip3 -> pip3)
+        // Strip path prefix: `/usr/bin/pip3` -> `pip3`.
         let cmd_name = cmd.rsplit('/').next().unwrap_or(&cmd);
 
         match cmd_name {
@@ -117,7 +117,6 @@ const PIP_ARG_FLAGS: &[&str] = &[
 ];
 
 fn extract_pip_packages(args: &[String], packages: &mut Vec<PackageRef>) {
-    // Look for "install" subcommand
     let mut iter = args.iter();
     let mut found_install = false;
     while let Some(arg) = iter.next() {
@@ -129,30 +128,26 @@ fn extract_pip_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             continue;
         }
 
-        // Skip flags
         if arg.starts_with('-') {
-            // Check if this flag consumes the next arg
             if PIP_ARG_FLAGS.contains(&lower.as_str()) {
-                let _ = iter.next(); // consume the value
+                let _ = iter.next();
             }
             continue;
         }
 
-        // Skip URL-based installs (git+, http://, file://, etc.)
+        // VCS / URL / local path installs aren't registry packages — skip.
         if arg.contains("://") || lower.starts_with("git+") {
             continue;
         }
-
-        // Skip local paths (contain / or \, or start with .)
         if arg.contains('/') || arg.contains('\\') || arg.starts_with('.') {
             continue;
         }
 
-        // Parse package name and version
-        // pip: foo==1.2.3, foo>=1.0, foo~=2.0, foo!=1.0, foo[extra]==1.0
+        // pip spec shapes we handle: foo==1.2.3, foo>=1.0, foo~=2.0, foo!=1.0,
+        // foo[extra]==1.0, foo[a,b]>=1.0.
         let pkg_str = arg.as_str();
 
-        // Strip extras: foo[bar,baz]==1.0 -> foo==1.0
+        // Strip extras: `foo[bar,baz]==1.0` -> name=`foo`, rest=`==1.0`.
         let (name_part, rest) = if let Some(bracket_pos) = pkg_str.find('[') {
             if let Some(close_pos) = pkg_str[bracket_pos..].find(']') {
                 let name = &pkg_str[..bracket_pos];
@@ -162,7 +157,6 @@ fn extract_pip_packages(args: &[String], packages: &mut Vec<PackageRef>) {
                 (pkg_str, "")
             }
         } else {
-            // Split at first version specifier
             let split_pos = pkg_str
                 .find("==")
                 .or_else(|| pkg_str.find(">="))
@@ -182,10 +176,7 @@ fn extract_pip_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             continue;
         }
 
-        // Extract version from rest (after ==, >=, etc.)
         let version = extract_pip_version(rest);
-
-        // Normalize PyPI name: lowercase, replace - and _ with -
         let normalized = normalize_pypi_name(name_part);
 
         packages.push(PackageRef {
@@ -231,13 +222,12 @@ fn extract_npm_packages(cmd_name: &str, args: &[String], packages: &mut Vec<Pack
     let mut iter = args.iter().peekable();
     let mut found_subcmd = false;
 
-    // For npx, the first non-flag arg is the package to run,
-    // unless --package/-p already specified an explicit package.
+    // npx is special: `npx foo` runs `foo` directly. `--package`/-p can override,
+    // in which case the first positional is an entry point, not a package.
     if cmd_name == "npx" {
         let mut has_explicit_package = false;
         while let Some(arg) = iter.next() {
             if arg.starts_with('-') {
-                // Some npx flags consume next arg
                 if arg == "--package" || arg == "-p" {
                     if let Some(pkg_arg) = iter.next() {
                         if let Some(pr) = parse_npm_package_spec(pkg_arg) {
@@ -248,7 +238,6 @@ fn extract_npm_packages(cmd_name: &str, args: &[String], packages: &mut Vec<Pack
                 }
                 continue;
             }
-            // First non-flag arg: only treat as package if no --package given
             if !has_explicit_package {
                 if let Some(pr) = parse_npm_package_spec(arg) {
                     packages.push(pr);
@@ -259,7 +248,6 @@ fn extract_npm_packages(cmd_name: &str, args: &[String], packages: &mut Vec<Pack
         return;
     }
 
-    // Look for install/i/add subcommand
     while let Some(arg) = iter.next() {
         let lower = arg.to_lowercase();
         if !found_subcmd {
@@ -269,7 +257,6 @@ fn extract_npm_packages(cmd_name: &str, args: &[String], packages: &mut Vec<Pack
             continue;
         }
 
-        // Skip flags
         if arg.starts_with('-') {
             let lower_ref = lower.as_str();
             if NPM_ARG_FLAGS.contains(&lower_ref) {
@@ -278,7 +265,6 @@ fn extract_npm_packages(cmd_name: &str, args: &[String], packages: &mut Vec<Pack
             continue;
         }
 
-        // Skip local paths and URLs
         if arg.contains("://") || arg.starts_with('.') || arg.starts_with('/') {
             continue;
         }
@@ -343,9 +329,7 @@ fn extract_cargo_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             continue;
         }
 
-        // Skip flags
         if arg.starts_with('-') {
-            // Flags that consume next arg
             if matches!(
                 lower.as_str(),
                 "--version"
@@ -365,7 +349,7 @@ fn extract_cargo_packages(args: &[String], packages: &mut Vec<PackageRef>) {
                     | "-j"
                     | "--rename"
             ) {
-                // If --version, capture it for the last package
+                // `--version` / `--vers` carries the version of the previously seen package.
                 if lower == "--version" || lower == "--vers" {
                     if let Some(ver) = iter.next() {
                         if let Some(last) = packages.last_mut() {
@@ -382,12 +366,12 @@ fn extract_cargo_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             continue;
         }
 
-        // Skip git URLs and local paths
+        // git URLs and local paths aren't crates.io packages.
         if arg.contains("://") || arg.starts_with('.') || arg.contains('/') {
             continue;
         }
 
-        // cargo add supports name@version
+        // `cargo add foo@1.0.0` form.
         let (name, version) = split_name_version(arg, '@');
 
         if !name.is_empty() {
@@ -414,12 +398,11 @@ fn extract_gem_packages(args: &[String], packages: &mut Vec<PackageRef>) {
         }
 
         if arg.starts_with('-') {
-            // gem install flags that take a value
             if matches!(
                 lower.as_str(),
                 "--version" | "-v" | "--source" | "--platform" | "--install-dir" | "-i"
             ) {
-                // Capture version for last package
+                // `--version` / `-v` carries the version of the previously seen gem.
                 if lower == "--version" || lower == "-v" {
                     if let Some(ver) = iter.next() {
                         if let Some(last) = packages.last_mut() {
@@ -436,7 +419,7 @@ fn extract_gem_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             continue;
         }
 
-        // gem name:version or just name
+        // `gem install rails:7.0` form (also accepts bare name).
         let (name, version) = split_name_version(arg, ':');
 
         if !name.is_empty() {
@@ -465,7 +448,7 @@ fn extract_go_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             continue;
         }
 
-        // go get github.com/user/pkg@v1.2.3
+        // `go get github.com/user/pkg@v1.2.3` form.
         let (name, version) = split_name_version(arg, '@');
 
         if !name.is_empty() {
@@ -493,7 +476,7 @@ fn extract_composer_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             continue;
         }
 
-        // composer require vendor/package:^1.0
+        // `composer require vendor/package:^1.0` form.
         let (name, version) = split_name_version(arg, ':');
 
         if !name.is_empty() {
@@ -529,7 +512,6 @@ fn extract_dotnet_packages(args: &[String], packages: &mut Vec<PackageRef>) {
         }
 
         if arg.starts_with('-') {
-            // --version takes a value
             if lower == "--version" || lower == "-v" {
                 if let Some(ver) = iter.next() {
                     if let Some(last) = packages.last_mut() {
@@ -540,7 +522,6 @@ fn extract_dotnet_packages(args: &[String], packages: &mut Vec<PackageRef>) {
                 }
                 continue;
             }
-            // Other flags that take values
             if matches!(lower.as_str(), "--source" | "-s" | "--framework" | "-f") {
                 let _ = iter.next();
             }
@@ -561,7 +542,7 @@ fn extract_dotnet_packages(args: &[String], packages: &mut Vec<PackageRef>) {
 /// `gradle` dependency notation `group:artifact:version`.
 fn extract_maven_packages(args: &[String], packages: &mut Vec<PackageRef>) {
     for arg in args {
-        // mvn dependency:get -Dartifact=group:artifact:version[:packaging[:classifier]]
+        // mvn form: `-Dartifact=group:artifact:version[:packaging[:classifier]]`.
         if let Some(coord) = arg.strip_prefix("-Dartifact=") {
             let parts: Vec<&str> = coord.splitn(4, ':').collect();
             if parts.len() >= 2 {
@@ -582,12 +563,11 @@ fn extract_maven_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             continue;
         }
 
-        // Skip flags
         if arg.starts_with('-') {
             continue;
         }
 
-        // Gradle-style group:artifact:version (at least 2 colons)
+        // Gradle dependency notation: `group:artifact:version` (at least one colon required).
         let parts: Vec<&str> = arg.splitn(4, ':').collect();
         if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
             let name = format!("{}:{}", parts[0], parts[1]);
@@ -620,15 +600,14 @@ fn extract_maven_packages(args: &[String], packages: &mut Vec<PackageRef>) {
 /// - Non-IP text
 /// - IPs embedded inside URLs (those are handled by URL extraction)
 pub fn extract_ipv4_from_token(token: &str) -> Option<Ipv4Addr> {
-    // Strip user@ prefix if present
     let after_at = if let Some(at_pos) = token.rfind('@') {
         &token[at_pos + 1..]
     } else {
         token
     };
 
-    // Strip :port suffix if present (but only if what follows the colon is
-    // purely digits — avoids stripping parts of IPv6 or other patterns)
+    // Only strip a trailing `:NNNN` — anything else after `:` would be part of
+    // an IPv6 literal or something else we shouldn't touch.
     let ip_str = if let Some(colon_pos) = after_at.rfind(':') {
         let after_colon = &after_at[colon_pos + 1..];
         if !after_colon.is_empty() && after_colon.chars().all(|c| c.is_ascii_digit()) {
@@ -640,7 +619,7 @@ pub fn extract_ipv4_from_token(token: &str) -> Option<Ipv4Addr> {
         after_at
     };
 
-    // Strip surrounding brackets that some formats use
+    // Some formats wrap with `[...]`; strip before parsing.
     let ip_str = ip_str.trim_matches(|c| c == '[' || c == ']');
 
     ip_str.parse::<Ipv4Addr>().ok()
@@ -670,9 +649,9 @@ fn hostname_rule_for_source(source: threatdb::ThreatSource) -> (RuleId, Severity
         threatdb::ThreatSource::ThreatFoxIoc => {
             (RuleId::ThreatThreatFoxIoc, Severity::High, "IOC hostname")
         }
-        // Phase A sources (package/IP-oriented) and FireHOL are not expected to
-        // appear on hostname records, but map defensively rather than using a
-        // catch-all so the compiler flags new variants.
+        // Package/IP-oriented sources and FireHOL aren't expected on hostname
+        // records, but enumerate them explicitly so the compiler flags any new
+        // variant added later instead of falling through a `_` arm.
         threatdb::ThreatSource::OssfMalicious
         | threatdb::ThreatSource::DatadogMalicious
         | threatdb::ThreatSource::FeodoTracker
@@ -695,8 +674,7 @@ fn ip_rule_for_source(source: threatdb::ThreatSource) -> (RuleId, Severity, &'st
         threatdb::ThreatSource::ThreatFoxIoc => {
             (RuleId::ThreatThreatFoxIoc, Severity::High, "IOC IP")
         }
-        // Phase A sources (package/hostname-oriented) and phishing feeds are not
-        // expected on IP records, but list explicitly for exhaustive matching.
+        // Same exhaustive-match rationale as the hostname mapping above.
         threatdb::ThreatSource::OssfMalicious
         | threatdb::ThreatSource::DatadogMalicious
         | threatdb::ThreatSource::FeodoTracker
@@ -724,19 +702,18 @@ pub fn check(
 ) -> Vec<Finding> {
     let db = match db {
         Some(d) => d,
-        None => return Vec::new(), // fail-open
+        // Fail-open: no DB loaded means no findings, never block the user.
+        None => return Vec::new(),
     };
 
     let mut findings = Vec::new();
 
-    // --- Package checks ---
     let segments = crate::tokenize::tokenize(input, shell);
     let packages = extract_packages(&segments);
 
     for pkg in &packages {
         let db_eco = pkg.ecosystem;
 
-        // 1. Known-malicious package lookup
         if let Some(m) = db.check_package(db_eco, &pkg.name, pkg.version.as_deref()) {
             findings.push(Finding {
                 rule_id: RuleId::ThreatMaliciousPackage,
@@ -764,11 +741,10 @@ pub fn check(
                 mitre_id: None,
                 custom_rule_id: None,
             });
-            // Skip typosquat/distance checks for packages already flagged malicious
+            // A confirmed-malicious package already explains itself — don't pile on typosquat findings.
             continue;
         }
 
-        // 2. Confirmed typosquat lookup
         if let Some(t) = db.check_typosquat(db_eco, &pkg.name) {
             findings.push(Finding {
                 rule_id: RuleId::ThreatPackageTyposquat,
@@ -792,7 +768,6 @@ pub fn check(
             });
         }
 
-        // 3. Levenshtein distance to popular package names
         if let Some((popular_name, distance)) = db.check_popular_distance(db_eco, &pkg.name) {
             findings.push(Finding {
                 rule_id: RuleId::ThreatPackageSimilarName,
@@ -820,11 +795,9 @@ pub fn check(
         }
     }
 
-    // --- Hostname + IP-from-URL checks ---
     let mut checked_ips = std::collections::HashSet::new();
     for url_info in extracted {
         if let Some(host) = url_info.parsed.host() {
-            // Check hostname against threat DB (Phase B data, empty in Phase A but wired)
             if let Some(m) = db.check_hostname(host) {
                 let (rule_id, severity, threat_type) = hostname_rule_for_source(m.source);
                 findings.push(Finding {
@@ -849,7 +822,7 @@ pub fn check(
                 });
             }
 
-            // Also check if URL host is an IP address (e.g., curl https://203.0.113.50/payload)
+            // URL host may itself be an IP literal (e.g. `https://203.0.113.50/payload`).
             if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
                 if checked_ips.insert(ip) {
                     if let Some(m) = db.check_ip(ip) {
@@ -880,7 +853,7 @@ pub fn check(
         }
     }
 
-    // --- IP checks from command tokens (ssh/scp/nc args) ---
+    // IP literals in command tokens — ssh/scp/nc and friends.
     for seg in &segments {
         for arg in &seg.args {
             if let Some(ip) = extract_ipv4_from_token(arg) {
@@ -921,14 +894,10 @@ mod tests {
     use super::*;
     use crate::tokenize;
 
-    // ── Helper ──────────────────────────────────────────────────────────
-
     fn tokenize_and_extract(input: &str) -> Vec<PackageRef> {
         let segments = tokenize::tokenize(input, ShellType::Posix);
         extract_packages(&segments)
     }
-
-    // ── pip tests ───────────────────────────────────────────────────────
 
     #[test]
     fn pip_install_single() {
@@ -952,7 +921,7 @@ mod tests {
         let pkgs = tokenize_and_extract("pip install requests>=2.0");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "requests");
-        // Only == gives exact version
+        // Only `==` pins an exact version; ranges leave version as None.
         assert_eq!(pkgs[0].version, None);
     }
 
@@ -1024,8 +993,6 @@ mod tests {
         let pkgs = tokenize_and_extract("pip freeze");
         assert!(pkgs.is_empty());
     }
-
-    // ── npm tests ───────────────────────────────────────────────────────
 
     #[test]
     fn npm_install_single() {
@@ -1129,8 +1096,6 @@ mod tests {
         assert_eq!(pkgs[1].name, "react-dom");
     }
 
-    // ── cargo tests ─────────────────────────────────────────────────────
-
     #[test]
     fn cargo_install() {
         let pkgs = tokenize_and_extract("cargo install ripgrep");
@@ -1175,8 +1140,6 @@ mod tests {
         assert!(pkgs.is_empty());
     }
 
-    // ── gem tests ───────────────────────────────────────────────────────
-
     #[test]
     fn gem_install() {
         let pkgs = tokenize_and_extract("gem install rails");
@@ -1200,8 +1163,6 @@ mod tests {
         assert_eq!(pkgs[0].name, "rails");
         assert_eq!(pkgs[0].version, Some("7.0.0".to_string()));
     }
-
-    // ── go tests ────────────────────────────────────────────────────────
 
     #[test]
     fn go_get() {
@@ -1228,8 +1189,6 @@ mod tests {
         assert_eq!(pkgs[0].version, Some("latest".to_string()));
     }
 
-    // ── composer tests ──────────────────────────────────────────────────
-
     #[test]
     fn composer_require() {
         let pkgs = tokenize_and_extract("composer require monolog/monolog");
@@ -1247,8 +1206,6 @@ mod tests {
         assert_eq!(pkgs[0].version, Some("^3.0".to_string()));
     }
 
-    // ── dotnet tests ────────────────────────────────────────────────────
-
     #[test]
     fn dotnet_add_package() {
         let pkgs = tokenize_and_extract("dotnet add package Newtonsoft.Json");
@@ -1265,8 +1222,6 @@ mod tests {
         assert_eq!(pkgs[0].name, "Newtonsoft.Json");
         assert_eq!(pkgs[0].version, Some("13.0.3".to_string()));
     }
-
-    // ── Edge cases ──────────────────────────────────────────────────────
 
     #[test]
     fn no_packages_in_ls() {
@@ -1289,8 +1244,6 @@ mod tests {
         assert_eq!(pkgs[1].ecosystem, Ecosystem::Npm);
         assert_eq!(pkgs[1].name, "lodash");
     }
-
-    // ── extract_ipv4_from_token tests ───────────────────────────────────
 
     #[test]
     fn ipv4_bare() {
@@ -1342,7 +1295,6 @@ mod tests {
 
     #[test]
     fn ipv6_not_matched() {
-        // IPv6 should not produce IPv4 results
         assert!(extract_ipv4_from_token("::1").is_none());
         assert!(extract_ipv4_from_token("2001:db8::1").is_none());
         assert!(extract_ipv4_from_token("fe80::1%eth0").is_none());
@@ -1360,15 +1312,11 @@ mod tests {
         assert_eq!(ip, Some(Ipv4Addr::new(10, 0, 0, 1)));
     }
 
-    // ── check() stub tests ──────────────────────────────────────────────
-
     #[test]
     fn check_returns_empty_without_db() {
         let findings = check("pip install malicious-pkg", ShellType::Posix, &[], None);
         assert!(findings.is_empty(), "check() must be fail-open without DB");
     }
-
-    // ── Rule mapping tests ──────────────────────────────────────────────
 
     #[test]
     fn hostname_rule_urlhaus_maps_to_malicious_url() {

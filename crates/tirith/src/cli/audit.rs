@@ -10,7 +10,6 @@ pub fn export(
     rule_ids: &[String],
     entry_type: &str,
 ) -> i32 {
-    // Validate entry type
     if !matches!(
         entry_type,
         "verdict" | "hook_telemetry" | "trust_change" | "all"
@@ -22,7 +21,6 @@ pub fn export(
         return 1;
     }
 
-    // CSV export only supports verdict entries
     if format == "csv" && entry_type != "verdict" {
         eprintln!(
             "tirith: CSV export only supports verdict entries; use --format json for {entry_type}"
@@ -79,7 +77,6 @@ pub fn export(
 
 /// Run the `tirith audit stats` subcommand.
 pub fn stats(session: Option<&str>, json: bool, entry_type: &str) -> i32 {
-    // Validate entry_type
     match entry_type {
         "verdict" | "hook_telemetry" => {}
         "all" | "trust_change" => {
@@ -150,7 +147,7 @@ pub fn stats(session: Option<&str>, json: bool, entry_type: &str) -> i32 {
             );
         } else {
             println!("Hook telemetry:");
-            // Sort by integration name, then by event name for stable output
+            // Sort by integration name then event name for stable output.
             let mut integrations: Vec<_> = hook_stats.events_by_integration.keys().collect();
             integrations.sort();
             for integration in integrations {
@@ -198,7 +195,6 @@ pub fn stats(session: Option<&str>, json: bool, entry_type: &str) -> i32 {
 
 /// Run the `tirith audit report` subcommand.
 pub fn report(format: &str, since: Option<&str>, entry_type: &str) -> i32 {
-    // Reports only support verdict entries
     if entry_type != "verdict" {
         eprintln!(
             "tirith: --entry-type {entry_type} is not supported for reports; only verdict is supported"
@@ -272,7 +268,6 @@ pub fn report(format: &str, since: Option<&str>, entry_type: &str) -> i32 {
             );
         }
         _ => {
-            // Default: markdown
             print!(
                 "{}",
                 audit_aggregator::generate_compliance_report(&filtered, &stats)

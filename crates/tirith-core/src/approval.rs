@@ -7,9 +7,9 @@ use crate::verdict::Verdict;
 
 /// Approval/warn-ack temp files older than this are considered abandoned
 /// (e.g. a `tirith check --approval-check` invoked from a terminal without
-/// a hook on the receiving end, per issue #80) and removed opportunistically
-/// on the next write. A live hook normally reads + deletes its own file
-/// within seconds, so an hour is a safe bound that won't race.
+/// a hook on the receiving end) and removed opportunistically on the next
+/// write. A live hook normally reads + deletes its own file within seconds,
+/// so an hour is a safe bound that won't race.
 const STALE_APPROVAL_TTL: Duration = Duration::from_secs(3600);
 
 /// Best-effort cleanup of leaked approval/warn-ack temp files in `$TEMP`.
@@ -66,7 +66,6 @@ pub fn check_approval(verdict: &Verdict, policy: &Policy) -> Option<ApprovalMeta
         return None;
     }
 
-    // Check each finding's rule_id against approval_rules
     for finding in &verdict.findings {
         let finding_rule_str = finding.rule_id.to_string();
         for approval_rule in &policy.approval_rules {
@@ -114,7 +113,6 @@ pub fn write_approval_file(metadata: &ApprovalMetadata) -> Result<PathBuf, std::
         .suffix(".env")
         .tempfile()?;
 
-    // Set permissions to 0600 on Unix before writing content
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -122,7 +120,6 @@ pub fn write_approval_file(metadata: &ApprovalMetadata) -> Result<PathBuf, std::
         std::fs::set_permissions(tmp.path(), perms)?;
     }
 
-    // Write key=value pairs
     writeln!(
         tmp,
         "TIRITH_REQUIRES_APPROVAL={}",
@@ -151,7 +148,7 @@ pub fn write_approval_file(metadata: &ApprovalMetadata) -> Result<PathBuf, std::
 
     tmp.flush()?;
 
-    // Persist the file (prevent auto-delete on drop)
+    // `.keep()` prevents auto-delete on drop so shell hooks can read the file after tirith exits.
     let (_, path) = tmp.keep().map_err(|e| e.error)?;
     Ok(path)
 }
@@ -359,7 +356,7 @@ mod tests {
     #[test]
     fn test_check_approval_empty_rules() {
         let verdict = make_verdict(RuleId::CurlPipeShell, Severity::High);
-        let policy = Policy::default(); // no approval_rules
+        let policy = Policy::default();
 
         let meta = check_approval(&verdict, &policy);
         assert!(meta.is_none());
@@ -399,11 +396,9 @@ mod tests {
 
     #[test]
     fn test_sanitize_rule_id() {
-        // Normal snake_case (from serde serialization) passes through
         assert_eq!(sanitize_rule_id("curl_pipe_shell"), "curl_pipe_shell");
         // Uppercase letters are stripped (only [a-z_] allowed)
         assert_eq!(sanitize_rule_id("CurlPipeShell"), "urlipehell");
-        // Truncates to 64 chars
         assert_eq!(sanitize_rule_id(&"a".repeat(100)), "a".repeat(64));
     }
 
@@ -414,7 +409,7 @@ mod tests {
         assert_eq!(sanitize_fallback("allow"), "allow");
         assert_eq!(sanitize_fallback("BLOCK"), "block");
         assert_eq!(sanitize_fallback("  warn  "), "warn");
-        // Malicious values default to "block"
+        // Malicious values default to "block" (fail-closed).
         assert_eq!(sanitize_fallback("block\nINJECTED=yes"), "block");
         assert_eq!(
             sanitize_fallback("allow\r\nTIRITH_REQUIRES_APPROVAL=no"),
@@ -462,7 +457,6 @@ mod tests {
         assert!(content.contains("TIRITH_APPROVAL_RULE=curl_pipe_shell"));
         assert!(content.contains("TIRITH_APPROVAL_DESCRIPTION=Pipe to shell detected"));
 
-        // Verify file permissions on Unix
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -470,7 +464,6 @@ mod tests {
             assert_eq!(perms.mode() & 0o777, 0o600);
         }
 
-        // Cleanup
         let _ = std::fs::remove_file(&path);
     }
 
@@ -508,19 +501,18 @@ mod tests {
 
     #[test]
     fn write_approval_file_cleans_up_stale_leaks() {
-        // Regression for issue #80: a `tirith check --approval-check` invoked
-        // from a terminal (or any caller that doesn't consume the temp file)
-        // used to leak `tirith-approval-*.env` into $TEMP forever. The next
-        // write must opportunistically remove leaked files older than the
-        // TTL — and must NOT touch fresh files (a concurrent hook may still
-        // be reading them) or unrelated files.
+        // Regression guard: a `tirith check --approval-check` invoked from a
+        // terminal (or any caller that doesn't consume the temp file) used to
+        // leak `tirith-approval-*.env` into $TEMP forever. The next write must
+        // opportunistically remove leaked files older than the TTL — and must
+        // NOT touch fresh files (a concurrent hook may still be reading them)
+        // or unrelated files.
         use std::fs::File;
         use std::time::{Duration, SystemTime};
 
         let dir = std::env::temp_dir();
 
-        // Make the test names unique-enough that parallel runs of this test
-        // suite do not interfere.
+        // Unique-enough suffix so parallel runs of this suite don't interfere.
         let suffix = format!("{}-{}", std::process::id(), rand_token());
         let stale = dir.join(format!("tirith-approval-stale-{suffix}.env"));
         let fresh = dir.join(format!("tirith-approval-fresh-{suffix}.env"));
@@ -555,7 +547,6 @@ mod tests {
         );
         assert!(new_path.exists(), "new approval file must exist");
 
-        // Cleanup
         let _ = std::fs::remove_file(&fresh);
         let _ = std::fs::remove_file(&unrelated);
         let _ = std::fs::remove_file(&new_path);

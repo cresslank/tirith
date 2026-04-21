@@ -8,8 +8,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-// ── Atomic write ───────────────────────────────────────────────────────
-
 /// Write `content` to `path` atomically via temp+rename.
 ///
 /// The `mode` parameter is accepted for API compatibility but ignored on Windows
@@ -54,7 +52,7 @@ pub fn atomic_write(path: &Path, content: &str, _mode: u32) -> Result<(), String
         tmp_path
     };
 
-    // Symlink safety: refuse to overwrite a symlink target.
+    // Refuse to overwrite a symlink target — matches Unix behavior.
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             let _ = fs::remove_file(&tmp);
@@ -79,8 +77,6 @@ pub fn atomic_write(path: &Path, content: &str, _mode: u32) -> Result<(), String
     Ok(())
 }
 
-// ── Write hook script ──────────────────────────────────────────────────
-
 /// Write a hook script. On Windows, executable permission is not needed
 /// (executability is determined by file extension, not mode bits).
 pub fn write_hook_script(
@@ -89,7 +85,6 @@ pub fn write_hook_script(
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
-    // Symlink check
     if let Ok(meta) = fs::symlink_metadata(path) {
         if meta.file_type().is_symlink() {
             return Err(format!(
@@ -143,8 +138,6 @@ pub fn write_hook_script(
     Ok(())
 }
 
-// ── Directory validation ───────────────────────────────────────────────
-
 /// Validate that `dir` stays within `scope_root` after canonicalization.
 pub fn validate_target_dir(dir: &Path, scope_root: Option<&Path>) -> Result<(), String> {
     let root = match scope_root {
@@ -196,8 +189,6 @@ pub fn validate_target_dir(dir: &Path, scope_root: Option<&Path>) -> Result<(), 
 
     Ok(())
 }
-
-// ── CLI subprocess runner ──────────────────────────────────────────────
 
 /// Run a CLI subprocess with 30s timeout and sanitized env.
 pub fn run_cli(cmd: &str, args: &[&str]) -> Result<std::process::Output, String> {
@@ -285,8 +276,6 @@ pub fn run_cli(cmd: &str, args: &[&str]) -> Result<std::process::Output, String>
         Err(e) => Err(e),
     }
 }
-
-// ── Backup helpers ─────────────────────────────────────────────────────
 
 /// Create a timestamped backup of `path` when `force` is true and the file exists.
 pub fn create_backup(path: &Path, force: bool) -> Result<(), String> {

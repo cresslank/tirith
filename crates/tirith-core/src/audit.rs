@@ -45,10 +45,9 @@ pub struct AuditEntry {
     pub event_id: Option<String>,
     pub tier_reached: u8,
 
-    // --- Tagged-union discriminator ---
+    /// Tagged-union discriminator — "verdict", "hook_telemetry", or "trust_change".
     pub entry_type: String,
 
-    // --- Hook telemetry fields ---
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -60,13 +59,11 @@ pub struct AuditEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<f64>,
 
-    // --- Raw verdict fields (before post-processing) ---
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_action: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_rule_ids: Option<Vec<String>>,
 
-    // --- Trust change fields ---
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_pattern: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,14 +80,12 @@ pub struct AuditEntry {
 /// Handles TIRITH_LOG check, path resolution, dir creation, symlink guard,
 /// open, lock, write, sync, unlock. Never panics or changes behavior on failure.
 fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> Option<String> {
-    // Early exit if logging disabled
     if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") {
         return None;
     }
 
     let path = log_path.or_else(default_log_path)?;
 
-    // Ensure directory exists
     if let Some(parent) = path.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
             audit_diagnostic(format!(
@@ -109,7 +104,8 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> Option<
         }
     };
 
-    // Refuse to follow symlinks (GHSA-c6rj-wmf4-6963)
+    // Refuse to follow symlinks — prevents an attacker with write access in the
+    // log directory from redirecting audit output to an arbitrary file.
     #[cfg(unix)]
     {
         match std::fs::symlink_metadata(&path) {
@@ -124,7 +120,6 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> Option<
         }
     }
 
-    // Open, lock, append, fsync, unlock
     let mut open_opts = OpenOptions::new();
     open_opts.create(true).append(true);
     #[cfg(unix)]
@@ -145,7 +140,7 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> Option<
         }
     };
 
-    // Harden legacy files: enforce 0600 on existing files too
+    // Enforce 0600 even on pre-existing files created before this tightening.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -248,9 +243,8 @@ pub fn log_verdict_with_raw(
         None => return,
     };
 
-    // --- Remote audit upload (Phase 10) ---
-    // Check if a policy server is configured via env vars. If so, spool the
-    // redacted audit entry for background upload.
+    // If a policy server is configured via env vars, spool the redacted audit
+    // entry for background upload.
     let server_url = std::env::var("TIRITH_SERVER_URL")
         .ok()
         .filter(|s| !s.is_empty());
@@ -349,9 +343,7 @@ fn default_log_path() -> Option<PathBuf> {
 }
 
 fn redact_command(cmd: &str, custom_patterns: &[String]) -> String {
-    // Apply DLP redaction: built-in patterns + custom policy patterns (Team)
     let dlp_redacted = crate::redact::redact_with_custom(cmd, custom_patterns);
-    // Then truncate to 80 bytes (UTF-8 safe)
     let prefix = crate::util::truncate_bytes(&dlp_redacted, 80);
     if prefix.len() == dlp_redacted.len() {
         dlp_redacted
@@ -377,7 +369,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("test.jsonl");
 
-        // Set TIRITH_LOG=0 to disable logging
         unsafe { std::env::set_var("TIRITH_LOG", "0") };
 
         let verdict = Verdict {
@@ -407,13 +398,11 @@ mod tests {
 
         log_verdict(&verdict, "test cmd", Some(log_path.clone()), None, &[]);
 
-        // File should not have been created
         assert!(
             !log_path.exists(),
             "log file should not be created when TIRITH_LOG=0"
         );
 
-        // Clean up env var
         unsafe { std::env::remove_var("TIRITH_LOG") };
     }
 
@@ -475,7 +464,7 @@ mod tests {
         let log_path = dir.path().join("audit.jsonl");
         let state_home = dir.path().join("state");
 
-        // Use an invalid local URL so drain returns early after spooling.
+        // Invalid local URL so drain returns early after spooling.
         unsafe { std::env::set_var("TIRITH_SERVER_URL", "http://127.0.0.1") };
         unsafe { std::env::set_var("TIRITH_API_KEY", "dummy") };
         unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
@@ -553,7 +542,6 @@ mod tests {
 
         log_verdict(&verdict, "test cmd", Some(symlink_path), None, &[]);
 
-        // Target file should be untouched
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "original",

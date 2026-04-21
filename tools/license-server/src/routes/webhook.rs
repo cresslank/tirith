@@ -24,7 +24,6 @@ pub async fn webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    // 1. Standard Webhooks HMAC verification
     let msg_id = header_str(&headers, "webhook-id")
         .ok_or_else(|| AppError::Unauthorized("missing webhook-id header".into()))?;
     let timestamp = header_str(&headers, "webhook-timestamp")
@@ -42,21 +41,19 @@ pub async fn webhook(
     )
     .map_err(|e| AppError::Unauthorized(format!("webhook verification: {e}")))?;
 
-    // 2. Parse JSON
     let event: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| AppError::BadWebhook(format!("invalid JSON: {e}")))?;
 
     let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-    // Use webhook-id header as event_id (Polar doesn't put event_id in body)
+    // Polar does not include event_id in the body; the webhook-id header
+    // is the authoritative identifier.
     let event_id = msg_id.to_string();
 
-    // 3. Early idempotency precheck
     if state.db.event_exists(&event_id).await? {
         return Ok(StatusCode::OK);
     }
 
-    // 4. Route by event type
     match event_type {
         "order.paid" => handle_order_paid(&state, &event, &event_id).await,
         "subscription.active" => handle_sub_active(&state, &event, &event_id).await,
@@ -71,8 +68,7 @@ pub async fn webhook(
     }
 }
 
-// ─── order.paid (Pro lifetime one-time purchase) ────────────────────────
-
+/// Handles `order.paid` — the one-time lifetime Pro purchase path.
 async fn handle_order_paid(
     state: &AppState,
     event: &serde_json::Value,
@@ -82,8 +78,7 @@ async fn handle_order_paid(
         .get("data")
         .ok_or_else(|| AppError::BadWebhook("missing data".into()))?;
 
-    // Gate: one-time orders only
-    // Reject if subscription_id is present (subscription renewal, not lifetime Pro)
+    // Skip subscription renewals; those are handled by subscription.* events.
     if data
         .get("subscription_id")
         .map(|v| !v.is_null())
@@ -95,7 +90,7 @@ async fn handle_order_paid(
         );
         return Ok(StatusCode::OK);
     }
-    // Reject if product is recurring
+    // Skip recurring products; those arrive as subscription.* events.
     if data
         .pointer("/product/is_recurring")
         .and_then(|v| v.as_bool())
@@ -125,15 +120,14 @@ async fn handle_order_paid(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // Product → tier resolution
     let product_id = json_str(data, "product_id")
         .ok_or_else(|| AppError::BadWebhook("missing product_id".into()))?;
 
     let tier = match state.config.tier_for_product(&product_id) {
         Some(t) => t.to_string(),
         None => {
-            // Unknown product → return 500 so Polar retries the full event.
-            // No dead-letter: provisioning requires the full event, not just tier fix.
+            // Return 500 so Polar retries the full event. Provisioning
+            // needs the whole event, not just a tier-fix dead-letter.
             error!(
                 event_id = %event_id,
                 product_id = %product_id,
@@ -145,7 +139,6 @@ async fn handle_order_paid(
         }
     };
 
-    // Provision: generate API key, token, receipt
     let creds = provision_credentials(state, &tier)?;
 
     let created_data = CreatedData {
@@ -172,8 +165,8 @@ async fn handle_order_paid(
     Ok(StatusCode::OK)
 }
 
-// ─── subscription.active (Team/Enterprise provision or reconciliation) ──
-
+/// Handles `subscription.active` — first-time Team/Enterprise provision
+/// or reconciliation for an existing subscription.
 async fn handle_sub_active(
     state: &AppState,
     event: &serde_json::Value,
@@ -200,7 +193,6 @@ async fn handle_sub_active(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // Tier resolution
     let (tier, tier_unknown) = resolve_tier(
         state,
         &sub_id,
@@ -212,11 +204,10 @@ async fn handle_sub_active(
     )
     .await;
 
-    // Check if API key already exists for this subscription
     let key_exists = state.db.has_api_key(&sub_id).await?;
 
     if key_exists {
-        // Status reconciliation + potential un-revoke
+        // Existing subscription: reconcile status and potentially un-revoke.
         let updated_data = UpdatedData {
             event_id: event_id.to_string(),
             event_type: "subscription.active".to_string(),
@@ -253,11 +244,11 @@ async fn handle_sub_active(
             }
         }
     } else {
-        // New subscription — full provision
+        // New subscription — full provision path.
         let tier_str = match &tier {
             Some(t) => t.clone(),
             None => {
-                // Unknown product → dead-letter and return 500 for retry
+                // Unknown product → dead-letter, 500 so Polar retries.
                 error!(
                     event_id = %event_id,
                     sub_id = %sub_id,
@@ -307,8 +298,8 @@ async fn handle_sub_active(
     Ok(StatusCode::OK)
 }
 
-// ─── subscription.canceled (benefits continue until period end) ─────────
-
+/// Handles `subscription.canceled`. Benefits continue until period end,
+/// so the API key is NOT revoked here.
 async fn handle_sub_canceled(
     state: &AppState,
     event: &serde_json::Value,
@@ -378,8 +369,7 @@ async fn handle_sub_canceled(
     Ok(StatusCode::OK)
 }
 
-// ─── subscription.revoked (terminal — revoke key) ──────────────────────
-
+/// Handles `subscription.revoked` — terminal state, revokes the API key.
 async fn handle_sub_revoked(
     state: &AppState,
     event: &serde_json::Value,
@@ -446,8 +436,7 @@ async fn handle_sub_revoked(
     Ok(StatusCode::OK)
 }
 
-// ─── subscription.past_due (payment failed — revoke key) ───────────────
-
+/// Handles `subscription.past_due` — payment failed, revokes the API key.
 async fn handle_sub_past_due(
     state: &AppState,
     event: &serde_json::Value,
@@ -518,8 +507,8 @@ async fn handle_sub_past_due(
     Ok(StatusCode::OK)
 }
 
-// ─── subscription.uncanceled (cancel reversal → back to active) ────────
-
+/// Handles `subscription.uncanceled` — a prior cancel was reversed, the
+/// subscription is back to active.
 async fn handle_sub_uncanceled(
     state: &AppState,
     event: &serde_json::Value,
@@ -592,8 +581,6 @@ async fn handle_sub_uncanceled(
 
     Ok(StatusCode::OK)
 }
-
-// ─── Helpers ──────────────────────────────────────────────────────────────
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
@@ -669,28 +656,24 @@ struct ProvisionResult {
     receipt_secret: String,
 }
 
-/// Generate API key, encrypt it, sign token, generate receipt secret.
+/// Generate a fresh API key + signed token + receipt secret and return
+/// the values the caller needs for DB insertion.
 fn provision_credentials(state: &AppState, tier: &str) -> Result<ProvisionResult, AppError> {
-    // Generate API key
     let mut api_key_bytes = [0u8; 32];
     OsRng.fill_bytes(&mut api_key_bytes);
     let api_key_raw = B64URL.encode(api_key_bytes);
 
-    // Hash for storage
     let mut hasher = Sha256::new();
     hasher.update(api_key_raw.as_bytes());
     let key_hash = hex::encode(hasher.finalize());
 
-    // Sign token
     let exp_ts = chrono::Utc::now().timestamp() + (state.config.token_ttl_days * 86400);
     let token = state.signer.sign_token(tier, exp_ts);
 
-    // Generate receipt secret
     let mut receipt_bytes = [0u8; 32];
     OsRng.fill_bytes(&mut receipt_bytes);
     let receipt_secret = B64URL.encode(receipt_bytes);
 
-    // Encrypt API key for pending_receipts
     let cipher = Aes256Gcm::new_from_slice(&state.config.receipt_encryption_key)
         .map_err(|e| AppError::Internal(format!("AES init: {e}")))?;
     let mut nonce_bytes = [0u8; 12];

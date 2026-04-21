@@ -469,8 +469,6 @@ context = "exec"
 expected_action = "block"
 expected_rules = ["xh_pipe_shell"]
 
-# Phase 8: Environment variable detection
-
 [[fixture]]
 name = "export_ld_preload"
 min_milestone = 1
@@ -566,8 +564,6 @@ input = "export HOME=/home/user"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
-
-# Phase 9: Network destination detection
 
 [[fixture]]
 name = "curl_metadata_aws"
@@ -665,9 +661,6 @@ context = "exec"
 expected_action = "allow"
 expected_rules = []
 
-# ─── GHSA-mf2g-pj5w-8799: Interpreter detection bypass class ───
-
-# ANSI-C quoting bypasses
 [[fixture]]
 name = "curl_pipe_ansi_c_bash"
 min_milestone = 1
@@ -700,7 +693,6 @@ context = "exec"
 expected_action = "block"
 expected_rules = ["curl_pipe_shell"]
 
-# Standard quoting bypasses
 [[fixture]]
 name = "curl_pipe_double_quoted_bash"
 min_milestone = 1
@@ -1105,8 +1097,6 @@ context = "exec"
 expected_action = "allow"
 expected_rules = []
 
-# ─── Cmd shell type ───
-
 [[fixture]]
 name = "cmd_pipe_to_cmd_exe"
 min_milestone = 1
@@ -1125,7 +1115,6 @@ shell = "cmd"
 expected_action = "allow"
 expected_rules = []
 
-# ── ProcMemAccess ──
 [[fixture]]
 name = "proc_mem_cat"
 min_milestone = 1
@@ -1174,7 +1163,6 @@ context = "exec"
 expected_action = "block"
 expected_rules = ["proc_mem_access"]
 
-# ── DockerRemotePrivEsc ──
 [[fixture]]
 name = "docker_remote_privileged"
 min_milestone = 1
@@ -1255,7 +1243,6 @@ context = "exec"
 expected_action = "block"
 expected_rules = ["docker_remote_priv_esc"]
 
-# ── CredentialFileSweep ──
 [[fixture]]
 name = "credential_sweep_tar"
 min_milestone = 1
@@ -1287,10 +1274,6 @@ input = "chmod 600 ~/.ssh/id_rsa ~/.aws/credentials"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
-
-# ---------------------------------------------------------------------------
-# Base64DecodeExecute fixtures
-# ---------------------------------------------------------------------------
 
 [[fixture]]
 name = "b64_pipe_bash"
@@ -1395,10 +1378,6 @@ input = "base64 -d file.b64 > output.bin"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
-
-# ---------------------------------------------------------------------------
-# DataExfiltration fixtures (per-flag-family)
-# ---------------------------------------------------------------------------
 
 [[fixture]]
 name = "curl_d_at_passwd"

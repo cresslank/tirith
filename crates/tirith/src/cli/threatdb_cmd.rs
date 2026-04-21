@@ -15,10 +15,6 @@ use tirith_core::threatdb_feeds::{
     parse_urlhaus_csv,
 };
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 /// Pinned Ed25519 public key for manifest signature verification.
 /// MUST be identical to the key in tirith-core/assets/keys/threatdb-verify.pub.
 /// Both files must be kept in sync — they are the same key used for DB and manifest signing.
@@ -58,10 +54,6 @@ const PHISHING_ARMY_URL: &str =
     "https://phishing.army/download/phishing_army_blocklist_extended.txt";
 const PHISHTANK_URL: &str = "https://data.phishtank.com/data/online-valid.csv";
 const TOR_EXIT_URL: &str = "https://check.torproject.org/torbulkexitlist";
-
-// ---------------------------------------------------------------------------
-// Manifest
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, serde::Deserialize)]
 struct Manifest {
@@ -112,10 +104,6 @@ impl Manifest {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Update command
-// ---------------------------------------------------------------------------
-
 pub fn update(force: bool, background: bool) -> i32 {
     if background {
         return run_background_update();
@@ -134,10 +122,10 @@ pub fn update(force: bool, background: bool) -> i32 {
 fn do_update(force: bool) -> Result<(), String> {
     let manifest = fetch_manifest()?;
 
-    // Verify manifest signature
     manifest.verify_signature()?;
 
-    // Check rollback protection (unless --force)
+    // Rollback protection: reject manifests with a lower version than what
+    // we already have installed, unless --force overrides.
     if !force {
         if let Some(db) = ThreatDb::cached() {
             let current_seq = db.build_sequence();
@@ -162,10 +150,8 @@ fn do_update(force: bool) -> Result<(), String> {
         manifest.version, manifest.size
     );
 
-    // Download the .dat file
     let data = download_db(&manifest)?;
 
-    // Verify SHA-256
     let computed_hash = hex::encode(Sha256::digest(&data));
     if computed_hash != manifest.sha256 {
         return Err(format!(
@@ -174,19 +160,17 @@ fn do_update(force: bool) -> Result<(), String> {
         ));
     }
 
-    // Verify .dat internal signature by loading it
+    // ThreatDb::from_bytes parses + verifies the .dat internal signature.
     let min_seq = if force { 0 } else { current_sequence() };
     let db =
         ThreatDb::from_bytes(data.clone(), min_seq).map_err(|e| format!("invalid DB file: {e}"))?;
     db.verify_signature()
         .map_err(|e| format!("DB file internal signature verification failed: {e}"))?;
 
-    // Atomic write to data_dir
     let dest =
         ThreatDb::default_path().ok_or_else(|| "cannot determine data directory".to_string())?;
     atomic_write(&dest, &data)?;
 
-    // Refresh the in-process cache
     ThreatDb::refresh_cache();
 
     let stats = db.stats();
@@ -291,8 +275,8 @@ fn update_supplemental_db(policy: &policy::Policy) -> Result<(), String> {
         );
     }
 
-    // At least one group is enabled (early return above handles the disabled case),
-    // so always fetch Tor exit nodes as a supplemental IP signal.
+    // At least one group must be enabled to reach here (fully-disabled case
+    // returned early), so Tor exit is always included as a supplemental IP signal.
     attempted_feeds += 1;
     log_feed_result("Tor exit", fetch_tor_exit_feed(&client, &mut supplemental));
 
@@ -474,7 +458,7 @@ fn run_background_update() -> i32 {
 
     let lock_path = state.join(LOCKFILE_NAME);
 
-    // Acquire exclusive lock — if held, another child is running, exit silently
+    // Exclusive lock: if already held, another child is updating — exit silently.
     let lock_file = match std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -493,11 +477,9 @@ fn run_background_update() -> i32 {
 
     use fs2::FileExt;
     if lock_file.try_lock_exclusive().is_err() {
-        // Another child holds the lock — exit silently
         return 0;
     }
 
-    // Load policy for auto_update_hours
     let policy = policy::Policy::discover(None);
     let auto_hours = policy.threat_intel.auto_update_hours;
     if auto_hours == 0 {
@@ -511,7 +493,6 @@ fn run_background_update() -> i32 {
     let now = unix_now();
     let success = result.is_ok();
     if success {
-        // Success: next check at now + auto_update_hours
         let next = now + auto_hours * 3600;
         if let Err(e) = std::fs::write(&next_check_path, next.to_string()) {
             eprintln!("tirith: warning: failed to write next-check-at: {e}");
@@ -520,7 +501,7 @@ fn run_background_update() -> i32 {
         if let Err(ref e) = result {
             eprintln!("tirith: background update failed: {e}");
         }
-        // Failure: backoff to now + 1h
+        // Backoff on failure to avoid hammering the upstream on repeated errors.
         let next = now + BACKOFF_SECS;
         if let Err(e) = std::fs::write(&next_check_path, next.to_string()) {
             eprintln!("tirith: warning: failed to write next-check-at: {e}");
@@ -534,10 +515,6 @@ fn run_background_update() -> i32 {
         1
     }
 }
-
-// ---------------------------------------------------------------------------
-// Status command
-// ---------------------------------------------------------------------------
 
 pub fn status(json: bool) -> i32 {
     let info = gather_status();
@@ -615,13 +592,14 @@ fn gather_status() -> ThreatDbStatus {
                 + stats.typosquat_count
                 + stats.popular_count;
 
-            // Load policy for staleness threshold
             let policy = policy::Policy::discover(None);
             let stale_hours = policy.threat_intel.auto_update_hours;
+            // Stale threshold = 2x the configured update interval; disabled
+            // auto-update (= 0) means never stale.
             let is_stale = if stale_hours == 0 {
-                false // auto-update disabled, never consider stale
+                false
             } else {
-                age_hours > (stale_hours as f64 * 2.0) // 2x threshold
+                age_hours > (stale_hours as f64 * 2.0)
             };
 
             ThreatDbStatus {
@@ -636,7 +614,8 @@ fn gather_status() -> ThreatDbStatus {
                 typosquat_count: Some(stats.typosquat_count),
                 popular_count: Some(stats.popular_count),
                 total_entries: Some(total),
-                skipped_range_only: None, // compile-time stat, not in DB header yet
+                // skipped_range_only is a compile-time stat not yet in the DB header.
+                skipped_range_only: None,
                 signature_valid: Some(sig_valid),
                 stale: is_stale,
                 error: None,
@@ -714,7 +693,6 @@ fn print_status_human(info: &ThreatDbStatus) {
         println!("  version:     {seq}");
     }
 
-    // Show breakdown
     if let (Some(pkg), Some(host), Some(ip), Some(typo), Some(pop)) = (
         info.package_count,
         info.hostname_count,
@@ -733,10 +711,6 @@ fn print_status_human(info: &ThreatDbStatus) {
     println!("               (fallback may hit GitHub API rate limits for unauthenticated users)");
 }
 
-// ---------------------------------------------------------------------------
-// Auto-update trigger (called from check.rs)
-// ---------------------------------------------------------------------------
-
 /// Guard: only try once per process lifetime.
 static UPDATE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
@@ -746,12 +720,10 @@ static UPDATE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 /// This is intentionally cheap: reads a timestamp file and optionally spawns
 /// a detached child. The actual download happens in the child process.
 pub fn maybe_background_update() {
-    // 1. Only try once per process lifetime
     if UPDATE_ATTEMPTED.swap(true, Ordering::Relaxed) {
         return;
     }
 
-    // 2. Respect auto_update_hours=0
     let policy = policy::Policy::discover(None);
     if policy.threat_intel.auto_update_hours == 0 {
         return;
@@ -762,36 +734,36 @@ pub fn maybe_background_update() {
         None => return,
     };
 
-    // 3. Check next-check-at timestamp
+    // A missing or unparseable next-check-at file is fine — treat it as "due"
+    // for first run or corrupt state recovery.
     let next_check_path = state.join(NEXT_CHECK_FILE);
     let now = unix_now();
     if let Ok(content) = std::fs::read_to_string(&next_check_path) {
         if let Ok(next_ts) = content.trim().parse::<u64>() {
             if now < next_ts {
-                return; // not yet due
+                return;
             }
         }
     }
-    // If file doesn't exist or is unparseable, proceed (first run or corrupt)
 
-    // 4. Layer 1 (parent-side, soft hint): check spawned-at dedup
+    // Parent-side soft dedup so multiple `tirith check` processes launched in
+    // the same second don't all spawn an update child. The real lock lives
+    // inside the background child.
     let spawned_at_path = state.join(SPAWNED_AT_FILE);
     if let Ok(content) = std::fs::read_to_string(&spawned_at_path) {
         if let Ok(spawned_ts) = content.trim().parse::<u64>() {
             if now.saturating_sub(spawned_ts) < SPAWNED_AT_DEDUP_SECS {
-                return; // another parent spawned recently
+                return;
             }
         }
     }
 
-    // Write spawned-at before spawning
     if let Err(e) = std::fs::create_dir_all(&state) {
         eprintln!("tirith: warning: failed to create state directory: {e}");
         return;
     }
     let _ = std::fs::write(&spawned_at_path, now.to_string());
 
-    // 5. Spawn detached child
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(_) => return,
@@ -812,17 +784,15 @@ pub fn maybe_background_update() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// HTTP helpers
-// ---------------------------------------------------------------------------
-
 /// Fetch the manifest from primary URL, falling back to the release asset URL.
 /// Falls back when: primary fetch fails OR primary manifest is older than current DB
 /// (stale primary, e.g., manifest PR not yet merged).
 fn fetch_manifest() -> Result<Manifest, String> {
     match fetch_manifest_from(MANIFEST_URL_PRIMARY) {
         Ok(m) => {
-            // Check if primary is stale (older than current DB)
+            // If the primary manifest's version is at or below the currently-
+            // installed DB, try the fallback in case it's ahead (releases can
+            // lag the raw.githubusercontent.com path during deploys).
             if let Some(db) = ThreatDb::cached() {
                 if m.version <= db.build_sequence() {
                     eprintln!("tirith: primary manifest is stale (v{} <= current v{}), trying fallback...",
@@ -831,7 +801,7 @@ fn fetch_manifest() -> Result<Manifest, String> {
                         Ok(fallback) if fallback.version > db.build_sequence() => {
                             return Ok(fallback)
                         }
-                        _ => {} // fallback also stale or failed — use primary
+                        _ => {}
                     }
                 }
             }
@@ -865,12 +835,12 @@ fn resolve_cache(
     cached_body: Option<&str>,
 ) -> Result<CacheResolution, String> {
     if http_status == 304 {
-        // Try cached body — must exist AND parse as valid JSON
+        // Corrupt or missing cached body falls through to RetryNeeded rather
+        // than erroring — caller will clean up stale ETag and retry.
         if let Some(body) = cached_body {
             if serde_json::from_str::<Manifest>(body).is_ok() {
                 return Ok(CacheResolution::Cached(body.to_string()));
             }
-            // Corrupt cached body → need unconditional retry (not an error)
         }
         return Ok(CacheResolution::RetryNeeded);
     }
@@ -907,7 +877,7 @@ fn fetch_manifest_from_with_state(
     let etag_path = state.as_ref().map(|d| d.join(format!("{cache_key}-etag")));
     let body_path = state.as_ref().map(|d| d.join(format!("{cache_key}-body")));
 
-    // Build request with conditional-GET headers (per-URL ETag)
+    // Conditional GET: attach a per-URL ETag from prior successful fetch.
     let mut req = client.get(url).header(
         "User-Agent",
         format!("tirith/{}", env!("CARGO_PKG_VERSION")),
@@ -927,14 +897,13 @@ fn fetch_manifest_from_with_state(
 
     let status = resp.status().as_u16();
 
-    // Extract ETag before consuming response body
+    // Extract ETag before consuming the response body.
     let resp_etag = resp
         .headers()
         .get("etag")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // Read body for non-304 responses (304 has no body)
     let resp_body = if status != 304 {
         let content_len = resp.content_length().unwrap_or(0);
         if content_len > MAX_MANIFEST_SIZE {
@@ -954,10 +923,11 @@ fn fetch_manifest_from_with_state(
         None
     };
 
-    // Load cached body only for 304 responses (avoid unnecessary I/O on 200)
+    // Only load cached body for 304 — avoids unnecessary I/O on 200.
     let cached_body = if status == 304 {
         body_path.as_ref().and_then(|bp| {
-            // Check file size BEFORE reading to avoid unbounded memory use
+            // Size-check BEFORE reading so an attacker-planted huge file
+            // cannot force unbounded memory allocation.
             if let Ok(meta) = std::fs::metadata(bp) {
                 if meta.len() > MAX_MANIFEST_SIZE {
                     eprintln!(
@@ -974,27 +944,25 @@ fn fetch_manifest_from_with_state(
         None
     };
 
-    // Use resolve_cache for the status/cache decision (tested state machine)
     match resolve_cache(status, resp_body.as_deref(), cached_body.as_deref()) {
         Ok(CacheResolution::Fresh(body)) => {
-            // Validate JSON BEFORE caching to prevent poisoned cache
+            // Validate JSON BEFORE caching so a bad response never poisons the cache.
             let manifest = serde_json::from_str::<Manifest>(&body)
                 .map_err(|e| format!("invalid manifest JSON: {e}"))?;
-            // Only persist after successful validation
             persist_cache_files(&etag_path, resp_etag.as_deref(), &body_path, &body);
             Ok(manifest)
         }
         Ok(CacheResolution::Cached(body)) => serde_json::from_str::<Manifest>(&body)
             .map_err(|e| format!("cached manifest parse error: {e}")),
         Ok(CacheResolution::RetryNeeded) => {
-            // Delete stale ETag/body to break 304 loop
+            // Delete stale ETag + body so the retry is unconditional —
+            // otherwise we'd loop on 304 forever.
             if let Some(ref ep) = etag_path {
                 let _ = std::fs::remove_file(ep);
             }
             if let Some(ref bp) = body_path {
                 let _ = std::fs::remove_file(bp);
             }
-            // Retry unconditionally
             let retry_resp = client
                 .get(url)
                 .header(
@@ -1013,7 +981,6 @@ fn fetch_manifest_from_with_state(
                     retry_content_len, MAX_MANIFEST_SIZE
                 ));
             }
-            // Persist ETag from retry response
             let retry_etag = retry_resp
                 .headers()
                 .get("etag")
@@ -1028,7 +995,6 @@ fn fetch_manifest_from_with_state(
                     retry_body.len()
                 ));
             }
-            // Validate JSON BEFORE caching to prevent poisoned cache
             let manifest = serde_json::from_str::<Manifest>(&retry_body)
                 .map_err(|e| format!("invalid manifest JSON on retry: {e}"))?;
             persist_cache_files(&etag_path, retry_etag.as_deref(), &body_path, &retry_body);
@@ -1097,10 +1063,6 @@ fn download_db(manifest: &Manifest) -> Result<Vec<u8>, String> {
     Ok(bytes.to_vec())
 }
 
-// ---------------------------------------------------------------------------
-// Filesystem helpers
-// ---------------------------------------------------------------------------
-
 /// Atomic write: write to a temp file in the same directory, then rename.
 fn atomic_write(dest: &PathBuf, data: &[u8]) -> Result<(), String> {
     let parent = dest
@@ -1141,10 +1103,6 @@ mod hex {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1153,10 +1111,6 @@ mod tests {
 
     /// Serialize tests that manipulate environment variables.
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    // -----------------------------------------------------------------------
-    // Testable coordination helpers (test-only, extracted from production code)
-    // -----------------------------------------------------------------------
 
     /// Check whether the next-check-at file indicates the update is not yet due.
     fn is_next_check_in_future(state_dir: &Path, now: u64) -> bool {
@@ -1198,10 +1152,6 @@ mod tests {
         Some(lock_file)
     }
 
-    // -----------------------------------------------------------------------
-    // 1. auto_update_hours=0 disables update
-    // -----------------------------------------------------------------------
-
     #[test]
     fn auto_update_hours_zero_disables_background_child() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1214,7 +1164,6 @@ mod tests {
         )
         .unwrap();
 
-        // Point policy discovery at our temp dir
         unsafe { std::env::set_var("TIRITH_POLICY_ROOT", tmp.path()) };
 
         let policy = policy::Policy::discover(Some(tmp.path().to_str().unwrap()));
@@ -1226,16 +1175,11 @@ mod tests {
         unsafe { std::env::remove_var("TIRITH_POLICY_ROOT") };
     }
 
-    // -----------------------------------------------------------------------
-    // 2. next-check-at in the future skips update
-    // -----------------------------------------------------------------------
-
     #[test]
     fn next_check_at_future_skips_update() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
 
-        // Write a next-check-at timestamp 1 hour in the future
         let future_ts = unix_now() + 3600;
         std::fs::write(state.join(NEXT_CHECK_FILE), future_ts.to_string()).unwrap();
 
@@ -1251,7 +1195,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
 
-        // Write a next-check-at timestamp 1 hour in the past
         let past_ts = unix_now().saturating_sub(3600);
         std::fs::write(state.join(NEXT_CHECK_FILE), past_ts.to_string()).unwrap();
 
@@ -1266,7 +1209,6 @@ mod tests {
     fn next_check_at_missing_allows_update() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
-        // No file written — first run scenario
 
         let now = unix_now();
         assert!(
@@ -1288,16 +1230,11 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // 3. spawned-at recent (<30s) skips update
-    // -----------------------------------------------------------------------
-
     #[test]
     fn spawned_at_recent_skips_update() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
 
-        // Write a spawned-at timestamp 5 seconds ago (within the 30s dedup window)
         let recent_ts = unix_now().saturating_sub(5);
         std::fs::write(state.join(SPAWNED_AT_FILE), recent_ts.to_string()).unwrap();
 
@@ -1313,7 +1250,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
 
-        // Write a spawned-at timestamp 60 seconds ago (outside the 30s dedup window)
         let old_ts = unix_now().saturating_sub(60);
         std::fs::write(state.join(SPAWNED_AT_FILE), old_ts.to_string()).unwrap();
 
@@ -1328,7 +1264,6 @@ mod tests {
     fn spawned_at_missing_allows_update() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
-        // No file — first spawn
 
         let now = unix_now();
         assert!(
@@ -1337,56 +1272,41 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // 4. UPDATE_ATTEMPTED AtomicBool guard prevents second attempt
-    // -----------------------------------------------------------------------
-
     #[test]
     fn update_attempted_guard_fires_once() {
-        // Use a standalone AtomicBool to verify the swap-based guard pattern
-        // (We cannot reset the global UPDATE_ATTEMPTED without affecting other tests.)
+        // Standalone AtomicBool because the real global UPDATE_ATTEMPTED
+        // cannot be reset without affecting other tests.
         let guard = AtomicBool::new(false);
 
-        // First swap: returns old value (false) — should proceed
         let first = guard.swap(true, Ordering::Relaxed);
         assert!(
             !first,
             "first swap should return false, allowing the update"
         );
 
-        // Second swap: returns old value (true) — should skip
         let second = guard.swap(true, Ordering::Relaxed);
         assert!(second, "second swap should return true, blocking re-entry");
 
-        // Third swap: still true
         let third = guard.swap(true, Ordering::Relaxed);
         assert!(third, "third swap should also return true");
     }
-
-    // -----------------------------------------------------------------------
-    // 5. Background child lock dedup
-    // -----------------------------------------------------------------------
 
     #[test]
     fn lock_dedup_second_acquire_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
 
-        // First acquire succeeds
         let lock1 = try_acquire_update_lock(state);
         assert!(lock1.is_some(), "first lock acquisition should succeed");
 
-        // Second acquire should fail (lock already held)
         let lock2 = try_acquire_update_lock(state);
         assert!(
             lock2.is_none(),
             "second lock acquisition should fail while first is held"
         );
 
-        // Drop the first lock to release
         drop(lock1);
 
-        // After releasing, a new acquire should succeed
         let lock3 = try_acquire_update_lock(state);
         assert!(
             lock3.is_some(),
@@ -1407,18 +1327,13 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // 6. Failure backoff: next-check-at = now + 1h on failure
-    // -----------------------------------------------------------------------
-
     #[test]
     fn failure_backoff_sets_one_hour() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
         let next_check_path = state.join(NEXT_CHECK_FILE);
 
-        // Simulate what run_background_update does on failure:
-        // writes now + BACKOFF_SECS to next-check-at
+        // Matches what run_background_update writes on failure.
         let now = unix_now();
         let backoff_ts = now + BACKOFF_SECS;
         std::fs::write(&next_check_path, backoff_ts.to_string()).unwrap();
@@ -1426,7 +1341,6 @@ mod tests {
         let content = std::fs::read_to_string(&next_check_path).unwrap();
         let written_ts: u64 = content.trim().parse().unwrap();
 
-        // Backoff should be ~1 hour from now (allow 5s tolerance)
         let diff = written_ts.saturating_sub(now);
         assert_eq!(
             diff, BACKOFF_SECS,
@@ -1445,7 +1359,6 @@ mod tests {
         let state = tmp.path();
         let next_check_path = state.join(NEXT_CHECK_FILE);
 
-        // Simulate what run_background_update does on success with auto_update_hours=24
         let auto_hours: u64 = 24;
         let now = unix_now();
         let next = now + auto_hours * 3600;
@@ -1464,8 +1377,8 @@ mod tests {
 
     #[test]
     fn backoff_differs_from_normal_interval() {
-        // Verify that the failure backoff (1h) is different from the default
-        // auto_update_hours (24h), so users retry sooner after failure.
+        // Failure backoff must be shorter than the normal interval so users
+        // retry sooner after a transient failure.
         let default_config = policy::ThreatIntelConfig::default();
         let normal_interval_secs = default_config.auto_update_hours * 3600;
         assert_ne!(
@@ -1478,10 +1391,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // 7. Canonical manifest payload format
-    // -----------------------------------------------------------------------
-
     #[test]
     fn canonical_payload_format_sorted_keys_no_whitespace() {
         let manifest = Manifest {
@@ -1489,12 +1398,11 @@ mod tests {
             size: 12345,
             url: "https://example.com/tirith-threatdb.dat".to_string(),
             version: 42,
-            signature: String::new(), // not used in canonical payload
+            signature: String::new(),
         };
 
         let payload = manifest.canonical_payload();
 
-        // Keys must be alphabetically sorted: sha256, size, url, version
         assert_eq!(
             payload,
             r#"{"sha256":"abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890","size":12345,"url":"https://example.com/tirith-threatdb.dat","version":42}"#,
@@ -1542,17 +1450,14 @@ mod tests {
         };
         let payload = manifest.canonical_payload();
 
-        // Verify it's valid UTF-8 (String type guarantees this, but be explicit)
         assert!(
             std::str::from_utf8(payload.as_bytes()).is_ok(),
             "canonical payload must be valid UTF-8"
         );
 
-        // Verify it's valid JSON
         let parsed: serde_json::Value =
             serde_json::from_str(&payload).expect("canonical payload must be valid JSON");
 
-        // Verify the JSON object has exactly the expected keys
         let obj = parsed.as_object().expect("payload should be a JSON object");
         let keys: Vec<&String> = obj.keys().collect();
         assert_eq!(
@@ -1585,7 +1490,6 @@ mod tests {
 
     #[test]
     fn canonical_payload_round_trips_through_json_parse() {
-        // Verify the canonical payload can be deserialized back to matching values
         let manifest = Manifest {
             sha256: "abc123".to_string(),
             size: 42,
@@ -1602,16 +1506,12 @@ mod tests {
         assert_eq!(parsed["version"], 99);
     }
 
-    // -----------------------------------------------------------------------
-    // Edge cases
-    // -----------------------------------------------------------------------
-
     #[test]
     fn spawned_at_exactly_at_boundary_skips() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
 
-        // Exactly at the boundary: 29 seconds ago (within the 30s window)
+        // 29s ago is still inside the 30s window.
         let now = 1000000u64;
         let ts = now - (SPAWNED_AT_DEDUP_SECS - 1);
         std::fs::write(state.join(SPAWNED_AT_FILE), ts.to_string()).unwrap();
@@ -1627,7 +1527,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
 
-        // Exactly at the boundary: 30 seconds ago (at the edge, >= DEDUP means proceed)
+        // Exactly 30s ago falls outside the dedup window (strict <).
         let now = 1000000u64;
         let ts = now - SPAWNED_AT_DEDUP_SECS;
         std::fs::write(state.join(SPAWNED_AT_FILE), ts.to_string()).unwrap();
@@ -1646,16 +1546,12 @@ mod tests {
         let now = 1000000u64;
         std::fs::write(state.join(NEXT_CHECK_FILE), now.to_string()).unwrap();
 
-        // now < next_ts is false when they're equal, so update should proceed
+        // Strict `<` comparison: equal timestamps proceed with the update.
         assert!(
             !is_next_check_in_future(state, now),
             "next-check-at == now should allow the update (not strictly in the future)"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // 8. Conditional-GET cache helpers
-    // -----------------------------------------------------------------------
 
     #[test]
     fn manifest_cache_key_is_url_specific() {
@@ -1686,7 +1582,6 @@ mod tests {
         assert_eq!(parsed.version, 99);
         assert_eq!(parsed.size, 42);
 
-        // Verify cached body can be written and re-read (simulates 304 flow)
         let tmp = tempfile::tempdir().unwrap();
         let body_file = tmp.path().join("cached-body");
         std::fs::write(&body_file, json).unwrap();
@@ -1703,20 +1598,14 @@ mod tests {
         let k1 = super::manifest_cache_key(url1);
         let k2 = super::manifest_cache_key(url2);
 
-        // ETag files should differ
         let etag1 = format!("{k1}-etag");
         let etag2 = format!("{k2}-etag");
         assert_ne!(etag1, etag2, "etag files must be per-URL");
 
-        // Body files should differ
         let body1 = format!("{k1}-body");
         let body2 = format!("{k2}-body");
         assert_ne!(body1, body2, "body cache files must be per-URL");
     }
-
-    // -----------------------------------------------------------------------
-    // 9. Cache state machine tests (simulated 200/304/corrupt flows)
-    // -----------------------------------------------------------------------
 
     /// Simulate the cache file operations that fetch_manifest_from does on a 200 response:
     /// persist ETag + body, then verify a simulated 304 can read them back.
@@ -1730,17 +1619,15 @@ mod tests {
 
         let manifest_json = r#"{"sha256":"dead","size":100,"url":"https://x.com/db.dat","version":5,"signature":"sig"}"#;
 
-        // Simulate 200: persist ETag + body (what fetch_manifest_from does on success)
+        // Simulate what fetch_manifest_from persists on a 200 response.
         std::fs::write(&etag_path, "\"etag-value-abc\"").unwrap();
         std::fs::write(&body_path, manifest_json).unwrap();
 
-        // Simulate 304: read cached body (what fetch_manifest_from does on 304)
         let cached = std::fs::read_to_string(&body_path).unwrap();
         let m: Manifest = serde_json::from_str(&cached).unwrap();
         assert_eq!(m.sha256, "dead");
         assert_eq!(m.version, 5);
 
-        // Verify ETag was persisted for conditional GET
         let etag = std::fs::read_to_string(&etag_path).unwrap();
         assert_eq!(etag.trim(), "\"etag-value-abc\"");
     }
@@ -1754,12 +1641,11 @@ mod tests {
         let etag_path = tmp.path().join(format!("{key}-etag"));
         let body_path = tmp.path().join(format!("{key}-body"));
 
-        // State: ETag exists but body does not (e.g., body was deleted manually)
+        // ETag without body — e.g. body manually deleted between runs.
         std::fs::write(&etag_path, "\"stale-etag\"").unwrap();
         assert!(!body_path.exists(), "body should not exist for this test");
 
-        // Simulate the 304 recovery: when body is missing, clean up ETag + body
-        // (This is the recovery path in fetch_manifest_from)
+        // This mirrors the 304 recovery path in fetch_manifest_from.
         let body_ok = body_path
             .exists()
             .then(|| std::fs::read_to_string(&body_path).ok())
@@ -1767,12 +1653,10 @@ mod tests {
             .and_then(|s| serde_json::from_str::<Manifest>(&s).ok());
 
         if body_ok.is_none() {
-            // Recovery: delete stale ETag so next request is unconditional
             let _ = std::fs::remove_file(&etag_path);
             let _ = std::fs::remove_file(&body_path);
         }
 
-        // After cleanup, ETag file should be gone
         assert!(
             !etag_path.exists(),
             "ETag should be deleted after 304 with missing body"
@@ -1788,17 +1672,14 @@ mod tests {
         let etag_path = tmp.path().join(format!("{key}-etag"));
         let body_path = tmp.path().join(format!("{key}-body"));
 
-        // State: ETag exists, body exists but is corrupt JSON
         std::fs::write(&etag_path, "\"some-etag\"").unwrap();
         std::fs::write(&body_path, "this is not json").unwrap();
 
-        // Simulate 304 cache read
         let body_ok = std::fs::read_to_string(&body_path)
             .ok()
             .and_then(|s| serde_json::from_str::<Manifest>(&s).ok());
 
         if body_ok.is_none() {
-            // Recovery: delete stale files
             let _ = std::fs::remove_file(&etag_path);
             let _ = std::fs::remove_file(&body_path);
         }
@@ -1830,7 +1711,6 @@ mod tests {
         let p_body = tmp.path().join(format!("{pk}-body"));
         let f_body = tmp.path().join(format!("{fk}-body"));
 
-        // Persist primary cache
         std::fs::write(&p_etag, "\"primary-etag\"").unwrap();
         std::fs::write(
             &p_body,
@@ -1838,7 +1718,6 @@ mod tests {
         )
         .unwrap();
 
-        // Persist fallback cache with different data
         std::fs::write(&f_etag, "\"fallback-etag\"").unwrap();
         std::fs::write(
             &f_body,
@@ -1846,7 +1725,6 @@ mod tests {
         )
         .unwrap();
 
-        // Verify independence
         let pm: Manifest =
             serde_json::from_str(&std::fs::read_to_string(&p_body).unwrap()).unwrap();
         let fm: Manifest =
@@ -1858,7 +1736,6 @@ mod tests {
             std::fs::read_to_string(&f_etag).unwrap()
         );
 
-        // Deleting primary cache does not affect fallback
         std::fs::remove_file(&p_etag).unwrap();
         std::fs::remove_file(&p_body).unwrap();
         assert!(
@@ -1870,10 +1747,6 @@ mod tests {
             "fallback body should survive primary cleanup"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // 10. Cache resolution state machine (exercises resolve_cache directly)
-    // -----------------------------------------------------------------------
 
     const VALID_MANIFEST: &str =
         r#"{"sha256":"abc","size":1,"url":"https://x.com/db.dat","version":1,"signature":"s"}"#;
@@ -1910,7 +1783,8 @@ mod tests {
 
     #[test]
     fn resolve_cache_304_with_corrupt_cache_returns_retry() {
-        // Corrupt cached body → RetryNeeded (not Err), so caller cleans up and retries
+        // Corrupt cached body maps to RetryNeeded so the caller can clean up
+        // and retry unconditionally; it is not an error.
         let r = super::resolve_cache(304, None, Some("not json")).unwrap();
         assert_eq!(
             r,
@@ -1945,12 +1819,8 @@ mod tests {
         assert_eq!(r, super::CacheResolution::Fresh(VALID_MANIFEST.to_string()));
     }
 
-    // -----------------------------------------------------------------------
-    // 11. Transport-level tests (mock HTTP server, exercises real fetch path)
-    //     Uses fetch_manifest_from_with_state() with injectable state dir
-    //     to avoid env var races between parallel tests.
-    // -----------------------------------------------------------------------
-
+    // Transport-level tests use fetch_manifest_from_with_state with an
+    // injectable state dir so parallel tests don't race on env vars.
     /// Helper: call fetch with isolated state dir (no env var races).
     fn fetch_with_state(url: &str, state: &std::path::Path) -> Result<Manifest, String> {
         super::fetch_manifest_from_with_state(url, Some(state.to_path_buf()))
@@ -1971,8 +1841,6 @@ mod tests {
             .create();
 
         let tmp = tempfile::tempdir().unwrap();
-        // state dir passed directly via fetch_with_state — no env var needed
-
         let url = format!("{}/manifest.json", server.url());
         let result = fetch_with_state(&url, tmp.path());
 
@@ -1981,7 +1849,6 @@ mod tests {
         assert_eq!(m.sha256, "abc");
         assert_eq!(m.version, 1);
 
-        // Verify cache files were written
         let key = super::manifest_cache_key(&url);
         let state = tmp.path();
         let etag_file = state.join(format!("{key}-etag"));
@@ -2004,9 +1871,7 @@ mod tests {
             .create();
 
         let tmp = tempfile::tempdir().unwrap();
-        // state dir passed directly via fetch_with_state — no env var needed
-
-        // Pre-populate cache files
+        // Pre-populate cache files so the 304 path exercises the happy case.
         let url = format!("{}/manifest.json", server.url());
         let key = super::manifest_cache_key(&url);
         let state = tmp.path();
@@ -2027,14 +1892,13 @@ mod tests {
     fn transport_304_without_cache_retries_and_succeeds() {
         let mut server = mockito::Server::new();
 
-        // First request: 304 (no cached body exists)
+        // First request 304 (no cached body), then unconditional retry to 200.
         let mock_304 = server
             .mock("GET", "/manifest.json")
             .with_status(304)
             .expect(1)
             .create();
 
-        // Retry request: 200 (unconditional)
         let retry_json = r#"{"sha256":"fresh","size":1,"url":"https://x.com/db.dat","version":7,"signature":"s"}"#;
         let mock_200 = server
             .mock("GET", "/manifest.json")
@@ -2045,9 +1909,7 @@ mod tests {
             .create();
 
         let tmp = tempfile::tempdir().unwrap();
-        // state dir passed directly via fetch_with_state — no env var needed
-
-        // Pre-populate only ETag (no body — simulates corrupt/deleted cache)
+        // ETag present but no body — simulates corrupt or manually-deleted cache.
         let url = format!("{}/manifest.json", server.url());
         let key = super::manifest_cache_key(&url);
         let state = tmp.path();
@@ -2062,7 +1924,6 @@ mod tests {
         assert_eq!(m.sha256, "fresh");
         assert_eq!(m.version, 7);
 
-        // Verify new ETag was persisted from retry
         let etag = std::fs::read_to_string(state.join(format!("{key}-etag"))).unwrap();
         assert_eq!(etag.trim(), "\"new-etag\"");
     }
@@ -2076,8 +1937,6 @@ mod tests {
             .create();
 
         let tmp = tempfile::tempdir().unwrap();
-        // state dir passed directly via fetch_with_state — no env var needed
-
         let url = format!("{}/manifest.json", server.url());
         let result = fetch_with_state(&url, tmp.path());
 
@@ -2097,15 +1956,13 @@ mod tests {
             .create();
 
         let tmp = tempfile::tempdir().unwrap();
-        // state dir passed directly via fetch_with_state — no env var needed
-
         let url = format!("{}/manifest.json", server.url());
         let result = fetch_with_state(&url, tmp.path());
 
         mock.assert();
         assert!(result.is_err(), "invalid JSON should fail");
 
-        // Verify body was NOT cached (validation-before-cache)
+        // Validation-before-cache: invalid JSON must not land in the cache.
         let key = super::manifest_cache_key(&url);
         let state = tmp.path();
         let body_file = state.join(format!("{key}-body"));
@@ -2127,12 +1984,11 @@ mod tests {
             .create();
 
         let tmp = tempfile::tempdir().unwrap();
-        // state dir passed directly via fetch_with_state — no env var needed
-
         let url = format!("{}/manifest.json", server.url());
         let _ = fetch_with_state(&url, tmp.path());
 
-        mock.assert(); // Fails if User-Agent didn't match
+        // mockito.assert() fails if the User-Agent header didn't match the regex.
+        mock.assert();
     }
 
     #[test]

@@ -1,9 +1,3 @@
-# Code file scan fixtures
-
-# ---------------------------------------------------------------------------
-# DynamicCodeExecution fixtures
-# ---------------------------------------------------------------------------
-
 [[fixture]]
 name = "eval_atob_proximity"
 min_milestone = 1
@@ -51,10 +45,6 @@ file_path = "test.js"
 expected_action = "allow"
 expected_rules = []
 
-# ---------------------------------------------------------------------------
-# ObfuscatedPayload fixtures
-# ---------------------------------------------------------------------------
-
 [[fixture]]
 name = "atob_eval_long_base64"
 min_milestone = 1
@@ -72,10 +62,6 @@ context = "file"
 file_path = "test.py"
 expected_action = "warn"
 expected_rules = ["obfuscated_payload"]
-
-# ---------------------------------------------------------------------------
-# SuspiciousCodeExfiltration fixtures
-# ---------------------------------------------------------------------------
 
 [[fixture]]
 name = "fetch_query_concat_cookie"

@@ -1,10 +1,10 @@
-//! Phase 1 tests for the bash hook's preexec enforcement path.
+//! Tests for the bash hook's preexec enforcement path.
 //!
-//! These tests drive an interactive bash subshell with a fake `tirith` binary
-//! on PATH that records its invocations and returns exit codes based on input
-//! pattern. The hook is sourced, user commands are fed via a here-doc, and we
-//! assert on side effects (sentinel files that a blocked command would have
-//! created) plus the invocation log from the fake tirith.
+//! Each test drives an interactive bash subshell with a fake `tirith` binary
+//! on PATH that logs its invocations and returns exit codes chosen by the
+//! input pattern. The hook is sourced, commands are fed via here-doc, and we
+//! assert on side effects — sentinel files a blocked command would have
+//! created — plus the invocation log from the fake tirith.
 
 #![cfg(unix)]
 
@@ -132,8 +132,6 @@ fn run_with_sentinels(
     (stdout, stderr, inv, sentinel_dir)
 }
 
-// ─── Enforcement-on: block path ────────────────────────────────────
-
 #[test]
 fn enforce_blocks_bare_command_with_rc1() {
     let (_out, _err, invocations, sentinel_dir) = run_with_sentinels(
@@ -211,8 +209,6 @@ ls / >/dev/null && touch {sentinels}/ls_ran; curl BLOCK_TOKEN-seq && touch {sent
     let _ = fs::remove_dir_all(&sentinel_dir);
 }
 
-// ─── Enforcement-on: allow / warn paths ────────────────────────────
-
 #[test]
 fn enforce_allows_clean_commands() {
     let (_out, _err, invocations, sentinel_dir) = run_with_sentinels(
@@ -252,8 +248,6 @@ echo WARN_TOKEN && touch {sentinels}/warn_ran
     let _ = fs::remove_dir_all(&sentinel_dir);
 }
 
-// ─── Enforcement-on: unexpected-rc degrade ─────────────────────────
-
 #[test]
 fn unexpected_rc_blocks_then_degrades_session() {
     let (_out, stderr, _inv, sentinel_dir) = run_with_sentinels(
@@ -281,8 +275,6 @@ echo post_degrade && touch {sentinels}/post_ran
     );
     let _ = fs::remove_dir_all(&sentinel_dir);
 }
-
-// ─── Install-time hostile-history detection ────────────────────────
 
 #[test]
 fn hostile_histcontrol_ignorespace_refuses_enforcement() {
@@ -344,8 +336,6 @@ echo BLOCK_TOKEN-ignoredups && touch {sentinels}/ran_anyway
     let _ = fs::remove_dir_all(&sentinel_dir);
 }
 
-// ─── Enforcement-off (default): warn-only preserved ────────────────
-
 #[test]
 fn enforce_off_preserves_warn_only_behavior() {
     let (_out, _err, invocations, sentinel_dir) = run_with_sentinels(
@@ -365,8 +355,6 @@ echo BLOCK_TOKEN-noenforce && touch {sentinels}/ran_in_warn_only
     );
     let _ = fs::remove_dir_all(&sentinel_dir);
 }
-
-// ─── Effective-state exports ───────────────────────────────────────
 
 #[test]
 fn enforcement_exports_blocks_protection() {
@@ -405,12 +393,10 @@ printf 'PROT=%s\n' "$TIRITH_BASH_EFFECTIVE_PROTECTION" >&2
     let _ = fs::remove_dir_all(&_tmp);
 }
 
-// ─── DEBUG trap chaining ───────────────────────────────────────────
-
 #[test]
 fn debug_trap_chains_user_trap() {
-    // User installs a DEBUG trap BEFORE sourcing the hook. Tirith must wrap,
-    // not clobber it.
+    // A DEBUG trap installed BEFORE sourcing the hook must be wrapped, not
+    // clobbered.
     let (_out, stderr, _inv, _tmp) = run_with_sentinels(
         r#"
 USER_TRAP_COUNT=0
@@ -460,8 +446,6 @@ trap -p DEBUG | grep -c '_tirith_debug_trampoline' >&2
     );
 }
 
-// ─── extdebug ownership ────────────────────────────────────────────
-
 #[test]
 fn extdebug_left_alone_when_user_enabled_it_first() {
     let (_out, stderr, _inv, _tmp) = run_with_sentinels(
@@ -484,22 +468,20 @@ printf 'OWNS=%s\n' "$_TIRITH_OWNS_EXTDEBUG" >&2
     );
 }
 
-// ─── Mid-session HISTCONTROL bypass (regression for P1 review finding) ──
-
 #[test]
 fn mid_session_ignorespace_does_not_bypass_via_stale_cache() {
-    // Reproducer for the P1 manual-review finding: with enforcement on,
-    // (1) a clean command produces a cached allow keyed by the current
-    // line, then (2) the user enables HISTCONTROL=ignorespace, then (3) a
-    // leading-space `curl BLOCK_TOKEN-...` is filtered out of history, so
-    // history_index does not advance. The hook MUST detect drift before
-    // honoring the cache and block the new command instead of returning
-    // the cached allow.
+    // Attack shape: with enforcement on,
+    // (1) a clean command produces a cached allow keyed by the typed line;
+    // (2) the user enables HISTCONTROL=ignorespace;
+    // (3) a leading-space `curl BLOCK_TOKEN-...` is filtered out of history,
+    //     so history_index does not advance.
+    // The hook MUST detect drift before honoring the cache and block the
+    // new command.
     //
-    // We install a fake `curl` shim and a downstream `&& touch` segment.
-    // Both must be skipped — the curl by drift-detection, the touch by
-    // the LINENO-keyed cross-path pin so the rest of the same typed line
-    // stays blocked even though the session has flipped to warn-only.
+    // Both the fake `curl` shim and the downstream `&& touch` segment must
+    // be skipped — the curl by drift-detection, the touch by the
+    // LINENO-keyed cross-path pin that keeps the rest of the same typed
+    // line blocked even after the session flips to warn-only.
     let tmpdir = tempfile::tempdir().unwrap();
     let bin_dir = tmpdir.path().join("bin");
     let log_path = tmpdir.path().join("tirith.log");
@@ -571,16 +553,14 @@ fn mid_session_ignorespace_does_not_bypass_via_stale_cache() {
 
 #[test]
 fn warn_only_does_not_dedupe_identical_commands_across_prompts() {
-    // Regression for the P3 manual-review finding: in warn-only mode the
-    // hook used to dedupe against `_tirith_last_cmd` regardless of which
-    // prompt it came from, so running the same command twice in a row only
-    // produced a single tirith invocation. With the per-typed-line cache
-    // key folded in, each prompt should get its own scan even if the
-    // command text is identical.
+    // Warn-only mode previously deduped against `_tirith_last_cmd` across
+    // prompts, so running the same command twice in a row produced only a
+    // single tirith invocation. With the per-typed-line cache key folded
+    // in, each prompt gets its own scan even if the command text is
+    // identical.
     //
-    // Ran under install-time-hostile HISTCONTROL=ignorespace so the path
-    // exercised is the install-time-degraded warn-only branch (the same
-    // one the reviewer reproduced).
+    // Runs under install-time-hostile HISTCONTROL=ignorespace so we hit
+    // the install-time-degraded warn-only branch.
     let (_out, _err, invocations, _tmp) = run_with_sentinels(
         r#"
  echo repeated_cmd
@@ -607,11 +587,11 @@ fn warn_only_does_not_dedupe_identical_commands_across_prompts() {
 
 #[test]
 fn install_time_hostile_config_uses_bash_command_for_warn_only() {
-    // Regression for the P2 review finding: when enforcement is refused at
-    // install time because history is hostile, the warn-only scan target must
-    // be BASH_COMMAND (not the stale history_line). Otherwise the DETECTED
-    // banners reference whatever history 1 happens to surface, which is by
-    // construction not what the user just ran.
+    // When enforcement is refused at install time because history is
+    // hostile, the warn-only scan target must be BASH_COMMAND, not the
+    // stale history_line — otherwise DETECTED banners reference whatever
+    // history entry 1 happens to surface, which is by construction not
+    // what the user just ran.
     let (_out, _err, invocations, _tmp) = run_with_sentinels(
         r#"
  echo from_user_command
@@ -633,8 +613,6 @@ fn install_time_hostile_config_uses_bash_command_for_warn_only() {
          invocations: {invocations:#?}"
     );
 }
-
-// ─── Warn-only post-degrade scan target ────────────────────────────
 
 #[test]
 fn post_degrade_warn_only_scans_bash_command_not_history() {

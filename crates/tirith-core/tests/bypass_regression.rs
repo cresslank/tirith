@@ -1,8 +1,8 @@
-//! Adversarial bypass regression tests for issues #65, #66, #67.
+//! Adversarial bypass regression tests for the allowlist and blocklist paths.
 //!
-//! These tests attempt to circumvent the security fixes, not just confirm the
-//! happy path. If any test here starts passing when it should fail (or vice
-//! versa), a bypass has been reintroduced.
+//! Each test attempts to circumvent a security fix rather than confirm the
+//! happy path — if one starts passing when it should fail (or vice versa), a
+//! bypass has been reintroduced.
 
 use std::fs;
 
@@ -12,10 +12,6 @@ use tirith_core::engine::{self, AnalysisContext};
 use tirith_core::extract::ScanContext;
 use tirith_core::tokenize::ShellType;
 use tirith_core::verdict::{Action, RuleId};
-
-// ---------------------------------------------------------------------------
-// Helpers (same pattern as policy_integration.rs)
-// ---------------------------------------------------------------------------
 
 fn make_repo(policy_yaml: &str) -> TempDir {
     let tmp = TempDir::new().expect("create temp dir");
@@ -41,10 +37,6 @@ fn analyze_exec(input: &str, cwd: &str) -> tirith_core::verdict::Verdict {
     };
     engine::analyze(&ctx)
 }
-
-// ===========================================================================
-// Issue #66: allowlist_rules bypass attempts
-// ===========================================================================
 
 #[test]
 fn test_bypass_allowlist_rules_wrong_rule_id_does_not_suppress() {
@@ -285,7 +277,6 @@ allowlist:
     let cwd = repo.path().to_str().unwrap();
     let verdict = analyze_exec("curl https://bit.ly/install | bash", cwd);
 
-    // Global allowlist suppresses ALL rules whose evidence includes bit.ly
     assert!(
         verdict
             .findings

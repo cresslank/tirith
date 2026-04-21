@@ -8,10 +8,6 @@ use tirith_core::scan;
 use tirith_core::tokenize::ShellType;
 use tirith_core::verdict::Severity;
 
-// ---------------------------------------------------------------------------
-// tirith policy init
-// ---------------------------------------------------------------------------
-
 const FULL_TEMPLATE: &str = r#"# Tirith security policy
 # Documentation: https://tirith.dev/docs/policy
 
@@ -69,7 +65,7 @@ pub fn init(force: bool, minimal: bool) -> i32 {
     let repo_root = match tirith_core::policy::find_repo_root(cwd.as_deref()) {
         Some(r) => r,
         None => {
-            // Fall back to cwd if no git repo found
+            // No git repo — fall back to cwd so `tirith policy init` still works.
             match std::env::current_dir() {
                 Ok(d) => d,
                 Err(e) => {
@@ -116,10 +112,6 @@ pub fn init(force: bool, minimal: bool) -> i32 {
     eprintln!("tirith policy init: created {}", policy_path.display());
     0
 }
-
-// ---------------------------------------------------------------------------
-// tirith policy validate
-// ---------------------------------------------------------------------------
 
 pub fn validate(path: Option<&str>, json: bool) -> i32 {
     let policy_path = match resolve_policy_path(path) {
@@ -230,10 +222,6 @@ fn print_validate_human(path: &std::path::Path, issues: &[policy_validate::Polic
     }
 }
 
-// ---------------------------------------------------------------------------
-// tirith policy test
-// ---------------------------------------------------------------------------
-
 pub fn test(command: Option<&str>, file: Option<&str>, json: bool) -> i32 {
     if command.is_none() && file.is_none() {
         eprintln!("tirith policy test: specify a command or --file <path>");
@@ -269,7 +257,6 @@ fn test_command(command: &str, json: bool) -> i32 {
     let policy = Policy::discover(cwd.as_deref());
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
 
-    // Gather policy match trace
     let trace = build_policy_trace(command, &policy);
 
     if json {
@@ -310,15 +297,13 @@ fn test_file(file_path: &str, json: bool) -> i32 {
     if result.findings.is_empty() {
         0
     } else if result.findings.iter().any(|f| f.severity >= Severity::High) {
-        1 // Block-equivalent: high+ findings
+        // Block-equivalent exit code for high+ severity.
+        1
     } else {
-        2 // Warn-equivalent: medium/low findings
+        // Warn-equivalent exit code for medium/low severity.
+        2
     }
 }
-
-// ---------------------------------------------------------------------------
-// Policy trace: which allowlist/blocklist entries were checked
-// ---------------------------------------------------------------------------
 
 #[derive(serde::Serialize)]
 struct PolicyTrace {
@@ -359,10 +344,6 @@ fn build_policy_trace(input: &str, policy: &Policy) -> PolicyTrace {
         blocklist_checked,
     }
 }
-
-// ---------------------------------------------------------------------------
-// JSON output helpers
-// ---------------------------------------------------------------------------
 
 fn print_test_command_json(
     command: &str,
@@ -413,10 +394,6 @@ fn print_test_file_json(file_path: &str, result: &scan::FileScanResult, _policy:
     println!();
 }
 
-// ---------------------------------------------------------------------------
-// Human output helpers
-// ---------------------------------------------------------------------------
-
 fn print_test_command_human(
     command: &str,
     verdict: &tirith_core::verdict::Verdict,
@@ -442,7 +419,6 @@ fn print_test_command_human(
         eprintln!("    {} {} — {}", sev, finding.rule_id, finding.title);
     }
 
-    // Show allowlist/blocklist trace
     if !trace.allowlist_checked.is_empty() || !trace.blocklist_checked.is_empty() {
         eprintln!();
         eprintln!("  policy trace:");
@@ -479,10 +455,6 @@ fn print_test_file_human(file_path: &str, result: &scan::FileScanResult, _policy
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 fn resolve_policy_path(explicit: Option<&str>) -> Option<PathBuf> {
     if let Some(p) = explicit {
         let path = PathBuf::from(p);
@@ -493,7 +465,6 @@ fn resolve_policy_path(explicit: Option<&str>) -> Option<PathBuf> {
         return None;
     }
 
-    // Reuse the core policy discovery logic: loads and returns the path if found.
     let policy = tirith_core::policy::Policy::discover(None);
     policy.path.map(PathBuf::from)
 }

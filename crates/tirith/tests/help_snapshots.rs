@@ -24,8 +24,6 @@ fn assert_help_has_examples(args: &[&str], expected_substring: &str) {
     );
 }
 
-// --- Help examples exist on every subcommand ---
-
 macro_rules! help_example_tests {
     ( $( $(#[$meta:meta])* $name:ident => ( [ $($arg:expr),+ ], $expected:expr ) ; )+ ) => {
         $(
@@ -70,13 +68,12 @@ help_example_tests! {
 fn help_root_lists_subcommands() {
     let out = tirith().args(["--help"]).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // Core subcommands are visible
     assert!(stdout.contains("check"));
     assert!(stdout.contains("scan"));
     assert!(stdout.contains("setup"));
     assert!(stdout.contains("doctor"));
     assert!(stdout.contains("mcp-server"));
-    // hook-event should be hidden
+    // hook-event is an internal subcommand and must not surface here.
     assert!(
         !stdout.contains("hook-event"),
         "hook-event should be hidden from top-level help"
@@ -89,7 +86,7 @@ fn help_check_shows_format_flag() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("--format"));
     assert!(stdout.contains("human, json"));
-    // --json should be hidden
+    // --json is an alias; only --format should be documented.
     assert!(
         !stdout.contains("  --json"),
         "--json should be hidden from help"
@@ -102,8 +99,6 @@ fn help_scan_shows_sarif_format() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("human, json, sarif"));
 }
-
-// --- Clap conflict behavior tests ---
 
 #[test]
 fn conflict_json_and_format() {
@@ -180,8 +175,6 @@ fn json_alias_works_alone() {
     );
 }
 
-// --- Error message regression tests ---
-
 #[test]
 fn setup_unknown_tool_suggests() {
     let out = tirith().args(["setup", "claud-code"]).output().unwrap();
@@ -204,8 +197,8 @@ fn init_unsupported_shell_suggests() {
     );
 }
 
-// --- JSON envelope stability ---
-// Note: `tirith score` does local URL analysis only (no network call).
+// `tirith score` does purely local URL analysis with no network call, so
+// its JSON output is deterministic.
 
 #[test]
 fn json_envelope_check() {
@@ -235,9 +228,6 @@ fn json_envelope_score() {
     assert!(json["findings"].is_array());
 }
 
-// --- Format equivalence ---
-// `tirith score` is deterministic (local URL analysis, no network).
-
 #[test]
 fn format_json_and_json_flag_equivalent_score() {
     let out_flag = tirith()
@@ -255,8 +245,6 @@ fn format_json_and_json_flag_equivalent_score() {
     assert_eq!(j1["risk_level"], j2["risk_level"]);
     assert_eq!(j1["findings"], j2["findings"]);
 }
-
-// --- Additional coverage tests ---
 
 #[test]
 fn format_human_explicit_matches_default() {

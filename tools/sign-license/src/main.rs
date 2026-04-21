@@ -125,10 +125,9 @@ fn cmd_keygen(output: &PathBuf, kid: &str) -> Result<(), String> {
     let pk = sk.verifying_key();
     let seed = sk.to_bytes();
 
-    // Write seed as hex to file
     let hex_seed: String = seed.iter().map(|b| format!("{b:02x}")).collect();
 
-    // Write with restricted permissions
+    // Unix: mode 0600; fall back to default permissions on other platforms.
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -176,7 +175,6 @@ fn cmd_keygen(output: &PathBuf, kid: &str) -> Result<(), String> {
     eprintln!("Private key seed written to: {}", output.display());
     eprintln!("KEEP THIS FILE SECRET. Do not commit it to version control.\n");
 
-    // Print public key as Rust array literal for KEYRING
     let pk_bytes = pk.to_bytes();
     println!("// Add this to KEYRING in crates/tirith-core/src/license.rs:");
     println!("KeyEntry {{");
@@ -194,7 +192,6 @@ fn cmd_keygen(output: &PathBuf, kid: &str) -> Result<(), String> {
     println!("\n    ],");
     println!("}}\n");
 
-    // Also print as hex for reference
     let pk_hex: String = pk_bytes.iter().map(|b| format!("{b:02x}")).collect();
     eprintln!("Public key (hex): {pk_hex}");
 
@@ -212,7 +209,6 @@ fn cmd_sign(
     seat_count: Option<u32>,
     nbf: Option<String>,
 ) -> Result<(), String> {
-    // Validate tier
     let tier_lower = tier.to_lowercase();
     match tier_lower.as_str() {
         "community" | "pro" | "team" | "enterprise" => {}
@@ -223,16 +219,13 @@ fn cmd_sign(
         }
     }
 
-    // Parse expiry → Unix timestamp
     let exp_ts = parse_timestamp(expires)?;
 
-    // Parse nbf if provided
     let nbf_ts = match &nbf {
         Some(s) => Some(parse_timestamp(s)?),
         None => None,
     };
 
-    // Read private key seed
     let hex_seed = std::fs::read_to_string(key_path)
         .map_err(|e| format!("cannot read key file {}: {e}", key_path.display()))?;
     let seed_bytes = hex_to_bytes(hex_seed.trim())?;
@@ -246,7 +239,6 @@ fn cmd_sign(
     seed_arr.copy_from_slice(&seed_bytes);
     let sk = SigningKey::from_bytes(&seed_arr);
 
-    // Build payload JSON
     let mut payload = serde_json::json!({
         "iss": "tirith.dev",
         "aud": "tirith-cli",
@@ -271,17 +263,15 @@ fn cmd_sign(
     let payload_json = serde_json::to_string(&payload).map_err(|e| format!("serialize: {e}"))?;
     let payload_bytes = payload_json.as_bytes();
 
-    // Sign
     let sig = sk.sign(payload_bytes);
 
-    // Encode
     let payload_b64 = B64URL.encode(payload_bytes);
     let sig_b64 = B64URL.encode(sig.to_bytes());
     let token = format!("{payload_b64}.{sig_b64}");
 
     println!("{token}");
 
-    // Print summary to stderr
+    // Summary printed to stderr so stdout stays machine-parseable.
     let exp_dt = chrono::DateTime::from_timestamp(exp_ts, 0)
         .map(|d| d.format("%Y-%m-%d").to_string())
         .unwrap_or_else(|| exp_ts.to_string());
@@ -300,7 +290,9 @@ fn cmd_sign(
     }
     eprintln!("\nActivate with: tirith activate <token>");
 
-    // Verify round-trip
+    // Re-verify the token we just produced. A failure here indicates the
+    // signing path itself is broken; refusing to print is safer than
+    // shipping an unverifiable token.
     let vk = sk.verifying_key();
     let (p_b64, s_b64) = token.split_once('.').unwrap();
     let p_bytes = B64URL.decode(p_b64).unwrap();
@@ -319,7 +311,6 @@ fn cmd_inspect(token_arg: Option<String>) -> Result<(), String> {
     let token = match token_arg {
         Some(t) => t,
         None => {
-            // Read from stdin
             let mut buf = String::new();
             std::io::stdin()
                 .read_to_string(&mut buf)
@@ -354,13 +345,11 @@ fn cmd_inspect(token_arg: Option<String>) -> Result<(), String> {
     let payload: serde_json::Value =
         serde_json::from_slice(&payload_bytes).map_err(|e| format!("invalid JSON payload: {e}"))?;
 
-    // Pretty-print payload
     println!(
         "{}",
         serde_json::to_string_pretty(&payload).unwrap_or_else(|_| format!("{payload:?}"))
     );
 
-    // Summary
     println!("\n--- Summary ---");
     if let Some(tier) = payload.get("tier").and_then(|v| v.as_str()) {
         println!("Tier:    {tier}");
@@ -405,16 +394,14 @@ fn cmd_inspect(token_arg: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────
-
-/// Parse a date string (YYYY-MM-DD) or Unix timestamp into i64.
+/// Parse a date string (YYYY-MM-DD) or Unix timestamp into i64. Dates
+/// resolve to 23:59:59 UTC on the given day so tokens stay valid through
+/// the stated expiry day.
 fn parse_timestamp(s: &str) -> Result<i64, String> {
-    // Try Unix timestamp first
     if let Ok(ts) = s.parse::<i64>() {
         return Ok(ts);
     }
 
-    // Try YYYY-MM-DD → end of day UTC
     let date = NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .map_err(|_| format!("invalid date/timestamp '{s}' — use YYYY-MM-DD or Unix timestamp"))?;
     let dt = date
@@ -423,7 +410,6 @@ fn parse_timestamp(s: &str) -> Result<i64, String> {
     Ok(dt.and_utc().timestamp())
 }
 
-/// Decode hex string to bytes.
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
     if hex.len() % 2 != 0 {
         return Err("hex string has odd length".to_string());
@@ -450,7 +436,6 @@ mod tests {
     #[test]
     fn test_parse_timestamp_date() {
         let ts = parse_timestamp("2025-12-31").unwrap();
-        // Should be 2025-12-31 23:59:59 UTC
         let dt = chrono::DateTime::from_timestamp(ts, 0).unwrap();
         assert_eq!(dt.format("%Y-%m-%d").to_string(), "2025-12-31");
     }
@@ -487,7 +472,6 @@ mod tests {
         let sig_b64 = B64URL.encode(sig.to_bytes());
         let token = format!("{payload_b64}.{sig_b64}");
 
-        // Verify
         let (p, s) = token.split_once('.').unwrap();
         let p_bytes = B64URL.decode(p).unwrap();
         let s_bytes = B64URL.decode(s).unwrap();
@@ -495,10 +479,10 @@ mod tests {
         assert!(vk.verify_strict(&p_bytes, &sig_check).is_ok());
     }
 
+    /// Guards the token wire format expected by `license.rs`:
+    /// `base64url(payload_json).base64url(ed25519_sig)`.
     #[test]
     fn test_token_matches_license_rs_format() {
-        // Verify the token format matches what license.rs expects:
-        // base64url(payload_json).base64url(ed25519_sig)
         let sk = SigningKey::generate(&mut OsRng);
 
         let payload =
@@ -510,15 +494,12 @@ mod tests {
         let sig_b64 = B64URL.encode(sig.to_bytes());
         let token = format!("{payload_b64}.{sig_b64}");
 
-        // Token must have exactly one dot
         assert_eq!(token.matches('.').count(), 1);
 
-        // Both segments must be non-empty
         let (left, right) = token.split_once('.').unwrap();
         assert!(!left.is_empty());
         assert!(!right.is_empty());
 
-        // Signature must be 64 bytes when decoded
         let sig_decoded = B64URL.decode(right).unwrap();
         assert_eq!(sig_decoded.len(), 64);
     }

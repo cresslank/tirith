@@ -65,10 +65,6 @@ pub fn resolve_shortened_url(url: &str) -> Option<String> {
     Some(resolved)
 }
 
-// ---------------------------------------------------------------------------
-// Internals
-// ---------------------------------------------------------------------------
-
 /// Extract the host portion from a URL string (cheap, no full parse).
 fn extract_host(url: &str) -> Option<&str> {
     let after_scheme = url

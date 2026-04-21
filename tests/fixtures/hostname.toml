@@ -304,8 +304,6 @@ context = "exec"
 expected_action = "allow"
 expected_rules = []
 
-# ─── Part 3: OCR confusion fixtures ───
-
 [[fixture]]
 name = "ocr_confusable_rnicrosoft"
 min_milestone = 3

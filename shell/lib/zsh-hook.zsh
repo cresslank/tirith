@@ -20,7 +20,7 @@ if [[ -z "${TIRITH_SESSION_ID:-}" ]]; then
   export TIRITH_SESSION_ID
 fi
 
-# Output helper: write to stderr by default (ADR-7).
+# Output helper: write to stderr by default.
 # Override via TIRITH_OUTPUT=tty to write to /dev/tty instead.
 _tirith_output() {
   if [[ "${TIRITH_OUTPUT:-}" == "tty" ]]; then
@@ -34,7 +34,6 @@ _tirith_escape_preview() {
   printf '%q' -- "$1"
 }
 
-# ─── Approval workflow helpers (ADR-7) ───
 
 _tirith_parse_approval() {
   local file="$1"
@@ -46,7 +45,7 @@ _tirith_parse_approval() {
 
   if [[ ! -r "$file" ]]; then
     _tirith_output "tirith: warning: approval file missing or unreadable, failing closed"
-    command rm -f "$file"  # ADR-7: delete on all paths
+    command rm -f "$file"  # delete on all paths
     _tirith_ap_required="yes"
     _tirith_ap_fallback="block"
     _tirith_ap_timeout=0
@@ -75,7 +74,6 @@ _tirith_parse_approval() {
   return 0
 }
 
-# ─── Warn-ack helpers (strict_warn, exit code 3) ───
 
 _tirith_parse_warn_ack() {
   local file="$1"
@@ -104,7 +102,7 @@ if zle -la | grep -q '^accept-line$'; then
 fi
 
 _tirith_accept_line() {
-  setopt localoptions clobber   # mktemp + redirect needs clobber (#70)
+  setopt localoptions clobber   # mktemp + redirect needs clobber
   local buf="$BUFFER"
 
   # Empty input: pass through
@@ -229,13 +227,13 @@ if zle -la | grep -q '^bracketed-paste$'; then
 fi
 
 _tirith_bracketed_paste() {
-  setopt localoptions clobber   # mktemp + redirect needs clobber (#70)
+  setopt localoptions clobber   # mktemp + redirect needs clobber
   # Read the pasted content into CUTBUFFER via the original widget
   local old_buffer="$BUFFER"
   local old_cursor="$CURSOR"
   zle _tirith_original_bracketed_paste 2>/dev/null || zle .bracketed-paste
 
-  # Honor explicit TIRITH=0 bypass (#30): skip paste scanning
+  # Honor explicit TIRITH=0 bypass: skip paste scanning
   [[ "${TIRITH:-}" == "0" ]] && return
 
   # The new content is what was added to BUFFER

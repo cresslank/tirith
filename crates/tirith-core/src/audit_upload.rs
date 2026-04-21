@@ -42,7 +42,6 @@ pub fn spool_event(event_json: &str) -> std::io::Result<()> {
 fn enforce_retention(lines: Vec<String>, max_events: usize, max_bytes: u64) -> Vec<String> {
     let mut result = lines;
 
-    // Trim to max_events (drop oldest = front of vec)
     if result.len() > max_events {
         let drop_count = result.len() - max_events;
         crate::audit::audit_diagnostic(format!(
@@ -51,12 +50,11 @@ fn enforce_retention(lines: Vec<String>, max_events: usize, max_bytes: u64) -> V
         result = result.into_iter().skip(drop_count).collect();
     }
 
-    // Trim to max_bytes (drop oldest until under limit)
-    let total_bytes: u64 = result.iter().map(|l| l.len() as u64 + 1).sum(); // +1 for newline
+    let total_bytes: u64 = result.iter().map(|l| l.len() as u64 + 1).sum(); // +1 per newline
     if total_bytes > max_bytes {
         let mut kept = Vec::new();
         let mut running_bytes: u64 = 0;
-        // Walk from newest (end) to oldest (start), keep until over budget
+        // Walk newest→oldest so the drop list favors the most stale events.
         for line in result.into_iter().rev() {
             let line_bytes = line.len() as u64 + 1;
             if running_bytes + line_bytes > max_bytes && !kept.is_empty() {
@@ -82,7 +80,7 @@ fn enforce_retention(lines: Vec<String>, max_events: usize, max_bytes: u64) -> V
 /// Events are uploaded one at a time with exponential backoff on failure.
 /// On auth errors (401/403) uploading stops immediately.
 pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes: u64) {
-    // SSRF protection
+    // Reject server URLs that would let us SSRF into private/internal hosts.
     if let Err(reason) = crate::url_validate::validate_server_url(server_url) {
         crate::audit::audit_diagnostic(format!("tirith: audit-upload: {reason}"));
         return;
@@ -93,7 +91,6 @@ pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes
         return;
     }
 
-    // Read all lines
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => return,
@@ -103,10 +100,8 @@ pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes
         return;
     }
 
-    // Enforce bounded retention
     let lines = enforce_retention(lines, max_events, max_bytes);
     if lines.is_empty() {
-        // Everything was trimmed -- write empty spool
         if let Err(e) = fs::write(&path, "") {
             crate::audit::audit_diagnostic(format!(
                 "tirith: audit-spool: failed to clear spool: {e}"
@@ -141,11 +136,11 @@ pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes
             {
                 Ok(resp) if resp.status().is_success() => {
                     success = true;
-                    backoff_ms = 1000; // reset on success
+                    backoff_ms = 1000;
                     break;
                 }
                 Ok(resp) if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 => {
-                    // Auth error -- stop trying entirely
+                    // Auth error — further retries will fail identically; stop early.
                     crate::audit::audit_diagnostic(
                         "tirith: audit-upload: auth failed, stopping upload",
                     );
@@ -161,12 +156,10 @@ pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes
         if success {
             sent_count += 1;
         } else {
-            // Failed after retries -- stop and keep remaining
             break;
         }
     }
 
-    // Rewrite spool with unsent lines
     rewrite_spool(&path, &lines[sent_count..]);
 }
 
@@ -205,7 +198,7 @@ pub fn spool_and_upload(
         return;
     }
 
-    // Spawn background thread for drain -- must not block the CLI
+    // Drain runs on a background thread — the CLI path must never block on network I/O.
     let url = server_url.to_string();
     let key = api_key.to_string();
     let max_ev = max_events.unwrap_or(DEFAULT_MAX_EVENTS);
@@ -221,7 +214,6 @@ mod tests {
 
     #[test]
     fn test_spool_path_uses_xdg_state() {
-        // Just verify the function doesn't panic
         let _path = spool_path();
     }
 
@@ -230,19 +222,17 @@ mod tests {
         let lines: Vec<String> = (0..20).map(|i| format!("{{\"n\":{i}}}")).collect();
         let trimmed = enforce_retention(lines, 10, u64::MAX);
         assert_eq!(trimmed.len(), 10);
-        // Should keep the newest 10 (indices 10-19)
+        // Should keep the newest 10 (indices 10-19).
         assert!(trimmed[0].contains("10"));
         assert!(trimmed[9].contains("19"));
     }
 
     #[test]
     fn test_enforce_retention_max_bytes() {
-        // Each line is ~10 bytes + newline = 11 bytes
+        // Each line is ~10 bytes + newline = 11 bytes; 55-byte cap fits ~5 lines.
         let lines: Vec<String> = (0..100).map(|i| format!("{{\"n\":{i:03}}}")).collect();
-        // Allow 55 bytes -- should fit ~5 lines
         let trimmed = enforce_retention(lines, usize::MAX, 55);
         assert!(trimmed.len() <= 5);
-        // Should keep newest lines
     }
 
     #[test]
@@ -257,9 +247,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tirith").join("audit-queue.jsonl");
 
-        // Override spool path via XDG_STATE_HOME
-        // We can't easily override spool_path() in unit tests, so test
-        // the write logic directly.
+        // spool_path() isn't easily overridable in unit tests, so exercise the
+        // write logic directly rather than going through spool_event().
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }

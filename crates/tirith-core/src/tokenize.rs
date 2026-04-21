@@ -37,10 +37,10 @@ pub struct Segment {
     /// Byte range of the *trimmed* segment content within the original input.
     /// `input[segment.byte_range.clone()] == segment.raw` holds.
     ///
-    /// Added for issue #29 to let downstream rules carve out byte spans of
-    /// specific segments (e.g. args to `tirith diff/score/why`). Callers that
-    /// construct `Segment` directly for tests can set any range — production
-    /// code goes through `push_segment` which derives it from `input`.
+    /// Lets downstream rules carve out byte spans of specific segments (e.g.
+    /// args to `tirith diff/score/why`). Test helpers that construct `Segment`
+    /// directly can set any range; production code goes through `push_segment`
+    /// which derives it from `input`.
     pub byte_range: std::ops::Range<usize>,
 }
 
@@ -864,12 +864,9 @@ mod tests {
         let _ = tokenize(input, ShellType::PowerShell);
     }
 
-    // -----------------------------------------------------------------------
-    // Segment.byte_range — prerequisite for #29 inert-arg-range carveout.
-    // Invariant: input[segment.byte_range.clone()] == segment.raw for every
-    // segment, in every shell tokenizer. The range is the *trimmed* span, not
-    // the raw accumulator span (the push_segment docstring explains why).
-    // -----------------------------------------------------------------------
+    // Segment.byte_range invariant: `input[segment.byte_range.clone()] ==
+    // segment.raw` for every segment in every shell tokenizer. The range spans
+    // the TRIMMED content, not the raw accumulator (see push_segment for why).
 
     fn assert_byte_ranges_match_raw(input: &str, segs: &[Segment]) {
         for (i, seg) in segs.iter().enumerate() {

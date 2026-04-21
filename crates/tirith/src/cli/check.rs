@@ -21,7 +21,6 @@ pub fn run(
 ) -> i32 {
     if cmd.trim().is_empty() {
         if approval_check {
-            // Empty command — no approval needed, write no-approval file
             match tirith_core::approval::write_no_approval_file() {
                 Ok(path) => {
                     println!("{}", path.display());
@@ -64,26 +63,20 @@ pub fn run(
         .map(|v| v == "0")
         .unwrap_or(false);
 
-    // Trigger background threat DB update early (detached child, non-blocking).
     // Must run before any early return (--approval-check, daemon path, etc.)
-    // so that hooks calling `tirith check --approval-check` still trigger updates.
+    // so hooks calling `tirith check --approval-check` still trigger updates.
     crate::cli::threatdb_cmd::maybe_background_update();
 
-    // Resolve session ID for post-processing and audit
     let session_id = tirith_core::session::resolve_session_id();
 
-    // Try daemon delegation: skip for --approval-check (requires local policy
-    // + approval file writes) and --no-daemon (explicit opt-out).
-    //
-    // Returns (verdict, Option<Policy>). Local analysis paths return the policy
-    // from the engine to avoid a redundant Policy::discover() call. The daemon
-    // path returns None because analysis already happened server-side.
+    // Daemon delegation skipped for --approval-check (needs local policy +
+    // approval file writes) and --no-daemon. Local paths return the policy from
+    // the engine to avoid a redundant Policy::discover() call; daemon path
+    // returns None because analysis happened server-side.
     let (mut raw_verdict, engine_policy) = if !approval_check && !no_daemon {
         if let Some(resp) =
             crate::cli::daemon::try_daemon_check(cmd, shell, cwd.as_deref(), interactive)
         {
-            // If daemon provides raw_findings, reconstruct a raw verdict for post-processing.
-            // Otherwise fall back to local analysis.
             if let Some(ref raw_findings) = resp.raw_findings {
                 let raw_action_parsed = resp
                     .raw_action
@@ -112,7 +105,7 @@ pub fn run(
                     None,
                 )
             } else {
-                // Pre-upgrade daemon: fall back to local analysis
+                // Pre-upgrade daemon without raw-findings support — run locally.
                 eprintln!(
                     "tirith: daemon does not support raw findings — falling back to local analysis"
                 );
@@ -132,7 +125,6 @@ pub fn run(
                 (v, Some(p))
             }
         } else {
-            // Daemon unavailable — fall through to local analysis
             let ctx = AnalysisContext {
                 input: cmd.to_string(),
                 shell: shell_type,
@@ -165,7 +157,7 @@ pub fn run(
         (v, Some(p))
     };
 
-    // If bypass was honored, skip post-processing — audit bypass and return early
+    // Bypass path audits and returns without post-processing.
     if raw_verdict.bypass_honored {
         let policy =
             engine_policy.unwrap_or_else(|| tirith_core::policy::Policy::discover(cwd.as_deref()));
@@ -181,7 +173,6 @@ pub fn run(
     }
 
     let ran_locally = engine_policy.is_some();
-    // Use policy from engine when available, otherwise load it (daemon path only)
     let policy =
         engine_policy.unwrap_or_else(|| tirith_core::policy::Policy::discover(cwd.as_deref()));
 
@@ -199,7 +190,8 @@ pub fn run(
         }
     }
 
-    // Capture raw info for audit BEFORE post-processing
+    // Snapshot raw action + rule ids before post-processing so the audit log
+    // can record both raw and effective verdicts (for policy-override visibility).
     let raw_action_str = format!("{:?}", raw_verdict.action);
     let raw_rule_ids: Vec<String> = raw_verdict
         .findings
@@ -207,8 +199,6 @@ pub fn run(
         .map(|f| f.rule_id.to_string())
         .collect();
 
-    // post_process_verdict handles: action overrides, approval detection,
-    // paranoia filtering, escalation, and session warning recording.
     let effective = tirith_core::escalation::post_process_verdict(
         &raw_verdict,
         &policy,
@@ -217,7 +207,6 @@ pub fn run(
         CallerContext::Cli,
     );
 
-    // Log audit with BOTH raw and effective info
     let event_id = uuid::Uuid::new_v4().to_string();
     tirith_core::audit::log_verdict_with_raw(
         &effective,
@@ -229,11 +218,9 @@ pub fn run(
         Some(raw_rule_ids),
     );
 
-    // Approval file writing (post_process_verdict handled check_approval + apply_approval
-    // internally, but write_approval_file must still be done here).
-    // Reconstruct ApprovalMetadata from the verdict fields set by apply_approval —
-    // do NOT re-call check_approval on the filtered findings, as paranoia filtering
-    // may have removed the causal finding.
+    // Reconstruct ApprovalMetadata from verdict fields set by apply_approval —
+    // do NOT re-call check_approval on the filtered findings, as paranoia
+    // filtering may have removed the causal finding.
     if approval_check {
         if effective.requires_approval == Some(true) {
             let meta = tirith_core::approval::ApprovalMetadata {
@@ -259,7 +246,6 @@ pub fn run(
                 }
             }
         } else {
-            // No approval needed
             match tirith_core::approval::write_no_approval_file() {
                 Ok(path) => {
                     println!("{}", path.display());
@@ -272,10 +258,9 @@ pub fn run(
         }
     }
 
-    // Auto-checkpoint before destructive commands.
-    // Skip in non-interactive mode: hooks and scripts need fast responses, and
-    // checkpoint::create() synchronously traverses the entire cwd which can take
-    // seconds on large directories.
+    // Skip auto-checkpoint in non-interactive mode: hooks and scripts need
+    // fast responses, and checkpoint::create() synchronously traverses the
+    // entire cwd which can take seconds on large directories.
     if interactive
         && effective.action != Action::Block
         && tirith_core::checkpoint::should_auto_checkpoint(cmd)
@@ -289,7 +274,7 @@ pub fn run(
                 {
                     eprintln!("tirith: auto-checkpoint failed (non-fatal): {e}");
                 } else {
-                    // Purge old checkpoints to prevent unbounded disk growth (#61)
+                    // Purge old checkpoints to prevent unbounded disk growth.
                     let config = tirith_core::checkpoint::CheckpointConfig::default();
                     if let Err(e) = tirith_core::checkpoint::purge(&config) {
                         eprintln!("tirith: checkpoint purge failed (non-fatal): {e}");
@@ -299,12 +284,10 @@ pub fn run(
         }
     }
 
-    // Write last_trigger.json for non-allow verdicts
     if effective.action != Action::Allow {
         last_trigger::write_last_trigger(&effective, cmd, &policy.dlp_custom_patterns);
     }
 
-    // Webhook dispatch (non-blocking background thread)
     if !policy.webhooks.is_empty() {
         tirith_core::webhook::dispatch(
             &effective,
@@ -314,17 +297,16 @@ pub fn run(
         );
     }
 
-    // For --approval-check mode, stdout has ONLY the temp-file path.
-    // Write human-readable output to stderr so hooks can display it.
+    // In --approval-check mode, stdout holds ONLY the temp-file path(s) so
+    // hooks can parse it line-by-line. Human output must go to stderr.
     if approval_check {
         if output::write_human(&effective, warn_only, std::io::stderr().lock()).is_err() {
             eprintln!("tirith: failed to write approval output");
         }
 
-        // Mode B: hook-driven strict_warn — write warn-ack temp file and exit 3.
-        // Shell hooks handle the interactive prompt. Exit code 3 is fail-open on
-        // old hooks (they fall through to "unexpected rc" path).
-        // NOTE: Hook version gating is a follow-up — exit code 3 is safe as-is.
+        // Mode B (hook-driven strict_warn): write warn-ack temp file and exit 3.
+        // Old hooks without warn-ack support treat rc=3 as "unexpected" and
+        // fail open, so this is backward-compatible.
         if effective.action == Action::Warn && (strict_warn || policy.strict_warn) {
             let max_sev = effective
                 .findings
@@ -334,8 +316,8 @@ pub fn run(
                 .unwrap_or(tirith_core::verdict::Severity::Low);
             match tirith_core::approval::write_warn_ack_file(effective.findings.len(), &max_sev) {
                 Ok(path) => {
-                    // Print warn-ack file path on a NEW line after the approval path
-                    // already on stdout. Hooks read line 1 = approval, line 2 = warn-ack.
+                    // Warn-ack path goes on a NEW line after the approval path
+                    // already printed; hooks read line 1 = approval, line 2 = warn-ack.
                     println!("{}", path.display());
                 }
                 Err(e) => {
@@ -343,13 +325,12 @@ pub fn run(
                     return 1;
                 }
             }
-            return tirith_core::verdict::Action::WarnAck.exit_code(); // exit 3
+            return tirith_core::verdict::Action::WarnAck.exit_code();
         }
 
         return effective.action.exit_code();
     }
 
-    // Output
     if json {
         if output::write_json(
             &effective,
@@ -364,10 +345,10 @@ pub fn run(
         eprintln!("tirith: failed to write output");
     }
 
-    // strict_warn promotion: prompt user in interactive mode (Mode A: direct CLI)
+    // Mode A (direct CLI strict_warn): prompt interactively. In non-interactive
+    // mode we fall through to exit code 2 for backward compatibility.
     let exit_code = effective.action.exit_code();
     if exit_code == 2 && (strict_warn || policy.strict_warn) && interactive {
-        // Mode A: direct CLI — prompt the user interactively
         eprint!(
             "tirith: proceed with {} warning(s)? [y/N] ",
             effective.findings.len()
@@ -375,11 +356,10 @@ pub fn run(
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).ok();
         if matches!(input.trim(), "y" | "Y" | "yes" | "Yes") {
-            return 0; // user acknowledged
+            return 0;
         }
-        return 1; // user declined
+        return 1;
     }
-    // strict_warn + non-interactive: return exit code 2 (backward-compatible Warn)
 
     exit_code
 }

@@ -161,14 +161,15 @@ fn expand_env_value(input: &str) -> String {
                     }
                 }
             } else {
-                // CR-6: Use peek to avoid consuming the delimiter character
+                // peek() (not next()) so the delimiter that ends the variable
+                // name stays in the stream for the outer loop to handle.
                 let mut var_name = String::new();
                 while let Some(&ch) = chars.peek() {
                     if ch.is_ascii_alphanumeric() || ch == '_' {
                         var_name.push(ch);
                         chars.next();
                     } else {
-                        break; // Don't consume the delimiter
+                        break;
                     }
                 }
                 if !var_name.is_empty() {
@@ -306,7 +307,7 @@ mod tests {
         let _guard = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // CR-6: The character after $VAR must not be swallowed
+        // Regression guard: the character after `$VAR` must NOT be swallowed.
         unsafe { std::env::set_var("TIRITH_TEST_WH2", "val") };
         assert_eq!(expand_env_value("$TIRITH_TEST_WH2/extra"), "val/extra");
         assert_eq!(expand_env_value("$TIRITH_TEST_WH2 rest"), "val rest");
@@ -330,9 +331,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Adversarial bypass attempts: sensitive env var exfiltration
-    // -----------------------------------------------------------------------
+    // Adversarial bypass attempts: sensitive env var exfiltration.
 
     #[test]
     fn test_bypass_sensitive_var_both_forms() {

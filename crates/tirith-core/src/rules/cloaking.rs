@@ -102,7 +102,6 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
 
     const MAX_BODY: usize = 10 * 1024 * 1024; // 10 MiB
 
-    // Fetch with each user-agent
     let mut responses: Vec<(String, u16, String)> = Vec::new();
 
     for (name, ua) in USER_AGENTS {
@@ -117,18 +116,16 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
         }
     }
 
-    // Check if all fetches failed
     let successful_count = responses.iter().filter(|(_, s, _)| *s != 0).count();
     if successful_count == 0 {
         return Err("all user-agent fetches failed — cannot perform cloaking analysis".to_string());
     }
 
-    // Use chrome as baseline
-    let baseline_idx = 0; // chrome is first
+    // chrome is the baseline (USER_AGENTS[0]); other agents are compared against it.
+    let baseline_idx = 0;
     let baseline_body = &responses[baseline_idx].2;
 
-    // If baseline fetch failed (empty body), we cannot reliably compare — return no findings
-    // rather than false-flagging every non-empty response as cloaking.
+    // If the baseline fetch failed we'd otherwise flag every successful agent as cloaked.
     if baseline_body.is_empty() {
         let agent_responses: Vec<AgentResponse> = responses
             .iter()
@@ -161,13 +158,12 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
         })
         .collect();
 
-    // Compare each non-baseline response against chrome baseline
     for (i, (name, _status, body)) in responses.iter().enumerate() {
         if i == baseline_idx {
             continue;
         }
         if body.is_empty() {
-            continue; // Skip failed fetches
+            continue;
         }
 
         let normalized = normalize_html(body);
@@ -175,7 +171,6 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
 
         if diff_chars > 10 {
             cloaking_detected = true;
-            // Generate diff text showing what words differ
             let diff_detail = generate_diff_text(&baseline_normalized, &normalized);
             diff_pairs.push(DiffPair {
                 agent_a: "chrome".to_string(),
@@ -238,14 +233,13 @@ fn fetch_with_ua(
 
     let status = response.status().as_u16();
 
-    // Check content length hint
     if let Some(len) = response.content_length() {
         if len > max_body as u64 {
             return Err(format!("response too large: {len} bytes"));
         }
     }
 
-    // Read body with size limit to prevent OOM from servers without Content-Length
+    // Belt-and-braces cap on the actual stream — Content-Length may be missing or lying.
     use std::io::Read as _;
     let mut body_bytes = Vec::with_capacity(max_body.min(1024 * 1024));
     response
@@ -348,7 +342,7 @@ fn generate_diff_text(baseline: &str, other: &str) -> String {
         }
     }
 
-    // Char-safe truncation (avoid panic on multibyte boundary)
+    // Char-safe truncation — slicing on a byte boundary inside a UTF-8 codepoint panics.
     if result.len() > 500 {
         let truncated: String = result.chars().take(497).collect();
         result = format!("{truncated}...");
@@ -368,7 +362,6 @@ fn word_diff_size(a: &str, b: &str) -> usize {
 
     let mut diff = 0usize;
 
-    // Words in A not in B (or fewer in B)
     for (word, &count_a) in &counts_a {
         let count_b = counts_b.get(word).copied().unwrap_or(0);
         if count_a > count_b {
@@ -376,7 +369,6 @@ fn word_diff_size(a: &str, b: &str) -> usize {
         }
     }
 
-    // Words in B not in A (or fewer in A)
     for (word, &count_b) in &counts_b {
         let count_a = counts_a.get(word).copied().unwrap_or(0);
         if count_b > count_a {
@@ -410,8 +402,8 @@ mod tests {
 
     #[test]
     fn test_normalize_html_strips_nonces() {
-        // Use a non-script element so the NONCE regex is actually exercised
-        // (the SCRIPT regex would strip the entire <script> tag before NONCE runs).
+        // Test on a non-script element — the SCRIPT regex would otherwise strip the
+        // whole `<script>` tag before NONCE runs and the assertion would pass vacuously.
         let input = r#"<div nonce="abc123">Content</div><p>More</p>"#;
         let normalized = normalize_html(input);
         assert!(
@@ -434,7 +426,6 @@ mod tests {
 
     #[test]
     fn test_word_diff_size_threshold() {
-        // Small cosmetic difference (single word)
         let diff = word_diff_size("Welcome to our site today", "Welcome to our site");
         assert!(diff <= 10, "minor diff should be <=10 chars, got {diff}");
     }

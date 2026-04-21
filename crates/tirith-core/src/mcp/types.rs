@@ -1,10 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-// ---------------------------------------------------------------------------
-// JSON-RPC 2.0
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Serialize)]
 pub struct JsonRpcResponse {
     pub jsonrpc: &'static str,
@@ -42,10 +38,6 @@ impl JsonRpcResponse {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// MCP protocol types
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -145,10 +137,7 @@ pub struct ResourceContent {
     pub text: String,
 }
 
-// ---------------------------------------------------------------------------
-// Supported protocol versions (newest first)
-// ---------------------------------------------------------------------------
-
+/// Supported MCP protocol versions, newest first.
 pub const SUPPORTED_VERSIONS: &[&str] = &[
     "2025-11-25", // Current
     "2025-06-18", // Structured tool outputs, enhanced OAuth
@@ -160,7 +149,8 @@ pub fn negotiate_version(requested: &str) -> String {
     if SUPPORTED_VERSIONS.contains(&requested) {
         requested.to_string()
     } else {
-        // Server responds with its preferred version — client decides whether to continue
+        // Unknown version from client — respond with our preferred version and
+        // let the client decide whether to continue.
         SUPPORTED_VERSIONS[0].to_string()
     }
 }

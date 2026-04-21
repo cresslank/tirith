@@ -37,11 +37,10 @@ pub struct AuditRecord {
     #[serde(default)]
     pub tier_reached: u8,
 
-    // --- Tagged-union discriminator ---
+    /// Tagged-union discriminator — "verdict", "hook_telemetry", or "trust_change".
     #[serde(default = "default_entry_type")]
     pub entry_type: String,
 
-    // --- Hook telemetry fields ---
     #[serde(default)]
     pub event: Option<String>,
     #[serde(default)]
@@ -53,13 +52,11 @@ pub struct AuditRecord {
     #[serde(default)]
     pub elapsed_ms: Option<f64>,
 
-    // --- Raw verdict fields (before post-processing) ---
     #[serde(default)]
     pub raw_action: Option<String>,
     #[serde(default)]
     pub raw_rule_ids: Option<Vec<String>>,
 
-    // --- Trust change fields ---
     #[serde(default)]
     pub trust_pattern: Option<String>,
     #[serde(default)]
@@ -177,11 +174,11 @@ pub fn filter_records(records: &[AuditRecord], filter: &AuditFilter) -> Vec<Audi
     records
         .iter()
         .filter(|r| {
-            // Entry type filter (default: verdict-only for backward compat)
             if !entry_type_matches(&r.entry_type, entry_type_filter) {
                 return false;
             }
-            // CR-10: Parse timestamps for proper timezone-aware comparison
+            // Parse timestamps so --since/--until compare with timezone awareness;
+            // fall back to lexicographic compare when either side fails to parse.
             if let Some(ref since) = filter.since {
                 match (parse_ts(&r.timestamp), parse_ts(since)) {
                     (Some(rt), Some(st)) => {
@@ -190,7 +187,6 @@ pub fn filter_records(records: &[AuditRecord], filter: &AuditFilter) -> Vec<Audi
                         }
                     }
                     _ => {
-                        // Fallback to lexicographic if parsing fails
                         if r.timestamp.as_str() < since.as_str() {
                             return false;
                         }
@@ -243,7 +239,7 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
     let mut raw_total_findings = 0usize;
     let mut total_commands = 0usize;
 
-    // Filter to verdict entries inline (empty entry_type = old records = verdict)
+    // Empty entry_type indicates a pre-tagged-union log entry; treat it as "verdict".
     let is_verdict = |r: &&AuditRecord| r.entry_type.is_empty() || r.entry_type == "verdict";
 
     for record in records.iter().filter(is_verdict) {
@@ -254,8 +250,8 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
         for rid in &record.rule_ids {
             *rule_counts.entry(rid.clone()).or_insert(0) += 1;
         }
-        // Raw detection stats (pre-paranoia). Falls back to effective rule_ids
-        // for old records without raw_rule_ids.
+        // Raw (pre-paranoia) stats. Older records without raw_rule_ids fall back
+        // to their effective rule_ids.
         if let Some(ref raw_ids) = record.raw_rule_ids {
             raw_total_findings += raw_ids.len();
             for rid in raw_ids {
@@ -284,7 +280,7 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
     let time_range = if total_commands == 0 {
         None
     } else {
-        // Use min/max by parsed timestamp (not first/last which assumes order)
+        // Parsed-timestamp min/max — can't assume records are in arrival order.
         let min_ts = records
             .iter()
             .filter(is_verdict)
@@ -408,7 +404,6 @@ pub fn generate_compliance_report(records: &[AuditRecord], stats: &AuditStats) -
 
     report.push_str("# Tirith Compliance Report\n\n");
 
-    // Executive summary
     report.push_str("## Executive Summary\n\n");
     report.push_str(&format!(
         "- **Total commands analyzed:** {}\n",
@@ -429,7 +424,6 @@ pub fn generate_compliance_report(records: &[AuditRecord], stats: &AuditStats) -
     }
     report.push('\n');
 
-    // Action breakdown
     report.push_str("## Action Breakdown\n\n");
     report.push_str("| Action | Count |\n|--------|-------|\n");
     let mut actions: Vec<_> = stats.actions.iter().collect();
@@ -439,7 +433,6 @@ pub fn generate_compliance_report(records: &[AuditRecord], stats: &AuditStats) -
     }
     report.push('\n');
 
-    // Top rules
     if !stats.top_rules.is_empty() {
         report.push_str("## Top Triggered Rules\n\n");
         report.push_str("| Rule ID | Count |\n|---------|-------|\n");
@@ -449,7 +442,6 @@ pub fn generate_compliance_report(records: &[AuditRecord], stats: &AuditStats) -
         report.push('\n');
     }
 
-    // Blocked commands summary
     let blocked: Vec<_> = records
         .iter()
         .filter(|r| r.action.eq_ignore_ascii_case("Block"))
@@ -508,7 +500,6 @@ tr:nth-child(even) { background: #e9ecef; }
 "#,
     );
 
-    // Stats cards
     html.push_str("<div>\n");
     html.push_str(&format!(
         "<div class=\"stat\"><div class=\"stat-value\">{}</div><div class=\"stat-label\">Commands</div></div>\n",
@@ -536,7 +527,6 @@ tr:nth-child(even) { background: #e9ecef; }
         ));
     }
 
-    // Action breakdown
     html.push_str("<h2>Action Breakdown</h2>\n<table><tr><th>Action</th><th>Count</th></tr>\n");
     let mut actions: Vec<_> = stats.actions.iter().collect();
     actions.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -549,7 +539,6 @@ tr:nth-child(even) { background: #e9ecef; }
     }
     html.push_str("</table>\n");
 
-    // Top rules
     if !stats.top_rules.is_empty() {
         html.push_str(
             "<h2>Top Triggered Rules</h2>\n<table><tr><th>Rule ID</th><th>Count</th></tr>\n",
@@ -564,7 +553,6 @@ tr:nth-child(even) { background: #e9ecef; }
         html.push_str("</table>\n");
     }
 
-    // Blocked commands
     let blocked: Vec<_> = records
         .iter()
         .filter(|r| r.action.eq_ignore_ascii_case("Block"))
@@ -821,7 +809,6 @@ mod tests {
         let csv = export_csv(&records);
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(lines.len(), 2);
-        // Field with comma and quotes should be properly escaped
         assert!(lines[1].contains("\"echo \"\"hello, world\"\"\""));
     }
 

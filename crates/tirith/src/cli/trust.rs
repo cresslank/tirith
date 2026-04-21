@@ -156,7 +156,8 @@ fn validate_pattern(pattern: &str, policy: &tirith_core::policy::Policy) -> Resu
     if pattern.is_empty() {
         return Err("pattern must not be empty".to_string());
     }
-    // No control characters (bytes < 0x20 except tab)
+    // Reject control characters (bytes < 0x20) except tab to stop users from
+    // smuggling ANSI escapes or NULs into trust-store entries.
     for (i, b) in pattern.bytes().enumerate() {
         if b < 0x20 && b != b'\t' {
             return Err(format!(
@@ -164,7 +165,6 @@ fn validate_pattern(pattern: &str, policy: &tirith_core::policy::Policy) -> Resu
             ));
         }
     }
-    // Not in blocklist
     if policy.is_blocklisted(pattern) {
         return Err(format!(
             "pattern '{pattern}' is in the blocklist and cannot be trusted"
@@ -175,7 +175,7 @@ fn validate_pattern(pattern: &str, policy: &tirith_core::policy::Policy) -> Resu
 
 /// `tirith trust add <pattern> [--rule <rule_id>] [--ttl <duration>] [--scope user|repo]`
 pub fn add(pattern: &str, rule_id: Option<&str>, ttl: Option<&str>, scope: &str) -> i32 {
-    // Validate pattern against policy (including flat user/org blocklists)
+    // Validate against policy plus flat user/org blocklists loaded below.
     let mut policy = tirith_core::policy::Policy::discover(None);
     policy.load_user_lists();
     policy.load_org_lists(None);
@@ -200,7 +200,6 @@ pub fn add(pattern: &str, rule_id: Option<&str>, ttl: Option<&str>, scope: &str)
         }
     };
 
-    // Compute TTL expiry if provided
     let ttl_expires = match ttl {
         Some(t) => match parse_ttl(t) {
             Ok(exp) => Some(exp),
@@ -227,7 +226,6 @@ pub fn add(pattern: &str, rule_id: Option<&str>, ttl: Option<&str>, scope: &str)
         return 1;
     }
 
-    // Audit log the trust change
     tirith_core::audit::log_trust_change(pattern, rule_id, "add", ttl_expires.as_deref(), scope);
 
     eprintln!(
@@ -239,7 +237,6 @@ pub fn add(pattern: &str, rule_id: Option<&str>, ttl: Option<&str>, scope: &str)
 
 /// `tirith trust list [--rule <id>] [--json] [--expired] [--scope user|repo|all]`
 pub fn list(rule_filter: Option<&str>, json: bool, show_expired: bool, scope: &str) -> i32 {
-    // Validate scope early
     if !matches!(scope, "user" | "repo" | "all") {
         eprintln!("tirith: trust list: unknown scope '{scope}' (use 'user', 'repo', or 'all')");
         return 1;
@@ -252,13 +249,12 @@ pub fn list(rule_filter: Option<&str>, json: bool, show_expired: bool, scope: &s
         s => vec![s],
     };
 
-    // Load trust.json entries from each scope
     for s in &scopes_to_load {
         let path = match trust_store_path(s) {
             Ok(p) => p,
             Err(e) => {
-                // Explicit single-scope request: hard error.
-                // "all" scope: skip gracefully (repo may not exist).
+                // "all" skips missing scopes (e.g., repo outside a git tree);
+                // an explicit single scope is a hard error.
                 if scope != "all" {
                     print_trust_error("list", &e, None);
                     return 1;
@@ -289,9 +285,7 @@ pub fn list(rule_filter: Option<&str>, json: bool, show_expired: bool, scope: &s
         }
     }
 
-    // Load flat allowlists when showing "all" scope
     if scope == "all" {
-        // User flat allowlist
         if let Some(config) = tirith_core::policy::config_dir() {
             let allowlist_path = config.join("allowlist");
             if let Ok(content) = fs::read_to_string(&allowlist_path) {
@@ -310,7 +304,6 @@ pub fn list(rule_filter: Option<&str>, json: bool, show_expired: bool, scope: &s
             }
         }
 
-        // Org flat allowlist
         if let Some(repo_root) = tirith_core::policy::find_repo_root(None) {
             let allowlist_path = repo_root.join(".tirith").join("allowlist");
             if let Ok(content) = fs::read_to_string(&allowlist_path) {
@@ -329,10 +322,9 @@ pub fn list(rule_filter: Option<&str>, json: bool, show_expired: bool, scope: &s
             }
         }
 
-        // Policy YAML allowlist
         let policy = tirith_core::policy::Policy::discover(None);
         for pattern in &policy.allowlist {
-            // Avoid duplicates from flat files already loaded
+            // Skip patterns already surfaced from the flat allowlist files.
             if !rows
                 .iter()
                 .any(|r| r.pattern == *pattern && r.source.starts_with("allowlist"))
@@ -359,7 +351,6 @@ pub fn list(rule_filter: Option<&str>, json: bool, show_expired: bool, scope: &s
         }
     }
 
-    // Apply rule filter
     if let Some(filter) = rule_filter {
         rows.retain(|r| {
             r.rule_id
@@ -375,7 +366,6 @@ pub fn list(rule_filter: Option<&str>, json: bool, show_expired: bool, scope: &s
     } else if rows.is_empty() {
         eprintln!("tirith: no trust entries found");
     } else {
-        // Column-aligned table output
         let max_pat = rows
             .iter()
             .map(|r| r.pattern.len())
@@ -457,7 +447,6 @@ pub fn remove(pattern: &str, rule_id: Option<&str>, scope: &str) -> i32 {
         return 1;
     }
 
-    // Audit log the trust change
     tirith_core::audit::log_trust_change(pattern, rule_id, "remove", None, scope);
 
     eprintln!("tirith: removed {removed} trust entry/entries for '{pattern}' (scope: {scope})");
@@ -496,7 +485,6 @@ pub fn last() -> i32 {
         }
     };
 
-    // Display trigger summary
     if let Some(ts) = val.get("timestamp").and_then(|v| v.as_str()) {
         eprintln!("Last trigger at: {ts}");
     }
@@ -504,7 +492,6 @@ pub fn last() -> i32 {
         eprintln!("Command: {cmd}");
     }
 
-    // Extract domains/URLs from findings evidence
     let mut domains: Vec<String> = Vec::new();
     if let Some(findings) = val.get("findings").and_then(|v| v.as_array()) {
         for finding in findings {
@@ -513,7 +500,6 @@ pub fn last() -> i32 {
             }
             if let Some(evidence) = finding.get("evidence").and_then(|v| v.as_array()) {
                 for ev in evidence {
-                    // Extract URL evidence
                     if let Some(raw) = ev.get("raw").and_then(|v| v.as_str()) {
                         if let Some(host) = extract_host(raw) {
                             if !domains.contains(&host) {
@@ -521,7 +507,6 @@ pub fn last() -> i32 {
                             }
                         }
                     }
-                    // Extract host comparison
                     if let Some(host) = ev.get("raw_host").and_then(|v| v.as_str()) {
                         let h = host.to_string();
                         if !domains.contains(&h) {
@@ -538,7 +523,6 @@ pub fn last() -> i32 {
         return 0;
     }
 
-    // Collect rule IDs from the trigger
     let rule_ids: Vec<String> = val
         .get("rule_ids")
         .and_then(|v| v.as_array())
@@ -566,7 +550,6 @@ pub fn last() -> i32 {
                 add(domain, None, None, "user");
             }
             "r" | "rule" => {
-                // Trust for the specific rule(s) that triggered
                 if rule_ids.is_empty() {
                     eprintln!("tirith: no rule IDs in last trigger, adding global trust");
                     add(domain, None, None, "user");
@@ -590,7 +573,6 @@ pub fn last() -> i32 {
 
 /// `tirith trust gc [--scope user|repo|all]`
 pub fn gc(scope: &str) -> i32 {
-    // Validate scope early
     if !matches!(scope, "user" | "repo" | "all") {
         eprintln!("tirith: trust gc: unknown scope '{scope}' (use 'user', 'repo', or 'all')");
         return 1;
@@ -650,17 +632,17 @@ pub fn gc(scope: &str) -> i32 {
 
 /// Extract a hostname from a URL string for trust prompts.
 fn extract_host(raw: &str) -> Option<String> {
-    // Try full URL parse first -- only trust result if the input has a scheme
+    // Only trust url::Url when the input has a scheme — schemeless inputs
+    // parse into unusable shapes.
     if raw.contains("://") {
         if let Ok(parsed) = url::Url::parse(raw) {
             return parsed.host_str().map(String::from);
         }
     }
-    // Fallback for schemeless: take everything before the first /
+    // Schemeless fallback: take the prefix up to the first '/'.
     let candidate = raw.split('/').next()?;
     let candidate = candidate.trim();
     if candidate.contains('.') && !candidate.contains(' ') {
-        // Strip port if present
         let host = if let Some((h, port)) = candidate.rsplit_once(':') {
             if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() {
                 h
@@ -872,7 +854,6 @@ mod tests {
 
         write_store(&path, &store).unwrap();
 
-        // Simulate GC
         let mut loaded = load_store(&path).unwrap();
         loaded.entries.retain(|e| !is_expired(e));
         write_store(&path, &loaded).unwrap();

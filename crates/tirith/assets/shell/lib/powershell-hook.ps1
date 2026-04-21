@@ -35,7 +35,6 @@ function global:_tirith_escape_preview {
     return (ConvertTo-Json -Compress -InputObject ([string]$Text))
 }
 
-# --- Approval workflow helpers (ADR-7) ---
 
 function global:_tirith_parse_approval {
     param($FilePath)
@@ -47,7 +46,7 @@ function global:_tirith_parse_approval {
 
     if (-not (Test-Path $FilePath -ErrorAction SilentlyContinue)) {
         [Console]::Error.WriteLine("tirith: warning: approval file missing or unreadable, failing closed")
-        Remove-Item $FilePath -Force -ErrorAction SilentlyContinue  # ADR-7: delete on all paths
+        Remove-Item $FilePath -Force -ErrorAction SilentlyContinue  # delete on all paths
         $script:_tirith_ap_required = "yes"
         $script:_tirith_ap_fallback = "block"
         return $false
@@ -119,7 +118,6 @@ function global:_tirith_read_with_timeout {
     return $buffer
 }
 
-# --- Warn-ack helpers (strict_warn, exit code 3) ---
 
 function global:_tirith_parse_warn_ack {
     param($FilePath)
@@ -279,7 +277,7 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
 
 # Override Ctrl+V for paste interception
 Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
-    # Honor TIRITH=0 bypass (#30): skip paste scanning
+    # Honor TIRITH=0 bypass: skip paste scanning
     if ($env:TIRITH -eq "0") {
         $content = Get-Clipboard -ErrorAction SilentlyContinue
         if (-not [string]::IsNullOrEmpty($content)) {

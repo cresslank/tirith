@@ -14,10 +14,6 @@ use serde::{Deserialize, Serialize};
 use crate::session_warnings::SessionWarnings;
 use crate::verdict::{Action, Finding, Severity, Verdict};
 
-// ---------------------------------------------------------------------------
-// Escalation rule types
-// ---------------------------------------------------------------------------
-
 fn default_window_60() -> u64 {
     60
 }
@@ -50,8 +46,8 @@ pub enum EscalationRule {
     },
 }
 
-/// The action an escalation rule can upgrade to. Only Block is supported
-/// (escalation can never downgrade).
+/// The action an escalation rule can upgrade to. Only Block is supported —
+/// escalation can never downgrade the action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EscalationAction {
@@ -65,10 +61,6 @@ impl EscalationAction {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Escalation application
-// ---------------------------------------------------------------------------
 
 /// Captures exactly which rule/domain triggered an escalation, enabling
 /// correct per-key cooldown scoping.
@@ -115,13 +107,13 @@ pub fn apply_escalation(
             } => {
                 let target = esc_action.to_action();
                 if action_gte(action, target) {
-                    continue; // Already at or above target
+                    continue;
                 }
 
                 let wildcard = rule_ids.iter().any(|id| id == "*");
 
-                // Precompute a counted map of current findings keyed by
-                // (rule_id, Option<domain>) so each pair is evaluated exactly once.
+                // Count current findings once per (rule_id, Option<domain>) key
+                // so we don't evaluate the same pair twice in the loop below.
                 let current_counts: HashMap<(String, Option<String>), u32> = {
                     let mut map = HashMap::new();
                     for f in findings {
@@ -145,18 +137,16 @@ pub fn apply_escalation(
                     map
                 };
 
-                // Iterate the deduped (rule_id, domain) keys.
                 for ((fid, domain), current_count) in &current_counts {
                     if action_gte(action, target) {
                         break;
                     }
 
-                    // Cooldown check: skip if a matching recent escalation event
-                    // exists in the session history.
                     if *cooldown_minutes > 0 {
                         let cooldown_active = session.escalation_events.iter().any(|ev| {
                             let rule_matches = if ev.rule_id == "*" {
-                                false // wildcard events only cool down wildcard aggregate
+                                // Wildcard events only cool down the wildcard aggregate path.
+                                false
                             } else {
                                 ev.rule_id == *fid
                             };
@@ -191,8 +181,8 @@ pub fn apply_escalation(
                             rule_id: fid.clone(),
                             domain: domain.clone(),
                         });
-                        // For wildcard rules, also record a wildcard hit so the
-                        // aggregate path cannot bypass per-rule cooldown.
+                        // Record a wildcard hit alongside so the aggregate
+                        // path cannot bypass per-rule cooldown.
                         if wildcard {
                             hits.push(EscalationHit {
                                 rule_id: "*".to_string(),
@@ -207,17 +197,16 @@ pub fn apply_escalation(
                     }
                 }
 
-                // Wildcard aggregate: only when NOT domain_scoped and not already
-                // at target. Catches mixed-rule sessions where no single rule
-                // crosses threshold but the total does.
+                // Wildcard aggregate path: catches mixed-rule sessions where no
+                // single rule crosses the threshold but the combined count does.
+                // Only applies when NOT domain_scoped.
                 if wildcard && !domain_scoped && !action_gte(action, target) {
-                    // Cooldown check for wildcard aggregate.
                     if *cooldown_minutes > 0 {
                         let wildcard_cooled = session.escalation_events.iter().any(|ev| {
                             ev.rule_id == "*" && is_within_minutes(&ev.timestamp, *cooldown_minutes)
                         });
                         if wildcard_cooled {
-                            continue; // skip aggregate path during cooldown
+                            continue;
                         }
                     }
 
@@ -266,7 +255,6 @@ pub fn apply_escalation(
         }
     }
 
-    // Deduplicate hits (same rule_id + domain should only appear once).
     let mut seen = HashSet::new();
     hits.retain(|h| seen.insert((h.rule_id.clone(), h.domain.clone())));
 
@@ -274,10 +262,11 @@ pub fn apply_escalation(
 }
 
 /// Check whether a timestamp string (RFC 3339) is within `minutes` of now.
+///
+/// Fail-safe: unparseable timestamps are treated as within-window so cooldown
+/// stays active rather than allowing premature re-escalation.
 fn is_within_minutes(timestamp: &str, minutes: u64) -> bool {
     let Ok(ts) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
-        // Conservative: treat unparseable timestamps as within-window so cooldown
-        // stays active rather than allowing premature re-escalation.
         return true;
     };
     let cutoff =
@@ -327,10 +316,6 @@ fn extract_finding_domains(finding: &Finding) -> Vec<String> {
     crate::session_warnings::extract_domains_from_evidence(&finding.evidence)
 }
 
-// ---------------------------------------------------------------------------
-// Caller context
-// ---------------------------------------------------------------------------
-
 /// Where the verdict is being processed. Non-CLI callers cannot prompt
 /// interactively, so approval requirements become blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,13 +326,9 @@ pub enum CallerContext {
     Daemon,
 }
 
-// ---------------------------------------------------------------------------
-// Post-process verdict
-// ---------------------------------------------------------------------------
-
 /// Shared post-processing pipeline applied after the core engine produces a
 /// raw verdict. Applies action overrides, approvals, paranoia filtering,
-/// escalation, and session warning recording in the canonical order.
+/// escalation, and session warning recording in that order.
 ///
 /// Side effects: reads and writes session state files (best-effort, never panics).
 pub fn post_process_verdict(
@@ -360,7 +341,8 @@ pub fn post_process_verdict(
     let mut effective = raw_verdict.clone();
     let mut causal_rule_ids: HashSet<String> = HashSet::new();
 
-    // --- 1. Action overrides on RAW findings (before any filtering) ---
+    // Action overrides apply to the RAW findings — before paranoia or any
+    // other filter could remove them.
     if !policy.action_overrides.is_empty() {
         let (new_action, caused_by) = apply_action_overrides(
             effective.action,
@@ -371,7 +353,8 @@ pub fn post_process_verdict(
         causal_rule_ids.extend(caused_by);
     }
 
-    // --- 2. Approval detection BEFORE warning recording ---
+    // Approval detection must run before session warning recording so an
+    // approval-required verdict doesn't get booked as a vanilla warning.
     if let Some(meta) = crate::approval::check_approval(&effective, policy) {
         crate::approval::apply_approval(&mut effective, &meta);
         causal_rule_ids.insert(meta.rule_id.clone());
@@ -380,9 +363,8 @@ pub fn post_process_verdict(
         }
     }
 
-    // --- 3. Paranoia filter + causal finding preservation ---
     // Save the pre-paranoia action so we can enforce "never downgrade" after
-    // filter_findings_by_paranoia recalculates from remaining findings.
+    // filter_findings_by_paranoia recalculates the action from what's left.
     let pre_paranoia_action = effective.action;
 
     let causal_indices: Vec<usize> = raw_verdict
@@ -395,17 +377,15 @@ pub fn post_process_verdict(
 
     crate::engine::filter_findings_by_paranoia(&mut effective, policy.paranoia);
 
-    // Paranoia filtering must never downgrade an action set by explicit overrides/approvals.
-    // Only restore when causal_rule_ids is non-empty (i.e., an override or approval fired).
-    // Engine-natural verdicts (no explicit override) should be allowed to be downgraded
-    // by paranoia filtering.
+    // Paranoia must never downgrade an action that was explicitly set by an
+    // override or approval. Engine-natural verdicts (no causal rules) ARE
+    // allowed to be downgraded — that's the point of paranoia.
     if !causal_rule_ids.is_empty()
         && action_rank(pre_paranoia_action) > action_rank(effective.action)
     {
         effective.action = pre_paranoia_action;
     }
 
-    // Re-add causal findings that paranoia may have removed
     for &idx in &causal_indices {
         if idx < raw_verdict.findings.len() {
             let causal = &raw_verdict.findings[idx];
@@ -421,10 +401,10 @@ pub fn post_process_verdict(
         }
     }
 
-    // If action is non-Allow due to explicit overrides/approvals but findings were
-    // all filtered out, restore some so the user can see why the action was set.
-    // Only do this when causal_rule_ids is non-empty — for engine-natural verdicts
-    // where paranoia filtered everything out, let the action naturally recompute to Allow.
+    // When paranoia filtered every finding out but an override/approval still
+    // forced a non-Allow action, surface some findings so the user can see WHY
+    // the action was set. Skip this when causal_rule_ids is empty — then the
+    // Allow-equivalent recompute is correct.
     if !causal_rule_ids.is_empty()
         && effective.action != Action::Allow
         && effective.findings.is_empty()
@@ -438,7 +418,7 @@ pub fn post_process_verdict(
         }
     }
 
-    // --- 4. Escalation check BEFORE recording ---
+    // Escalation runs BEFORE warning recording so the escalated action wins.
     if !policy.escalation.is_empty() && matches!(effective.action, Action::Warn | Action::WarnAck) {
         let session = crate::session_warnings::load(session_id);
         let (new_action, caused_by, escalation_hits, reason) = apply_escalation(
@@ -449,19 +429,17 @@ pub fn post_process_verdict(
         );
         if new_action != effective.action {
             effective.escalation_reason = reason;
-            // Record escalation events outside the warning recording gate:
-            // escalated blocks are Action::Block and would skip the Warn/WarnAck
-            // recording path, so we write them separately.
+            // Escalations upgrade to Action::Block, which skips the Warn/WarnAck
+            // recording path below — so record the escalation events separately.
             crate::session_warnings::record_escalation_event(session_id, &escalation_hits);
         }
         effective.action = new_action;
         causal_rule_ids.extend(caused_by);
     }
 
-    // --- 5. Session outcome recording — warnings + hidden findings ---
-    // Compute hidden findings via multiset diff of raw minus final effective.
-    // Collect actual Finding references so `record_outcome` can store full
-    // `HiddenEvent` details for `tirith warnings --hidden`.
+    // Hidden findings = multiset diff of raw minus effective. Keep the actual
+    // Finding references so record_outcome can store full HiddenEvent details
+    // (exposed via `tirith warnings --hidden`).
     let hidden_findings_vec: Vec<&Finding> = {
         let mut effective_counts: HashMap<(String, String, String, String), u32> = HashMap::new();
         for f in &effective.findings {
@@ -517,10 +495,6 @@ pub fn post_process_verdict(
     effective
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,8 +549,6 @@ mod tests {
         session
     }
 
-    // --- Escalation tests ---
-
     #[test]
     fn test_repeat_count_below_threshold() {
         let session = session_with_history("non_ascii_hostname", 2);
@@ -591,7 +563,7 @@ mod tests {
         }];
 
         let (action, causal, _, _) = apply_escalation(Action::Warn, &findings, &session, &rules);
-        // 2 (history) + 1 (current) = 3 < 5
+        // 2 (history) + 1 (current) = 3 < 5.
         assert_eq!(action, Action::Warn);
         assert!(causal.is_empty());
     }
@@ -610,7 +582,6 @@ mod tests {
         }];
 
         let (action, causal, hits, _) = apply_escalation(Action::Warn, &findings, &session, &rules);
-        // 4 + 1 = 5 >= 5
         assert_eq!(action, Action::Block);
         assert!(causal.contains("non_ascii_hostname"));
         assert!(hits
@@ -632,9 +603,8 @@ mod tests {
         }];
 
         let (action, _, hits, _) = apply_escalation(Action::Warn, &findings, &session, &rules);
-        // 9 + 1 = 10 >= 10 (aggregate wildcard path)
+        // 9 + 1 = 10 — the aggregate wildcard path.
         assert_eq!(action, Action::Block);
-        // Should have a wildcard hit
         assert!(hits.iter().any(|h| h.rule_id == "*" && h.is_wildcard()));
     }
 
@@ -651,7 +621,7 @@ mod tests {
         }];
 
         let (action, _, _, _) = apply_escalation(Action::Warn, &findings, &session, &rules);
-        // Only 1 >= Medium
+        // Only 1 finding is ≥ Medium, threshold is 3.
         assert_eq!(action, Action::Warn);
     }
 
@@ -686,16 +656,14 @@ mod tests {
             cooldown_minutes: 0,
         }];
 
-        // Already Block -- should stay Block even though threshold not met
+        // Already Block: stays Block even though the rule's threshold isn't met.
         let (action, _, _, _) = apply_escalation(Action::Block, &findings, &session, &rules);
         assert_eq!(action, Action::Block);
     }
 
     #[test]
     fn test_cooldown_suppresses_escalation() {
-        // Simulate: escalation fired recently, cooldown should prevent re-fire.
         let mut session = session_with_history("shortened_url", 4);
-        // Add a recent escalation event for this rule.
         session
             .escalation_events
             .push_back(crate::session_warnings::EscalationEvent {
@@ -713,7 +681,7 @@ mod tests {
             cooldown_minutes: 60,
         }];
 
-        // 4 (history) + 1 (current) = 5 >= 3, but cooldown is active
+        // 4 (history) + 1 (current) = 5 ≥ threshold, but cooldown is active.
         let (action, causal, hits, _) = apply_escalation(Action::Warn, &findings, &session, &rules);
         assert_eq!(action, Action::Warn);
         assert!(causal.is_empty());
@@ -722,7 +690,7 @@ mod tests {
 
     #[test]
     fn test_cooldown_zero_does_not_suppress() {
-        // cooldown_minutes=0 means no cooldown; escalation always fires.
+        // cooldown_minutes=0 disables cooldown entirely.
         let mut session = session_with_history("shortened_url", 4);
         session
             .escalation_events
@@ -747,8 +715,7 @@ mod tests {
 
     #[test]
     fn test_wildcard_cooldown_suppresses_aggregate() {
-        // Wildcard aggregate cooldown: a previous wildcard escalation event
-        // should suppress the aggregate path.
+        // A prior wildcard escalation event must cool down the aggregate path.
         let mut session = session_with_history("any_rule", 9);
         session
             .escalation_events
@@ -768,11 +735,9 @@ mod tests {
         }];
 
         let (action, _, _, _) = apply_escalation(Action::Warn, &findings, &session, &rules);
-        // 9 + 1 = 10, but wildcard cooldown is active
+        // 9 + 1 = 10, but wildcard cooldown is active.
         assert_eq!(action, Action::Warn);
     }
-
-    // --- Action override tests ---
 
     #[test]
     fn test_action_override_block() {
@@ -789,7 +754,7 @@ mod tests {
     fn test_action_override_invalid_value_ignored() {
         let findings = vec![make_finding(RuleId::NonAsciiHostname, Severity::Medium)];
         let mut overrides = HashMap::new();
-        // "warn" is not a valid override value
+        // Only "block" is a valid override value.
         overrides.insert("non_ascii_hostname".to_string(), "warn".to_string());
 
         let (action, causal) = apply_action_overrides(Action::Warn, &findings, &overrides);
@@ -807,8 +772,6 @@ mod tests {
         assert_eq!(action, Action::Warn);
         assert!(causal.is_empty());
     }
-
-    // --- Post-process verdict tests ---
 
     #[test]
     fn test_post_process_noop_on_allow() {
@@ -881,7 +844,8 @@ mod tests {
 
     #[test]
     fn test_post_process_ordering_override_before_escalation() {
-        // Action override should fire first, escalation should see Block already
+        // Override must fire first; escalation then sees action already at Block
+        // and becomes a no-op.
         let findings = vec![make_finding(RuleId::ShortenedUrl, Severity::Medium)];
         let raw = Verdict {
             action: Action::Warn,
@@ -922,7 +886,6 @@ mod tests {
             "test-session",
             CallerContext::Cli,
         );
-        // Should be Block from the override, not from escalation
         assert_eq!(result.action, Action::Block);
     }
 
@@ -938,13 +901,12 @@ mod tests {
                 ..
             } => {
                 assert_eq!(threshold, 5);
-                assert_eq!(window_minutes, 60); // default
-                assert_eq!(cooldown_minutes, 0); // default
+                assert_eq!(window_minutes, 60);
+                assert_eq!(cooldown_minutes, 0);
             }
             _ => panic!("expected RepeatCount"),
         }
 
-        // With explicit cooldown_minutes
         let json_cd = r#"{"trigger":"repeat_count","rule_ids":["*"],"threshold":5,"action":"block","cooldown_minutes":10}"#;
         let rule_cd: EscalationRule = serde_json::from_str(json_cd).unwrap();
         match rule_cd {
@@ -968,8 +930,9 @@ mod tests {
 
     #[test]
     fn test_hidden_count_multiset_with_duplicates() {
-        // Two raw findings share the same (rule_id, severity, title, description).
-        // Only one survives paranoia. Hidden count should be 1, not 0.
+        // Regression guard: duplicate findings sharing all identity fields
+        // must count as two in the raw-vs-effective multiset diff, so one
+        // surviving finding leaves one in the hidden set (not zero).
         let dup_finding = make_finding(RuleId::ShortenedUrl, Severity::Medium);
         let low_finding = Finding {
             severity: Severity::Low,
@@ -995,9 +958,8 @@ mod tests {
             escalation_reason: None,
         };
 
-        // Paranoia 1: keeps Medium+, removes Low
-        // Two identical Medium findings both survive, one Low is hidden
-        let policy = crate::policy::Policy::default(); // paranoia=1
+        // Default Policy has paranoia=1, which keeps Medium+ and removes Low.
+        let policy = crate::policy::Policy::default();
         let result = post_process_verdict(
             &raw,
             &policy,
@@ -1006,7 +968,6 @@ mod tests {
             CallerContext::Cli,
         );
 
-        // Both Medium findings visible, Low finding hidden
         assert_eq!(
             result
                 .findings
@@ -1015,9 +976,5 @@ mod tests {
                 .count(),
             2
         );
-        // The Low finding was hidden by paranoia (but re-added by fallback
-        // because action stayed non-Allow). In this case both dup_findings
-        // keep the action at Warn, so the Low may or may not be re-added.
-        // The key invariant: hidden_count is the correct multiset diff.
     }
 }

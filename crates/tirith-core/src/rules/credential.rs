@@ -21,10 +21,6 @@ use crate::rules::shared::SENSITIVE_KEY_VARS;
 use crate::tokenize::ShellType;
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
-// ---------------------------------------------------------------------------
-// TOML schema
-// ---------------------------------------------------------------------------
-
 #[derive(Deserialize)]
 struct PatternFile {
     #[serde(default)]
@@ -59,10 +55,6 @@ struct PrivateKeyDef {
     #[allow(dead_code)]
     severity: String,
 }
-
-// ---------------------------------------------------------------------------
-// Compiled patterns (loaded once)
-// ---------------------------------------------------------------------------
 
 struct CompiledPattern {
     name: String,
@@ -103,10 +95,6 @@ static GENERIC_SECRET_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("GENERIC_SECRET_RE compile")
 });
 
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
-
 /// Check text for credential leaks. Exec + paste only (not file-scan).
 pub fn check(input: &str, _shell: ShellType, context: ScanContext) -> Vec<Finding> {
     if matches!(context, ScanContext::FileScan) {
@@ -124,10 +112,6 @@ pub fn check(input: &str, _shell: ShellType, context: ScanContext) -> Vec<Findin
 
     findings
 }
-
-// ---------------------------------------------------------------------------
-// Layer 1: Known provider patterns
-// ---------------------------------------------------------------------------
 
 fn check_known_patterns(input: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -157,10 +141,6 @@ fn check_known_patterns(input: &str) -> Vec<Finding> {
     findings
 }
 
-// ---------------------------------------------------------------------------
-// Layer 2: Private key blocks
-// ---------------------------------------------------------------------------
-
 fn check_private_keys(input: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
     for _ in PRIVATE_KEY_RE.find_iter(input) {
@@ -182,10 +162,6 @@ fn check_private_keys(input: &str) -> Vec<Finding> {
     }
     findings
 }
-
-// ---------------------------------------------------------------------------
-// Layer 3: Generic entropy-based secrets (paste only)
-// ---------------------------------------------------------------------------
 
 fn check_generic_secrets(input: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -217,16 +193,14 @@ fn check_generic_secrets(input: &str) -> Vec<Finding> {
     findings
 }
 
-// ---------------------------------------------------------------------------
-// Dedup helper: suppress if the match is part of `export VAR=`, `env VAR=`,
-// or fish `set ... VAR` where VAR is in SENSITIVE_KEY_VARS.
-// ---------------------------------------------------------------------------
-
+/// Suppress a credential match that's already going to fire as `SensitiveEnvExport`
+/// elsewhere — i.e. the value sits behind `export VAR=`, `env VAR=`, or fish
+/// `set ... VAR` where `VAR` is in `SENSITIVE_KEY_VARS`. Avoids double-reporting.
 fn is_covered_by_env_export(input: &str, match_start: usize) -> bool {
     let prefix = &input[..match_start];
     let trimmed = prefix.trim_end();
 
-    // Case 1: POSIX-style `VAR=value` — check for export/env/set before VAR=
+    // POSIX form: `... export VAR=value` / `... env VAR=value` / `... set VAR=value`.
     let posix_match = SENSITIVE_KEY_VARS.iter().any(|var| {
         let suffix_eq = format!("{var}=");
         let suffix_eq_sq = format!("{var}='");
@@ -251,14 +225,12 @@ fn is_covered_by_env_export(input: &str, match_start: usize) -> bool {
         return true;
     }
 
-    // Case 2: Fish-style `set [-gx] VAR value` — VAR is followed by space, not =
-    // The matched secret starts at match_start. In fish, the prefix looks like
-    // `set -gx AWS_ACCESS_KEY_ID ` (space before the value, no =).
-    // Use the raw prefix (not trimmed) to preserve trailing space.
+    // Fish form: `set [-gx] VAR value` (space, not `=`, between VAR and value).
+    // The prefix immediately before the match looks like `set -gx VAR ` — so we
+    // need the *raw* prefix (trailing space preserved) to anchor on the space.
     let raw_prefix = prefix;
     SENSITIVE_KEY_VARS.iter().any(|var| {
         let suffix_space = format!("{var} ");
-        // Check raw prefix (not trimmed) so trailing space is preserved
         if !raw_prefix.ends_with(&suffix_space) {
             return false;
         }
@@ -271,15 +243,12 @@ fn is_covered_by_env_export(input: &str, match_start: usize) -> bool {
     })
 }
 
-/// Check if `before` ends with a chain starting from `cmd`.
-/// Handles intervening flags like `env -S VAR=` or `set -gx VAR`.
+/// Check if `before` ends with a chain starting from `cmd`, allowing intervening
+/// flags or VAR=val pairs (e.g. `env -S VAR=`, `set -gx VAR`).
 fn has_command_prefix(before: &str, cmd: &str) -> bool {
-    // Split on whitespace and check if cmd appears as any word
     let words: Vec<&str> = before.split_whitespace().collect();
-    // Find the last occurrence of cmd in the words
     for (i, w) in words.iter().enumerate().rev() {
         if *w == cmd {
-            // Everything after cmd should be flags or VAR=val pairs
             let rest = &words[i + 1..];
             return rest.iter().all(|w| w.starts_with('-') || w.contains('='));
         }
@@ -287,9 +256,7 @@ fn has_command_prefix(before: &str, cmd: &str) -> bool {
     false
 }
 
-// ---------------------------------------------------------------------------
-// Entropy scoring — ported from ripsecrets (MIT)
-// ---------------------------------------------------------------------------
+// Entropy scoring — ported from ripsecrets (MIT). See module-level docs for source.
 
 /// Probability that `s` is a random string (higher = more likely random).
 fn p_random(s: &[u8]) -> f64 {
@@ -331,8 +298,6 @@ fn is_random(s: &[u8]) -> bool {
     true
 }
 
-// ---- Bigrams (from ripsecrets) ----
-
 static BIGRAMS: Lazy<HashSet<&'static [u8]>> = Lazy::new(|| {
     let bigrams_bytes: &[u8] = b"er,te,an,en,ma,ke,10,at,/m,on,09,ti,al,io,.h,./,..,ra,ht,es,or,tm,pe,ml,re,in,3/,n3,0F,ok,ey,00,80,08,ss,07,15,81,F3,st,52,KE,To,01,it,2B,2C,/E,P_,EY,B7,se,73,de,VP,EV,to,od,B0,0E,nt,et,_P,A0,60,90,0A,ri,30,ar,C0,op,03,ec,ns,as,FF,F7,po,PK,la,.p,AE,62,me,F4,71,8E,yp,pa,50,qu,D7,7D,rs,ea,Y_,t_,ha,3B,c/,D2,ls,DE,pr,am,E0,oc,06,li,do,id,05,51,40,ED,_p,70,ed,04,02,t.,rd,mp,20,d_,co,ro,ex,11,ua,nd,0C,0D,D0,Eq,le,EF,wo,e_,e.,ct,0B,_c,Li,45,rT,pt,14,61,Th,56,sT,E6,DF,nT,16,85,em,BF,9E,ne,_s,25,91,78,57,BE,ta,ng,cl,_t,E1,1F,y_,xp,cr,4F,si,s_,E5,pl,AB,ge,7E,F8,35,E2,s.,CF,58,32,2F,E7,1B,ve,B1,3D,nc,Gr,EB,C6,77,64,sl,8A,6A,_k,79,C8,88,ce,Ex,5C,28,EA,A6,2A,Ke,A7,th,CA,ry,F0,B6,7/,D9,6B,4D,DA,3C,ue,n7,9C,.c,7B,72,ac,98,22,/o,va,2D,n.,_m,B8,A3,8D,n_,12,nE,ca,3A,is,AD,rt,r_,l-,_C,n1,_v,y.,yw,1/,ov,_n,_d,ut,no,ul,sa,CT,_K,SS,_e,F1,ty,ou,nG,tr,s/,il,na,iv,L_,AA,da,Ty,EC,ur,TX,xt,lu,No,r.,SL,Re,sw,_1,om,e/,Pa,xc,_g,_a,X_,/e,vi,ds,ai,==,ts,ni,mg,ic,o/,mt,gm,pk,d.,ch,/p,tu,sp,17,/c,ym,ot,ki,Te,FE,ub,nL,eL,.k,if,he,34,e-,23,ze,rE,iz,St,EE,-p,be,In,ER,67,13,yn,ig,ib,_f,.o,el,55,Un,21,fi,54,mo,mb,gi,_r,Qu,FD,-o,ie,fo,As,7F,48,41,/i,eS,ab,FB,1E,h_,ef,rr,rc,di,b.,ol,im,eg,ap,_l,Se,19,oS,ew,bs,Su,F5,Co,BC,ud,C1,r-,ia,_o,65,.r,sk,o_,ck,CD,Am,9F,un,fa,F6,5F,nk,lo,ev,/f,.t,sE,nO,a_,EN,E4,Di,AC,95,74,1_,1A,us,ly,ll,_b,SA,FC,69,5E,43,um,tT,OS,CE,87,7A,59,44,t-,bl,ad,Or,D5,A_,31,24,t/,ph,mm,f.,ag,RS,Of,It,FA,De,1D,/d,-k,lf,hr,gu,fy,D6,89,6F,4E,/k,w_,cu,br,TE,ST,R_,E8,/O";
     bigrams_bytes.split(|b| *b == b',').collect()
@@ -348,8 +313,6 @@ fn p_random_bigrams(s: &[u8]) -> f64 {
     }
     p_binomial(s.len(), num_bigrams, (BIGRAMS.len() as f64) / (64.0 * 64.0))
 }
-
-// ---- Char class probabilities ----
 
 fn p_random_char_class(s: &[u8], base: f64) -> f64 {
     if base == 16.0 {
@@ -374,8 +337,6 @@ fn p_random_char_class_aux(s: &[u8], min: u8, max: u8, base: f64) -> f64 {
     let num_chars = (max - min + 1) as f64;
     p_binomial(s.len(), count, num_chars / base)
 }
-
-// ---- Distinct values ----
 
 fn p_random_distinct_values(s: &[u8], base: f64) -> f64 {
     let total_possible: f64 = base.powi(s.len() as i32);
@@ -427,8 +388,6 @@ fn num_distinct_configurations_aux(num_positions: usize, position: usize, remain
             * num_distinct_configurations_aux(num_positions, position, remaining - 1)
 }
 
-// ---- Binomial probability ----
-
 fn p_binomial(n: usize, x: usize, p: f64) -> f64 {
     let left_tail = (x as f64) < n as f64 * p;
     let min = if left_tail { 0 } else { x };
@@ -450,10 +409,6 @@ fn factorial(n: usize) -> f64 {
     }
     res
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -481,7 +436,7 @@ mod tests {
 
     #[test]
     fn test_bare_aws_key_assignment_fires() {
-        // Bare VAR= without export/env/set is NOT suppressed
+        // Bare VAR= without export/env/set must NOT be suppressed.
         let input = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE";
         let findings = check(input, ShellType::Posix, ScanContext::Exec);
         assert!(
@@ -578,7 +533,6 @@ mod tests {
 
     #[test]
     fn test_generic_entropy_detected() {
-        // A keyword-assignment with a random-looking value in paste context
         let input = r#"secret_key = "xK9mP2vL7nR4wQ8jF3hB6dT1yC5uA0eG""#;
         let findings = check(input, ShellType::Posix, ScanContext::Paste);
         assert!(
@@ -604,7 +558,6 @@ mod tests {
 
     #[test]
     fn test_readable_password_not_flagged() {
-        // A readable, non-random password should NOT be flagged by entropy check
         let input = r#"password = "hello_world""#;
         let findings = check(input, ShellType::Posix, ScanContext::Paste);
         assert!(
@@ -617,7 +570,7 @@ mod tests {
 
     #[test]
     fn test_p_random_ported_correctly() {
-        // Verify the ported p_random gives same results as ripsecrets
+        // Anchors against ripsecrets behaviour — guards the entropy port.
         assert!(p_random(b"hello_world") < 1.0 / 1e6);
         assert!(p_random(b"xK9mP2vL7nR4wQ8jF3hB6dT1yC5uA0eG") > 1.0 / 1e4);
         assert!(p_random(b"rT8vN1kL5qW3mC7xH2jP9sD4fB6yZ0uA") > 1.0 / 1e4);
@@ -641,7 +594,7 @@ mod tests {
 
     #[test]
     fn test_fish_set_eq_suppressed() {
-        // POSIX-style VAR= after set (some fish versions)
+        // Some fish versions accept POSIX-style VAR= after set.
         let input = "set -gx AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE";
         let findings = check(input, ShellType::Fish, ScanContext::Exec);
         assert!(
@@ -652,7 +605,7 @@ mod tests {
 
     #[test]
     fn test_fish_set_space_suppressed() {
-        // Canonical fish form: set -gx VAR value (space-separated)
+        // Canonical fish form: `set -gx VAR value` (space-separated, no `=`).
         let input = "set -gx AWS_ACCESS_KEY_ID AKIAIOSFODNN7EXAMPLE";
         let findings = check(input, ShellType::Fish, ScanContext::Exec);
         assert!(

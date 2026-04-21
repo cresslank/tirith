@@ -19,7 +19,6 @@ pub fn activate(key: &str) -> i32 {
         }
     };
 
-    // Write the token to the license key file
     let path = match license::license_key_path() {
         Some(p) => p,
         None => {
@@ -110,7 +109,6 @@ pub fn refresh() -> i32 {
 
     #[cfg(unix)]
     {
-        // Read server URL and API key from env or policy config
         let server_url = std::env::var("TIRITH_SERVER_URL")
             .ok()
             .filter(|s| !s.is_empty())
@@ -145,7 +143,6 @@ pub fn refresh() -> i32 {
 
         match license::refresh_from_server(&server_url, &api_key) {
             Ok(token) => {
-                // Validate the new token
                 let info = match license::decode_and_validate_token(&token) {
                     Some(info) => info,
                     None => {
@@ -154,7 +151,6 @@ pub fn refresh() -> i32 {
                     }
                 };
 
-                // Write token
                 let path = match license::license_key_path() {
                     Some(p) => p,
                     None => {
@@ -266,7 +262,6 @@ fn format_expiry(exp: &str) -> String {
             return dt.format("%Y-%m-%d %H:%M UTC").to_string();
         }
     }
-    // Already a date string
     exp.to_string()
 }
 
@@ -278,7 +273,6 @@ fn days_remaining(exp: &str) -> Option<i64> {
         let delta = exp_dt.signed_duration_since(now);
         return Some(delta.num_days());
     }
-    // ISO 8601 date
     if let Ok(date) = chrono::NaiveDate::parse_from_str(exp, "%Y-%m-%d") {
         let today = now.date_naive();
         return Some((date - today).num_days());

@@ -20,7 +20,6 @@ pub fn verify_webhook(
     sig_header: &str,
     max_age_secs: i64,
 ) -> Result<(), WebhookError> {
-    // Decode the secret: strip "whsec_" prefix, base64-decode the remainder.
     let key_b64 = secret
         .strip_prefix("whsec_")
         .ok_or(WebhookError::InvalidSecret)?;
@@ -28,12 +27,12 @@ pub fn verify_webhook(
         .decode(key_b64)
         .map_err(|_| WebhookError::InvalidSecret)?;
 
-    // Replay protection
+    // Replay protection: reject messages whose timestamp is out of window.
     let ts: i64 = timestamp
         .parse()
         .map_err(|_| WebhookError::InvalidTimestamp)?;
     let now = chrono::Utc::now().timestamp();
-    // Use checked_sub to prevent overflow with extreme timestamps
+    // checked_sub guards against overflow on extreme timestamps.
     let expired = now
         .checked_sub(ts)
         .map(|d| d.unsigned_abs() > max_age_secs as u64)
@@ -42,7 +41,7 @@ pub fn verify_webhook(
         return Err(WebhookError::TimestampExpired);
     }
 
-    // HMAC-SHA256: key = decoded secret, msg = "{msg_id}.{timestamp}.{body}"
+    // Standard Webhooks HMAC input: "{msg_id}.{timestamp}.{body}".
     let mut mac =
         HmacSha256::new_from_slice(&key_bytes).map_err(|_| WebhookError::InvalidSecret)?;
     mac.update(msg_id.as_bytes());
@@ -53,7 +52,8 @@ pub fn verify_webhook(
 
     let expected = mac.finalize().into_bytes();
 
-    // Parse space-separated "v1,<base64>" entries — any valid match = pass (key rotation).
+    // Accept any matching "v1,<base64>" entry — supports key rotation
+    // where multiple signatures are sent in the same header.
     let mut found_v1 = false;
     for entry in sig_header.split(' ') {
         let entry = entry.trim();
@@ -114,7 +114,7 @@ mod tests {
     use super::*;
 
     fn make_secret() -> (String, Vec<u8>) {
-        let raw_key = b"test-secret-key-32bytes-long!!!!"; // 32 bytes
+        let raw_key = b"test-secret-key-32bytes-long!!!!";
         let b64 = base64::engine::general_purpose::STANDARD.encode(raw_key);
         (format!("whsec_{b64}"), raw_key.to_vec())
     }
@@ -151,7 +151,6 @@ mod tests {
         let msg_id = "msg_abc123";
         let ts = chrono::Utc::now().timestamp().to_string();
 
-        // Sign with a different key
         let wrong_key = b"wrong-secret-key-32bytes-long!!!";
         let sig_header = sign_body(wrong_key, msg_id, &ts, body);
 
@@ -179,7 +178,7 @@ mod tests {
         let ts = chrono::Utc::now().timestamp().to_string();
 
         let valid_sig = sign_body(&key, msg_id, &ts, body);
-        // Simulate key rotation: old (invalid) sig first, then current (valid) sig
+        // Key rotation: a stale signature first, then the current one.
         let sig_header = format!("v1,aW52YWxpZHNpZ25hdHVyZWhlcmUxMjM0NTY3 {valid_sig}");
 
         assert!(verify_webhook(&secret, msg_id, &ts, body, &sig_header, 300).is_ok());

@@ -50,8 +50,7 @@ pub fn write_json(
 /// preexec `DEBUG` trap). In that mode, Block verdicts render as `DETECTED
 /// (shell hook cannot block in preexec mode — command will still run)` instead
 /// of `BLOCKED`, and the bypass hint line is rewritten accordingly. The flag
-/// is human-only — it never reaches `write_json`, audit logs, or exit codes
-/// (see issue #77).
+/// is human-only — it MUST never reach `write_json`, audit logs, or exit codes.
 pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std::io::Result<()> {
     if verdict.findings.is_empty() {
         return Ok(());

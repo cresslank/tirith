@@ -246,7 +246,7 @@ pub fn list() -> Result<Vec<CheckpointListEntry>, String> {
 /// or absolute paths.
 fn validate_restore_path(path: &str) -> Result<(), String> {
     let p = Path::new(path);
-    // Path::is_absolute() is platform-specific (Windows requires drive letter),
+    // `Path::is_absolute()` on Windows only matches paths with a drive letter,
     // so also reject Unix-style absolute paths explicitly on all platforms.
     if p.is_absolute() || path.starts_with('/') {
         return Err(format!("restore path is absolute: {path}"));
@@ -289,13 +289,10 @@ pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
 
     for entry in &manifest {
         if entry.is_dir {
-            continue; // Directories are created implicitly
+            continue; // Directories are created implicitly when their children restore.
         }
 
-        // CR-1: Validate original_path against path traversal
         validate_restore_path(&entry.original_path)?;
-
-        // CR-2: Validate sha256 field is a proper hex filename
         validate_sha256_filename(&entry.sha256)?;
 
         let src = files_dir.join(&entry.sha256);
@@ -308,7 +305,6 @@ pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
         }
 
         let dst = Path::new(&entry.original_path);
-        // SF-3: Propagate create_dir_all failure with clear message
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent).map_err(|e| {
                 format!(
@@ -340,7 +336,8 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
 
     let files_dir = cp_dir.join("files");
     let mut diffs = Vec::new();
-    // CR-9: Track paths already classified to avoid duplicates
+    // Track paths already classified so integrity/deleted/modified branches
+    // don't each emit a DiffEntry for the same file.
     let mut classified_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for entry in &manifest {
@@ -348,7 +345,6 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
             continue;
         }
 
-        // Check backup integrity first (merged with main loop to avoid CR-9 duplicates)
         let backup = files_dir.join(&entry.sha256);
         if !backup.exists() {
             diffs.push(DiffEntry {
@@ -373,7 +369,6 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
             continue;
         }
 
-        // SF-6: Handle sha256_file failure explicitly instead of unwrap_or_default
         match sha256_file(current_path) {
             Ok(current_sha) => {
                 if current_sha != entry.sha256 {
@@ -402,7 +397,6 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
         }
     }
 
-    // classified_paths used to ensure no duplicates (CR-9 fix applied above by merging loops)
     let _ = &classified_paths;
 
     Ok(diffs)
@@ -423,7 +417,6 @@ pub fn purge(config: &CheckpointConfig) -> Result<PurgeResult, String> {
     let mut removed_count = 0;
     let mut freed_bytes: u64 = 0;
 
-    // Remove by age
     let now = chrono::Utc::now();
     let max_age = chrono::Duration::days(config.max_age_days as i64);
     all.retain(|e| {
@@ -435,11 +428,11 @@ pub fn purge(config: &CheckpointConfig) -> Result<PurgeResult, String> {
                     Ok(()) => {
                         freed_bytes += e.total_bytes;
                         removed_count += 1;
-                        return false; // Successfully removed, drop from list
+                        return false;
                     }
                     Err(err) => {
                         eprintln!("tirith: checkpoint purge: failed to remove {}: {err}", e.id);
-                        return true; // Failed to remove, keep in list
+                        return true;
                     }
                 }
             }
@@ -447,7 +440,6 @@ pub fn purge(config: &CheckpointConfig) -> Result<PurgeResult, String> {
         true
     });
 
-    // Remove by count (keep newest)
     while all.len() > config.max_count {
         if let Some(oldest) = all.pop() {
             let cp_dir = base_dir.join(&oldest.id);
@@ -461,15 +453,14 @@ pub fn purge(config: &CheckpointConfig) -> Result<PurgeResult, String> {
                         "tirith: checkpoint purge: failed to remove {}: {e}",
                         oldest.id
                     );
-                    // Failed to remove — stop trying to shrink by count
-                    // to avoid infinite loop with a stuck entry.
+                    // A stuck entry would otherwise loop forever while `all.len()`
+                    // stays over the cap.
                     break;
                 }
             }
         }
     }
 
-    // Remove by total size (keep newest)
     let mut total: u64 = all.iter().map(|e| e.total_bytes).sum();
     while config.max_total_bytes > 0 && total > config.max_total_bytes && !all.is_empty() {
         if let Some(oldest) = all.pop() {
@@ -485,8 +476,8 @@ pub fn purge(config: &CheckpointConfig) -> Result<PurgeResult, String> {
                         "tirith: checkpoint purge: failed to remove {}: {e}",
                         oldest.id
                     );
-                    // Failed to remove — stop trying to shrink by size
-                    // to avoid infinite loop with a stuck entry.
+                    // A stuck entry would otherwise loop forever while `total`
+                    // stays over the cap.
                     break;
                 }
             }
@@ -532,16 +523,13 @@ pub fn create_and_purge(paths: &[&str], trigger_command: Option<&str>) -> Result
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
 /// Backup a single file to the checkpoint files directory.
 fn backup_file(path: &Path, files_dir: &Path) -> Result<ManifestEntry, String> {
     let sha = sha256_file(path)?;
     let dst = files_dir.join(&sha);
 
-    // Only copy if not already stored (dedup by content hash)
+    // Content-addressed dedup: two checkpointed files with identical contents
+    // share a single on-disk copy.
     if !dst.exists() {
         fs::copy(path, &dst).map_err(|e| format!("copy: {e}"))?;
     }
@@ -609,7 +597,7 @@ fn backup_dir_recursive(
         };
         let path = entry.path();
 
-        // Use symlink_metadata to avoid TOCTOU race between is_symlink() and later reads
+        // symlink_metadata avoids a TOCTOU race between is_symlink() and later reads.
         let meta = match path.symlink_metadata() {
             Ok(m) => m,
             Err(e) => {
@@ -619,7 +607,8 @@ fn backup_dir_recursive(
         };
 
         if meta.file_type().is_symlink() {
-            continue; // Skip symlinks for safety
+            // Following symlinks could back up files outside the intended tree.
+            continue;
         }
 
         if meta.file_type().is_file() {
@@ -639,7 +628,8 @@ fn backup_dir_recursive(
                 }
             }
         } else if path.is_dir() {
-            // Skip hidden directories (like .git)
+            // Skip dotfiles/dotdirs (e.g. .git) — they're rarely worth snapshotting
+            // and can dominate the size budget.
             if path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -706,10 +696,9 @@ mod tests {
 
         let entry = backup_file(&test_file, &files_dir).unwrap();
         assert!(!entry.sha256.is_empty());
-        assert_eq!(entry.size, 11); // "hello world" = 11 bytes
+        assert_eq!(entry.size, 11);
         assert!(!entry.is_dir);
 
-        // Verify the backed up file exists
         let backup_path = files_dir.join(&entry.sha256);
         assert!(backup_path.exists());
         let content = fs::read_to_string(&backup_path).unwrap();
@@ -781,8 +770,8 @@ mod tests {
 
     #[test]
     fn test_create_and_purge_removes_expired() {
-        // Verify create_and_purge() creates a new checkpoint AND purges
-        // age-expired ones in a single call.
+        // create_and_purge() must create a new checkpoint AND purge age-expired
+        // ones in a single call.
         let _guard = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -798,7 +787,7 @@ mod tests {
         // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
         unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
 
-        // Seed an ancient checkpoint (60 days old, exceeds 30-day default)
+        // Seed an ancient checkpoint (60 days old, past the 30-day default).
         let cp_base = state_dir.join("tirith/checkpoints");
         let old_cp = cp_base.join("old-expired");
         let old_files = old_cp.join("files");
@@ -824,11 +813,10 @@ mod tests {
         fs::write(old_cp.join("manifest.json"), manifest.to_string()).unwrap();
         assert!(old_cp.exists());
 
-        // Act
         let work_str = workdir.to_str().unwrap();
         let result = create_and_purge(&[work_str], Some("rm -rf tempstuff"));
 
-        // Restore env before assertions (so cleanup runs even on failure)
+        // Restore env before assertions so cleanup runs even on assertion failure.
         match prev {
             Some(val) => unsafe { std::env::set_var("XDG_STATE_HOME", val) },
             None => unsafe { std::env::remove_var("XDG_STATE_HOME") },

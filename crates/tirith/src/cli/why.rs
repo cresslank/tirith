@@ -23,12 +23,10 @@ pub fn run(json: bool) -> i32 {
     };
 
     if json {
-        // Pass through JSON directly
         println!("{content}");
         return 0;
     }
 
-    // Parse and display human-readable
     let val: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(e) => {

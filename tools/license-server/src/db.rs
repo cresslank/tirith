@@ -104,11 +104,11 @@ impl Db {
         })
     }
 
-    /// Run schema migrations for Paddle → Polar transition.
-    /// Safe to call repeatedly — each migration is guarded by column-existence checks.
+    /// Run schema migrations. Safe to call repeatedly — each migration is
+    /// guarded by column-existence checks.
     fn migrate(conn: &Connection) -> Result<(), AppError> {
-        // Migration 1: Rename price_id → product_id in subscriptions table.
-        // If the table has price_id but not product_id, rename it.
+        // Rename the legacy `price_id` column to `product_id` when the old
+        // column exists but the new one does not.
         let has_price_id = conn
             .prepare("SELECT price_id FROM subscriptions LIMIT 0")
             .is_ok();
@@ -132,8 +132,6 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("db open readonly: {e}")))
     }
 
-    // ─── Idempotency ────────────────────────────────────────────────
-
     pub async fn event_exists(&self, event_id: &str) -> Result<bool, AppError> {
         let conn = self.conn.clone();
         let eid = event_id.to_string();
@@ -154,8 +152,8 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 
-    // ─── Provision (order.paid or subscription.active first event) ──
-
+    /// First-time provision path (triggered by `order.paid` or the first
+    /// `subscription.active`).
     pub async fn process_subscription_created(
         &self,
         data: CreatedData,
@@ -166,7 +164,6 @@ impl Db {
             let tx = conn.unchecked_transaction()
                 .map_err(|e| AppError::Internal(format!("db tx: {e}")))?;
 
-            // Idempotency check
             let exists: bool = tx
                 .query_row(
                     "SELECT 1 FROM webhook_events WHERE event_id=?1",
@@ -181,8 +178,9 @@ impl Db {
                 return Ok(CreatedOutcome::Duplicate);
             }
 
-            // UPSERT subscription — reconcile status to 'active' unless terminal (revoked).
-            // The CASE preserves 'revoked' so the terminal guard below can detect it.
+            // Reconcile status to 'active' unless the row is already
+            // terminal ('revoked'). The CASE preserves 'revoked' so the
+            // guard below can detect it.
             tx.execute(
                 "INSERT INTO subscriptions (id, customer_id, email, tier, status, product_id, last_event_at)
                  VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6)
@@ -202,7 +200,7 @@ impl Db {
             )
             .map_err(|e| AppError::Internal(format!("db upsert sub: {e}")))?;
 
-            // Read current status (may differ from 'active' if row already existed)
+            // Re-read status — may still be 'revoked' if the row pre-existed.
             let status: String = tx
                 .query_row(
                     "SELECT status FROM subscriptions WHERE id=?1",
@@ -211,20 +209,18 @@ impl Db {
                 )
                 .map_err(|e| AppError::Internal(format!("db read status: {e}")))?;
 
-            // Mark event
             tx.execute(
                 "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, ?2)",
                 params![data.event_id, data.event_type],
             )
             .map_err(|e| AppError::Internal(format!("db mark event: {e}")))?;
 
-            // Terminal guard: revoked is absorbing — do not provision
+            // 'revoked' is absorbing — never provision on top of it.
             if status == "revoked" {
                 tx.commit().map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
                 return Ok(CreatedOutcome::SkippedRevoked);
             }
 
-            // Check if api_key already exists
             let key_exists: bool = tx
                 .query_row(
                     "SELECT 1 FROM api_keys WHERE subscription_id=?1",
@@ -240,17 +236,17 @@ impl Db {
                 return Ok(CreatedOutcome::AlreadyProvisioned);
             }
 
-            // Determine if this is partial provisioning (past_due)
+            // past_due starts with the key flagged as revoked — partial
+            // provision.
             let revoked = if status == "past_due" { 1 } else { 0 };
 
-            // Insert api_key
             tx.execute(
                 "INSERT INTO api_keys (key_hash, subscription_id, revoked) VALUES (?1, ?2, ?3)",
                 params![data.key_hash, data.subscription_id, revoked],
             )
             .map_err(|e| AppError::Internal(format!("db insert key: {e}")))?;
 
-            // Insert token (only for full provisioning)
+            // Tokens are only issued on full (non-past_due) provisioning.
             if revoked == 0 {
                 if let Some(ref token) = data.token {
                     tx.execute(
@@ -261,7 +257,6 @@ impl Db {
                 }
             }
 
-            // Insert pending receipt
             tx.execute(
                 "INSERT INTO pending_receipts (receipt_secret, subscription_id, api_key_enc, api_key_nonce, token, checkout_id, expires_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now', '+1 hour'))",
@@ -287,8 +282,8 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 
-    // ─── subscription.canceled (benefits continue until period end) ──
-
+    /// `subscription.canceled`: benefits continue until period end; the API
+    /// key is NOT revoked.
     pub async fn process_subscription_canceled(
         &self,
         data: CanceledData,
@@ -299,7 +294,6 @@ impl Db {
             let tx = conn.unchecked_transaction()
                 .map_err(|e| AppError::Internal(format!("db tx: {e}")))?;
 
-            // Idempotency
             let exists: bool = tx
                 .query_row(
                     "SELECT 1 FROM webhook_events WHERE event_id=?1",
@@ -311,10 +305,10 @@ impl Db {
                 .unwrap_or(false);
             if exists {
                 tx.commit().map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
-                return Ok(false); // duplicate
+                return Ok(false);
             }
 
-            // Terminal guard: if already revoked, absorb
+            // 'revoked' absorbs canceled.
             let prev_status: Option<String> = tx
                 .query_row(
                     "SELECT status FROM subscriptions WHERE id=?1",
@@ -325,17 +319,15 @@ impl Db {
                 .map_err(|e| AppError::Internal(format!("db read prev: {e}")))?;
 
             if prev_status.as_deref() == Some("revoked") {
-                // Mark event, absorb transition
                 tx.execute(
                     "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, 'subscription.canceled')",
                     params![data.event_id],
                 )
                 .map_err(|e| AppError::Internal(format!("db mark event: {e}")))?;
                 tx.commit().map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
-                return Ok(false); // absorbed by terminal state
+                return Ok(false);
             }
 
-            // UPSERT with canceled status — key NOT revoked (benefits continue)
             tx.execute(
                 "INSERT INTO subscriptions (id, customer_id, email, tier, status, product_id, last_event_at)
                  VALUES (?1, ?2, ?3, ?4, 'canceled', ?5, ?6)
@@ -358,9 +350,6 @@ impl Db {
             )
             .map_err(|e| AppError::Internal(format!("db upsert canceled: {e}")))?;
 
-            // NO key revocation — Polar canceled means benefits continue until period end
-
-            // Mark event
             tx.execute(
                 "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, 'subscription.canceled')",
                 params![data.event_id],
@@ -374,8 +363,7 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 
-    // ─── subscription.revoked (terminal — revoke key) ────────────────
-
+    /// `subscription.revoked`: terminal state, revokes the API key.
     pub async fn process_subscription_revoked(&self, data: RevokedData) -> Result<bool, AppError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -383,7 +371,6 @@ impl Db {
             let tx = conn.unchecked_transaction()
                 .map_err(|e| AppError::Internal(format!("db tx: {e}")))?;
 
-            // Idempotency
             let exists: bool = tx
                 .query_row(
                     "SELECT 1 FROM webhook_events WHERE event_id=?1",
@@ -395,10 +382,9 @@ impl Db {
                 .unwrap_or(false);
             if exists {
                 tx.commit().map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
-                return Ok(false); // duplicate
+                return Ok(false);
             }
 
-            // UPSERT with revoked status
             tx.execute(
                 "INSERT INTO subscriptions (id, customer_id, email, tier, status, product_id, last_event_at)
                  VALUES (?1, ?2, ?3, ?4, 'revoked', ?5, ?6)
@@ -421,14 +407,12 @@ impl Db {
             )
             .map_err(|e| AppError::Internal(format!("db upsert revoked: {e}")))?;
 
-            // Revoke API key
             tx.execute(
                 "UPDATE api_keys SET revoked=1 WHERE subscription_id=?1",
                 params![data.subscription_id],
             )
             .map_err(|e| AppError::Internal(format!("db revoke key: {e}")))?;
 
-            // Mark event
             tx.execute(
                 "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, 'subscription.revoked')",
                 params![data.event_id],
@@ -441,8 +425,6 @@ impl Db {
         .await
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
-
-    // ─── API key existence check (for webhook routing) ────────────────
 
     pub async fn has_api_key(&self, subscription_id: &str) -> Result<bool, AppError> {
         let conn = self.conn.clone();
@@ -464,8 +446,8 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 
-    // ─── subscription.updated (status transitions with terminal guard) ─
-
+    /// `subscription.updated`: status transitions with a terminal guard so
+    /// a prior `revoked` row absorbs later state changes.
     pub async fn process_subscription_updated(
         &self,
         data: UpdatedData,
@@ -476,7 +458,6 @@ impl Db {
             let tx = conn.unchecked_transaction()
                 .map_err(|e| AppError::Internal(format!("db tx: {e}")))?;
 
-            // Idempotency
             let exists: bool = tx
                 .query_row(
                     "SELECT 1 FROM webhook_events WHERE event_id=?1",
@@ -491,7 +472,8 @@ impl Db {
                 return Ok(UpdatedOutcome::Duplicate);
             }
 
-            // Step 1: Read previous status BEFORE any writes
+            // Read previous status BEFORE any writes so the terminal guard
+            // below can compare against the real prior state.
             let prev_status: Option<String> = tx
                 .query_row(
                     "SELECT status FROM subscriptions WHERE id=?1",
@@ -501,9 +483,8 @@ impl Db {
                 .optional()
                 .map_err(|e| AppError::Internal(format!("db read prev: {e}")))?;
 
-            // Step 2: Terminal absorption — revoked absorbs ALL non-revoked transitions
+            // revoked absorbs every non-revoked transition.
             if prev_status.as_deref() == Some("revoked") && data.new_status != "revoked" {
-                // Mark event + commit, but do NOT change status
                 tx.execute(
                     "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, ?2)",
                     params![data.event_id, data.event_type],
@@ -513,7 +494,6 @@ impl Db {
                 return Ok(UpdatedOutcome::TerminalIgnored);
             }
 
-            // Step 3: UPSERT with validated status (safe — revoked can't be overwritten)
             tx.execute(
                 "INSERT INTO subscriptions (id, customer_id, email, tier, status, product_id, last_event_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -535,7 +515,6 @@ impl Db {
             )
             .map_err(|e| AppError::Internal(format!("db upsert updated: {e}")))?;
 
-            // Step 3b: Apply tier if resolved
             if let Some(ref tier) = data.resolved_tier {
                 if let Some(ref product_id) = data.product_id {
                     tx.execute(
@@ -552,9 +531,10 @@ impl Db {
                 .map_err(|e| AppError::Internal(format!("db set unknown tier: {e}")))?;
             }
 
-            // Step 4: Side effects based on status
-            // Since revoked was already absorbed in step 2, all remaining prev_statuses
-            // (past_due, canceled, active, None) are valid for un-revoke on active.
+            // Side effects by status. The earlier terminal guard means
+            // `prev_status == revoked` never reaches this match, so any
+            // remaining prev_status (past_due / canceled / active / None)
+            // is safe to un-revoke when transitioning to active.
             let outcome = match data.new_status.as_str() {
                 "active" => {
                     let rows = tx
@@ -570,7 +550,8 @@ impl Db {
                     }
                 }
                 "canceled" => {
-                    // No key change — benefits continue until period end
+                    // Benefits continue until period end, so the key is
+                    // left as-is.
                     UpdatedOutcome::StatusUpdated
                 }
                 "past_due" => {
@@ -582,7 +563,6 @@ impl Db {
                     UpdatedOutcome::Revoked
                 }
                 "revoked" => {
-                    // Idempotent re-revoke (prev was also revoked or first time)
                     tx.execute(
                         "UPDATE api_keys SET revoked=1 WHERE subscription_id=?1",
                         params![data.subscription_id],
@@ -591,7 +571,7 @@ impl Db {
                     UpdatedOutcome::Revoked
                 }
                 _ => {
-                    // Unknown status → treat as inactive
+                    // Unknown status → revoke defensively.
                     tx.execute(
                         "UPDATE api_keys SET revoked=1 WHERE subscription_id=?1",
                         params![data.subscription_id],
@@ -601,7 +581,6 @@ impl Db {
                 }
             };
 
-            // Mark event
             tx.execute(
                 "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, ?2)",
                 params![data.event_id, data.event_type],
@@ -614,8 +593,6 @@ impl Db {
         .await
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
-
-    // ─── Receipt lookup ─────────────────────────────────────────────
 
     pub async fn receipt_lookup(&self, checkout_id: &str) -> Result<Option<String>, AppError> {
         let conn = self.conn.clone();
@@ -636,8 +613,8 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 
-    // ─── Receipt consume (atomic) ───────────────────────────────────
-
+    /// Atomic consume — DELETE … RETURNING ensures exactly one request
+    /// receives the row.
     pub async fn receipt_consume(
         &self,
         receipt_secret: &str,
@@ -667,8 +644,6 @@ impl Db {
         .await
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
-
-    // ─── Refresh (auth + token signing) ─────────────────────────────
 
     pub async fn lookup_api_key(&self, key_hash: &str) -> Result<Option<String>, AppError> {
         let conn = self.conn.clone();
@@ -736,8 +711,6 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 
-    // ─── Dead letter ────────────────────────────────────────────────
-
     pub async fn insert_dead_letter(&self, dl: DeadLetterData) -> Result<(), AppError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -752,8 +725,6 @@ impl Db {
         .await
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
-
-    // ─── Cleanup ────────────────────────────────────────────────────
 
     pub async fn cleanup(&self) -> Result<(), AppError> {
         let conn = self.conn.clone();
@@ -771,8 +742,7 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 
-    // ─── Dead-letter auto-retry query (subscription events only) ────
-
+    /// Returns only subscription-type dead letters — filtered in SQL.
     pub async fn get_retryable_dead_letters(&self) -> Result<Vec<RetryableDeadLetter>, AppError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -853,8 +823,6 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 }
-
-// ─── Data types ─────────────────────────────────────────────────────
 
 pub struct CreatedData {
     pub event_id: String,
@@ -1052,8 +1020,6 @@ mod tests {
         (status, revoked)
     }
 
-    // ─── Provision tests ─────────────────────────────────────────────
-
     #[tokio::test]
     async fn test_provision_creates_key_and_token() {
         let db = test_db();
@@ -1093,7 +1059,6 @@ mod tests {
     #[tokio::test]
     async fn test_provision_skipped_if_revoked() {
         let db = test_db();
-        // Manually create a revoked subscription with no key
         {
             let conn = db.conn.lock().unwrap();
             conn.execute(
@@ -1107,8 +1072,6 @@ mod tests {
         assert!(matches!(outcome, CreatedOutcome::SkippedRevoked));
     }
 
-    // ─── Canceled tests (benefits continue) ──────────────────────────
-
     #[tokio::test]
     async fn test_canceled_does_not_revoke_key() {
         let db = test_db();
@@ -1121,7 +1084,7 @@ mod tests {
 
         let (status, revoked) = read_state(&db, "sub_1");
         assert_eq!(status, "canceled");
-        assert_eq!(revoked, Some(false)); // key NOT revoked
+        assert_eq!(revoked, Some(false));
     }
 
     #[tokio::test]
@@ -1135,13 +1098,11 @@ mod tests {
 
         let canceled = make_canceled("evt_3", "sub_1");
         let processed = db.process_subscription_canceled(canceled).await.unwrap();
-        assert!(!processed); // absorbed
+        assert!(!processed);
 
         let (status, _) = read_state(&db, "sub_1");
-        assert_eq!(status, "revoked"); // still revoked
+        assert_eq!(status, "revoked");
     }
-
-    // ─── Revoked tests (terminal) ────────────────────────────────────
 
     #[tokio::test]
     async fn test_revoked_revokes_key() {
@@ -1155,10 +1116,8 @@ mod tests {
 
         let (status, revoked) = read_state(&db, "sub_1");
         assert_eq!(status, "revoked");
-        assert_eq!(revoked, Some(true)); // key IS revoked
+        assert_eq!(revoked, Some(true));
     }
-
-    // ─── Updated tests (terminal absorption) ─────────────────────────
 
     #[tokio::test]
     async fn test_active_after_past_due_unrevokes() {
@@ -1197,8 +1156,8 @@ mod tests {
         assert_eq!(outcome, UpdatedOutcome::TerminalIgnored);
 
         let (status, revoked) = read_state(&db, "sub_1");
-        assert_eq!(status, "revoked"); // still revoked
-        assert_eq!(revoked, Some(true)); // still revoked
+        assert_eq!(status, "revoked");
+        assert_eq!(revoked, Some(true));
     }
 
     #[tokio::test]
@@ -1230,7 +1189,7 @@ mod tests {
 
         let (status, revoked) = read_state(&db, "sub_1");
         assert_eq!(status, "canceled");
-        assert_eq!(revoked, Some(false)); // key NOT revoked
+        assert_eq!(revoked, Some(false));
     }
 
     #[tokio::test]
@@ -1242,7 +1201,6 @@ mod tests {
         let canceled = make_updated("evt_2", "sub_1", "canceled");
         db.process_subscription_updated(canceled).await.unwrap();
 
-        // Uncanceled → active
         let active = make_updated("evt_3", "sub_1", "active");
         let outcome = db.process_subscription_updated(active).await.unwrap();
         assert_eq!(outcome, UpdatedOutcome::Unrevoked);
@@ -1266,24 +1224,22 @@ mod tests {
         assert_eq!(outcome, UpdatedOutcome::Duplicate);
     }
 
-    // ─── Out-of-order event tests ────────────────────────────────────
-
     #[tokio::test]
     async fn test_provision_after_canceled_reconciles_to_active() {
         let db = test_db();
-        // canceled arrives first (creates row with status=canceled)
+        // canceled arrives first (creates row with status=canceled) and
+        // subscription.active provision arrives second.
         let canceled = make_canceled("evt_1", "sub_1");
         db.process_subscription_canceled(canceled).await.unwrap();
 
         let (status, _) = read_state(&db, "sub_1");
         assert_eq!(status, "canceled");
 
-        // subscription.active provision arrives second
         let created = make_created("evt_2", "sub_1", "team");
         let outcome = db.process_subscription_created(created).await.unwrap();
         assert!(matches!(outcome, CreatedOutcome::Provisioned));
 
-        // Status should be reconciled to active, not stuck at canceled
+        // Status should be reconciled to active, not stuck at canceled.
         let (status, revoked) = read_state(&db, "sub_1");
         assert_eq!(status, "active");
         assert_eq!(revoked, Some(false));
@@ -1301,18 +1257,17 @@ mod tests {
         let mut revoked2 = make_revoked("evt_3", "sub_1");
         revoked2.occurred_at = Some("2024-01-04T00:00:00Z".to_string());
         let processed = db.process_subscription_revoked(revoked2).await.unwrap();
-        assert!(processed); // not a duplicate event, but idempotent
+        // Distinct event_id so not a duplicate; re-revoke is idempotent.
+        assert!(processed);
 
         let (status, revoked) = read_state(&db, "sub_1");
         assert_eq!(status, "revoked");
         assert_eq!(revoked, Some(true));
     }
 
-    // ─── Migration test ──────────────────────────────────────────────
-
     #[tokio::test]
     async fn test_migration_renames_price_id_to_product_id() {
-        // Create a DB with old schema (price_id)
+        // Seed a DB carrying the legacy `price_id` column.
         let conn = Connection::open(":memory:").unwrap();
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -1331,10 +1286,8 @@ mod tests {
         )
         .unwrap();
 
-        // Run migration
         Db::migrate(&conn).unwrap();
 
-        // Verify product_id column exists and has the old data
         let product_id: String = conn
             .query_row(
                 "SELECT product_id FROM subscriptions WHERE id='sub_old'",
@@ -1344,7 +1297,6 @@ mod tests {
             .unwrap();
         assert_eq!(product_id, "pri_abc");
 
-        // Verify price_id no longer exists
         assert!(conn
             .prepare("SELECT price_id FROM subscriptions LIMIT 0")
             .is_err());

@@ -74,7 +74,7 @@ impl ByteScanResult {
     /// are removed, and the `has_*` flags are re-derived from the survivors so
     /// downstream tier-1/tier-3 gates stay consistent.
     ///
-    /// Used by issue #29's exec-context carveout: bytes inside the inert arg
+    /// Used by the inspection-subcommand carveout: bytes inside the inert arg
     /// span of `tirith diff/score/why/...` commands shouldn't trigger Unicode-
     /// style rules. `has_invalid_utf8` is a whole-input property and is left
     /// unchanged.
@@ -159,6 +159,8 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
 
         // Escape sequences: CSI (\e[), OSC (\e]), APC (\e_), DCS (\eP)
         if b == 0x1b {
+            // CSI (\e[), OSC (\e]), APC (\e_), DCS (\eP) are the escape-sequence
+            // introducers used for terminal injection attacks.
             if i + 1 < len {
                 let next = input[i + 1];
                 if next == b'[' || next == b']' || next == b'_' || next == b'P' {
@@ -180,7 +182,6 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                     continue;
                 }
             } else {
-                // Trailing lone ESC
                 result.has_ansi_escapes = true;
                 result.details.push(ByteFinding {
                     offset: i,
@@ -191,9 +192,8 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
             }
         }
 
-        // Control characters (< 0x20, excluding common whitespace and ESC)
-        // For \r: only flag when followed by non-\n (display-overwriting attack).
-        // Trailing \r and \r\n (Windows line endings) are benign clipboard artifacts.
+        // CR: only flag mid-stream CRs (display-overwriting attacks). Trailing
+        // CR and CRLF (Windows line endings) are benign clipboard artifacts.
         if b == b'\r' {
             let is_attack_cr = i + 1 < len && input[i + 1] != b'\n';
             if is_attack_cr {
@@ -215,7 +215,6 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
             });
         }
 
-        // DEL character
         if b == 0x7F {
             result.has_control_chars = true;
             result.details.push(ByteFinding {
@@ -226,16 +225,15 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
             });
         }
 
-        // Check for UTF-8 multi-byte sequences that are bidi or zero-width
+        // UTF-8 continuation byte? Decode the char and check it against every
+        // invisible/confusable class in one pass.
         if b >= 0xc0 {
-            // Try to decode UTF-8 character
             let remaining = &input[i..];
             if let Some(ch) = std::str::from_utf8(remaining)
                 .ok()
                 .or_else(|| std::str::from_utf8(&remaining[..remaining.len().min(4)]).ok())
                 .and_then(|s| s.chars().next())
             {
-                // Bidi controls
                 if is_bidi_control(ch) {
                     result.has_bidi_controls = true;
                     result.details.push(ByteFinding {
@@ -245,8 +243,8 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                         description: format!("bidi control U+{:04X}", ch as u32),
                     });
                 }
-                // Zero-width characters (ZWSP, ZWNJ, ZWJ, BOM, CGJ, Soft Hyphen, Word Joiner)
-                // BOM (U+FEFF) at offset 0 is a file-encoding artifact, not an attack
+                // ZWSP, ZWNJ, ZWJ, BOM, CGJ, Soft Hyphen, Word Joiner.
+                // BOM (U+FEFF) at offset 0 is a file-encoding artifact, not an attack.
                 if is_zero_width(ch) && !(ch == '\u{FEFF}' && i == 0) {
                     result.has_zero_width = true;
                     result.details.push(ByteFinding {
@@ -256,7 +254,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                         description: format!("zero-width character U+{:04X}", ch as u32),
                     });
                 }
-                // Unicode Tags (hidden ASCII encoding) U+E0000–U+E007F
+                // Unicode Tags U+E0000–U+E007F (hidden-ASCII encoding).
                 if is_unicode_tag(ch) {
                     result.has_unicode_tags = true;
                     result.details.push(ByteFinding {
@@ -266,7 +264,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                         description: format!("unicode tag U+{:04X}", ch as u32),
                     });
                 }
-                // Variation selectors: U+FE00–U+FE0F and U+E0100–U+E01EF
+                // U+FE00–U+FE0F and U+E0100–U+E01EF.
                 if is_variation_selector(ch) {
                     result.has_variation_selectors = true;
                     result.details.push(ByteFinding {
@@ -276,7 +274,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                         description: format!("variation selector U+{:04X}", ch as u32),
                     });
                 }
-                // Invisible math operators U+2061–U+2064
+                // U+2061–U+2064.
                 if is_invisible_math_operator(ch) {
                     result.has_invisible_math_operators = true;
                     result.details.push(ByteFinding {
@@ -286,7 +284,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                         description: format!("invisible math operator U+{:04X}", ch as u32),
                     });
                 }
-                // Invisible whitespace: stealth encoding spaces
+                // Invisible whitespace (stealth-encoded spaces).
                 if is_invisible_whitespace(ch) {
                     result.has_invisible_whitespace = true;
                     result.details.push(ByteFinding {
@@ -296,7 +294,6 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                         description: format!("invisible whitespace U+{:04X}", ch as u32),
                     });
                 }
-                // Hangul Fillers (invisible Korean characters)
                 if is_hangul_filler(ch) {
                     result.has_hangul_fillers = true;
                     result.details.push(ByteFinding {
@@ -306,7 +303,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                         description: format!("hangul filler U+{:04X}", ch as u32),
                     });
                 }
-                // Text-level confusable characters (math alphanumerics + hostname confusables)
+                // Math alphanumerics + hostname confusables.
                 if let Some(target) = crate::text_confusables::is_text_confusable(ch) {
                     result.has_confusable_text = true;
                     result.details.push(ByteFinding {
@@ -379,12 +376,9 @@ fn is_unicode_tag(ch: char) -> bool {
     ('\u{E0000}'..='\u{E007F}').contains(&ch)
 }
 
-/// Check if a character is a variation selector.
+/// Check if a character is a variation selector (VS1-16 or VS17-256).
 fn is_variation_selector(ch: char) -> bool {
-    // VS1-16
-    ('\u{FE00}'..='\u{FE0F}').contains(&ch)
-    // VS17-256 (Supplementary)
-    || ('\u{E0100}'..='\u{E01EF}').contains(&ch)
+    ('\u{FE00}'..='\u{FE0F}').contains(&ch) || ('\u{E0100}'..='\u{E01EF}').contains(&ch)
 }
 
 /// Check if a character is a Hangul Filler (invisible Korean character).
@@ -397,9 +391,9 @@ fn is_hangul_filler(ch: char) -> bool {
     )
 }
 
-/// Check if a character is an invisible math operator.
+/// Check if a character is an invisible math operator (Function Application,
+/// Invisible Times, Invisible Separator, Invisible Plus).
 fn is_invisible_math_operator(ch: char) -> bool {
-    // Function Application, Invisible Times, Invisible Separator, Invisible Plus
     ('\u{2061}'..='\u{2064}').contains(&ch)
 }
 
@@ -435,14 +429,12 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
         let sink_context = is_sink_context(segment, &segments);
         let resolved = resolve_segment_command(segment);
 
-        // Issue #29 Arm A: narrow skip — only suppress URL extraction for the
-        // *arg span* of a first-segment tirith inspection subcommand, NOT the
-        // whole segment. Leading env assignments and wrapper text must still
-        // be analyzed (`FOO=https://evil.com tirith diff safe` must still
-        // flag FOO). `resolved` can come through a sudo/env/command/time
-        // wrapper, so we locate where the word "tirith" actually lives in
-        // `segment.args` (or as `segment.command`) before looking for the
-        // inspection subcommand.
+        // Suppress URL extraction ONLY for the arg span of a first-segment
+        // tirith inspection subcommand — not the whole segment. Leading env
+        // assignments and wrapper tokens (sudo/env/time) must still be
+        // analyzed; `FOO=https://evil.com tirith diff safe` must still flag
+        // FOO. Since `resolved` can come through a wrapper, we first locate
+        // where the literal "tirith" word lives in the segment.
         let inspection_skip_args_from: Option<usize> = if seg_idx == 0 {
             resolved.as_ref().and_then(|cmd| {
                 if cmd.name != "tirith" {
@@ -493,8 +485,8 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
             url_sources.push(cmd.as_str());
         }
         for (arg_idx, arg) in segment.args.iter().enumerate() {
-            // For tirith inspection subcommands, stop at the subcommand word —
-            // args from there on are the inert arg span (issue #29).
+            // For tirith inspection subcommands, the subcommand word and all
+            // later args form the inert arg span — don't extract URLs from them.
             if let Some(skip_from) = inspection_skip_args_from {
                 if arg_idx >= skip_from {
                     break;
@@ -522,14 +514,13 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
             .is_some_and(|cmd| matches!(cmd.name.as_str(), "docker" | "podman" | "nerdctl"));
         if sink_context && !is_docker_cmd {
             if let Some(cmd) = resolved.as_ref() {
-                // scp/rsync arguments are either (a) remote specs (handled via
+                // scp/rsync arguments are either (a) remote specs (handled by
                 // parse_scp_remote_spec below) or (b) local file paths — never
                 // schemeless domain candidates. Skip the schemeless heuristic
-                // for these commands entirely; scheme-full URLs (http://...)
-                // are still caught earlier via URL_REGEX. See issue #26:
-                // `scp test.asdf testhost:/home/user/` previously flagged both
-                // the local file "test.asdf" (via `.asdf` TLD shape) and the
-                // remote spec "testhost:/home/user/" (via bare host:path).
+                // for these commands; scheme-full URLs still get caught by
+                // URL_REGEX earlier. Without this skip, `scp test.asdf
+                // host:/home/user/` trips on both the local filename (`.asdf`
+                // TLD shape) and the remote spec (`host:path` shape).
                 let is_remote_copy = matches!(cmd.name.as_str(), "scp" | "rsync");
                 for (arg_idx, arg) in cmd.args.iter().enumerate() {
                     // Skip args that are output-file flag values
@@ -565,7 +556,8 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
                 if let Some(docker_subcmd) = cmd.args.first() {
                     let subcmd_lower = docker_subcmd.to_lowercase();
                     if subcmd_lower == "build" {
-                        // For build, only -t/--tag values are image refs
+                        // `docker build` takes the image ref from -t/--tag.
+                        // Every other arg is build context / flags.
                         let mut i = 1;
                         while i < cmd.args.len() {
                             let arg = strip_quotes(&cmd.args[i]);
@@ -606,7 +598,7 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
                             }
                         }
                     } else if subcmd_lower == "image" {
-                        // docker image pull/push/inspect — actual subcmd is args[1]
+                        // `docker image pull/push/...` — the real subcommand is args[1].
                         if let Some(image_subcmd) = cmd.args.get(1) {
                             let image_subcmd_lower = image_subcmd.to_lowercase();
                             if matches!(
@@ -617,7 +609,8 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
                             }
                         }
                     } else if matches!(subcmd_lower.as_str(), "pull" | "run" | "create") {
-                        // First non-flag arg is image, then stop
+                        // First non-flag arg is the image; any later args are
+                        // arguments to the containerized command, not refs.
                         extract_first_docker_image(&cmd.args[1..], seg_idx, &mut results);
                     }
                 }
@@ -705,7 +698,7 @@ fn extract_first_docker_image(args: &[String], seg_idx: usize, results: &mut Vec
             continue;
         }
         if !end_of_options && clean.starts_with("--") && clean.contains('=') {
-            continue; // --flag=value, skip
+            continue;
         }
         if !end_of_options && clean.starts_with('-') {
             if DOCKER_VALUE_FLAGS.iter().any(|f| clean == *f) {
@@ -728,7 +721,9 @@ fn extract_first_docker_image(args: &[String], seg_idx: usize, results: &mut Vec
                 in_sink_context: true,
             });
         }
-        break; // Only first non-flag arg is the image
+        // Only the FIRST non-flag arg is the image; anything else is the
+        // containerized command's argv.
+        break;
     }
 }
 
@@ -813,25 +808,16 @@ fn resolve_named_command<'a>(command: &str, args: &'a [String]) -> Option<Resolv
 /// - `sudo -E -H cmd args…`                            → cmd after flags
 /// - `sudo VAR=val cmd args…`                          → env assignment, cmd after
 ///
-/// Unknown flags that take a value are NOT special-cased exhaustively; we only
-/// honor the common value-taking short/long flags. This is intentionally
-/// conservative: if we can't unambiguously resolve the command, we return None
-/// (so URL extraction / #29 carveout falls back to the literal first token).
+/// Unknown value-taking flags aren't special-cased; we honor only the common
+/// ones. Deliberately conservative: if we can't unambiguously resolve the
+/// command, return None and let the caller fall back to the literal first token.
 fn resolve_sudo_wrapper(args: &[String]) -> Option<ResolvedCommand<'_>> {
-    // Short flags that take a value:
-    //   -u user, -g group, -p prompt, -C fd, -D dir,
-    //   -U list-user, -r role, -t type
+    // Short sudo(8) flags that take a value.
     //
-    // Deliberately NOT on this list (boolean flags in sudo(8)):
-    //   -S  read password from stdin
-    //   -A  use askpass helper
-    //   -B  ring bell on prompt
-    //   -h  short for --help (NOT --host; --host only comes as long form here)
-    //   -E -H -K -L -l -n -P -s -V -v
-    //
-    // Putting booleans in the value-taking list was the bug behind the
-    // `sudo -S tirith diff ...` regression: treating `-S` as value-taking
-    // skipped `tirith` and the inspection carveout never engaged.
+    // Boolean-only flags (-S stdin, -A askpass, -B bell, -E -H -K -L -l -n -P
+    // -s -V -v, and -h which is short for --help, not --host) must NOT be on
+    // this list — treating them as value-taking would eat the next token and
+    // break wrapped-command resolution.
     const SUDO_VALUE_FLAGS: &[&str] = &["-u", "-g", "-p", "-C", "-D", "-U", "-r", "-t"];
     // Long flags that take a value unless combined with `=`.
     const SUDO_LONG_VALUE_FLAGS: &[&str] = &[
@@ -983,21 +969,19 @@ fn resolve_tirith_command(args: &[String]) -> Option<ResolvedCommand<'_>> {
 /// Whether a tirith subcommand is an "inspection" command — i.e. one whose
 /// purpose is to describe/score a suspicious input that the user deliberately
 /// typed (not execute it). For these, we suppress URL extraction and the
-/// exec-context byte-scan carveout (issue #29).
+/// exec-context byte-scan carveout.
 ///
-/// **List is deliberately narrow** — only the "here's a suspicious input, tell
-/// me about it" commands that the regression targets. Subcommands like
-/// `doctor`, `init`, `setup`, `version`, etc. are intentionally NOT on the
-/// list; if a real false positive surfaces there later, add it WITH a
-/// motivating fixture.
+/// **Deliberately narrow** — only the "here's a suspicious input, tell me
+/// about it" commands. Adding anything else (e.g. `doctor`, `init`, `setup`,
+/// `version`) requires a motivating false-positive fixture.
 fn is_tirith_inspection_subcommand(sub: &str) -> bool {
     matches!(sub, "diff" | "score" | "why" | "receipt" | "explain")
 }
 
 /// Resolve the first segment of `input` as a potential tirith inspection
-/// subcommand. When matched, returns the byte range (within `input`) of the
-/// arg span that follows the subcommand word — i.e. the inert region that
-/// should be skipped by URL extraction and Unicode-style byte scans.
+/// subcommand. When matched, return the byte range (within `input`) of the
+/// arg span that follows the subcommand word — the inert region that should
+/// be skipped by URL extraction and Unicode-style byte scans.
 ///
 /// Returns `None` for:
 /// - non-tirith commands
@@ -1143,7 +1127,7 @@ fn is_source_command(cmd: &str) -> bool {
 ///
 /// Shell-aware: the Windows drive-letter guard is narrow on Posix/Fish
 /// (single-letter SSH aliases like `scp file x:/tmp/` are legitimate there),
-/// wider on PowerShell/Cmd. See issue #26.
+/// wider on PowerShell/Cmd so drive letters do not masquerade as remote specs.
 /// Parsed scp/rsync remote spec of shape `[user@]host:path`. Returned by
 /// [`parse_scp_remote_spec`] so callers (e.g. `network_deny` enforcement) can
 /// route on the host without re-parsing. `path` is kept as the literal
@@ -1156,40 +1140,30 @@ pub struct ScpRemoteSpec {
 
 /// Parse `[user@]host:path` from an scp/rsync argument.
 ///
-/// Accepts:
-/// - `host:path` (bare host — the shape that regressed in #26)
-/// - `user@host:path` (original covered shape)
-///
-/// Rejects (returns None):
+/// Accepts `host:path` and `user@host:path`. Rejects:
 /// - tokens without `:` → plain local path
 /// - tokens starting with `-` → flag
 /// - tokens containing `://` → URL scheme
-/// - tokens where `:` is preceded by `/` → absolute local path with `:` in name
-/// - tokens where host part is empty
-/// - tokens where host part contains `/` → not a hostname
+/// - `:` preceded by `/` → absolute local path that happens to contain `:`
+/// - empty host part, or host containing `/`
 /// - Windows drive-letter shapes (see below)
 ///
-/// Windows drive-letter guard — intentionally narrow so it doesn't break
+/// Windows drive-letter guard — deliberately narrow so it doesn't break
 /// legitimate one-letter SSH aliases (e.g. `scp file x:/tmp/`):
-/// - `X:\...` (single letter + `:` + `\`) — reject ALWAYS; backslash after a
-///   drive letter is never a scp remote path.
-/// - `X:/...` (single letter + `:` + `/`) — reject ONLY for PowerShell/Cmd;
-///   on POSIX this collides with legitimate one-letter aliases.
-/// - `X:foo` (single letter + `:` + anything else) — ACCEPT; ambiguous with
-///   the `x:relative-path` alias form; back-compat wins over over-rejection.
+/// - `X:\...` — reject ALWAYS; backslash after a drive letter is never scp.
+/// - `X:/...` — reject ONLY on PowerShell/Cmd; POSIX treats this as an alias.
+/// - `X:foo`  — ACCEPT everywhere; ambiguous with scp's `x:relative-path`,
+///   and preserving back-compat here beats over-rejection.
 pub fn parse_scp_remote_spec(arg: &str, shell: ShellType) -> Option<ScpRemoteSpec> {
     if arg.is_empty() || arg.starts_with('-') || arg.contains("://") {
         return None;
     }
 
     // Two accepted shapes:
-    //   1. `user@host[:path]` — `user@` present, colon optional.
-    //      Strict scp syntax requires the colon, but tirith historically
-    //      treated bare `user@host` as a remote target too (see #60 test
-    //      `test_scp_user_at_host_not_treated_as_schemeless_url`) to suppress
-    //      a false positive on `looks_like_schemeless_host`. Preserve that.
-    //   2. `host:path` — no `@`, colon required. This is the shape that
-    //      regressed in #26.
+    //   1. `user@host[:path]` — the colon is optional. Strict scp requires it,
+    //      but we also accept bare `user@host` to suppress a false positive
+    //      where `looks_like_schemeless_host` would otherwise flag it.
+    //   2. `host:path` — no `@`, colon required.
     if let Some(at_pos) = arg.find('@') {
         let before_at = &arg[..at_pos];
         let after_at = &arg[at_pos + 1..];
@@ -1231,16 +1205,16 @@ pub fn parse_scp_remote_spec(arg: &str, shell: ShellType) -> Option<ScpRemoteSpe
         return None;
     }
 
-    // Windows drive-letter guard — narrow by design (issue #26 / #60 refinement).
-    // Only kicks in when host is a single ASCII letter AND `user@` is absent.
+    // Windows drive-letter guard — only applies when host is a single ASCII
+    // letter AND `user@` is absent (see module doc above for shape breakdown).
     if host.len() == 1 && host.chars().next().unwrap().is_ascii_alphabetic() {
         let first_after = after_colon.chars().next();
         match first_after {
-            Some('\\') => return None, // X:\... always a drive path
+            Some('\\') => return None,
             Some('/') if matches!(shell, ShellType::PowerShell | ShellType::Cmd) => {
-                return None; // X:/... on Windows shells
+                return None;
             }
-            _ => {} // X:foo or X:/ on Posix/Fish → accepted as ambiguous/alias form
+            _ => {}
         }
     }
 
@@ -1894,16 +1868,12 @@ mod tests {
         assert_eq!(docker_urls[0].raw, "evil.registry/ns/img:1");
     }
 
-    /// Constraint #2: Verify that EXTRACTOR_IDS is non-empty and
-    /// that all generated fragment counts are positive.
-    /// This is a module boundary enforcement test — ensures no secret
-    /// extractors exist outside the declarative pattern table.
+    /// Module-boundary enforcement: guarantees no tier-1 extractor exists
+    /// outside the declarative pattern table in `build.rs`.
     #[test]
     fn test_tier1_module_boundary_enforcement() {
-        // Verify extractor IDs are generated
         let ids = tier1_generated::EXTRACTOR_IDS;
         assert!(!ids.is_empty(), "EXTRACTOR_IDS must not be empty");
-        // Verify exec and paste fragment counts
         let exec_count = tier1_generated::TIER1_EXEC_FRAGMENT_COUNT;
         let paste_count = tier1_generated::TIER1_PASTE_FRAGMENT_COUNT;
         assert!(exec_count > 0, "Must have exec fragments");
@@ -1911,14 +1881,11 @@ mod tests {
             paste_count >= exec_count,
             "Paste fragments must be superset of exec fragments"
         );
-        // Verify the generated patterns are valid regexes
         Regex::new(tier1_generated::TIER1_EXEC_PATTERN)
             .expect("Generated exec pattern must be valid regex");
         Regex::new(tier1_generated::TIER1_PASTE_PATTERN)
             .expect("Generated paste pattern must be valid regex");
     }
-
-    // ─── CR normalization tests ───
 
     #[test]
     fn test_scan_bytes_trailing_cr_not_flagged() {
@@ -1976,8 +1943,9 @@ mod tests {
 
     #[test]
     fn test_schemeless_skip_curl_output_flag() {
+        // `-o <filename>` is curl's output flag; the filename must not be
+        // treated as a schemeless URL even though it matches the host shape.
         let urls = extract_urls("curl -o lenna.png https://example.com", ShellType::Posix);
-        // Should NOT have schemeless URL for lenna.png
         let schemeless: Vec<_> = urls
             .iter()
             .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
@@ -2061,10 +2029,6 @@ mod tests {
         assert!(schemeless.is_empty());
     }
 
-    // -----------------------------------------------------------------------
-    // #26: scp/rsync `host:/path` must not trip schemeless_to_sink.
-    // -----------------------------------------------------------------------
-
     fn scp_has_schemeless(cmd: &str, shell: ShellType) -> bool {
         extract_urls(cmd, shell)
             .iter()
@@ -2124,9 +2088,9 @@ mod tests {
 
     #[test]
     fn test_scp_windows_ambiguous_drive_letter_accepted() {
-        // `C:foo` is ambiguous — keep back-compat with `x:relative-path` aliases
-        // by accepting it in every shell. Over-rejecting here is what broke #26
-        // in the first place, in spirit: narrow guards beat blanket bans.
+        // `C:foo` is ambiguous with scp's `x:relative-path` alias form — accept
+        // it in every shell to preserve back-compat; narrow guards beat blanket
+        // bans here.
         for shell in [
             ShellType::Posix,
             ShellType::Fish,
@@ -2154,7 +2118,7 @@ mod tests {
     fn test_scp_rejects_flag_and_absolute_local() {
         assert!(parse_scp_remote_spec("-P", ShellType::Posix).is_none());
         assert!(parse_scp_remote_spec("--port=22", ShellType::Posix).is_none());
-        // `/tmp:weird` — colon preceded by `/`, absolute local path
+        // `/tmp:weird` — `:` preceded by `/` means absolute local path.
         assert!(parse_scp_remote_spec("/tmp:weird", ShellType::Posix).is_none());
     }
 

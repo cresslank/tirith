@@ -20,7 +20,6 @@ use state::AppState;
 
 #[tokio::main]
 async fn main() {
-    // Logging
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("LOG_LEVEL")
@@ -28,18 +27,15 @@ async fn main() {
         )
         .init();
 
-    // Config (panics on missing required vars — fail-fast)
+    // Fail-fast: Config::from_env panics if any required var is missing.
     let config = Config::from_env();
     let port = config.port;
 
-    // Database
     let db = Db::open(&config.database_url).expect("failed to open database");
 
-    // Token signer
     let signer = TokenSigner::from_hex_seed(&config.ed25519_seed_hex, config.kid.clone())
         .expect("failed to init token signer");
 
-    // HTTP client for Polar API
     let http_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(1))
         .timeout(Duration::from_secs(3))
@@ -53,12 +49,10 @@ async fn main() {
         http_client: http_client.clone(),
     };
 
-    // Background tasks
     spawn_cleanup_task(db.clone());
     spawn_dead_letter_retry_task(db.clone(), Arc::new(config.clone()), http_client);
     spawn_backup_task(config.clone());
 
-    // Router
     let app = routes::router()
         .with_state(state)
         .layer(TraceLayer::new_for_http())
@@ -86,9 +80,12 @@ fn spawn_cleanup_task(db: Db) {
     });
 }
 
-/// Dead-letter auto-retry: re-fetch unresolvable products from Polar API every 5 min.
-/// Only retries subscription-type dead letters (order.paid unknown-product returns 500
-/// so Polar retries the full event — those never enter the dead-letter table).
+/// Dead-letter auto-retry: re-fetch unresolvable products from the Polar
+/// API every five minutes.
+///
+/// Only subscription-type dead letters are retried here. `order.paid` with
+/// an unknown product returns 500 so Polar retries the full event, and
+/// those never land in the dead-letter table.
 fn spawn_dead_letter_retry_task(db: Db, config: Arc<Config>, http_client: reqwest::Client) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(300));
@@ -106,7 +103,6 @@ async fn retry_dead_letters(
     config: &Config,
     http_client: &reqwest::Client,
 ) -> Result<(), String> {
-    // Only returns subscription-type dead letters (filtered in SQL)
     let entries = db
         .get_retryable_dead_letters()
         .await
@@ -118,7 +114,7 @@ async fn retry_dead_letters(
             None => continue,
         };
 
-        // Staleness guard 1: tier already fixed by a newer event
+        // Stale if the tier was already fixed by a newer event.
         if entry.current_tier.as_deref() != Some("unknown") {
             info!(
                 dead_letter_id = entry.id,
@@ -129,7 +125,7 @@ async fn retry_dead_letters(
             continue;
         }
 
-        // Staleness guard 2: check if a newer event has been processed
+        // Stale if a newer event has landed on the subscription.
         if let (Some(ref dl_occurred), Some(ref sub_last)) =
             (&entry.occurred_at, &entry.last_event_at)
         {
@@ -144,7 +140,6 @@ async fn retry_dead_letters(
             }
         }
 
-        // Fetch subscription from Polar API to resolve product_id → tier
         let url = format!("https://api.polar.sh/v1/subscriptions/{sub_id}");
         let resp = http_client
             .get(&url)
@@ -184,7 +179,6 @@ async fn retry_dead_letters(
             }
         };
 
-        // Extract product_id from Polar API response
         let product_id = body.get("product_id").and_then(|v| v.as_str());
 
         if let Some(pid) = product_id {
@@ -214,7 +208,6 @@ async fn retry_dead_letters(
 fn spawn_backup_task(config: Config) {
     tokio::spawn(async move {
         loop {
-            // Sleep until next 03:00 UTC
             let now = chrono::Utc::now();
             let next_3am = {
                 let today_3am = now.date_naive().and_hms_opt(3, 0, 0).unwrap();
@@ -233,7 +226,6 @@ fn spawn_backup_task(config: Config) {
             let db_path = config.database_url.clone();
             let date_str = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
-            // Derive backup dir from db path
             let db_dir = std::path::Path::new(&db_path)
                 .parent()
                 .unwrap_or(std::path::Path::new("/data"));
@@ -246,7 +238,8 @@ fn spawn_backup_task(config: Config) {
             let backup_path = backup_dir.join(format!("tirith-license-{date_str}.db"));
             let backup_path_str = backup_path.display().to_string();
 
-            // Run backup using a separate read-only connection
+            // VACUUM INTO is run on a separate read-only handle so writers
+            // are never blocked by the backup.
             let result = tokio::task::spawn_blocking({
                 let db_path = db_path.clone();
                 let backup_path_str = backup_path_str.clone();
@@ -265,7 +258,6 @@ fn spawn_backup_task(config: Config) {
                 Ok(Ok(())) => {
                     info!(path = %backup_path_str, "daily backup completed");
 
-                    // Write SHA-256 checksum
                     if let Ok(data) = tokio::fs::read(&backup_path).await {
                         use sha2::{Digest, Sha256};
                         let hash = hex::encode(Sha256::digest(&data));
@@ -276,10 +268,8 @@ fn spawn_backup_task(config: Config) {
                         }
                     }
 
-                    // Retain last 7 local copies
                     cleanup_old_backups(&backup_dir, 7).await;
 
-                    // Optional R2 upload
                     if let (
                         Some(ref endpoint),
                         Some(ref bucket),
@@ -390,7 +380,6 @@ async fn upload_to_r2(
         }
     }
 
-    // Upload checksum too
     let checksum_path = format!("{backup_path}.sha256");
     if let Ok(checksum_data) = tokio::fs::read(&checksum_path).await {
         let checksum_key = format!("backups/tirith-license-{date_str}.db.sha256");

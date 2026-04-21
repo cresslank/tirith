@@ -89,7 +89,7 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
             continue;
         }
 
-        // Phase 1: Parse as raw JSON — failure here is a true parse error (-32700)
+        // Raw-JSON parse first: failure here is a JSON-RPC parse error (-32700).
         let raw: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
@@ -110,8 +110,8 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
             }
         };
 
-        // Phase 2: Validate JSON-RPC envelope — failure here is invalid request (-32600)
-        // Extract id first so we can include it in error responses when recoverable.
+        // JSON-RPC envelope validation: failures here are invalid-request (-32600).
+        // Extract id first so error responses can echo it when the client's id was recoverable.
         let raw_id = raw.get("id").cloned();
 
         // Recover a usable id: JSON-RPC allows string, number, or null — reject
@@ -266,10 +266,6 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
     0
 }
 
-// ---------------------------------------------------------------------------
-// Method handlers
-// ---------------------------------------------------------------------------
-
 fn handle_initialize(params: &Option<Value>) -> Value {
     let requested_version = params
         .as_ref()
@@ -363,22 +359,18 @@ fn handle_resources_read(id: Value, params: &Option<Value>) -> JsonRpcResponse {
     }
 }
 
-// ---------------------------------------------------------------------------
-// I/O
-// ---------------------------------------------------------------------------
-
 /// Write a JSON-RPC response. Returns false if the output is broken (caller should exit).
 fn write_response(output: &mut impl Write, resp: &JsonRpcResponse) -> bool {
     match serde_json::to_string(resp) {
         Ok(json) => {
             if writeln!(output, "{json}").is_err() || output.flush().is_err() {
-                return false; // Output pipe broken — caller should exit
+                return false;
             }
             true
         }
         Err(_) => {
-            // Serialization failed — should not happen with well-formed types.
-            // Attempt to send an internal error response as a fallback.
+            // Should not happen with well-formed types. Try to send an internal
+            // error response as a fallback so the client isn't left hanging.
             let fallback = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal serialization error"}}"#;
             let _ = writeln!(output, "{fallback}");
             let _ = output.flush();

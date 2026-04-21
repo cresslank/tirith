@@ -6,8 +6,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-// ── Atomic write ───────────────────────────────────────────────────────
-
 /// Write `content` to `path` atomically via temp+rename.
 ///
 /// Uses `O_EXCL` (`create_new`) to prevent clobbering stale temp files.
@@ -20,20 +18,20 @@ pub fn atomic_write(path: &Path, content: &str, mode: u32) -> Result<(), String>
         .ok_or_else(|| format!("no parent directory for {}", path.display()))?;
     fs::create_dir_all(parent).map_err(|e| format!("create dirs {}: {e}", parent.display()))?;
 
-    // Determine mode: preserve existing file permissions or use default
+    // Preserve existing file permissions; fall back to the caller's mode.
     let effective_mode = match fs::metadata(path) {
         Ok(meta) => meta.permissions().mode() & 0o7777,
         Err(_) => mode,
     };
 
-    // Generate unique temp file name: PID + monotonic counter
+    // PID + monotonic counter keeps temp file names unique across concurrent
+    // setups without needing stat+retry loops for name collisions.
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
     let tmp = {
         let mut tmp_path;
         let mut f_result;
 
-        // First attempt
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         tmp_path = parent.join(format!(".tirith-setup-{}-{}.tmp", std::process::id(), n));
         f_result = fs::OpenOptions::new()
@@ -41,7 +39,8 @@ pub fn atomic_write(path: &Path, content: &str, mode: u32) -> Result<(), String>
             .create_new(true)
             .open(&tmp_path);
 
-        // Retry up to 3 times on collision (stale temp from previous crash)
+        // Collisions come from stale temps left by previous crashes; retry
+        // up to 3 times before giving up.
         for _ in 0..3 {
             if f_result.is_ok() {
                 break;
@@ -68,8 +67,7 @@ pub fn atomic_write(path: &Path, content: &str, mode: u32) -> Result<(), String>
         format!("chmod {}: {e}", tmp.display())
     })?;
 
-    // Symlink safety: refuse to overwrite a symlink target (or broken symlink).
-    // Always use symlink_metadata — path.exists() misses broken symlinks.
+    // symlink_metadata (not path.exists) so broken symlinks also error out.
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             let _ = fs::remove_file(&tmp);
@@ -78,8 +76,8 @@ pub fn atomic_write(path: &Path, content: &str, mode: u32) -> Result<(), String>
                 path.display()
             ));
         }
-        Ok(_) => {} // Regular file or directory — proceed
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // New file — safe
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             let _ = fs::remove_file(&tmp);
             return Err(format!("stat {}: {e}", path.display()));
@@ -94,8 +92,6 @@ pub fn atomic_write(path: &Path, content: &str, mode: u32) -> Result<(), String>
     Ok(())
 }
 
-// ── Write hook script ──────────────────────────────────────────────────
-
 /// Write a hook script with executable permissions.
 ///
 /// - Hard-errors if `path` is a symlink (even with `--force`).
@@ -109,7 +105,7 @@ pub fn write_hook_script(
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
-    // Symlink check first (always, even in dry-run — safety violation)
+    // Symlink check runs even in dry-run — it's a safety violation, not an I/O op.
     if let Ok(meta) = fs::symlink_metadata(path) {
         if meta.file_type().is_symlink() {
             return Err(format!(
@@ -119,12 +115,10 @@ pub fn write_hook_script(
         }
     }
 
-    // Check existing content
     if path.exists() {
         let existing =
             fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         if existing == content {
-            // Content matches — verify mode
             if !dry_run {
                 let meta =
                     fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
@@ -147,7 +141,6 @@ pub fn write_hook_script(
             return Ok(());
         }
 
-        // Content differs
         if !force {
             if dry_run {
                 eprintln!(
@@ -163,7 +156,6 @@ pub fn write_hook_script(
         }
     }
 
-    // Write the file
     if dry_run {
         eprintln!(
             "[dry-run] would write {} ({} bytes, mode 0755)",
@@ -175,15 +167,14 @@ pub fn write_hook_script(
 
     atomic_write(path, content, 0o755)?;
 
-    // Always enforce 0o755 (overrides permission preservation from atomic_write)
+    // Always enforce 0o755; atomic_write preserves prior permissions which
+    // may be stricter than we need for an executable hook.
     fs::set_permissions(path, fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("chmod {}: {e}", path.display()))?;
 
     eprintln!("tirith: wrote {}", path.display());
     Ok(())
 }
-
-// ── Directory validation ───────────────────────────────────────────────
 
 /// Validate that `dir` stays within `scope_root` after canonicalization.
 ///
@@ -200,7 +191,6 @@ pub fn validate_target_dir(dir: &Path, scope_root: Option<&Path>) -> Result<(), 
         .canonicalize()
         .map_err(|e| format!("canonicalize {}: {e}", root.display()))?;
 
-    // Walk up from dir to find nearest existing ancestor
     let mut check = dir.to_path_buf();
     loop {
         if check.exists() {
@@ -224,7 +214,7 @@ pub fn validate_target_dir(dir: &Path, scope_root: Option<&Path>) -> Result<(), 
         }
     }
 
-    // Check each component for symlinks inside scope
+    // Each existing component must not be a symlink pointing back into scope.
     let mut path_so_far = PathBuf::new();
     for component in dir.components() {
         path_so_far.push(component);
@@ -242,8 +232,6 @@ pub fn validate_target_dir(dir: &Path, scope_root: Option<&Path>) -> Result<(), 
 
     Ok(())
 }
-
-// ── CLI subprocess runner ──────────────────────────────────────────────
 
 /// Run a CLI subprocess with 30s timeout and sanitized env.
 ///
@@ -267,11 +255,11 @@ pub fn run_cli(cmd: &str, args: &[&str]) -> Result<std::process::Output, String>
         .spawn()
         .map_err(|e| format!("{cmd} not found or failed to start: {e}"))?;
 
-    // Take pipe handles — child retains the process handle for wait/kill
+    // Draining pipes in background threads prevents pipe-buffer deadlock
+    // when the child writes more than pipe capacity before exiting.
     let stdout_handle = child.stdout.take();
     let stderr_handle = child.stderr.take();
 
-    // Drain pipes in background threads (prevents pipe-buffer deadlock)
     let mut stdout_thread = Some(std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut h) = stdout_handle {
@@ -287,7 +275,6 @@ pub fn run_cli(cmd: &str, args: &[&str]) -> Result<std::process::Output, String>
         buf
     }));
 
-    // Poll child with timeout
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let status = loop {
         match child.try_wait() {
@@ -295,7 +282,8 @@ pub fn run_cli(cmd: &str, args: &[&str]) -> Result<std::process::Output, String>
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
-                    let _ = child.wait(); // Reap zombie
+                    // wait() after kill() to reap the zombie.
+                    let _ = child.wait();
                     if let Some(t) = stdout_thread.take() {
                         let _ = t.join();
                     }
@@ -340,8 +328,6 @@ pub fn run_cli(cmd: &str, args: &[&str]) -> Result<std::process::Output, String>
     }
 }
 
-// ── Backup helpers ─────────────────────────────────────────────────────
-
 /// Create a timestamped backup of `path` when `force` is true and the file exists.
 ///
 /// Format: `{path}.tirith-backup-{YYYYMMDD-HHMMSS}`
@@ -372,7 +358,6 @@ pub fn create_backup(path: &Path, force: bool) -> Result<(), String> {
     })?;
     eprintln!("tirith: backup at {}", backup_path.display());
 
-    // Retention: keep 5 most recent, delete older (best-effort)
     cleanup_old_backups(path);
 
     Ok(())
@@ -438,7 +423,7 @@ fn cleanup_old_backups(path: &Path) {
         return;
     }
 
-    // Sort by name (timestamp is embedded, lexicographic order = chronological)
+    // Timestamps are embedded, so lexicographic order equals chronological.
     backups.sort();
     let to_remove = backups.len() - 5;
     for old in &backups[..to_remove] {
@@ -487,7 +472,8 @@ mod tests {
         atomic_write(&path, "new", 0o644).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600); // Preserved, not overwritten to 0o644
+        // Preserved existing 0o600, not overwritten with mode arg 0o644.
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
@@ -497,7 +483,6 @@ mod tests {
         fs::write(&path, "#!/bin/bash\necho hi").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
 
-        // Should skip (same content)
         write_hook_script(&path, "#!/bin/bash\necho hi", false, false).unwrap();
     }
 
@@ -550,7 +535,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let evil = tempfile::tempdir().unwrap();
 
-        // Create a symlink inside dir that points outside
+        // Symlink inside dir pointing outside the scope must be rejected.
         let link = dir.path().join("escape");
         std::os::unix::fs::symlink(evil.path(), &link).unwrap();
 
@@ -565,13 +550,11 @@ mod tests {
         let path = dir.path().join("config.json");
         fs::write(&path, "data").unwrap();
 
-        // Create 7 backups
         for i in 0..7 {
             let name = format!("config.json.tirith-backup-20260101-00000{i}");
             fs::write(dir.path().join(&name), "backup").unwrap();
         }
 
-        // Run cleanup
         cleanup_old_backups(&path);
 
         let count = fs::read_dir(dir.path())

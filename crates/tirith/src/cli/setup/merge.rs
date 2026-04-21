@@ -154,7 +154,6 @@ pub fn merge_hooks_json(
 
     match matching_indices.len() {
         0 => {
-            // No existing entry — append
             event_arr.push(hook_entry);
         }
         1 => {
@@ -176,7 +175,6 @@ pub fn merge_hooks_json(
                     path.display()
                 ));
             }
-            // force: replace (backup only when not dry-run)
             if !dry_run {
                 super::fs_helpers::create_backup(path, true)?;
             }
@@ -196,11 +194,10 @@ pub fn merge_hooks_json(
                     path.display()
                 ));
             }
-            // force: remove all matching, insert one (backup only when not dry-run)
             if !dry_run {
                 super::fs_helpers::create_backup(path, true)?;
             }
-            // Remove in reverse order to preserve indices
+            // Remove in reverse order so earlier indices stay valid.
             for &idx in matching_indices.iter().rev() {
                 event_arr.remove(idx);
             }
@@ -369,7 +366,6 @@ fn merge_hook_settings_inner(
 
     match matcher_indices.len() {
         0 => {
-            // No existing matcher — create new matcher entry with the hook
             arr.push(json!({
                 "matcher": matcher_name,
                 "hooks": [new_hook_entry]
@@ -386,7 +382,6 @@ fn merge_hook_settings_inner(
 
             match marker_hook_idx {
                 Some(hi) => {
-                    // Existing tirith hook found — check if identical
                     let existing = &arr[idx]["hooks"][hi];
                     if *existing == new_hook_entry {
                         eprintln!(
@@ -408,15 +403,15 @@ fn merge_hook_settings_inner(
                             path.display()
                         ));
                     }
-                    // force: replace just this hook entry
                     if !dry_run {
                         super::fs_helpers::create_backup(path, true)?;
                     }
                     arr[idx]["hooks"][hi] = new_hook_entry;
                 }
                 None => {
-                    // Matcher exists but no tirith hook — append to inner hooks[].
-                    // Replace hooks if missing or non-array (e.g. null from malformed config).
+                    // Matcher exists but has no tirith hook: append to inner
+                    // hooks[], replacing it if it's missing or non-array
+                    // (e.g. null from a malformed config).
                     let obj = arr[idx]
                         .as_object_mut()
                         .ok_or_else(|| "matcher entry is not an object".to_string())?;
@@ -431,7 +426,6 @@ fn merge_hook_settings_inner(
             }
         }
         _ => {
-            // Multiple matcher entries with the same name
             if !force {
                 if dry_run {
                     eprintln!(
@@ -455,15 +449,15 @@ fn merge_hook_settings_inner(
             for (pos, &idx) in matcher_indices.iter().enumerate() {
                 if let Some(inner) = arr[idx]["hooks"].as_array_mut() {
                     inner.retain(|h| !has_marker(h));
-                    // Collect remaining hooks from duplicate matchers (not first)
+                    // Non-tirith hooks from duplicates get consolidated into
+                    // the first matcher so we don't silently drop them.
                     if pos > 0 {
                         orphan_hooks.append(inner);
                     }
                 }
             }
 
-            // Ensure first matcher has a valid hooks array and insert new hook.
-            // Replace hooks if missing or non-array (e.g. null from malformed config).
+            // Replace `hooks` if missing or non-array (e.g. null from malformed config).
             let first = arr[matcher_indices[0]]
                 .as_object_mut()
                 .ok_or_else(|| "matcher entry is not an object".to_string())?;
@@ -474,12 +468,10 @@ fn merge_hook_settings_inner(
                 .as_array_mut()
                 .expect("just ensured hooks is an array");
 
-            // Move orphaned hooks from duplicates into the first matcher
             inner_arr.extend(orphan_hooks);
-            // Add the new tirith hook
             inner_arr.push(new_hook_entry);
 
-            // Remove all duplicate matcher entries (reverse order to preserve indices)
+            // Reverse order so earlier indices stay valid while removing.
             for &idx in matcher_indices[1..].iter().rev() {
                 arr.remove(idx);
             }
@@ -566,7 +558,6 @@ pub fn merge_vscode_settings(
         return Ok(());
     }
 
-    // If force and block exists, remove the old block first
     let already_backed_up;
     let working_text = if has_begin && force {
         if !dry_run {
@@ -581,7 +572,6 @@ pub fn merge_vscode_settings(
         raw.clone()
     };
 
-    // Build the managed block
     let managed_block = format!(
         "\x20\x20{begin_marker}\n\
          \x20\x20\"hooks\": {{\n\
@@ -595,7 +585,7 @@ pub fn merge_vscode_settings(
          \x20\x20{end_marker}"
     );
 
-    // Check for existing "hooks" key outside managed block (line-by-line scan)
+    // Line-by-line scan for an existing "hooks" key outside the managed block.
     let hooks_key_re =
         regex::Regex::new(r#"^\s*"hooks"\s*:"#).map_err(|e| format!("regex compile: {e}"))?;
 
@@ -610,7 +600,6 @@ pub fn merge_vscode_settings(
             continue;
         }
         if !in_managed_block && hooks_key_re.is_match(line) {
-            // Print manual instructions to stdout
             println!(
                 "Add the following to your hooks.PreToolUse array in {}:\n\
                  {{\n\
@@ -627,9 +616,8 @@ pub fn merge_vscode_settings(
         }
     }
 
-    // Insert managed block before the last `}` in the file
+    // Insert the managed block just before the file's closing brace.
     let insert_pos = working_text.rfind('}').ok_or_else(|| {
-        // Print manual instructions to stdout
         println!(
             "Add the following to {}:\n{}",
             path.display(),
@@ -641,11 +629,11 @@ pub fn merge_vscode_settings(
         )
     })?;
 
-    // Find the preceding non-empty, non-comment line and add trailing comma if needed
     let before_brace = &working_text[..insert_pos];
     let mut result = String::new();
 
-    // Check if the last meaningful line before the closing brace needs a comma
+    // The last non-empty, non-comment line needs a trailing comma if the
+    // managed block is about to follow it in the same object.
     let needs_comma = before_brace
         .lines()
         .rev()
@@ -660,12 +648,10 @@ pub fn merge_vscode_settings(
         .unwrap_or(false);
 
     if needs_comma {
-        // Add comma to the last non-empty, non-comment line
         let lines: Vec<&str> = before_brace.lines().collect();
         for i in (0..lines.len()).rev() {
             let trimmed = lines[i].trim();
             if !trimmed.is_empty() && !trimmed.starts_with("//") {
-                // Append comma to this line
                 result = lines[..i].join("\n");
                 if !result.is_empty() {
                     result.push('\n');
@@ -681,7 +667,6 @@ pub fn merge_vscode_settings(
             }
         }
         if result.is_empty() {
-            // Fallback: no line found to add comma to
             result = before_brace.to_string();
         }
     } else {
@@ -695,7 +680,6 @@ pub fn merge_vscode_settings(
     result.push('\n');
     result.push_str(&working_text[insert_pos..]);
 
-    // Ensure trailing newline
     if !result.ends_with('\n') {
         result.push('\n');
     }
@@ -709,9 +693,9 @@ pub fn merge_vscode_settings(
         return Ok(());
     }
 
-    // Create backup of existing file before modifying (settings.json is high-value user content).
-    // Always back up on first-time insertion into existing file, regardless of --force.
-    // Skip if the force+remove path above already created a backup this invocation.
+    // settings.json is high-value user content — always back up on first-time
+    // insertion, regardless of --force. Skip if the force+remove path above
+    // already took a backup this invocation.
     if path.exists() && !already_backed_up {
         super::fs_helpers::create_backup_always(path)?;
     }
@@ -764,8 +748,6 @@ fn remove_managed_block(
 mod tests {
     use super::*;
     use serde_json::json;
-
-    // ── merge_mcp_json ──────────────────────────────────────────────
 
     #[test]
     fn mcp_json_creates_new_file() {
@@ -866,8 +848,6 @@ mod tests {
         assert_eq!(backup_count, 0);
     }
 
-    // ── merge_mcp_json_with_key (VS Code "servers") ─────────────────
-
     #[test]
     fn mcp_json_vscode_servers_key() {
         let dir = tempfile::tempdir().unwrap();
@@ -913,8 +893,6 @@ mod tests {
         assert_eq!(content["servers"]["other"]["command"], "other");
         assert_eq!(content["servers"]["tirith-gateway"]["command"], "tirith");
     }
-
-    // ── merge_hooks_json ────────────────────────────────────────────
 
     #[test]
     fn hooks_json_creates_new_file_with_version() {
@@ -1021,8 +999,6 @@ mod tests {
         assert_eq!(arr.len(), 2);
     }
 
-    // ── merge_claude_settings ───────────────────────────────────────
-
     #[test]
     fn claude_settings_creates_new() {
         let dir = tempfile::tempdir().unwrap();
@@ -1052,8 +1028,6 @@ mod tests {
         let arr = content["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
     }
-
-    // ── merge_vscode_settings ───────────────────────────────────────
 
     #[test]
     fn vscode_settings_creates_managed_block() {
@@ -1180,8 +1154,6 @@ mod tests {
         assert!(!result.contains("old-hook.sh"), "old hook command removed");
     }
 
-    // ── remove_managed_block ────────────────────────────────────────
-
     #[test]
     fn remove_managed_block_removes_block() {
         let text = "before\n// BEGIN x\nstuff\n// END x\nafter\n";
@@ -1204,8 +1176,6 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("END marker without BEGIN"));
     }
-
-    // ── merge_gemini_settings ──────────────────────────────────────
 
     #[test]
     fn gemini_settings_creates_new() {
@@ -1495,8 +1465,6 @@ mod tests {
         .unwrap();
         assert!(!path.exists());
     }
-
-    // ── merge_hook_settings_inner (Claude refactor validation) ─────
 
     #[test]
     fn claude_inner_preserves_other_hooks_in_bash_matcher() {

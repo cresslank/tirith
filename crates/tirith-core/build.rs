@@ -591,7 +591,6 @@ fn generate_tier1_regex(out_dir: &str) {
             paste_fragments.push(frag.to_string());
         }
 
-        // Enforce: every entry must have at least one fragment
         if entry.tier1_exec_fragments.is_empty() && entry.tier1_paste_only_fragments.is_empty() {
             let id = entry.id;
             panic!(
@@ -601,7 +600,6 @@ fn generate_tier1_regex(out_dir: &str) {
         }
     }
 
-    // Load credential patterns from TOML and inject tier-1 entries
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let cred_path = Path::new(&manifest_dir)
         .join("assets")
@@ -612,7 +610,6 @@ fn generate_tier1_regex(out_dir: &str) {
     let cred_file: CredentialPatternsFile = toml::from_str(&cred_content)
         .unwrap_or_else(|e| panic!("Failed to parse credential_patterns.toml: {e}"));
 
-    // credential_known — exec fragments from all [[pattern]] entries
     {
         let mut known_frags: Vec<String> = Vec::new();
         if let Some(ref patterns) = cred_file.pattern {
@@ -631,7 +628,6 @@ fn generate_tier1_regex(out_dir: &str) {
         }
     }
 
-    // credential_private_key — exec fragment from [[private_key_pattern]]
     {
         let pk_patterns = cred_file
             .private_key_pattern
@@ -648,12 +644,11 @@ fn generate_tier1_regex(out_dir: &str) {
         }
     }
 
-    // credential_generic — paste-only fragment for generic key=value patterns
     {
         // Tier-1 must be a superset of GENERIC_SECRET_RE. The runtime regex
-        // allows optional quote/bracket before the operator (["']?\]?), which
-        // cannot contain literal " in the r"..." generated output. We use
-        // .{0,2} as a permissive stand-in for the optional quote+bracket.
+        // allows an optional quote/bracket before the operator (["']?\]?),
+        // which cannot contain a literal " in the r"..." generated output,
+        // so .{0,2} is used as a permissive stand-in.
         let generic_frag = r"(?i:key|token|secret|password)\w*.{0,2}\s*(?:[:=]|:=|=>|<-|>)";
         ids.push("credential_generic".to_string());
         paste_fragments.push(generic_frag.to_string());
@@ -680,7 +675,6 @@ fn generate_tier1_regex(out_dir: &str) {
         "pub const TIER1_PASTE_FRAGMENT_COUNT: usize = {paste_count};\n",
     ));
 
-    // Generate extractor IDs array
     code.push_str("\npub const EXTRACTOR_IDS: &[&str] = &[\n");
     for id in &ids {
         code.push_str(&format!("    \"{id}\",\n"));
@@ -691,16 +685,12 @@ fn generate_tier1_regex(out_dir: &str) {
     fs::write(&out_path, code).unwrap();
 }
 
-// ---------------------------------------------------------------------------
-// Rule explanations
-// ---------------------------------------------------------------------------
-
 /// (snake_case id, PascalCase enum variant) for every RuleId in verdict.rs.
-/// build.rs uses snake_case for TOML validation, PascalCase for generating
-/// the mitre_id match function.
+/// Snake_case is used for TOML validation, PascalCase for generating the
+/// mitre_id match function.
 ///
-/// SYNC: must match `enum RuleId` in src/verdict.rs exactly.
-/// The `test_all_rule_ids_have_explanation` test catches drift at CI time.
+/// Must match `enum RuleId` in src/verdict.rs exactly. The
+/// `test_all_rule_ids_have_explanation` test catches drift at CI time.
 const EXPECTED_RULES: &[(&str, &str)] = &[
     // Hostname
     ("non_ascii_hostname", "NonAsciiHostname"),
@@ -780,17 +770,17 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("web3_rpc_endpoint", "Web3RpcEndpoint"),
     ("web3_address_in_url", "Web3AddressInUrl"),
     ("vet_not_configured", "VetNotConfigured"),
-    // Threat intelligence — Phase A (local DB)
+    // Threat intelligence — local DB
     ("threat_malicious_package", "ThreatMaliciousPackage"),
     ("threat_malicious_ip", "ThreatMaliciousIp"),
     ("threat_package_typosquat", "ThreatPackageTyposquat"),
     ("threat_package_similar_name", "ThreatPackageSimilarName"),
-    // Threat intelligence — Phase B (keyed feeds)
+    // Threat intelligence — supplemental feeds
     ("threat_malicious_url", "ThreatMaliciousUrl"),
     ("threat_phishing_url", "ThreatPhishingUrl"),
     ("threat_tor_exit_node", "ThreatTorExitNode"),
     ("threat_threat_fox_ioc", "ThreatThreatFoxIoc"),
-    // Threat intelligence — Phase C (real-time API)
+    // Threat intelligence — real-time lookups
     ("threat_osv_vulnerable", "ThreatOsvVulnerable"),
     ("threat_cisa_kev", "ThreatCisaKev"),
     ("threat_suspicious_package", "ThreatSuspiciousPackage"),
@@ -871,10 +861,8 @@ fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
     let file: RuleExplanationsFile = toml::from_str(&content)
         .unwrap_or_else(|e| panic!("Failed to parse rule_explanations.toml: {e}"));
 
-    // Build lookup of expected IDs → PascalCase variant
     let expected: std::collections::HashMap<&str, &str> = EXPECTED_RULES.iter().copied().collect();
 
-    // Validate: no duplicates
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in &file.rule {
         if !seen.insert(entry.id.clone()) {
@@ -882,7 +870,6 @@ fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
         }
     }
 
-    // Validate: every entry has a valid id
     for entry in &file.rule {
         if !expected.contains_key(entry.id.as_str()) {
             panic!(
@@ -892,14 +879,12 @@ fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
         }
     }
 
-    // Validate: every expected id is present
     for (snake, _pascal) in EXPECTED_RULES {
         if !seen.contains(*snake) {
             panic!("rule_explanations.toml: missing entry for '{snake}'");
         }
     }
 
-    // Validate: categories
     for entry in &file.rule {
         if !VALID_CATEGORIES.contains(&entry.category.as_str()) {
             panic!(
@@ -910,7 +895,6 @@ fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
         }
     }
 
-    // --- Generate code ---
     let esc = |s: &str| esc_rust_str(s);
 
     let mut code = String::new();
@@ -919,7 +903,6 @@ fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
          // Modify assets/data/rule_explanations.toml and rebuild.\n\n",
     );
 
-    // Per-entry static arrays for slice fields
     for entry in &file.rule {
         let upper_id = entry.id.to_uppercase();
         if !entry.examples_bad.is_empty() {
@@ -951,7 +934,6 @@ fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
         }
     }
 
-    // Main explanations array
     code.push_str("\npub const RULE_EXPLANATIONS: &[RuleExplanation] = &[\n");
     for entry in &file.rule {
         let upper_id = entry.id.to_uppercase();
@@ -999,7 +981,6 @@ fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
     }
     code.push_str("];\n");
 
-    // MITRE ATT&CK match function over RuleId enum
     code.push_str(
         "\n/// MITRE ATT&CK lookup generated from rule_explanations.toml.\n\
          /// Single source of truth — replaces the hand-written match in engine.rs.\n\

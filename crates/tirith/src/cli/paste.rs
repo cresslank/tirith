@@ -13,8 +13,7 @@ pub fn run(
     interactive_flag: bool,
     html_path: Option<&str>,
 ) -> i32 {
-    // Read raw bytes from stdin with 1 MiB cap
-    const MAX_PASTE: u64 = 1024 * 1024; // 1 MiB
+    const MAX_PASTE: u64 = 1024 * 1024;
 
     let mut raw_bytes = Vec::new();
     if let Err(e) = std::io::stdin()
@@ -41,7 +40,7 @@ pub fn run(
         }
     };
 
-    // Decode to string (lossy for URL extraction)
+    // Lossy is fine here — raw bytes are preserved separately for byte-scan rules.
     let input = String::from_utf8_lossy(&raw_bytes).into_owned();
 
     let interactive = if interactive_flag {
@@ -54,7 +53,6 @@ pub fn run(
         is_terminal::is_terminal(std::io::stderr())
     };
 
-    // Read clipboard HTML if provided
     let clipboard_html = html_path.and_then(|path| match std::fs::read_to_string(path) {
         Ok(html) => Some(html),
         Err(e) => {
@@ -80,11 +78,10 @@ pub fn run(
 
     let mut verdict = engine::analyze(&ctx);
 
-    // Apply paranoia filter (suppress Info/Low findings based on policy + tier)
     let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
 
-    // Log to audit BEFORE paranoia filtering so the audit captures full detection
-    // (ADR-13: engine always detects everything; paranoia is an output-layer filter).
+    // Audit must capture full detection BEFORE paranoia filtering (ADR-13:
+    // engine always detects everything; paranoia is an output-layer filter).
     // Skip if bypass was honored — analyze() already logged it.
     if !verdict.bypass_honored {
         let event_id = uuid::Uuid::new_v4().to_string();
@@ -99,7 +96,6 @@ pub fn run(
 
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
 
-    // Write last_trigger.json for non-allow verdicts
     if verdict.action != tirith_core::verdict::Action::Allow {
         last_trigger::write_last_trigger(&verdict, &ctx.input, &policy.dlp_custom_patterns);
     }

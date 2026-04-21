@@ -30,10 +30,6 @@ pub fn new_session_id() -> String {
     generate_session_id()
 }
 
-// ---------------------------------------------------------------------------
-// Split API — env + file-based fallback
-// ---------------------------------------------------------------------------
-
 /// Immutable env-var session (returns `&'static str`, cached in `OnceLock`).
 ///
 /// Returns `Some` if `TIRITH_SESSION_ID` is set and non-empty, `None` otherwise.
@@ -168,7 +164,6 @@ fn load_or_create_fallback_file(scope: &str) -> String {
         None => return generate_session_id(),
     };
 
-    // Try to read existing file
     if let Ok(meta) = std::fs::symlink_metadata(&path) {
         if let Ok(modified) = meta.modified() {
             if let Ok(age) = std::time::SystemTime::now().duration_since(modified) {
@@ -184,7 +179,6 @@ fn load_or_create_fallback_file(scope: &str) -> String {
         }
     }
 
-    // Generate new ID and write
     let new_id = generate_session_id();
     write_fallback_file(&path, &new_id);
     new_id
@@ -192,7 +186,6 @@ fn load_or_create_fallback_file(scope: &str) -> String {
 
 /// Write a fallback session ID to file with secure permissions.
 fn write_fallback_file(path: &PathBuf, session_id: &str) {
-    // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             crate::audit::audit_diagnostic(format!(

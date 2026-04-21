@@ -30,7 +30,7 @@ if [[ -z "${TIRITH_SESSION_ID:-}" ]]; then
   export TIRITH_SESSION_ID
 fi
 
-# Output helper: write to stderr by default (ADR-7).
+# Output helper: write to stderr by default.
 # Override via TIRITH_OUTPUT=tty to write to /dev/tty instead.
 _tirith_output() {
   if [[ "${TIRITH_OUTPUT:-}" == "tty" ]]; then
@@ -44,7 +44,6 @@ _tirith_escape_preview() {
   printf '%q' "$1"
 }
 
-# ─── Approval workflow helpers (ADR-7) ───
 
 # Parse approval temp file. On success, sets _tirith_ap_* variables.
 # On failure (missing/unreadable/corrupt), returns 1 with fail-closed defaults.
@@ -58,7 +57,7 @@ _tirith_parse_approval() {
 
   if [[ ! -r "$file" ]]; then
     _tirith_output "tirith: warning: approval file missing or unreadable, failing closed"
-    command rm -f "$file"  # ADR-7: delete on all paths
+    command rm -f "$file"  # delete on all paths
     _tirith_ap_required="yes"
     _tirith_ap_fallback="block"
     _tirith_ap_timeout=0
@@ -76,7 +75,7 @@ _tirith_parse_approval() {
     esac
   done < "$file"
 
-  # Delete temp file after reading (ADR-7 lifecycle)
+  # Delete temp file after reading
   command rm -f "$file"
 
   # Corrupt file (no valid keys) → fail closed (reset all fields)
@@ -90,7 +89,6 @@ _tirith_parse_approval() {
   return 0
 }
 
-# ─── Warn-ack helpers (strict_warn, exit code 3) ───
 
 _tirith_parse_warn_ack() {
   local file="$1"
@@ -113,7 +111,6 @@ _tirith_parse_warn_ack() {
   return 0
 }
 
-# ─── Persistent safe mode infrastructure ───
 
 # Trim whitespace to match Rust policy.rs:state_dir() behavior
 _TIRITH_STATE_DIR="${XDG_STATE_HOME:-}"
@@ -130,7 +127,6 @@ _tirith_persist_safe_mode() {
   fi
 }
 
-# ─── Preexec helpers (shared by warn-only and Phase 1 enforcement paths) ───
 
 # Read the most recent history entry as "<index>|<cmd>" on stdout. Returns 1
 # with empty stdout when history is unavailable, disabled, or malformed.
@@ -221,7 +217,7 @@ _tirith_cmd_is_in_line() {
   return 1
 }
 
-# Install-time gate for Phase 1 enforcement. Hostile history configurations
+# Install-time gate for preexec enforcement. Hostile history configurations
 # cannot provide a trustworthy whole-line view, so the hook stays in
 # warn-only rather than claim protection it cannot deliver.
 _tirith_history_is_trustworthy_for_enforcement() {
@@ -236,10 +232,10 @@ _tirith_history_is_trustworthy_for_enforcement() {
 }
 
 # Enable `extdebug` if (and only if) tirith is the one turning it on. Tracks
-# ownership via _TIRITH_OWNS_EXTDEBUG so a future phase can safely clean up
-# at shell exit; it is deliberately left on for the rest of the session once
-# enabled, because disabling it inside the DEBUG trap would break the
-# `return 1` skip semantic bash relies on.
+# ownership via _TIRITH_OWNS_EXTDEBUG so we can safely clean up at shell exit;
+# it is deliberately left on for the rest of the session once enabled, because
+# disabling it inside the DEBUG trap would break the `return 1` skip semantic
+# bash relies on.
 _tirith_enable_extdebug() {
   if shopt -q extdebug; then
     return 0
@@ -289,7 +285,6 @@ _tirith_session_degrade_to_warn_only() {
   fi
 }
 
-# ─── Preexec function (used by both preexec mode and degrade fallback) ───
 
 _tirith_preexec() {
   [[ "${_TIRITH_BASH_INTERNAL:-0}" == "1" ]] && return 0
@@ -325,7 +320,6 @@ _tirith_preexec() {
   local rc
 
   if [[ "${_TIRITH_PREEXEC_ENFORCE:-0}" == "1" ]]; then
-    # ─── Enforcement path ────────────────────────────────────────────
     # Helper failed (no history entry available): cannot enforce whole-line
     # semantics, so block the current DEBUG fire and downgrade the session.
     if [[ -z "$history_index" ]]; then
@@ -344,7 +338,7 @@ _tirith_preexec() {
       _tirith_last_key="$line_id"
       _tirith_last_rc=1
       _tirith_session_degrade_to_warn_only \
-        "tirith: bash history no longer matches BASH_COMMAND (likely HISTCONTROL/HISTIGNORE filtering, an alias, or a shell transformation outside Phase 1 scope); cannot enforce whole-line semantics; falling back to warn-only. For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter)."
+        "tirith: bash history no longer matches BASH_COMMAND (likely HISTCONTROL/HISTIGNORE filtering, an alias, or a shell transformation outside the whole-line drift check); cannot enforce whole-line semantics; falling back to warn-only. For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter)."
       return 1
     fi
 
@@ -380,7 +374,6 @@ _tirith_preexec() {
     esac
   fi
 
-  # ─── Warn-only path ──────────────────────────────────────────────
   # Cross-path pinned-block carryover: a prior degrade may have written
   # (_tirith_last_key=$line_id, _tirith_last_rc=1) so the rest of the same
   # typed line continues to be skipped by extdebug. Keying on LINENO means
@@ -421,7 +414,6 @@ _tirith_preexec() {
   return 0
 }
 
-# ─── Degrade function ───
 
 _tirith_degrade_to_preexec() {
   local reason="${1:-unknown}"
@@ -450,7 +442,6 @@ _tirith_degrade_to_preexec() {
   fi
 }
 
-# ─── PROMPT_COMMAND management ───
 
 _tirith_prompt_hook() {
   local pending_eval="${_TIRITH_PENDING_EVAL:-}"
@@ -499,7 +490,6 @@ _tirith_ensure_prompt_hook() {
   return 0
 }
 
-# ─── Mode selection ───
 
 if [[ -n "${TIRITH_BASH_MODE:-}" ]]; then
   _TIRITH_BASH_MODE="$TIRITH_BASH_MODE"
@@ -515,7 +505,6 @@ else
   _TIRITH_BASH_MODE="enter"
 fi
 
-# ─── Effective-state exports (for `tirith doctor` live reporting) ───
 #
 # Doctor is a child process and cannot read shell-local `_TIRITH_*` variables,
 # so the hook exports a small public contract: `TIRITH_BASH_EFFECTIVE_MODE` and
@@ -533,7 +522,6 @@ if [[ $- == *i* ]]; then
   fi
 fi
 
-# ─── Phase 1: preexec enforcement opt-in (TIRITH_BASH_PREEXEC_ENFORCE) ───
 #
 # Users who set TIRITH_BASH_PREEXEC_ENFORCE to a truthy value get real
 # blocking in preexec mode via `shopt -s extdebug` + `return 1` from the
@@ -570,7 +558,6 @@ if [[ "$_TIRITH_BASH_MODE" == "preexec" ]] \
   fi
 fi
 
-# ─── Helpers ───
 
 # Check if a command is unsafe to eval (heredocs, multiline, etc.)
 _tirith_unsafe_to_eval() {
@@ -610,7 +597,6 @@ _tirith_unsafe_to_eval() {
   return 1
 }
 
-# ─── Startup health gate ───
 
 _tirith_startup_health_check() {
   # Test-only override: bypass startup gate to reach runtime failure paths in PTY tests.
@@ -627,7 +613,6 @@ _tirith_startup_health_check() {
   return 0
 }
 
-# ─── Enter mode (interactive only) ───
 
 if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
   # Enter mode: interactive shell only (bind-x requires readline).
@@ -841,7 +826,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         fi
       done
 
-      # Honor explicit TIRITH=0 bypass (#30): skip paste scanning
+      # Honor explicit TIRITH=0 bypass: skip paste scanning
       if [[ "${TIRITH:-}" == "0" ]]; then
         READLINE_LINE="${READLINE_LINE:0:$READLINE_POINT}${pasted}${READLINE_LINE:$READLINE_POINT}"
         READLINE_POINT=$((READLINE_POINT + ${#pasted}))

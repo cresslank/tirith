@@ -123,7 +123,6 @@ fn normalize_shell_token(input: &str, shell: ShellType) -> String {
                     i += 1;
                 }
             }
-            // SINGLE_QUOTE: everything literal until closing '
             QState::Single => {
                 if chars[i] == '\'' {
                     // PowerShell: '' inside single quotes is an escaped literal '
@@ -139,7 +138,6 @@ fn normalize_shell_token(input: &str, shell: ShellType) -> String {
                     i += 1;
                 }
             }
-            // DOUBLE_QUOTE
             QState::Double => {
                 if chars[i] == '"' {
                     state = QState::Normal;
@@ -169,7 +167,6 @@ fn normalize_shell_token(input: &str, shell: ShellType) -> String {
                     i += 1;
                 }
             }
-            // ANSIC_QUOTE (POSIX only): decode escape sequences
             QState::AnsiC => {
                 if chars[i] == '\'' {
                     state = QState::Normal;
@@ -324,7 +321,6 @@ pub fn check(
     let mut findings = Vec::new();
     let segments = tokenize::tokenize(input, shell);
 
-    // Check for pipe-to-interpreter patterns
     let has_pipe = segments.iter().any(|s| {
         s.preceding_separator.as_deref() == Some("|")
             || s.preceding_separator.as_deref() == Some("|&")
@@ -333,7 +329,7 @@ pub fn check(
         check_pipe_to_interpreter(&segments, shell, &mut findings);
     }
 
-    // Check for insecure TLS flags in source commands
+    // source/. reuse transport rules because they execute the fetched body.
     for segment in &segments {
         if let Some(ref cmd) = segment.command {
             let cmd_base = normalize_cmd_base(cmd, shell);
@@ -345,36 +341,19 @@ pub fn check(
         }
     }
 
-    // Check for dotfile overwrites
     check_dotfile_overwrite(&segments, &mut findings);
-
-    // Check for archive extraction to sensitive paths
     check_archive_extract(&segments, &mut findings);
-
-    // Check for process memory access
     check_proc_mem_access(&segments, shell, &mut findings);
-
-    // Check for Docker remote privilege escalation
     check_docker_remote_privesc(&segments, shell, &mut findings);
-
-    // Check for credential file sweep (exec-only)
     check_credential_file_sweep(&segments, shell, scan_context, &mut findings);
 
-    // Check for cargo install/add without supply-chain audit (exec-only)
     if scan_context == ScanContext::Exec {
         check_vet_not_configured(&segments, cwd, &mut findings);
     }
 
-    // Check for dangerous environment variable exports
     check_env_var_in_command(&segments, &mut findings);
-
-    // Check for network destination access (metadata endpoints, private networks)
     check_network_destination(&segments, &mut findings);
-
-    // Check for base64 decode-execute chains
     check_base64_decode_execute(&segments, shell, &mut findings);
-
-    // Check for data exfiltration via curl/wget uploads
     check_data_exfiltration(&segments, shell, &mut findings);
 
     findings
@@ -386,23 +365,21 @@ fn resolve_interpreter_name(seg: &tokenize::Segment, shell: ShellType) -> Option
     if let Some(ref cmd) = seg.command {
         let cmd_base = normalize_cmd_base(cmd, shell);
 
-        // Direct interpreter
         if is_interpreter(&cmd_base) {
             return Some(cmd_base);
         }
 
-        // Subshell: (bash) → strip parens, check
+        // Subshell: (bash -c '...') tokenizes with parens glued to the command.
         let stripped = cmd_base.trim_start_matches('(').trim_end_matches(')');
         if stripped != cmd_base && is_interpreter(stripped) {
             return Some(stripped.to_string());
         }
 
-        // Brace group: { → first arg is command
+        // Brace group: { cmd; } — the interpreter sits in the first arg.
         if cmd_base == "{" {
             return resolve_from_args(&seg.args, shell);
         }
 
-        // Known wrappers
         match cmd_base.as_str() {
             "sudo" => return resolve_sudo_args(&seg.args, shell),
             "env" => return resolve_env_args(&seg.args, shell),
@@ -452,7 +429,6 @@ fn resolve_base_sudo(args: &[String], shell: ShellType) -> Option<String> {
     while idx < args.len() {
         let normalized = normalize_shell_token(args[idx].trim(), shell);
         if normalized == "--" {
-            // Next positional after -- is the command
             if idx + 1 < args.len() {
                 return Some(normalize_cmd_base(&args[idx + 1], shell));
             }
@@ -479,7 +455,7 @@ fn resolve_base_sudo(args: &[String], shell: ShellType) -> Option<String> {
             }
             continue;
         }
-        // First positional is the command — recurse for nested wrappers
+        // First positional is the command — recurse so nested sudo/env/etc still resolves.
         let base = normalize_cmd_base(&args[idx], shell);
         return match base.as_str() {
             "sudo" => resolve_base_sudo(&args[idx + 1..], shell),
@@ -542,12 +518,11 @@ fn resolve_base_env(args: &[String], shell: ShellType) -> Option<String> {
             }
             continue;
         }
-        // VAR=VALUE assignments
+        // env VAR=VALUE assignments — not the command itself.
         if normalized.contains('=') {
             idx += 1;
             continue;
         }
-        // First positional is the command
         let base = normalize_cmd_base(&args[idx], shell);
         return match base.as_str() {
             "sudo" => resolve_base_sudo(&args[idx + 1..], shell),
@@ -764,14 +739,13 @@ fn resolve_step_generic<'a>(args: &'a [String], shell: ShellType) -> ResolveStep
         let raw = args[idx].trim();
         let normalized = normalize_shell_token(raw, shell);
 
-        // Track end-of-options marker
         if normalized == "--" {
             seen_dashdash = true;
             idx += 1;
             continue;
         }
 
-        // Skip flags and assignments (only before --)
+        // Before `--`: flags and VAR=VALUE assignments are skipped. After `--`, everything is a positional.
         if !seen_dashdash
             && (normalized.starts_with("--")
                 || normalized.starts_with('-')
@@ -858,14 +832,13 @@ fn resolve_step_sudo<'a>(args: &'a [String], shell: ShellType) -> ResolveStep<'a
         }
         if normalized.starts_with('-') {
             if value_short_flags.iter().any(|f| normalized == *f) {
-                // Exact match: e.g. -u → next arg is the value
                 idx += 2;
             } else if normalized.len() > 2
-                && value_short_flags.iter().any(|f| {
-                    normalized.ends_with(&f[1..]) // last char matches value-flag letter
-                })
+                && value_short_flags
+                    .iter()
+                    .any(|f| normalized.ends_with(&f[1..]))
             {
-                // Combined short flags: e.g. -iu → -i + -u, last flag takes a value
+                // Combined short flags (e.g. `-iu`): last letter may still consume the next arg.
                 idx += 2;
             } else {
                 idx += 1;
@@ -1021,7 +994,6 @@ fn check_pipe_to_interpreter(
         if let Some(sep) = &seg.preceding_separator {
             if sep == "|" || sep == "|&" {
                 if let Some(interpreter) = resolve_interpreter_name(seg, shell) {
-                    // i > 0 is guaranteed — the loop skips i == 0 above.
                     let source = &segments[i - 1];
                     let source_cmd_ref = source.command.as_deref().unwrap_or("unknown");
                     let source_base = normalize_cmd_base(source_cmd_ref, shell);
@@ -1124,7 +1096,6 @@ fn check_pipe_to_interpreter(
 
 fn check_dotfile_overwrite(segments: &[tokenize::Segment], findings: &mut Vec<Finding>) {
     for segment in segments {
-        // Check for redirects to dotfiles
         let raw = &segment.raw;
         if (raw.contains("> ~/.")
             || raw.contains("> $HOME/.")
@@ -1155,7 +1126,6 @@ fn check_archive_extract(segments: &[tokenize::Segment], findings: &mut Vec<Find
         if let Some(ref cmd) = segment.command {
             let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd).to_lowercase();
             if cmd_base == "tar" || cmd_base == "unzip" || cmd_base == "7z" {
-                // Check if extracting to a sensitive directory
                 let raw = &segment.raw;
                 let sensitive_targets = [
                     "-C /",
@@ -1192,10 +1162,6 @@ fn check_archive_extract(segments: &[tokenize::Segment], findings: &mut Vec<Find
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Process memory access detection
-// ---------------------------------------------------------------------------
 
 /// Commands that read file contents — scoped to utilities commonly used
 /// for proc memory dumping. Excludes echo/printf (not file readers).
@@ -1267,10 +1233,6 @@ fn check_proc_mem_access(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Docker remote privilege escalation detection
-// ---------------------------------------------------------------------------
-
 fn check_docker_remote_privesc(
     segments: &[tokenize::Segment],
     shell: ShellType,
@@ -1327,11 +1289,9 @@ fn detect_docker_remote_host(
 ) -> bool {
     for (i, arg) in norm_args.iter().enumerate() {
         let lower = arg.to_lowercase();
-        // -H=tcp://... or --host=tcp://... (combined form, quotes already stripped)
         if arg.starts_with("-H=tcp://") || lower.starts_with("--host=tcp://") {
             return true;
         }
-        // -H tcp://... or --host tcp://... (flag + next arg)
         if arg == "-H" || lower == "--host" {
             if let Some(next) = norm_args.get(i + 1) {
                 if next.starts_with("tcp://") {
@@ -1340,7 +1300,7 @@ fn detect_docker_remote_host(
             }
         }
     }
-    // DOCKER_HOST=tcp://... as env prefix (Path A: direct leading env assignment)
+    // Leading env assignment: `DOCKER_HOST=tcp://... docker ...`
     for (name, value) in tokenize::leading_env_assignments(&seg.raw) {
         if name.eq_ignore_ascii_case("DOCKER_HOST") {
             let clean_val = normalize_shell_token(&value, shell);
@@ -1349,8 +1309,8 @@ fn detect_docker_remote_host(
             }
         }
     }
-    // Path B: env wrapper form (env DOCKER_HOST=tcp://... docker ...)
-    // Skip DOCKER_HOST= args that follow -e/--env (those set container env, not client remote)
+    // env-wrapper form: `env DOCKER_HOST=tcp://... docker ...`.
+    // Skip DOCKER_HOST= values that follow -e/--env — those set *container* env, not the client's remote.
     let args = &seg.args;
     for (i, arg) in args.iter().enumerate() {
         let norm = normalize_shell_token(arg, shell);
@@ -1358,12 +1318,11 @@ fn detect_docker_remote_host(
             .strip_prefix("DOCKER_HOST=")
             .or_else(|| norm.strip_prefix("docker_host="))
         {
-            // Check if this arg is a container -e/--env value (not client config)
             if i > 0 {
                 let prev = normalize_shell_token(&args[i - 1], shell);
                 let prev_lower = prev.to_lowercase();
                 if prev_lower == "-e" || prev_lower == "--env" {
-                    continue; // container env, not client remote
+                    continue;
                 }
             }
             let clean_val = normalize_shell_token(val, shell);
@@ -1378,7 +1337,6 @@ fn detect_docker_remote_host(
 fn has_docker_root_mount(norm_args: &[String]) -> bool {
     for (i, arg) in norm_args.iter().enumerate() {
         let lower = arg.to_lowercase();
-        // -v /:/... or --volume /:/... (flag + next value)
         if lower == "-v" || lower == "--volume" {
             if let Some(val) = norm_args.get(i + 1) {
                 if val.starts_with("/:/") {
@@ -1386,11 +1344,9 @@ fn has_docker_root_mount(norm_args: &[String]) -> bool {
                 }
             }
         }
-        // -v=/:/... or --volume=/:/...
         if lower.starts_with("-v=/:/") || lower.starts_with("--volume=/:/") {
             return true;
         }
-        // --mount type=bind,src=/,dst=/...
         let mount_val = if lower == "--mount" {
             norm_args.get(i + 1).map(|s| s.as_str())
         } else {
@@ -1408,10 +1364,6 @@ fn has_docker_root_mount(norm_args: &[String]) -> bool {
     }
     false
 }
-
-// ---------------------------------------------------------------------------
-// Credential file sweep detection
-// ---------------------------------------------------------------------------
 
 const CREDENTIAL_PATHS: &[&str] = &[
     "/.ssh/id_",
@@ -1485,10 +1437,6 @@ fn check_credential_file_sweep(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Phase 8: Dangerous environment variable detection
-// ---------------------------------------------------------------------------
 
 /// Environment variables that enable arbitrary code injection via dynamic linker.
 const CODE_INJECTION_VARS: &[&str] = &[
@@ -1564,24 +1512,20 @@ fn is_cargo_install_or_add(args: &[String]) -> bool {
             skip_next = false;
             continue;
         }
-        // Toolchain specs (+nightly, +stable)
+        // `cargo +nightly install foo` — the `+toolchain` is not a flag.
         if arg.starts_with('+') {
             continue;
         }
-        // Long flags with = (--config=foo): skip this arg only
         if arg.starts_with("--") && arg.contains('=') {
             continue;
         }
-        // Known value-taking flags: skip this AND next
         if CARGO_VALUE_FLAGS.contains(&arg.as_str()) {
             skip_next = true;
             continue;
         }
-        // Other flags (--locked, -v, etc.)
         if arg.starts_with('-') {
             continue;
         }
-        // First positional arg is the subcommand — only match install/add
         return arg == "install" || arg == "add";
     }
     false
@@ -1611,8 +1555,7 @@ fn check_vet_not_configured(
         return;
     }
 
-    // Check if supply-chain/ config exists relative to the analysis context cwd.
-    // Require an explicit cwd — without one we cannot reliably check the filesystem.
+    // Require an explicit cwd — without one we cannot reliably resolve supply-chain/config.toml.
     let cwd = match cwd {
         Some(dir) => dir,
         None => return,
@@ -1714,10 +1657,6 @@ fn redact_env_value(val: &str) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Phase 9 (free): Network destination detection
-// ---------------------------------------------------------------------------
-
 /// Cloud metadata endpoint IPs that expose instance credentials.
 const METADATA_ENDPOINTS: &[&str] = &["169.254.169.254", "100.100.100.200"];
 
@@ -1774,7 +1713,7 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
         for arg in &segment.args {
             let trimmed = arg.trim().trim_matches(|c: char| c == '\'' || c == '"');
             if trimmed.starts_with('-') {
-                // Check flag=value args for embedded URLs (e.g., --url=http://evil.com)
+                // `--url=http://evil.com` style — URL is wedged into the flag value.
                 if let Some((_flag, value)) = trimmed.split_once('=') {
                     check_host_for_network_issues(value, findings);
                 }
@@ -1788,35 +1727,29 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
 
 /// Extract a host/IP from a URL-like command argument.
 fn extract_host_from_arg(arg: &str) -> Option<String> {
-    // URL with scheme: http://HOST[:PORT]/path
     if let Some(scheme_end) = arg.find("://") {
         let after_scheme = &arg[scheme_end + 3..];
-        // Strip userinfo (anything before @)
         let after_userinfo = if let Some(at_idx) = after_scheme.find('@') {
             &after_scheme[at_idx + 1..]
         } else {
             after_scheme
         };
-        // Get host:port (before first /)
         let host_port = after_userinfo.split('/').next().unwrap_or(after_userinfo);
         let host = strip_port(host_port);
-        // Reject obviously invalid hosts (malformed brackets, embedded paths)
         if host.is_empty() || host.contains('/') || host.contains('[') {
             return None;
         }
         return Some(host);
     }
 
-    // Bare host/IP: "169.254.169.254/path" or just "169.254.169.254"
+    // Bare host/IP like `curl 169.254.169.254/path`.
     let host_part = arg.split('/').next().unwrap_or(arg);
     let host = strip_port(host_part);
 
-    // Accept valid IPv4 addresses for bare hosts (no scheme)
     if host.parse::<std::net::Ipv4Addr>().is_ok() {
         return Some(host);
     }
 
-    // Accept bracketed IPv6: [::1]
     if host_part.starts_with('[') {
         if let Some(bracket_end) = host_part.find(']') {
             let ipv6 = &host_part[1..bracket_end];
@@ -1831,18 +1764,17 @@ fn extract_host_from_arg(arg: &str) -> Option<String> {
 
 /// Strip port number from a host:port string, handling IPv6 brackets.
 fn strip_port(host_port: &str) -> String {
-    // Handle IPv6: [::1]:8080
+    // Bracketed IPv6 with port: [::1]:8080
     if host_port.starts_with('[') {
         if let Some(bracket_end) = host_port.find(']') {
             return host_port[1..bracket_end].to_string();
         }
     }
-    // Don't strip from unbracketed IPv6 (multiple colons)
+    // Unbracketed string with multiple colons is bare IPv6 — port stripping would corrupt it.
     let colon_count = host_port.chars().filter(|&c| c == ':').count();
     if colon_count > 1 {
-        return host_port.to_string(); // IPv6, don't strip
+        return host_port.to_string();
     }
-    // IPv4 or hostname with single colon: strip trailing :PORT
     if let Some(colon_idx) = host_port.rfind(':') {
         if host_port[colon_idx + 1..].parse::<u16>().is_ok() {
             return host_port[..colon_idx].to_string();
@@ -1947,11 +1879,9 @@ pub fn check_network_policy(
     let mut findings = Vec::new();
 
     for segment in &segments {
-        // Resolve through wrappers (`sudo`, `env`, `command`, `time`, etc.)
-        // so e.g. `sudo curl http://evil.com` and `env curl http://evil.com`
-        // are treated identically to the bare source command. Before this
-        // fix `segment.command` was read literally and any wrapper bypassed
-        // the deny list.
+        // Resolve through wrappers (`sudo`, `env`, `command`, `time`, ...) so e.g.
+        // `sudo curl http://evil.com` is treated like the bare source command. Reading
+        // `segment.command` directly lets any wrapper bypass the deny list.
         let Some((resolved_name, resolved_args)) = crate::extract::resolve_wrapped_command(segment)
         else {
             continue;
@@ -1965,7 +1895,7 @@ pub fn check_network_policy(
         for arg in &resolved_args {
             let trimmed = arg.trim().trim_matches(|c: char| c == '\'' || c == '"');
             if trimmed.starts_with('-') {
-                // Check flag=value args for embedded URLs (e.g., --url=http://evil.com)
+                // `--url=http://evil.com` style — URL is wedged into the flag value.
                 if let Some((_flag, value)) = trimmed.split_once('=') {
                     if let Some(host) = extract_host_from_arg(value) {
                         if matches_network_list(&host, allow) {
@@ -1994,10 +1924,9 @@ pub fn check_network_policy(
                 continue;
             }
 
-            // scp/rsync remote specs ([user@]host:path) don't match the generic
-            // URL-scheme or bare-IP heuristics `extract_host_from_arg` uses, so
-            // they need their own path. See issue #26 review follow-up — before
-            // this, scp/rsync remote specs were invisible to network_deny.
+            // scp/rsync remote specs ([user@]host:path) aren't URLs and don't match
+            // `extract_host_from_arg`, so they need their own path or the deny list
+            // silently passes them through.
             if is_scp_family {
                 if let Some(spec) = crate::extract::parse_scp_remote_spec(trimmed, shell) {
                     let host = spec.host;
@@ -2027,7 +1956,6 @@ pub fn check_network_policy(
             }
 
             if let Some(host) = extract_host_from_arg(trimmed) {
-                // Allow list exempts from deny
                 if matches_network_list(&host, allow) {
                     continue;
                 }
@@ -2113,16 +2041,12 @@ fn cidr_contains(host: &str, cidr: &str) -> Option<bool> {
     Some(net_bits == host_bits)
 }
 
-// ---------------------------------------------------------------------------
-// Base64 decode-execute detection
-// ---------------------------------------------------------------------------
-
 fn check_base64_decode_execute(
     segments: &[tokenize::Segment],
     shell: ShellType,
     findings: &mut Vec<Finding>,
 ) {
-    // Pattern A: Pipe chain — base64 with decode flag piped to interpreter
+    // Pattern A: `base64 -d | bash` — base64 leads the chain.
     for (i, seg) in segments.iter().enumerate() {
         if let Some(ref cmd) = seg.command {
             let cmd_base = normalize_cmd_base(cmd, shell);
@@ -2132,7 +2056,6 @@ fn check_base64_decode_execute(
                     matches!(norm.as_str(), "-d" | "--decode" | "-D")
                 });
                 if has_decode_flag {
-                    // Check if next piped segment is an interpreter
                     if let Some(next_seg) = segments.get(i + 1) {
                         if let Some(ref sep) = next_seg.preceding_separator {
                             if (sep == "|" || sep == "|&")
@@ -2161,8 +2084,7 @@ fn check_base64_decode_execute(
             }
         }
 
-        // Also check: something piped to base64 -d piped to interpreter
-        // e.g. echo X | base64 -d | bash — base64 is mid-chain
+        // Pattern A': `echo X | base64 -d | bash` — base64 is mid-chain.
         if i >= 1 {
             if let Some(ref sep) = seg.preceding_separator {
                 if sep == "|" || sep == "|&" {
@@ -2179,7 +2101,7 @@ fn check_base64_decode_execute(
                                         if (next_sep == "|" || next_sep == "|&")
                                             && resolve_interpreter_name(next_seg, shell).is_some()
                                         {
-                                            // Only fire if we didn't already fire above (when i was the base64 segment)
+                                            // Pattern A and A' both observe the same chain; only fire once per input.
                                             let already_found = findings
                                                 .iter()
                                                 .any(|f| f.rule_id == RuleId::Base64DecodeExecute);
@@ -2212,10 +2134,9 @@ fn check_base64_decode_execute(
         }
     }
 
-    // Pattern B: Inline decode-execute — interpreter -c/-e with decode+execute tokens
-    // Uses resolve_interpreter_name to handle wrappers (sudo, env, command, nohup, exec)
+    // Pattern B: inline decode-execute — e.g. `python -c '...b64decode...'`.
+    // Wrapped forms (sudo, env, command, nohup) resolve through resolve_interpreter_name.
     for seg in segments {
-        // Resolve through wrappers: sudo python → python, env node → node
         let interpreter = if let Some(ref cmd) = seg.command {
             let cmd_base = normalize_cmd_base(cmd, shell);
             if is_interpreter(&cmd_base) {
@@ -2228,7 +2149,6 @@ fn check_base64_decode_execute(
         };
 
         if let Some(interp) = interpreter {
-            // Check ALL args (including wrapper args) for -c/-e and decode+execute tokens
             let has_exec_flag = seg.args.iter().any(|arg| {
                 let norm = normalize_shell_token(arg, shell);
                 norm == "-c" || norm == "-e"
@@ -2261,7 +2181,7 @@ fn check_base64_decode_execute(
         }
     }
 
-    // Pattern C: PowerShell -EncodedCommand / -enc / -ec
+    // Pattern C: `powershell -EncodedCommand <base64>` (and `-enc`/`-ec` aliases).
     for seg in segments {
         if let Some(ref cmd) = seg.command {
             let cmd_base = normalize_cmd_base(cmd, shell);
@@ -2294,10 +2214,6 @@ fn check_base64_decode_execute(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Data exfiltration detection (POSIX + Fish: curl/wget upload of sensitive data)
-// ---------------------------------------------------------------------------
-
 /// Sensitive file paths for data exfiltration detection.
 const SENSITIVE_PATHS: &[&str] = &[
     "/etc/passwd",
@@ -2322,7 +2238,6 @@ fn is_sensitive_file_ref(value: &str) -> bool {
 fn has_sensitive_env_ref(value: &str) -> bool {
     use crate::rules::shared::SENSITIVE_KEY_VARS;
     for var in SENSITIVE_KEY_VARS {
-        // $VAR or ${VAR}
         if value.contains(&format!("${var}")) || value.contains(&format!("${{{var}}}")) {
             return true;
         }
@@ -2331,7 +2246,7 @@ fn has_sensitive_env_ref(value: &str) -> bool {
 }
 
 fn has_sensitive_cmd_substitution(value: &str) -> bool {
-    // Check for $(cmd) with sensitive paths — no backtick detection (PowerShell conflict)
+    // `$(...)` only — backtick substitution is ambiguous in PowerShell where ` is the escape char.
     if let Some(start) = value.find("$(") {
         let rest = &value[start..];
         return SENSITIVE_PATHS.iter().any(|p| rest.contains(p));
@@ -2364,19 +2279,14 @@ fn check_curl_exfiltration(seg: &tokenize::Segment, shell: ShellType, findings: 
     while i < args.len() {
         let norm = normalize_shell_token(&args[i], shell);
 
-        // -d / --data / --data-binary / --data-raw / --data-urlencode
+        // curl accepts short flags glued (`-d@file`) as well as `-d file`, hence the length-2 check.
         let is_data_flag =
-            norm == "-d" || norm.starts_with("--data") || norm.starts_with("-d") && norm.len() > 2; // combined form -dVAL
-
-        // -F / --form
+            norm == "-d" || norm.starts_with("--data") || norm.starts_with("-d") && norm.len() > 2;
         let is_form_flag =
             norm == "-F" || norm.starts_with("--form") || norm.starts_with("-F") && norm.len() > 2;
-
-        // -T / --upload-file
         let is_upload_flag = norm == "-T" || norm.starts_with("--upload-file");
 
         if is_data_flag || is_form_flag || is_upload_flag {
-            // Get the value: either from =VAL, combined form, or next arg
             let value = if let Some(eq_pos) = norm.find('=') {
                 Some(norm[eq_pos + 1..].to_string())
             } else if (norm == "-d"
@@ -2392,11 +2302,8 @@ fn check_curl_exfiltration(seg: &tokenize::Segment, shell: ShellType, findings: 
             {
                 i += 1;
                 Some(normalize_shell_token(&args[i], shell))
-            } else if norm.starts_with("-d") && norm.len() > 2 {
-                // Combined -dVAL
-                Some(norm[2..].to_string())
-            } else if norm.starts_with("-F") && norm.len() > 2 {
-                // Combined -FVAL
+            } else if (norm.starts_with("-d") || norm.starts_with("-F")) && norm.len() > 2 {
+                // Glued short-flag form: -dVAL or -FVAL.
                 Some(norm[2..].to_string())
             } else {
                 None
@@ -2404,7 +2311,7 @@ fn check_curl_exfiltration(seg: &tokenize::Segment, shell: ShellType, findings: 
 
             if let Some(val) = value {
                 let is_sensitive = if is_upload_flag {
-                    // -T uses direct file paths (no @)
+                    // curl's `-T` takes a raw path (no `@` prefix, unlike `-d`/`-F`).
                     SENSITIVE_PATHS.iter().any(|p| val.contains(p))
                 } else {
                     is_sensitive_file_ref(&val)
@@ -2427,7 +2334,7 @@ fn check_curl_exfiltration(seg: &tokenize::Segment, shell: ShellType, findings: 
                         mitre_id: None,
                         custom_rule_id: None,
                     });
-                    return; // One finding per segment
+                    return;
                 }
             }
         }
@@ -2801,8 +2708,6 @@ mod tests {
         assert_eq!(extract_host_from_arg("output.txt"), None);
     }
 
-    // --- Network policy tests ---
-
     #[test]
     fn test_network_policy_deny_exact() {
         let deny = vec!["evil.com".to_string()];
@@ -2916,9 +2821,8 @@ mod tests {
 
     #[test]
     fn test_network_policy_catches_scp_host_path() {
-        // #26 review follow-up: before this fix, bare scp/rsync host:path
-        // remote specs were invisible to network_deny because
-        // `extract_host_from_arg` only handles scheme-ful URLs / bare IPs.
+        // scp/rsync remote specs need their own parser path because
+        // `extract_host_from_arg` only handles scheme-ful URLs and bare IPs.
         let deny = vec!["evil.com".to_string()];
         let allow = vec![];
         let findings = check_network_policy(
@@ -2976,12 +2880,6 @@ mod tests {
         );
         assert!(findings.is_empty());
     }
-
-    // -----------------------------------------------------------------------
-    // Wrapper resolution: sudo/doas/env/command/time must not bypass policy.
-    // The policy gate now keys off the RESOLVED command, not segment.command,
-    // so `sudo curl …` is treated identically to bare `curl …`.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_network_policy_catches_sudo_wrapped_curl() {
@@ -3263,8 +3161,6 @@ mod tests {
         );
     }
 
-    // ── normalize_shell_token unit tests ──
-
     #[test]
     fn test_normalize_ansi_c_basic() {
         assert_eq!(normalize_shell_token("$'bash'", ShellType::Posix), "bash");
@@ -3360,8 +3256,6 @@ mod tests {
         assert_eq!(result, "bash");
     }
 
-    // ── normalize_cmd_base unit tests ──
-
     #[test]
     fn test_cmd_base_path() {
         assert_eq!(
@@ -3425,8 +3319,6 @@ mod tests {
             "bash"
         );
     }
-
-    // ── resolve_interpreter_name tests for new patterns ──
 
     #[test]
     fn test_resolve_ansi_c_quoted_bash() {
@@ -3514,8 +3406,6 @@ mod tests {
             "should detect PowerShell backtick-escaped iex"
         );
     }
-
-    // --- Remediation hint tests ---
 
     #[test]
     fn test_pipe_to_interpreter_hint_with_url() {

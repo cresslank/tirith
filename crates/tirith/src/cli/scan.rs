@@ -19,7 +19,6 @@ pub fn run(
     exclude: &[String],
     profile: Option<&str>,
 ) -> i32 {
-    // Resolve effective settings: CLI args merged with profile (if any)
     let mut effective_include: Vec<String> = include.to_vec();
     let mut effective_exclude: Vec<String> = exclude.to_vec();
     let mut effective_ignore: Vec<String> = ignore.to_vec();
@@ -28,7 +27,7 @@ pub fn run(
     if let Some(profile_name) = profile {
         let policy = Policy::discover(None);
         if let Some(scan_profile) = policy.scan.profiles.get(profile_name) {
-            // Profile values are defaults; CLI flags override when non-empty
+            // Profile values are defaults; CLI flags override when non-empty.
             if effective_include.is_empty() {
                 effective_include = scan_profile.include.clone();
             }
@@ -36,10 +35,9 @@ pub fn run(
                 effective_exclude = scan_profile.exclude.clone();
             }
             if effective_ignore.is_empty() {
-                // Merge profile ignore and profile exclude-as-ignore
                 effective_ignore = scan_profile.ignore.clone();
             }
-            // Profile fail_on is used only when CLI is at the default value
+            // Profile fail_on applies only when CLI is at its default value.
             if fail_on == "critical" {
                 if let Some(ref profile_fail_on) = scan_profile.fail_on {
                     effective_fail_on = profile_fail_on.clone();
@@ -52,12 +50,10 @@ pub fn run(
 
     let fail_on_severity = parse_severity(&effective_fail_on);
 
-    // --stdin mode: read from stdin
     if stdin {
         return run_stdin(json, sarif, ci, fail_on_severity);
     }
 
-    // --file mode: scan a single file
     if let Some(file_path) = file {
         if should_skip_file(
             file_path,
@@ -70,12 +66,10 @@ pub fn run(
         return run_single_file(file_path, json, sarif, ci, fail_on_severity);
     }
 
-    // Directory/path mode
     let scan_path = path
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    // Single file passed as positional argument
     if scan_path.is_file() {
         let path_str = scan_path.display().to_string();
         if should_skip_file(
@@ -413,18 +407,15 @@ fn should_skip_file(
         })
     };
 
-    // Ignore patterns: skip if matched
     if matches(ignore) {
         return true;
     }
 
-    // Exclude patterns: skip if matched
     if matches(exclude) {
         return true;
     }
 
-    // Include patterns: if non-empty, file must match at least one positive include
-    // (negation patterns starting with '!' are treated as excludes, not includes)
+    // '!'-prefixed include patterns act as excludes, not includes.
     let positive_includes: Vec<&String> = include.iter().filter(|p| !p.starts_with('!')).collect();
     let negated_includes: Vec<String> = include
         .iter()
@@ -442,7 +433,6 @@ fn should_skip_file(
         }
     }
 
-    // Negated includes: skip if matched
     if negated_includes.iter().any(|p| {
         tirith_core::scan::matches_ignore_pattern(file_name, p)
             || tirith_core::scan::matches_ignore_pattern(file_path, p)

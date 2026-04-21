@@ -31,11 +31,7 @@ pub fn is_renderable_file(path: Option<&std::path::Path>) -> bool {
     matches!(ext.as_str(), "md" | "html" | "htm" | "xhtml" | "pdf")
 }
 
-// ---------------------------------------------------------------------------
-// CSS hiding detection
-// ---------------------------------------------------------------------------
-
-/// 6 CSS hiding patterns that conceal content from visual rendering.
+/// CSS hiding patterns that conceal content from visual rendering.
 fn check_css_hiding(input: &str, findings: &mut Vec<Finding>) {
     use once_cell::sync::Lazy;
     use regex::Regex;
@@ -98,12 +94,12 @@ fn check_css_hiding(input: &str, findings: &mut Vec<Finding>) {
                 custom_rule_id: None,
             });
 
-            // Only report first CSS technique per finding (avoid flood)
+            // Limit to one finding per technique — the compound check below catches stacking.
             break;
         }
     }
 
-    // Check for multiple CSS hiding techniques (compound hiding is more suspicious)
+    // Stacking multiple hiding techniques is much more deliberate than a single occurrence.
     let technique_count = CSS_PATTERNS
         .iter()
         .filter(|(p, _)| p.is_match(input))
@@ -131,16 +127,12 @@ fn check_css_hiding(input: &str, findings: &mut Vec<Finding>) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Color hiding detection (WCAG luminance)
-// ---------------------------------------------------------------------------
-
 /// Detect text hidden via color similarity (e.g., white text on white background).
+/// Uses WCAG 2.0 contrast ratio with a 1.5:1 cutoff — well below readable thresholds.
 fn check_color_hiding(input: &str, findings: &mut Vec<Finding>) {
     use once_cell::sync::Lazy;
     use regex::Regex;
 
-    // Match inline style with both color and background-color
     static COLOR_PAIR: Lazy<Regex> = Lazy::new(|| {
         Regex::new(
             r#"(?i)style\s*=\s*["'][^"']*(?:(?:color\s*:\s*([^;"']+))[^"']*background(?:-color)?\s*:\s*([^;"']+)|(?:background(?:-color)?\s*:\s*([^;"']+))[^"']*color\s*:\s*([^;"']+))"#,
@@ -192,15 +184,15 @@ fn check_color_hiding(input: &str, findings: &mut Vec<Finding>) {
 fn parse_color(s: &str) -> Option<(f64, f64, f64)> {
     let s = s.trim();
 
-    // Named colors (common hiding pairs)
     match s.to_lowercase().as_str() {
         "white" => return Some((1.0, 1.0, 1.0)),
         "black" => return Some((0.0, 0.0, 0.0)),
-        "transparent" => return Some((1.0, 1.0, 1.0)), // treat as white for contrast
+        // `transparent` shows whatever's behind it; treating it as white is the common
+        // hiding case (white-on-transparent over a white page).
+        "transparent" => return Some((1.0, 1.0, 1.0)),
         _ => {}
     }
 
-    // Hex: #rgb or #rrggbb
     if let Some(hex) = s.strip_prefix('#') {
         if !hex.is_ascii() {
             return None;
@@ -222,7 +214,6 @@ fn parse_color(s: &str) -> Option<(f64, f64, f64)> {
         };
     }
 
-    // rgb(r, g, b)
     if s.starts_with("rgb(") && s.ends_with(')') {
         let inner = &s[4..s.len() - 1];
         let parts: Vec<&str> = inner.split(',').collect();
@@ -257,10 +248,6 @@ fn contrast_ratio(c1: (f64, f64, f64), c2: (f64, f64, f64)) -> f64 {
     (lighter + 0.05) / (darker + 0.05)
 }
 
-// ---------------------------------------------------------------------------
-// HTML hidden/aria-hidden attribute detection
-// ---------------------------------------------------------------------------
-
 fn check_html_hidden_attributes(input: &str, findings: &mut Vec<Finding>) {
     use once_cell::sync::Lazy;
     use regex::Regex;
@@ -274,12 +261,12 @@ fn check_html_hidden_attributes(input: &str, findings: &mut Vec<Finding>) {
         return;
     }
 
-    // Filter out common benign patterns (SVG symbol defs, icon sprites)
+    // Common a11y patterns are benign: SVG symbol defs, screen-reader-only spans,
+    // and icon sprites all legitimately use hidden / aria-hidden.
     let suspicious: Vec<_> = matches
         .iter()
         .filter(|m| {
             let text = m.as_str().to_lowercase();
-            // aria-hidden on <svg>, <span class="sr-only">, <i class="icon"> are benign
             !(text.starts_with("<svg") || text.contains("sr-only") || text.contains("icon"))
         })
         .collect();
@@ -313,10 +300,6 @@ fn check_html_hidden_attributes(input: &str, findings: &mut Vec<Finding>) {
         custom_rule_id: None,
     });
 }
-
-// ---------------------------------------------------------------------------
-// Comment content danger analysis
-// ---------------------------------------------------------------------------
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -408,16 +391,11 @@ fn analyze_comment_danger(body: &str) -> Option<(Severity, &'static str)> {
     None
 }
 
-// ---------------------------------------------------------------------------
-// HTML comment detection
-// ---------------------------------------------------------------------------
-
 fn check_html_comments(
     input: &str,
     file_path: Option<&std::path::Path>,
     findings: &mut Vec<Finding>,
 ) {
-    // Only check HTML-like files
     let is_html = match file_path {
         Some(p) => {
             let ext = p
@@ -427,10 +405,8 @@ fn check_html_comments(
                 .to_lowercase();
             matches!(ext.as_str(), "html" | "htm" | "xhtml" | "md")
         }
-        None => {
-            // No file path — check if content looks like HTML
-            input.contains("<!DOCTYPE") || input.contains("<html") || input.contains("<!--")
-        }
+        // Without a path, sniff for HTML markers in the content itself.
+        None => input.contains("<!DOCTYPE") || input.contains("<html") || input.contains("<!--"),
     };
 
     if !is_html {
@@ -448,16 +424,14 @@ fn check_html_comments(
         let line = line_number_of(input, cap.get(0).unwrap().start());
         comment_count += 1;
 
-        // Check for dangerous content first
         if let Some((sev, reason)) = analyze_comment_danger(body) {
             dangerous_comments.push((line, sev, reason));
         } else if body.len() > 50 {
-            // Fall back to length-based Low
+            // Length-based heuristic — long opaque comments are suspicious even without keywords.
             long_comments.push((line, body.len()));
         }
     }
 
-    // Emit dangerous comment findings (one per severity level to avoid spam)
     if !dangerous_comments.is_empty() {
         let max_sev = dangerous_comments.iter().map(|(_, s, _)| *s).max().unwrap();
         findings.push(Finding {
@@ -482,7 +456,6 @@ fn check_html_comments(
         });
     }
 
-    // Still emit length-based Low findings separately
     if !long_comments.is_empty() {
         findings.push(Finding {
             rule_id: RuleId::HtmlComment,
@@ -508,16 +481,11 @@ fn check_html_comments(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Markdown comment detection
-// ---------------------------------------------------------------------------
-
 fn check_markdown_comments(
     input: &str,
     file_path: Option<&std::path::Path>,
     findings: &mut Vec<Finding>,
 ) {
-    // Only check Markdown files
     let is_md = match file_path {
         Some(p) => {
             let ext = p
@@ -534,7 +502,7 @@ fn check_markdown_comments(
         return;
     }
 
-    // Markdown link-reference comments: [//]: # (hidden text)
+    // Markdown's link-reference syntax doubles as a comment: `[//]: # (hidden text)`.
     static MD_COMMENT: Lazy<Regex> =
         Lazy::new(|| Regex::new(r#"\[//\]\s*:\s*#\s*\(([^)]*)\)"#).unwrap());
 
@@ -600,10 +568,6 @@ fn check_markdown_comments(
     }
 }
 
-// ---------------------------------------------------------------------------
-// PDF hidden text detection
-// ---------------------------------------------------------------------------
-
 /// Check a PDF file (raw bytes) for hidden text using sub-pixel scale transforms.
 ///
 /// Attackers embed invisible text in PDFs using font-size 0 or scale transforms
@@ -620,7 +584,7 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
         }
     };
 
-    let mut hidden_texts: Vec<(u32, String)> = Vec::new(); // (page_num, text_snippet)
+    let mut hidden_texts: Vec<(u32, String)> = Vec::new();
 
     for (page_num, page_id) in doc.get_pages() {
         let content = match doc.get_page_content(page_id) {
@@ -633,7 +597,8 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
             Err(_) => continue,
         };
 
-        let mut current_font_size: f64 = 12.0; // Default
+        // PDF default text font size if `Tf` is never seen.
+        let mut current_font_size: f64 = 12.0;
         let mut current_scale: f64 = 1.0;
         let mut in_text_block = false;
 
@@ -647,7 +612,7 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
                 "ET" => {
                     in_text_block = false;
                 }
-                // Text font and size: Tf <font> <size>
+                // `Tf <font> <size>` — operand 1 is the size.
                 "Tf" if in_text_block => {
                     if let Some(size) = op.operands.get(1) {
                         if let Ok(s) = pdf_operand_to_f64(size) {
@@ -655,8 +620,7 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
                         }
                     }
                 }
-                // Text matrix: Tm <a> <b> <c> <d> <e> <f>
-                // a and d are x/y scale factors
+                // Text matrix `Tm a b c d e f` — `a` and `d` are x/y scale factors.
                 "Tm" if in_text_block => {
                     if op.operands.len() >= 4 {
                         let a = pdf_operand_to_f64(&op.operands[0]).unwrap_or(1.0);
@@ -664,7 +628,7 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
                         current_scale = a.abs().min(d.abs());
                     }
                 }
-                // Concatenate matrix: cm <a> <b> <c> <d> <e> <f>
+                // CTM `cm a b c d e f` — only adopt sub-1.0 scales (avoid clobbering normal layout).
                 "cm" => {
                     if op.operands.len() >= 4 {
                         let a = pdf_operand_to_f64(&op.operands[0]).unwrap_or(1.0);
@@ -675,11 +639,10 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
                         }
                     }
                 }
-                // Show text: Tj, TJ, ', "
                 "Tj" | "TJ" | "'" | "\"" if in_text_block => {
                     let effective_size = current_font_size * current_scale;
                     if effective_size < 1.0 {
-                        // Sub-pixel text — hidden from human view
+                        // Text rendered below 1px is invisible to humans but still extracted by AI tools.
                         let text = extract_text_from_operands(&op.operands);
                         if !text.trim().is_empty() {
                             hidden_texts.push((page_num, text));
@@ -741,7 +704,7 @@ fn extract_text_from_operands(operands: &[lopdf::Object]) -> String {
     for op in operands {
         match op {
             lopdf::Object::String(bytes, _) => {
-                // Try UTF-8, fall back to latin-1
+                // Try UTF-8 first; PDFs often hold latin-1 — fall back byte-by-byte.
                 match std::str::from_utf8(bytes) {
                     Ok(s) => result.push_str(s),
                     Err(_) => {
@@ -752,7 +715,7 @@ fn extract_text_from_operands(operands: &[lopdf::Object]) -> String {
                 }
             }
             lopdf::Object::Array(arr) => {
-                // TJ array: mix of strings and spacing adjustments
+                // `TJ` array interleaves strings and numeric kerning adjustments — keep the strings.
                 for item in arr {
                     if let lopdf::Object::String(bytes, _) = item {
                         match std::str::from_utf8(bytes) {
@@ -771,10 +734,6 @@ fn extract_text_from_operands(operands: &[lopdf::Object]) -> String {
     }
     result
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 /// Get 1-based line number for a byte offset.
 fn line_number_of(input: &str, byte_offset: usize) -> usize {
@@ -1027,8 +986,8 @@ mod tests {
 
     #[test]
     fn test_parse_color_multibyte_hex_no_panic() {
-        // Multi-byte characters like 'é' (2 bytes, 1 char) could cause
-        // a panic via byte-index slicing if not guarded.
+        // Multi-byte chars (e.g. 'é' is 2 bytes / 1 char) would panic in the
+        // hex-length branches without the `is_ascii` guard.
         assert_eq!(parse_color("#é1"), None);
         assert_eq!(parse_color("#é1é2é3"), None);
         assert_eq!(parse_color("#\u{1F600}ab"), None);
@@ -1062,7 +1021,7 @@ mod tests {
 
     #[test]
     fn test_pdf_invalid_bytes_no_panic() {
-        // Invalid PDF bytes should not panic, just return empty
+        // Garbage in must produce empty findings — never a panic.
         let findings = check_pdf(b"not a pdf");
         assert!(
             findings.is_empty(),
@@ -1073,7 +1032,7 @@ mod tests {
     #[test]
     fn test_pdf_operand_to_f64() {
         assert_eq!(pdf_operand_to_f64(&lopdf::Object::Integer(42)), Ok(42.0));
-        // Real stores f32 internally, so compare with tolerance
+        // lopdf::Object::Real stores f32 internally — compare with tolerance.
         let real_val = pdf_operand_to_f64(&lopdf::Object::Real(3.15)).unwrap();
         assert!((real_val - 3.15).abs() < 0.001, "got {real_val}");
         assert!(pdf_operand_to_f64(&lopdf::Object::Boolean(true)).is_err());
@@ -1100,10 +1059,9 @@ mod tests {
 
     #[test]
     fn test_truncate_str_multibyte_safe() {
-        // Multibyte characters: each emoji is 4 bytes
+        // Each emoji is 4 bytes / 1 char — naive byte-index truncation would panic.
         let s = "\u{1F600}\u{1F601}\u{1F602}\u{1F603}";
-        assert_eq!(s.len(), 16); // 4 chars * 4 bytes each
-                                 // Truncating to 2 chars should NOT panic
+        assert_eq!(s.len(), 16);
         let result = truncate_str(s, 2);
         assert_eq!(result, "\u{1F600}\u{1F601}...");
     }
@@ -1122,10 +1080,6 @@ mod tests {
     fn test_truncate_str_truncated() {
         assert_eq!(truncate_str("hello world", 5), "hello...");
     }
-
-    // -----------------------------------------------------------------------
-    // Enhanced comment content analysis tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_html_comment_prompt_injection() {
@@ -1167,7 +1121,7 @@ mod tests {
     fn test_html_comment_plain_curl_no_bump() {
         let input = "<!-- This curl example shows how to fetch data: curl http://api.example.com/v1/users -->";
         let findings = check(input, Some(Path::new("test.html")));
-        // Should only fire at Low (length-based), not Medium/High
+        // A plain `curl` mention without `| sh` must stay length-based (Low), not bump to Medium/High.
         let html_findings: Vec<_> = findings
             .iter()
             .filter(|f| f.rule_id == RuleId::HtmlComment)

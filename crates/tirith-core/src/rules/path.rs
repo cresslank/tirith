@@ -12,7 +12,7 @@ pub fn check(
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
 
-    // Use raw_path for non-ASCII detection (url crate percent-encodes non-ASCII)
+    // Use raw_path for non-ASCII detection — the url crate percent-encodes non-ASCII before we see it.
     if let Some(rp) = raw_path {
         check_non_ascii_path(rp, &mut findings);
         check_homoglyph_in_path(rp, &mut findings);
@@ -51,7 +51,6 @@ fn check_non_ascii_path(normalized: &str, findings: &mut Vec<Finding>) {
 }
 
 fn check_homoglyph_in_path(normalized: &str, findings: &mut Vec<Finding>) {
-    // Check for confusable characters near known path patterns
     let known_paths = [
         "install", "setup", "init", "config", "login", "auth", "admin", "api", "token", "key",
         "secret", "password",
@@ -63,11 +62,10 @@ fn check_homoglyph_in_path(normalized: &str, findings: &mut Vec<Finding>) {
         }
         let lower = segment.to_lowercase();
 
-        // Check if segment has mixed ASCII and non-ASCII suggesting homoglyphs
+        // Mixed ASCII + non-ASCII in one segment is the homoglyph shape we care about.
         let has_ascii = segment.bytes().any(|b| b.is_ascii_alphabetic());
         let has_non_ascii = segment.bytes().any(|b| b > 0x7F);
         if has_ascii && has_non_ascii {
-            // Check proximity to known paths
             for known in &known_paths {
                 if levenshtein(&lower, known) <= 2 {
                     findings.push(Finding {

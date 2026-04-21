@@ -35,7 +35,6 @@ pub fn check(url: &UrlLike, policy: &Policy) -> Vec<Finding> {
 
 fn check_non_ascii_hostname(raw_host: &str, findings: &mut Vec<Finding>) {
     if raw_host.bytes().any(|b| b > 0x7F) {
-        // Generate detailed homoglyph analysis
         let homoglyph_evidence = homoglyph::analyze_hostname(raw_host);
 
         findings.push(Finding {
@@ -139,7 +138,6 @@ fn check_userinfo_trick(url: &UrlLike, findings: &mut Vec<Finding>) {
 }
 
 fn check_raw_ip(host: &str, findings: &mut Vec<Finding>) {
-    // Check IPv4
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
         // Loopback (127.x) is benign local development — skip.
         if ip.octets()[0] == 127 {
@@ -160,7 +158,6 @@ fn check_raw_ip(host: &str, findings: &mut Vec<Finding>) {
         });
         return;
     }
-    // Check IPv6 (strip brackets)
     let stripped = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = stripped.parse::<std::net::Ipv6Addr>() {
         // IPv6 loopback (::1) or IPv4-mapped loopback (::ffff:127.x) is benign — skip.
@@ -217,10 +214,9 @@ fn check_confusable_domain(
     for known in builtin.chain(additional) {
         let known_lower = known.to_lowercase();
         if host_lower == known_lower {
-            continue; // Exact match — not confusable
+            continue;
         }
 
-        // Unicode skeleton check (existing)
         if skeleton == known_lower {
             findings.push(Finding {
                 rule_id: RuleId::ConfusableDomain,
@@ -241,7 +237,6 @@ fn check_confusable_domain(
             return;
         }
 
-        // OCR confusion check: apply OCR normalization and compare
         if ocr_normalized != host_lower && ocr_normalized == known_lower {
             findings.push(Finding {
                 rule_id: RuleId::ConfusableDomain,
@@ -304,7 +299,7 @@ fn ocr_normalize(input: &str) -> String {
     while i < bytes.len() {
         let mut matched = false;
         if consecutive_subs < 3 {
-            // Try each confusion entry (already sorted by length descending)
+            // Entries are sorted by length descending — longest match wins.
             for &(confusable, canonical) in confusions {
                 let conf_bytes = confusable.as_bytes();
                 if i + conf_bytes.len() <= bytes.len()
@@ -319,9 +314,8 @@ fn ocr_normalize(input: &str) -> String {
             }
         }
         if !matched {
-            // Reset consecutive counter on non-substitution
             consecutive_subs = 0;
-            // Advance by one UTF-8 character to preserve multi-byte chars
+            // Advance by one UTF-8 character to preserve multi-byte chars.
             let remaining = &input[i..];
             if let Some(ch) = remaining.chars().next() {
                 result.push(ch);

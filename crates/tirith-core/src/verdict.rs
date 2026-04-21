@@ -93,17 +93,17 @@ pub enum RuleId {
     Web3AddressInUrl,
     VetNotConfigured,
 
-    // Threat intelligence rules — local DB (Phase A)
+    // Threat intelligence rules — local DB
     ThreatMaliciousPackage,
     ThreatMaliciousIp,
     ThreatPackageTyposquat,
     ThreatPackageSimilarName,
-    // Phase B (keyed feeds) — define now so RuleId is stable
+    // Supplemental-feed rules are defined now so RuleId stays stable.
     ThreatMaliciousUrl,
     ThreatPhishingUrl,
     ThreatTorExitNode,
     ThreatThreatFoxIoc,
-    // Phase C (real-time API)
+    // Real-time lookup rules
     ThreatOsvVulnerable,
     ThreatCisaKev,
     ThreatSuspiciousPackage,
@@ -330,7 +330,6 @@ pub struct Verdict {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub urls_extracted_count: Option<usize>,
 
-    // --- Approval workflow metadata (Team, Phase 7) ---
     /// Whether this verdict requires human approval before execution.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requires_approval: Option<bool>,
@@ -347,7 +346,6 @@ pub struct Verdict {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_description: Option<String>,
 
-    // --- Escalation metadata ---
     /// Human-readable reason when escalation upgraded the action.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub escalation_reason: Option<String>,

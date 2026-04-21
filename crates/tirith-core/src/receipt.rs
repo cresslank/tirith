@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_short_hash_non_ascii() {
-        // Multi-byte UTF-8: each char is 3 bytes, so 12 bytes = 4 chars
+        // Multi-byte UTF-8: each char is 3 bytes, so 12 bytes = 4 chars.
         let s = "日本語テスト";
         let result = short_hash(s);
         assert!(!result.is_empty());
@@ -188,7 +188,8 @@ mod tests {
 
     #[test]
     fn test_receipt_save_no_predictable_tmp() {
-        // Verify NamedTempFile is used: no .{sha}.json.tmp should remain after save.
+        // NamedTempFile must replace the earlier predictable `.{sha}.json.tmp`
+        // scheme — none of those files should appear after save().
         let dir = tempfile::tempdir().unwrap();
         let receipts_sub = dir.path().join("receipts");
         std::fs::create_dir_all(&receipts_sub).unwrap();
@@ -206,13 +207,11 @@ mod tests {
             tmp.persist(&path).unwrap();
         }
 
-        // The old predictable tmp file should NOT exist
         let old_tmp = receipts_sub.join(format!(".{sha}.json.tmp"));
         assert!(
             !old_tmp.exists(),
             "predictable .{{sha}}.json.tmp should not exist after NamedTempFile save"
         );
-        // The final file should exist
         assert!(path.exists(), "receipt file should exist after persist");
     }
 
@@ -227,7 +226,8 @@ mod tests {
 
         let sha = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
-        // Write a receipt file with 0600 permissions using the same pattern as save()
+        // Mirror save()'s 0600 pattern directly so this test stays independent
+        // of the public API's internals.
         let path = receipts_dir.join(format!("{sha}.json"));
         let json = r#"{"test": true}"#;
         {

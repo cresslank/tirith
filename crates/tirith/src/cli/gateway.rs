@@ -16,10 +16,6 @@ use tirith_core::mcp::types::{ContentItem, JsonRpcError, JsonRpcResponse, ToolCa
 use tirith_core::tokenize::ShellType;
 use tirith_core::verdict::{Action, Finding};
 
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Deserialize)]
 pub struct GatewayConfig {
     pub guarded_tools: Vec<GuardedTool>,
@@ -140,10 +136,7 @@ fn validate_policy_values(policy: &PolicyConfig) -> Result<(), String> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// JSON Pointer (RFC 6901) — resolved against params object
-// ---------------------------------------------------------------------------
-
+/// JSON Pointer (RFC 6901) resolved against a params object.
 fn validate_json_pointer(pointer: &str) -> Result<(), String> {
     if pointer.is_empty() {
         return Ok(());
@@ -190,10 +183,7 @@ fn resolve_json_pointer<'a>(value: &'a Value, pointer: &str) -> Option<&'a Value
     Some(current)
 }
 
-// ---------------------------------------------------------------------------
-// Audit log (one JSON line per event, stderr)
-// ---------------------------------------------------------------------------
-
+/// Audit log: one JSON line per event, written to stderr.
 #[derive(Serialize)]
 struct AuditEntry<'a> {
     ts: String,
@@ -291,10 +281,6 @@ fn cmd_hash_prefix(cmd: &str) -> String {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// validate-config subcommand
-// ---------------------------------------------------------------------------
-
 pub fn validate_config(config_path: &str) -> i32 {
     let content = match std::fs::read_to_string(config_path) {
         Ok(c) => c,
@@ -318,12 +304,7 @@ pub fn validate_config(config_path: &str) -> i32 {
     0
 }
 
-// ---------------------------------------------------------------------------
-// gateway run — main entry point
-// ---------------------------------------------------------------------------
-
 pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &str) -> i32 {
-    // Recursion guard
     let depth: u32 = std::env::var("TIRITH_GATEWAY_DEPTH")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -333,7 +314,6 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
         return 1;
     }
 
-    // Load and compile config
     let content = match std::fs::read_to_string(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -358,7 +338,6 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
 
     eprintln!("tirith gateway: batch JSON-RPC requests are denied until batch interception is implemented");
 
-    // Spawn upstream process
     let mut child = match Command::new(upstream_bin)
         .args(upstream_args)
         .env("TIRITH_GATEWAY_DEPTH", (depth + 1).to_string())
@@ -391,8 +370,8 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
     let pending_warns: Arc<Mutex<HashMap<Value, (Vec<Finding>, Instant)>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    // Thread 2: upstream stdout reader
-    // Sets shutdown on EOF so main thread exits even if Thread 1 is blocked on stdin.
+    // Thread 2 (upstream stdout): must set shutdown on EOF so main thread
+    // exits even when Thread 1 is blocked reading client stdin.
     let tx2 = output_tx.clone();
     let sd2 = shutdown.clone();
     let pw2 = Arc::clone(&pending_warns);
@@ -410,9 +389,9 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
                     }
                 }
                 Ok(None) => {
-                    // Upstream EOF — signal main thread to stop.
-                    // Without this, main hangs if Thread 1 is blocked on stdin
-                    // (Thread 1's sender keeps the channel alive).
+                    // Upstream EOF: must signal shutdown here, otherwise
+                    // main hangs because Thread 1's sender keeps the channel
+                    // alive while Thread 1 is blocked on stdin.
                     sd2.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -425,7 +404,6 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
         }
     });
 
-    // Thread 3: upstream stderr drainer
     let sd3 = shutdown.clone();
     let t_stderr = thread::spawn(move || {
         let reader = BufReader::new(child_stderr);
@@ -440,7 +418,6 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
         }
     });
 
-    // Thread 1: client stdin reader + interception
     let tx1 = output_tx;
     let sd1 = shutdown.clone();
     let cd1 = client_done.clone();
@@ -458,9 +435,10 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
             let raw_line = match read_bounded_line(&mut reader, max_bytes) {
                 Ok(Some(line)) => line,
                 Ok(None) => {
+                    // Client stdin EOF — normal shutdown path.
                     cd1.store(true, Ordering::Relaxed);
                     sd1.store(true, Ordering::Relaxed);
-                    break; // Client stdin EOF (normal shutdown)
+                    break;
                 }
                 Err(n) => {
                     eprintln!("tirith gateway: client message exceeds max_message_bytes ({n} > {max_bytes}), terminating");
@@ -470,19 +448,13 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
             };
 
             let write_err = match serde_json::from_slice::<Value>(&raw_line) {
-                Err(_) => {
-                    // Parse fails → forward raw bytes
-                    forward(&mut upstream, &raw_line).err()
-                }
+                Err(_) => forward(&mut upstream, &raw_line).err(),
                 Ok(Value::Array(ref arr)) => {
-                    // Batch → fail closed (Phase 1)
+                    // Batch requests fail closed until batch interception lands.
                     handle_batch_deny(arr, &tx1);
                     None
                 }
-                Ok(ref val) if !val.is_object() => {
-                    // Non-object, non-array → forward raw bytes
-                    forward(&mut upstream, &raw_line).err()
-                }
+                Ok(ref val) if !val.is_object() => forward(&mut upstream, &raw_line).err(),
                 Ok(ref obj) => {
                     process_object(obj, &raw_line, &cfg, &mut upstream, &tx1, &pw1).err()
                 }
@@ -493,10 +465,10 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
                 break;
             }
         }
-        drop(upstream); // Signal EOF to child
+        // Drop upstream stdin to signal EOF to the child process.
+        drop(upstream);
     });
 
-    // Main thread: output writer with recv_timeout for shutdown observability
     let sd_main = shutdown.clone();
     let mut stdout = io::stdout().lock();
     let mut last_sweep = Instant::now();
@@ -521,7 +493,7 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
-        // Periodically evict stale pending_warns entries (TTL 30s, sweep every 10s)
+        // Evict stale pending_warns entries: TTL 30s, sweep every 10s.
         if last_sweep.elapsed() > Duration::from_secs(10) {
             if let Ok(mut map) = pending_warns.lock() {
                 let cutoff = Instant::now() - Duration::from_secs(30);
@@ -532,16 +504,16 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
     }
     drop(stdout);
 
-    // Shutdown child — abnormal unless client initiated shutdown via stdin EOF
+    // Abnormal shutdown unless the client initiated it via stdin EOF.
     let abnormal = !client_done.load(Ordering::Relaxed);
     let exit_code = shutdown_child(&mut child, abnormal);
 
-    // Join Thread 2 and 3 — bounded by child process death (stdout/stderr EOF).
+    // Threads 2 and 3 exit once child stdout/stderr hit EOF, so join is safe.
     let _ = t_upstream.join();
     let _ = t_stderr.join();
 
-    // Thread 1 may be blocked on stdin read_line and cannot be unblocked from
-    // another thread. Use a short timeout join; process exit will clean it up.
+    // Thread 1 may be blocked on stdin read_line and cannot be interrupted
+    // from another thread — bounded wait, then process exit cleans it up.
     let client_handle = t_client;
     let join_done = Arc::new(AtomicBool::new(false));
     let jd = join_done.clone();
@@ -558,10 +530,6 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
 
     exit_code
 }
-
-// ---------------------------------------------------------------------------
-// Process a single JSON object from client
-// ---------------------------------------------------------------------------
 
 fn process_object(
     obj: &Value,
@@ -1025,10 +993,6 @@ fn handle_invalid_guarded_request(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Guarded check
-// ---------------------------------------------------------------------------
-
 enum GuardedResult {
     NotGuarded,
     GuardedNotification {
@@ -1079,7 +1043,6 @@ fn check_guarded(obj: &Value, config: &CompiledConfig) -> GuardedResult {
         None => return GuardedResult::NotGuarded,
     };
 
-    // Extract command via JSON Pointer paths (resolved against params)
     let extracted_command = || {
         for pointer in &guard.command_paths {
             if let Some(val) = resolve_json_pointer(params, pointer) {
@@ -1118,10 +1081,7 @@ fn check_guarded(obj: &Value, config: &CompiledConfig) -> GuardedResult {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Batch deny (Phase 1: fail closed)
-// ---------------------------------------------------------------------------
-
+/// Batch request handler: currently fails closed until batch interception lands.
 fn handle_batch_deny(arr: &[Value], output_tx: &mpsc::Sender<Vec<u8>>) {
     if arr.is_empty() {
         let resp = JsonRpcResponse::err(
@@ -1189,10 +1149,6 @@ fn handle_batch_deny(arr: &[Value], output_tx: &mpsc::Sender<Vec<u8>>) {
         false,
     );
 }
-
-// ---------------------------------------------------------------------------
-// Deny response builder
-// ---------------------------------------------------------------------------
 
 fn build_deny_response(
     id: Value,
@@ -1289,10 +1245,6 @@ fn build_invalid_id_request_response() -> String {
     .unwrap_or_default()
 }
 
-// ---------------------------------------------------------------------------
-// Warn augmentation — inject findings into upstream responses
-// ---------------------------------------------------------------------------
-
 /// Check if an upstream response line matches a pending warn-forwarded request.
 /// If so, augment the response with findings and remove the entry from the map.
 /// Returns `Some(augmented_bytes)` on success, `None` to pass through original.
@@ -1362,10 +1314,6 @@ fn build_warn_augmented_response(mut parsed: Value, findings: &[Finding]) -> Opt
     serde_json::to_vec(&parsed).ok()
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 fn forward(writer: &mut impl Write, line: &[u8]) -> io::Result<()> {
     writer.write_all(line)?;
     writer.write_all(b"\n")?;
@@ -1373,12 +1321,11 @@ fn forward(writer: &mut impl Write, line: &[u8]) -> io::Result<()> {
 }
 
 fn shutdown_child(child: &mut Child, abnormal: bool) -> i32 {
-    // Check if already exited
     if let Ok(Some(_)) = child.try_wait() {
         return if abnormal { 1 } else { 0 };
     }
 
-    // Wait up to 5 seconds for graceful exit (stdin already closed)
+    // stdin is already closed; give the child up to 5s for a graceful exit.
     for _ in 0..50 {
         thread::sleep(Duration::from_millis(100));
         if let Ok(Some(_)) = child.try_wait() {
@@ -1386,7 +1333,6 @@ fn shutdown_child(child: &mut Child, abnormal: bool) -> i32 {
         }
     }
 
-    // Send SIGTERM (Unix) or TerminateProcess (Windows)
     #[cfg(unix)]
     unsafe {
         libc::kill(child.id() as i32, libc::SIGTERM);
@@ -1396,7 +1342,7 @@ fn shutdown_child(child: &mut Child, abnormal: bool) -> i32 {
         let _ = child.kill();
     }
 
-    // Wait 2 more seconds
+    // Grace period after SIGTERM before force-killing.
     for _ in 0..20 {
         thread::sleep(Duration::from_millis(100));
         if let Ok(Some(_)) = child.try_wait() {
@@ -1404,7 +1350,6 @@ fn shutdown_child(child: &mut Child, abnormal: bool) -> i32 {
         }
     }
 
-    // Force kill
     let _ = child.kill();
     let _ = child.wait();
     if abnormal {
@@ -1414,18 +1359,15 @@ fn shutdown_child(child: &mut Child, abnormal: bool) -> i32 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Bounded line reader — prevents unbounded allocation from oversize lines
-// Uses fill_buf()/consume() to read in chunks without allocating beyond limit.
-// ---------------------------------------------------------------------------
-
+/// Bounded line reader — prevents unbounded allocation from oversize lines.
+/// Uses fill_buf()/consume() to read in chunks without ever allocating past limit.
 fn read_bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<Option<Vec<u8>>, usize> {
     let mut buf = Vec::with_capacity(std::cmp::min(limit, 8192));
     loop {
         let available = match reader.fill_buf() {
             Ok([]) => {
                 if buf.is_empty() {
-                    return Ok(None); // EOF
+                    return Ok(None);
                 }
                 return Ok(Some(buf));
             }
@@ -1451,10 +1393,10 @@ fn read_bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<Option<V
 
         let avail_len = available.len();
         if buf.len() + avail_len > limit {
-            // Oversize — consume this chunk and drain to newline
+            // Oversize line: drop the in-flight chunk and drain until the
+            // next newline so the reader resyncs for the following message.
             reader.consume(avail_len);
             let total = buf.len() + avail_len;
-            // Drain remaining bytes until newline or EOF
             loop {
                 match reader.fill_buf() {
                     Ok([]) => return Err(total),
@@ -1476,15 +1418,9 @@ fn read_bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<Option<V
     }
 }
 
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- Config tests --
 
     #[test]
     fn test_config_parse_valid() {
@@ -1564,8 +1500,6 @@ guarded_tools:
         assert_eq!(config.policy.max_message_bytes, 1_048_576);
     }
 
-    // -- JSON Pointer tests --
-
     #[test]
     fn test_json_pointer_against_params() {
         let params: Value = serde_json::json!({
@@ -1595,8 +1529,6 @@ guarded_tools:
         let val: Value = serde_json::json!({"a/b": 1});
         assert!(resolve_json_pointer(&val, "/a~1b").is_some());
     }
-
-    // -- Guarded check tests --
 
     fn test_config() -> CompiledConfig {
         let yaml = r#"
@@ -1682,8 +1614,6 @@ guarded_tools:
         ));
     }
 
-    // -- Batch deny tests --
-
     #[test]
     fn test_batch_empty() {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -1735,8 +1665,6 @@ guarded_tools:
         }
     }
 
-    // -- Bounded line reader tests --
-
     #[test]
     fn test_bounded_read_normal() {
         let data = b"hello\nworld\n";
@@ -1787,16 +1715,12 @@ guarded_tools:
         assert_eq!(line, &[0x80, 0x81, 0x82]);
     }
 
-    // -- Recursion guard test --
-
     #[test]
     fn test_recursion_depth() {
         // Verify the depth check logic: any depth >= 1 should trigger abort
         let depth: u32 = 1;
         assert!(depth >= 1);
     }
-
-    // -- No-id error rule test --
 
     #[test]
     fn test_no_id_notification_not_guarded() {
@@ -1810,8 +1734,6 @@ guarded_tools:
             GuardedResult::NotGuarded
         ));
     }
-
-    // -- Invalid id type tests (Fix #4: non-batch path) --
 
     #[test]
     fn test_guarded_boolean_id_rejected() {
@@ -1902,8 +1824,6 @@ guarded_tools:
         ));
     }
 
-    // -- Policy enum validation tests (Fix #5) --
-
     #[test]
     fn test_config_bad_warn_action() {
         let yaml = r#"
@@ -1957,8 +1877,6 @@ policy:
         assert!(CompiledConfig::from_config(config).is_ok());
     }
 
-    // -- Audit serialization test (Fix #3) --
-
     #[test]
     fn test_audit_entry_serializes_valid_json() {
         let entry = AuditEntry {
@@ -2010,8 +1928,6 @@ policy:
         assert!(parsed["tool_name"].as_str().unwrap().contains("injected"));
     }
 
-    // -- max_message_bytes=0 rejected --
-
     #[test]
     fn test_config_rejects_zero_max_message_bytes() {
         let yaml = "guarded_tools: []\npolicy:\n  max_message_bytes: 0\n";
@@ -2019,8 +1935,6 @@ policy:
         let err = CompiledConfig::from_config(config).unwrap_err();
         assert!(err.contains("max_message_bytes"));
     }
-
-    // -- Fail-mode deny formatting --
 
     #[test]
     fn test_fail_mode_deny_no_double_prefix() {
@@ -2068,8 +1982,6 @@ policy:
         );
         assert!(v["id"].is_null());
     }
-
-    // -- Upstream write-failure shutdown test --
 
     #[test]
     fn test_forward_to_broken_writer_returns_error() {
@@ -2142,8 +2054,6 @@ policy:
         assert!(v["id"].is_null());
     }
 
-    // -- Deny response wire format contract test (P1 fix) --
-
     #[test]
     fn test_deny_response_uses_wire_format_enums() {
         use tirith_core::verdict::{Finding, Severity, Timings, Verdict};
@@ -2210,8 +2120,6 @@ policy:
         assert!(!text.contains("ShortenedUrl"));
         assert!(!text.contains("CurlPipeShell"));
     }
-
-    // -- Warn augmentation tests --
 
     fn test_finding(
         rule_id: tirith_core::verdict::RuleId,

@@ -34,7 +34,7 @@ pub fn run(
 
     let warnings = session_warnings::load(&sid);
 
-    // Load paranoia from local policy (no network fetch for shell-exit hot path).
+    // discover_partial is local-only; the shell-exit hot path must not trigger a network fetch.
     let cwd = std::env::current_dir().ok();
     let cwd_str = cwd.as_ref().and_then(|p| p.to_str());
     let policy = tirith_core::policy::Policy::discover_partial(cwd_str);
@@ -42,7 +42,6 @@ pub fn run(
 
     let hidden_count = warnings.hidden_findings;
 
-    // Short-circuit: nothing to show at all
     if warnings.total_warnings == 0 && hidden_count == 0 && !show_hidden {
         if json {
             let out = WarningsJson {
@@ -86,13 +85,13 @@ pub fn run(
         return 0;
     }
 
-    // Summary mode: gate hidden-only output at >= 3 to avoid noise on shell exit
+    // Summary mode suppresses hidden-only output under 3 findings to avoid
+    // noise on every shell exit; >= 3 is significant enough to surface.
     if warnings.total_warnings == 0 && hidden_count < 3 && summary {
         maybe_clear(clear, &sid);
         return 0;
     }
 
-    // Handle zero warnings but significant hidden findings (>= 3) in summary mode
     if warnings.total_warnings == 0 && hidden_count >= 3 && summary {
         eprintln!(
             "tirith: {hidden_count} hidden findings suppressed at paranoia={paranoia} \u{2014} run 'tirith doctor' for details"
@@ -132,7 +131,7 @@ fn print_summary(w: &SessionWarnings, top_rules: &[(String, u32)]) {
             "tirith: {} warning(s) ({}) + {} hidden \u{2014} run 'tirith warnings' for details",
             w.total_warnings, rule_summary, hidden,
         );
-        // Use stored per-severity counts (recorded at detection time) for accurate guidance
+        // Per-severity counts were recorded at detection time, so guidance is accurate.
         let hidden_desc = hidden_severity_desc(w.hidden_low, w.hidden_info);
         let next_level = next_paranoia_for_hidden(w.hidden_low, w.hidden_info);
         if let Some(next) = next_level {
@@ -227,7 +226,6 @@ fn print_table(w: &SessionWarnings, top_rules: &[(String, u32)], paranoia: u8) {
         );
     }
 
-    // Top rules summary
     if !top_rules.is_empty() {
         let top_str: String = top_rules
             .iter()
@@ -237,11 +235,10 @@ fn print_table(w: &SessionWarnings, top_rules: &[(String, u32)], paranoia: u8) {
         println!("\nTop rules: {top_str}");
     }
 
-    // Suggestions for frequently-firing rules (threshold: 3+)
+    // Suggest trust entries when a rule fires >= 3 times in this session.
     let suggestion_threshold = 3;
     for (rule, count) in top_rules {
         if *count >= suggestion_threshold {
-            // Try to extract a representative domain for the suggestion
             let domain = find_domain_for_rule(w, rule);
             if let Some(d) = domain {
                 println!(
@@ -255,7 +252,6 @@ fn print_table(w: &SessionWarnings, top_rules: &[(String, u32)], paranoia: u8) {
         }
     }
 
-    // Paranoia guidance footer when hidden findings exist
     if hidden > 0 {
         print_paranoia_footer(w.hidden_low, w.hidden_info, paranoia);
     }
@@ -275,7 +271,6 @@ fn print_hidden_table(w: &SessionWarnings) {
         total.min(cap)
     );
 
-    // Table header
     println!(
         "  {:<3} \u{2502} {:<8} \u{2502} {:<8} \u{2502} {:<20} \u{2502} {:<28} \u{2502} Command",
         "#", "Time", "Severity", "Rule", "Title",
@@ -324,7 +319,6 @@ fn print_paranoia_footer(hidden_low: u32, hidden_info: u32, paranoia: u8) {
     let desc = hidden_severity_desc(hidden_low, hidden_info);
     println!();
     println!("{total} lower-severity findings hidden ({desc}).");
-    // Show paranoia levels with current marked
     println!(
         "  Level 1-2{}: Medium+ only",
         if paranoia <= 2 { " (current)" } else { "" }
@@ -355,9 +349,9 @@ fn hidden_severity_desc(hidden_low: u32, hidden_info: u32) -> String {
 /// Compute the minimum paranoia level needed to surface stored hidden findings.
 fn next_paranoia_for_hidden(hidden_low: u32, hidden_info: u32) -> Option<u8> {
     if hidden_low > 0 {
-        Some(3) // Level 3 shows Low+
+        Some(3)
     } else if hidden_info > 0 {
-        Some(4) // Level 4 shows Info
+        Some(4)
     } else {
         None
     }
@@ -365,13 +359,11 @@ fn next_paranoia_for_hidden(hidden_low: u32, hidden_info: u32) -> Option<u8> {
 
 /// Extract HH:MM:SS from an ISO 8601 timestamp.
 fn extract_time(ts: &str) -> &str {
-    // Look for 'T' separator, then take up to 8 chars (HH:MM:SS)
     if let Some(t_pos) = ts.find('T') {
         let after_t = &ts[t_pos + 1..];
         let end = after_t.len().min(8);
         &after_t[..end]
     } else {
-        // Fallback: return first 8 chars or the whole string
         let end = ts.len().min(8);
         &ts[..end]
     }
@@ -391,8 +383,6 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 
 /// Show first segment of a UUID-style session ID for compactness.
 fn truncate_session_id(sid: &str) -> &str {
-    // UUIDs have format xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-    // Show first 8 chars + rest abbreviated
     if sid.len() > 12 {
         &sid[..12]
     } else {
@@ -461,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_hidden_only_session_below_threshold_no_output() {
-        // total_warnings=0, hidden_findings=2 (< 3) → no summary output
+        // hidden_findings < 3 should not produce summary output.
         let w = SessionWarnings {
             session_id: "test".to_string(),
             session_start: "2026-04-05T00:00:00Z".to_string(),
@@ -492,7 +482,7 @@ mod tests {
             escalation_events: std::collections::VecDeque::new(),
             hidden_events: std::collections::VecDeque::new(),
         };
-        // The gate in run() is: total_warnings == 0 && hidden >= 3 → print hidden line
+        // Matches the gate in run(): total_warnings == 0 && hidden >= 3.
         assert_eq!(w.total_warnings, 0);
         assert!(w.hidden_findings >= 3);
     }

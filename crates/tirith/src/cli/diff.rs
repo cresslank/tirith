@@ -4,7 +4,6 @@ use tirith_core::parse;
 pub fn run(url: &str, json: bool) -> i32 {
     let parsed = parse::parse_url(url);
 
-    // Gather diff data
     let host = parsed.host().map(String::from);
     let raw_host = parsed.raw_host().map(String::from);
     let scheme = parsed.scheme().map(String::from);
@@ -12,16 +11,14 @@ pub fn run(url: &str, json: bool) -> i32 {
     let port = parsed.port();
     let userinfo = parsed.userinfo().map(String::from);
 
-    // Compare against known-good: check if host matches known domains
     let is_known = host.as_deref().map(data::is_known_domain).unwrap_or(false);
 
-    // Check for host/raw_host divergence (IDNA normalization difference)
+    // host/raw_host diverge when IDNA normalization rewrote the host.
     let host_divergence = match (host.as_deref(), raw_host.as_deref()) {
         (Some(h), Some(rh)) => h != rh,
         _ => false,
     };
 
-    // Check scheme safety
     let scheme_warning = match scheme.as_deref() {
         Some("http") => Some("HTTP (unencrypted) — consider HTTPS"),
         Some("ftp") => Some("FTP (unencrypted)"),
@@ -30,7 +27,6 @@ pub fn run(url: &str, json: bool) -> i32 {
         _ => None,
     };
 
-    // Check for suspicious port
     let port_warning = match port {
         Some(p) if p != 80 && p != 443 && p != 22 && p != 9418 && is_known => {
             Some(format!("Non-standard port {p} on known domain"))
@@ -38,7 +34,6 @@ pub fn run(url: &str, json: bool) -> i32 {
         _ => None,
     };
 
-    // Check for userinfo
     let userinfo_warning = userinfo.as_ref().and_then(|ui| {
         if ui.contains('.') {
             Some("Userinfo contains dot — may be domain impersonation")

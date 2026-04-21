@@ -183,10 +183,6 @@ pub fn call(name: &str, arguments: &Value) -> ToolCallResult {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tool implementations
-// ---------------------------------------------------------------------------
-
 fn call_check_command(args: &Value) -> ToolCallResult {
     let command = match args.get("command").and_then(|v| v.as_str()) {
         Some(c) => c,
@@ -563,10 +559,6 @@ fn build_cloaking_response(
         structured_content: Some(structured),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn tool_error(msg: &str) -> ToolCallResult {
     ToolCallResult {

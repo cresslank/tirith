@@ -12,8 +12,6 @@ const BEGIN_MARKER: &str = "# BEGIN tirith-hook v1";
 const END_MARKER: &str = "# END tirith-hook";
 const BEGIN_PREFIX: &str = "# BEGIN tirith-hook";
 
-// ── Shell quoting ────────────────────────────────────────────────────
-
 /// Check whether a binary path needs quoting for shell interpolation.
 fn needs_quoting(s: &str) -> bool {
     s.bytes().any(|b| {
@@ -62,8 +60,6 @@ pub(crate) fn shell_quote(path: &str, shell: &str) -> String {
     }
 }
 
-// ── Shell profile detection ──────────────────────────────────────────
-
 /// Detect the user's default shell and return its profile file path.
 fn detect_shell_profile() -> Option<(&'static str, PathBuf)> {
     let home = home::home_dir()?;
@@ -72,7 +68,7 @@ fn detect_shell_profile() -> Option<(&'static str, PathBuf)> {
     let profile = match shell {
         "zsh" => home.join(".zshrc"),
         "bash" => {
-            // Prefer .bashrc if it exists, else .bash_profile, else create .bashrc
+            // .bashrc preferred; fall back to .bash_profile, else create .bashrc.
             let bashrc = home.join(".bashrc");
             let bash_profile = home.join(".bash_profile");
             if bashrc.exists() {
@@ -85,9 +81,8 @@ fn detect_shell_profile() -> Option<(&'static str, PathBuf)> {
         }
         "fish" => home.join(".config").join("fish").join("config.fish"),
         "nushell" => {
-            // Standard nushell config location
             let config = home.join(".config").join("nushell").join("config.nu");
-            // Only offer if nushell config dir exists (user has nushell configured)
+            // Only offer if the user already has a nushell config directory.
             if config.exists() || config.parent().map(|p| p.exists()).unwrap_or(false) {
                 config
             } else {
@@ -95,7 +90,7 @@ fn detect_shell_profile() -> Option<(&'static str, PathBuf)> {
             }
         }
         "powershell" => {
-            // On macOS/Linux, PowerShell profile lives in ~/.config/powershell/
+            // On macOS/Linux, PowerShell profile lives under ~/.config/powershell/.
             let profile = home
                 .join(".config")
                 .join("powershell")
@@ -112,8 +107,6 @@ fn detect_shell_profile() -> Option<(&'static str, PathBuf)> {
     Some((shell, profile))
 }
 
-// ── Manual-hook detection ────────────────────────────────────────────
-
 /// Check for a manually-added tirith init invocation (uncommented executable line).
 ///
 /// Skips comments and empty lines to avoid false positives on documentation
@@ -121,20 +114,15 @@ fn detect_shell_profile() -> Option<(&'static str, PathBuf)> {
 fn has_executable_tirith_init(content: &str) -> bool {
     content.lines().any(|line| {
         let trimmed = line.trim();
-        // Skip comments (POSIX # and PowerShell #)
         if trimmed.starts_with('#') {
             return false;
         }
-        // Skip empty
         if trimmed.is_empty() {
             return false;
         }
-        // Match executable tirith init patterns
         trimmed.contains("tirith init")
     })
 }
-
-// ── Marker validation ────────────────────────────────────────────────
 
 /// Validate that each BEGIN marker has a matching END marker.
 ///
@@ -166,8 +154,6 @@ fn validate_marker_pairing(content: &str) -> Result<(), String> {
     Ok(())
 }
 
-// ── Drift detection ──────────────────────────────────────────────────
-
 /// Extract the full managed block (BEGIN through END, inclusive) from content.
 fn extract_managed_block(content: &str) -> Option<String> {
     let mut in_block = false;
@@ -196,8 +182,6 @@ fn extract_managed_block(content: &str) -> Option<String> {
     }
 }
 
-// ── Main entry point ─────────────────────────────────────────────────
-
 /// Install the tirith shell hook into the user's shell profile.
 ///
 /// Appends a managed block containing the appropriate init line for the
@@ -213,7 +197,7 @@ pub fn install_shell_hook(tirith_bin: &str, force: bool, dry_run: bool) -> Resul
     let hook_line = match shell {
         "fish" => format!("{quoted_bin} init --shell fish | source"),
         "nushell" => {
-            // Nushell can't eval dynamically — resolve the source path at setup time
+            // Nushell can't eval dynamically — resolve the source path at setup time.
             match std::process::Command::new(tirith_bin)
                 .args(["init", "--shell", "nushell"])
                 .output()
@@ -238,7 +222,6 @@ pub fn install_shell_hook(tirith_bin: &str, force: bool, dry_run: bool) -> Resul
 
     let managed_block = format!("{BEGIN_MARKER}\n{hook_line}\n{END_MARKER}\n");
 
-    // Read existing content
     let existing = if profile_path.exists() {
         fs::read_to_string(&profile_path)
             .map_err(|e| format!("read {}: {e}", profile_path.display()))?
@@ -251,7 +234,8 @@ pub fn install_shell_hook(tirith_bin: &str, force: bool, dry_run: bool) -> Resul
         .filter(|line| line.starts_with(BEGIN_PREFIX))
         .count();
 
-    // Check for manually-added tirith init (uncommented executable line, no managed block)
+    // If the user manually added `tirith init` (no managed block), don't
+    // touch their profile — they opted out of the managed setup.
     if begin_count == 0 && has_executable_tirith_init(&existing) {
         eprintln!(
             "tirith: shell hook already in {} (manually added), skipping",
@@ -260,12 +244,10 @@ pub fn install_shell_hook(tirith_bin: &str, force: bool, dry_run: bool) -> Resul
         return Ok(());
     }
 
-    // Validate marker pairing before any mutation
     validate_marker_pairing(&existing)?;
 
     match begin_count {
         0 => {
-            // No existing block — append
             if dry_run {
                 eprintln!(
                     "[dry-run] would append tirith shell hook to {}",
@@ -287,7 +269,6 @@ pub fn install_shell_hook(tirith_bin: &str, force: bool, dry_run: bool) -> Resul
             eprintln!("tirith: added shell hook to {}", profile_path.display());
         }
         1 => {
-            // One existing block — check for drift
             let existing_block = extract_managed_block(&existing);
             let matches = existing_block
                 .as_deref()
@@ -309,7 +290,6 @@ pub fn install_shell_hook(tirith_bin: &str, force: bool, dry_run: bool) -> Resul
                 ));
             }
 
-            // force (or content matches + force): replace
             if dry_run {
                 eprintln!(
                     "[dry-run] would replace tirith shell hook in {}",
@@ -330,7 +310,6 @@ pub fn install_shell_hook(tirith_bin: &str, force: bool, dry_run: bool) -> Resul
             eprintln!("tirith: replaced shell hook in {}", profile_path.display());
         }
         _ => {
-            // Multiple blocks
             if !force {
                 return Err(format!(
                     "multiple tirith-hook blocks found in {} — use --force to deduplicate",
@@ -364,8 +343,6 @@ pub fn install_shell_hook(tirith_bin: &str, force: bool, dry_run: bool) -> Resul
     Ok(())
 }
 
-// ── Block removal ────────────────────────────────────────────────────
-
 /// Remove all lines between BEGIN and END tirith-hook markers (inclusive).
 ///
 /// SAFETY: Caller must call `validate_marker_pairing` first. This function
@@ -396,13 +373,9 @@ fn remove_hook_blocks(content: &str) -> String {
     out
 }
 
-// ── Tests ────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── shell_quote ──────────────────────────────────────────────
 
     #[test]
     fn quote_simple_name_unchanged() {
@@ -471,8 +444,6 @@ mod tests {
         );
     }
 
-    // ── has_executable_tirith_init ───────────────────────────────
-
     #[test]
     fn detects_eval_form() {
         let content = "export PATH=...\neval \"$(tirith init)\"\n";
@@ -496,8 +467,6 @@ mod tests {
         assert!(!has_executable_tirith_init(""));
         assert!(!has_executable_tirith_init("\n\n"));
     }
-
-    // ── validate_marker_pairing ──────────────────────────────────
 
     #[test]
     fn valid_single_block() {
@@ -531,8 +500,6 @@ mod tests {
         assert!(err.contains("nested BEGIN"), "got: {err}");
     }
 
-    // ── extract_managed_block ────────────────────────────────────
-
     #[test]
     fn extract_existing_block() {
         let content =
@@ -548,8 +515,6 @@ mod tests {
     fn extract_no_block() {
         assert!(extract_managed_block("just content\n").is_none());
     }
-
-    // ── remove_hook_blocks ───────────────────────────────────────
 
     #[test]
     fn remove_single_block() {
@@ -582,15 +547,13 @@ mod tests {
 
     #[test]
     fn end_marker_exact_match_only() {
-        // "# END tirith-hooking" should NOT be treated as the end marker
+        // "# END tirith-hooking" is a prefix match but NOT equal to the END
+        // marker, so it stays inside the block and gets removed with it.
         let content =
             "# BEGIN tirith-hook v1\nhook\n# END tirith-hooking\nstuff\n# END tirith-hook\n";
         let result = remove_hook_blocks(content);
-        // "# END tirith-hooking" is inside the block (not an exact match), so removed
         assert_eq!(result, "");
     }
-
-    // ── drift detection ──────────────────────────────────────────
 
     #[test]
     fn drift_detected_when_content_differs() {

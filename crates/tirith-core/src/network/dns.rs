@@ -43,13 +43,9 @@ pub fn check_dns_blocklist(domain: &str) -> Vec<String> {
     matches
 }
 
-// ---------------------------------------------------------------------------
-// Internals
-// ---------------------------------------------------------------------------
-
 /// Resolve a domain to its IPv4 addresses using the system resolver.
 fn resolve_domain_ips(domain: &str) -> Option<Vec<String>> {
-    // ToSocketAddrs requires a port; we use 0 as a dummy.
+    // ToSocketAddrs requires a port; port 0 is a harmless placeholder.
     let lookup = format!("{domain}:0");
     let addrs: Vec<String> = lookup
         .to_socket_addrs()

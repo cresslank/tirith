@@ -1,15 +1,15 @@
-//! Phase 0 tests for the bash hook's effective-state exports and for
-//! `tirith doctor`'s rendering of those exports.
+//! Tests for the bash hook's effective-state exports and `tirith doctor`'s
+//! rendering of them.
 //!
-//! The hook exports two public env vars for child processes so that
-//! `tirith doctor`—which is a child process and cannot read shell-locals—can
-//! truthfully report the live mode and protection level of the parent shell:
+//! The hook exports two public env vars so that `tirith doctor` — a child
+//! process that cannot read the parent shell's locals — can truthfully
+//! report the live state of the parent shell:
 //!
 //! * `TIRITH_BASH_EFFECTIVE_MODE` ∈ {`enter`, `preexec`, `disabled`}
 //! * `TIRITH_BASH_EFFECTIVE_PROTECTION` ∈ {`blocks`, `warn-only`, `disabled`}
 //!
-//! Both exports are gated on interactive shells (`[[ $- == *i* ]]`) so that a
-//! non-interactive `source` does not leak a misleading status into child
+//! Both exports are gated on interactive shells (`[[ $- == *i* ]]`) so that
+//! a non-interactive `source` does not leak a misleading status into child
 //! processes.
 
 #![cfg(unix)]
@@ -35,7 +35,7 @@ fn source_hook_and_dump_exports(extra_env: &[(&str, &str)]) -> String {
            \"${{TIRITH_BASH_EFFECTIVE_PROTECTION:-}}\""
     );
 
-    // Start from a minimal env so user-shell config cannot colour the result.
+    // Start from a minimal env so user shell config cannot influence results.
     let mut cmd = Command::new("bash");
     cmd.args(["--norc", "--noprofile", "-i", "-c", &script])
         .env_clear()
@@ -95,9 +95,9 @@ fn hook_exports_preexec_in_ssh_sessions() {
 
 #[test]
 fn hook_does_not_export_in_noninteractive_shell() {
-    // No `-i` flag: hook must be a no-op and must NOT leak status vars into
-    // child processes. Otherwise a scripted `source` would mislead a later
-    // `tirith doctor` into claiming the shell is protected when it is not.
+    // No `-i` flag: the hook must be a no-op and must NOT leak status vars
+    // into child processes. Otherwise a scripted `source` would mislead a
+    // later `tirith doctor` into claiming the shell is protected.
     let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
     let hook = hook_path();
     let script = format!(
@@ -127,21 +127,18 @@ fn hook_does_not_export_in_noninteractive_shell() {
     );
 }
 
-// ─── tirith doctor rendering ───
-//
-// Doctor is driven entirely off env vars, so we don't need to actually source
-// the hook — we seed the env vars directly and assert the formatted output
-// splits "requested" (user-set knobs) from "effective" (live hook-exported
-// state).
+// Doctor is driven entirely off env vars, so we seed them directly and
+// assert the formatted output splits "requested" (user-set knobs) from
+// "effective" (live hook-exported state).
 
 fn doctor_stdout(env: &[(&str, &str)]) -> String {
     let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
     let bin = env!("CARGO_BIN_EXE_tirith");
 
     // Run doctor as a direct child of bash so the ancestor-walking
-    // `detect_shell` sees bash, even when the test harness (cargo/zsh) is its
-    // ancestor. We deliberately do NOT use `exec`: with `exec`, bash is
-    // replaced in-place and tirith's parent becomes the harness again.
+    // `detect_shell` sees bash, even when the test harness (cargo/zsh) is
+    // its own ancestor. Never use bash `exec` here — it replaces bash
+    // in place and tirith's parent becomes the harness again.
     let export_lines: Vec<String> = env
         .iter()
         .map(|(k, v)| format!("export {k}={}", shell_quote(v)))
@@ -160,7 +157,7 @@ fn doctor_stdout(env: &[(&str, &str)]) -> String {
 }
 
 fn shell_quote(s: &str) -> String {
-    // Simple single-quote wrap; test values never contain single quotes.
+    // Single-quote wrap only; test values never contain single quotes.
     format!("'{s}'")
 }
 
@@ -192,8 +189,9 @@ fn doctor_shows_effective_state_when_hook_loaded() {
 
 #[test]
 fn doctor_distinguishes_requested_from_effective_on_degrade() {
-    // User requested enforcement but the live hook reports warn-only — simulates
-    // a mid-session degrade. Doctor must not paper over the mismatch.
+    // User requested enforcement but the live hook reports warn-only —
+    // simulates a mid-session degrade. Doctor must not paper over the
+    // mismatch.
     let stdout = doctor_stdout(&[
         ("TIRITH_BASH_MODE", "preexec"),
         ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
@@ -212,9 +210,9 @@ fn doctor_distinguishes_requested_from_effective_on_degrade() {
 
 #[test]
 fn doctor_reports_not_loaded_when_exports_absent() {
-    // User set a bash knob (so we know they care about bash), but the hook
-    // hasn't exported effective state — e.g. the knob was set in the env but
-    // the shell was spawned non-interactively so the hook no-op'd.
+    // User set a bash knob (signalling they care about bash) but the hook
+    // hasn't exported effective state — e.g. the shell was spawned
+    // non-interactively so the hook no-op'd.
     let stdout = doctor_stdout(&[("TIRITH_BASH_MODE", "enter")]);
     assert!(
         stdout.contains("bash hook:            not loaded in this process"),
@@ -234,7 +232,7 @@ fn doctor_reports_not_loaded_when_exports_absent() {
 
 #[test]
 fn doctor_default_requested_mode_shown_when_env_unset() {
-    // No TIRITH_BASH_MODE set but hook exports present (e.g. default enter mode).
+    // TIRITH_BASH_MODE unset but hook exports present (default enter mode).
     let stdout = doctor_stdout(&[
         ("TIRITH_BASH_EFFECTIVE_MODE", "enter"),
         ("TIRITH_BASH_EFFECTIVE_PROTECTION", "blocks"),

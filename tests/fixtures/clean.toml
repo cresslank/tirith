@@ -240,8 +240,6 @@ context = "exec"
 expected_action = "allow"
 expected_rules = []
 
-# ─── Issue #60: schemeless URL false positive fixes ───
-
 [[fixture]]
 name = "ssh_git_github"
 min_milestone = 0

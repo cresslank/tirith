@@ -13,7 +13,6 @@ pub fn analyze_hostname(raw: &str) -> Evidence {
             let script = ch.script();
             let script_name = format!("{script:?}");
 
-            // Get the hex bytes for this character
             let mut hex_bytes = String::new();
             for byte in ch.to_string().as_bytes() {
                 if !hex_bytes.is_empty() {
@@ -33,7 +32,6 @@ pub fn analyze_hostname(raw: &str) -> Evidence {
         byte_offset += ch.len_utf8();
     }
 
-    // Generate escaped/punycode version using url crate's IDNA handling
     let escaped = escape_to_ascii(raw);
 
     Evidence::HomoglyphAnalysis {
@@ -45,7 +43,6 @@ pub fn analyze_hostname(raw: &str) -> Evidence {
 
 /// Get a human-readable description of a character based on its script
 fn get_char_description(ch: char, script_name: &str) -> String {
-    // Common confusable mappings for Cyrillic
     let description = match ch {
         'а' => "Cyrillic 'а' (looks like Latin 'a')",
         'е' => "Cyrillic 'е' (looks like Latin 'e')",
@@ -88,21 +85,15 @@ fn get_char_description(ch: char, script_name: &str) -> String {
     }
 }
 
-/// Convert a hostname to its ASCII/punycode equivalent using IDNA rules.
-/// Uses the url crate which implements proper IDNA/UTS-46 normalization.
+/// Convert a hostname to its ASCII/punycode equivalent using IDNA/UTS-46.
+///
+/// The url crate implements the full UTS-46 rules, so we wrap `raw` in a dummy
+/// URL and read back `host_str()` rather than reimplementing IDNA here.
 fn escape_to_ascii(raw: &str) -> String {
-    // url crate's Host::parse handles IDNA encoding
-    // We construct a dummy URL to leverage its parsing
     let dummy_url = format!("https://{raw}/");
     match url::Url::parse(&dummy_url) {
-        Ok(parsed) => {
-            // host_str() returns the ASCII/punycode form
-            parsed.host_str().unwrap_or(raw).to_string()
-        }
-        Err(_) => {
-            // Fallback: return raw if parsing fails
-            raw.to_string()
-        }
+        Ok(parsed) => parsed.host_str().unwrap_or(raw).to_string(),
+        Err(_) => raw.to_string(),
     }
 }
 
@@ -133,7 +124,6 @@ mod tests {
     #[test]
     fn test_escape_to_ascii_punycode() {
         let escaped = escape_to_ascii("paradіgm.xyz");
-        // Should contain xn-- prefix for the punycode-encoded label
         assert!(
             escaped.contains("xn--"),
             "Expected punycode, got: {escaped}"
@@ -148,7 +138,6 @@ mod tests {
 
     #[test]
     fn test_escape_google_cyrillic() {
-        // Classic homograph: gооgle with Cyrillic о
         let escaped = escape_to_ascii("gооgle.com");
         assert!(
             escaped.contains("xn--"),
@@ -158,7 +147,8 @@ mod tests {
 
     #[test]
     fn test_escape_mixed_labels() {
-        // First label has homoglyph, second is pure ASCII
+        // First label has a homoglyph, second is pure ASCII — only the
+        // homoglyph label should be punycoded.
         let escaped = escape_to_ascii("аpple.example.com");
         assert!(escaped.contains("xn--"), "First label should be punycode");
         assert!(escaped.contains("example.com"), "ASCII labels preserved");
@@ -172,7 +162,7 @@ mod tests {
         } = evidence
         {
             assert_eq!(suspicious_chars.len(), 1);
-            // 'a' is 1 byte, so Cyrillic і starts at offset 1
+            // 'a' is 1 byte, so Cyrillic і starts at offset 1.
             assert_eq!(suspicious_chars[0].offset, 1);
         } else {
             panic!("Expected HomoglyphAnalysis evidence");
@@ -187,7 +177,7 @@ mod tests {
         } = evidence
         {
             assert_eq!(suspicious_chars.len(), 1);
-            // Cyrillic і is U+0456 = UTF-8 d1 96
+            // Cyrillic і is U+0456 = UTF-8 d1 96.
             assert_eq!(suspicious_chars[0].hex_bytes, "d1 96");
         } else {
             panic!("Expected HomoglyphAnalysis evidence");
@@ -200,7 +190,7 @@ mod tests {
         let json = serde_json::to_string(&evidence).expect("serialization should work");
         assert!(json.contains("homoglyph_analysis"));
         assert!(json.contains("suspicious_chars"));
-        assert!(json.contains("character")); // renamed from char
+        assert!(json.contains("character"));
     }
 
     #[test]
@@ -210,7 +200,7 @@ mod tests {
             suspicious_chars, ..
         } = evidence
         {
-            // Should find Cyrillic а and two Cyrillic р
+            // Cyrillic а plus two Cyrillic р.
             assert_eq!(suspicious_chars.len(), 3);
         } else {
             panic!("Expected HomoglyphAnalysis evidence");

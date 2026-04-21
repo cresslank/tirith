@@ -113,7 +113,8 @@ mod tests {
             tmp.persist(&path).unwrap();
         }
 
-        // The old predictable tmp file should NOT exist
+        // The old predictable tmp file must not be produced — a symlink-race
+        // attacker could exploit it.
         let old_tmp = dir.path().join(".last_trigger.json.tmp");
         assert!(
             !old_tmp.exists(),

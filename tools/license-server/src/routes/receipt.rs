@@ -30,8 +30,8 @@ pub async fn receipt_lookup(
             Ok(Redirect::to(&redirect_url).into_response())
         }
         None => {
-            // Race condition: redirect arrived before webhook processed
-            // Return a page with meta-refresh retry
+            // Redirect arrived before the webhook finished processing.
+            // Serve a page that retries the redirect automatically.
             let html = receipt_not_ready_page(&query.checkout);
             Ok((
                 StatusCode::OK,
@@ -50,14 +50,13 @@ pub async fn receipt_view(
     State(state): State<AppState>,
     Path(receipt_secret): Path<String>,
 ) -> Result<Response, AppError> {
-    // Atomic consume — exactly one request gets the row
+    // Atomic consume — exactly one request gets the row.
     let row = state
         .db
         .receipt_consume(&receipt_secret)
         .await?
         .ok_or_else(|| AppError::NotFound("Receipt expired or already viewed".into()))?;
 
-    // Decrypt API key
     let cipher = Aes256Gcm::new_from_slice(&state.config.receipt_encryption_key).map_err(|e| {
         error!("AES-GCM key init failed: {e}");
         AppError::Internal("License delivery error. Contact support@tirith.dev".into())

@@ -102,7 +102,6 @@ fn run_fixture(fixture: &Fixture) {
         ),
     };
 
-    // Check action
     assert_eq!(
         verdict.action,
         expected_action,
@@ -117,7 +116,6 @@ fn run_fixture(fixture: &Fixture) {
             .collect::<Vec<_>>()
     );
 
-    // Check that expected rules are present (if specified)
     if !fixture.expected_rules.is_empty() {
         let found_rules: Vec<String> = verdict
             .findings
@@ -248,11 +246,9 @@ fn test_policy_fixtures() {
 }
 
 /// Documented-behavior regression guard. Every fixture in
-/// `tests/fixtures/documented_commands.toml` represents a behavioral contract
-/// tirith has published (README/TIRITH.md/docs) or committed to in response to
-/// a closed issue. If a refactor silently breaks one of those contracts, this
-/// test fails — which is how the three regressions behind #26/#29/#30(#78)
-/// were supposed to have been caught.
+/// `tests/fixtures/documented_commands.toml` encodes a behavioral contract
+/// already promised to users in the README or TIRITH.md. A refactor that
+/// silently breaks one of those contracts fails here.
 #[test]
 fn test_documented_commands_fixtures() {
     let fixtures = load_fixtures("documented_commands.toml");
@@ -317,7 +313,6 @@ fn test_threatintel_fixtures() {
     }
     eprintln!("Passed {count} threatintel fixtures");
 
-    // Clean up env var (best-effort; tests are single-threaded by default)
     std::env::remove_var("TIRITH_THREATDB_PATH");
 }
 
@@ -377,7 +372,8 @@ fn test_tier1_coverage() {
                 _ => continue,
             };
 
-            // For paste context with raw bytes, check byte scan too
+            // Paste context: byte scan catches bidi/zero-width/etc. directly,
+            // bypassing the tier-1 regex.
             if scan_context == ScanContext::Paste {
                 let bytes = if !fixture.raw_bytes.is_empty() {
                     &fixture.raw_bytes
@@ -398,11 +394,12 @@ fn test_tier1_coverage() {
                     || byte_scan.has_confusable_text;
 
                 if byte_triggered {
-                    continue; // Byte scan catches it
+                    continue;
                 }
             }
 
-            // Exec context: bidi/zero-width check bypasses tier 1 regex (M4 fix)
+            // Exec context: byte scan for bidi/zero-width/etc. bypasses the
+            // tier-1 regex via the exec_bidi_triggered path in engine.rs.
             if scan_context == ScanContext::Exec {
                 let byte_scan = tirith_core::extract::scan_bytes(fixture.input.as_bytes());
                 if byte_scan.has_bidi_controls
@@ -538,17 +535,17 @@ const ALL_RULE_IDS: &[&str] = &[
     "web3_rpc_endpoint",
     "web3_address_in_url",
     "vet_not_configured",
-    // Threat intelligence — Phase A (local DB)
+    // Threat intelligence — local DB
     "threat_malicious_package",
     "threat_malicious_ip",
     "threat_package_typosquat",
     "threat_package_similar_name",
-    // Threat intelligence — Phase B (keyed feeds)
+    // Threat intelligence — supplemental feeds
     "threat_malicious_url",
     "threat_phishing_url",
     "threat_tor_exit_node",
     "threat_threat_fox_ioc",
-    // Threat intelligence — Phase C (real-time API)
+    // Threat intelligence — real-time lookups
     "threat_osv_vulnerable",
     "threat_cisa_kev",
     "threat_suspicious_package",
@@ -601,14 +598,6 @@ fn load_all_fixtures() -> Vec<(String, Fixture)> {
     all
 }
 
-// ---------------------------------------------------------------------------
-// Safeguard #1: Every RuleId variant must have at least one fixture.
-//
-// If someone adds a new rule but forgets to write a fixture, this fails.
-// If someone adds a new RuleId to the enum but forgets to add it to
-// ALL_RULE_IDS above, `test_rule_id_list_is_complete` catches that.
-// ---------------------------------------------------------------------------
-
 /// Rules that depend on runtime state and cannot be tested via static fixtures.
 /// - proxy_env_set: requires HTTP_PROXY/HTTPS_PROXY env vars to be set
 /// - policy_blocklisted: requires a blocklist file in policy config
@@ -624,17 +613,17 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "pdf_hidden_text",    // requires .pdf file input
     "config_malformed",   // requires MCP config filename context in file scan
     "vet_not_configured", // requires cargo install without cargo-vet
-    // Threat intelligence — Phase A rules are now tested with test-threatdb.dat
-    // (see test_threatintel_fixtures which sets TIRITH_THREATDB_PATH).
-    // Phase B/C rules still require external feeds or real-time APIs.
-    "threat_malicious_url",      // Phase B: requires keyed URLhaus feed
-    "threat_phishing_url",       // Phase B: requires keyed phishing feed
-    "threat_tor_exit_node",      // Phase B: requires Tor exit node list
-    "threat_threat_fox_ioc",     // Phase B: requires keyed ThreatFox feed
-    "threat_osv_vulnerable",     // Phase C: requires real-time OSV.dev API
-    "threat_cisa_kev",           // Phase C: requires real-time CISA KEV correlation
-    "threat_suspicious_package", // Phase C: requires real-time deps.dev/ecosyste.ms API
-    "threat_safe_browsing",      // Phase C: requires Google Safe Browsing API key
+    // Local-DB threat rules are covered by test-threatdb.dat in
+    // test_threatintel_fixtures. The rules below still depend on optional
+    // feeds or live APIs.
+    "threat_malicious_url",      // requires supplemental URLhaus data
+    "threat_phishing_url",       // requires supplemental phishing feeds
+    "threat_tor_exit_node",      // requires supplemental Tor exit-node data
+    "threat_threat_fox_ioc",     // requires supplemental ThreatFox data
+    "threat_osv_vulnerable",     // requires live OSV.dev lookups
+    "threat_cisa_kev",           // requires live CISA KEV correlation
+    "threat_suspicious_package", // requires live package-health lookups
+    "threat_safe_browsing",      // requires a Google Safe Browsing API key
 ];
 
 #[test]
@@ -736,17 +725,17 @@ fn test_rule_id_list_is_complete() {
         RuleId::Web3RpcEndpoint,
         RuleId::Web3AddressInUrl,
         RuleId::VetNotConfigured,
-        // Threat intelligence — Phase A (local DB)
+        // Threat intelligence — local DB
         RuleId::ThreatMaliciousPackage,
         RuleId::ThreatMaliciousIp,
         RuleId::ThreatPackageTyposquat,
         RuleId::ThreatPackageSimilarName,
-        // Threat intelligence — Phase B (keyed feeds)
+        // Threat intelligence — supplemental feeds
         RuleId::ThreatMaliciousUrl,
         RuleId::ThreatPhishingUrl,
         RuleId::ThreatTorExitNode,
         RuleId::ThreatThreatFoxIoc,
-        // Threat intelligence — Phase C (real-time API)
+        // Threat intelligence — real-time lookups
         RuleId::ThreatOsvVulnerable,
         RuleId::ThreatCisaKev,
         RuleId::ThreatSuspiciousPackage,
@@ -787,11 +776,6 @@ fn test_rule_id_list_is_complete() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Safeguard #2: Non-URL-dependent rules must have at least one fixture
-// where the input contains no URL. This prevents the tier-1 URL regex
-// from accidentally being the only reason analysis runs.
-// ---------------------------------------------------------------------------
 #[test]
 fn test_no_url_rules_have_no_url_fixtures() {
     // Rules that CAN fire when the input has no URL at all.
@@ -867,13 +851,6 @@ fn test_no_url_rules_have_no_url_fixtures() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Safeguard #3: Build-time cross-reference — every rule "trigger category"
-// must have a corresponding PATTERN_TABLE entry in build.rs.
-//
-// The PATTERN_TABLE entry IDs are exposed via extract::extractor_ids().
-// This test verifies that expected trigger categories exist.
-// ---------------------------------------------------------------------------
 #[test]
 fn test_extractor_ids_cover_rule_triggers() {
     let ids: HashSet<&str> = tirith_core::extract::extractor_ids()
@@ -959,14 +936,6 @@ fn test_extractor_ids_cover_rule_triggers() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Safeguard #4: Tier-1 must not gate any expected-block/warn fixture.
-//
-// For every non-allow fixture, the full engine must reach tier 3.
-// If tier_reached < 3, tier-1 silently suppressed the rule — a security bug.
-// This is the single most impactful test: it catches the EXACT class of bug
-// that caused the dotfile overwrite gap.
-// ---------------------------------------------------------------------------
 #[test]
 fn test_tier1_does_not_gate_findings() {
     let all_fixtures = load_all_fixtures();
@@ -1030,8 +999,9 @@ fn test_tier1_does_not_gate_findings() {
     );
 }
 
-/// Constraint #6: Non-ASCII in paste is only an analysis trigger, never a sole WARN/BLOCK reason.
-/// Pasting text that contains only non-ASCII characters (no URLs, no commands) must result in Allow.
+/// Non-ASCII in paste is only an analysis trigger, never a sole WARN/BLOCK
+/// reason. A paste containing only non-ASCII characters (no URLs, no
+/// commands) must resolve to Allow.
 #[test]
 fn test_non_ascii_paste_not_sole_warn() {
     let non_ascii_inputs = [
@@ -1068,14 +1038,14 @@ fn test_non_ascii_paste_not_sole_warn() {
     }
 }
 
-/// Constraint #7: Tier-1 regex must match all interpreters from the shared INTERPRETERS const.
-/// This prevents drift between the tier-1 gate (build.rs) and the tier-3 detection (command.rs).
+/// The tier-1 regex must match every name in the shared `INTERPRETERS`
+/// constant — drift between the tier-1 gate (build.rs) and the tier-3
+/// detection (command.rs) would silently gate real attacks.
 #[test]
 fn test_tier1_matches_all_interpreters() {
     use tirith_core::extract::{tier1_scan, ScanContext};
     use tirith_core::rules::command::INTERPRETERS;
 
-    // 1. Plain interpreter: cat /tmp/s.sh | <name>
     for name in INTERPRETERS {
         let input = format!("cat /tmp/s.sh | {}", name);
         assert!(
@@ -1086,7 +1056,6 @@ fn test_tier1_matches_all_interpreters() {
         );
     }
 
-    // 2. Quoted wrappers
     assert!(
         tier1_scan("cat /tmp/s.sh | 'sudo' bash", ScanContext::Exec),
         "Tier-1 scan must match quoted wrapper 'sudo'"
@@ -1096,19 +1065,16 @@ fn test_tier1_matches_all_interpreters() {
         "Tier-1 scan must match quoted wrapper \"env\""
     );
 
-    // 3. Wrapper chains
     assert!(
         tier1_scan("cat /tmp/s.sh | command sudo bash", ScanContext::Exec),
         "Tier-1 scan must match wrapper chain"
     );
 
-    // 4. ANSI-C quoted interpreter
     assert!(
         tier1_scan("cat /tmp/s.sh | $'bash'", ScanContext::Exec),
         "Tier-1 scan must match ANSI-C quoted interpreter"
     );
 
-    // 5. Case insensitive
     assert!(
         tier1_scan("cat /tmp/s.sh | BASH", ScanContext::Exec),
         "Tier-1 scan must match uppercase interpreter"

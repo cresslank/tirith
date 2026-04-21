@@ -17,7 +17,7 @@ if not set -q TIRITH_SESSION_ID
     set -gx TIRITH_SESSION_ID (printf '%x-%x' %self (date +%s))
 end
 
-# Output helper: write to stderr by default (ADR-7).
+# Output helper: write to stderr by default.
 # Override via TIRITH_OUTPUT=tty to write to /dev/tty instead.
 function _tirith_output
     if test "$TIRITH_OUTPUT" = "tty"
@@ -31,7 +31,6 @@ function _tirith_escape_preview
     string escape -- $argv[1]
 end
 
-# ─── Approval workflow helpers (ADR-7) ───
 
 function _tirith_parse_approval
     set -g _tirith_ap_required "no"
@@ -42,7 +41,7 @@ function _tirith_parse_approval
 
     if not test -r "$argv[1]"
         _tirith_output "tirith: warning: approval file missing or unreadable, failing closed"
-        command rm -f "$argv[1]"  # ADR-7: delete on all paths
+        command rm -f "$argv[1]"  # delete on all paths
         set -g _tirith_ap_required "yes"
         set -g _tirith_ap_fallback "block"
         return 1
@@ -79,7 +78,6 @@ function _tirith_parse_approval
     return 0
 end
 
-# ─── Warn-ack helpers (strict_warn, exit code 3) ───
 
 function _tirith_parse_warn_ack
     set -g _tirith_wa_findings 0
@@ -116,7 +114,7 @@ if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish
     functions -c fish_clipboard_paste _tirith_original_fish_clipboard_paste
 
     function fish_clipboard_paste
-        # Honor TIRITH=0 bypass (#30): skip paste scanning
+        # Honor TIRITH=0 bypass: skip paste scanning
         if test "$TIRITH" = "0"
             _tirith_original_fish_clipboard_paste
             return

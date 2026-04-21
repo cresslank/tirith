@@ -40,7 +40,6 @@ impl Config {
         let mut receipt_encryption_key = [0u8; 32];
         receipt_encryption_key.copy_from_slice(&enc_key_bytes);
 
-        // Map Polar product UUIDs to tier names
         let mut product_tier_map = HashMap::new();
         for (env_key, tier) in [
             ("POLAR_PRODUCT_PRO", "pro"),

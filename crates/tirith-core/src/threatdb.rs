@@ -41,10 +41,6 @@ use thiserror::Error;
 use crate::policy;
 use crate::util::levenshtein;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 const MAGIC: &[u8; 8] = b"TIRITHDB";
 const FORMAT_VERSION: u32 = 1;
 /// Total header size in bytes.
@@ -63,10 +59,6 @@ const MTIME_CHECK_INTERVAL_SECS: u64 = 60;
 /// The corresponding private key is stored as a GitHub Actions secret (THREATDB_SIGNING_KEY).
 static VERIFY_KEY_BYTES: &[u8; PUBLIC_KEY_LENGTH] =
     include_bytes!("../assets/keys/threatdb-verify.pub");
-
-// ---------------------------------------------------------------------------
-// Enums
-// ---------------------------------------------------------------------------
 
 /// Package ecosystem identifiers, encoded as a single byte in the DB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -133,13 +125,11 @@ impl Ecosystem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ThreatSource {
-    // Phase A sources
     OssfMalicious = 0,
     DatadogMalicious = 1,
     FeodoTracker = 2,
     EcosystemsTyposquat = 3,
     CisaKev = 4,
-    // Phase B sources (reserved)
     Urlhaus = 5,
     PhishingArmy = 6,
     PhishTank = 7,
@@ -225,10 +215,6 @@ impl Confidence {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Match result types
-// ---------------------------------------------------------------------------
-
 /// Result of a package, hostname, or IP lookup in the threat DB.
 ///
 /// `ecosystem` is `Some` for package matches and `None` for hostname/IP matches
@@ -266,10 +252,6 @@ pub struct ThreatDbStats {
     pub string_table_bytes: u32,
 }
 
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Error)]
 pub enum ThreatDbError {
     #[error("invalid magic: expected TIRITHDB")]
@@ -293,10 +275,6 @@ pub enum ThreatDbError {
     #[error("string table offset out of bounds: {0}")]
     StringOutOfBounds(u32),
 }
-
-// ---------------------------------------------------------------------------
-// Internal record layout (fixed-size per section)
-// ---------------------------------------------------------------------------
 
 /// Package record size:
 ///   ecosystem(1) + name_len(2) + name(variable, capped at 256) + NOT fixed-size.
@@ -331,10 +309,7 @@ const POPULAR_INDEX_ENTRY_SIZE: usize = 8;
 /// Hostname index entry: offset(u32 LE) + key_hash(u32 LE) = 8 bytes.
 const HOSTNAME_INDEX_ENTRY_SIZE: usize = 8;
 
-// ---------------------------------------------------------------------------
-// Hash helper — FNV-1a 32-bit
-// ---------------------------------------------------------------------------
-
+/// FNV-1a 32-bit hash used for both string-table dedup and index key hashes.
 fn fnv1a_hash(data: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     for &b in data {
@@ -351,10 +326,6 @@ fn pkg_key_hash(eco: Ecosystem, name: &[u8]) -> u32 {
     fnv1a_hash(&buf)
 }
 
-// ---------------------------------------------------------------------------
-// Binary read helpers
-// ---------------------------------------------------------------------------
-
 fn read_u16_le(buf: &[u8], off: usize) -> Option<u16> {
     buf.get(off..off + 2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
@@ -369,10 +340,6 @@ fn read_u64_le(buf: &[u8], off: usize) -> Option<u64> {
     buf.get(off..off + 8)
         .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
 }
-
-// ---------------------------------------------------------------------------
-// ThreatDb — the main reader
-// ---------------------------------------------------------------------------
 
 /// In-memory threat intelligence database loaded from the signed binary file.
 #[derive(Debug)]
@@ -399,10 +366,6 @@ pub struct ThreatDb {
 }
 
 impl ThreatDb {
-    // ------------------------------------------------------------------
-    // Loading
-    // ------------------------------------------------------------------
-
     /// Load and verify a threat DB from raw bytes.
     ///
     /// `min_sequence` enforces rollback protection — the DB is rejected if its
@@ -562,10 +525,6 @@ impl ThreatDb {
         self
     }
 
-    // ------------------------------------------------------------------
-    // Signature verification
-    // ------------------------------------------------------------------
-
     /// Verify the Ed25519 signature and signer fingerprint.
     ///
     /// Returns `Ok(())` if the signature is valid and the signer fingerprint
@@ -599,10 +558,6 @@ impl ThreatDb {
             .map_err(|_| "Ed25519 signature verification failed".to_string())
     }
 
-    // ------------------------------------------------------------------
-    // Accessors
-    // ------------------------------------------------------------------
-
     pub fn build_time(&self) -> u64 {
         self.build_timestamp
     }
@@ -630,10 +585,6 @@ impl ThreatDb {
         }
     }
 
-    // ------------------------------------------------------------------
-    // String table
-    // ------------------------------------------------------------------
-
     fn read_string_table_entry(&self, offset: u32) -> Option<&str> {
         if offset == 0xFFFF_FFFF {
             return None;
@@ -647,10 +598,6 @@ impl ThreatDb {
         }
         std::str::from_utf8(&self.data[start..end]).ok()
     }
-
-    // ------------------------------------------------------------------
-    // Package lookups (Section 1)
-    // ------------------------------------------------------------------
 
     /// Look up index entry: returns (data_offset, key_hash).
     fn pkg_index_entry(&self, idx: u32) -> Option<(u32, u32)> {
@@ -793,10 +740,6 @@ impl ThreatDb {
         None
     }
 
-    // ------------------------------------------------------------------
-    // Hostname lookups (Section 2 — empty in Phase A)
-    // ------------------------------------------------------------------
-
     /// Check a hostname against the threat DB.
     pub fn check_hostname(&self, host: &str) -> Option<ThreatMatch> {
         if self.hostname_index_count == 0 {
@@ -872,10 +815,6 @@ impl ThreatDb {
         None
     }
 
-    // ------------------------------------------------------------------
-    // IP lookups (Section 3)
-    // ------------------------------------------------------------------
-
     /// Check an IPv4 address against the threat DB.
     pub fn check_ip(&self, ip: Ipv4Addr) -> Option<ThreatMatch> {
         if self.ip_count == 0 {
@@ -913,10 +852,6 @@ impl ThreatDb {
         }
         None
     }
-
-    // ------------------------------------------------------------------
-    // Typosquat lookups (Section 4)
-    // ------------------------------------------------------------------
 
     /// Check a package name against known typosquats.
     pub fn check_typosquat(&self, eco: Ecosystem, name: &str) -> Option<TyposquatMatch> {
@@ -1003,17 +938,12 @@ impl ThreatDb {
         None
     }
 
-    // ------------------------------------------------------------------
-    // Popular package lookups (Section 5) — for Levenshtein
-    // ------------------------------------------------------------------
-
     /// Find the closest popular package name within Levenshtein distance.
-    /// Returns `(popular_name, distance)` if distance <= 1 (hardcoded threshold).
+    /// Returns `(popular_name, distance)` if distance <= 1.
     pub fn check_popular_distance(&self, eco: Ecosystem, name: &str) -> Option<(String, usize)> {
-        // Linear scan is acceptable for top-5k list (short names, fast comparison).
-        // Only entries with matching ecosystem are compared.
+        // Linear scan is fine for ~5k short names.
         let mut best: Option<(String, usize)> = None;
-        let max_distance = 1; // Only flag distance <=1
+        let max_distance = 1;
 
         for i in 0..self.popular_index_count {
             let base = self.popular_index_offset as usize + i as usize * POPULAR_INDEX_ENTRY_SIZE;
@@ -1077,10 +1007,6 @@ impl ThreatDb {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Process-wide cache with hot-reload
-    // ------------------------------------------------------------------
-
     /// Get the cached threat DB instance, loading/reloading as needed.
     ///
     /// Re-checks file mtime every 60 seconds.  If the file changed, reloads
@@ -1110,10 +1036,6 @@ struct PkgRecord<'a> {
     versions: Vec<&'a str>,
     reference_offset: u32,
 }
-
-// ---------------------------------------------------------------------------
-// Process-wide cache
-// ---------------------------------------------------------------------------
 
 static CACHE: OnceLock<ThreatDbCache> = OnceLock::new();
 
@@ -1236,11 +1158,8 @@ fn combined_mtime_epoch() -> Option<u64> {
         .map(|mtime| mtime.rotate_left(13) ^ supplemental.rotate_left(29) ^ 0x5448_5245_4154_4442)
 }
 
-// ---------------------------------------------------------------------------
-// Writer — used by the compiler binary to build `.dat` files
-// ---------------------------------------------------------------------------
-
-/// Builder for creating threat DB files.
+/// Builder for creating threat DB files (used by the compiler binary to
+/// produce `.dat` files).
 ///
 /// Usage:
 /// ```ignore
@@ -1437,9 +1356,6 @@ impl ThreatDbWriter {
         self.popular
             .dedup_by(|a, b| a.ecosystem == b.ecosystem && a.name == b.name);
 
-        // --- Serialize data regions ---
-
-        // Package data region
         let mut pkg_data: Vec<u8> = Vec::new();
         let mut pkg_index: Vec<(u32, u32)> = Vec::new(); // (data_offset, key_hash)
 
@@ -1524,8 +1440,7 @@ impl ThreatDbWriter {
             ip_data.push(ip.source as u8);
         }
 
-        // --- Compute layout ---
-        // After header:
+        // File layout after header:
         //   pkg_index | pkg_data | hostname_index | hostname_data |
         //   ip_data | typo_index | typo_data | popular_index | popular_data | string_table
 
@@ -1592,7 +1507,6 @@ impl ThreatDbWriter {
         hostname_index.sort_by_key(|&(_, hash)| hash);
         typo_index.sort_by_key(|&(_, hash)| hash);
 
-        // --- Assemble the file ---
         let total_size = HEADER_SIZE
             + pkg_index_size
             + pkg_data.len()
@@ -1693,10 +1607,6 @@ impl ThreatDbWriter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1758,8 +1668,6 @@ mod tests {
         ThreatDb::from_bytes(bytes, 0).expect("load failed")
     }
 
-    // ----- Round-trip: write -> read -> verify -----
-
     #[test]
     fn test_round_trip_all_sections() {
         let key = SigningKey::generate(&mut OsRng);
@@ -1773,10 +1681,8 @@ mod tests {
         assert_eq!(stats.ip_count, 3);
         assert_eq!(stats.typosquat_count, 2);
         assert_eq!(stats.popular_count, 4);
-        assert_eq!(stats.hostname_count, 0); // Phase A: empty
+        assert_eq!(stats.hostname_count, 0);
     }
-
-    // ----- Package lookups -----
 
     #[test]
     fn test_package_version_in_list() {
@@ -1852,7 +1758,6 @@ mod tests {
         let key = SigningKey::generate(&mut OsRng);
         let db = build_test_db(&key);
 
-        // "evil-package" is Npm, not PyPI
         assert!(db
             .check_package(Ecosystem::PyPI, "evil-package", Some("1.0.0"))
             .is_none());
@@ -1868,8 +1773,6 @@ mod tests {
             .expect("should match");
         assert_eq!(m.confidence, Confidence::Medium);
     }
-
-    // ----- IP lookups -----
 
     #[test]
     fn test_ip_found() {
@@ -1895,7 +1798,6 @@ mod tests {
         let key = SigningKey::generate(&mut OsRng);
         let db = build_test_db(&key);
 
-        // IPs are sorted: 10.0.0.1, 192.168.1.100, 203.0.113.50
         assert!(db.check_ip(Ipv4Addr::new(10, 0, 0, 1)).is_some());
     }
 
@@ -1906,8 +1808,6 @@ mod tests {
 
         assert!(db.check_ip(Ipv4Addr::new(203, 0, 113, 50)).is_some());
     }
-
-    // ----- Typosquat lookups -----
 
     #[test]
     fn test_typosquat_found() {
@@ -1936,14 +1836,11 @@ mod tests {
         assert!(db.check_typosquat(Ecosystem::PyPI, "reacct").is_none());
     }
 
-    // ----- Popular / Levenshtein -----
-
     #[test]
     fn test_popular_distance_1() {
         let key = SigningKey::generate(&mut OsRng);
         let db = build_test_db(&key);
 
-        // "reqests" is distance 1 from "requests" (missing 'u')
         let result = db.check_popular_distance(Ecosystem::PyPI, "reqests");
         assert!(result.is_some(), "should find close match");
         let (name, dist) = result.unwrap();
@@ -1956,7 +1853,6 @@ mod tests {
         let key = SigningKey::generate(&mut OsRng);
         let db = build_test_db(&key);
 
-        // Exact match should return None (package is popular itself)
         assert!(db.check_popular_distance(Ecosystem::Npm, "react").is_none());
     }
 
@@ -1965,11 +1861,8 @@ mod tests {
         let key = SigningKey::generate(&mut OsRng);
         let db = build_test_db(&key);
 
-        // "xyz" is far from all popular packages
         assert!(db.check_popular_distance(Ecosystem::Npm, "xyz").is_none());
     }
-
-    // ----- Hostname lookups (Phase A: empty) -----
 
     #[test]
     fn test_hostname_empty_section() {
@@ -1978,8 +1871,6 @@ mod tests {
 
         assert!(db.check_hostname("evil.example.com").is_none());
     }
-
-    // ----- Signature verification -----
 
     #[test]
     fn test_signature_valid() {
@@ -2047,8 +1938,6 @@ mod tests {
         );
     }
 
-    // ----- Rollback protection -----
-
     #[test]
     fn test_rollback_rejected() {
         let key = SigningKey::generate(&mut OsRng);
@@ -2087,8 +1976,6 @@ mod tests {
         assert!(ThreatDb::from_bytes(bytes, 10).is_ok());
     }
 
-    // ----- Invalid data -----
-
     #[test]
     fn test_invalid_magic() {
         let mut data = vec![0u8; HEADER_SIZE + 10];
@@ -2118,8 +2005,6 @@ mod tests {
             Err(ThreatDbError::UnsupportedVersion(99))
         ));
     }
-
-    // ----- Binary search edge cases -----
 
     #[test]
     fn test_single_entry_db() {
@@ -2165,8 +2050,6 @@ mod tests {
         assert_eq!(stats.ip_count, 0);
     }
 
-    // ----- Cache -----
-
     #[test]
     fn test_cache_returns_none_when_no_file() {
         // ThreatDb::cached() should return None when no DB file exists.
@@ -2180,8 +2063,6 @@ mod tests {
         // May be None or Some depending on test environment; just ensure no panic.
         let _ = result;
     }
-
-    // ----- Deduplication -----
 
     #[test]
     fn test_writer_deduplicates() {
@@ -2355,8 +2236,6 @@ mod tests {
             std::env::remove_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
         }
     }
-
-    // ----- String table -----
 
     #[test]
     fn test_string_table_deduplication() {

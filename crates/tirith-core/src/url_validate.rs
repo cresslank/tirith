@@ -1,4 +1,5 @@
-/// URL validation for outbound HTTP requests (SSRF protection).
+//! URL validation for outbound HTTP requests — SSRF protection.
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
 type HostResolver = dyn Fn(&str, u16) -> Result<Vec<IpAddr>, String>;
@@ -389,13 +390,11 @@ mod tests {
         assert!(result.unwrap_err().contains("169.254.169.254"));
     }
 
-    // -----------------------------------------------------------------------
-    // Adversarial bypass attempts: embedded IPv4 / translated IPv6
-    // -----------------------------------------------------------------------
+    // Adversarial bypass attempts: embedded IPv4 / translated IPv6.
 
     #[test]
     fn test_bypass_mapped_cloud_metadata() {
-        // ::ffff:169.254.169.254 — AWS metadata endpoint via IPv4-mapped
+        // ::ffff:169.254.169.254 — AWS metadata endpoint via IPv4-mapped.
         let result = validate_outbound_url_with_resolver(
             "https://[::ffff:169.254.169.254]/latest/meta-data/",
             UrlValidationMode::Server,
