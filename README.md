@@ -300,7 +300,8 @@ yay -S tirith
 **Nix:**
 
 ```bash
-nix profile install github:sheeki03/tirith
+nix profile install nixpkgs#tirith              # from nixpkgs
+nix profile install github:sheeki03/tirith      # from upstream flake
 # or try without installing: nix run github:sheeki03/tirith -- --version
 ```
 
