@@ -122,6 +122,67 @@ pub mod setup;
 #[cfg(test)]
 pub(crate) mod test_harness;
 
+fn trim_wrapping_quotes(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
+fn parse_shim_target(contents: &str) -> Option<std::path::PathBuf> {
+    contents.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        if !key.trim().eq_ignore_ascii_case("path") {
+            return None;
+        }
+        let value = trim_wrapping_quotes(value.trim());
+        if value.is_empty() {
+            return None;
+        }
+        Some(std::path::PathBuf::from(value))
+    })
+}
+
+fn resolve_shim_target(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut sidecar = path.to_path_buf();
+    sidecar.set_extension("shim");
+
+    let contents = std::fs::read_to_string(&sidecar).ok()?;
+    let target = parse_shim_target(&contents)?;
+    let target = if target.is_relative() {
+        sidecar.parent()?.join(target)
+    } else {
+        target
+    };
+
+    target.canonicalize().ok().or(Some(target))
+}
+
+fn resolve_effective_tirith_target(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    if let Some(target) = resolve_shim_target(path) {
+        return Some(target);
+    }
+
+    path.canonicalize().ok()
+}
+
+pub fn tirith_path_lookup_command() -> &'static str {
+    #[cfg(unix)]
+    {
+        "which -a tirith"
+    }
+    #[cfg(not(unix))]
+    {
+        "where.exe tirith"
+    }
+}
+
 /// Resolve all `tirith` executables on PATH using the shell's own command resolution.
 /// Returns paths that the shell would actually execute, not just filesystem entries.
 pub fn resolve_tirith_on_path() -> Vec<std::path::PathBuf> {
@@ -153,17 +214,18 @@ pub fn resolve_tirith_on_path() -> Vec<std::path::PathBuf> {
 }
 
 /// Find `tirith` executables on PATH that are not the current binary.
-/// Deduplicates by canonical path so duplicate PATH entries don't produce repeated warnings.
+/// Deduplicates by logical target path so duplicate PATH entries and shim aliases
+/// don't produce repeated warnings.
 pub fn find_shadow_binaries() -> Vec<String> {
     let our_canonical = std::env::current_exe()
         .ok()
-        .and_then(|p| p.canonicalize().ok());
+        .and_then(|p| resolve_effective_tirith_target(&p));
 
     let mut seen = std::collections::HashSet::new();
     let mut shadows = Vec::new();
 
     for path in resolve_tirith_on_path() {
-        let canonical = path.canonicalize().ok();
+        let canonical = resolve_effective_tirith_target(&path);
         // Skip if it resolves to our own binary
         if let (Some(ours), Some(ref theirs)) = (&our_canonical, &canonical) {
             if ours == theirs {
@@ -179,4 +241,73 @@ pub fn find_shadow_binaries() -> Vec<String> {
         }
     }
     shadows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_shim_target, resolve_shim_target};
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn parse_shim_target_accepts_unquoted_values() {
+        let parsed =
+            parse_shim_target("path = C:\\Users\\alice\\scoop\\apps\\tirith\\current\\tirith.exe");
+        assert_eq!(
+            parsed,
+            Some(PathBuf::from(
+                "C:\\Users\\alice\\scoop\\apps\\tirith\\current\\tirith.exe"
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_shim_target_accepts_case_insensitive_quoted_values() {
+        let parsed = parse_shim_target("ARGS = --help\r\nPATH = \"/tmp/tirith.exe\"\r\n");
+        assert_eq!(parsed, Some(PathBuf::from("/tmp/tirith.exe")));
+    }
+
+    #[test]
+    fn resolve_shim_target_uses_absolute_target_from_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("apps/tirith/current/tirith.exe");
+        let shim = dir.path().join("shims/tirith.exe");
+
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        fs::write(&real, b"real").unwrap();
+        fs::write(&shim, b"shim").unwrap();
+        fs::write(
+            shim.with_extension("shim"),
+            format!("path = \"{}\"\n", real.display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_shim_target(&shim).unwrap().canonicalize().unwrap(),
+            real.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_shim_target_uses_relative_target_from_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("apps/tirith/current/tirith.exe");
+        let shim = dir.path().join("shims/tirith.exe");
+
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        fs::write(&real, b"real").unwrap();
+        fs::write(&shim, b"shim").unwrap();
+        fs::write(
+            shim.with_extension("shim"),
+            "path = ../apps/tirith/current/tirith.exe\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_shim_target(&shim).unwrap().canonicalize().unwrap(),
+            real.canonicalize().unwrap()
+        );
+    }
 }

@@ -730,7 +730,7 @@ fn print_human(info: &DoctorInfo) {
             println!("    - {shadow}");
         }
         println!("  These may shadow this binary and cause unexpected behavior.");
-        println!("  Check with: which -a tirith");
+        println!("  Check with: {}", super::tirith_path_lookup_command());
         println!();
     }
     println!("  shell:        {}", info.detected_shell);

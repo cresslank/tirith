@@ -28,8 +28,10 @@ fn check_path_shadow() -> Option<String> {
     Some(format!(
         "tirith: WARNING: '{}' shadows this binary ({})\n\
          tirith: This may be a different package (e.g. pip-installed).\n\
-         tirith: Run 'which -a tirith' to inspect, and remove the conflicting binary.",
-        shadows[0], our_exe,
+         tirith: Run '{}' to inspect, and remove the conflicting binary.",
+        shadows[0],
+        our_exe,
+        super::tirith_path_lookup_command(),
     ))
 }
 
