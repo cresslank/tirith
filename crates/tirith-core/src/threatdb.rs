@@ -1018,10 +1018,17 @@ impl ThreatDb {
         cache.get()
     }
 
-    /// Force-refresh the cached DB (useful after download).
+    /// Force-refresh the cached DB from the current configured source.
+    ///
+    /// Explicit refreshes honor source/overlay changes even when the primary
+    /// DB build sequence does not increase. This matters for tests and for
+    /// supplemental overlay rebuilds, both of which intentionally reuse the
+    /// same signed primary DB.
     pub fn refresh_cache() {
         if let Some(cache) = CACHE.get() {
             cache.force_reload();
+        } else {
+            let _ = CACHE.get_or_init(ThreatDbCache::new);
         }
     }
 }
@@ -1045,6 +1052,12 @@ struct ThreatDbCache {
     loaded_mtime: AtomicU64,
 }
 
+struct CacheSource {
+    primary_path: PathBuf,
+    supplemental_path: Option<PathBuf>,
+    combined_mtime: u64,
+}
+
 impl ThreatDbCache {
     fn new() -> Self {
         let cache = Self {
@@ -1062,30 +1075,36 @@ impl ThreatDbCache {
         let last_check = self.last_mtime_check.load(Ordering::Relaxed);
         if now.saturating_sub(last_check) >= MTIME_CHECK_INTERVAL_SECS {
             self.last_mtime_check.store(now, Ordering::Relaxed);
-            if let Some(file_mtime) = combined_mtime_epoch() {
-                if file_mtime != self.loaded_mtime.load(Ordering::Relaxed) {
-                    self.reload(file_mtime);
+            match current_cache_source() {
+                Some(source) => {
+                    if source.combined_mtime != self.loaded_mtime.load(Ordering::Relaxed) {
+                        self.reload(&source, false);
+                    }
                 }
+                None => self.clear(),
             }
         }
         self.db.read().ok()?.clone()
     }
 
     fn force_reload(&self) {
-        if let Some(file_mtime) = combined_mtime_epoch() {
-            self.reload(file_mtime);
+        if let Some(source) = current_cache_source() {
+            self.reload(&source, true);
+        } else {
+            self.clear();
         }
     }
 
-    fn reload(&self, file_mtime: u64) {
-        let min_seq = self
+    fn reload(&self, source: &CacheSource, allow_downgrade: bool) {
+        let current_seq = self
             .db
             .read()
             .ok()
             .and_then(|guard| guard.as_ref().map(|db| db.build_sequence))
             .unwrap_or(0);
+        let loaded_mtime = self.loaded_mtime.load(Ordering::Relaxed);
 
-        match ThreatDb::load_from_data_dir() {
+        match ThreatDb::load_from_path(&source.primary_path, 0) {
             Ok(primary_db) => {
                 if let Err(e) = primary_db.verify_signature() {
                     eprintln!(
@@ -1097,25 +1116,31 @@ impl ThreatDbCache {
                 // They are intentionally not verified against the pinned release signing key:
                 // `load_from_path()` still validates the binary structure/header/version, but
                 // authenticity is anchored to the local machine policy and filesystem, not CI.
-                let supplemental_db = ThreatDb::supplemental_path()
-                    .filter(|path| path.exists())
-                    .and_then(|path| match ThreatDb::load_from_path(&path, 0) {
-                        Ok(db) => Some(db),
-                        Err(e) => {
-                            eprintln!(
+                let supplemental_db =
+                    source.supplemental_path.as_ref().and_then(
+                        |path| match ThreatDb::load_from_path(path, 0) {
+                            Ok(db) => Some(db),
+                            Err(e) => {
+                                eprintln!(
                                 "tirith: warning: failed to load supplemental threat DB {}: {e}",
                                 path.display()
                             );
-                            None
-                        }
-                    });
+                                None
+                            }
+                        },
+                    );
                 let new_db = primary_db.with_supplemental(supplemental_db);
-                // Skip rollback check on reload — the from_bytes already checks min_sequence=0.
-                // We accept any newer sequence.
-                if new_db.build_sequence > min_seq || min_seq == 0 {
+                if should_replace_cached_db(
+                    current_seq,
+                    new_db.build_sequence,
+                    loaded_mtime,
+                    source.combined_mtime,
+                    allow_downgrade,
+                ) {
                     if let Ok(mut guard) = self.db.write() {
                         *guard = Some(Arc::new(new_db));
-                        self.loaded_mtime.store(file_mtime, Ordering::Relaxed);
+                        self.loaded_mtime
+                            .store(source.combined_mtime, Ordering::Relaxed);
                     }
                 }
             }
@@ -1124,6 +1149,26 @@ impl ThreatDbCache {
             }
         }
     }
+
+    fn clear(&self) {
+        if let Ok(mut guard) = self.db.write() {
+            *guard = None;
+        }
+        self.loaded_mtime.store(0, Ordering::Relaxed);
+    }
+}
+
+fn should_replace_cached_db(
+    current_sequence: u64,
+    new_sequence: u64,
+    loaded_mtime: u64,
+    new_mtime: u64,
+    allow_downgrade: bool,
+) -> bool {
+    allow_downgrade
+        || current_sequence == 0
+        || new_sequence > current_sequence
+        || (new_sequence == current_sequence && new_mtime != loaded_mtime)
 }
 
 fn unix_now() -> u64 {
@@ -1133,9 +1178,8 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn file_mtime_epoch() -> Option<u64> {
-    let path = ThreatDb::default_path()?;
-    let meta = std::fs::metadata(&path).ok()?;
+fn path_mtime_epoch(path: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
     meta.modified()
         .ok()?
         .duration_since(std::time::UNIX_EPOCH)
@@ -1143,19 +1187,29 @@ fn file_mtime_epoch() -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
-fn combined_mtime_epoch() -> Option<u64> {
-    let primary = file_mtime_epoch();
-    let supplemental = ThreatDb::supplemental_path()
-        .and_then(|path| std::fs::metadata(path).ok())
-        .and_then(|meta| meta.modified().ok())
-        .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
+fn current_cache_source() -> Option<CacheSource> {
+    let primary_path = ThreatDb::default_path()?;
+    let primary_mtime = path_mtime_epoch(&primary_path)?;
+    let supplemental_path = ThreatDb::supplemental_path().filter(|path| path.exists());
+    let supplemental_mtime = supplemental_path
+        .as_ref()
+        .and_then(|path| path_mtime_epoch(path))
         .unwrap_or(0);
 
-    // A supplemental DB is never authoritative on its own, so we only expose a
-    // combined mtime when the primary signed DB exists.
-    primary
-        .map(|mtime| mtime.rotate_left(13) ^ supplemental.rotate_left(29) ^ 0x5448_5245_4154_4442)
+    Some(CacheSource {
+        primary_path,
+        supplemental_path,
+        combined_mtime: combined_mtime_from_parts(primary_mtime, supplemental_mtime),
+    })
+}
+
+fn combined_mtime_from_parts(primary_mtime: u64, supplemental_mtime: u64) -> u64 {
+    primary_mtime.rotate_left(13) ^ supplemental_mtime.rotate_left(29) ^ 0x5448_5245_4154_4442
+}
+
+#[cfg(test)]
+fn combined_mtime_epoch() -> Option<u64> {
+    current_cache_source().map(|source| source.combined_mtime)
 }
 
 /// Builder for creating threat DB files (used by the compiler binary to
@@ -1666,6 +1720,17 @@ mod tests {
 
         let bytes = writer.build(signing_key).expect("build failed");
         ThreatDb::from_bytes(bytes, 0).expect("load failed")
+    }
+
+    fn signed_fixture_db_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests")
+            .join("fixtures")
+            .join("test-threatdb.dat")
     }
 
     #[test]
@@ -2235,6 +2300,92 @@ mod tests {
             std::env::remove_var("TIRITH_THREATDB_PATH");
             std::env::remove_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
         }
+    }
+
+    #[test]
+    fn test_refresh_cache_reloads_when_only_supplemental_changes() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = signed_fixture_db_path();
+        let tmp = tempfile::tempdir().unwrap();
+        let supplemental = tmp.path().join("supplemental.dat");
+        let signing_key = SigningKey::generate(&mut OsRng);
+
+        unsafe {
+            std::env::set_var("TIRITH_THREATDB_PATH", &fixture);
+            std::env::remove_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
+        }
+        ThreatDb::refresh_cache();
+
+        let before = ThreatDb::cached().expect("fixture DB should load");
+        assert!(
+            before
+                .check_package(Ecosystem::PyPI, "overlay-pkg", Some("2.0.0"))
+                .is_none(),
+            "fixture DB should not include the test-only supplemental package"
+        );
+
+        let mut writer = ThreatDbWriter::new(1700000001, 1);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "overlay-pkg",
+            &["2.0.0"],
+            ThreatSource::DatadogMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer
+            .write_to(&supplemental, &signing_key)
+            .expect("write supplemental DB");
+
+        unsafe {
+            std::env::set_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH", &supplemental);
+        }
+        ThreatDb::refresh_cache();
+
+        let after = ThreatDb::cached().expect("fixture DB with supplemental should load");
+        assert!(
+            after
+                .check_package(Ecosystem::PyPI, "overlay-pkg", Some("2.0.0"))
+                .is_some(),
+            "refresh_cache should pick up supplemental changes even when the primary sequence is unchanged"
+        );
+
+        unsafe {
+            std::env::remove_var("TIRITH_THREATDB_PATH");
+            std::env::remove_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
+        }
+        ThreatDb::refresh_cache();
+    }
+
+    #[test]
+    fn test_refresh_cache_clears_when_current_source_disappears() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = signed_fixture_db_path();
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing-primary.dat");
+
+        unsafe {
+            std::env::set_var("TIRITH_THREATDB_PATH", &fixture);
+            std::env::remove_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
+        }
+        ThreatDb::refresh_cache();
+        assert!(ThreatDb::cached().is_some(), "fixture DB should load");
+
+        unsafe {
+            std::env::set_var("TIRITH_THREATDB_PATH", &missing);
+        }
+        ThreatDb::refresh_cache();
+        assert!(
+            ThreatDb::cached().is_none(),
+            "refresh_cache should clear the cached DB when the configured primary file disappears"
+        );
+
+        unsafe {
+            std::env::remove_var("TIRITH_THREATDB_PATH");
+            std::env::remove_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
+        }
+        ThreatDb::refresh_cache();
     }
 
     #[test]

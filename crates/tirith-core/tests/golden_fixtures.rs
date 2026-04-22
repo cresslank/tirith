@@ -314,6 +314,7 @@ fn test_threatintel_fixtures() {
     eprintln!("Passed {count} threatintel fixtures");
 
     std::env::remove_var("TIRITH_THREATDB_PATH");
+    tirith_core::threatdb::ThreatDb::refresh_cache();
 }
 
 /// Verify total fixture count across all files.
