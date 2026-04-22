@@ -189,4 +189,6 @@ main() {
   info "  rm ${INSTALL_DIR}/tirith"
 }
 
-main
+if [ "${TIRITH_INSTALL_SH_LIB:-0}" != "1" ]; then
+  main "$@"
+fi

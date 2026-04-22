@@ -84,3 +84,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-deny --locked
       - run: cargo deny check
+
+  install-script:
+    name: Install script (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: "Linux" }
+          - { os: macos-latest, name: "macOS" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax check
+        run: sh -n scripts/install.sh
+      - name: verify_sha256 regression tests
+        run: sh tests/install-sh/verify_sha256.sh
