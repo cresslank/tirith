@@ -10,7 +10,7 @@
 [![GitHub Stars](https://img.shields.io/github/stars/sheeki03/tirith?style=flat&logo=github)](https://github.com/sheeki03/tirith/stargazers)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE-AGPL)
 
-[Website](https://tirith.sh) | [Docs](https://tirith.sh/docs) | [Changelog](https://github.com/sheeki03/tirith/releases)
+[Website](https://tirith.sh) | [Docs](https://tirith.sh/docs) | [SKILL.md](SKILL.md) | [Changelog](https://github.com/sheeki03/tirith/releases)
 
 ---
 
@@ -25,7 +25,7 @@ You can't. Neither can your terminal. Both `і` characters are Cyrillic (U+0456)
 
 Browsers solved this years ago. Terminals still render Unicode, ANSI escapes, and invisible characters without question. AI agents run shell commands and install packages without inspecting what's inside.
 
-**Tirith stands at the gate.** It intercepts commands, pasted content, and scanned files for homograph URLs, obfuscated payloads, credential exfiltration, and malicious AI skills/configs before they execute.
+**Tirith stands at the gate.** It intercepts commands, pasted content, and scanned files for homograph URLs, obfuscated payloads, credential exfiltration, malicious AI skills/configs, and known-bad packages/domains/IPs from a signed threat intelligence database before they execute.
 
 ```bash
 brew install sheeki03/tap/tirith
@@ -43,6 +43,9 @@ eval "$(tirith init --shell bash)"
 # fish
 tirith init --shell fish | source
 ```
+
+> [!TIP]
+> `eval "$(tirith init)"` auto-detects your current shell (it inspects the parent process and falls back to `$SHELL` if needed). The explicit `--shell` flag is only required when you want to override the detection.
 
 That's it. Every command you run is now guarded. Zero friction on clean input. Sub-millisecond overhead. You forget it's there until it saves you.
 
@@ -141,7 +144,7 @@ Nothing. Zero output. You forget tirith is running.
 | **Data exfiltration** | `curl -d @/etc/passwd`, `curl -T ~/.ssh/id_rsa`, `wget --post-file`, env var uploads (`$AWS_SECRET_ACCESS_KEY`), command substitution exfil |
 | **Code file scanning** | Obfuscated payloads (`eval(atob(...))`), dynamic code execution (`exec(b64decode(...))`), secret exfiltration via `fetch`/`requests.post` in JS/Python files |
 | **Credential detection** | AWS keys, GitHub PATs, Stripe/Slack/SendGrid/Anthropic/GCP/npm tokens, private key blocks, plus entropy-based generic secret detection |
-| **Post-compromise behavior** | Process memory scraping (`/proc/*/mem`), Docker remote privilege escalation, credential file sweeps — inspired by the TeamPCP attack |
+| **Post-compromise behavior** | Process memory scraping (`/proc/*/mem`), Docker remote privilege escalation, credential file sweeps — calibrated against TeamPCP and UNC1069 post-compromise tooling |
 | **Command safety** | Dotfile overwrites, archive extraction to sensitive paths, cloud metadata endpoint access, private network access |
 | **Insecure transport** | Plain HTTP piped to shell, `curl -k`, disabled TLS verification, shortened URLs hiding destinations |
 | **Environment** | Proxy hijacking, sensitive env exports, code injection via env, interpreter hijack, shell injection env |
@@ -150,6 +153,52 @@ Nothing. Zero output. You forget tirith is running.
 | **Path analysis** | Non-ASCII paths, homoglyphs in paths, double-encoding |
 | **Rendered content** | Hidden CSS/color content, hidden HTML attributes, comment content analysis (prompt injection at High, destructive commands at Medium) |
 | **Cloaking detection** | Server-side cloaking (bot vs browser), clipboard hidden content, PDF hidden text |
+
+---
+
+## Threat intelligence
+
+Tirith ships a signed local threat database for package, hostname, and IP reputation. When a shell hook or `tirith check` sees a package install or suspicious infrastructure reference, it matches that input against the database before the command executes, instead of relying only on static heuristics.
+
+**Signed DB** (built daily by CI, verified on download and load):
+
+- Known-malicious packages from [OpenSSF Malicious Packages](https://github.com/ossf/malicious-packages) and [Datadog Security Labs](https://github.com/DataDog/malicious-software-packages-dataset)
+- Malicious IP infrastructure from [Feodo Tracker](https://feodotracker.abuse.ch/) (abuse.ch)
+- Confirmed typosquats and popular-package baselines from [ecosyste.ms](https://ecosyste.ms/)
+- [CISA Known Exploited Vulnerabilities](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) catalog for runtime advisory correlation
+
+**Optional supplemental feeds** (user-local overlay):
+
+- [URLhaus](https://urlhaus.abuse.ch/) and [ThreatFox](https://threatfox.abuse.ch/) via an abuse.ch auth key
+- [PhishTank](https://phishtank.org/) (Cisco Talos) and [Phishing Army](https://phishing.army/) blocklists
+- Tor exit node list from [Tor Project](https://www.torproject.org/)
+
+**Optional live enrichment** during `tirith check` and daemon mode:
+
+- [OSV.dev](https://osv.dev/) advisory lookups (Google OSS)
+- [deps.dev](https://deps.dev/) package health signals (Google OSS) and [ecosyste.ms](https://ecosyste.ms/) maintainer data
+- [Google Safe Browsing](https://safebrowsing.google.com/) URL reputation with your own API key
+
+```bash
+tirith threat-db update           # download + verify the signed DB
+tirith threat-db status           # age, signature, version, entry counts
+```
+
+By default, shell hooks and `tirith check` trigger a cheap background refresh check every 24 hours. Daemon mode keeps the same enrichment path warm in the background.
+
+This helps catch known-malicious packages, confirmed typosquats, slopsquatted package names, malicious download infrastructure, and packages with live OSV / CISA KEV advisory data.
+
+**Attack families tirith is built for** (illustrative, not a caught-by-current-code claim):
+
+| Incident | Year | Attack shape |
+|---|---|---|
+| [Shai-Hulud npm worm](https://socket.dev/blog/shai-hulud-worm) | 2025 | Self-propagating package malware; exfiltrated GitHub tokens and AWS keys from 180+ packages, published findings to public `Shai-Hulud` repos |
+| [Slopsquatting](https://socket.dev/blog/slopsquatting-how-ai-hallucinations-are-fueling-a-new-class-of-supply-chain-attacks) | 2023–ongoing | Attackers register LLM-hallucinated package names on npm / PyPI / crates.io; [USENIX 2025](https://www.usenix.org/system/files/conference/usenixsecurity25/sec25cycle1-prepub-742-spracklen.pdf) found 58% of hallucinated names repeat across runs |
+| Team PCP / UNC1069 tooling | ongoing | Post-compromise credential sweeps, `/proc/*/mem` scraping, Docker privilege escalation |
+| [colors.js / faker.js sabotage](https://snyk.io/blog/open-source-npm-packages-colors-faker/) | 2022 | Author self-sabotage of widely-used packages |
+| [event-stream compromise](https://github.com/dominictarr/event-stream/issues/116) | 2018 | Transferred ownership to attacker; payload targeted Bitcoin wallets |
+
+Package-name extraction currently covers language ecosystems (pip, npm/yarn/pnpm/bun, cargo, gem, go, composer, dotnet, mvn/gradle), not distro-level package managers (`apt` / `dnf` / `yum` / `pacman`). That's why xz-utils, which entered through Linux distro tarballs, is not in the table despite being a headline incident.
 
 ---
 
@@ -325,6 +374,9 @@ tirith init --shell fish | source   # in ~/.config/fish/config.fish
 
 Bash uses enter mode by default with automatic fallback to preexec on failure. See [troubleshooting](docs/troubleshooting.md#unexpected-tirith-exit-codes) for details on error handling and SSH fallback behavior.
 
+> [!WARNING]
+> Bash's default preexec mode warns but cannot block in-place. Set `TIRITH_BASH_PREEXEC_ENFORCE=1` for real blocking via `shopt -s extdebug`. Enforcement refuses to activate when `HISTCONTROL` contains `ignorespace` / `ignoredups` / `ignoreboth`, any `HISTIGNORE` is set, or `set +o history` is active — those make the block racy.
+
 #### Enforcement by shell
 
 | Shell | Behavior |
@@ -408,6 +460,9 @@ tirith daemon start       # tirith check auto-delegates when running
 tirith daemon stop
 ```
 
+> [!NOTE]
+> Daemon mode is Unix-only today.
+
 ---
 
 ## Commands
@@ -417,6 +472,8 @@ tirith daemon stop
 | `tirith check -- <cmd>` | Analyze a command without executing it |
 | `tirith paste` | Check pasted content (called automatically by shell hooks) |
 | `tirith scan [path]` | Scan files/directories with `--include`, `--exclude`, `--profile`, `--format sarif`, `--ci` |
+| `tirith threat-db update` | Download, verify, and install the signed threat database |
+| `tirith threat-db status` | Show DB age, signature status, version, and entry counts |
 | `tirith explain --rule <id>` | Show documentation, examples, and remediation for any detection rule |
 | `tirith policy init` | Generate a starter `.tirith/policy.yaml` in your repo |
 | `tirith policy validate` | Validate policy YAML for syntax, schema, and conflicts |
@@ -545,6 +602,9 @@ tirith: proceed with 1 warning(s)? [y/N]
 
 Shell hooks use exit code 3 for the warn-ack protocol. Old hooks that don't know about exit code 3 fall through to fail-open behavior.
 
+> [!NOTE]
+> Exit code 3 is the warn-ack hook protocol path, not the normal direct-CLI contract. Non-hook callers should not normally see exit code 3; if they do, it indicates acknowledgement is required.
+
 ### Bypass
 
 For the rare case you know exactly what you're doing:
@@ -554,6 +614,9 @@ TIRITH=0 curl -L https://something.xyz | bash
 ```
 
 This is a standard shell per-command prefix — the variable only exists for that single command and does not persist in your session. Organizations can disable this entirely: `allow_bypass_env: false` in policy.
+
+> [!CAUTION]
+> `TIRITH=0` is per-command. Do not export it in shell profiles, dotfiles, or CI config — a permanent bypass defeats the entire protection model. If you find yourself reaching for it often, add the trusted source to `allowlist` in your policy file instead.
 
 ---
 
