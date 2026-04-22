@@ -5,6 +5,130 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-04-21
+
+### Added
+
+- **Bash preexec enforcement (opt-in)** — set `TIRITH_BASH_PREEXEC_ENFORCE=1` to get real blocking in bash preexec mode via `shopt -s extdebug` plus `return 1` from the `DEBUG` trap. Whole-line fail-closed semantics; one block verdict skips the entire typed line. Install-time hostile-history check refuses to engage in shells where `HISTCONTROL` contains `ignorespace`/`ignoredups`/`ignoreboth`, any `HISTIGNORE` is set, or history is disabled. Runtime drift detection with cache-then-degrade downgrades the session to warn-only rather than claim protection it cannot deliver. Idempotent `DEBUG` trap trampoline chains through any pre-existing user `DEBUG` trap. Closes the "tirith says BLOCKED but the command executes" gap in #77.
+- **`tirith doctor` live state** — bash hook now exports `TIRITH_BASH_EFFECTIVE_MODE` and `TIRITH_BASH_EFFECTIVE_PROTECTION` (interactive shells only) so `doctor`, a child process, can read the parent shell's live state. Doctor splits requested-vs-effective onto separate lines so mid-session degrades are legible.
+- **First-use preexec banner** — on the first command it intercepts, bash preexec prints a one-line reminder that warn-only mode does not block, with a pointer at enter mode.
+- **Threat intelligence database** (Phases A/B/C) — `tirith threatdb` subcommand, threat DB compiler binary with CI workflow, signed cache format, detection rules keyed on known-bad hostnames/IPs/packages/typosquats, supplemental feed overlay with Phase B feed parsers and rule mapping, Phase C runtime API enrichment wired into `check` and daemon paths, auto-update and staleness reporting in `doctor`.
+- **Per-session warning accumulator** with a new `tirith warnings` CLI command and shell exit summaries across all hooks.
+- **Escalation engine** with cooldown and post-process verdicts, integrated into the engine, audit log, MCP gateway, check, and daemon paths.
+- **Strict warn mode** with a new `WarnAck` exit code 3.
+- **Daemon mode** with network-aware URL checks; Windows parity for network and setup features.
+- **`tirith policy init`, `validate`, `test`** subcommands; **`tirith explain --rule`** for rule documentation.
+- **`tirith doctor --fix`** for progressive remediation, plus `--reset-bash-safe-mode` flag.
+- **`tirith setup`** gains `copilot-cli` (#74) and `kiro` (#75); scanner recognises `.kiro/`, `.amazonq/cli-agents/`, and `.github/hooks/` as config paths.
+- **`--include`, `--exclude`, `--profile`** scan filters.
+- **GitHub Action, pre-commit hook, and SARIF enrichment** for CI integration.
+- **Text confusable detection** (math alphanumerics, same-word mixed-script) plus expanded terminal/config rules.
+- **Detection gap analysis** surfaced in `tirith doctor`.
+- **Warn-only rendering** for preexec mode (#77) — preexec verdicts now render "DETECTED (shell hook cannot block in preexec mode...)" instead of the misleading "BLOCKED" banner.
+- `SKILL.md` for AI agent discovery.
+- CLI UX: error suggestions, color module, `confirm` helper, normalised output flags, help examples on every subcommand.
+- Tokenizer span tracking (trimmed byte range per segment) to support tighter carveouts without string scanning.
+- `aarch64-unknown-linux-musl` target in the release pipeline.
+
+### Fixed
+
+- Restore `TIRITH=0` pipe bypass without weakening paste safety (#78).
+- Scp/rsync remote-spec parser replaced so `host:/path` no longer trips URL-host false positives (#26).
+- Carve out tirith inspection args so the scanner doesn't match its own prompt text (#29).
+- Wrapped commands (`sudo`, `env`, `doas`, `command`, `time`, `nohup` prefixes) now resolve through `resolve_wrapped_command` in the `network_deny` path so prefix chains cannot bypass policy.
+- `codefile` byte slicing clamps to UTF-8 char boundaries to avoid a panic on non-ASCII code (#76).
+- Approval and warn-ack temp files are cleaned up on all paths to stop `/tmp` leaks (#80).
+- Close mid-session `HISTCONTROL` bypass; preexec cache key corrected so drift-triggering pipelines do not leak composite rules.
+- Warn-only dedupe scoped to a single typed line so long pipelines no longer suppress later DETECTED banners.
+- Windows CI: Finding import, daemon/setup module compilation, XDG audit spool test gated to Unix, Gemini path assertion gated to Unix.
+- Platform-specific snapshot tests replaced with cross-platform assertions.
+- Early signing-key check in the threat DB workflow.
+- Linux bash preexec tests made deterministic; CI caps hung test job runtime.
+
+### Changed
+
+- Stacked CI runs on the same ref are now cancelled; `fuzz/target` and `Cargo.lock` ignored in CI path filters.
+- Documentation across README and `docs/troubleshooting.md` updated for the new enforcement matrix, threat-intel features, escalation, hidden findings, `--format` flag canonicalisation, and new MCP client setup guides (Gemini CLI, OpenClaw, Pi CLI).
+
+## [0.2.12] - 2026-04-01
+
+### Fixed
+
+- Always-on pro runtime and shell-hook regression fixes.
+- Windows CI test failures.
+- Release publish workflow hardened.
+- Crates.io re-publish idempotency check + HTTP status-code wait step.
+- User-Agent header added to the crates.io API poll.
+
+### Changed
+
+- Docker image uses pre-built release binaries instead of compiling inside the container.
+
+## [0.2.11] - 2026-03-31
+
+### Added
+
+- `Base64DecodeExecute`, `DataExfiltration`, and code-file scan rules for JS/Python files (obfuscated payloads, dynamic code execution, secret exfiltration via `fetch`/`requests.post`).
+- HTML and Markdown comment content analysis with severity tiers (High for prompt injection, Medium for destructive commands).
+
+### Fixed
+
+- Send-position-only contract enforced for `SuspiciousCodeExfiltration`.
+- Fish block-hides-prompt regression (#31).
+- Zsh hook crash when `noclobber` is enabled (#70).
+- Postfix `++`/`--` vs division disambiguation in the codefile exfil parser.
+- Hardcoded user path removed from the Cursor MCP config template.
+
+## [0.2.10] - 2026-03-25
+
+### Added
+
+- TeamPCP post-compromise behavior detection rules (`/proc/*/mem` scraping, Docker remote privilege escalation, credential-file sweeps) and domain corpus fix.
+- Credential leak detection: known-pattern tokens (AWS, GitHub, Stripe, Slack, SendGrid, Anthropic, GCP, npm, private-key blocks) plus entropy-based generic secret detection.
+
+## [0.2.9] - 2026-03-24
+
+### Fixed
+
+- SSRF bypass closed.
+- `allowlist_rules` policy field now enforced.
+- Webhook env-var hardening.
+
+## [0.2.8] - 2026-03-21
+
+### Added
+
+- SSRF protection on cloaking fetch with DNS resolution checks.
+
+### Fixed
+
+- Cmd caret escapes inside double quotes; env values now redacted in findings.
+- Inline `TIRITH=0` paste bypass removed; blocked content previews escape control characters.
+- Guarded JSON-RPC notifications are analysed rather than forwarded blindly.
+- Inline bypass parsing hardened; self-invocation guard removed.
+- URL extraction from env-prefix assignments (`FOO=bar cmd url`); MCP scan file count capped.
+- Secrets redacted in JSON output; shell metacharacters quoted in `init` output.
+- Windows CI stability; `rustls-webpki` bumped for RUSTSEC-2026-0049 (0.101.x line ignored until upstream patches land).
+- Windows `data_dir` uses `APPDATA`.
+- `clippy::type_complexity` cleanup via `HostResolver` type alias.
+
+## [0.2.7] - 2026-03-12
+
+### Fixed
+
+- VS Code / Cursor shell-env resolution: skip the `.zshenv` guard when the shell is resolving its env for IDE integration.
+
+### Changed
+
+- README lists `openclaw` under the setup commands.
+
+## [0.2.6] - 2026-03-09
+
+### Added
+
+- Cmd (Windows cmd.exe) shell tokenizer.
+- `tirith setup openclaw` command.
+
 ## [0.2.5]
 
 ### Added

@@ -122,6 +122,7 @@ pub mod setup;
 #[cfg(test)]
 pub(crate) mod test_harness;
 
+#[cfg(any(test, windows))]
 fn trim_wrapping_quotes(value: &str) -> &str {
     let bytes = value.as_bytes();
     if bytes.len() >= 2
@@ -134,6 +135,7 @@ fn trim_wrapping_quotes(value: &str) -> &str {
     }
 }
 
+#[cfg(any(test, windows))]
 fn parse_shim_target(contents: &str) -> Option<std::path::PathBuf> {
     contents.lines().find_map(|line| {
         let (key, value) = line.split_once('=')?;
@@ -148,6 +150,7 @@ fn parse_shim_target(contents: &str) -> Option<std::path::PathBuf> {
     })
 }
 
+#[cfg(any(test, windows))]
 fn resolve_shim_target(path: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut sidecar = path.to_path_buf();
     sidecar.set_extension("shim");
