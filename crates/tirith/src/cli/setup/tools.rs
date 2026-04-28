@@ -10,6 +10,18 @@ use super::run_impl::{copy_gateway_config, Scope, SetupOpts};
 use super::zshenv;
 use serde_json::json;
 
+#[cfg(unix)]
+fn offer_zshenv_guard_for_opts(opts: &SetupOpts) -> Result<(), String> {
+    let zshenv_tirith_bin =
+        super::run_impl::resolve_tirith_bin_for_zshenv(&opts.tirith_bin, opts.dry_run)?;
+    zshenv::offer_zshenv_guard(
+        opts.install_zshenv,
+        opts.force,
+        opts.dry_run,
+        &zshenv_tirith_bin,
+    )
+}
+
 pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
     let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
     let target = match opts.scope {
@@ -218,12 +230,7 @@ pub fn setup_codex(opts: &SetupOpts) -> Result<(), String> {
     }
 
     #[cfg(unix)]
-    zshenv::offer_zshenv_guard(
-        opts.install_zshenv,
-        opts.force,
-        opts.dry_run,
-        &opts.tirith_bin,
-    )?;
+    offer_zshenv_guard_for_opts(opts)?;
 
     eprintln!();
     eprintln!("tirith: Codex setup complete");
@@ -312,12 +319,7 @@ pub fn setup_cursor(opts: &SetupOpts) -> Result<(), String> {
     }
 
     #[cfg(unix)]
-    zshenv::offer_zshenv_guard(
-        opts.install_zshenv,
-        opts.force,
-        opts.dry_run,
-        &opts.tirith_bin,
-    )?;
+    offer_zshenv_guard_for_opts(opts)?;
 
     eprintln!();
     eprintln!("tirith: Cursor setup complete");
@@ -383,12 +385,7 @@ pub fn setup_vscode(opts: &SetupOpts) -> Result<(), String> {
     }
 
     #[cfg(unix)]
-    zshenv::offer_zshenv_guard(
-        opts.install_zshenv,
-        opts.force,
-        opts.dry_run,
-        &opts.tirith_bin,
-    )?;
+    offer_zshenv_guard_for_opts(opts)?;
 
     eprintln!();
     eprintln!("tirith: VS Code setup complete");
@@ -649,12 +646,7 @@ pub fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
     }
 
     #[cfg(unix)]
-    zshenv::offer_zshenv_guard(
-        opts.install_zshenv,
-        opts.force,
-        opts.dry_run,
-        &opts.tirith_bin,
-    )?;
+    offer_zshenv_guard_for_opts(opts)?;
 
     eprintln!();
     eprintln!("tirith: Windsurf setup complete");

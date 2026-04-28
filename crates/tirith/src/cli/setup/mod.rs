@@ -23,6 +23,8 @@ pub use self::run_impl::run;
 mod run_impl {
     use super::fs_helpers;
     use etcetera::BaseStrategy;
+    #[cfg(unix)]
+    use std::path::Path;
     use std::path::PathBuf;
 
     /// All tools recognized by `tirith setup`.
@@ -254,6 +256,109 @@ mod run_impl {
         }
     }
 
+    /// Resolve a tirith path suitable for ~/.zshenv.
+    ///
+    /// Unlike interactive shell profiles and MCP configs, `.zshenv` runs before
+    /// normal PATH setup. Prefer a stable executable path so non-interactive
+    /// `zsh -lc ...` checks do not depend on `.zprofile` or `.zshrc`.
+    #[cfg(unix)]
+    pub(super) fn resolve_tirith_bin_for_zshenv(
+        tirith_bin: &str,
+        dry_run: bool,
+    ) -> Result<String, String> {
+        choose_zshenv_tirith_bin(
+            find_executable_on_path("tirith"),
+            current_tirith_exe(),
+            tirith_bin,
+            dry_run,
+        )
+    }
+
+    #[cfg(unix)]
+    fn choose_zshenv_tirith_bin(
+        path_candidate: Option<PathBuf>,
+        current_exe: Option<PathBuf>,
+        tirith_bin: &str,
+        dry_run: bool,
+    ) -> Result<String, String> {
+        if let Some(path) = path_candidate {
+            if is_script_wrapper(&path) {
+                if let Some(exe) = current_exe {
+                    return Ok(exe.display().to_string());
+                }
+            }
+            return Ok(path.display().to_string());
+        }
+
+        if let Some(exe) = current_exe {
+            return Ok(exe.display().to_string());
+        }
+
+        if Path::new(tirith_bin).is_absolute() {
+            return Ok(tirith_bin.to_string());
+        }
+
+        if dry_run {
+            eprintln!(
+                "tirith: WARNING: tirith not found — previewing zshenv guard with portable name 'tirith' (actual setup would fail)"
+            );
+            Ok("tirith".into())
+        } else {
+            Err(
+                "tirith binary not found — ensure tirith is installed and on PATH before installing zshenv guard"
+                    .into(),
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    fn current_tirith_exe() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        if exe.file_name()? == "tirith" {
+            Some(exe)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(unix)]
+    fn find_executable_on_path(name: &str) -> Option<PathBuf> {
+        let path_var = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(name);
+            if is_executable_file(&candidate) {
+                if candidate.is_absolute() {
+                    return Some(candidate);
+                }
+                if let Ok(abs) = candidate.canonicalize() {
+                    return Some(abs);
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(unix)]
+    fn is_executable_file(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return false;
+        };
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(unix)]
+    fn is_script_wrapper(path: &Path) -> bool {
+        use std::io::Read;
+
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return false;
+        };
+        let mut bytes = [0u8; 2];
+        file.read_exact(&mut bytes).is_ok() && bytes == *b"#!"
+    }
+
     /// Check that a binary is available on PATH.
     /// In dry-run mode, warn but don't fail.
     fn check_binary_on_path(name: &str, dry_run: bool) -> Result<(), String> {
@@ -386,6 +491,19 @@ mod run_impl {
     mod tests {
         use super::*;
 
+        #[cfg(unix)]
+        fn write_executable(path: &Path, content: &str) {
+            use std::os::unix::fs::PermissionsExt;
+
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, content).unwrap();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+
         #[test]
         fn resolve_scope_rejects_user_for_copilot_cli() {
             let result = resolve_scope("copilot-cli", Some("user"));
@@ -414,6 +532,52 @@ mod run_impl {
                 Scope::Project
             );
             assert_eq!(resolve_scope("kiro", Some("user")).unwrap(), Scope::User);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn zshenv_resolver_prefers_executable_path_over_portable_name() {
+            let dir = tempfile::tempdir().unwrap();
+            let tirith = dir.path().join("tirith");
+            write_executable(&tirith, "");
+
+            let resolved =
+                choose_zshenv_tirith_bin(Some(tirith.clone()), None, "tirith", false).unwrap();
+
+            assert_eq!(resolved, tirith.display().to_string());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn zshenv_resolver_uses_current_exe_when_path_entry_is_script_wrapper() {
+            let dir = tempfile::tempdir().unwrap();
+            let wrapper = dir.path().join("tirith");
+            let native = dir.path().join("native").join("tirith");
+            write_executable(&wrapper, "#!/usr/bin/env node\n");
+            write_executable(&native, "");
+
+            let resolved =
+                choose_zshenv_tirith_bin(Some(wrapper), Some(native.clone()), "tirith", false)
+                    .unwrap();
+
+            assert_eq!(resolved, native.display().to_string());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn zshenv_resolver_keeps_absolute_fallback() {
+            let resolved =
+                choose_zshenv_tirith_bin(None, None, "/opt/custom/bin/tirith", false).unwrap();
+
+            assert_eq!(resolved, "/opt/custom/bin/tirith");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn zshenv_resolver_allows_portable_name_in_dry_run() {
+            let resolved = choose_zshenv_tirith_bin(None, None, "tirith", true).unwrap();
+
+            assert_eq!(resolved, "tirith");
         }
     }
 }

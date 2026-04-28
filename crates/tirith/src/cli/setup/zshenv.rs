@@ -17,7 +17,8 @@ pub fn offer_zshenv_guard(
     dry_run: bool,
     tirith_bin: &str,
 ) -> Result<(), String> {
-    let guard_content = crate::assets::ZSHENV_GUARD.replace("__TIRITH_BIN__", tirith_bin);
+    let quoted_tirith_bin = super::shell_profile::shell_quote(tirith_bin, "zsh");
+    let guard_content = crate::assets::ZSHENV_GUARD.replace("__TIRITH_BIN__", &quoted_tirith_bin);
     let managed_block = format!("{BEGIN_MARKER}\n{guard_content}\n{END_MARKER}\n");
 
     if !install {
@@ -313,6 +314,15 @@ mod tests {
         use super::*;
         use crate::cli::test_harness::with_fake_env;
 
+        fn write_executable(path: &std::path::Path, content: &str) {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::write(path, content).unwrap();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+
         fn zsh_available() -> bool {
             std::process::Command::new("zsh")
                 .arg("--version")
@@ -466,6 +476,20 @@ mod tests {
             });
         }
 
+        #[test]
+        fn tirith_bin_placeholder_is_quoted_for_zsh() {
+            if !zsh_available() {
+                return;
+            }
+            with_fake_home(|home| {
+                offer_zshenv_guard(true, false, false, "/opt/it's tirith/bin/tirith").unwrap();
+                let content = std::fs::read_to_string(home.join(".zshenv")).unwrap();
+
+                assert!(content.contains("_tirith_bin='/opt/it'\\''s tirith/bin/tirith'"));
+                assert!(!content.contains("__TIRITH_BIN__"));
+            });
+        }
+
         /// Helper: write a .zshenv with the guard plus a trailing export,
         /// then run `zsh -c 'echo $POST_GUARD'` with the given extra env
         /// vars. Returns (stdout, exit_code).
@@ -495,6 +519,7 @@ mod tests {
                 .env("ZDOTDIR", home)
                 .env("HOME", home)
                 .envs(extra_env.iter().copied())
+                .env_remove("TIRITH_BIN")
                 .output()
                 .expect("failed to spawn zsh");
 
@@ -550,6 +575,27 @@ mod tests {
                 // tirith_bin is nonexistent → guard hits "not found" → exit 1.
                 let (_stdout, code) = run_guard_scenario(home, "/nonexistent/tirith", &[]);
                 assert_eq!(code, 1, "guard should exit 1 when tirith binary not found");
+            });
+        }
+
+        #[test]
+        fn guard_uses_baked_absolute_tirith_when_path_lacks_it() {
+            if !zsh_available() {
+                return;
+            }
+            with_fake_home(|home| {
+                let dir = tempfile::tempdir().unwrap();
+                let tirith = dir.path().join("tirith");
+                write_executable(&tirith, "#!/bin/sh\nexit 0\n");
+
+                let (stdout, code) = run_guard_scenario(
+                    home,
+                    &tirith.display().to_string(),
+                    &[("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")],
+                );
+
+                assert_eq!(code, 0, "absolute tirith path should not need PATH lookup");
+                assert_eq!(stdout, "POST_GUARD=loaded");
             });
         }
     }

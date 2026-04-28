@@ -10,8 +10,11 @@ if [[ -n "${ZSH_EXECUTION_STRING:-}" \
    && "${TIRITH_ZSHENV_SKIP:-}" != "1" \
    && -z "${VSCODE_RESOLVING_ENVIRONMENT:-}" ]]; then
 
-  # __TIRITH_BIN__ is replaced at setup time by resolve_tirith_bin()
-  _tirith_bin="${TIRITH_BIN:-__TIRITH_BIN__}"
+  # __TIRITH_BIN__ is replaced at setup time by zshenv-specific path resolution.
+  _tirith_bin="${TIRITH_BIN:-}"
+  if [[ -z "$_tirith_bin" ]]; then
+    _tirith_bin=__TIRITH_BIN__
+  fi
 
   if [[ ! -x "$(command -v "$_tirith_bin" 2>/dev/null)" ]]; then
     echo "tirith: $_tirith_bin not found — command blocked for safety" >&2
