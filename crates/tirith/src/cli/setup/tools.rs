@@ -8,7 +8,25 @@ use super::merge;
 use super::run_impl::{copy_gateway_config, Scope, SetupOpts};
 #[cfg(unix)]
 use super::zshenv;
-use serde_json::json;
+use serde_json::{json, Value};
+
+fn codex_mcp_get_reports_missing(stderr: &str) -> bool {
+    let stderr = stderr.to_lowercase();
+    stderr.contains("not found")
+        || stderr.contains("does not exist")
+        || stderr.contains("no mcp server named")
+}
+
+fn codex_mcp_config_matches(value: &Value, expected_command: &str, expected_args: &[&str]) -> bool {
+    let config = value.get("transport").unwrap_or(value);
+    let command = config.get("command").and_then(Value::as_str);
+    let args: Option<Vec<&str>> = config
+        .get("args")
+        .and_then(Value::as_array)
+        .and_then(|values| values.iter().map(Value::as_str).collect());
+
+    command == Some(expected_command) && args.as_deref() == Some(expected_args)
+}
 
 pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
     let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
@@ -134,13 +152,13 @@ pub fn setup_codex(opts: &SetupOpts) -> Result<(), String> {
         let exists = if get_out.status.success() {
             true
         } else {
-            let stderr = String::from_utf8_lossy(&get_out.stderr).to_lowercase();
-            if stderr.contains("not found") || stderr.contains("does not exist") {
+            let stderr = String::from_utf8_lossy(&get_out.stderr);
+            if codex_mcp_get_reports_missing(&stderr) {
                 false
             } else {
                 return Err(format!(
                     "codex mcp get failed unexpectedly: {}",
-                    String::from_utf8_lossy(&get_out.stderr).trim()
+                    stderr.trim()
                 ));
             }
         };
@@ -163,17 +181,11 @@ pub fn setup_codex(opts: &SetupOpts) -> Result<(), String> {
             let config_matches = match json_out {
                 Ok(ref out) if out.status.success() => {
                     match serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                        Ok(val) => {
-                            let cmd = val.get("command").and_then(|v| v.as_str());
-                            let args: Option<Vec<&str>> = val
-                                .get("args")
-                                .and_then(|v| v.as_array())
-                                .map(|a| a.iter().filter_map(|v| v.as_str()).collect());
-                            Some(
-                                cmd == Some(tirith_bin)
-                                    && args.as_deref() == Some(expected_args.as_slice()),
-                            )
-                        }
+                        Ok(val) => Some(codex_mcp_config_matches(
+                            &val,
+                            tirith_bin,
+                            expected_args.as_slice(),
+                        )),
                         Err(_) => None,
                     }
                 }
@@ -879,6 +891,171 @@ fn write_owned_json(
 mod tests {
     use super::*;
     use crate::cli::test_harness::{with_fake_env, EnvGuard};
+
+    #[test]
+    fn codex_mcp_get_reports_missing_accepts_known_cli_messages() {
+        assert!(codex_mcp_get_reports_missing(
+            "Error: No MCP server named 'tirith-gateway' found."
+        ));
+        assert!(codex_mcp_get_reports_missing(
+            "error: MCP server tirith-gateway not found"
+        ));
+        assert!(codex_mcp_get_reports_missing(
+            "tirith-gateway does not exist"
+        ));
+    }
+
+    #[test]
+    fn codex_mcp_config_matches_current_transport_shape() {
+        let value = json!({
+            "name": "tirith-gateway",
+            "transport": {
+                "type": "stdio",
+                "command": "tirith",
+                "args": [
+                    "gateway",
+                    "run",
+                    "--upstream-bin",
+                    "tirith",
+                    "--upstream-arg",
+                    "mcp-server",
+                    "--config",
+                    "/Users/example/.config/tirith/gateway.yaml"
+                ]
+            }
+        });
+        let expected_args = [
+            "gateway",
+            "run",
+            "--upstream-bin",
+            "tirith",
+            "--upstream-arg",
+            "mcp-server",
+            "--config",
+            "/Users/example/.config/tirith/gateway.yaml",
+        ];
+
+        assert!(codex_mcp_config_matches(&value, "tirith", &expected_args));
+    }
+
+    #[test]
+    fn codex_mcp_config_matches_legacy_top_level_shape() {
+        let value = json!({
+            "command": "tirith",
+            "args": ["gateway", "run"]
+        });
+        let expected_args = ["gateway", "run"];
+
+        assert!(codex_mcp_config_matches(&value, "tirith", &expected_args));
+    }
+
+    #[test]
+    fn codex_mcp_config_rejects_drift() {
+        let value = json!({
+            "name": "tirith-gateway",
+            "transport": {
+                "type": "stdio",
+                "command": "tirith",
+                "args": ["gateway", "run", "--config", "/old/path.yaml"]
+            }
+        });
+        let expected_args = ["gateway", "run", "--config", "/new/path.yaml"];
+
+        assert!(!codex_mcp_config_matches(&value, "tirith", &expected_args));
+    }
+
+    #[cfg(unix)]
+    fn write_fake_codex(bin_dir: &std::path::Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let codex = bin_dir.join("codex");
+        std::fs::write(&codex, script).unwrap();
+        let mut perms = std::fs::metadata(&codex).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&codex, perms).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_codex_registers_when_current_cli_reports_missing_server() {
+        with_fake_env(false, |home, _cwd| {
+            let bin_dir = tempfile::tempdir().unwrap();
+            let log_path = home.join("codex.log");
+            let _path = EnvGuard::set("PATH", bin_dir.path());
+            let _log = EnvGuard::set("CODEX_LOG", &log_path);
+            let _shell = EnvGuard::set("SHELL", std::path::Path::new("/bin/zsh"));
+
+            write_fake_codex(
+                bin_dir.path(),
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> "$CODEX_LOG"
+if [ "$1" = "mcp" ] && [ "$2" = "get" ] && [ "$3" = "tirith-gateway" ]; then
+  echo "Error: No MCP server named 'tirith-gateway' found." >&2
+  exit 1
+fi
+if [ "$1" = "mcp" ] && [ "$2" = "add" ]; then
+  exit 0
+fi
+echo "unexpected codex args: $*" >&2
+exit 64
+"#,
+            );
+
+            let mut opts = opts_for(Scope::User);
+            opts.tirith_bin = "/bin/tirith".to_string();
+
+            setup_codex(&opts).unwrap();
+
+            let log = std::fs::read_to_string(log_path).unwrap();
+            assert!(log.contains("mcp get tirith-gateway"));
+            assert!(
+                log.contains("mcp add tirith-gateway -- /bin/tirith gateway run"),
+                "setup should register after missing-server response; log: {log}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_codex_accepts_current_transport_json_as_up_to_date() {
+        with_fake_env(false, |home, _cwd| {
+            let bin_dir = tempfile::tempdir().unwrap();
+            let log_path = home.join("codex.log");
+            let _path = EnvGuard::set("PATH", bin_dir.path());
+            let _log = EnvGuard::set("CODEX_LOG", &log_path);
+            let _shell = EnvGuard::set("SHELL", std::path::Path::new("/bin/zsh"));
+
+            write_fake_codex(
+                bin_dir.path(),
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> "$CODEX_LOG"
+if [ "$1" = "mcp" ] && [ "$2" = "get" ] && [ "$3" = "tirith-gateway" ]; then
+  echo "tirith-gateway"
+  exit 0
+fi
+if [ "$1" = "mcp" ] && [ "$2" = "get" ] && [ "$3" = "--json" ] && [ "$4" = "tirith-gateway" ]; then
+  printf '%s%s%s\n' '{"name":"tirith-gateway","transport":{"type":"stdio","command":"/bin/tirith","args":["gateway","run","--upstream-bin","/bin/tirith","--upstream-arg","mcp-server","--config","' "$HOME" '/.config/tirith/gateway.yaml"]}}'
+  exit 0
+fi
+echo "unexpected codex args: $*" >&2
+exit 64
+"#,
+            );
+
+            let mut opts = opts_for(Scope::User);
+            opts.tirith_bin = "/bin/tirith".to_string();
+
+            setup_codex(&opts).unwrap();
+
+            let log = std::fs::read_to_string(log_path).unwrap();
+            assert!(log.contains("mcp get tirith-gateway"));
+            assert!(log.contains("mcp get --json tirith-gateway"));
+            assert!(
+                !log.contains("mcp add"),
+                "up-to-date transport config must not be re-registered; log: {log}"
+            );
+        });
+    }
 
     /// GEMINI_CLI_HOME env override: writes to $GEMINI_CLI_HOME/.gemini/...
     /// and uses scope_root=None (skips containment check), which allows the
