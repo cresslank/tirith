@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Daily threat-DB manifest direct-pushes to `main` instead of opening auto-merge PRs that silently no-op'd when no required checks were present, accumulating an unmerged backlog.
 - Scoop helper code moved under `#[cfg(windows)]` to silence a clippy warning surfaced by recent toolchain versions.
+- `_tirith_output` in the bash, fish, and zsh hooks now forwards all arguments instead of only `$1` / `$argv[1]`. No call site passes more than one argument today, but the previous form was a footgun for any future refactor that splits a multi-line message across positional arguments.
 
 ## [0.3.0] - 2026-04-21
 

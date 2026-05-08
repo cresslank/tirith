@@ -21,9 +21,9 @@ end
 # Override via TIRITH_OUTPUT=tty to write to /dev/tty instead.
 function _tirith_output
     if test "$TIRITH_OUTPUT" = "tty"
-        printf '%s\n' "$argv[1]" >/dev/tty
+        printf '%s\n' $argv >/dev/tty
     else
-        printf '%s\n' "$argv[1]" >&2
+        printf '%s\n' $argv >&2
     end
 end
 

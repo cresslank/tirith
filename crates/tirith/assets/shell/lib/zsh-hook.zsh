@@ -24,9 +24,9 @@ fi
 # Override via TIRITH_OUTPUT=tty to write to /dev/tty instead.
 _tirith_output() {
   if [[ "${TIRITH_OUTPUT:-}" == "tty" ]]; then
-    printf '%s\n' "$1" >/dev/tty
+    printf '%s\n' "$@" >/dev/tty
   else
-    printf '%s\n' "$1" >&2
+    printf '%s\n' "$@" >&2
   fi
 }
 
