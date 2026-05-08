@@ -23,6 +23,8 @@ pub use self::run_impl::run;
 mod run_impl {
     use super::fs_helpers;
     use etcetera::BaseStrategy;
+    #[cfg(unix)]
+    use std::path::Path;
     use std::path::PathBuf;
 
     /// All tools recognized by `tirith setup`.
@@ -254,6 +256,114 @@ mod run_impl {
         }
     }
 
+    /// Resolve a tirith path suitable for ~/.zshenv.
+    ///
+    /// Unlike interactive shell profiles and MCP configs, `.zshenv` runs before
+    /// normal PATH setup (`.zprofile`/`.zshrc` haven't run yet in a non-
+    /// interactive `zsh -lc ...`). Resolve a stable executable path so the
+    /// guard's `command -v` succeeds regardless of PATH state.
+    #[cfg(unix)]
+    pub(super) fn resolve_tirith_bin_for_zshenv(
+        tirith_bin: &str,
+        dry_run: bool,
+    ) -> Result<String, String> {
+        choose_zshenv_tirith_bin(
+            find_executable_on_path("tirith"),
+            current_tirith_exe(),
+            tirith_bin,
+            dry_run,
+        )
+    }
+
+    /// Pure-function core of [`resolve_tirith_bin_for_zshenv`]. Takes the two
+    /// candidate sources as inputs so it can be unit-tested without touching
+    /// process-global state.
+    #[cfg(unix)]
+    fn choose_zshenv_tirith_bin(
+        path_candidate: Option<PathBuf>,
+        current_exe: Option<PathBuf>,
+        tirith_bin: &str,
+        dry_run: bool,
+    ) -> Result<String, String> {
+        if let Some(path) = path_candidate {
+            // If the PATH entry is a `#!` wrapper (e.g. the npm JS launcher),
+            // prefer the running native binary, which is what the wrapper
+            // exec'd into. Same root-cause class as the npm shadow-detection
+            // bug that needed canonicalize-through-wrapper handling.
+            if is_script_wrapper(&path) {
+                if let Some(exe) = current_exe {
+                    return Ok(exe.display().to_string());
+                }
+            }
+            return Ok(path.display().to_string());
+        }
+        if let Some(exe) = current_exe {
+            return Ok(exe.display().to_string());
+        }
+        if Path::new(tirith_bin).is_absolute() {
+            return Ok(tirith_bin.to_string());
+        }
+        if dry_run {
+            eprintln!(
+                "tirith: WARNING: tirith not found — previewing zshenv guard with portable name 'tirith' (actual setup would fail)"
+            );
+            Ok("tirith".into())
+        } else {
+            Err("tirith binary not found — ensure tirith is installed and on PATH before installing zshenv guard".into())
+        }
+    }
+
+    #[cfg(unix)]
+    fn current_tirith_exe() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        if exe.file_name()? == "tirith" {
+            Some(exe)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(unix)]
+    fn find_executable_on_path(name: &str) -> Option<PathBuf> {
+        let path_var = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(name);
+            if !is_executable_file(&candidate) {
+                continue;
+            }
+            // Always canonicalize when found, so a symlink on PATH (e.g.
+            // /usr/local/bin/tirith → /usr/bin/tirith) resolves to its real
+            // path. Caller compares this against `current_exe()`; a symlink
+            // mismatch reproduces the npm-shadow class of equality bug.
+            return candidate.canonicalize().ok().or(Some(candidate));
+        }
+        None
+    }
+
+    #[cfg(unix)]
+    fn is_executable_file(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return false;
+        };
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(unix)]
+    fn is_script_wrapper(path: &Path) -> bool {
+        // `read` not `read_exact`: a 1-byte file is not a wrapper but
+        // read_exact errors on it. Same end behavior here since we check
+        // n == 2, but `read` is the precise primitive for "up to N bytes."
+        use std::io::Read;
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return false;
+        };
+        let mut bytes = [0u8; 2];
+        file.read(&mut bytes)
+            .map(|n| n == 2 && &bytes == b"#!")
+            .unwrap_or(false)
+    }
+
     /// Check that a binary is available on PATH.
     /// In dry-run mode, warn but don't fail.
     fn check_binary_on_path(name: &str, dry_run: bool) -> Result<(), String> {
@@ -385,6 +495,85 @@ mod run_impl {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[cfg(unix)]
+        fn write_executable(path: &Path, content: &str) {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, content).unwrap();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn zshenv_resolver_prefers_executable_path_over_portable_name() {
+            let dir = tempfile::tempdir().unwrap();
+            let tirith = dir.path().join("tirith");
+            write_executable(&tirith, "");
+            let resolved =
+                choose_zshenv_tirith_bin(Some(tirith.clone()), None, "tirith", false).unwrap();
+            assert_eq!(resolved, tirith.display().to_string());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn zshenv_resolver_uses_current_exe_when_path_entry_is_script_wrapper() {
+            let dir = tempfile::tempdir().unwrap();
+            let wrapper = dir.path().join("tirith");
+            let native = dir.path().join("native").join("tirith");
+            write_executable(&wrapper, "#!/usr/bin/env node\n");
+            write_executable(&native, "");
+            let resolved =
+                choose_zshenv_tirith_bin(Some(wrapper), Some(native.clone()), "tirith", false)
+                    .unwrap();
+            assert_eq!(resolved, native.display().to_string());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn zshenv_resolver_keeps_absolute_fallback() {
+            let resolved =
+                choose_zshenv_tirith_bin(None, None, "/opt/custom/bin/tirith", false).unwrap();
+            assert_eq!(resolved, "/opt/custom/bin/tirith");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn zshenv_resolver_allows_portable_name_in_dry_run() {
+            let resolved = choose_zshenv_tirith_bin(None, None, "tirith", true).unwrap();
+            assert_eq!(resolved, "tirith");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn find_executable_on_path_canonicalizes_symlink() {
+            use crate::cli::test_harness::{with_fake_env, EnvGuard};
+            use std::os::unix;
+            with_fake_env(false, |_home, _cwd| {
+                let target_dir = tempfile::tempdir().unwrap();
+                let link_dir = tempfile::tempdir().unwrap();
+                let real_tirith = target_dir.path().join("tirith");
+                write_executable(&real_tirith, "");
+
+                let symlink_tirith = link_dir.path().join("tirith");
+                unix::fs::symlink(&real_tirith, &symlink_tirith).unwrap();
+
+                let _path = EnvGuard::set("PATH", link_dir.path());
+                let found = find_executable_on_path("tirith")
+                    .expect("symlink on PATH should be discoverable");
+                let expected = real_tirith
+                    .canonicalize()
+                    .expect("real tirith path canonicalizes");
+                assert_eq!(
+                    found, expected,
+                    "symlink must resolve to canonical real path"
+                );
+            });
+        }
 
         #[test]
         fn resolve_scope_rejects_user_for_copilot_cli() {

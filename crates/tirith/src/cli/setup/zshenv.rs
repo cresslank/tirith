@@ -17,7 +17,12 @@ pub fn offer_zshenv_guard(
     dry_run: bool,
     tirith_bin: &str,
 ) -> Result<(), String> {
-    let guard_content = crate::assets::ZSHENV_GUARD.replace("__TIRITH_BIN__", tirith_bin);
+    // Quote for zsh: a path with spaces, apostrophes, or shell metacharacters
+    // would otherwise break the assignment in the asset template. The asset's
+    // `__TIRITH_BIN__` placeholder is intentionally unquoted in the template
+    // because the substitution produces an already-quoted shell literal.
+    let quoted_tirith_bin = super::shell_profile::shell_quote(tirith_bin, "zsh");
+    let guard_content = crate::assets::ZSHENV_GUARD.replace("__TIRITH_BIN__", &quoted_tirith_bin);
     let managed_block = format!("{BEGIN_MARKER}\n{guard_content}\n{END_MARKER}\n");
 
     if !install {
@@ -494,6 +499,10 @@ mod tests {
                 .arg("echo \"POST_GUARD=${POST_GUARD:-unset}\"")
                 .env("ZDOTDIR", home)
                 .env("HOME", home)
+                // A developer running tests with TIRITH_BIN exported in their
+                // shell would have it leak into the spawned zsh and shadow
+                // the placeholder logic the guard is exercising.
+                .env_remove("TIRITH_BIN")
                 .envs(extra_env.iter().copied())
                 .output()
                 .expect("failed to spawn zsh");
@@ -550,6 +559,57 @@ mod tests {
                 // tirith_bin is nonexistent → guard hits "not found" → exit 1.
                 let (_stdout, code) = run_guard_scenario(home, "/nonexistent/tirith", &[]);
                 assert_eq!(code, 1, "guard should exit 1 when tirith binary not found");
+            });
+        }
+
+        #[test]
+        fn tirith_bin_placeholder_is_quoted_for_zsh() {
+            if !zsh_available() {
+                return;
+            }
+            with_fake_home(|home| {
+                offer_zshenv_guard(true, false, false, "/opt/it's tirith/bin/tirith").unwrap();
+                let content = std::fs::read_to_string(home.join(".zshenv")).unwrap();
+                // shell_quote(..., "zsh") wraps in single quotes and escapes
+                // embedded apostrophes via the '\'' idiom.
+                assert!(
+                    content.contains("_tirith_bin='/opt/it'\\''s tirith/bin/tirith'"),
+                    "rendered content should be zsh-quoted; got:\n{content}"
+                );
+                // The placeholder token must not survive substitution.
+                assert!(
+                    !content.contains("__TIRITH_BIN__"),
+                    "placeholder must be fully replaced; got:\n{content}"
+                );
+            });
+        }
+
+        #[test]
+        fn guard_uses_baked_absolute_tirith_when_path_lacks_it() {
+            if !zsh_available() {
+                return;
+            }
+            with_fake_home(|home| {
+                use std::os::unix::fs::PermissionsExt;
+                // Real (no-op) tirith binary somewhere PATH below won't reach.
+                let dir = tempfile::tempdir().unwrap();
+                let tirith = dir.path().join("tirith");
+                std::fs::write(&tirith, "#!/bin/sh\nexit 0\n").unwrap();
+                let mut perms = std::fs::metadata(&tirith).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&tirith, perms).unwrap();
+
+                // Strip PATH to system dirs that don't contain tirith.
+                let (stdout, code) = run_guard_scenario(
+                    home,
+                    &tirith.display().to_string(),
+                    &[("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")],
+                );
+                assert_eq!(
+                    code, 0,
+                    "guard should pass with baked absolute path even when PATH lacks tirith"
+                );
+                assert_eq!(stdout, "POST_GUARD=loaded");
             });
         }
     }
