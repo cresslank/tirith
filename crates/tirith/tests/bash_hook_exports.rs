@@ -23,13 +23,31 @@ fn hook_path() -> String {
     )
 }
 
+/// Split `extra_env` into a session-local shell prelude and real process env
+/// vars. `_TIRITH_TEST_*` overrides MUST be session-local: the hook
+/// deliberately unsets exported (env-inherited) `_TIRITH_TEST_*` values —
+/// treating them as attacker-controllable — and honors only session-local ones.
+fn split_test_env(extra_env: &[(&str, &str)]) -> (String, Vec<(String, String)>) {
+    let mut prelude = String::new();
+    let mut env_vars = Vec::new();
+    for (k, v) in extra_env {
+        if k.starts_with("_TIRITH_TEST_") {
+            prelude.push_str(&format!("{k}='{v}'; "));
+        } else {
+            env_vars.push((k.to_string(), v.to_string()));
+        }
+    }
+    (prelude, env_vars)
+}
+
 /// Source the hook inside a clean, interactive bash subshell with a fresh
 /// state dir and print the two exported vars in `key=value` form.
 fn source_hook_and_dump_exports(extra_env: &[(&str, &str)]) -> String {
     let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
     let hook = hook_path();
+    let (prelude, env_vars) = split_test_env(extra_env);
     let script = format!(
-        "source '{hook}' 2>/dev/null; \
+        "{prelude}source '{hook}' 2>/dev/null; \
          printf 'MODE=%s\\nPROT=%s\\n' \
            \"${{TIRITH_BASH_EFFECTIVE_MODE:-}}\" \
            \"${{TIRITH_BASH_EFFECTIVE_PROTECTION:-}}\""
@@ -42,7 +60,7 @@ fn source_hook_and_dump_exports(extra_env: &[(&str, &str)]) -> String {
         .env("HOME", std::env::var("HOME").unwrap_or_default())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("XDG_STATE_HOME", tmpdir.path());
-    for (k, v) in extra_env {
+    for (k, v) in &env_vars {
         cmd.env(k, v);
     }
     let out = cmd.output().expect("failed to run bash");
@@ -56,7 +74,12 @@ fn source_hook_and_dump_exports(extra_env: &[(&str, &str)]) -> String {
 
 #[test]
 fn hook_exports_enter_by_default_outside_ssh() {
-    let out = source_hook_and_dump_exports(&[]);
+    // Skip the startup health gate: in a non-PTY `bash -i -c` — including on
+    // macOS's ancient /bin/bash 3.2, which CI runs — `bind -x` may not register,
+    // so the gate would degrade enter->preexec. This test verifies *mode
+    // resolution* (enter is the default outside SSH), independent of bind-x
+    // viability; the PTY conformance harness covers actual delivery.
+    let out = source_hook_and_dump_exports(&[("_TIRITH_TEST_SKIP_HEALTH", "1")]);
     assert!(
         out.contains("MODE=enter"),
         "expected MODE=enter, got:\n{out}"
@@ -244,5 +267,59 @@ fn doctor_default_requested_mode_shown_when_env_unset() {
     assert!(
         stdout.contains("bash mode:            enter"),
         "effective mode missing, got:\n{stdout}"
+    );
+}
+
+/// Source the hook in an interactive subshell, run `body`, then dump the two
+/// effective-state exports. Like `source_hook_and_dump_exports`, but lets a
+/// test drive a state transition (e.g. a degrade) before the dump.
+fn source_hook_run_and_dump(extra_env: &[(&str, &str)], body: &str) -> String {
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+    let hook = hook_path();
+    let (prelude, env_vars) = split_test_env(extra_env);
+    let script = format!(
+        "{prelude}source '{hook}' 2>/dev/null; {body}; \
+         printf 'MODE=%s\\nPROT=%s\\n' \
+           \"${{TIRITH_BASH_EFFECTIVE_MODE:-}}\" \
+           \"${{TIRITH_BASH_EFFECTIVE_PROTECTION:-}}\""
+    );
+
+    let mut cmd = Command::new("bash");
+    cmd.args(["--norc", "--noprofile", "-i", "-c", &script])
+        .env_clear()
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("XDG_STATE_HOME", tmpdir.path());
+    for (k, v) in &env_vars {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("failed to run bash");
+    assert!(
+        out.status.success(),
+        "bash exited non-zero: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// #111: an enter->preexec auto-degrade must refresh the exported effective
+/// state, so a child `tirith doctor` after a degrade reports the truth instead
+/// of the stale `enter`/`blocks` values exported at shell startup.
+#[test]
+fn degrade_to_preexec_reexports_effective_state() {
+    // `_TIRITH_TEST_SKIP_HEALTH=1` keeps the hook in enter mode — it would
+    // otherwise auto-degrade at the startup health gate in a non-PTY shell, so
+    // the explicit degrade below would not be the transition under test.
+    let out = source_hook_run_and_dump(
+        &[("_TIRITH_TEST_SKIP_HEALTH", "1")],
+        "_tirith_degrade_to_preexec degrade-test",
+    );
+    assert!(
+        out.contains("MODE=preexec"),
+        "degrade must re-export TIRITH_BASH_EFFECTIVE_MODE=preexec, got:\n{out}"
+    );
+    assert!(
+        out.contains("PROT=warn-only"),
+        "degrade must re-export TIRITH_BASH_EFFECTIVE_PROTECTION=warn-only, got:\n{out}"
     );
 }
