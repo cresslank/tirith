@@ -3,7 +3,135 @@ use std::path::PathBuf;
 
 use tirith_core::policy::Policy;
 use tirith_core::scan::{self, ScanConfig};
-use tirith_core::verdict::Severity;
+use tirith_core::verdict::{RuleId, Severity};
+
+// ---------------------------------------------------------------------------
+// Built-in scan profiles
+// ---------------------------------------------------------------------------
+//
+// `tirith scan --profile <name>` tunes a scan for a specific use case. Three
+// profiles are built in; a policy `scan.profiles.<name>` entry with the same
+// name overrides the built-in one (the user's policy always wins).
+//
+// A built-in profile sets a default `fail_on`, an `exclude` list, and a
+// per-rule overlay that runs *after* the scan: it can suppress a rule's
+// findings entirely (a check that does not apply to this use case) or pin a
+// rule's severity (so the profile, not the rule's default, decides whether a
+// finding fails CI). The overlay is intentionally small and explicit — no
+// profile can ever invent a finding, only suppress or re-grade one.
+
+/// What a built-in profile does to one rule's findings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileRuleAction {
+    /// Drop every finding for this rule — the check is out of scope for the
+    /// profile's use case.
+    Suppress,
+    /// Pin every finding for this rule to a fixed severity.
+    SetSeverity(Severity),
+}
+
+/// A built-in scan profile: a default `fail_on`, scan-scope `exclude`
+/// patterns, and a per-rule overlay.
+struct BuiltInProfile {
+    /// Default CI-failure threshold (overridden by an explicit `--fail-on`).
+    fail_on: &'static str,
+    /// Glob patterns excluded from the scan (merged with `--exclude`).
+    exclude: &'static [&'static str],
+    /// Per-rule overlay applied to the scan results.
+    rule_overlay: &'static [(RuleId, ProfileRuleAction)],
+}
+
+/// Resolve a built-in profile by name, or `None` when the name is not a
+/// built-in. The three profiles:
+///
+/// * **`ci-hardening`** — hardening a CI/CD pipeline. Every CI/repo
+///   supply-chain check runs at full strength and `fail_on` is `high`, so a
+///   `pull_request_target` trigger or a `curl | bash` step fails the build.
+///   Unpinned-action and un-pinned-image findings (hardening gaps) are kept
+///   but pinned to `medium` so they surface without failing CI on their own.
+/// * **`ai-agent-repo`** — a repository an AI coding agent operates in. The
+///   priority is config-poisoning and injection risk, not pinning hygiene:
+///   the high-severity injection / dangerous-trigger / dangerous-script rules
+///   stay, while the noisy hardening-gap rules (unpinned action, un-pinned
+///   image) are suppressed so an agent is not flooded with low-value findings.
+/// * **`oss-maintainer`** — an open-source maintainer reviewing a contributed
+///   change. The priority is contributor-controllable attack surface:
+///   workflow script-injection, the `pull_request_target` trigger, and
+///   dangerous `package.json` lifecycle scripts are emphasised (kept at
+///   `high`); pinning-hygiene findings are downgraded to `low`. `fail_on` is
+///   `high`.
+fn built_in_profile(name: &str) -> Option<BuiltInProfile> {
+    match name {
+        "ci-hardening" => Some(BuiltInProfile {
+            fail_on: "high",
+            exclude: &[],
+            rule_overlay: &[
+                (
+                    RuleId::WorkflowUnpinnedAction,
+                    ProfileRuleAction::SetSeverity(Severity::Medium),
+                ),
+                (
+                    RuleId::DockerfileUnpinnedImage,
+                    ProfileRuleAction::SetSeverity(Severity::Medium),
+                ),
+            ],
+        }),
+        "ai-agent-repo" => Some(BuiltInProfile {
+            fail_on: "high",
+            exclude: &[],
+            rule_overlay: &[
+                // Pinning-hygiene gaps are low-value noise for an agent — the
+                // agent is not the one choosing action versions.
+                (RuleId::WorkflowUnpinnedAction, ProfileRuleAction::Suppress),
+                (RuleId::DockerfileUnpinnedImage, ProfileRuleAction::Suppress),
+            ],
+        }),
+        "oss-maintainer" => Some(BuiltInProfile {
+            fail_on: "high",
+            exclude: &[],
+            rule_overlay: &[
+                // Hardening gaps are real but not the maintainer's
+                // review priority on an incoming PR — keep them visible but
+                // low so attention goes to the injection / trigger findings.
+                (
+                    RuleId::WorkflowUnpinnedAction,
+                    ProfileRuleAction::SetSeverity(Severity::Low),
+                ),
+                (
+                    RuleId::DockerfileUnpinnedImage,
+                    ProfileRuleAction::SetSeverity(Severity::Low),
+                ),
+            ],
+        }),
+        _ => None,
+    }
+}
+
+/// Names of every built-in profile, for help text and the unknown-profile
+/// error message.
+const BUILT_IN_PROFILE_NAMES: &[&str] = &["ci-hardening", "ai-agent-repo", "oss-maintainer"];
+
+/// Apply a built-in profile's per-rule overlay to a slice of findings:
+/// suppress findings for a `Suppress` rule, re-grade findings for a
+/// `SetSeverity` rule. Returns the filtered/adjusted findings.
+fn apply_rule_overlay(
+    findings: Vec<tirith_core::verdict::Finding>,
+    overlay: &[(RuleId, ProfileRuleAction)],
+) -> Vec<tirith_core::verdict::Finding> {
+    findings
+        .into_iter()
+        .filter_map(
+            |mut f| match overlay.iter().find(|(rule, _)| *rule == f.rule_id) {
+                Some((_, ProfileRuleAction::Suppress)) => None,
+                Some((_, ProfileRuleAction::SetSeverity(sev))) => {
+                    f.severity = *sev;
+                    Some(f)
+                }
+                None => Some(f),
+            },
+        )
+        .collect()
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -23,11 +151,18 @@ pub fn run(
     let mut effective_exclude: Vec<String> = exclude.to_vec();
     let mut effective_ignore: Vec<String> = ignore.to_vec();
     let mut effective_fail_on = fail_on.to_string();
+    // The per-rule overlay from a resolved built-in profile, applied to scan
+    // results after the scan. Empty when no built-in profile is in effect.
+    let mut rule_overlay: Vec<(RuleId, ProfileRuleAction)> = Vec::new();
 
     if let Some(profile_name) = profile {
         let policy = Policy::discover(None);
-        if let Some(scan_profile) = policy.scan.profiles.get(profile_name) {
-            // Profile values are defaults; CLI flags override when non-empty.
+        let policy_profile = policy.scan.profiles.get(profile_name);
+        let built_in = built_in_profile(profile_name);
+
+        if let Some(scan_profile) = policy_profile {
+            // A policy `scan.profiles.<name>` entry — the user's policy always
+            // wins over a same-named built-in profile.
             if effective_include.is_empty() {
                 effective_include = scan_profile.include.clone();
             }
@@ -43,15 +178,29 @@ pub fn run(
                     effective_fail_on = profile_fail_on.clone();
                 }
             }
+        } else if let Some(bp) = &built_in {
+            // A built-in profile: default fail_on, scope excludes, and a
+            // per-rule overlay applied to the results below.
+            if effective_exclude.is_empty() {
+                effective_exclude = bp.exclude.iter().map(|s| s.to_string()).collect();
+            }
+            if fail_on == "critical" {
+                effective_fail_on = bp.fail_on.to_string();
+            }
+            rule_overlay = bp.rule_overlay.to_vec();
         } else {
-            eprintln!("tirith scan: warning: profile '{profile_name}' not found in policy");
+            eprintln!(
+                "tirith scan: warning: profile '{profile_name}' not found — \
+                 built-in profiles are: {}",
+                BUILT_IN_PROFILE_NAMES.join(", ")
+            );
         }
     }
 
     let fail_on_severity = parse_severity(&effective_fail_on);
 
     if stdin {
-        return run_stdin(json, sarif, ci, fail_on_severity);
+        return run_stdin(json, sarif, ci, fail_on_severity, &rule_overlay);
     }
 
     if let Some(file_path) = file {
@@ -63,7 +212,7 @@ pub fn run(
         ) {
             return 0;
         }
-        return run_single_file(file_path, json, sarif, ci, fail_on_severity);
+        return run_single_file(file_path, json, sarif, ci, fail_on_severity, &rule_overlay);
     }
 
     let scan_path = path
@@ -80,7 +229,7 @@ pub fn run(
         ) {
             return 0;
         }
-        return run_single_file(&path_str, json, sarif, ci, fail_on_severity);
+        return run_single_file(&path_str, json, sarif, ci, fail_on_severity, &rule_overlay);
     }
 
     let config = ScanConfig {
@@ -93,7 +242,17 @@ pub fn run(
         max_files: None,
     };
 
-    let result = scan::scan(&config);
+    let mut result = scan::scan(&config);
+    // A built-in profile re-grades / suppresses findings before output and
+    // before the exit-code decision, so the profile's policy is what CI sees.
+    // `scanned_count` is left untouched — a file whose findings were all
+    // suppressed was still scanned; only display and the verdict change.
+    if !rule_overlay.is_empty() {
+        for file_result in &mut result.file_results {
+            let findings = std::mem::take(&mut file_result.findings);
+            file_result.findings = apply_rule_overlay(findings, &rule_overlay);
+        }
+    }
 
     if sarif {
         print_sarif_result(&result);
@@ -112,7 +271,13 @@ pub fn run(
     }
 }
 
-fn run_stdin(json: bool, sarif: bool, ci: bool, fail_on: Severity) -> i32 {
+fn run_stdin(
+    json: bool,
+    sarif: bool,
+    ci: bool,
+    fail_on: Severity,
+    rule_overlay: &[(RuleId, ProfileRuleAction)],
+) -> i32 {
     const MAX_STDIN: u64 = 10 * 1024 * 1024;
 
     let mut raw_bytes = Vec::new();
@@ -133,7 +298,10 @@ fn run_stdin(json: bool, sarif: bool, ci: bool, fail_on: Severity) -> i32 {
     }
 
     let content = String::from_utf8_lossy(&raw_bytes).into_owned();
-    let result = scan::scan_stdin(&content, &raw_bytes);
+    let mut result = scan::scan_stdin(&content, &raw_bytes);
+    if !rule_overlay.is_empty() {
+        result.findings = apply_rule_overlay(std::mem::take(&mut result.findings), rule_overlay);
+    }
 
     if sarif {
         print_sarif_file_result(&result);
@@ -152,7 +320,14 @@ fn run_stdin(json: bool, sarif: bool, ci: bool, fail_on: Severity) -> i32 {
     }
 }
 
-fn run_single_file(file_path: &str, json: bool, sarif: bool, ci: bool, fail_on: Severity) -> i32 {
+fn run_single_file(
+    file_path: &str,
+    json: bool,
+    sarif: bool,
+    ci: bool,
+    fail_on: Severity,
+    rule_overlay: &[(RuleId, ProfileRuleAction)],
+) -> i32 {
     let path = PathBuf::from(file_path);
     if !path.exists() {
         eprintln!("tirith scan: file not found: {file_path}");
@@ -160,13 +335,16 @@ fn run_single_file(file_path: &str, json: bool, sarif: bool, ci: bool, fail_on: 
         return 1;
     }
 
-    let result = match scan::scan_single_file(&path) {
+    let mut result = match scan::scan_single_file(&path) {
         Some(r) => r,
         None => {
             eprintln!("tirith scan: could not read file: {file_path}");
             return 1;
         }
     };
+    if !rule_overlay.is_empty() {
+        result.findings = apply_rule_overlay(std::mem::take(&mut result.findings), rule_overlay);
+    }
 
     if sarif {
         print_sarif_file_result(&result);
@@ -441,4 +619,122 @@ fn should_skip_file(
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tirith_core::verdict::Finding;
+
+    fn finding(rule: RuleId, sev: Severity) -> Finding {
+        Finding {
+            rule_id: rule,
+            severity: sev,
+            title: "t".to_string(),
+            description: "d".to_string(),
+            evidence: vec![],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }
+    }
+
+    #[test]
+    fn built_in_profiles_resolve() {
+        assert!(built_in_profile("ci-hardening").is_some());
+        assert!(built_in_profile("ai-agent-repo").is_some());
+        assert!(built_in_profile("oss-maintainer").is_some());
+        assert!(built_in_profile("nonexistent").is_none());
+        // Every advertised name resolves.
+        for name in BUILT_IN_PROFILE_NAMES {
+            assert!(
+                built_in_profile(name).is_some(),
+                "advertised profile '{name}' must resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn ci_hardening_keeps_high_findings_and_regrades_pinning() {
+        let bp = built_in_profile("ci-hardening").unwrap();
+        assert_eq!(bp.fail_on, "high");
+        let findings = vec![
+            finding(RuleId::WorkflowDangerousTrigger, Severity::High),
+            finding(RuleId::WorkflowUnpinnedAction, Severity::Medium),
+        ];
+        let out = apply_rule_overlay(findings, bp.rule_overlay);
+        // The dangerous-trigger High finding survives untouched.
+        assert!(
+            out.iter()
+                .any(|f| f.rule_id == RuleId::WorkflowDangerousTrigger
+                    && f.severity == Severity::High)
+        );
+        // The unpinned-action finding is kept (still Medium under ci-hardening).
+        assert!(
+            out.iter()
+                .any(|f| f.rule_id == RuleId::WorkflowUnpinnedAction
+                    && f.severity == Severity::Medium)
+        );
+    }
+
+    #[test]
+    fn ai_agent_repo_suppresses_pinning_noise_keeps_injection() {
+        let bp = built_in_profile("ai-agent-repo").unwrap();
+        let findings = vec![
+            finding(RuleId::WorkflowUntrustedInput, Severity::High),
+            finding(RuleId::WorkflowUnpinnedAction, Severity::Medium),
+            finding(RuleId::DockerfileUnpinnedImage, Severity::Medium),
+        ];
+        let out = apply_rule_overlay(findings, bp.rule_overlay);
+        // The injection finding stays.
+        assert!(out
+            .iter()
+            .any(|f| f.rule_id == RuleId::WorkflowUntrustedInput));
+        // Pinning-hygiene findings are suppressed entirely.
+        assert!(!out
+            .iter()
+            .any(|f| f.rule_id == RuleId::WorkflowUnpinnedAction));
+        assert!(!out
+            .iter()
+            .any(|f| f.rule_id == RuleId::DockerfileUnpinnedImage));
+    }
+
+    #[test]
+    fn oss_maintainer_downgrades_pinning_to_low() {
+        let bp = built_in_profile("oss-maintainer").unwrap();
+        let findings = vec![
+            finding(RuleId::PackageScriptDangerous, Severity::High),
+            finding(RuleId::WorkflowUnpinnedAction, Severity::Medium),
+        ];
+        let out = apply_rule_overlay(findings, bp.rule_overlay);
+        // The dangerous-script finding keeps its High severity.
+        assert!(out
+            .iter()
+            .any(|f| f.rule_id == RuleId::PackageScriptDangerous && f.severity == Severity::High));
+        // The unpinned-action finding is downgraded to Low.
+        assert!(out
+            .iter()
+            .any(|f| f.rule_id == RuleId::WorkflowUnpinnedAction && f.severity == Severity::Low));
+    }
+
+    #[test]
+    fn empty_overlay_is_identity() {
+        let findings = vec![finding(RuleId::WorkflowDangerousTrigger, Severity::High)];
+        let out = apply_rule_overlay(findings.clone(), &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].rule_id, RuleId::WorkflowDangerousTrigger);
+        assert_eq!(out[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn overlay_leaves_unlisted_rules_untouched() {
+        // A rule not in the overlay passes through unchanged.
+        let bp = built_in_profile("ci-hardening").unwrap();
+        let findings = vec![finding(RuleId::ConfigInjection, Severity::High)];
+        let out = apply_rule_overlay(findings, bp.rule_overlay);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].rule_id, RuleId::ConfigInjection);
+        assert_eq!(out[0].severity, Severity::High);
+    }
 }

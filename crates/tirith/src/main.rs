@@ -270,12 +270,28 @@ Examples:
         shell: Option<String>,
     },
 
-    /// Scan files for hidden content and config poisoning
+    /// Scan files for hidden content, config poisoning, and CI/repo supply-chain risk
     #[command(after_help = "\
+Scans repository files for hidden/invisible content, AI-config poisoning, and
+CI/repo supply-chain risks: unpinned GitHub Actions, the pull_request_target
+trigger, curl|bash in workflow run steps, untrusted-input interpolation,
+un-pinned Dockerfile base images, remote Terraform modules, untrusted Helm
+chart repos, and dangerous package.json install scripts.
+
 Examples:
   tirith scan ./
   tirith scan --ci --fail-on high ./
-  tirith scan --format sarif ./ > results.sarif")]
+  tirith scan --format sarif ./ > results.sarif
+  tirith scan --profile ci-hardening ./
+  tirith scan --profile oss-maintainer ./
+
+Built-in --profile values:
+  ci-hardening    harden a CI/CD pipeline — every supply-chain check at full
+                  strength, fail-on high
+  ai-agent-repo   a repo an AI agent works in — keep injection/poisoning
+                  findings, suppress low-value pinning-hygiene noise
+  oss-maintainer  reviewing a contributed change — emphasize contributor-
+                  controllable risk (script injection, dangerous triggers)")]
     Scan {
         /// Path to scan (directory or file)
         path: Option<String>,
@@ -318,7 +334,8 @@ Examples:
         #[arg(long)]
         exclude: Vec<String>,
 
-        /// Load a named scan profile from policy
+        /// Scan profile: a built-in (ci-hardening, ai-agent-repo, oss-maintainer)
+        /// or a named profile from policy (a policy profile of the same name wins)
         #[arg(long)]
         profile: Option<String>,
     },

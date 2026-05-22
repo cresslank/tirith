@@ -294,6 +294,16 @@ fn test_codefile_fixtures() {
 }
 
 #[test]
+fn test_cifile_fixtures() {
+    let fixtures = load_fixtures("cifile.toml");
+    let count = fixtures.len();
+    for fixture in &fixtures {
+        run_fixture(fixture);
+    }
+    eprintln!("Passed {count} cifile fixtures");
+}
+
+#[test]
 fn test_threatintel_fixtures() {
     // Point the threat DB cache at the test fixture DB so that DB-dependent
     // rules (threat_malicious_package, threat_malicious_ip, etc.) can fire.
@@ -451,6 +461,7 @@ const ALL_FIXTURE_FILES: &[&str] = &[
     "rendered.toml",
     "credential.toml",
     "codefile.toml",
+    "cifile.toml",
     "threatintel.toml",
 ];
 
@@ -544,6 +555,13 @@ const ALL_RULE_IDS: &[&str] = &[
     "helm_untrusted_repo",
     "terraform_remote_module",
     "brew_untrusted_tap",
+    // CI / repo supply-chain scan rules
+    "workflow_unpinned_action",
+    "workflow_dangerous_trigger",
+    "workflow_curl_pipe_shell",
+    "workflow_untrusted_input",
+    "dockerfile_unpinned_image",
+    "package_script_dangerous",
     // Threat intelligence — local DB
     "threat_malicious_package",
     "threat_malicious_ip",
@@ -742,6 +760,13 @@ fn test_rule_id_list_is_complete() {
         RuleId::HelmUntrustedRepo,
         RuleId::TerraformRemoteModule,
         RuleId::BrewUntrustedTap,
+        // CI / repo supply-chain scan rules
+        RuleId::WorkflowUnpinnedAction,
+        RuleId::WorkflowDangerousTrigger,
+        RuleId::WorkflowCurlPipeShell,
+        RuleId::WorkflowUntrustedInput,
+        RuleId::DockerfileUnpinnedImage,
+        RuleId::PackageScriptDangerous,
         // Threat intelligence — local DB
         RuleId::ThreatMaliciousPackage,
         RuleId::ThreatMaliciousIp,
@@ -832,6 +857,12 @@ fn test_no_url_rules_have_no_url_fixtures() {
         "suspicious_code_exfiltration", // file scan, no URL needed
         "hangul_filler",                // byte-level, no URL needed
         "confusable_text",              // byte-level, no URL needed
+        "workflow_unpinned_action",     // CI workflow file scan, no URL needed
+        "workflow_dangerous_trigger",   // CI workflow file scan, no URL needed
+        "workflow_curl_pipe_shell",     // CI workflow file scan, no URL needed
+        "workflow_untrusted_input",     // CI workflow file scan, no URL needed
+        "dockerfile_unpinned_image",    // Dockerfile scan, no URL needed
+        "package_script_dangerous",     // package.json scan, no URL needed
     ]
     .into_iter()
     .collect();

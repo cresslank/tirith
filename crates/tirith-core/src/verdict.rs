@@ -102,6 +102,14 @@ pub enum RuleId {
     TerraformRemoteModule,
     BrewUntrustedTap,
 
+    // CI / repo supply-chain scan rules (file-content scan)
+    WorkflowUnpinnedAction,
+    WorkflowDangerousTrigger,
+    WorkflowCurlPipeShell,
+    WorkflowUntrustedInput,
+    DockerfileUnpinnedImage,
+    PackageScriptDangerous,
+
     // Threat intelligence rules — local DB
     ThreatMaliciousPackage,
     ThreatMaliciousIp,

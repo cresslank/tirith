@@ -808,6 +808,13 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("helm_untrusted_repo", "HelmUntrustedRepo"),
     ("terraform_remote_module", "TerraformRemoteModule"),
     ("brew_untrusted_tap", "BrewUntrustedTap"),
+    // CI / repo supply-chain scan rules
+    ("workflow_unpinned_action", "WorkflowUnpinnedAction"),
+    ("workflow_dangerous_trigger", "WorkflowDangerousTrigger"),
+    ("workflow_curl_pipe_shell", "WorkflowCurlPipeShell"),
+    ("workflow_untrusted_input", "WorkflowUntrustedInput"),
+    ("dockerfile_unpinned_image", "DockerfileUnpinnedImage"),
+    ("package_script_dangerous", "PackageScriptDangerous"),
     // Threat intelligence — local DB
     ("threat_malicious_package", "ThreatMaliciousPackage"),
     ("threat_malicious_ip", "ThreatMaliciousIp"),

@@ -155,6 +155,12 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::HelmUntrustedRepo
         | RuleId::TerraformRemoteModule
         | RuleId::BrewUntrustedTap
+        | RuleId::WorkflowUnpinnedAction
+        | RuleId::WorkflowDangerousTrigger
+        | RuleId::WorkflowCurlPipeShell
+        | RuleId::WorkflowUntrustedInput
+        | RuleId::DockerfileUnpinnedImage
+        | RuleId::PackageScriptDangerous
         | RuleId::HiddenCssContent
         | RuleId::HiddenColorContent
         | RuleId::HiddenHtmlAttribute

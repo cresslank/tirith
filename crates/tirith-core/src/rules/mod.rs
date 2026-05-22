@@ -1,3 +1,4 @@
+pub mod cifile;
 pub mod cloaking;
 pub mod codefile;
 pub mod command;

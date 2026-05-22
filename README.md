@@ -336,6 +336,26 @@ Run `tirith mcp-server` or use `tirith setup <tool> --with-mcp` to register tiri
 - **Invisible Unicode** — zero-width characters (including Mongolian Vowel Separator), bidi controls, soft hyphens, Unicode tags, Hangul fillers, invisible whitespace encoding, math alphanumeric confusables
 - **MCP config issues** — insecure HTTP connections, raw IP servers, shell metacharacters in args, duplicate server names, wildcard tool access
 
+### CI / repo supply-chain scanning
+
+`tirith scan` also inspects the files a repository checks in to describe its own build and deploy pipeline. It detects the dangerous *pattern*, not the tool — a SHA-pinned action, a digest-pinned image, a local Terraform module, and a normal `package.json` stay clean.
+
+**What it catches in CI / infrastructure files:**
+
+- **GitHub Actions workflows** (`.github/workflows/*.yml`) — an action `uses:` reference pinned to a mutable ref (`@v3`, `@main`) instead of a commit SHA; the `pull_request_target` trigger; a `curl … | bash` pipe-to-shell in a `run:` step; an attacker-controllable `${{ github.event.* }}` value interpolated into a `run:` shell step (script injection)
+- **Dockerfiles** — a `FROM` base image on the mutable `latest` tag (or no tag) with no `@sha256:` digest pin
+- **Terraform** (`*.tf`) — a `module` block sourced from a remote / untrusted location rather than a local path or the Terraform Registry
+- **Helm charts** (`Chart.yaml`) — a chart dependency from an untrusted chart repository
+- **`package.json`** — a `preinstall` / `install` / `postinstall` lifecycle script that runs a dangerous command (pipe-to-shell, obfuscated payload, download-and-run); these hooks run automatically on `npm install`
+
+Three built-in `--profile` values tune the scan: `ci-hardening` (every check at full strength, fail-on `high`), `ai-agent-repo` (keeps injection findings, drops low-value pinning-hygiene noise), and `oss-maintainer` (emphasises contributor-controllable risk when reviewing a change).
+
+```bash
+tirith scan ./                          # scan the repo
+tirith scan --profile ci-hardening ./   # tune for CI/CD hardening
+tirith scan --format sarif ./ > out.sarif
+```
+
 ### Hidden content detection
 
 Detects content invisible to humans but readable by AI in HTML, Markdown, and PDF:
