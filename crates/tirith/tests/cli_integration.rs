@@ -3502,8 +3502,9 @@ fn install_human_output_never_claims_sandboxing() {
         let window_start = idx.saturating_sub(12);
         let window = &lower[window_start..idx + "sandbox".len()];
         assert!(
-            window.contains("not a sandbox"),
-            "the word 'sandbox' may only appear as 'not a sandbox', \
+            window.contains("not a sandbox") || window.contains("not sandbox"),
+            "the word 'sandbox' may only appear in a negating phrase \
+             ('not a sandbox' / 'not sandbox' / 'does not sandbox'), \
              found in context: ...{window}..."
         );
     }

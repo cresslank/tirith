@@ -701,8 +701,14 @@ fn go_mod_require_entry(entry: &str) -> Option<DeclaredDependency> {
 fn parse_gemfile(text: &str) -> Vec<DeclaredDependency> {
     let mut out = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    // Track group nesting so a dev/test group tags its gems.
-    let mut group_dev_depth = 0i32;
+    // A stack of open `… do` blocks; the bool records whether the block is a
+    // `group :development` / `group :test` block. A gem is dev-tagged when any
+    // enclosing block is a dev group. Every `do`/`end` pair is tracked — not
+    // only `group` blocks — so the depth stays correct when a non-dev block (a
+    // nested `group`, `platforms`, `source`, …) opens and closes inside a dev
+    // group; decrementing a single dev counter on every `end` would wrongly
+    // drop the dev tag when such an inner block closes.
+    let mut block_stack: Vec<bool> = Vec::new();
 
     for raw in text.lines() {
         // Strip a `#` comment.
@@ -714,16 +720,16 @@ fn parse_gemfile(text: &str) -> Vec<DeclaredDependency> {
         if line.is_empty() {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("group ") {
-            let lower = rest.to_lowercase();
-            let is_dev = lower.contains("development") || lower.contains("test");
-            if line.ends_with("do") {
-                group_dev_depth += if is_dev { 1 } else { 0 };
-            }
+        if line == "end" {
+            block_stack.pop();
             continue;
         }
-        if line == "end" && group_dev_depth > 0 {
-            group_dev_depth -= 1;
+        if line.ends_with(" do") || line == "do" {
+            let is_dev_group = line.strip_prefix("group ").is_some_and(|rest| {
+                let lower = rest.to_lowercase();
+                lower.contains("development") || lower.contains("test")
+            });
+            block_stack.push(is_dev_group);
             continue;
         }
         if let Some(name) = gemfile_gem_name(line) {
@@ -732,7 +738,7 @@ fn parse_gemfile(text: &str) -> Vec<DeclaredDependency> {
                     name,
                     ecosystem: Ecosystem::RubyGems,
                     version: None,
-                    dev: group_dev_depth > 0,
+                    dev: block_stack.iter().any(|&is_dev| is_dev),
                 });
             }
         }
@@ -1862,6 +1868,31 @@ end
         assert!(names.contains(&"puma"));
         let rspec = deps.iter().find(|d| d.name == "rspec").unwrap();
         assert!(rspec.dev, "a gem in a :test group must be dev-tagged");
+    }
+
+    #[test]
+    fn parse_gemfile_nested_non_dev_group_keeps_dev_tag() {
+        // A non-dev group nested inside a `:development` group: its closing
+        // `end` must not clear the dev tag of gems that follow it but are
+        // still inside the outer dev group.
+        let text = "\
+group :development do
+  gem 'beforegem'
+  group :assets do
+    gem 'innergem'
+  end
+  gem 'aftergem'
+end
+gem 'toplevelgem'
+";
+        let deps = parse_gemfile(text);
+        let dev = |n: &str| deps.iter().find(|d| d.name == n).unwrap().dev;
+        assert!(dev("beforegem"), "a gem before the nested group is dev");
+        assert!(
+            dev("aftergem"),
+            "a gem after a nested non-dev group, still inside :development, must stay dev-tagged"
+        );
+        assert!(!dev("toplevelgem"), "a top-level gem is not dev");
     }
 
     // --- is_plausible_package_name ----------------------------------------
