@@ -1,0 +1,1061 @@
+//! `tirith install` — the safe-install transaction.
+//!
+//! `tirith install <npm|pip|cargo|url> <args...>` wraps a real package install
+//! with **pre-execution install-risk analysis** and records the transaction.
+//! It is the *assembly chunk* of M3 (Supply-Chain Firewall): it composes
+//! existing tirith building blocks rather than adding new detection —
+//!
+//!  * the install-command rules, URL rules, and threat-DB package rules, via
+//!    [`tirith_core::engine`];
+//!  * the deterministic package-risk scorer
+//!    ([`tirith_core::package_risk`]) and its opt-in registry-API provenance
+//!    signals;
+//!  * [`tirith_core::checkpoint`] for a before/after file record;
+//!  * [`tirith_core::receipt`] / [`tirith_core::runner`] for the safe
+//!    download-and-run path of the `url` form;
+//!  * [`tirith_core::audit`] for the transaction record.
+//!
+//! The flow is **analyze → inform → record → run**:
+//!  1. *Analyze* — score the package(s) and the would-be install command
+//!     *before* anything is installed, producing one explainable verdict.
+//!  2. *Inform* — present the verdict. A **block** refuses (bypass per
+//!     policy); a **warn** requires an interactive acknowledgement, exactly as
+//!     `tirith check` does; an **allow** proceeds.
+//!  3. *Record* — take a checkpoint of the working directory and audit-log
+//!     the verdict so there is a before/after record of the transaction.
+//!  4. *Run* — only now invoke the real `npm install` / `pip install` /
+//!     `cargo install` (directly, never through a shell), or the downloaded
+//!     script for the `url` form.
+//!
+//! ## What this is NOT
+//!
+//! This is install-risk **analysis** plus a recorded transaction. It does
+//! **not** sandbox, isolate, or contain the install — runtime sandboxing is an
+//! explicit tirith non-goal (see `docs/threat-model.md`). The real install
+//! runs with the user's full privileges. tirith's contribution is that the
+//! install is analyzed, surfaced, and recorded *first* — nothing here, in
+//! `--help`, or in the docs, claims otherwise.
+
+#[cfg(unix)]
+use tirith_core::runner::{self, RunOptions};
+
+use std::process::Command;
+
+use tirith_core::engine::{self, AnalysisContext};
+use tirith_core::extract::ScanContext;
+use tirith_core::install_txn::{self, InstallPlan, OnlineMode, PackageManager, PlanRequest};
+use tirith_core::policy::Policy;
+use tirith_core::registry_api::{self, HttpRegistryClient};
+use tirith_core::style::Stream;
+use tirith_core::threatdb::{Ecosystem, ThreatDb};
+use tirith_core::verdict::{Action, Verdict};
+
+/// Which install source the `<npm|pip|cargo|url>` positional selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum InstallSource {
+    /// `npm install <pkg...>`
+    Npm,
+    /// `pip install <pkg...>`
+    Pip,
+    /// `cargo install <pkg...>`
+    Cargo,
+    /// Download and run an install script from a URL (delegates to the
+    /// existing `tirith run` safe download-and-run machinery).
+    Url,
+}
+
+impl InstallSource {
+    /// The package-manager mapping, or `None` for [`InstallSource::Url`]
+    /// (which is not a package-manager transaction).
+    fn package_manager(self) -> Option<PackageManager> {
+        match self {
+            InstallSource::Npm => Some(PackageManager::Npm),
+            InstallSource::Pip => Some(PackageManager::Pip),
+            InstallSource::Cargo => Some(PackageManager::Cargo),
+            InstallSource::Url => None,
+        }
+    }
+}
+
+/// Abstraction over actually running the real package-manager install.
+///
+/// The production implementation ([`ProcessInstallRunner`]) spawns the real
+/// process; tests inject a fake so a test **never** installs anything and
+/// **never** touches the network. The trait takes the resolved argv — the
+/// program and its arguments — and runs it *directly*, never via a shell.
+pub trait InstallRunner {
+    /// Run the install command `program args...` and return its exit code.
+    ///
+    /// `None` is returned when the process was terminated by a signal (no
+    /// exit code) or could not be spawned at all — the caller treats either as
+    /// a non-success.
+    fn run(&self, program: &str, args: &[String]) -> std::io::Result<Option<i32>>;
+}
+
+/// Production [`InstallRunner`] — spawns the real package manager with
+/// inherited stdio so its output streams straight to the user's terminal.
+pub struct ProcessInstallRunner;
+
+impl InstallRunner for ProcessInstallRunner {
+    fn run(&self, program: &str, args: &[String]) -> std::io::Result<Option<i32>> {
+        // Direct spawn — `program` is a fixed package-manager name and `args`
+        // are passed through argv, so there is no shell and no word-splitting.
+        let status = Command::new(program).args(args).status()?;
+        Ok(status.code())
+    }
+}
+
+/// Entry point for `tirith install`.
+///
+/// `source` selects the install kind; `args` are the user's arguments after
+/// the source (the package list / flags, or the URL for the `url` form).
+#[allow(clippy::too_many_arguments)]
+pub fn run(
+    source: InstallSource,
+    args: &[String],
+    online: bool,
+    offline: bool,
+    json: bool,
+    yes: bool,
+    no_exec: bool,
+    sha256: Option<String>,
+) -> i32 {
+    match source.package_manager() {
+        Some(manager) => run_package_manager(manager, args, online, offline, json, yes, no_exec),
+        None => run_url(args, online, offline, json, no_exec, sha256),
+    }
+}
+
+// ===========================================================================
+// package-manager form: npm / pip / cargo
+// ===========================================================================
+
+#[allow(clippy::too_many_arguments)]
+fn run_package_manager(
+    manager: PackageManager,
+    args: &[String],
+    online: bool,
+    offline: bool,
+    json: bool,
+    yes: bool,
+    no_exec: bool,
+) -> i32 {
+    if args.is_empty() {
+        eprintln!(
+            "tirith install: no packages or arguments given for {}.",
+            manager.label()
+        );
+        eprintln!(
+            "  try: tirith install {} <package>   (e.g. tirith install {} {})",
+            manager.label(),
+            manager.label(),
+            example_package(manager),
+        );
+        return 2;
+    }
+
+    let interactive = is_terminal::is_terminal(std::io::stderr());
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+    let policy = Policy::discover(cwd.as_deref());
+
+    // --- ANALYZE --------------------------------------------------------
+    // Resolve the registry-API path. Offline by default; `--online` opts in,
+    // and `--offline` / `TIRITH_OFFLINE` overrides `--online`. The resolver is
+    // offline-safe — it degrades any registry failure to `Unavailable`.
+    let use_online = online && !offline && !offline_env_active();
+    let http_client = HttpRegistryClient::new();
+    let resolver =
+        |eco: Ecosystem, name: &str| registry_api::gather_api_signals(&http_client, eco, name);
+    let online_mode = if use_online {
+        OnlineMode::Resolver(&resolver)
+    } else {
+        OnlineMode::Off
+    };
+
+    let db = ThreatDb::cached();
+    let plan_request = PlanRequest {
+        manager,
+        user_args: args,
+        db: db.as_deref(),
+        policy: &policy,
+        cwd: cwd.clone(),
+        interactive,
+        online: online_mode,
+    };
+    let plan = install_txn::plan_install(&plan_request);
+
+    // --- INFORM ---------------------------------------------------------
+    if json {
+        print_plan_json(&plan, use_online);
+    } else {
+        print_plan_human(&plan, use_online);
+    }
+
+    // Audit the verdict regardless of the decision — the analysis happened.
+    tirith_core::audit::log_verdict(
+        &plan.verdict,
+        &format!("install {}", plan.analysis_command),
+        None,
+        None,
+        &policy.dlp_custom_patterns,
+    );
+
+    // `--no-exec` stops here: the user asked for analysis only. The
+    // transaction was analyzed, informed, and audited; nothing will be
+    // installed, so the proceed/refuse gate — which only governs whether the
+    // *real install runs* — does not apply. The exit code still reflects the
+    // verdict so a script can branch on it: 0 allow, 1 block, 2 warn.
+    if no_exec {
+        if !json {
+            eprintln!(
+                "tirith install: --no-exec — analysis only, '{}' was NOT run.",
+                plan.analysis_command
+            );
+        }
+        return match plan.verdict.action {
+            Action::Allow => 0,
+            Action::Block => 1,
+            Action::Warn | Action::WarnAck => 2,
+        };
+    }
+
+    // The gate. A block refuses; a warn needs acknowledgement; an allow
+    // proceeds. `decide_proceed` returns the exit code to use when NOT
+    // proceeding, or `Go` when the transaction should go ahead.
+    match decide_proceed(&plan.verdict, &policy, interactive, yes, json) {
+        ProceedDecision::Stop(code) => return code,
+        ProceedDecision::Go => {}
+    }
+
+    // --- RECORD then RUN ------------------------------------------------
+    run_and_record(&plan, cwd.as_deref(), json, &ProcessInstallRunner)
+}
+
+/// Outcome of the verdict gate.
+enum ProceedDecision {
+    /// Proceed with the install.
+    Go,
+    /// Do not install; exit with this code.
+    Stop(i32),
+}
+
+/// Apply the verdict gate, consistent with `tirith check`:
+///
+///  * **Block** — refuse. If the policy allows the environment bypass and
+///    `TIRITH=0` is set, the block is bypassed (and audited as such by the
+///    caller). Otherwise exit `1`.
+///  * **Warn / WarnAck** — require acknowledgement. With `--yes`, or an
+///    interactive `y` at the prompt, proceed; otherwise exit `2`.
+///  * **Allow** — proceed.
+fn decide_proceed(
+    verdict: &Verdict,
+    policy: &Policy,
+    interactive: bool,
+    yes: bool,
+    json: bool,
+) -> ProceedDecision {
+    match verdict.action {
+        Action::Allow => ProceedDecision::Go,
+
+        Action::Block => {
+            // Policy-gated environment bypass — the same `TIRITH=0` escape
+            // hatch `tirith check` honors. A non-interactive session may only
+            // bypass when policy additionally opts that in.
+            let bypass_set = std::env::var("TIRITH").ok().as_deref() == Some("0");
+            let bypass_allowed =
+                policy.allow_bypass_env && (interactive || policy.allow_bypass_env_noninteractive);
+            if bypass_set && bypass_allowed {
+                if !json {
+                    eprintln!(
+                        "tirith install: BLOCK bypassed via TIRITH=0 (policy permits) — \
+                         proceeding against advice."
+                    );
+                }
+                ProceedDecision::Go
+            } else {
+                if !json {
+                    eprintln!(
+                        "tirith install: refusing to install — the analysis BLOCKED \
+                         this transaction (see findings above)."
+                    );
+                    if policy.allow_bypass_env {
+                        eprintln!("  to override against advice: TIRITH=0 tirith install ...");
+                    }
+                }
+                ProceedDecision::Stop(1)
+            }
+        }
+
+        Action::Warn | Action::WarnAck => {
+            if yes {
+                if !json {
+                    eprintln!(
+                        "tirith install: proceeding past {} warning(s) (--yes).",
+                        verdict.findings.len()
+                    );
+                }
+                return ProceedDecision::Go;
+            }
+            if !interactive {
+                if !json {
+                    eprintln!(
+                        "tirith install: {} warning(s) — not installing in a \
+                         non-interactive session. Re-run with --yes to proceed.",
+                        verdict.findings.len()
+                    );
+                }
+                return ProceedDecision::Stop(2);
+            }
+            // Interactive acknowledgement, mirroring `tirith check`'s prompt.
+            eprint!(
+                "tirith install: proceed with {} warning(s) and install? [y/N] ",
+                verdict.findings.len()
+            );
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_err() {
+                eprintln!("tirith install: could not read confirmation — not installing.");
+                return ProceedDecision::Stop(2);
+            }
+            if matches!(input.trim(), "y" | "Y" | "yes" | "Yes") {
+                ProceedDecision::Go
+            } else {
+                eprintln!("tirith install: cancelled — nothing was installed.");
+                ProceedDecision::Stop(2)
+            }
+        }
+    }
+}
+
+/// Take a before-install checkpoint, run the real install via `runner`, then
+/// report — the *record* and *run* steps of the transaction.
+///
+/// The checkpoint is best-effort: it snapshots the working directory so the
+/// user has a before/after record (`tirith checkpoint diff <id>`). It is **not**
+/// a sandbox and **not** an automatic rollback — a failed install is not undone
+/// for the user; the checkpoint simply makes the change inspectable.
+fn run_and_record(
+    plan: &InstallPlan,
+    cwd: Option<&str>,
+    json: bool,
+    runner: &dyn InstallRunner,
+) -> i32 {
+    // --- RECORD: before-install checkpoint ------------------------------
+    let checkpoint_id = match cwd {
+        Some(dir) => {
+            let trigger = format!("install {}", plan.analysis_command);
+            match tirith_core::checkpoint::create(&[dir], Some(&trigger)) {
+                Ok(meta) => {
+                    if !json {
+                        eprintln!(
+                            "tirith install: checkpoint {} taken ({} file(s)) — \
+                             before/after record only, not a sandbox.",
+                            meta.id, meta.file_count
+                        );
+                    }
+                    Some(meta.id)
+                }
+                Err(e) => {
+                    // A checkpoint failure must not abort the install — it is
+                    // a record, not a gate. Report and continue.
+                    if !json {
+                        eprintln!("tirith install: checkpoint skipped (non-fatal): {e}");
+                    }
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    // --- RUN: the real install -----------------------------------------
+    if !json {
+        eprintln!("tirith install: running '{}' ...", plan.analysis_command);
+    }
+    let exit_code = match runner.run(&plan.argv.program, &plan.argv.args) {
+        Ok(Some(code)) => code,
+        Ok(None) => {
+            if !json {
+                eprintln!(
+                    "tirith install: '{}' did not return an exit code \
+                     (terminated by signal).",
+                    plan.argv.program
+                );
+            }
+            1
+        }
+        Err(e) => {
+            if !json {
+                eprintln!("tirith install: failed to run '{}': {e}", plan.argv.program);
+            }
+            return 1;
+        }
+    };
+
+    if json {
+        print_outcome_json(plan, checkpoint_id.as_deref(), exit_code);
+    } else {
+        let after = if exit_code == 0 {
+            "completed".to_string()
+        } else {
+            format!("exited {exit_code}")
+        };
+        eprintln!("tirith install: '{}' {after}.", plan.analysis_command);
+        if let Some(id) = &checkpoint_id {
+            eprintln!("  before/after record: tirith checkpoint diff {id}");
+        }
+    }
+
+    exit_code
+}
+
+// ===========================================================================
+// url form — delegates to the existing `tirith run` machinery
+// ===========================================================================
+
+/// The `url` form: download-and-run an install script.
+///
+/// Per the assembly principle, this does **not** re-implement download or
+/// execution — it delegates wholly to [`tirith_core::runner`], the existing
+/// `tirith run` safe download-and-run path. `runner::run` already downloads
+/// with a size cap and timeout, computes a SHA-256, statically analyzes the
+/// script body, enforces an interpreter allowlist, writes a [`Receipt`], and
+/// asks for confirmation on the controlling terminal before executing.
+///
+/// `tirith install` adds a *preflight risk verdict* on top: the URL is
+/// analyzed first (download-shaped, not pipe-to-shell, so a legitimate
+/// installer URL is not auto-blocked), and a BLOCK refuses before any
+/// download. A non-blocking preflight then hands off to `runner::run`, whose
+/// own `Execute this script? [y/N]` prompt is the go-ahead for execution.
+#[cfg(unix)]
+fn run_url(
+    args: &[String],
+    _online: bool,
+    _offline: bool,
+    json: bool,
+    no_exec: bool,
+    sha256: Option<String>,
+) -> i32 {
+    let url = match args {
+        [single] => single.as_str(),
+        [] => {
+            eprintln!("tirith install: no URL given.");
+            eprintln!("  try: tirith install url https://get.example-tool.sh");
+            return 2;
+        }
+        _ => {
+            eprintln!(
+                "tirith install: the url form takes exactly one URL \
+                 (got {} arguments).",
+                args.len()
+            );
+            return 2;
+        }
+    };
+
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+    let policy = Policy::discover(cwd.as_deref());
+    let interactive = is_terminal::is_terminal(std::io::stderr());
+
+    // --- ANALYZE: URL preflight ----------------------------------------
+    // Analyze the URL as a *download* (`curl -fsSL <url>`), NOT as a
+    // pipe-to-shell. Analyzing `curl <url> | sh` would make CurlPipeShell fire
+    // on every URL and turn every URL install into a block. The real script
+    // body is analyzed separately by `runner::run` after download.
+    let preflight = preflight_url(url, cwd.as_deref(), interactive);
+
+    if json {
+        print_url_preflight_json(url, &preflight);
+    } else {
+        print_url_preflight_human(url, &preflight);
+    }
+
+    tirith_core::audit::log_verdict(
+        &preflight,
+        &format!("install url {url}"),
+        None,
+        None,
+        &policy.dlp_custom_patterns,
+    );
+
+    // A blocking preflight refuses before any download happens.
+    if preflight.action == Action::Block {
+        let bypass_set = std::env::var("TIRITH").ok().as_deref() == Some("0");
+        let bypass_allowed =
+            policy.allow_bypass_env && (interactive || policy.allow_bypass_env_noninteractive);
+        if !(bypass_set && bypass_allowed) {
+            if !json {
+                eprintln!(
+                    "tirith install: refusing to download — the URL preflight \
+                     BLOCKED this transaction (see findings above)."
+                );
+            }
+            return 1;
+        }
+        if !json {
+            eprintln!(
+                "tirith install: URL preflight BLOCK bypassed via TIRITH=0 \
+                 (policy permits) — proceeding against advice."
+            );
+        }
+    }
+
+    // A warning preflight is surfaced; `runner::run`'s own confirmation prompt
+    // is the acknowledgement, so there is no second prompt here.
+    if preflight.action != Action::Allow && !json {
+        eprintln!(
+            "tirith install: URL preflight raised {} finding(s) — the script \
+             body will be analyzed and you will be asked to confirm before it runs.",
+            preflight.findings.len()
+        );
+    }
+
+    // --- RECORD + RUN: delegate to the existing safe runner -------------
+    // `runner::run` re-analyzes the *downloaded script*, writes a Receipt, and
+    // (unless --no-exec) prompts on /dev/tty before executing.
+    let opts = RunOptions {
+        url: url.to_string(),
+        no_exec,
+        interactive,
+        expected_sha256: sha256,
+    };
+    match runner::run(opts) {
+        Ok(result) => {
+            if json {
+                print_url_outcome_json(&result);
+            } else if result.executed {
+                eprintln!(
+                    "tirith install: install script executed (receipt {}).",
+                    tirith_core::receipt::short_hash(&result.receipt.sha256)
+                );
+            } else {
+                eprintln!(
+                    "tirith install: install script downloaded and recorded, \
+                     not executed (receipt {}).",
+                    tirith_core::receipt::short_hash(&result.receipt.sha256)
+                );
+            }
+            if result.executed {
+                result.exit_code.unwrap_or(1)
+            } else {
+                0
+            }
+        }
+        Err(e) => {
+            if json {
+                let err = serde_json::json!({ "error": e });
+                let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &err);
+                println!();
+            } else {
+                eprintln!("tirith install: {e}");
+            }
+            1
+        }
+    }
+}
+
+/// On non-Unix the `url` form is unavailable — `tirith run` (and thus the
+/// safe runner) is Unix-only. npm/pip/cargo still work.
+#[cfg(not(unix))]
+fn run_url(
+    _args: &[String],
+    _online: bool,
+    _offline: bool,
+    _json: bool,
+    _no_exec: bool,
+    _sha256: Option<String>,
+) -> i32 {
+    eprintln!(
+        "tirith install: the url form is only available on Unix. \
+         Use `tirith install npm|pip|cargo` instead."
+    );
+    2
+}
+
+/// Analyze a URL as a download (not a pipe-to-shell) and return the verdict.
+///
+/// Separated so it is unit-testable without touching the network — it only
+/// runs the offline `engine::analyze`, no fetch.
+fn preflight_url(url: &str, cwd: Option<&str>, interactive: bool) -> Verdict {
+    let ctx = AnalysisContext {
+        // A download shape: a legitimate installer URL must not trip the
+        // pipe-to-shell rule here. The script body is analyzed for real by
+        // the runner after it is fetched.
+        input: format!("curl -fsSL {url}"),
+        shell: tirith_core::tokenize::ShellType::Posix,
+        scan_context: ScanContext::Exec,
+        raw_bytes: None,
+        interactive,
+        cwd: cwd.map(|s| s.to_string()),
+        file_path: None,
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
+    };
+    engine::analyze(&ctx)
+}
+
+// ===========================================================================
+// output
+// ===========================================================================
+
+/// A short, well-known example package per manager, for the usage hint.
+fn example_package(manager: PackageManager) -> &'static str {
+    match manager {
+        PackageManager::Npm => "left-pad",
+        PackageManager::Pip => "requests",
+        PackageManager::Cargo => "ripgrep",
+    }
+}
+
+/// `true` when `TIRITH_OFFLINE` is set to a truthy value — mirrors
+/// `cli::package` / `cli::ecosystem` so the offline switch is uniform.
+fn offline_env_active() -> bool {
+    std::env::var("TIRITH_OFFLINE")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Render the analysis verdict for a package-manager install (human form).
+fn print_plan_human(plan: &InstallPlan, online: bool) {
+    let s = Stream::Stderr;
+    eprintln!(
+        "tirith install: analyzing '{}' before running it",
+        plan.analysis_command
+    );
+    eprintln!("  (pre-execution install-risk analysis — not a sandbox)");
+    eprintln!();
+
+    // Per-package risk scores.
+    if plan.packages.is_empty() {
+        eprintln!("  packages: none on the command line (command-shape analysis only)");
+    } else {
+        eprintln!("  packages:");
+        for pkg in &plan.packages {
+            eprintln!(
+                "    - {} {} — risk {}/100 ({})",
+                pkg.reference.ecosystem, pkg.reference.name, pkg.risk.score, pkg.risk.risk_level,
+            );
+        }
+    }
+    eprintln!();
+
+    // The verdict.
+    match plan.verdict.action {
+        Action::Allow => {
+            eprintln!(
+                "  {}",
+                tirith_core::style::green("verdict: ALLOW — no supply-chain risks found", s)
+            );
+        }
+        Action::Warn | Action::WarnAck => {
+            eprintln!(
+                "  {}",
+                tirith_core::style::yellow(
+                    &format!(
+                        "verdict: WARN — {} finding(s), acknowledgement required",
+                        plan.verdict.findings.len()
+                    ),
+                    s,
+                )
+            );
+        }
+        Action::Block => {
+            eprintln!(
+                "  {}",
+                tirith_core::style::bold_red(
+                    &format!(
+                        "verdict: BLOCK — {} finding(s), install refused",
+                        plan.verdict.findings.len()
+                    ),
+                    s,
+                )
+            );
+        }
+    }
+    for finding in &plan.verdict.findings {
+        let sev = tirith_core::style::severity_label(&finding.severity, s);
+        eprintln!("    {} {} — {}", sev, finding.rule_id, finding.title);
+        eprintln!("      {}", finding.description);
+    }
+
+    if !plan.notes.is_empty() {
+        eprintln!();
+        eprintln!("  notes:");
+        for note in &plan.notes {
+            eprintln!("    - {note}");
+        }
+    }
+    if !online && !plan.packages.is_empty() {
+        eprintln!();
+        eprintln!(
+            "  (offline analysis — re-run with --online to add registry-API \
+             provenance signals)"
+        );
+    }
+    eprintln!();
+}
+
+/// Render the analysis verdict for a package-manager install (JSON form).
+fn print_plan_json(plan: &InstallPlan, online: bool) {
+    #[derive(serde::Serialize)]
+    struct PackageOut<'a> {
+        ecosystem: String,
+        name: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        version: Option<&'a str>,
+        risk_score: u32,
+        risk_level: &'a str,
+    }
+    #[derive(serde::Serialize)]
+    struct PlanOut<'a> {
+        schema_version: u32,
+        kind: &'a str,
+        manager: &'a str,
+        command: &'a str,
+        sandboxed: bool,
+        online: bool,
+        packages: Vec<PackageOut<'a>>,
+        verdict: &'a Verdict,
+        notes: &'a [String],
+    }
+    let packages = plan
+        .packages
+        .iter()
+        .map(|p| PackageOut {
+            ecosystem: p.reference.ecosystem.to_string(),
+            name: &p.reference.name,
+            version: p.reference.version.as_deref(),
+            risk_score: p.risk.score,
+            risk_level: p.risk.risk_level,
+        })
+        .collect();
+    let out = PlanOut {
+        schema_version: 1,
+        kind: "install_analysis",
+        manager: plan.manager.label(),
+        command: &plan.analysis_command,
+        // Explicit and always false: this transaction is analyzed, not
+        // sandboxed. A consumer can assert on it.
+        sandboxed: false,
+        online,
+        packages,
+        verdict: &plan.verdict,
+        notes: &plan.notes,
+    };
+    if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
+        eprintln!("tirith install: failed to write JSON output");
+        return;
+    }
+    println!();
+}
+
+/// JSON record of the completed package-manager transaction.
+fn print_outcome_json(plan: &InstallPlan, checkpoint_id: Option<&str>, exit_code: i32) {
+    let out = serde_json::json!({
+        "schema_version": 1,
+        "kind": "install_outcome",
+        "manager": plan.manager.label(),
+        "command": plan.analysis_command,
+        "sandboxed": false,
+        "ran": true,
+        "exit_code": exit_code,
+        "checkpoint_id": checkpoint_id,
+        "verdict_action": format!("{:?}", plan.verdict.action),
+    });
+    if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
+        eprintln!("tirith install: failed to write JSON output");
+        return;
+    }
+    println!();
+}
+
+/// Render the URL-form preflight verdict (human form).
+fn print_url_preflight_human(url: &str, verdict: &Verdict) {
+    let s = Stream::Stderr;
+    eprintln!("tirith install: preflight analysis of install URL");
+    eprintln!("  url: {url}");
+    eprintln!("  (pre-execution URL-risk analysis — the script body is analyzed after download; not a sandbox)");
+    match verdict.action {
+        Action::Allow => {
+            eprintln!("  {}", tirith_core::style::green("preflight: ALLOW", s));
+        }
+        Action::Warn | Action::WarnAck => {
+            eprintln!(
+                "  {}",
+                tirith_core::style::yellow(
+                    &format!("preflight: WARN — {} finding(s)", verdict.findings.len()),
+                    s,
+                )
+            );
+        }
+        Action::Block => {
+            eprintln!(
+                "  {}",
+                tirith_core::style::bold_red(
+                    &format!("preflight: BLOCK — {} finding(s)", verdict.findings.len()),
+                    s,
+                )
+            );
+        }
+    }
+    for finding in &verdict.findings {
+        let sev = tirith_core::style::severity_label(&finding.severity, s);
+        eprintln!("    {} {} — {}", sev, finding.rule_id, finding.title);
+        eprintln!("      {}", finding.description);
+    }
+}
+
+/// Render the URL-form preflight verdict (JSON form).
+fn print_url_preflight_json(url: &str, verdict: &Verdict) {
+    let out = serde_json::json!({
+        "schema_version": 1,
+        "kind": "install_url_preflight",
+        "url": url,
+        "sandboxed": false,
+        "verdict": verdict,
+    });
+    if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
+        eprintln!("tirith install: failed to write JSON output");
+        return;
+    }
+    println!();
+}
+
+/// JSON record of the completed URL transaction (the `runner` result).
+#[cfg(unix)]
+fn print_url_outcome_json(result: &runner::RunResult) {
+    let out = serde_json::json!({
+        "schema_version": 1,
+        "kind": "install_url_outcome",
+        "sandboxed": false,
+        "receipt": &result.receipt,
+        "executed": result.executed,
+        "exit_code": result.exit_code,
+    });
+    if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
+        eprintln!("tirith install: failed to write JSON output");
+        return;
+    }
+    println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tirith_core::verdict::{Finding, RuleId, Severity};
+
+    /// A fake [`InstallRunner`] — records the argv it was asked to run and
+    /// returns a canned exit code. It NEVER spawns a process, so a test using
+    /// it installs nothing and touches no network.
+    struct FakeRunner {
+        exit_code: Option<i32>,
+        seen: Mutex<Vec<(String, Vec<String>)>>,
+    }
+    impl FakeRunner {
+        fn new(exit_code: Option<i32>) -> Self {
+            Self {
+                exit_code,
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+    impl InstallRunner for FakeRunner {
+        fn run(&self, program: &str, args: &[String]) -> std::io::Result<Option<i32>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((program.to_string(), args.to_vec()));
+            Ok(self.exit_code)
+        }
+    }
+
+    fn allow_verdict() -> Verdict {
+        Verdict::from_findings(vec![], 3, Default::default())
+    }
+
+    fn warn_verdict() -> Verdict {
+        Verdict::from_findings(
+            vec![Finding {
+                rule_id: RuleId::ThreatSuspiciousPackage,
+                severity: Severity::Medium,
+                title: "t".to_string(),
+                description: "d".to_string(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }],
+            3,
+            Default::default(),
+        )
+    }
+
+    fn block_verdict() -> Verdict {
+        Verdict::from_findings(
+            vec![Finding {
+                rule_id: RuleId::ThreatMaliciousPackage,
+                severity: Severity::Critical,
+                title: "t".to_string(),
+                description: "d".to_string(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }],
+            3,
+            Default::default(),
+        )
+    }
+
+    #[test]
+    fn install_source_package_manager_mapping() {
+        assert_eq!(
+            InstallSource::Npm.package_manager(),
+            Some(PackageManager::Npm)
+        );
+        assert_eq!(
+            InstallSource::Pip.package_manager(),
+            Some(PackageManager::Pip)
+        );
+        assert_eq!(
+            InstallSource::Cargo.package_manager(),
+            Some(PackageManager::Cargo)
+        );
+        assert_eq!(InstallSource::Url.package_manager(), None);
+    }
+
+    #[test]
+    fn decide_proceed_allow_goes() {
+        let policy = Policy::default();
+        assert!(matches!(
+            decide_proceed(&allow_verdict(), &policy, false, false, true),
+            ProceedDecision::Go
+        ));
+    }
+
+    #[test]
+    fn decide_proceed_block_stops_with_exit_1() {
+        let policy = Policy::default();
+        // No TIRITH=0 in env for this test path.
+        assert!(matches!(
+            decide_proceed(&block_verdict(), &policy, true, false, true),
+            ProceedDecision::Stop(1)
+        ));
+    }
+
+    #[test]
+    fn decide_proceed_warn_noninteractive_stops_without_yes() {
+        let policy = Policy::default();
+        assert!(matches!(
+            decide_proceed(&warn_verdict(), &policy, false, false, true),
+            ProceedDecision::Stop(2)
+        ));
+    }
+
+    #[test]
+    fn decide_proceed_warn_with_yes_goes() {
+        let policy = Policy::default();
+        assert!(matches!(
+            decide_proceed(&warn_verdict(), &policy, false, true, true),
+            ProceedDecision::Go
+        ));
+    }
+
+    #[test]
+    fn fake_runner_records_argv_and_never_spawns() {
+        // run_and_record with a fake runner: nothing is installed, the argv is
+        // recorded, and the fake's exit code is returned.
+        let req_args = vec!["my-pkg".to_string()];
+        let argv = install_txn::build_argv(PackageManager::Npm, &req_args);
+        let plan = InstallPlan {
+            manager: PackageManager::Npm,
+            argv: argv.clone(),
+            analysis_command: argv.display(),
+            packages: vec![],
+            verdict: allow_verdict(),
+            risk_breakdowns: vec![],
+            notes: vec![],
+        };
+        let runner = FakeRunner::new(Some(0));
+        // cwd = None so no checkpoint is attempted (keeps the test hermetic —
+        // no filesystem writes outside tempdirs).
+        let code = run_and_record(&plan, None, true, &runner);
+        assert_eq!(code, 0);
+        let seen = runner.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the runner must be called exactly once");
+        assert_eq!(seen[0].0, "npm");
+        assert_eq!(seen[0].1, vec!["install", "my-pkg"]);
+    }
+
+    #[test]
+    fn fake_runner_propagates_nonzero_exit() {
+        let req_args = vec!["my-pkg".to_string()];
+        let argv = install_txn::build_argv(PackageManager::Cargo, &req_args);
+        let plan = InstallPlan {
+            manager: PackageManager::Cargo,
+            argv: argv.clone(),
+            analysis_command: argv.display(),
+            packages: vec![],
+            verdict: allow_verdict(),
+            risk_breakdowns: vec![],
+            notes: vec![],
+        };
+        let runner = FakeRunner::new(Some(17));
+        let code = run_and_record(&plan, None, true, &runner);
+        assert_eq!(code, 17, "the install's own exit code must propagate");
+    }
+
+    #[test]
+    fn fake_runner_signal_termination_is_failure() {
+        let argv = install_txn::build_argv(PackageManager::Pip, &["x".to_string()]);
+        let plan = InstallPlan {
+            manager: PackageManager::Pip,
+            argv: argv.clone(),
+            analysis_command: argv.display(),
+            packages: vec![],
+            verdict: allow_verdict(),
+            risk_breakdowns: vec![],
+            notes: vec![],
+        };
+        let runner = FakeRunner::new(None); // signal-terminated → no code
+        let code = run_and_record(&plan, None, true, &runner);
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn preflight_url_plain_installer_does_not_block() {
+        // A plain https installer URL, analyzed as a *download*, must not be
+        // blocked — analyzing it as a pipe-to-shell would. Offline, no network.
+        let verdict = preflight_url("https://get.example-tool.sh/install.sh", None, false);
+        assert_ne!(
+            verdict.action,
+            Action::Block,
+            "a download-shaped preflight must not block a plain installer URL: {:?}",
+            verdict.findings,
+        );
+    }
+
+    #[test]
+    fn preflight_url_raw_ip_is_flagged() {
+        // A raw-IP URL is suspicious and the preflight should surface it
+        // (raw_ip_url rule) — still offline, no fetch.
+        let verdict = preflight_url("http://203.0.113.5/install.sh", None, false);
+        assert!(
+            verdict.action != Action::Allow,
+            "a raw-IP install URL should raise at least one finding"
+        );
+    }
+}

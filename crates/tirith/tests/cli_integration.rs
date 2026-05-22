@@ -3328,3 +3328,202 @@ fn update_rollback_dry_run_changes_nothing() {
     assert_eq!(fs::metadata(&live).unwrap().len(), original_len);
     assert_eq!(fs::read(&backup).unwrap(), b"BACKUP-BYTES");
 }
+
+// ---------------------------------------------------------------------------
+// `tirith install` — the safe-install transaction (M3 chunk 6, item 7).
+//
+// Every test below runs the real `tirith install` binary but MUST NOT install
+// anything and MUST NOT hit the network:
+//   * the npm/pip/cargo form is always run with `--no-exec`, which stops the
+//     transaction after analysis — before the real package manager is ever
+//     spawned;
+//   * `TIRITH_OFFLINE=1` is set so even the (already opt-in) registry-API
+//     path is a guaranteed no-op;
+//   * the `url` form is exercised only for argument validation, which short-
+//     circuits before any download.
+// ---------------------------------------------------------------------------
+
+/// A `tirith` command for install tests: TIRITH bypass cleared, offline forced.
+fn tirith_install() -> Command {
+    let mut cmd = tirith();
+    cmd.env("TIRITH_OFFLINE", "1");
+    cmd
+}
+
+#[test]
+fn install_missing_source_is_usage_error() {
+    // No `<npm|pip|cargo|url>` positional — clap rejects it.
+    let out = tirith_install()
+        .args(["install"])
+        .output()
+        .expect("failed to run tirith install");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "missing install source must be a usage error"
+    );
+}
+
+#[test]
+fn install_npm_no_packages_is_usage_error() {
+    let out = tirith_install()
+        .args(["install", "npm"])
+        .output()
+        .expect("failed to run tirith install");
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no packages"),
+        "should explain that no packages were given, got: {stderr}"
+    );
+}
+
+#[test]
+fn install_npm_clean_package_no_exec_exits_zero() {
+    // A package name unknown to any threat DB, analyzed offline, with
+    // --no-exec: the transaction is analyzed and recorded but the real
+    // `npm install` is never run. Exit 0, nothing installed.
+    //
+    // tirith's own flags (--no-exec here) go BEFORE the <source>; anything
+    // after the source is forwarded verbatim to the package manager.
+    let out = tirith_install()
+        .args([
+            "install",
+            "--no-exec",
+            "npm",
+            "my-unique-internal-pkg-xyzzy",
+        ])
+        .output()
+        .expect("failed to run tirith install");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a clean --no-exec install must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("NOT run") || stderr.contains("--no-exec"),
+        "must state the install was not run, got: {stderr}"
+    );
+}
+
+#[test]
+fn install_no_exec_json_is_well_formed_and_not_sandboxed() {
+    // The JSON envelope for an analyzed transaction must parse, identify
+    // itself, and carry `sandboxed: false` — tirith never claims to sandbox.
+    let out = tirith_install()
+        .args([
+            "install",
+            "--no-exec",
+            "--format",
+            "json",
+            "npm",
+            "my-unique-internal-pkg-xyzzy",
+        ])
+        .output()
+        .expect("failed to run tirith install");
+    // --no-exec exit code reflects the verdict: 0 allow / 1 block / 2 warn.
+    // A clean unknown npm package, analyzed offline, allows → exit 0.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a clean --no-exec npm analysis must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("install --no-exec --format json must produce valid JSON");
+    assert_eq!(json["kind"], "install_analysis");
+    assert_eq!(json["manager"], "npm");
+    assert_eq!(
+        json["sandboxed"], false,
+        "install must never report itself as sandboxed"
+    );
+    assert_eq!(json["command"], "npm install my-unique-internal-pkg-xyzzy");
+    assert!(
+        json["verdict"].is_object(),
+        "the JSON must embed the analysis verdict"
+    );
+    // --no-exec means the transaction never produced an `install_outcome`.
+    assert!(
+        json.get("ran").is_none(),
+        "an analyze-only run must not report `ran`"
+    );
+}
+
+#[test]
+fn install_human_output_never_claims_sandboxing() {
+    // Honest-framing guard: the human output may use the word "sandbox" ONLY
+    // in the explicit "not a sandbox" disclaimer — never as a claim.
+    let out = tirith_install()
+        .args([
+            "install",
+            "--no-exec",
+            "pip",
+            "my-unique-internal-pkg-xyzzy",
+        ])
+        .output()
+        .expect("failed to run tirith install");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lower = combined.to_lowercase();
+    // Every occurrence of "sandbox" must be inside a negating phrase.
+    for (idx, _) in lower.match_indices("sandbox") {
+        let window_start = idx.saturating_sub(12);
+        let window = &lower[window_start..idx + "sandbox".len()];
+        assert!(
+            window.contains("not a sandbox"),
+            "the word 'sandbox' may only appear as 'not a sandbox', \
+             found in context: ...{window}..."
+        );
+    }
+    assert!(
+        !lower.contains("isolate") && !lower.contains("isolation"),
+        "install output must not claim to isolate the install: {combined}"
+    );
+}
+
+#[test]
+fn install_help_states_it_is_not_a_sandbox() {
+    let out = tirith()
+        .args(["install", "--help"])
+        .output()
+        .expect("failed to run tirith install --help");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("does NOT sandbox") || stdout.contains("not sandbox"),
+        "install --help must state it does not sandbox, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("non-goal"),
+        "install --help must reference sandboxing as a non-goal, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn install_url_no_url_is_usage_error() {
+    // The url form with no URL — short-circuits before any download.
+    let out = tirith_install()
+        .args(["install", "url"])
+        .output()
+        .expect("failed to run tirith install url");
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn install_url_extra_args_is_usage_error() {
+    // The url form takes exactly one URL — two is a usage error, no download.
+    let out = tirith_install()
+        .args([
+            "install",
+            "url",
+            "https://a.example.com/install.sh",
+            "https://b.example.com/install.sh",
+        ])
+        .output()
+        .expect("failed to run tirith install url");
+    assert_eq!(out.status.code(), Some(2));
+}

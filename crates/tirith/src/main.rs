@@ -148,6 +148,75 @@ Examples:
         sha256: Option<String>,
     },
 
+    /// Analyze and run a package install as a recorded transaction
+    #[command(after_help = "\
+A safe-install transaction: tirith analyzes an install's supply-chain risk
+BEFORE running it, presents the verdict, records the transaction (a working-
+directory checkpoint plus an audit entry), then runs the real install only
+after the analysis and your go-ahead.
+
+This is pre-execution install-RISK ANALYSIS plus a recorded transaction. It
+does NOT sandbox or isolate the install — the real `npm install` / `pip
+install` / `cargo install` (or the downloaded script) runs with your full
+privileges. Runtime sandboxing is an explicit tirith non-goal.
+
+The package(s) are scored with the deterministic `tirith package risk`
+engine, the install command with the install-command rules, and any URL with
+the URL analysis. A block refuses (bypass per policy); a warn requires
+acknowledgement; an allow proceeds. Offline by default — `--online` adds
+registry-API provenance signals; `--offline` / TIRITH_OFFLINE forces offline.
+
+tirith's own flags (--online, --offline, --no-exec, --yes, --format, --sha256)
+go BEFORE the <source>; everything AFTER the source is passed verbatim to the
+package manager (so `--save-dev` reaches npm, not tirith).
+
+Examples:
+  tirith install npm left-pad
+  tirith install --online pip requests
+  tirith install --yes cargo ripgrep
+  tirith install --no-exec npm some-pkg       # analyze only, do not install
+  tirith install npm some-pkg --save-dev      # --save-dev is passed to npm
+  tirith install url https://get.example-tool.sh")]
+    Install {
+        /// What to install: a package manager (npm, pip, cargo) or a URL
+        #[arg(value_enum)]
+        source: cli::install::InstallSource,
+
+        /// Packages and flags passed verbatim to the package manager (or the
+        /// URL for the `url` form). tirith's own flags go before <source>.
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        args: Vec<String>,
+
+        /// Also consult each package's registry API (npm / PyPI / crates.io)
+        /// for provenance signals. Off by default; ignored under --offline.
+        #[arg(long)]
+        online: bool,
+
+        /// Force offline analysis even if --online is passed. Also honored via
+        /// the TIRITH_OFFLINE environment variable.
+        #[arg(long)]
+        offline: bool,
+
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+
+        /// Proceed past warnings without an interactive prompt
+        #[arg(long)]
+        yes: bool,
+
+        /// Analyze and record only — do NOT run the real install
+        #[arg(long)]
+        no_exec: bool,
+
+        /// Expected SHA-256 of the downloaded script (url form only)
+        #[arg(long)]
+        sha256: Option<String>,
+    },
+
     /// Score a URL for security risk
     #[command(after_help = "\
 Examples:
@@ -1541,6 +1610,21 @@ fn run() {
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
             cli::run::run(&url, no_exec, json, sha256)
+        }
+
+        Commands::Install {
+            source,
+            args,
+            online,
+            offline,
+            format,
+            json,
+            yes,
+            no_exec,
+            sha256,
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::install::run(source, &args, online, offline, json, yes, no_exec, sha256)
         }
 
         Commands::Score {

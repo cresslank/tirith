@@ -41,6 +41,7 @@ help_example_tests! {
     help_paste      => (["paste", "--help"], "tirith paste");
     #[cfg(unix)]
     help_run        => (["run", "--help"], "tirith run");
+    help_install    => (["install", "--help"], "tirith install npm left-pad");
     help_score      => (["score", "--help"], "tirith score");
     help_score_explain => (["score", "--help"], "tirith score --explain");
     help_policy_tune => (["policy", "tune", "--help"], "tirith policy tune --from-audit");

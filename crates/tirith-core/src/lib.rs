@@ -11,6 +11,7 @@ pub mod engine;
 pub mod escalation;
 pub mod extract;
 pub mod homoglyph;
+pub mod install_txn;
 pub mod license;
 pub mod mcp;
 pub mod network;

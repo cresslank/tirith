@@ -102,6 +102,7 @@ pub mod explain;
 pub mod gateway;
 pub mod hook_event;
 pub mod init;
+pub mod install;
 pub mod last_trigger;
 pub mod license_cmd;
 pub mod manpage;
