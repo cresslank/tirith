@@ -3484,6 +3484,14 @@ fn install_no_exec_json_is_well_formed_and_not_sandboxed() {
 /// BLOCK. This pins the audit-after-decision ordering: the entry exists and
 /// carries the BLOCK verdict. (The bypass-stamped path runs the real package
 /// manager, which a hermetic test cannot exercise.)
+///
+/// Unix-gated: the test isolates the audit log by pointing `XDG_DATA_HOME` at
+/// a tempdir, but `data_dir()` resolves the roaming-AppData location
+/// differently on Windows, so the audit file does not land where the test
+/// reads it. The CR9 ordering invariant is OS-independent and is exercised on
+/// the Linux / macOS / MSRV runners; auditing on Windows is tracked as a
+/// separate follow-up.
+#[cfg(unix)]
 #[test]
 fn install_block_is_audited_with_the_block_verdict() {
     let tmp = tempfile::tempdir().expect("tempdir");
