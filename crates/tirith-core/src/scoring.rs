@@ -161,6 +161,11 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::WorkflowUntrustedInput
         | RuleId::DockerfileUnpinnedImage
         | RuleId::PackageScriptDangerous
+        | RuleId::NotebookHiddenContent
+        | RuleId::NotebookSuspiciousOutput
+        | RuleId::AgentInstructionHidden
+        | RuleId::SvgScriptEmbedded
+        | RuleId::SvgExternalReference
         | RuleId::HiddenCssContent
         | RuleId::HiddenColorContent
         | RuleId::HiddenHtmlAttribute

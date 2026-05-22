@@ -1,3 +1,4 @@
+pub mod aifile;
 pub mod cifile;
 pub mod cloaking;
 pub mod codefile;

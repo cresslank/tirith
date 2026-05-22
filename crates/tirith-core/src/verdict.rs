@@ -110,6 +110,13 @@ pub enum RuleId {
     DockerfileUnpinnedImage,
     PackageScriptDangerous,
 
+    // AI-relevant file hidden-content scan rules (file-content scan)
+    NotebookHiddenContent,
+    NotebookSuspiciousOutput,
+    AgentInstructionHidden,
+    SvgScriptEmbedded,
+    SvgExternalReference,
+
     // Threat intelligence rules — local DB
     ThreatMaliciousPackage,
     ThreatMaliciousIp,

@@ -919,6 +919,9 @@ pulled from api.tirith.dev
 | `.github/workflows/*.yml` | Actions pulling from spoofed URLs, curl in CI steps |
 | `package.json` scripts | `"postinstall": "curl ... \| bash"` |
 | `.env.example`, config templates | Spoofed API endpoints, service URLs |
+| `*.ipynb` (Jupyter notebooks) | Invisible/bidi characters, base64 blobs, hidden cells, suspicious cell outputs |
+| `CLAUDE.md`, `AGENTS.md`, `.cursorrules` | Hidden directives — HTML comments, visually-hidden elements (visible instructions are expected, not flagged) |
+| `*.svg` | Embedded `<script>`, `on*` event handlers, `javascript:` URIs, remote refs, XXE external entities |
 
 ### Modes
 

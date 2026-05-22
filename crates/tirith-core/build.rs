@@ -815,6 +815,12 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("workflow_untrusted_input", "WorkflowUntrustedInput"),
     ("dockerfile_unpinned_image", "DockerfileUnpinnedImage"),
     ("package_script_dangerous", "PackageScriptDangerous"),
+    // AI-relevant file hidden-content scan rules
+    ("notebook_hidden_content", "NotebookHiddenContent"),
+    ("notebook_suspicious_output", "NotebookSuspiciousOutput"),
+    ("agent_instruction_hidden", "AgentInstructionHidden"),
+    ("svg_script_embedded", "SvgScriptEmbedded"),
+    ("svg_external_reference", "SvgExternalReference"),
     // Threat intelligence — local DB
     ("threat_malicious_package", "ThreatMaliciousPackage"),
     ("threat_malicious_ip", "ThreatMaliciousIp"),

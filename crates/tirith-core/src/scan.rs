@@ -453,10 +453,14 @@ fn is_known_config_dir(name: &str) -> bool {
 }
 
 /// File extensions that indicate binary content (skip scanning).
+///
+/// `.svg` is deliberately NOT here: an SVG is XML text and can carry an
+/// active payload (`<script>`, an `on*` event handler) or an external
+/// reference — the `aifile` rules scan it for hidden / smuggled content.
 fn is_binary_extension(name: &str) -> bool {
     let binary_exts = [
-        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".svg", ".webp", ".mp3", ".mp4", ".wav",
-        ".avi", ".mov", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".exe", ".dll", ".so",
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".mp3", ".mp4", ".wav", ".avi",
+        ".mov", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".exe", ".dll", ".so",
         ".dylib", ".o", ".a", ".wasm", ".pyc", ".class", ".jar",
     ];
     let name_lower = name.to_lowercase();
@@ -564,6 +568,33 @@ mod tests {
         assert!(is_binary_extension("archive.tar.gz"));
         assert!(!is_binary_extension("config.json"));
         assert!(!is_binary_extension("CLAUDE.md"));
+        // SVG is XML text — it must NOT be skipped as binary, so the
+        // `aifile` rules can scan it for active / hidden content.
+        assert!(!is_binary_extension("logo.svg"));
+        assert!(!is_binary_extension("ICON.SVG"));
+    }
+
+    #[test]
+    fn test_svg_active_content_visible_in_scan() {
+        // An SVG carrying a <script> must be collected (not skipped as binary)
+        // and flagged by the aifile rules.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let file_path = tmp.path().join("evil.svg");
+        std::fs::write(
+            &file_path,
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><script>fetch('/x')</script></svg>"#,
+        )
+        .expect("write temp file");
+
+        let result = scan_single_file(&file_path).expect("scan should succeed");
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|f| f.rule_id == crate::verdict::RuleId::SvgScriptEmbedded),
+            "SVG with embedded script should be flagged: {:?}",
+            result.findings
+        );
     }
 
     #[test]

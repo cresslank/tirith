@@ -304,6 +304,16 @@ fn test_cifile_fixtures() {
 }
 
 #[test]
+fn test_aifile_fixtures() {
+    let fixtures = load_fixtures("aifile.toml");
+    let count = fixtures.len();
+    for fixture in &fixtures {
+        run_fixture(fixture);
+    }
+    eprintln!("Passed {count} aifile fixtures");
+}
+
+#[test]
 fn test_threatintel_fixtures() {
     // Point the threat DB cache at the test fixture DB so that DB-dependent
     // rules (threat_malicious_package, threat_malicious_ip, etc.) can fire.
@@ -462,6 +472,7 @@ const ALL_FIXTURE_FILES: &[&str] = &[
     "credential.toml",
     "codefile.toml",
     "cifile.toml",
+    "aifile.toml",
     "threatintel.toml",
 ];
 
@@ -562,6 +573,12 @@ const ALL_RULE_IDS: &[&str] = &[
     "workflow_untrusted_input",
     "dockerfile_unpinned_image",
     "package_script_dangerous",
+    // AI-relevant file hidden-content scan rules
+    "notebook_hidden_content",
+    "notebook_suspicious_output",
+    "agent_instruction_hidden",
+    "svg_script_embedded",
+    "svg_external_reference",
     // Threat intelligence — local DB
     "threat_malicious_package",
     "threat_malicious_ip",
@@ -767,6 +784,12 @@ fn test_rule_id_list_is_complete() {
         RuleId::WorkflowUntrustedInput,
         RuleId::DockerfileUnpinnedImage,
         RuleId::PackageScriptDangerous,
+        // AI-relevant file hidden-content scan rules
+        RuleId::NotebookHiddenContent,
+        RuleId::NotebookSuspiciousOutput,
+        RuleId::AgentInstructionHidden,
+        RuleId::SvgScriptEmbedded,
+        RuleId::SvgExternalReference,
         // Threat intelligence — local DB
         RuleId::ThreatMaliciousPackage,
         RuleId::ThreatMaliciousIp,
@@ -863,6 +886,10 @@ fn test_no_url_rules_have_no_url_fixtures() {
         "workflow_untrusted_input",     // CI workflow file scan, no URL needed
         "dockerfile_unpinned_image",    // Dockerfile scan, no URL needed
         "package_script_dangerous",     // package.json scan, no URL needed
+        "notebook_hidden_content",      // .ipynb scan, no URL needed
+        "notebook_suspicious_output",   // .ipynb scan, no URL needed
+        "agent_instruction_hidden",     // AI-instruction file scan, no URL needed
+        "svg_script_embedded",          // SVG scan, no URL needed
     ]
     .into_iter()
     .collect();

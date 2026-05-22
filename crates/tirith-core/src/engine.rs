@@ -570,6 +570,16 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             ));
         }
 
+        // AI-relevant file hidden-content rules: Jupyter notebooks, AI
+        // agent-instruction files, and SVG images. The module self-selects by
+        // file path; a non-AI-relevant file produces nothing.
+        if crate::rules::aifile::is_ai_file(ctx.file_path.as_deref()) {
+            findings.extend(crate::rules::aifile::check(
+                &ctx.input,
+                ctx.file_path.as_deref(),
+            ));
+        }
+
         if crate::rules::rendered::is_renderable_file(ctx.file_path.as_deref()) {
             // PDFs need their own parser; everything else is treated as text.
             let is_pdf = ctx

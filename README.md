@@ -365,6 +365,14 @@ Detects content invisible to humans but readable by AI in HTML, Markdown, and PD
 - **HTML/Markdown comments** — prompt injection phrases (High), destructive commands like `rm -rf` or `curl|bash` (Medium), long comments hiding instructions (Low)
 - **PDF hidden text** — sub-pixel rendered text (font-size < 1px) invisible to readers but parseable by LLMs
 
+### AI-relevant file hidden-content scanning
+
+`tirith scan` also inspects file types an AI coding agent (or a renderer) reads and acts on, looking for content **smuggled past a human reviewer**. A normal notebook, an ordinary `CLAUDE.md` with visible instructions, and a plain SVG image stay clean — only hidden / smuggled content fires.
+
+- **Jupyter notebooks** (`*.ipynb`) — invisible / bidi / zero-width characters in cell source, a base64-encoded blob embedded in source, a cell hidden from the rendered view (`metadata.jupyter.source_hidden` / a `hide_input` tag), and cell *outputs* carrying invisible characters or active / hidden HTML
+- **AI agent-instruction files** (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, and similar) — *hidden* directives only: an instruction inside an HTML comment (invisible in rendered Markdown) or a visually-hidden HTML element. These files legitimately contain visible instructions, so ordinary visible instructions never fire
+- **SVG images** (`*.svg`) — an embedded `<script>`, an inline `on*` event handler, a `javascript:` URI, a remote `xlink:href` / `href`, or an XXE external-entity declaration
+
 ### Cloaking detection
 
 `tirith fetch` compares server responses across 6 user-agents (Chrome, ClaudeBot, ChatGPT-User, PerplexityBot, Googlebot, curl) to detect when servers serve different content to AI bots vs browsers.

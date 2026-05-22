@@ -347,6 +347,13 @@ trigger, curl|bash in workflow run steps, untrusted-input interpolation,
 un-pinned Dockerfile base images, remote Terraform modules, untrusted Helm
 chart repos, and dangerous package.json install scripts.
 
+It also scans AI-relevant file types for content smuggled past a human
+reviewer: hidden content in Jupyter notebooks (.ipynb) — invisible characters,
+base64 blobs, hidden cells, suspicious outputs; hidden directives in AI
+agent-instruction files (CLAUDE.md, AGENTS.md, .cursorrules) — HTML comments
+and visually-hidden elements; and active or external content in SVG images —
+embedded scripts, event handlers, remote references.
+
 Examples:
   tirith scan ./
   tirith scan --ci --fail-on high ./
