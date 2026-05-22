@@ -72,20 +72,16 @@ pub struct RegistryMetadata {
     /// assess an abnormal version jump. `None` when fewer than two versions
     /// exist.
     pub previous_version: Option<String>,
-    /// The set of current maintainer / owner identifiers the registry lists.
-    /// Meaningful **only** when [`maintainers_known`](Self::maintainers_known)
-    /// is `true` — a registry API that does not carry maintainers leaves this
-    /// empty *and* `maintainers_known = false`, and an empty list must NOT
-    /// then be read as "this package has no owners".
+    /// The maintainer / owner identifiers the registry lists for the package.
+    ///
+    /// `Some(list)` — this registry's API exposes a maintainer / owner field
+    /// and `list` is what it carried (an empty `Some(vec![])` is a real
+    /// "registry lists zero owners" signal). `None` — this registry's API does
+    /// not carry a maintainer field at all (the PyPI JSON API and the
+    /// crates.io crate endpoint do not; the npm registry does), so ownership is
+    /// honestly *unknown*, never a false "ownership changed".
     #[serde(default)]
-    pub maintainers: Vec<String>,
-    /// `true` when this registry's API actually exposes a maintainer / owner
-    /// field. The npm registry does; the PyPI JSON API and the crates.io
-    /// crate endpoint do not. The ownership signal is only assessed when this
-    /// is `true`, so an absent field is honestly "unknown", never a false
-    /// "ownership changed".
-    #[serde(default)]
-    pub maintainers_known: bool,
+    pub maintainers: Option<Vec<String>>,
     /// Total downloads over the registry's reported window, when available.
     pub recent_downloads: Option<u64>,
     /// A source-repository URL the registry lists for the package, when any.
@@ -219,7 +215,7 @@ pub fn provenance_from_metadata(meta: &RegistryMetadata) -> ApiProvenance {
         .map(|t| now.saturating_sub(t) / SECONDS_PER_DAY);
 
     // Ownership signal — assessed ONLY when the registry actually exposes a
-    // maintainer / owner field (`maintainers_known`). A single registry API
+    // maintainer / owner field (`maintainers` is `Some`). A single registry API
     // call carries the *current* maintainer set, not its history, so a literal
     // "transfer" cannot be proven from one document; what *is* a real,
     // detectable red flag is a published package the registry lists with
@@ -228,16 +224,16 @@ pub fn provenance_from_metadata(meta: &RegistryMetadata) -> ApiProvenance {
     // set is just newness, not a transfer.
     //
     // For a registry whose API does not carry maintainers at all (PyPI,
-    // crates.io here), this is `None` — honestly unknown — never a false
-    // `Some(true)` inferred from an unavoidably-empty list.
-    let ownership_transferred = if !meta.maintainers_known {
-        None
-    } else {
-        match (meta.maintainers.is_empty(), package_age_days) {
+    // crates.io here), `maintainers` is `None` and this is `None` — honestly
+    // unknown — never a false `Some(true)` inferred from an unavoidably-empty
+    // list.
+    let ownership_transferred = match &meta.maintainers {
+        None => None,
+        Some(list) => match (list.is_empty(), package_age_days) {
             (true, Some(age)) if age > VERY_NEW_PACKAGE_DAYS => Some(true),
             (true, None) => None, // ownerless but age unknown — cannot judge
             _ => Some(false),
-        }
+        },
     };
 
     let version_spike = match (&meta.latest_version, &meta.previous_version) {
@@ -506,10 +502,10 @@ fn fetch_npm(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadata
         latest_version_unix,
         latest_version,
         previous_version,
-        maintainers: doc.maintainers.into_iter().filter_map(|m| m.name).collect(),
-        // The npm registry DOES expose a `maintainers` field, so the ownership
-        // signal is meaningful for npm packages.
-        maintainers_known: true,
+        // The npm registry DOES expose a `maintainers` field — `Some(list)`,
+        // so the ownership signal is meaningful for npm packages (even an
+        // empty list is a real "zero listed owners" signal).
+        maintainers: Some(doc.maintainers.into_iter().filter_map(|m| m.name).collect()),
         // The full npm document does not carry download counts; that is a
         // separate api.npmjs.org endpoint. We deliberately do not make a
         // second request — `recent_downloads` stays `None` (no signal).
@@ -643,10 +639,9 @@ fn fetch_pypi(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadat
         previous_version,
         // PyPI's JSON API does not expose maintainers in a stable machine
         // form, nor download counts (that is the separate pypistats service).
-        // Both stay unset — `maintainers_known = false` so the ownership
+        // `maintainers` is `None` — the field is absent — so the ownership
         // signal is honestly reported as unknown, not falsely inferred.
-        maintainers: Vec::new(),
-        maintainers_known: false,
+        maintainers: None,
         recent_downloads: None,
         repository_url,
         yanked_or_deprecated,
@@ -739,10 +734,9 @@ fn fetch_crates(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetad
         latest_version,
         previous_version,
         // crates.io does not list per-crate owners on this endpoint (owners
-        // are a separate endpoint); `maintainers_known = false` so the
-        // ownership signal is honestly unknown for crates.
-        maintainers: Vec::new(),
-        maintainers_known: false,
+        // are a separate endpoint); `maintainers` is `None` so the ownership
+        // signal is honestly unknown for crates.
+        maintainers: None,
         recent_downloads: doc.krate.downloads,
         repository_url: doc.krate.repository,
         yanked_or_deprecated,
@@ -1007,8 +1001,7 @@ mod tests {
             latest_version_unix: Some(unix_now() - 365 * SECONDS_PER_DAY),
             latest_version: Some("4.18.2".to_string()),
             previous_version: Some("4.18.1".to_string()),
-            maintainers: vec!["alice".to_string()],
-            maintainers_known: true,
+            maintainers: Some(vec!["alice".to_string()]),
             recent_downloads: Some(5_000_000),
             repository_url: Some("https://github.com/owner/repo".to_string()),
             yanked_or_deprecated: false,
@@ -1125,8 +1118,9 @@ mod tests {
 
     #[test]
     fn ownership_transfer_inferred_for_ownerless_old_package() {
-        let mut m = meta_clean(); // maintainers_known = true (npm-shaped)
-        m.maintainers = Vec::new();
+        // npm-shaped: `maintainers` is `Some` (the field exists) but empty.
+        let mut m = meta_clean();
+        m.maintainers = Some(Vec::new());
         m.created_unix = Some(unix_now() - 3650 * SECONDS_PER_DAY);
         assert_eq!(
             provenance_from_metadata(&m).ownership_transferred,
@@ -1145,12 +1139,11 @@ mod tests {
 
     #[test]
     fn ownership_unknown_when_registry_omits_maintainers() {
-        // A PyPI / crates.io-shaped response: an unavoidably-empty maintainer
-        // list with `maintainers_known = false` must NOT be read as an
-        // ownership transfer — it is honestly unknown.
+        // A PyPI / crates.io-shaped response: `maintainers` is `None` — the
+        // registry API has no maintainer field — so an ownerless package must
+        // NOT be read as an ownership transfer; it is honestly unknown.
         let mut m = meta_clean();
-        m.maintainers = Vec::new();
-        m.maintainers_known = false;
+        m.maintainers = None;
         m.created_unix = Some(unix_now() - 3650 * SECONDS_PER_DAY);
         assert_eq!(
             provenance_from_metadata(&m).ownership_transferred,
@@ -1318,5 +1311,40 @@ mod tests {
         assert!(parse_rfc3339_to_unix("2020-01-01T00:00:00Z").is_some());
         assert!(parse_rfc3339_to_unix("2020-01-01T00:00:00.000Z").is_some());
         assert!(parse_rfc3339_to_unix("not-a-date").is_none());
+    }
+
+    #[test]
+    fn cache_envelope_tolerates_old_maintainers_shape() {
+        // The on-disk cache is best-effort and TTL'd, so the `maintainers` /
+        // `maintainers_known` -> `maintainers: Option<Vec<String>>` shape
+        // change must not hard-fail a stale entry. An old envelope carried a
+        // `maintainers` array and a now-removed `maintainers_known` bool: the
+        // array still deserializes into `Some(list)` and the unknown field is
+        // ignored, so the cache load succeeds (no needless re-fetch).
+        let old = r#"{
+            "fetched_at": 1700000000,
+            "value": {
+                "source": "npm",
+                "maintainers": ["alice", "bob"],
+                "maintainers_known": true,
+                "yanked_or_deprecated": false
+            }
+        }"#;
+        let env: CacheEnvelope =
+            serde_json::from_str(old).expect("an old-format cache entry must still deserialize");
+        assert_eq!(
+            env.value.maintainers,
+            Some(vec!["alice".to_string(), "bob".to_string()])
+        );
+
+        // An envelope with no `maintainers` field at all defaults to `None`
+        // (the registry-omits-the-field case) — never a panic.
+        let no_field = r#"{
+            "fetched_at": 1700000000,
+            "value": { "source": "pypi", "yanked_or_deprecated": false }
+        }"#;
+        let env: CacheEnvelope = serde_json::from_str(no_field)
+            .expect("a cache entry without `maintainers` must deserialize");
+        assert_eq!(env.value.maintainers, None);
     }
 }

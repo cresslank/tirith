@@ -350,8 +350,12 @@ fn npm_ownerless_established_package_flags_ownership() {
 
     let client = HttpRegistryClient::with_base_url_for_test(&server.url());
     let meta = client.fetch(Ecosystem::Npm, "abandoned-pkg").unwrap();
-    assert!(meta.maintainers_known, "npm exposes maintainers");
-    assert!(meta.maintainers.is_empty());
+    // npm exposes a maintainers field — `Some` — and this package lists none.
+    assert_eq!(
+        meta.maintainers,
+        Some(Vec::new()),
+        "npm exposes maintainers; this package lists zero"
+    );
     let prov = tirith_core::registry_api::provenance_from_metadata(&meta);
     assert_eq!(
         prov.ownership_transferred,
@@ -383,7 +387,10 @@ fn pypi_ownership_signal_is_unknown_not_false_positive() {
 
     let client = HttpRegistryClient::with_base_url_for_test(&server.url());
     let meta = client.fetch(Ecosystem::PyPI, "flask").unwrap();
-    assert!(!meta.maintainers_known, "PyPI API carries no maintainers");
+    assert_eq!(
+        meta.maintainers, None,
+        "the PyPI API carries no maintainers field"
+    );
     let prov = tirith_core::registry_api::provenance_from_metadata(&meta);
     assert_eq!(
         prov.ownership_transferred, None,
