@@ -3988,3 +3988,190 @@ fn collect_scan_findings(
         _ => {}
     }
 }
+
+// ===========================================================================
+// `tirith mcp lock` — MCP server inventory + lockfile generation (Milestone 4).
+//
+// These exercise the real binary against temp repositories. Each test pins the
+// repository root via `TIRITH_POLICY_ROOT` (so the test never depends on the
+// cwd or a real `.git`) and isolates the user config/state dirs on every
+// platform — `XDG_*` on Unix, `APPDATA` on Windows — so a `mcp lock` run can
+// never read or write outside the tempdir.
+// ===========================================================================
+
+/// Run `tirith mcp lock <args>` with `repo_root` pinned as the repository root
+/// and the user config/state/cache dirs isolated to `iso`. Returns
+/// `(stdout, stderr, exit_code)`.
+fn run_mcp_lock(
+    repo_root: &std::path::Path,
+    iso: &std::path::Path,
+    args: &[&str],
+) -> (String, String, i32) {
+    let out = tirith()
+        .arg("mcp")
+        .arg("lock")
+        .args(args)
+        .env("TIRITH_POLICY_ROOT", repo_root)
+        // Isolate user-level dirs so the command cannot touch the real home.
+        // `XDG_*` cover Unix; `APPDATA` covers Windows (etcetera honors it).
+        .env("XDG_CONFIG_HOME", iso)
+        .env("XDG_STATE_HOME", iso)
+        .env("XDG_CACHE_HOME", iso)
+        .env("XDG_DATA_HOME", iso)
+        .env("APPDATA", iso)
+        .output()
+        .expect("failed to run tirith mcp lock");
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+#[test]
+fn mcp_lock_writes_lockfile_for_planted_config() {
+    // A temp repo with a planted `.mcp.json` → a lockfile is written with the
+    // expected servers.
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{
+            "mcpServers": {
+                "filesystem": { "command": "npx", "args": ["-y", "server-filesystem"] },
+                "remote": { "url": "https://mcp.example.com/sse", "tools": ["search"] }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let (stdout, _err, code) = run_mcp_lock(repo.path(), iso.path(), &[]);
+    assert_eq!(code, 0, "mcp lock should exit 0 on success");
+
+    // The lockfile path is printed to stdout.
+    let lock_path = repo.path().join(".tirith").join("mcp.lock");
+    assert!(
+        stdout.trim().ends_with("mcp.lock"),
+        "stdout should print the lockfile path; got: {stdout}"
+    );
+    assert!(lock_path.is_file(), ".tirith/mcp.lock must be written");
+
+    // The lockfile records both servers, deterministically sorted by name.
+    let contents = fs::read_to_string(&lock_path).unwrap();
+    let lock: serde_json::Value = serde_json::from_str(&contents).expect("lockfile must be JSON");
+    assert_eq!(lock["format_version"], 1);
+    let servers = lock["servers"].as_array().expect("servers array");
+    assert_eq!(servers.len(), 2);
+    assert_eq!(servers[0]["name"], "filesystem");
+    assert_eq!(servers[1]["name"], "remote");
+    assert_eq!(servers[1]["transport"]["kind"], "url");
+    assert!(
+        lock["inventory_hash"]
+            .as_str()
+            .is_some_and(|h| !h.is_empty()),
+        "lockfile must carry a non-empty inventory hash"
+    );
+}
+
+#[test]
+fn mcp_lock_json_reports_server_and_config_counts() {
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": { "a": { "command": "node" } } }"#,
+    )
+    .unwrap();
+    fs::create_dir_all(repo.path().join(".vscode")).unwrap();
+    fs::write(
+        repo.path().join(".vscode/mcp.json"),
+        r#"{ "servers": { "b": { "command": "node" } } }"#,
+    )
+    .unwrap();
+
+    let (stdout, _err, code) = run_mcp_lock(repo.path(), iso.path(), &["--format", "json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("mcp lock JSON");
+    assert_eq!(v["configs_found"], 2, "two MCP configs were planted");
+    assert_eq!(v["servers_locked"], 2, "two servers were declared");
+    assert_eq!(v["malformed_configs"].as_array().unwrap().len(), 0);
+    assert_eq!(v["lockfile"]["servers"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn mcp_lock_no_mcp_config_is_clean_not_an_error() {
+    // A repo with no MCP config → a clean "nothing to lock" result: exit 0, an
+    // honest message, and an empty-but-valid lockfile written as a baseline.
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+
+    let (stdout, err, code) = run_mcp_lock(repo.path(), iso.path(), &[]);
+    assert_eq!(code, 0, "no MCP config is NOT an error — must exit 0");
+    assert!(
+        err.contains("no MCP configuration"),
+        "the no-config case must be reported plainly; stderr: {err}"
+    );
+
+    // An empty lockfile is still written so a later check has a baseline.
+    let lock_path = repo.path().join(".tirith").join("mcp.lock");
+    assert!(
+        lock_path.is_file(),
+        "an empty lockfile must still be written"
+    );
+    assert!(stdout.trim().ends_with("mcp.lock"));
+    let lock: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&lock_path).unwrap()).unwrap();
+    assert_eq!(lock["servers"].as_array().unwrap().len(), 0);
+    assert_eq!(lock["configs"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn mcp_lock_is_deterministic_across_runs() {
+    // Re-running `mcp lock` on an unchanged repo must produce a byte-identical
+    // lockfile — the property that makes it diff-friendly for chunk 2.
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": { "z": { "url": "https://z.example" }, "a": { "command": "n" } } }"#,
+    )
+    .unwrap();
+
+    let (_o1, _e1, c1) = run_mcp_lock(repo.path(), iso.path(), &[]);
+    let lock_path = repo.path().join(".tirith").join("mcp.lock");
+    let first = fs::read_to_string(&lock_path).unwrap();
+    let (_o2, _e2, c2) = run_mcp_lock(repo.path(), iso.path(), &[]);
+    let second = fs::read_to_string(&lock_path).unwrap();
+
+    assert_eq!(c1, 0);
+    assert_eq!(c2, 0);
+    assert_eq!(
+        first, second,
+        "mcp lock must be deterministic: re-running on an unchanged repo \
+         must produce a byte-identical lockfile"
+    );
+}
+
+#[test]
+fn mcp_lock_malformed_config_is_recorded_not_fatal() {
+    // A malformed MCP config contributes no servers and is reported as
+    // unparseable — it is never an error.
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    fs::write(repo.path().join("mcp.json"), "{ not valid json at all").unwrap();
+
+    let (stdout, _err, code) = run_mcp_lock(repo.path(), iso.path(), &["--format", "json"]);
+    assert_eq!(code, 0, "a malformed config is not fatal");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("mcp lock JSON");
+    // The file is discovered (counts as a config) but yields no servers.
+    assert_eq!(v["configs_found"], 1);
+    assert_eq!(v["servers_locked"], 0);
+    let malformed = v["malformed_configs"].as_array().unwrap();
+    assert_eq!(malformed.len(), 1);
+    assert_eq!(malformed[0], "mcp.json");
+}

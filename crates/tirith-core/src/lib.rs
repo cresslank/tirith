@@ -14,6 +14,7 @@ pub mod homoglyph;
 pub mod install_txn;
 pub mod license;
 pub mod mcp;
+pub mod mcp_lock;
 pub mod network;
 pub mod normalize;
 pub mod output;

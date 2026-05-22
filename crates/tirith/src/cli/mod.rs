@@ -146,6 +146,7 @@ pub mod install;
 pub mod last_trigger;
 pub mod license_cmd;
 pub mod manpage;
+pub mod mcp;
 pub mod mcp_server;
 pub mod package;
 pub mod paste;

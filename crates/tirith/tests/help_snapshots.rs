@@ -74,6 +74,8 @@ help_example_tests! {
     help_gateway    => (["gateway", "--help"], "tirith gateway");
     help_license    => (["license", "--help"], "tirith license");
     help_mcp_server => (["mcp-server", "--help"], "tirith mcp-server");
+    help_mcp        => (["mcp", "--help"], "tirith mcp lock");
+    help_mcp_lock   => (["mcp", "lock", "--help"], "tirith mcp lock --format json");
     help_verify_self => (["verify-self", "--help"], "tirith verify-self --format json");
     help_update     => (["update", "--help"], "tirith update --verify");
     help_update_rollback => (["update", "--help"], "tirith update --rollback");

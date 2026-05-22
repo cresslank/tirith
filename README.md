@@ -320,6 +320,10 @@ Run `tirith mcp-server` or use `tirith setup <tool> --with-mcp` to register tiri
 | `tirith_verify_mcp_config` | Validate MCP configs for insecure servers, shell injection in args, wildcard tools |
 | `tirith_fetch_cloaking` | Detect server-side cloaking (different content for bots vs browsers) |
 
+### MCP server governance
+
+`tirith mcp lock` captures every MCP server a repository declares — across `.mcp.json` / `mcp.json` / `mcp_settings.json` and the IDE config variants (`.vscode/`, `.cursor/`, `.windsurf/`, `.cline/`, `.amazonq/`, `.continue/`, `.kiro/`) — into a deterministic lockfile at `.tirith/mcp.lock`. Each server is recorded with its transport (a remote URL, or a local command + args), declared tools, and a content hash; servers are sorted by name so the lockfile is diff-friendly. Discovery is repo-local only and touches no network. (`tirith mcp` is a separate command group from `tirith mcp-server`, which runs tirith *as* an MCP server.)
+
 ### Config file scanning
 
 `tirith scan` detects prompt injection and hidden payloads in AI config files. It prioritizes and scans 50+ known AI config file patterns:
@@ -696,6 +700,7 @@ tirith daemon stop
 | `tirith audit {export,stats,report}` | Audit log management for compliance |
 | `tirith init` | Print the shell hook for your shell profile |
 | `tirith mcp-server` | Run as MCP server over JSON-RPC stdio |
+| `tirith mcp lock` | Inventory the repo's MCP servers into a deterministic `.tirith/mcp.lock` lockfile |
 
 ---
 

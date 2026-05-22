@@ -445,6 +445,31 @@ Used by MCP client configurations to run tirith as a local tool server."
     )]
     McpServer,
 
+    /// Govern the MCP servers a repository declares
+    #[command(after_help = "\
+Captures and governs the Model Context Protocol (MCP) servers a repository
+declares across its MCP configuration files — .mcp.json / mcp.json /
+mcp_settings.json and the IDE variants under .vscode/, .cursor/, .windsurf/,
+.cline/, .amazonq/, .continue/, .kiro/.
+
+`tirith mcp lock` writes a deterministic lockfile at .tirith/mcp.lock recording
+every declared MCP server — its name, transport (a remote URL, or a local
+command + args), and declared tools — plus a content hash per server and over
+the whole inventory. The lockfile is diff-friendly: servers are sorted by name,
+so a `git diff` shows exactly what changed in the repo's MCP surface.
+
+This is a local file operation — no network, off the detection hot path.
+Discovery is repo-local only: user-level configs (e.g. ~/.claude/) are never
+inventoried.
+
+Examples:
+  tirith mcp lock
+  tirith mcp lock --format json")]
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
+
     /// MCP gateway proxy — intercepts shell tool calls for security analysis
     #[command(after_help = "\
 Examples:
@@ -1442,6 +1467,30 @@ registry failure degrades gracefully. Findings respect the policy allowlist.")]
 }
 
 #[derive(Subcommand)]
+enum McpAction {
+    /// Generate or update .tirith/mcp.lock from the repo's MCP configs
+    #[command(after_help = "\
+Discovers the repository's MCP configuration files, builds a structured
+inventory of every declared MCP server, and writes a deterministic lockfile to
+.tirith/mcp.lock at the repository root.
+
+If no MCP configuration is found, that is reported plainly — it is not an
+error; an empty lockfile is still written so a later check has a baseline.
+
+Examples:
+  tirith mcp lock
+  tirith mcp lock --format json")]
+    Lock {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ThreatDbAction {
     /// Download or update the threat intelligence database
     #[command(after_help = "\
@@ -1707,6 +1756,13 @@ fn run() {
         }
 
         Commands::McpServer => cli::mcp_server::run(),
+
+        Commands::Mcp { action } => match action {
+            McpAction::Lock { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::mcp::lock(json)
+            }
+        },
 
         Commands::Gateway { action } => match action {
             GatewayAction::Run {
