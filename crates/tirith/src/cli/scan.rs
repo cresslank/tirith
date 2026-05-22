@@ -254,18 +254,27 @@ pub fn run(
         }
     }
 
-    if sarif {
-        print_sarif_result(&result);
+    // A JSON / SARIF write failure is the command's own I/O failure: a piped
+    // consumer must not receive truncated output paired with a `0` success
+    // code. When the scan would otherwise exit 0, surface exit 1 instead. A
+    // non-zero finding-driven code already propagates and is kept.
+    let output_ok = if sarif {
+        print_sarif_result(&result)
     } else if json {
-        print_json_result(&result);
-    } else if !ci {
-        print_human_result(&result);
-    }
+        print_json_result(&result)
+    } else {
+        if !ci {
+            print_human_result(&result);
+        }
+        true
+    };
 
     if result.has_findings_at_or_above(fail_on_severity) {
         1
     } else if result.total_findings() > 0 {
         2
+    } else if !output_ok {
+        1
     } else {
         0
     }
@@ -303,18 +312,25 @@ fn run_stdin(
         result.findings = apply_rule_overlay(std::mem::take(&mut result.findings), rule_overlay);
     }
 
-    if sarif {
-        print_sarif_file_result(&result);
+    // A JSON / SARIF write failure must not be reported as a `0` success —
+    // see `run`.
+    let output_ok = if sarif {
+        print_sarif_file_result(&result)
     } else if json {
-        print_json_file_result(&result);
-    } else if !ci {
-        print_human_file_result(&result);
-    }
+        print_json_file_result(&result)
+    } else {
+        if !ci {
+            print_human_file_result(&result);
+        }
+        true
+    };
 
     if result.findings.iter().any(|f| f.severity >= fail_on) {
         1
     } else if !result.findings.is_empty() {
         2
+    } else if !output_ok {
+        1
     } else {
         0
     }
@@ -346,18 +362,25 @@ fn run_single_file(
         result.findings = apply_rule_overlay(std::mem::take(&mut result.findings), rule_overlay);
     }
 
-    if sarif {
-        print_sarif_file_result(&result);
+    // A JSON / SARIF write failure must not be reported as a `0` success —
+    // see `run`.
+    let output_ok = if sarif {
+        print_sarif_file_result(&result)
     } else if json {
-        print_json_file_result(&result);
-    } else if !ci {
-        print_human_file_result(&result);
-    }
+        print_json_file_result(&result)
+    } else {
+        if !ci {
+            print_human_file_result(&result);
+        }
+        true
+    };
 
     if result.findings.iter().any(|f| f.severity >= fail_on) {
         1
     } else if !result.findings.is_empty() {
         2
+    } else if !output_ok {
+        1
     } else {
         0
     }
@@ -377,7 +400,10 @@ fn parse_severity(s: &str) -> Severity {
     }
 }
 
-fn print_json_result(result: &scan::ScanResult) {
+/// Emit a directory-scan result as JSON. Returns `false` on a JSON-write
+/// failure so the caller can exit non-zero — a piped consumer must not see
+/// truncated JSON paired with a success code.
+fn print_json_result(result: &scan::ScanResult) -> bool {
     #[derive(serde::Serialize)]
     struct JsonScanOutput<'a> {
         schema_version: u32,
@@ -420,12 +446,15 @@ fn print_json_result(result: &scan::ScanResult) {
 
     if serde_json::to_writer_pretty(std::io::stdout().lock(), &output).is_err() {
         eprintln!("tirith scan: failed to write JSON output");
-        return;
+        return false;
     }
     println!();
+    true
 }
 
-fn print_json_file_result(result: &scan::FileScanResult) {
+/// Emit a single-file scan result as JSON. Returns `false` on a JSON-write
+/// failure.
+fn print_json_file_result(result: &scan::FileScanResult) -> bool {
     #[derive(serde::Serialize)]
     struct JsonOutput<'a> {
         schema_version: u32,
@@ -443,9 +472,10 @@ fn print_json_file_result(result: &scan::FileScanResult) {
 
     if serde_json::to_writer_pretty(std::io::stdout().lock(), &output).is_err() {
         eprintln!("tirith scan: failed to write JSON output");
-        return;
+        return false;
     }
     println!();
+    true
 }
 
 fn print_human_result(result: &scan::ScanResult) {
@@ -498,7 +528,8 @@ fn print_human_result(result: &scan::ScanResult) {
     }
 }
 
-fn print_sarif_result(result: &scan::ScanResult) {
+/// Emit a directory-scan result as SARIF. Returns `false` on a write failure.
+fn print_sarif_result(result: &scan::ScanResult) -> bool {
     use tirith_core::sarif::{self, SarifFinding};
 
     let version = env!("CARGO_PKG_VERSION");
@@ -518,11 +549,14 @@ fn print_sarif_result(result: &scan::ScanResult) {
     let sarif_json = sarif::to_sarif(&findings, version);
     if serde_json::to_writer_pretty(std::io::stdout().lock(), &sarif_json).is_err() {
         eprintln!("tirith scan: failed to write SARIF output");
+        return false;
     }
     println!();
+    true
 }
 
-fn print_sarif_file_result(result: &scan::FileScanResult) {
+/// Emit a single-file scan result as SARIF. Returns `false` on a write failure.
+fn print_sarif_file_result(result: &scan::FileScanResult) -> bool {
     use tirith_core::sarif::{self, SarifFinding};
 
     let version = env!("CARGO_PKG_VERSION");
@@ -540,8 +574,10 @@ fn print_sarif_file_result(result: &scan::FileScanResult) {
     let sarif_json = sarif::to_sarif(&findings, version);
     if serde_json::to_writer_pretty(std::io::stdout().lock(), &sarif_json).is_err() {
         eprintln!("tirith scan: failed to write SARIF output");
+        return false;
     }
     println!();
+    true
 }
 
 fn print_human_file_result(result: &scan::FileScanResult) {

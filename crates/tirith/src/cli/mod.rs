@@ -46,6 +46,26 @@ impl HumanJsonSarifFormat {
     }
 }
 
+/// `true` when the `TIRITH_OFFLINE` environment variable is set to a truthy
+/// value (`1`, `true`, `yes`, `on`, case-insensitive, trimmed). An empty value,
+/// an unset variable, or any other value is treated as "not offline".
+///
+/// This is the env-var half of the CLI-wide offline switch. The commands that
+/// have a networked `--online` opt-in (`package risk`, `ecosystem scan`,
+/// `install`) and the background threat-DB refresh all route through this one
+/// helper so the offline switch behaves identically everywhere.
+pub(crate) fn offline_env_active() -> bool {
+    std::env::var("TIRITH_OFFLINE")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Suggest the closest match from a list of candidates using Levenshtein distance.
 /// Returns `None` if no candidate is within `max_distance`.
 pub fn suggest_closest<'a>(

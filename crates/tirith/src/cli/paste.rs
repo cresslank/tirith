@@ -85,7 +85,9 @@ pub fn run(
     // Skip if bypass was honored — analyze() already logged it.
     if !verdict.bypass_honored {
         let event_id = uuid::Uuid::new_v4().to_string();
-        tirith_core::audit::log_verdict(
+        // Best-effort audit on the `paste` hot path — a write failure must not
+        // change behavior, so the Result is intentionally dropped.
+        let _ = tirith_core::audit::log_verdict(
             &verdict,
             &ctx.input,
             None,

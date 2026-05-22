@@ -86,9 +86,11 @@ impl InstallSource {
 pub trait InstallRunner {
     /// Run the install command `program args...` and return its exit code.
     ///
-    /// `None` is returned when the process was terminated by a signal (no
-    /// exit code) or could not be spawned at all — the caller treats either as
-    /// a non-success.
+    /// `Ok(Some(code))` is the process's exit code; `Ok(None)` means the
+    /// process was terminated by a signal and so has no exit code. A failure
+    /// to *spawn* the process at all is an `Err` (the production
+    /// implementation's `?`), not `Ok(None)`. The caller treats both `Ok(None)`
+    /// and `Err` as a non-success.
     fn run(&self, program: &str, args: &[String]) -> std::io::Result<Option<i32>>;
 }
 
@@ -121,18 +123,25 @@ pub fn run(
     sha256: Option<String>,
 ) -> i32 {
     // A tirith-owned flag placed AFTER <source> lands in the package-manager
-    // args (trailing_var_arg), not parsed by tirith. For `--no-exec` that is a
-    // safety footgun: `tirith install npm pkg --no-exec` would forward
+    // args (trailing_var_arg), not parsed by tirith. For a tirith flag that is
+    // a safety footgun: `tirith install npm pkg --no-exec` would forward
     // `--no-exec` to npm and STILL run the real install, despite the user
-    // asking to analyze only. No package manager has a `--no-exec` install
-    // flag, so a `--no-exec` in the trailing args is unambiguously a misplaced
-    // tirith flag — a hard error, not a silent no-op.
-    if args.iter().any(|a| a == "--no-exec") {
+    // asking to analyze only. The guarded flags are the tirith-owned options
+    // that no package manager interprets as an install flag, so finding one in
+    // the trailing args is unambiguously a misplaced tirith flag — a hard
+    // error, not a silent no-op. `--offline` is deliberately NOT guarded
+    // (`cargo install --offline` is legitimate), nor `--format` / `--json`
+    // (`npm install --json` is legitimate).
+    const MISPLACED_TIRITH_FLAGS: &[&str] = &["--no-exec", "--online", "--yes"];
+    if let Some(flag) = args
+        .iter()
+        .find(|a| MISPLACED_TIRITH_FLAGS.contains(&a.as_str()))
+    {
         eprintln!(
-            "tirith install: `--no-exec` is a tirith option and must come \
-             before the <source> argument (e.g. `tirith install --no-exec npm \
+            "tirith install: `{flag}` is a tirith option and must come before \
+             the <source> argument (e.g. `tirith install {flag} npm \
              <package>`). After <source>, arguments go to the package manager \
-             — a misplaced `--no-exec` would not stop the install."
+             — a misplaced `{flag}` would not affect tirith."
         );
         return 2;
     }
@@ -180,7 +189,7 @@ fn run_package_manager(
     // Resolve the registry-API path. Offline by default; `--online` opts in,
     // and `--offline` / `TIRITH_OFFLINE` overrides `--online`. The resolver is
     // offline-safe — it degrades any registry failure to `Unavailable`.
-    let use_online = online && !offline && !offline_env_active();
+    let use_online = online && !offline && !super::offline_env_active();
     let http_client = HttpRegistryClient::new();
     let resolver =
         |eco: Ecosystem, name: &str| registry_api::gather_api_signals(&http_client, eco, name);
@@ -204,19 +213,32 @@ fn run_package_manager(
 
     // --- INFORM ---------------------------------------------------------
     if json {
-        print_plan_json(&plan, use_online);
+        // A JSON-write failure means the consumer never received the analysis
+        // — do not then run the install behind a verdict it cannot read. Exit
+        // non-zero, consistent with `tirith version`'s JSON-failure handling.
+        if !print_plan_json(&plan, use_online) {
+            return 1;
+        }
     } else {
         print_plan_human(&plan, use_online);
     }
 
     // Audit the verdict regardless of the decision — the analysis happened.
-    tirith_core::audit::log_verdict(
+    // A failed audit write does not abort the transaction (it is a record, not
+    // a gate), but it must not be silent: the transaction claims to be
+    // recorded. Surface it as a non-fatal notice, mirroring the checkpoint
+    // path's "skipped (non-fatal)" pattern.
+    if let Err(e) = tirith_core::audit::log_verdict(
         &plan.verdict,
         &format!("install {}", plan.analysis_command),
         None,
         None,
         &policy.dlp_custom_patterns,
-    );
+    ) {
+        if !json {
+            eprintln!("tirith install: audit log not written (non-fatal): {e}");
+        }
+    }
 
     // `--no-exec` stops here: the user asked for analysis only. The
     // transaction was analyzed, informed, and audited; nothing will be
@@ -410,7 +432,13 @@ fn run_and_record(
     };
 
     if json {
-        print_outcome_json(plan, checkpoint_id.as_deref(), exit_code);
+        // The install already ran; the outcome JSON is how the consumer learns
+        // the result. If that write fails, a `0` install exit must not be
+        // reported as overall success — surface the output failure as exit 1.
+        // (A non-zero install exit already propagates and is kept.)
+        if !print_outcome_json(plan, checkpoint_id.as_deref(), exit_code) && exit_code == 0 {
+            return 1;
+        }
     } else {
         let after = if exit_code == 0 {
             "completed".to_string()
@@ -484,18 +512,28 @@ fn run_url(
     let preflight = preflight_url(url, cwd.as_deref(), interactive);
 
     if json {
-        print_url_preflight_json(url, &preflight);
+        // A JSON-write failure means the consumer never received the preflight
+        // verdict — do not then proceed to download. Exit non-zero.
+        if !print_url_preflight_json(url, &preflight) {
+            return 1;
+        }
     } else {
         print_url_preflight_human(url, &preflight);
     }
 
-    tirith_core::audit::log_verdict(
+    // A failed audit write does not abort the transaction, but the URL form
+    // also claims to be recorded — surface a non-fatal notice on failure.
+    if let Err(e) = tirith_core::audit::log_verdict(
         &preflight,
         &format!("install url {url}"),
         None,
         None,
         &policy.dlp_custom_patterns,
-    );
+    ) {
+        if !json {
+            eprintln!("tirith install: audit log not written (non-fatal): {e}");
+        }
+    }
 
     // A blocking preflight refuses before any download happens.
     if preflight.action == Action::Block {
@@ -540,24 +578,35 @@ fn run_url(
     };
     match runner::run(opts) {
         Ok(result) => {
-            if json {
-                print_url_outcome_json(&result);
-            } else if result.executed {
-                eprintln!(
-                    "tirith install: install script executed (receipt {}).",
-                    tirith_core::receipt::short_hash(&result.receipt.sha256)
-                );
+            let json_ok = if json {
+                print_url_outcome_json(&result)
             } else {
-                eprintln!(
-                    "tirith install: install script downloaded and recorded, \
-                     not executed (receipt {}).",
-                    tirith_core::receipt::short_hash(&result.receipt.sha256)
-                );
-            }
-            if result.executed {
+                if result.executed {
+                    eprintln!(
+                        "tirith install: install script executed (receipt {}).",
+                        tirith_core::receipt::short_hash(&result.receipt.sha256)
+                    );
+                } else {
+                    eprintln!(
+                        "tirith install: install script downloaded and recorded, \
+                         not executed (receipt {}).",
+                        tirith_core::receipt::short_hash(&result.receipt.sha256)
+                    );
+                }
+                true
+            };
+            let outcome_code = if result.executed {
                 result.exit_code.unwrap_or(1)
             } else {
                 0
+            };
+            // A JSON-write failure must not be reported as a `0` success — if
+            // the outcome JSON did not reach the consumer, surface exit 1.
+            // (A non-zero script exit already propagates and is kept.)
+            if !json_ok && outcome_code == 0 {
+                1
+            } else {
+                outcome_code
             }
         }
         Err(e) => {
@@ -625,20 +674,6 @@ fn example_package(manager: PackageManager) -> &'static str {
         PackageManager::Pip => "requests",
         PackageManager::Cargo => "ripgrep",
     }
-}
-
-/// `true` when `TIRITH_OFFLINE` is set to a truthy value — mirrors
-/// `cli::package` / `cli::ecosystem` so the offline switch is uniform.
-fn offline_env_active() -> bool {
-    std::env::var("TIRITH_OFFLINE")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
 }
 
 /// Render the analysis verdict for a package-manager install (human form).
@@ -721,8 +756,21 @@ fn print_plan_human(plan: &InstallPlan, online: bool) {
     eprintln!();
 }
 
+/// Write `value` as pretty JSON to stdout. Returns `false` on a write failure
+/// (a broken pipe, a full disk) so the caller can exit non-zero — a piped
+/// consumer must not see truncated JSON paired with a success exit code.
+fn write_json_stdout<T: serde::Serialize>(value: &T) -> bool {
+    if serde_json::to_writer_pretty(std::io::stdout().lock(), value).is_err() {
+        eprintln!("tirith install: failed to write JSON output");
+        return false;
+    }
+    println!();
+    true
+}
+
 /// Render the analysis verdict for a package-manager install (JSON form).
-fn print_plan_json(plan: &InstallPlan, online: bool) {
+/// Returns `false` on a JSON-write failure.
+fn print_plan_json(plan: &InstallPlan, online: bool) -> bool {
     #[derive(serde::Serialize)]
     struct PackageOut<'a> {
         ecosystem: String,
@@ -768,15 +816,12 @@ fn print_plan_json(plan: &InstallPlan, online: bool) {
         verdict: &plan.verdict,
         notes: &plan.notes,
     };
-    if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
-        eprintln!("tirith install: failed to write JSON output");
-        return;
-    }
-    println!();
+    write_json_stdout(&out)
 }
 
-/// JSON record of the completed package-manager transaction.
-fn print_outcome_json(plan: &InstallPlan, checkpoint_id: Option<&str>, exit_code: i32) {
+/// JSON record of the completed package-manager transaction. Returns `false`
+/// on a JSON-write failure.
+fn print_outcome_json(plan: &InstallPlan, checkpoint_id: Option<&str>, exit_code: i32) -> bool {
     let out = serde_json::json!({
         "schema_version": 1,
         "kind": "install_outcome",
@@ -788,11 +833,7 @@ fn print_outcome_json(plan: &InstallPlan, checkpoint_id: Option<&str>, exit_code
         "checkpoint_id": checkpoint_id,
         "verdict_action": format!("{:?}", plan.verdict.action),
     });
-    if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
-        eprintln!("tirith install: failed to write JSON output");
-        return;
-    }
-    println!();
+    write_json_stdout(&out)
 }
 
 /// Render the URL-form preflight verdict (human form).
@@ -831,8 +872,9 @@ fn print_url_preflight_human(url: &str, verdict: &Verdict) {
     }
 }
 
-/// Render the URL-form preflight verdict (JSON form).
-fn print_url_preflight_json(url: &str, verdict: &Verdict) {
+/// Render the URL-form preflight verdict (JSON form). Returns `false` on a
+/// JSON-write failure.
+fn print_url_preflight_json(url: &str, verdict: &Verdict) -> bool {
     let out = serde_json::json!({
         "schema_version": 1,
         "kind": "install_url_preflight",
@@ -840,16 +882,13 @@ fn print_url_preflight_json(url: &str, verdict: &Verdict) {
         "sandboxed": false,
         "verdict": verdict,
     });
-    if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
-        eprintln!("tirith install: failed to write JSON output");
-        return;
-    }
-    println!();
+    write_json_stdout(&out)
 }
 
 /// JSON record of the completed URL transaction (the `runner` result).
+/// Returns `false` on a JSON-write failure.
 #[cfg(unix)]
-fn print_url_outcome_json(result: &runner::RunResult) {
+fn print_url_outcome_json(result: &runner::RunResult) -> bool {
     let out = serde_json::json!({
         "schema_version": 1,
         "kind": "install_url_outcome",
@@ -858,11 +897,7 @@ fn print_url_outcome_json(result: &runner::RunResult) {
         "executed": result.executed,
         "exit_code": result.exit_code,
     });
-    if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
-        eprintln!("tirith install: failed to write JSON output");
-        return;
-    }
-    println!();
+    write_json_stdout(&out)
 }
 
 #[cfg(test)]
@@ -1002,7 +1037,6 @@ mod tests {
             analysis_command: argv.display(),
             packages: vec![],
             verdict: allow_verdict(),
-            risk_breakdowns: vec![],
             notes: vec![],
         };
         let runner = FakeRunner::new(Some(0));
@@ -1026,7 +1060,6 @@ mod tests {
             analysis_command: argv.display(),
             packages: vec![],
             verdict: allow_verdict(),
-            risk_breakdowns: vec![],
             notes: vec![],
         };
         let runner = FakeRunner::new(Some(17));
@@ -1043,7 +1076,6 @@ mod tests {
             analysis_command: argv.display(),
             packages: vec![],
             verdict: allow_verdict(),
-            risk_breakdowns: vec![],
             notes: vec![],
         };
         let runner = FakeRunner::new(None); // signal-terminated → no code

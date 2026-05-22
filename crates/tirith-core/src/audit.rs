@@ -76,31 +76,51 @@ pub struct AuditEntry {
     pub trust_scope: Option<String>,
 }
 
+/// Outcome of an audit-log append.
+///
+/// The distinction matters for callers that want to surface a failed write:
+/// [`AuditWrite::Skipped`] is *not* an error (the user turned logging off, or
+/// no log path could be resolved), whereas [`AuditWrite::Failed`] is a real I/O
+/// failure that broke the "recorded transaction" promise.
+enum AuditWrite {
+    /// The entry was written; the serialized line is carried for the optional
+    /// remote-upload spool.
+    Written(String),
+    /// Logging was intentionally not performed — `TIRITH_LOG=0`, or no log
+    /// path. Not an error.
+    Skipped,
+    /// A real write failure. The string is a human-readable reason.
+    Failed(String),
+}
+
 /// Shared I/O helper: serialize an AuditEntry and append it to the audit log.
 /// Handles TIRITH_LOG check, path resolution, dir creation, symlink guard,
-/// open, lock, write, sync, unlock. Never panics or changes behavior on failure.
-fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> Option<String> {
+/// open, lock, write, sync, unlock. Never panics or changes behavior on failure;
+/// a real write failure is reported as [`AuditWrite::Failed`] so callers may
+/// surface it.
+fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWrite {
     if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") {
-        return None;
+        return AuditWrite::Skipped;
     }
 
-    let path = log_path.or_else(default_log_path)?;
+    let Some(path) = log_path.or_else(default_log_path) else {
+        return AuditWrite::Skipped;
+    };
 
     if let Some(parent) = path.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
-            audit_diagnostic(format!(
-                "tirith: audit: cannot create log dir {}: {e}",
-                parent.display()
-            ));
-            return None;
+            let reason = format!("cannot create log dir {}: {e}", parent.display());
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            return AuditWrite::Failed(reason);
         }
     }
 
     let line = match serde_json::to_string(entry) {
         Ok(l) => l,
         Err(e) => {
-            audit_diagnostic(format!("tirith: audit: failed to serialize entry: {e}"));
-            return None;
+            let reason = format!("failed to serialize entry: {e}");
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            return AuditWrite::Failed(reason);
         }
     };
 
@@ -110,11 +130,9 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> Option<
     {
         match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                audit_diagnostic(format!(
-                    "tirith: audit: refusing to follow symlink at {}",
-                    path.display()
-                ));
-                return None;
+                let reason = format!("refusing to follow symlink at {}", path.display());
+                audit_diagnostic(format!("tirith: audit: {reason}"));
+                return AuditWrite::Failed(reason);
             }
             _ => {}
         }
@@ -132,11 +150,9 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> Option<
     let file = match file {
         Ok(f) => f,
         Err(e) => {
-            audit_diagnostic(format!(
-                "tirith: audit: cannot open {}: {e}",
-                path.display()
-            ));
-            return None;
+            let reason = format!("cannot open {}: {e}", path.display());
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            return AuditWrite::Failed(reason);
         }
     };
 
@@ -148,41 +164,50 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> Option<
     }
 
     if let Err(e) = file.lock_exclusive() {
-        audit_diagnostic(format!(
-            "tirith: audit: cannot lock {}: {e}",
-            path.display()
-        ));
-        return None;
+        let reason = format!("cannot lock {}: {e}", path.display());
+        audit_diagnostic(format!("tirith: audit: {reason}"));
+        return AuditWrite::Failed(reason);
     }
 
     let mut writer = std::io::BufWriter::new(&file);
     if let Err(e) = writeln!(writer, "{line}") {
-        audit_diagnostic(format!("tirith: audit: write failed: {e}"));
+        let reason = format!("write failed: {e}");
+        audit_diagnostic(format!("tirith: audit: {reason}"));
         let _ = fs2::FileExt::unlock(&file);
-        return None;
+        return AuditWrite::Failed(reason);
     }
     if let Err(e) = writer.flush() {
-        audit_diagnostic(format!("tirith: audit: flush failed: {e}"));
+        let reason = format!("flush failed: {e}");
+        audit_diagnostic(format!("tirith: audit: {reason}"));
+        let _ = fs2::FileExt::unlock(&file);
+        return AuditWrite::Failed(reason);
     }
     if let Err(e) = file.sync_all() {
         audit_diagnostic(format!("tirith: audit: sync failed: {e}"));
     }
     let _ = fs2::FileExt::unlock(&file);
 
-    Some(line)
+    AuditWrite::Written(line)
 }
 
 /// Append an entry to the audit log. Never panics or changes verdict on failure.
 ///
 /// `custom_dlp_patterns` are Team-tier regex patterns applied alongside built-in
 /// DLP redaction before the command is written to the log.
+///
+/// Returns `Ok(())` when the entry was written *or* logging was intentionally
+/// not performed (`TIRITH_LOG=0`, no resolvable log path). Returns `Err(reason)`
+/// only on a real write failure — a caller that promises a "recorded
+/// transaction" can surface that failure as a non-fatal notice. The result is
+/// `#[must_use]`: a caller that genuinely does not care must `let _ =` it.
+#[must_use = "a failed audit write is silently lost unless the Result is handled"]
 pub fn log_verdict(
     verdict: &Verdict,
     command: &str,
     log_path: Option<PathBuf>,
     event_id: Option<String>,
     custom_dlp_patterns: &[String],
-) {
+) -> Result<(), String> {
     log_verdict_with_raw(
         verdict,
         command,
@@ -191,13 +216,16 @@ pub fn log_verdict(
         custom_dlp_patterns,
         None,
         None,
-    );
+    )
 }
 
 /// Like `log_verdict` but accepts optional raw (pre-post-processing) action and rule_ids.
 ///
 /// `raw_action` captures the engine's original action before overrides/escalation.
 /// `raw_rule_ids` captures all rule_ids from raw detection (before paranoia).
+///
+/// Returns `Err(reason)` only on a real write failure (see [`log_verdict`]).
+#[must_use = "a failed audit write is silently lost unless the Result is handled"]
 pub fn log_verdict_with_raw(
     verdict: &Verdict,
     command: &str,
@@ -206,7 +234,7 @@ pub fn log_verdict_with_raw(
     custom_dlp_patterns: &[String],
     raw_action: Option<String>,
     raw_rule_ids: Option<Vec<String>>,
-) {
+) -> Result<(), String> {
     let entry = AuditEntry {
         timestamp: chrono::Utc::now().to_rfc3339(),
         session_id: crate::session::resolve_session_id(),
@@ -239,8 +267,12 @@ pub fn log_verdict_with_raw(
     };
 
     let line = match append_to_audit_log(&entry, log_path) {
-        Some(l) => l,
-        None => return,
+        AuditWrite::Written(l) => l,
+        // Logging was intentionally off — not a failure the caller should hear
+        // about.
+        AuditWrite::Skipped => return Ok(()),
+        // A real write failure — the "recorded transaction" promise broke.
+        AuditWrite::Failed(reason) => return Err(reason),
     };
 
     // If a policy server is configured via env vars, spool the redacted audit
@@ -254,6 +286,7 @@ pub fn log_verdict_with_raw(
     if let (Some(url), Some(key)) = (server_url, api_key) {
         crate::audit_upload::spool_and_upload(&line, &url, &key, None, None);
     }
+    Ok(())
 }
 
 /// Log a hook telemetry event to the audit log. Never panics or changes behavior on failure.
@@ -294,7 +327,11 @@ pub fn log_hook_event(
         trust_scope: None,
     };
 
-    append_to_audit_log(&entry, None);
+    // Telemetry / trust-change entries are best-effort; a write failure here is
+    // not surfaced to the user (unlike `log_verdict`'s recorded-transaction
+    // promise). The diagnostic inside `append_to_audit_log` still fires under
+    // `TIRITH_AUDIT_DEBUG`.
+    let _ = append_to_audit_log(&entry, None);
 }
 
 /// Log a trust change (add/remove) to the audit log. Never panics or changes behavior on failure.
@@ -335,7 +372,11 @@ pub fn log_trust_change(
         trust_scope: Some(scope.to_string()),
     };
 
-    append_to_audit_log(&entry, None);
+    // Telemetry / trust-change entries are best-effort; a write failure here is
+    // not surfaced to the user (unlike `log_verdict`'s recorded-transaction
+    // promise). The diagnostic inside `append_to_audit_log` still fires under
+    // `TIRITH_AUDIT_DEBUG`.
+    let _ = append_to_audit_log(&entry, None);
 }
 
 fn default_log_path() -> Option<PathBuf> {
@@ -396,7 +437,11 @@ mod tests {
             escalation_reason: None,
         };
 
-        log_verdict(&verdict, "test cmd", Some(log_path.clone()), None, &[]);
+        // TIRITH_LOG=0 is an intentional skip, not a failure → Ok(()).
+        assert!(
+            log_verdict(&verdict, "test cmd", Some(log_path.clone()), None, &[]).is_ok(),
+            "TIRITH_LOG=0 is an intentional skip, not a write failure"
+        );
 
         assert!(
             !log_path.exists(),
@@ -495,7 +540,7 @@ mod tests {
             escalation_reason: None,
         };
 
-        log_verdict(&verdict, "echo hello", Some(log_path), None, &[]);
+        let _ = log_verdict(&verdict, "echo hello", Some(log_path), None, &[]);
 
         let spool = state_home.join("tirith").join("audit-queue.jsonl");
         assert!(spool.exists(), "remote audit events should be spooled");
@@ -540,7 +585,13 @@ mod tests {
             escalation_reason: None,
         };
 
-        log_verdict(&verdict, "test cmd", Some(symlink_path), None, &[]);
+        // Refusing the symlink is a real write failure → Err, so the caller
+        // can surface it.
+        let result = log_verdict(&verdict, "test cmd", Some(symlink_path), None, &[]);
+        assert!(
+            result.is_err(),
+            "refusing a symlinked log path must report a write failure"
+        );
 
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),

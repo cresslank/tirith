@@ -166,7 +166,9 @@ pub fn run(
         let policy =
             engine_policy.unwrap_or_else(|| tirith_core::policy::Policy::discover(cwd.as_deref()));
         let event_id = uuid::Uuid::new_v4().to_string();
-        tirith_core::audit::log_verdict(
+        // Best-effort audit on the `check` hot path — a write failure must not
+        // change the exit code, so the Result is intentionally dropped.
+        let _ = tirith_core::audit::log_verdict(
             &raw_verdict,
             cmd,
             None,
@@ -212,7 +214,9 @@ pub fn run(
     );
 
     let event_id = uuid::Uuid::new_v4().to_string();
-    tirith_core::audit::log_verdict_with_raw(
+    // Best-effort audit on the `check` hot path — a write failure must not
+    // change the exit code, so the Result is intentionally dropped.
+    let _ = tirith_core::audit::log_verdict_with_raw(
         &effective,
         cmd,
         None,

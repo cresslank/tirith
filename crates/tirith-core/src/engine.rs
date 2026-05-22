@@ -504,7 +504,10 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             verdict.bypass_honored = true;
             verdict.interactive_detected = ctx.interactive;
             verdict.policy_path_used = policy.path.clone();
-            crate::audit::log_verdict(
+            // Best-effort audit on the engine hot path — a write failure here
+            // must not change the verdict, so the Result is intentionally
+            // dropped (the diagnostic still fires under TIRITH_AUDIT_DEBUG).
+            let _ = crate::audit::log_verdict(
                 &verdict,
                 &ctx.input,
                 None,

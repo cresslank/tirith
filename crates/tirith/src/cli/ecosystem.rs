@@ -40,7 +40,9 @@ use tirith_core::verdict::Action;
 /// * `0` — no findings (or every finding allowlisted);
 /// * `1` — at least one finding at or above the BLOCK threshold (a
 ///   confirmed-malicious / typosquat dependency);
-/// * `2` — only advisory (WARN-level) findings.
+/// * `2` — only advisory (WARN-level) findings, **or** a usage error (the
+///   given path does not exist). Exit `2` keeps a usage error distinct from a
+///   `1` BLOCK finding, exactly as `tirith install` does.
 pub fn scan(path: Option<&str>, online: bool, offline: bool, json: bool) -> i32 {
     let scan_root: PathBuf = path
         .map(PathBuf::from)
@@ -52,7 +54,9 @@ pub fn scan(path: Option<&str>, online: bool, offline: bool, json: bool) -> i32 
             scan_root.display()
         );
         eprintln!("  try: tirith ecosystem scan ./  (scan the current directory)");
-        return 1;
+        // A usage error, not a finding — exit 2 so it never collides with
+        // exit 1 (= a BLOCK-level finding).
+        return 2;
     }
 
     // Threat DB — offline name / typosquat signals. `None` is not an error:
@@ -74,7 +78,7 @@ pub fn scan(path: Option<&str>, online: bool, offline: bool, json: bool) -> i32 
     // `ApiSignals::Unavailable` (the package-risk score then falls back to
     // offline signals). It is memoized inside `ecosystem_scan::scan`, so a
     // package declared in two manifests is fetched at most once.
-    let use_online = online && !offline && !offline_env_active();
+    let use_online = online && !offline && !super::offline_env_active();
     let http_client = HttpRegistryClient::new();
     let resolver = |eco: Ecosystem, name: &str| -> ApiSignals {
         registry_api::gather_api_signals(&http_client, eco, name)
@@ -95,17 +99,31 @@ pub fn scan(path: Option<&str>, online: bool, offline: bool, json: bool) -> i32 
     let report = ecosystem_scan::scan(&request);
 
     // Audit-log the verdict, exactly as the other analysis commands do. The
-    // "command" string identifies this as an ecosystem scan of the root.
-    tirith_core::audit::log_verdict(
+    // "command" string identifies this as an ecosystem scan of the root. A
+    // failed audit write does not abort the scan, but it must not be silent —
+    // surface it as a non-fatal notice.
+    if let Err(e) = tirith_core::audit::log_verdict(
         &report.verdict,
         &format!("ecosystem scan {}", report.scan_root),
         None,
         None,
         &policy.dlp_custom_patterns,
-    );
+    ) {
+        if !json {
+            eprintln!("tirith ecosystem scan: audit log not written (non-fatal): {e}");
+        }
+    }
 
     if json {
-        print_json(&report);
+        // A JSON-write failure is the command's own I/O failure. If the report
+        // would otherwise exit 0 (a clean scan), surface exit 1 so a piped
+        // consumer does not treat truncated JSON as a clean pass. A non-zero
+        // finding-driven code (1 BLOCK / 2 WARN) already propagates and is
+        // kept.
+        if !print_json(&report) {
+            let code = exit_code(report.action());
+            return if code == 0 { 1 } else { code };
+        }
     } else {
         print_human(&report);
     }
@@ -121,21 +139,6 @@ fn exit_code(action: Action) -> i32 {
         Action::Warn | Action::WarnAck => 2,
         Action::Allow => 0,
     }
-}
-
-/// `true` when `TIRITH_OFFLINE` is set to a truthy value. Mirrors
-/// `cli::package`'s `offline_env_active` so the offline switch is consistent
-/// across the CLI.
-fn offline_env_active() -> bool {
-    std::env::var("TIRITH_OFFLINE")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
 }
 
 /// Decide whether a `(ecosystem, name)` dependency is allowlisted by `policy`.
@@ -180,7 +183,10 @@ fn package_allowlisted(policy: &Policy, eco: Ecosystem, name: &str) -> bool {
 /// Emit the full machine-readable report. The structure is a thin wrapper over
 /// [`EcosystemScanReport`] (which already derives `Serialize`), with a
 /// `schema_version` for forward compatibility.
-fn print_json(report: &EcosystemScanReport) {
+///
+/// Returns `false` on a JSON-write failure so the caller can exit non-zero — a
+/// piped consumer must not see truncated JSON paired with a success code.
+fn print_json(report: &EcosystemScanReport) -> bool {
     #[derive(serde::Serialize)]
     struct JsonOut<'a> {
         schema_version: u32,
@@ -193,9 +199,10 @@ fn print_json(report: &EcosystemScanReport) {
     };
     if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
         eprintln!("tirith ecosystem scan: failed to write JSON output");
-        return;
+        return false;
     }
     println!();
+    true
 }
 
 /// Render the human-readable report to stderr (the summary) and stdout (the
@@ -410,14 +417,16 @@ mod tests {
     }
 
     #[test]
-    fn scan_of_missing_path_exits_1() {
+    fn scan_of_missing_path_exits_2() {
+        // A path that does not exist is a usage error → exit 2, never 1
+        // (1 is reserved for a BLOCK-level finding).
         let code = scan(
             Some("/definitely/not/a/real/path/xyzzy-ecosystem"),
             false,
             false,
             true,
         );
-        assert_eq!(code, 1);
+        assert_eq!(code, 2);
     }
 
     #[test]

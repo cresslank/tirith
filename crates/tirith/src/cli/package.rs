@@ -58,21 +58,6 @@ pub fn explain(
     )
 }
 
-/// `true` when `TIRITH_OFFLINE` is set to a truthy value. Mirrors
-/// `threatdb_cmd::offline_env_active` so the offline switch is consistent
-/// across the CLI.
-fn offline_env_active() -> bool {
-    std::env::var("TIRITH_OFFLINE")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run(
     ecosystem: &str,
@@ -133,17 +118,17 @@ fn run(
         api,
     };
 
+    // `score_package` itself asserts the factor-sum invariant (the breakdown
+    // is reproducible by hand), so no extra guard is needed here.
     let breakdown = package_risk::score_package(&signals);
-    // Defence in depth: the breakdown's public contract is that the factors
-    // sum to the score. Assert it in debug so a future factor that breaks the
-    // invariant is caught immediately (same guard as `tirith score`).
-    debug_assert!(
-        breakdown.verify(),
-        "package-risk breakdown factors must sum to the final score"
-    );
 
     if json {
-        print_json(&breakdown, explain);
+        // A JSON-write failure is the command's own I/O failure — exit
+        // non-zero so a piped consumer does not treat truncated JSON as
+        // success (consistent with `tirith version`).
+        if !print_json(&breakdown, explain) {
+            return 1;
+        }
     } else {
         print_human(&breakdown, explain);
     }
@@ -171,7 +156,7 @@ fn gather_api(
     name: &str,
     offline_flag: bool,
 ) -> ApiSignals {
-    if offline_flag || offline_env_active() {
+    if offline_flag || super::offline_env_active() {
         return ApiSignals::unavailable(
             "offline mode is active (--offline / TIRITH_OFFLINE) — \
              registry-API signals were skipped, scored with offline signals only",
@@ -367,7 +352,10 @@ fn detect_binary_blob(dir: &Path) -> (bool, Option<String>) {
 
 // --- output ----------------------------------------------------------------
 
-fn print_json(breakdown: &RiskBreakdown, explain: bool) {
+/// Emit the package-risk breakdown as JSON. Returns `false` on a JSON-write
+/// failure so the caller can exit non-zero — a piped consumer must not see
+/// truncated JSON paired with a success exit code.
+fn print_json(breakdown: &RiskBreakdown, explain: bool) -> bool {
     #[derive(serde::Serialize)]
     struct PackageRiskOutput<'a> {
         ecosystem: &'a str,
@@ -398,9 +386,11 @@ fn print_json(breakdown: &RiskBreakdown, explain: bool) {
         risk_breakdown: if explain { Some(breakdown) } else { None },
     };
     if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
-        eprintln!("tirith: failed to write JSON output");
+        eprintln!("tirith package: failed to write JSON output");
+        return false;
     }
     println!();
+    true
 }
 
 fn print_human(breakdown: &RiskBreakdown, explain: bool) {

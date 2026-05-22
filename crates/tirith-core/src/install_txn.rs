@@ -130,17 +130,26 @@ pub struct InstallPlan {
     /// The packages the transaction will install, as extracted from the
     /// arguments. Empty when the user passed only flags (e.g. a bare
     /// `pip install -r requirements.txt`, where there is no package on the
-    /// command line to score).
+    /// command line to score). Each [`PlannedPackage`] carries its own
+    /// [`RiskBreakdown`] — see [`InstallPlan::risk_breakdowns`].
     pub packages: Vec<PlannedPackage>,
     /// The composed verdict: command-shape findings merged with
     /// package-risk findings, de-duplicated, action derived from the strongest.
     pub verdict: Verdict,
-    /// The per-package risk breakdowns, kept for the explainable output. One
-    /// entry per [`InstallPlan::packages`] entry, same order.
-    pub risk_breakdowns: Vec<RiskBreakdown>,
     /// Notes about analysis coverage (a missing threat DB, an unrecognized
     /// package spec). Surfaced so the transaction is honest about its limits.
     pub notes: Vec<String>,
+}
+
+impl InstallPlan {
+    /// The per-package [`RiskBreakdown`]s, in [`InstallPlan::packages`] order.
+    ///
+    /// A derived view over `packages` — the breakdown is stored once, on each
+    /// [`PlannedPackage`], so there is no separate `risk_breakdowns` field that
+    /// could drift out of agreement with it.
+    pub fn risk_breakdowns(&self) -> impl Iterator<Item = &RiskBreakdown> {
+        self.packages.iter().map(|p| &p.risk)
+    }
 }
 
 /// One package the install transaction will install, plus its risk breakdown.
@@ -262,15 +271,11 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
     // ever contains one, so this is belt-and-suspenders.
     let eco = manager.ecosystem();
     let mut planned: Vec<PlannedPackage> = Vec::new();
-    let mut risk_breakdowns: Vec<RiskBreakdown> = Vec::new();
 
     for pkg in extracted.into_iter().filter(|p| p.ecosystem == eco) {
         let signals = gather_package_signals(request, eco, &pkg, &mut notes);
+        // `score_package` itself asserts the factor-sum invariant.
         let breakdown = package_risk::score_package(&signals);
-        debug_assert!(
-            breakdown.verify(),
-            "package-risk breakdown factors must sum to the score"
-        );
 
         // (4) Turn the breakdown into findings, de-duplicated against the
         // threat-DB findings the engine already produced for this package.
@@ -278,7 +283,6 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
             findings.push(finding);
         }
 
-        risk_breakdowns.push(breakdown.clone());
         planned.push(PlannedPackage {
             reference: pkg,
             risk: breakdown,
@@ -318,7 +322,6 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
         analysis_command,
         packages: planned,
         verdict,
-        risk_breakdowns,
         notes,
     }
 }
@@ -698,7 +701,7 @@ mod tests {
             plan.verdict.action == Action::Warn || plan.verdict.action == Action::Block,
             "alarming provenance must not Allow: action={:?} score={:?}",
             plan.verdict.action,
-            plan.risk_breakdowns.first().map(|b| b.score),
+            plan.risk_breakdowns().next().map(|b| b.score),
         );
         assert!(
             plan.verdict

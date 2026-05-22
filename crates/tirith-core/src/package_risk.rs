@@ -366,29 +366,6 @@ pub struct PackageSignals {
     pub api: ApiSignals,
 }
 
-impl PackageSignals {
-    /// Construct offline-only signals — the registry-API state defaults to
-    /// [`ApiSignals::NotComputed`]. The networked caller overwrites `api`.
-    pub fn offline(
-        ecosystem: Ecosystem,
-        name: String,
-        threat_db_missing: bool,
-        name_vs_popular: NameVsPopular,
-        malicious_typosquat_of: Option<String>,
-        content_signals: ContentSignals,
-    ) -> Self {
-        PackageSignals {
-            ecosystem,
-            name,
-            threat_db_missing,
-            name_vs_popular,
-            malicious_typosquat_of,
-            content_signals,
-            api: ApiSignals::offline(),
-        }
-    }
-}
-
 /// Compute the deterministic risk score and full factor breakdown from
 /// already-gathered offline signals.
 ///
@@ -532,7 +509,7 @@ pub fn score_package(signals: &PackageSignals) -> RiskBreakdown {
         });
     }
 
-    RiskBreakdown {
+    let breakdown = RiskBreakdown {
         ecosystem: signals.ecosystem.to_string(),
         name: signals.name.clone(),
         score,
@@ -543,7 +520,21 @@ pub fn score_package(signals: &PackageSignals) -> RiskBreakdown {
         content_signals: signals.content_signals.clone(),
         api_signals: signals.api.clone(),
         factors,
-    }
+    };
+
+    // The breakdown's public contract is that every factor sums exactly to the
+    // final score (the "reproducible by hand" guarantee). A real `assert!` —
+    // not a `debug_assert!` — so a future factor that violates the invariant
+    // is caught in release builds too. `score_package` is a non-hot-path
+    // inspection helper, so the one integer compare costs nothing.
+    assert!(
+        breakdown.verify(),
+        "package-risk breakdown factors ({}) must sum to the final score ({})",
+        breakdown.factor_sum(),
+        breakdown.score,
+    );
+
+    breakdown
 }
 
 /// Derive the registry-API provenance factors from gathered [`ApiProvenance`].

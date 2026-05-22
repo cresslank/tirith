@@ -714,25 +714,6 @@ fn print_status_human(info: &ThreatDbStatus) {
 /// Guard: only try once per process lifetime.
 static UPDATE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
-/// True when the `TIRITH_OFFLINE` environment variable is set to a truthy
-/// value (`1`, `true`, `yes`, `on`, case-insensitive). An empty value, an
-/// unset variable, or any other value is treated as "not offline".
-///
-/// This is the env-var half of the offline switch; `tirith check` also has a
-/// `--offline` flag that is plumbed through explicitly. Either being set makes
-/// the background threat-DB refresh a guaranteed no-op (zero network).
-pub fn offline_env_active() -> bool {
-    std::env::var("TIRITH_OFFLINE")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
 /// Spawn a detached child process to update the threat DB if due.
 ///
 /// Called from `check.rs` after the verdict is computed.
@@ -748,7 +729,7 @@ pub fn maybe_background_update(offline_flag: bool) {
     // Offline short-circuit comes BEFORE the once-per-process guard so a
     // later online call in the same process is not silently disabled by an
     // earlier offline one (the guard is a dedup, not a latch on intent).
-    if offline_flag || offline_env_active() {
+    if offline_flag || super::offline_env_active() {
         return;
     }
 
@@ -3312,11 +3293,13 @@ mod tests {
 
     #[test]
     fn offline_env_active_recognizes_truthy_values() {
+        // `offline_env_active` now lives in `cli/mod.rs` (one shared helper);
+        // this still exercises it through the local env-guard infra.
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for v in ["1", "true", "TRUE", "yes", "On", " on "] {
             let _e = OfflineEnvGuard::set(v);
             assert!(
-                super::offline_env_active(),
+                crate::cli::offline_env_active(),
                 "TIRITH_OFFLINE={v:?} should be treated as offline"
             );
         }
@@ -3328,13 +3311,13 @@ mod tests {
         for v in ["0", "false", "no", "", "off", "garbage"] {
             let _e = OfflineEnvGuard::set(v);
             assert!(
-                !super::offline_env_active(),
+                !crate::cli::offline_env_active(),
                 "TIRITH_OFFLINE={v:?} should NOT be treated as offline"
             );
         }
         let _e = OfflineEnvGuard::unset();
         assert!(
-            !super::offline_env_active(),
+            !crate::cli::offline_env_active(),
             "unset TIRITH_OFFLINE should not be offline"
         );
     }
