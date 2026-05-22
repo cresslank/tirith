@@ -3554,3 +3554,368 @@ fn install_url_extra_args_is_usage_error() {
         .expect("failed to run tirith install url");
     assert_eq!(out.status.code(), Some(2));
 }
+
+// ---------------------------------------------------------------------------
+// `tirith ecosystem scan` — project dependency-manifest supply-chain scan.
+//
+// Every test runs the real binary but MUST NOT hit the network:
+//   * no `--online`, so the registry-API path is never constructed;
+//   * `TIRITH_OFFLINE=1` belt-and-suspenders so even a stray `--online` would
+//     be a no-op;
+//   * the threat DB is pinned to the signed test fixture DB
+//     (`tests/fixtures/test-threatdb.dat`, which lists `requests` as a popular
+//     pypi package) so the slopsquat heuristic is deterministic;
+//   * `XDG_STATE_HOME` / `XDG_DATA_HOME` (and the Windows `APPDATA`) are
+//     isolated to a temp dir so no real cache or audit log is touched.
+// ---------------------------------------------------------------------------
+
+/// A `tirith ecosystem`/`package` command: offline forced, threat DB pinned to
+/// the test fixture, all state dirs isolated under `tmp`.
+fn tirith_ecosystem(tmp: &std::path::Path) -> Command {
+    let mut cmd = tirith();
+    cmd.env("TIRITH_OFFLINE", "1")
+        .env("TIRITH_THREATDB_PATH", test_threatdb_fixture())
+        .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH")
+        .env("XDG_STATE_HOME", tmp.join("state"))
+        // `data_dir()` honors XDG_DATA_HOME on Unix but %APPDATA% on Windows —
+        // set both so the audit log is isolated on every platform.
+        .env("XDG_DATA_HOME", tmp.join("data"))
+        .env("APPDATA", tmp.join("data"))
+        .env_remove("TIRITH_POLICY_ROOT");
+    cmd
+}
+
+#[test]
+fn ecosystem_scan_clean_project_exits_zero() {
+    // A project whose sole dependency is a name no threat DB knows and that is
+    // not slopsquat-shaped: no findings, exit 0.
+    let proj = tempfile::tempdir().expect("project tempdir");
+    fs::write(
+        proj.path().join("Cargo.toml"),
+        "[dependencies]\nmy-unique-internal-crate-xyzzy = \"1.0\"\n",
+    )
+    .expect("write Cargo.toml");
+
+    let state = tempfile::tempdir().expect("state tempdir");
+    let out = tirith_ecosystem(state.path())
+        .args(["ecosystem", "scan", proj.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run tirith ecosystem scan");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a clean project must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn ecosystem_scan_slopsquat_dependency_surfaces_a_finding() {
+    // A pypi requirement with the textbook slopsquat shape: a language prefix
+    // (`python-`), a real popular package token (`requests`, listed popular in
+    // the fixture DB), and a generic filler word (`helper`). The slopsquat
+    // heuristic flags it as a suspicious package (a WARN-level finding → 2).
+    let proj = tempfile::tempdir().expect("project tempdir");
+    fs::write(
+        proj.path().join("requirements.txt"),
+        "python-requests-helper==1.0.0\n",
+    )
+    .expect("write requirements.txt");
+
+    let state = tempfile::tempdir().expect("state tempdir");
+    let out = tirith_ecosystem(state.path())
+        .args(["ecosystem", "scan", proj.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run tirith ecosystem scan");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a slopsquat-shaped dependency is a WARN-level finding (exit 2), \
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("slopsquat") || combined.contains("python-requests-helper"),
+        "the scan output must name the slopsquat finding, got:\n{combined}"
+    );
+}
+
+#[test]
+fn ecosystem_scan_json_carries_assessments_and_verdict() {
+    // `--format json` must emit a parseable envelope carrying the per-dependency
+    // assessments and the resolved verdict.
+    let proj = tempfile::tempdir().expect("project tempdir");
+    fs::write(
+        proj.path().join("requirements.txt"),
+        "python-requests-helper==1.0.0\n",
+    )
+    .expect("write requirements.txt");
+
+    let state = tempfile::tempdir().expect("state tempdir");
+    let out = tirith_ecosystem(state.path())
+        .args([
+            "ecosystem",
+            "scan",
+            "--format",
+            "json",
+            proj.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run tirith ecosystem scan --format json");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("ecosystem scan --format json must produce valid JSON");
+    assert!(
+        json["assessments"].is_array(),
+        "JSON envelope must carry an assessments array: {json}"
+    );
+    assert!(
+        json["verdict"]["findings"].is_array(),
+        "JSON envelope must carry the verdict's findings: {json}"
+    );
+    assert_eq!(
+        json["verdict"]["findings"].as_array().map(|a| a.is_empty()),
+        Some(false),
+        "the slopsquat dependency must surface at least one finding: {json}"
+    );
+    // Offline scan — the report records that no registry API was consulted.
+    assert_eq!(json["online"], serde_json::Value::Bool(false));
+}
+
+#[test]
+fn ecosystem_scan_no_manifest_directory_is_handled_cleanly() {
+    // A directory with no dependency manifest at all: not an error — exit 0
+    // with a "no dependency manifests found" note, never a crash.
+    let proj = tempfile::tempdir().expect("project tempdir");
+    fs::write(proj.path().join("README.md"), "# just docs\n").expect("write README");
+
+    let state = tempfile::tempdir().expect("state tempdir");
+    let out = tirith_ecosystem(state.path())
+        .args(["ecosystem", "scan", proj.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run tirith ecosystem scan");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a directory with no manifests must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no dependency manifests"),
+        "must state that no manifests were found, got: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `tirith package risk` / `tirith package explain` — offline by default.
+// Same isolation as the ecosystem-scan tests (offline forced, fixture DB,
+// isolated state) — no test reaches the network or installs anything.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn package_risk_is_offline_by_default() {
+    // With no `--online`, `package risk` never consults a registry API: the
+    // JSON `api_signals` state is `not_computed`. This is the observable proof
+    // that the default run made no network call.
+    let state = tempfile::tempdir().expect("state tempdir");
+    let out = tirith_ecosystem(state.path())
+        .args(["package", "risk", "--format", "json", "npm", "react"])
+        .output()
+        .expect("failed to run tirith package risk");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "package risk must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("package risk --format json must produce valid JSON");
+    assert_eq!(
+        json["api_signals"]["state"], "not_computed",
+        "a default (offline) run must not consult the registry API: {json}"
+    );
+    assert!(json["score"].is_number(), "JSON must carry a score: {json}");
+    assert!(
+        json["risk_level"].is_string(),
+        "JSON must carry a risk_level: {json}"
+    );
+}
+
+#[test]
+fn package_risk_online_with_tirith_offline_env_is_honored() {
+    // `--online` together with `TIRITH_OFFLINE=1` must NOT reach the network:
+    // the offline env var wins, and the registry-API state degrades to
+    // `unavailable` with an offline reason — no `available`, no hang.
+    let state = tempfile::tempdir().expect("state tempdir");
+    let out = tirith_ecosystem(state.path())
+        .args([
+            "package", "risk", "--online", "--format", "json", "npm", "react",
+        ])
+        .output()
+        .expect("failed to run tirith package risk --online");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an --online run forced offline must still exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("package risk --online --format json must produce valid JSON");
+    assert_eq!(
+        json["api_signals"]["state"], "unavailable",
+        "TIRITH_OFFLINE must force `--online` to skip the registry: {json}"
+    );
+    let reason = json["api_signals"]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("offline"),
+        "the unavailable reason must explain offline mode, got: {reason}"
+    );
+}
+
+#[test]
+fn package_explain_json_carries_factor_breakdown() {
+    // `package explain --format json` must emit the full factor breakdown — the
+    // factors that sum to the score (reproducible by hand).
+    let state = tempfile::tempdir().expect("state tempdir");
+    let out = tirith_ecosystem(state.path())
+        .args(["package", "explain", "--format", "json", "npm", "react"])
+        .output()
+        .expect("failed to run tirith package explain");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "package explain must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("package explain --format json must produce valid JSON");
+    let factors = json["risk_breakdown"]["factors"]
+        .as_array()
+        .expect("explain JSON must carry the risk_breakdown factors array");
+    assert!(
+        !factors.is_empty(),
+        "the factor breakdown must not be empty: {json}"
+    );
+    // The factors sum to the score — the reproducible-by-hand contract.
+    let factor_sum: i64 = factors
+        .iter()
+        .map(|f| f["points"].as_i64().unwrap_or(0))
+        .sum();
+    assert_eq!(
+        factor_sum,
+        json["score"].as_i64().unwrap_or(-1),
+        "the factor breakdown must sum exactly to the score: {json}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `tirith scan` directory walk — picks up every scannable file type.
+//
+// The scan is purely local file-content analysis (no network). This exercises
+// the directory walk end-to-end: a Dockerfile, a `.github/workflows/*.yml`,
+// and a `.ipynb` dropped in a temp tree must each be discovered and produce a
+// finding (previously only the single-file SVG path had coverage).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scan_directory_walk_finds_dockerfile_workflow_and_notebook() {
+    let proj = tempfile::tempdir().expect("project tempdir");
+
+    // A Dockerfile with an un-pinned base image → dockerfile_unpinned_image.
+    fs::write(
+        proj.path().join("Dockerfile"),
+        "FROM ubuntu:latest\nRUN apt-get update\n",
+    )
+    .expect("write Dockerfile");
+
+    // A GitHub Actions workflow with a curl|bash run step →
+    // workflow_curl_pipe_shell. The walk must descend into `.github/workflows`.
+    let workflows = proj.path().join(".github").join("workflows");
+    fs::create_dir_all(&workflows).expect("create .github/workflows");
+    fs::write(
+        workflows.join("ci.yml"),
+        "name: CI\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    \
+         steps:\n      - run: curl https://install.example.com | bash\n",
+    )
+    .expect("write ci.yml");
+
+    // A Jupyter notebook with a hidden cell → notebook_hidden_content.
+    fs::write(
+        proj.path().join("analysis.ipynb"),
+        r#"{"cells":[{"cell_type":"code","source":"print('hi')","metadata":{"jupyter":{"source_hidden":true}}}]}"#,
+    )
+    .expect("write analysis.ipynb");
+
+    let out = tirith()
+        .args(["scan", "--format", "json", proj.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run tirith scan");
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("scan --format json must produce valid JSON");
+
+    // Collect every rule_id and the relative file path of every finding across
+    // the whole scanned tree.
+    let mut rule_ids: Vec<String> = Vec::new();
+    let mut finding_paths: Vec<String> = Vec::new();
+    collect_scan_findings(&json, &mut rule_ids, &mut finding_paths);
+
+    for expected in [
+        "dockerfile_unpinned_image",
+        "workflow_curl_pipe_shell",
+        "notebook_hidden_content",
+    ] {
+        assert!(
+            rule_ids.iter().any(|r| r == expected),
+            "the directory walk must surface `{expected}`; found rules: {rule_ids:?}"
+        );
+    }
+    // Each of the three file types was actually visited by the walk.
+    for needle in ["Dockerfile", "ci.yml", "analysis.ipynb"] {
+        assert!(
+            finding_paths.iter().any(|p| p.contains(needle)),
+            "the walk must have scanned a file matching `{needle}`; \
+             finding paths: {finding_paths:?}"
+        );
+    }
+}
+
+/// Walk a `tirith scan --format json` document and collect every finding's
+/// `rule_id` and the file path it was reported against. The scan JSON nests
+/// per-file results, so this descends recursively and is shape-tolerant.
+fn collect_scan_findings(
+    value: &serde_json::Value,
+    rule_ids: &mut Vec<String>,
+    finding_paths: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            // A file-result object carries a `path` plus a `findings` array.
+            let path = map.get("path").and_then(|p| p.as_str());
+            if let (Some(path), Some(findings)) =
+                (path, map.get("findings").and_then(|f| f.as_array()))
+            {
+                for finding in findings {
+                    if let Some(rule) = finding.get("rule_id").and_then(|r| r.as_str()) {
+                        rule_ids.push(rule.to_string());
+                        finding_paths.push(path.to_string());
+                    }
+                }
+            }
+            for v in map.values() {
+                collect_scan_findings(v, rule_ids, finding_paths);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                collect_scan_findings(v, rule_ids, finding_paths);
+            }
+        }
+        _ => {}
+    }
+}

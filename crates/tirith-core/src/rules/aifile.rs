@@ -459,10 +459,11 @@ fn check_notebook(input: &str, findings: &mut Vec<Finding>) {
             title: "Active / hidden content in a Jupyter notebook cell output".to_string(),
             description: format!(
                 "A stored cell output in cell {cell_idx} of this Jupyter notebook carries \
-                 {reason}. A saved `text/html` output is rendered when the notebook is opened, \
-                 and can contain a script, an event handler, or content hidden via CSS — \
-                 content a reviewer reading the notebook source would not notice. Clear \
-                 notebook outputs before committing, and review this output."
+                 {reason}. A saved rich output (a `text/html` or `application/javascript` MIME \
+                 bundle) is rendered when the notebook is opened, and can contain a script, an \
+                 event handler, or content hidden via CSS — content a reviewer reading the \
+                 notebook source would not notice. Clear notebook outputs before committing, \
+                 and review this output."
             ),
             evidence: vec![Evidence::Text {
                 detail: format!("cell {cell_idx} output: {reason}"),
@@ -540,6 +541,12 @@ fn scan_output(output: &serde_json::Value) -> (Option<(usize, Vec<String>)>, Opt
     // string or an array of strings.
     let mut plain = String::new();
     let mut html = String::new();
+    // A JavaScript MIME bundle on the output. `application/javascript` is the
+    // standard Jupyter MIME for a script the notebook renderer *executes* on
+    // open; `text/javascript` is the older spelling some kernels still emit.
+    // Either is active content in a saved output — there is no benign reason a
+    // committed cell output carries executable JavaScript.
+    let mut has_js_mime = false;
 
     if let Some(t) = obj.get("text") {
         plain.push_str(&join_source(Some(t)));
@@ -550,6 +557,13 @@ fn scan_output(output: &serde_json::Value) -> (Option<(usize, Vec<String>)>, Opt
         }
         if let Some(th) = data.get("text/html") {
             html.push_str(&join_source(Some(th)));
+        }
+        for js_mime in ["application/javascript", "text/javascript"] {
+            if let Some(js) = data.get(js_mime) {
+                if !join_source(Some(js)).trim().is_empty() {
+                    has_js_mime = true;
+                }
+            }
         }
     }
 
@@ -563,11 +577,14 @@ fn scan_output(output: &serde_json::Value) -> (Option<(usize, Vec<String>)>, Opt
         }
     };
 
-    // Active / hidden content inside a saved `text/html` output. The
-    // active-content reasons (`<script>` / event handler / `javascript:`) come
-    // from the shared `active_html_reasons` helper; this path reports the first
-    // one. CSS-hiding is a notebook-output-only fallback, checked after.
-    let html_hit = if !html.is_empty() {
+    // Active / hidden content in a saved output. A JavaScript MIME bundle is
+    // executable content on its own — it is reported first. Otherwise the
+    // `text/html` output is classified for active content (`<script>` / event
+    // handler / `javascript:`, via the shared `active_html_reasons` helper) or
+    // for CSS-hiding (a notebook-output-only fallback).
+    let html_hit = if has_js_mime {
+        Some("an application/javascript output MIME bundle (executable content)")
+    } else if !html.is_empty() {
         let lower = html.to_ascii_lowercase();
         active_html_reasons(&lower).into_iter().next().or_else(|| {
             html_has_css_hiding(&lower)
@@ -1184,6 +1201,30 @@ mod tests {
     }
 
     #[test]
+    fn notebook_application_javascript_output_flagged() {
+        // An `application/javascript` output MIME bundle is executable content
+        // the notebook renderer runs on open — no benign committed output
+        // carries it.
+        let nb = r#"{"cells":[{"cell_type":"code","source":"x","outputs":[{"output_type":"display_data","data":{"application/javascript":["fetch('https://evil.example.com/x')"]}}]}]}"#;
+        assert!(has(nb, "n.ipynb", RuleId::NotebookSuspiciousOutput));
+    }
+
+    #[test]
+    fn notebook_text_javascript_output_flagged() {
+        // `text/javascript` is the older MIME spelling some kernels still emit.
+        let nb = r#"{"cells":[{"cell_type":"code","source":"x","outputs":[{"output_type":"display_data","data":{"text/javascript":["window.location='/x'"]}}]}]}"#;
+        assert!(has(nb, "n.ipynb", RuleId::NotebookSuspiciousOutput));
+    }
+
+    #[test]
+    fn notebook_empty_javascript_mime_output_clean() {
+        // An empty / whitespace-only JS MIME bundle is not active content —
+        // it must not fire.
+        let nb = r#"{"cells":[{"cell_type":"code","source":"x","outputs":[{"output_type":"display_data","data":{"application/javascript":["   "]}}]}]}"#;
+        assert!(clean(nb, "n.ipynb"));
+    }
+
+    #[test]
     fn notebook_normal_output_clean() {
         let nb = r#"{"cells":[{"cell_type":"code","source":"1+1","outputs":[{"output_type":"execute_result","data":{"text/plain":["2"]}}]}]}"#;
         assert!(clean(nb, "n.ipynb"));
@@ -1375,13 +1416,24 @@ mod tests {
 
     #[test]
     fn find_base64_blob_requires_real_base64() {
-        // A long hex string is not base64-shaped enough to decode oddly — but
-        // it IS valid base64 alphabet; the length+decode gate still applies.
-        // The key negative: a short run never matches.
+        // A short run never matches — it is below MIN_BASE64_BLOB_LEN.
         assert!(find_base64_blob("abc").is_none());
         // A long run of a real base64 encoding matches.
         let long = base64::engine::general_purpose::STANDARD.encode("a".repeat(80));
         assert!(find_base64_blob(&long).is_some());
+        // A string of non-base64-alphabet bytes never matches, even when long:
+        // `.` is outside the alphabet, so no run of MIN_BASE64_BLOB_LEN forms.
+        let dotted = ".".repeat(MIN_BASE64_BLOB_LEN * 2);
+        assert!(find_base64_blob(&dotted).is_none());
+        // Hex digits ARE inside the base64 alphabet, so a long hex run that
+        // happens to be a valid length still decodes — the gate is
+        // length + decodes-as-base64, NOT "looks like a payload". A hex run of
+        // a length divisible by 4 is therefore (honestly) a match.
+        let long_hex = "deadbeef".repeat(16); // 128 chars, len % 4 == 0
+        assert!(
+            find_base64_blob(&long_hex).is_some(),
+            "a long hex run is valid base64 alphabet and decodes — it matches"
+        );
     }
 
     #[test]

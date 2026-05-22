@@ -1654,6 +1654,36 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn dockerfile_multi_from_two_unpinned_folds_to_one_finding() {
+        // A multi-stage build with two distinct un-pinned external base images
+        // (a `:latest` build stage and an un-tagged runtime stage). The two
+        // un-pinned FROM lines fold into ONE finding; the `FROM builder` stage
+        // reference is internal and adds nothing.
+        let df = "FROM golang:latest AS builder\n\
+                  WORKDIR /src\n\
+                  RUN go build -o app .\n\
+                  FROM debian\n\
+                  COPY --from=builder /src/app /app\n\
+                  CMD [\"/app\"]\n";
+        let findings = run(df, "Dockerfile");
+        let unpinned: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == RuleId::DockerfileUnpinnedImage)
+            .collect();
+        assert_eq!(
+            unpinned.len(),
+            1,
+            "two distinct un-pinned base images must fold into one finding"
+        );
+        // The folded finding reports the count of un-pinned FROM lines.
+        assert!(
+            unpinned[0].description.contains('2'),
+            "the folded finding must note that 2 FROM lines are un-pinned: {}",
+            unpinned[0].description
+        );
+    }
+
     // --- Terraform --------------------------------------------------------
 
     #[test]
@@ -1741,6 +1771,23 @@ mod tests {
     fn helm_file_repo_clean() {
         let chart = "dependencies:\n  - name: common\n    repository: file://../common\n    \
                      version: 1.0.0\n";
+        assert!(!has(chart, "Chart.yaml", RuleId::HelmUntrustedRepo));
+    }
+
+    #[test]
+    fn helm_untrusted_oci_dependency_repo_flagged() {
+        // Helm 3 supports `oci://` dependency repositories; an untrusted OCI
+        // host is the same remote-pull risk as an untrusted https chart repo.
+        let chart = "apiVersion: v2\nname: app\ndependencies:\n  - name: redis\n    \
+                     repository: oci://registry.evil.example.com/charts\n    version: 1.0.0\n";
+        assert!(has(chart, "Chart.yaml", RuleId::HelmUntrustedRepo));
+    }
+
+    #[test]
+    fn helm_trusted_oci_dependency_repo_clean() {
+        // An `oci://` dependency on a recognised host (ghcr.io) must stay clean.
+        let chart = "apiVersion: v2\nname: app\ndependencies:\n  - name: redis\n    \
+                     repository: oci://ghcr.io/example-org/charts\n    version: 1.0.0\n";
         assert!(!has(chart, "Chart.yaml", RuleId::HelmUntrustedRepo));
     }
 

