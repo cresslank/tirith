@@ -93,6 +93,15 @@ pub enum RuleId {
     Web3AddressInUrl,
     VetNotConfigured,
 
+    // Install-command rules (package-manager / infrastructure)
+    RepoAddFromPipe,
+    UnsignedRepoTrust,
+    GpgCheckDisabled,
+    KubectlApplyRemote,
+    HelmUntrustedRepo,
+    TerraformRemoteModule,
+    BrewUntrustedTap,
+
     // Threat intelligence rules — local DB
     ThreatMaliciousPackage,
     ThreatMaliciousIp,

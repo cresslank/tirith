@@ -819,6 +819,92 @@ examples_good = ["cargo vet && cargo install some-crate"]
 false_positive_guidance = "Not all Rust projects use cargo-vet. This is informational for projects that want supply-chain auditing."
 remediation = "Set up cargo-vet: cargo install cargo-vet && cargo vet init."
 
+# ── Install-command rules (package-manager / infrastructure) ────────────
+
+[[rule]]
+id = "repo_add_from_pipe"
+title = "APT repository added from a piped download"
+category = "ecosystem"
+severity_rationale = "High — a repo definition fetched off the wire and written straight into sources.list is never reviewed and its signing key is not verified; the repo can then install arbitrary packages as root."
+description = "A network download (curl/wget) is piped through `tee` into an apt sources.list file, or redirected directly into one. The repository definition is added without review and without verifying its signing key."
+examples_bad = ["curl -fsSL https://example.com/repo.list | sudo tee /etc/apt/sources.list.d/x.list"]
+examples_good = ["sudo apt-get install ./reviewed-repo-config.deb"]
+false_positive_guidance = "Some legitimate installers add their own apt repository this way. Review the downloaded repo definition and confirm the signing key before trusting it."
+remediation = "Download the repo definition to a file, review it, import the publisher's GPG key explicitly, then place the file under /etc/apt/sources.list.d/."
+mitre_id = "T1195.002"
+
+[[rule]]
+id = "unsigned_repo_trust"
+title = "APT signature verification disabled"
+category = "ecosystem"
+severity_rationale = "High — disabling signature verification removes the authenticity guarantee for every package installed from the affected repository."
+description = "An apt sources entry uses `[trusted=yes]`, or an apt command passes `--allow-unauthenticated` / `--allow-insecure-repositories`. Either disables GPG signature verification, so packages are installed without an authenticity check."
+examples_bad = ["echo 'deb [trusted=yes] http://repo.example.com/ ./' | sudo tee /etc/apt/sources.list.d/x.list"]
+examples_good = ["sudo apt-get install nginx"]
+false_positive_guidance = "Some internal or local-mirror repositories are configured without signatures. Prefer importing the repository's GPG key over disabling verification."
+remediation = "Import the repository's signing key and reference it with `signed-by=` instead of using `[trusted=yes]` or `--allow-unauthenticated`."
+mitre_id = "T1195.002"
+
+[[rule]]
+id = "gpg_check_disabled"
+title = "Package signature checking disabled"
+category = "ecosystem"
+severity_rationale = "High — with GPG checking off, a spoofed or compromised mirror can serve tampered packages that are installed without warning."
+description = "A dnf/yum/zypper command passes `--nogpgcheck`, a yum/dnf repo config sets `gpgcheck=0`, or a pacman config sets `SigLevel = Never`. All disable package signature verification."
+examples_bad = ["sudo dnf install --nogpgcheck somepkg"]
+examples_good = ["sudo dnf install httpd"]
+false_positive_guidance = "Local builds and internal mirrors are sometimes configured without signatures. Prefer signing your packages or importing the repo key over disabling the check."
+remediation = "Keep gpgcheck enabled and import the repository's GPG key, or for pacman keep SigLevel at a value that requires signatures."
+mitre_id = "T1195.002"
+
+[[rule]]
+id = "kubectl_apply_remote"
+title = "kubectl apply from a remote manifest"
+category = "ecosystem"
+severity_rationale = "High when the manifest is a raw/shortened URL — a remote manifest applied unseen can create privileged workloads, RBAC bindings, or admission webhooks in the cluster."
+description = "A `kubectl apply`/`create`/`replace` command is given `-f` with a remote URL. The manifest is fetched and applied to the cluster without local review; shortened URLs additionally hide the real source."
+examples_bad = ["kubectl apply -f https://raw.githubusercontent.com/owner/repo/main/deploy.yaml"]
+examples_good = ["kubectl apply -f ./deploy.yaml"]
+false_positive_guidance = "Applying a manifest from a vendor's documented URL is common. Download the manifest, review it, and apply the local copy when possible."
+remediation = "Download the manifest, review what it creates (RBAC, privileged pods, webhooks), then `kubectl apply -f` the local file."
+mitre_id = "T1610"
+
+[[rule]]
+id = "helm_untrusted_repo"
+title = "Helm chart from an untrusted repository"
+category = "ecosystem"
+severity_rationale = "Medium — a Helm chart can deploy privileged workloads and cluster RBAC; an unrecognized chart repository should be confirmed before use."
+description = "A `helm install`/`upgrade`/`repo add`/`pull` command references a chart repository URL that is not in the set of recognized chart repositories."
+examples_bad = ["helm repo add evil https://charts.evil.example.com"]
+examples_good = ["helm repo add bitnami https://charts.bitnami.com/bitnami"]
+false_positive_guidance = "Internal and vendor chart repositories will trigger this. Confirm the repository is trusted and add it to your policy allowlist."
+remediation = "Use charts from a known repository, or review the chart (`helm template`) before installing it."
+mitre_id = "T1195.002"
+
+[[rule]]
+id = "terraform_remote_module"
+title = "Terraform module from an untrusted remote source"
+category = "ecosystem"
+severity_rationale = "Medium — a remote Terraform module runs with full cloud credentials on apply and can provision arbitrary infrastructure."
+description = "A `terraform init -from-module` (or `tofu`) command copies a root module from a remote source — a git URL, an http(s) archive, or a code-hosting path — rather than a local directory or the Terraform Registry."
+examples_bad = ["terraform init -from-module=git::https://example.com/m.git"]
+examples_good = ["terraform init -from-module=./modules/vpc"]
+false_positive_guidance = "Pulling a module from a trusted internal git host is common. Pin the module to an exact revision and review it before applying."
+remediation = "Vendor the module locally or pin it to an exact, reviewed revision; verify the source host is one you trust."
+mitre_id = "T1195.002"
+
+[[rule]]
+id = "brew_untrusted_tap"
+title = "Homebrew formula or tap from an arbitrary URL"
+category = "ecosystem"
+severity_rationale = "High when installing a formula from a raw URL — Homebrew runs the fetched Ruby formula directly, outside any audited tap."
+description = "A `brew install` command is given a raw URL instead of a formula name, or a `brew tap` is pointed at an explicit non-GitHub git remote. Homebrew formulae are executable Ruby."
+examples_bad = ["brew install https://example.com/formula.rb"]
+examples_good = ["brew install ripgrep"]
+false_positive_guidance = "Installing from a one-off formula URL is occasionally legitimate. Review the formula's Ruby source before installing."
+remediation = "Install formulae by name from a reviewed tap; if you must use a custom tap, confirm the tap repository is one you trust."
+mitre_id = "T1195.002"
+
 # ── Rendered content rules ──────────────────────────────────────────────
 
 [[rule]]

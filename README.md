@@ -132,7 +132,7 @@ Nothing. Zero output. You forget tirith is running.
 
 ## What it catches
 
-**80+ detection rules across 15 categories.**
+**90+ detection rules across 16 categories.**
 
 | Category | What it stops |
 |----------|--------------|
@@ -150,6 +150,7 @@ Nothing. Zero output. You forget tirith is running.
 | **Environment** | Proxy hijacking, sensitive env exports, code injection via env, interpreter hijack, shell injection env |
 | **Config file security** | Config injection, suspicious indicators, non-ASCII/invisible unicode in configs, MCP server security (insecure/untrusted/duplicate/permissive) |
 | **Ecosystem threats** | Git clone typosquats, untrusted Docker registries, pip/npm URL installs, web3 RPC endpoints, vet-not-configured |
+| **Install-command safety** | APT repos added from a piped download, `[trusted=yes]` / `--allow-unauthenticated` / `--nogpgcheck` / pacman `SigLevel = Never` (disabled signature checks), `kubectl apply -f` against raw/shortened remote manifests, Helm charts from untrusted repos, Terraform modules from untrusted remote sources, `brew install`/`tap` from arbitrary URLs |
 | **Path analysis** | Non-ASCII paths, homoglyphs in paths, double-encoding |
 | **Rendered content** | Hidden CSS/color content, hidden HTML attributes, comment content analysis (prompt injection at High, destructive commands at Medium) |
 | **Cloaking detection** | Server-side cloaking (bot vs browser), clipboard hidden content, PDF hidden text |

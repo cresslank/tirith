@@ -485,6 +485,36 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Package manager install commands — trigger threat DB lookup",
     },
     PatternEntry {
+        id: "install_command",
+        tier1_exec_fragments: &[
+            // Tool invocations the install-command rules inspect. The rules
+            // themselves tokenize and check subcommands/flags; this is just the
+            // tier-1 gate that lets them run.
+            r"\b(?:apt|apt-get|aptitude)\s+(?:install|update|upgrade|add-repository)\b",
+            r"\bdnf\s+(?:install|upgrade|update)\b",
+            r"\b(?:yum|zypper)\s+install\b",
+            r"\bpacman\s+-[A-Za-z]*S",
+            r"\b(?:yay|paru|trizen)\s",
+            r"\bbrew\s+(?:install|tap|reinstall)\b",
+            r"\bkubectl\s+(?:apply|create|replace)\b",
+            r"\bhelm\s+(?:install|upgrade|repo)\b",
+            r"\bterraform\s+(?:init|get)\b",
+            // High-risk markers — these can appear without the tool name on the
+            // same scanned line (e.g. a quoted sources-list entry).
+            r"sources\.list",
+            r"add-apt-repository\b",
+            r"\[trusted=yes\]",
+            r"--allow-unauthenticated\b",
+            r"--allow-insecure-repositories\b",
+            r"--nogpgcheck\b",
+            r"(?i)gpgcheck\s*=\s*0",
+            r"(?i)SigLevel\s*=\s*Never",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Package-manager / infrastructure install commands and their \
+                high-risk markers (unsigned repos, disabled GPG checks, remote manifests)",
+    },
+    PatternEntry {
         id: "env_var_dangerous",
         tier1_exec_fragments: &[
             r"LD_PRELOAD",
@@ -770,6 +800,14 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("web3_rpc_endpoint", "Web3RpcEndpoint"),
     ("web3_address_in_url", "Web3AddressInUrl"),
     ("vet_not_configured", "VetNotConfigured"),
+    // Install-command rules
+    ("repo_add_from_pipe", "RepoAddFromPipe"),
+    ("unsigned_repo_trust", "UnsignedRepoTrust"),
+    ("gpg_check_disabled", "GpgCheckDisabled"),
+    ("kubectl_apply_remote", "KubectlApplyRemote"),
+    ("helm_untrusted_repo", "HelmUntrustedRepo"),
+    ("terraform_remote_module", "TerraformRemoteModule"),
+    ("brew_untrusted_tap", "BrewUntrustedTap"),
     // Threat intelligence — local DB
     ("threat_malicious_package", "ThreatMaliciousPackage"),
     ("threat_malicious_ip", "ThreatMaliciousIp"),

@@ -148,6 +148,13 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::Web3RpcEndpoint
         | RuleId::Web3AddressInUrl
         | RuleId::VetNotConfigured
+        | RuleId::RepoAddFromPipe
+        | RuleId::UnsignedRepoTrust
+        | RuleId::GpgCheckDisabled
+        | RuleId::KubectlApplyRemote
+        | RuleId::HelmUntrustedRepo
+        | RuleId::TerraformRemoteModule
+        | RuleId::BrewUntrustedTap
         | RuleId::HiddenCssContent
         | RuleId::HiddenColorContent
         | RuleId::HiddenHtmlAttribute

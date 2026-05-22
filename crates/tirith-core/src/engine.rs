@@ -682,6 +682,13 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         );
         findings.extend(command_findings);
 
+        // Install-command rules: package-manager / infrastructure install
+        // patterns (unsigned repos, disabled GPG checks, remote manifests).
+        // Pure pattern detection — same exec/paste applicability as command
+        // rules, no network on the hot path.
+        let install_findings = crate::rules::install::check(&ctx.input, ctx.shell);
+        findings.extend(install_findings);
+
         let cred_findings =
             crate::rules::credential::check(&ctx.input, ctx.shell, ctx.scan_context);
         findings.extend(cred_findings);
