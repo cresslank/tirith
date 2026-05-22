@@ -804,10 +804,19 @@ fn check_terraform(input: &str, findings: &mut Vec<Finding>) {
 
         // A `module "<name>" {` block header (the `{` may be on this line).
         let opens_module = is_module_block_header(code);
+        if opens_module {
+            // The block opens at depth `brace_depth + 1`; remember it *before*
+            // inspecting this line so a one-line module — `module "x" { source
+            // = "…" }` — has its `source` inspected on the same line, not only
+            // on a later line once the depth was already set.
+            module_block_depth = Some(brace_depth + 1);
+        }
 
-        // Inside a module block, inspect `source = "<value>"`.
+        // Inside a module block, inspect `source = "<value>"`. With the
+        // header handled above, `module_block_depth` is set for a one-line
+        // block too, so `parse_hcl_source` runs against the rest of that line.
         if let Some(open_depth) = module_block_depth {
-            if brace_depth >= open_depth {
+            if brace_depth + 1 >= open_depth {
                 if let Some(source) = parse_hcl_source(code) {
                     if is_untrusted_tf_source(&source) {
                         flagged_count += 1;
@@ -819,13 +828,10 @@ fn check_terraform(input: &str, findings: &mut Vec<Finding>) {
             }
         }
 
-        // Update brace depth for this line.
-        let opens = code.matches('{').count() as i32;
-        let closes = code.matches('}').count() as i32;
-        if opens_module {
-            // The block opens at the current depth; remember it.
-            module_block_depth = Some(brace_depth + 1);
-        }
+        // Update brace depth for this line. Braces inside a double-quoted
+        // string (`source = "git::https://…/{var}"`, a heredoc-ish value) are
+        // not block delimiters — count only the structural ones.
+        let (opens, closes) = count_structural_braces(code);
         brace_depth += opens - closes;
         if brace_depth < 0 {
             brace_depth = 0;
@@ -892,6 +898,27 @@ fn strip_hcl_comment(line: &str) -> &str {
     line
 }
 
+/// Count the structural `{` and `}` braces in an HCL line, ignoring any brace
+/// that sits inside a double-quoted string literal. A `source` value such as
+/// `"git::https://example.com/m?ref={var}"` carries literal braces that are
+/// part of the string, not block delimiters — counting them as block depth
+/// skews the `module`-block tracking and the `source` line is then attributed
+/// to the wrong (or no) block.
+fn count_structural_braces(code: &str) -> (i32, i32) {
+    let mut in_string = false;
+    let mut opens = 0i32;
+    let mut closes = 0i32;
+    for b in code.bytes() {
+        match b {
+            b'"' => in_string = !in_string,
+            b'{' if !in_string => opens += 1,
+            b'}' if !in_string => closes += 1,
+            _ => {}
+        }
+    }
+    (opens, closes)
+}
+
 /// Whether `code` is a `module "<name>" {`-style block header.
 fn is_module_block_header(code: &str) -> bool {
     // Accept `module "x" {`, `module "x"` (brace next line), `module x {`.
@@ -904,17 +931,53 @@ fn is_module_block_header(code: &str) -> bool {
 }
 
 /// Parse a `source = "<value>"` HCL assignment, returning the unquoted value.
+///
+/// The `source` token may appear at the start of the line or, for a one-line
+/// module block (`module "x" { source = "…" }`), after the opening brace — so
+/// the scan looks for a `source` *token* anywhere in `code` rather than only
+/// as a prefix. To avoid matching `source` inside a string literal or as a
+/// substring of a longer identifier (`data_source`, `mysource`), the match
+/// must be at an HCL token boundary and outside any double-quoted string.
 fn parse_hcl_source(code: &str) -> Option<String> {
-    let rest = code.strip_prefix("source")?;
-    let rest = rest.trim_start();
-    let rest = rest.strip_prefix('=')?;
-    let value = rest.trim();
-    // The value should be a double-quoted string literal.
-    if value.len() >= 2 && value.starts_with('"') {
-        // Take up to the closing quote.
-        let inner = &value[1..];
-        let end = inner.find('"')?;
-        return Some(inner[..end].to_string());
+    const KEY: &str = "source";
+    let bytes = code.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            in_string = !in_string;
+            i += 1;
+            continue;
+        }
+        if in_string {
+            i += 1;
+            continue;
+        }
+        // A `source` token: preceded by a non-identifier byte (or line start)
+        // and followed by a non-identifier byte (or line end).
+        if code[i..].starts_with(KEY)
+            && (i == 0 || !is_ident(bytes[i - 1]))
+            && bytes
+                .get(i + KEY.len())
+                .map(|b| !is_ident(*b))
+                .unwrap_or(true)
+        {
+            let after = code[i + KEY.len()..].trim_start();
+            if let Some(rest) = after.strip_prefix('=') {
+                let value = rest.trim();
+                // The value should be a double-quoted string literal.
+                if value.len() >= 2 && value.starts_with('"') {
+                    let inner = &value[1..];
+                    if let Some(end) = inner.find('"') {
+                        return Some(inner[..end].to_string());
+                    }
+                }
+                return None;
+            }
+        }
+        i += 1;
     }
     None
 }
@@ -1770,6 +1833,53 @@ mod tests {
         let tf = "module \"vpc\" {\n  # source = \"github.com/acme/old\"\n  \
                   source = \"./modules/vpc\"\n}\n";
         assert!(!has(tf, "main.tf", RuleId::TerraformRemoteModule));
+    }
+
+    #[test]
+    fn terraform_one_line_remote_module_flagged() {
+        // CR4(a): a one-line module block — the `source` sits on the same line
+        // the block opens. It must still be inspected.
+        let tf = "module \"vpc\" { source = \"git::https://example.com/vpc.git\" }\n";
+        assert!(
+            has(tf, "main.tf", RuleId::TerraformRemoteModule),
+            "a one-line module block with a remote source must be flagged"
+        );
+    }
+
+    #[test]
+    fn terraform_one_line_local_module_clean() {
+        // The one-line-block handling must not over-fire on a local source.
+        let tf = "module \"vpc\" { source = \"./modules/vpc\" }\n";
+        assert!(
+            !has(tf, "main.tf", RuleId::TerraformRemoteModule),
+            "a one-line module block with a local source must stay clean"
+        );
+    }
+
+    #[test]
+    fn terraform_braces_in_string_do_not_skew_depth_flagged() {
+        // CR4(b): a literal `{` / `}` inside a quoted string is not a block
+        // delimiter. A naive raw-brace count would close the module block
+        // early and miss the remote `source` on the next line.
+        let tf = "module \"vpc\" {\n  \
+                  description = \"interpolated ${var.name} value with { brace\"\n  \
+                  source = \"git::https://example.com/vpc.git\"\n}\n";
+        assert!(
+            has(tf, "main.tf", RuleId::TerraformRemoteModule),
+            "braces inside a quoted string must not close the module block early"
+        );
+    }
+
+    #[test]
+    fn terraform_source_substring_identifier_clean() {
+        // `data_source` / a `source`-suffixed identifier is not the `source`
+        // key — the token-boundary scan must not match it.
+        let tf = "module \"vpc\" {\n  data_source = \"github.com/x/y\"\n  \
+                  source = \"./modules/vpc\"\n}\n";
+        assert!(
+            !has(tf, "main.tf", RuleId::TerraformRemoteModule),
+            "a `source`-suffixed identifier must not be treated as the source key"
+        );
     }
 
     #[test]

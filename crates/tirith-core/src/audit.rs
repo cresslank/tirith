@@ -182,8 +182,15 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
         let _ = fs2::FileExt::unlock(&file);
         return AuditWrite::Failed(reason);
     }
+    // A failed `sync_all()` means the line reached the OS buffer but was not
+    // durably flushed to disk — the "recorded transaction" promise is not met.
+    // Report it as a real write failure so the caller can surface it, rather
+    // than claiming the entry was written.
     if let Err(e) = file.sync_all() {
-        audit_diagnostic(format!("tirith: audit: sync failed: {e}"));
+        let reason = format!("sync failed: {e}");
+        audit_diagnostic(format!("tirith: audit: {reason}"));
+        let _ = fs2::FileExt::unlock(&file);
+        return AuditWrite::Failed(reason);
     }
     let _ = fs2::FileExt::unlock(&file);
 
@@ -553,7 +560,24 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_audit_refuses_symlink() {
+        // Hermetic: hold the env lock and pin every input that could otherwise
+        // route this through `AuditWrite::Skipped` (which would yield `Ok` and
+        // silently break the assertion). A runner-set `TIRITH_LOG=0` would skip
+        // logging entirely; an `XDG_STATE_HOME`/`APPDATA` difference only
+        // affects the remote-upload spool but is pinned for full isolation.
+        // The log path itself is the explicit `symlink_path` below.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         let dir = tempfile::tempdir().unwrap();
+        let state_home = dir.path().join("state");
+        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+        unsafe { std::env::set_var("APPDATA", &state_home) };
+        unsafe { std::env::remove_var("TIRITH_SERVER_URL") };
+        unsafe { std::env::remove_var("TIRITH_API_KEY") };
+
         let target = dir.path().join("target");
         std::fs::write(&target, "original").unwrap();
 
@@ -598,5 +622,70 @@ mod tests {
             "original",
             "audit should refuse to write through symlink"
         );
+
+        unsafe { std::env::remove_var("TIRITH_LOG") };
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        unsafe { std::env::remove_var("APPDATA") };
+    }
+
+    /// CR2: a write that reaches `append_to_audit_log` but cannot be durably
+    /// recorded must surface as a write failure, not a silent success. The
+    /// symlink-refusal path is one such failure and is the closest
+    /// deterministically-triggerable proxy for the `sync_all()` failure the
+    /// CR2 fix also now reports — both return `AuditWrite::Failed` → `Err`.
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_durability_failure_is_reported() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_home = dir.path().join("state");
+        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+        unsafe { std::env::set_var("APPDATA", &state_home) };
+        unsafe { std::env::remove_var("TIRITH_SERVER_URL") };
+        unsafe { std::env::remove_var("TIRITH_API_KEY") };
+
+        // A directory cannot be opened for append — `append_to_audit_log` must
+        // report this as `AuditWrite::Failed`, never silently succeed.
+        let log_path = dir.path().join("not-a-file");
+        std::fs::create_dir(&log_path).unwrap();
+
+        let verdict = Verdict {
+            action: Action::Allow,
+            findings: vec![],
+            tier_reached: 1,
+            timings_ms: crate::verdict::Timings {
+                tier0_ms: 0.0,
+                tier1_ms: 0.0,
+                tier2_ms: None,
+                tier3_ms: None,
+                total_ms: 0.0,
+            },
+            bypass_requested: false,
+            bypass_honored: false,
+            bypass_available: false,
+            interactive_detected: false,
+            policy_path_used: None,
+            urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
+            escalation_reason: None,
+        };
+
+        let result = log_verdict(&verdict, "test cmd", Some(log_path), None, &[]);
+        assert!(
+            result.is_err(),
+            "an audit write that cannot be durably recorded must report a failure"
+        );
+
+        unsafe { std::env::remove_var("TIRITH_LOG") };
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        unsafe { std::env::remove_var("APPDATA") };
     }
 }
