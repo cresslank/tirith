@@ -540,6 +540,24 @@ Examples:
         action: PackageAction,
     },
 
+    /// Scan a project's dependency manifests for supply-chain risk
+    #[command(after_help = "\
+Walks a project directory, parses every dependency manifest it understands
+(npm, Python, Rust, Go, Ruby), and scores every declared dependency with the
+same deterministic engine as `tirith package risk` — plus a slopsquat
+(AI-hallucinated package name) heuristic. Offline by default; --online adds
+registry-API provenance signals. Findings are policy-aware and audit-logged.
+
+Examples:
+  tirith ecosystem scan
+  tirith ecosystem scan ./my-project
+  tirith ecosystem scan --online ./my-project
+  tirith ecosystem scan --format json ./my-project")]
+    Ecosystem {
+        #[command(subcommand)]
+        action: EcosystemAction,
+    },
+
     /// Manage the threat intelligence database
     #[command(
         name = "threat-db",
@@ -1287,6 +1305,46 @@ Offline by default. --online adds the registry-API provenance factors (see
 }
 
 #[derive(Subcommand)]
+enum EcosystemAction {
+    /// Scan a project directory's dependency manifests for supply-chain risk
+    #[command(after_help = "\
+Examples:
+  tirith ecosystem scan
+  tirith ecosystem scan ./my-project
+  tirith ecosystem scan --online ./my-project
+  tirith ecosystem scan --format json ./my-project
+
+Discovers package.json / package-lock.json, requirements*.txt / pyproject.toml,
+Cargo.toml, go.mod, and Gemfile. Every declared dependency is scored with the
+deterministic package-risk engine and checked for the slopsquat (AI-hallucinated
+name) pattern. Offline by default — name and typosquat signals come from the
+local threat database. --online additionally consults the registry API for
+provenance signals; it is ignored under --offline / TIRITH_OFFLINE and a
+registry failure degrades gracefully. Findings respect the policy allowlist.")]
+    Scan {
+        /// Project directory to scan (or a single manifest file).
+        /// Defaults to the current directory.
+        path: Option<String>,
+        /// Also consult each package's registry API (npm / PyPI / crates.io)
+        /// for provenance signals. Off by default — this is the only path on
+        /// which `ecosystem scan` reaches the network. Ignored when --offline
+        /// or TIRITH_OFFLINE is set; a registry failure degrades gracefully.
+        #[arg(long)]
+        online: bool,
+        /// Force offline scoring even if --online is passed. Also honored via
+        /// the TIRITH_OFFLINE environment variable.
+        #[arg(long)]
+        offline: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ThreatDbAction {
     /// Download or update the threat intelligence database
     #[command(after_help = "\
@@ -1820,6 +1878,19 @@ fn run() {
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::package::explain(&ecosystem, &name, path.as_deref(), online, offline, json)
+            }
+        },
+
+        Commands::Ecosystem { action } => match action {
+            EcosystemAction::Scan {
+                path,
+                online,
+                offline,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::ecosystem::scan(path.as_deref(), online, offline, json)
             }
         },
 

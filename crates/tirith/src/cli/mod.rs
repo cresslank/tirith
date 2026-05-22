@@ -97,6 +97,7 @@ pub mod completions;
 pub mod daemon;
 pub mod diff;
 pub mod doctor;
+pub mod ecosystem;
 pub mod explain;
 pub mod gateway;
 pub mod hook_event;

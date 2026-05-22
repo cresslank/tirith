@@ -260,6 +260,21 @@ tirith package risk --online npm react  # also consult the registry API
 
 The score is advisory and standalone: `package risk` is not a detection rule and changes no verdict, exit code, or audit log.
 
+### Ecosystem scan — supply-chain firewall
+
+`tirith ecosystem scan [path]` is the directory-level companion to `package risk`. It walks a project, discovers every dependency manifest it understands — npm (`package.json`, `package-lock.json`), Python (`requirements*.txt`, `pyproject.toml`), Rust (`Cargo.toml`), Go (`go.mod`), Ruby (`Gemfile`) — and scores **every declared dependency** with the same deterministic `package_risk` factor engine.
+
+```bash
+tirith ecosystem scan                       # scan the current project
+tirith ecosystem scan ./my-project          # scan a specific directory
+tirith ecosystem scan --online ./my-project # also consult the registry API
+tirith ecosystem scan --format json ./      # full machine-readable report
+```
+
+**It folds in slopsquat detection.** *Slopsquatting* is the registration of a plausible-but-fake package name that LLMs tend to hallucinate when asked to suggest a dependency. `ecosystem scan` flags a dependency as slopsquat-suspicious only when **all three** hold: the name is not a known-real / known-popular package, it is **name-shaped like an AI hallucination** (a language prefix such as `python-` / `node-` plus descriptive tokens, a stack of generic filler words like `helper` / `utils` / `client`, or an unusually long descriptive name), **and** it sits near a real popular name (a one-edit near-miss, or it embeds a popular package name as a word). Requiring all three keeps the false-positive rate low — an honest `data-utils` with no popular anchor does not fire.
+
+**Offline by default, opt-in `--online`.** Name and typosquat signals come from the local threat database; `--online` adds the registry-API provenance signals, gated and degraded exactly as `package risk --online` is — never on the `check` hot path. Findings flow through tirith's normal `Verdict` / `Finding` model: they are explainable (`tirith explain --rule threat_suspicious_package`), audit-logged, and respect the policy allowlist (an allowlisted package — by bare name or `ecosystem:name` — is suppressed). Exit codes match `tirith scan`: `1` for a blocking finding (a confirmed-malicious / typosquat dependency), `2` for advisory findings, `0` when clean.
+
 This helps catch known-malicious packages, confirmed typosquats, slopsquatted package names, malicious download infrastructure, and packages with live OSV / CISA KEV advisory data.
 
 **Attack families tirith is built for** (illustrative, not a caught-by-current-code claim):

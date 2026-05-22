@@ -6,6 +6,7 @@ pub mod audit_upload;
 pub mod checkpoint;
 pub mod confusables;
 pub mod data;
+pub mod ecosystem_scan;
 pub mod engine;
 pub mod escalation;
 pub mod extract;

@@ -1199,12 +1199,12 @@ remediation = "Update the package to a non-vulnerable version immediately. CISA 
 id = "threat_suspicious_package"
 title = "Suspicious package metadata"
 category = "threatintel"
-severity_rationale = "Low — the package has suspicious metadata (very new, single maintainer, low downloads) but is not confirmed malicious. This is an advisory signal."
-description = "The package has metadata characteristics often associated with malicious packages: very recently published, single maintainer, low download count, or missing repository URL. This rule uses real-time API lookups (deps.dev, ecosyste.ms) for package health signals. Phase C feature — requires network access."
-examples_bad = ["npm install brand-new-package-no-downloads"]
-examples_good = ["npm install lodash"]
-false_positive_guidance = "New, legitimate packages will trigger this rule. It is advisory only (Low severity). Established packages with active maintainers will not trigger this."
-remediation = "Review the package on its registry page. Check the maintainer, publication date, download count, and source repository before installing."
+severity_rationale = "Low to Medium — the package has suspicious characteristics (very new, low downloads, missing repository, or an AI-hallucinated 'slopsquat' name shape) but is not confirmed malicious. This is an advisory signal."
+description = "The package has characteristics often associated with malicious packages. Two paths emit this rule. (1) Real-time API lookups (deps.dev, ecosyste.ms) flag a very recently published package, a low download count, or a missing repository URL. (2) `tirith ecosystem scan` flags a declared dependency whose name is slopsquat-suspicious — not a known-real package, name-shaped like an LLM hallucination (a language prefix plus descriptive tokens, or a stack of generic filler words), and sitting near a real popular package. Slopsquatting is the registration of plausible-but-fake names that AI assistants tend to hallucinate when suggesting dependencies."
+examples_bad = ["npm install brand-new-package-no-downloads", "a pyproject.toml declaring python-requests-helper"]
+examples_good = ["npm install lodash", "a pyproject.toml declaring requests"]
+false_positive_guidance = "New, legitimate packages will trigger the metadata path. The slopsquat path is a conservative name-shape heuristic — it fires only when the name is unknown, looks AI-generated, AND sits near a real popular package — but a legitimate descriptively-named companion package can still match. Review the package on its registry page; if it is intentional, suppress it via the policy allowlist."
+remediation = "Review the package on its registry page. Check the maintainer, publication date, download count, and source repository before installing. For a slopsquat finding, confirm the package actually exists and is the one you intended — AI assistants sometimes suggest package names that were never published."
 
 [[rule]]
 id = "threat_safe_browsing"
