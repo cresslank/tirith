@@ -1184,6 +1184,53 @@ impl ThreatDb {
         None
     }
 
+    /// Whether `name` is itself a known-popular package in `eco`.
+    ///
+    /// This is the exact-match companion to [`check_popular_distance`], which
+    /// deliberately *skips* exact matches (it answers "what popular package is
+    /// this a near-miss of?"). Provenance scoring needs both: the exact check
+    /// recognizes a name as a well-known, widely-installed package, while the
+    /// distance check flags a name that merely *resembles* one.
+    ///
+    /// [`check_popular_distance`]: Self::check_popular_distance
+    pub fn is_popular_package(&self, eco: Ecosystem, name: &str) -> bool {
+        // Linear scan, same as `check_popular_distance` — the popular index is
+        // sorted by (ecosystem, name) on disk but not by hash, so a hash-keyed
+        // binary search would not be sound here.
+        for i in 0..self.popular_index_count {
+            let base = self.popular_index_offset as usize + i as usize * POPULAR_INDEX_ENTRY_SIZE;
+            let data_off = match read_u32_le(&self.data, base) {
+                Some(v) => v as usize,
+                None => continue,
+            };
+            let rec_eco = match self.data.get(data_off).and_then(|&b| Ecosystem::from_u8(b)) {
+                Some(e) => e,
+                None => continue,
+            };
+            if rec_eco != eco {
+                continue;
+            }
+            let name_len = match read_u16_le(&self.data, data_off + 1) {
+                Some(l) => l as usize,
+                None => continue,
+            };
+            let name_start = data_off + 3;
+            let name_end = name_start + name_len;
+            if name_end > self.data.len() {
+                continue;
+            }
+            if let Ok(popular_name) = std::str::from_utf8(&self.data[name_start..name_end]) {
+                if popular_name == name {
+                    return true;
+                }
+            }
+        }
+        self.supplemental
+            .as_deref()
+            .map(|db| db.is_popular_package(eco, name))
+            .unwrap_or(false)
+    }
+
     /// Find the closest popular package name within Levenshtein distance.
     /// Returns `(popular_name, distance)` if distance <= 1.
     pub fn check_popular_distance(&self, eco: Ecosystem, name: &str) -> Option<(String, usize)> {
@@ -2173,6 +2220,38 @@ mod tests {
         let db = build_test_db(&key);
 
         assert!(db.check_popular_distance(Ecosystem::Npm, "xyz").is_none());
+    }
+
+    #[test]
+    fn test_is_popular_package_exact_match() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        // Exact, in the right ecosystem → true.
+        assert!(db.is_popular_package(Ecosystem::Npm, "react"));
+        assert!(db.is_popular_package(Ecosystem::PyPI, "requests"));
+        // Right name, wrong ecosystem → false.
+        assert!(!db.is_popular_package(Ecosystem::PyPI, "react"));
+        // A near-miss is not an exact match → false.
+        assert!(!db.is_popular_package(Ecosystem::Npm, "reactt"));
+        // Unknown name → false.
+        assert!(!db.is_popular_package(Ecosystem::Npm, "totally-unknown-pkg"));
+    }
+
+    #[test]
+    fn test_is_popular_package_finds_supplemental_overlay() {
+        let key = SigningKey::generate(&mut OsRng);
+        let primary =
+            ThreatDb::from_bytes(ThreatDbWriter::new(1700000000, 1).build(&key).unwrap(), 0)
+                .unwrap();
+        let mut overlay_writer = ThreatDbWriter::new(1700000001, 1);
+        overlay_writer.add_popular(Ecosystem::Crates, "serde");
+        let overlay =
+            ThreatDb::from_bytes(overlay_writer.build(&key).unwrap(), 0).expect("overlay load");
+        let db = primary.with_supplemental(Some(overlay));
+
+        assert!(db.is_popular_package(Ecosystem::Crates, "serde"));
+        assert!(!db.is_popular_package(Ecosystem::Crates, "not-there"));
     }
 
     #[test]

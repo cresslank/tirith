@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod network;
 pub mod normalize;
 pub mod output;
+pub mod package_risk;
 pub mod parse;
 pub mod policy;
 pub mod policy_client;
