@@ -458,13 +458,19 @@ command + args), and declared tools — plus a content hash per server and over
 the whole inventory. The lockfile is diff-friendly: servers are sorted by name,
 so a `git diff` shows exactly what changed in the repo's MCP surface.
 
+`tirith mcp verify` gates on drift: it loads the committed lockfile, rebuilds
+the current inventory, and exits non-zero when the two differ. `tirith mcp
+diff` shows the same drift informationally (always exits 0).
+
 This is a local file operation — no network, off the detection hot path.
 Discovery is repo-local only: user-level configs (e.g. ~/.claude/) are never
 inventoried.
 
 Examples:
   tirith mcp lock
-  tirith mcp lock --format json")]
+  tirith mcp lock --format json
+  tirith mcp verify
+  tirith mcp diff --format json")]
     Mcp {
         #[command(subcommand)]
         action: McpAction,
@@ -1488,6 +1494,62 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+
+    /// Verify that the current MCP inventory matches .tirith/mcp.lock (gates on drift)
+    #[command(after_help = "\
+Loads the committed .tirith/mcp.lock baseline, rebuilds the current MCP-server
+inventory from the repo's configuration files, and reports any drift — an MCP
+server added, removed, or altered (transport, env, declared tools, or URL
+credentials) since the lockfile was taken.
+
+This is the gating companion to `tirith mcp lock`: use it in CI to fail a
+build when an MCP surface change lands without a lockfile refresh. The human
+output never prints env values or URL userinfos — only the redacted / hashed
+form the lockfile already carries.
+
+Exit codes:
+  0  inventory matches the lockfile (no drift).
+  1  drift detected — the inventory and the lockfile differ.
+  2  usage error — no lockfile to verify against, cannot read it, the
+     repository root could not be determined, or another operational failure.
+
+Examples:
+  tirith mcp verify
+  tirith mcp verify --format json")]
+    Verify {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Show the drift between the current MCP inventory and .tirith/mcp.lock (informational)
+    #[command(after_help = "\
+Shows the same drift `tirith mcp verify` computes, but as an informational
+diff — always exits 0, never gates a CI build. Use it to inspect what an
+edit to an MCP config will do before running `tirith mcp lock` to refresh
+the committed lockfile.
+
+The human output groups drifts as added / removed / changed, naming each
+server by its declared name. Env values and URL userinfos are never printed
+— only that the variable / credential changed, and only on a per-name basis.
+
+Exit code:
+  0  always — `diff` is informational. Use `verify` to gate.
+
+Examples:
+  tirith mcp diff
+  tirith mcp diff --format json")]
+    Diff {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1761,6 +1823,14 @@ fn run() {
             McpAction::Lock { format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::mcp::lock(json)
+            }
+            McpAction::Verify { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::mcp::verify(json)
+            }
+            McpAction::Diff { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::mcp::diff(json)
             }
         },
 

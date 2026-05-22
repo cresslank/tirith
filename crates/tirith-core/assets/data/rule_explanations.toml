@@ -738,6 +738,18 @@ false_positive_guidance = "Some MCP server arguments may legitimately contain th
 remediation = "Remove shell metacharacters from MCP server arguments. Use proper quoting or configuration files instead."
 mitre_id = "T1195.002"
 
+[[rule]]
+id = "mcp_server_drift"
+title = "MCP server inventory has drifted from the committed lockfile"
+category = "config"
+severity_rationale = "Medium — drift between the current MCP inventory and .tirith/mcp.lock means a server was added, removed, or altered (transport, env, tools, or URL credentials) since the lockfile was last taken. The change may be intentional, but it deserves human review before commit."
+description = "The MCP servers declared in this repository's configuration files no longer match the inventory recorded in `.tirith/mcp.lock`. A server may have been added or removed; an existing server may have changed transport (a swapped command, args, or remote URL), gained or lost an env variable, had a stored credential rotated (env value-hash or URL userinfo-hash change), or had its declared tools modified. None of these changes are inherently malicious — they are exactly what a config update looks like — but each is a security-relevant surface change that should be reviewed and the lockfile re-committed."
+examples_bad = []
+examples_good = []
+false_positive_guidance = "Drift is expected immediately after editing an MCP config. Run `tirith mcp verify` to see what changed, review it, and run `tirith mcp lock` to refresh the committed lockfile."
+remediation = "Run `tirith mcp diff` (informational) or `tirith mcp verify` (gating) to see the exact drift, confirm the change is intentional, then re-run `tirith mcp lock` to refresh `.tirith/mcp.lock`."
+mitre_id = "T1195.002"
+
 # ── Ecosystem rules ─────────────────────────────────────────────────────
 
 [[rule]]

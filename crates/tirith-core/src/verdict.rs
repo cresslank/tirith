@@ -83,6 +83,7 @@ pub enum RuleId {
     McpDuplicateServerName,
     McpOverlyPermissive,
     McpSuspiciousArgs,
+    McpServerDrift,
 
     // Ecosystem rules
     GitTyposquat,

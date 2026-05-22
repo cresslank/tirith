@@ -141,6 +141,7 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::McpDuplicateServerName
         | RuleId::McpOverlyPermissive
         | RuleId::McpSuspiciousArgs
+        | RuleId::McpServerDrift
         | RuleId::GitTyposquat
         | RuleId::DockerUntrustedRegistry
         | RuleId::PipUrlInstall

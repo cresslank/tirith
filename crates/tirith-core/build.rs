@@ -792,6 +792,7 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("mcp_duplicate_server_name", "McpDuplicateServerName"),
     ("mcp_overly_permissive", "McpOverlyPermissive"),
     ("mcp_suspicious_args", "McpSuspiciousArgs"),
+    ("mcp_server_drift", "McpServerDrift"),
     // Ecosystem
     ("git_typosquat", "GitTyposquat"),
     ("docker_untrusted_registry", "DockerUntrustedRegistry"),

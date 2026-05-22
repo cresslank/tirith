@@ -4328,3 +4328,303 @@ fn mcp_lock_does_not_leak_env_secret_into_committed_file() {
         );
     }
 }
+
+// ===========================================================================
+// `tirith mcp verify` / `tirith mcp diff` — Milestone 4 chunk 2 drift detection.
+//
+// Same isolation pattern as the `mcp lock` tests above: pin
+// `TIRITH_POLICY_ROOT` to the temp repo so the binary cannot drift onto the
+// real cwd or a real `.git`, and isolate user dirs on every platform
+// (`XDG_*` on Unix, `APPDATA` on Windows).
+// ===========================================================================
+
+/// Run `tirith mcp <subcommand> <args>` against a temp repo with the
+/// usual isolation. Returns `(stdout, stderr, exit_code)`.
+fn run_mcp_subcommand(
+    subcommand: &str,
+    repo_root: &std::path::Path,
+    iso: &std::path::Path,
+    args: &[&str],
+) -> (String, String, i32) {
+    let out = tirith()
+        .arg("mcp")
+        .arg(subcommand)
+        .args(args)
+        .env("TIRITH_POLICY_ROOT", repo_root)
+        .env("XDG_CONFIG_HOME", iso)
+        .env("XDG_STATE_HOME", iso)
+        .env("XDG_CACHE_HOME", iso)
+        .env("XDG_DATA_HOME", iso)
+        .env("APPDATA", iso)
+        .output()
+        .unwrap_or_else(|_| panic!("failed to run tirith mcp {subcommand}"));
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+#[test]
+fn mcp_verify_exits_zero_when_inventory_matches_lockfile() {
+    // Plant a config, lock it, then verify — the inventory matches, so
+    // `verify` must exit 0.
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": { "s": { "command": "node" } } }"#,
+    )
+    .unwrap();
+
+    let (_o, _e, lock_code) = run_mcp_lock(repo.path(), iso.path(), &[]);
+    assert_eq!(lock_code, 0);
+
+    let (_o, err, code) = run_mcp_subcommand("verify", repo.path(), iso.path(), &[]);
+    assert_eq!(code, 0, "no drift → exit 0; stderr: {err}");
+    assert!(
+        err.contains("no drift"),
+        "verify must report 'no drift' on a clean inventory; got: {err}"
+    );
+}
+
+#[test]
+fn mcp_verify_exits_one_when_inventory_drifts() {
+    // Lock, then mutate the config — `verify` must surface drift with exit 1.
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": { "s": { "command": "node" } } }"#,
+    )
+    .unwrap();
+
+    let (_o, _e, lock_code) = run_mcp_lock(repo.path(), iso.path(), &[]);
+    assert_eq!(lock_code, 0);
+
+    // Now add a second server in the config.
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": {
+            "s": { "command": "node" },
+            "t": { "command": "deno" }
+        } }"#,
+    )
+    .unwrap();
+
+    let (_o, err, code) = run_mcp_subcommand("verify", repo.path(), iso.path(), &[]);
+    assert_eq!(code, 1, "drift → exit 1");
+    assert!(
+        err.contains("drift detected"),
+        "verify must announce drift; got: {err}"
+    );
+}
+
+#[test]
+fn mcp_verify_exits_two_when_no_lockfile() {
+    // Without a baseline lockfile, `verify` cannot operate — that is a
+    // usage error (2), distinct from drift (1) and from no-drift (0).
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": { "s": { "command": "node" } } }"#,
+    )
+    .unwrap();
+
+    let (_o, err, code) = run_mcp_subcommand("verify", repo.path(), iso.path(), &[]);
+    assert_eq!(code, 2, "missing lockfile → exit 2");
+    assert!(
+        err.contains("no lockfile"),
+        "missing lockfile must be reported explicitly; got: {err}"
+    );
+}
+
+#[test]
+fn mcp_verify_json_emits_envelope() {
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": { "s": { "command": "node" } } }"#,
+    )
+    .unwrap();
+
+    run_mcp_lock(repo.path(), iso.path(), &[]);
+
+    let (stdout, _err, code) =
+        run_mcp_subcommand("verify", repo.path(), iso.path(), &["--format", "json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("verify JSON");
+    assert_eq!(v["in_sync"], true);
+    assert_eq!(v["drift_count"], 0);
+    assert_eq!(v["command"], "tirith mcp verify");
+    assert_eq!(v["lockfile_format_version"], 4);
+}
+
+#[test]
+fn mcp_verify_json_reports_drift_added() {
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": { "s": { "command": "node" } } }"#,
+    )
+    .unwrap();
+
+    run_mcp_lock(repo.path(), iso.path(), &[]);
+
+    // Add a new server.
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": {
+            "s": { "command": "node" },
+            "added": { "command": "deno" }
+        } }"#,
+    )
+    .unwrap();
+
+    let (stdout, _err, code) =
+        run_mcp_subcommand("verify", repo.path(), iso.path(), &["--format", "json"]);
+    assert_eq!(code, 1);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("verify JSON");
+    assert_eq!(v["in_sync"], false);
+    assert_eq!(v["added_count"], 1);
+    assert_eq!(v["removed_count"], 0);
+    assert_eq!(v["changed_count"], 0);
+    let drifts = v["drifts"].as_array().unwrap();
+    assert_eq!(drifts.len(), 1);
+    assert_eq!(drifts[0]["kind"], "added");
+    assert_eq!(drifts[0]["name"], "added");
+}
+
+#[test]
+fn mcp_diff_always_exits_zero_even_with_drift() {
+    // `diff` is informational — drift does not affect its exit code.
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": { "s": { "command": "node" } } }"#,
+    )
+    .unwrap();
+
+    run_mcp_lock(repo.path(), iso.path(), &[]);
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": {
+            "s": { "command": "node" },
+            "t": { "command": "deno" }
+        } }"#,
+    )
+    .unwrap();
+
+    let (_o, err, code) = run_mcp_subcommand("diff", repo.path(), iso.path(), &[]);
+    assert_eq!(code, 0, "diff is informational — exit 0 even with drift");
+    assert!(
+        err.contains("drift"),
+        "diff stderr should still announce the drift; got: {err}"
+    );
+}
+
+#[test]
+fn mcp_diff_exits_two_when_no_lockfile() {
+    // Even the informational diff distinguishes "nothing to compare" from
+    // "no drift" so a piped consumer can react.
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    let (_o, _e, code) = run_mcp_subcommand("diff", repo.path(), iso.path(), &[]);
+    assert_eq!(code, 2);
+}
+
+#[test]
+fn mcp_verify_does_not_leak_env_value_on_drift() {
+    // Headline privacy check: a value-hash rotation surfaces as drift; the
+    // raw env value never appears in stdout or stderr.
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+
+    let secret_old = "ghp_OLD_DRIFT_PROBE_BYTES_supersecret";
+    let secret_new = "ghp_NEW_DRIFT_PROBE_BYTES_rotated";
+    fs::write(
+        repo.path().join(".mcp.json"),
+        format!(
+            r#"{{ "mcpServers": {{ "s": {{ "command": "node",
+                "env": {{ "API_TOKEN": "{secret_old}" }} }} }} }}"#
+        ),
+    )
+    .unwrap();
+    run_mcp_lock(repo.path(), iso.path(), &[]);
+
+    fs::write(
+        repo.path().join(".mcp.json"),
+        format!(
+            r#"{{ "mcpServers": {{ "s": {{ "command": "node",
+                "env": {{ "API_TOKEN": "{secret_new}" }} }} }} }}"#
+        ),
+    )
+    .unwrap();
+
+    let (stdout, err, code) =
+        run_mcp_subcommand("verify", repo.path(), iso.path(), &["--format", "json"]);
+    assert_eq!(code, 1, "value-hash flip must surface as drift");
+    assert!(
+        !stdout.contains(secret_old) && !stdout.contains(secret_new),
+        "raw env values must NEVER appear in stdout: stdout={stdout}"
+    );
+    assert!(
+        !err.contains(secret_old) && !err.contains(secret_new),
+        "raw env values must NEVER appear in stderr: stderr={err}"
+    );
+
+    // Human surface: the same property.
+    let (stdout_h, err_h, code_h) = run_mcp_subcommand("verify", repo.path(), iso.path(), &[]);
+    assert_eq!(code_h, 1);
+    assert!(!stdout_h.contains(secret_old) && !stdout_h.contains(secret_new));
+    assert!(!err_h.contains(secret_old) && !err_h.contains(secret_new));
+}
+
+#[test]
+fn mcp_verify_does_not_leak_url_userinfo_on_drift() {
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+
+    let userinfo_old = "admin:ghp_OLD_URL_USERINFO_DRIFT_PROBE";
+    let userinfo_new = "admin:ghp_NEW_URL_USERINFO_DRIFT_PROBE";
+    fs::write(
+        repo.path().join(".mcp.json"),
+        format!(
+            r#"{{ "mcpServers": {{ "s": {{ "url": "https://{userinfo_old}@mcp.example.com/sse" }} }} }}"#
+        ),
+    )
+    .unwrap();
+    run_mcp_lock(repo.path(), iso.path(), &[]);
+
+    fs::write(
+        repo.path().join(".mcp.json"),
+        format!(
+            r#"{{ "mcpServers": {{ "s": {{ "url": "https://{userinfo_new}@mcp.example.com/sse" }} }} }}"#
+        ),
+    )
+    .unwrap();
+
+    let (stdout, err, code) = run_mcp_subcommand("verify", repo.path(), iso.path(), &[]);
+    assert_eq!(code, 1);
+    assert!(
+        !stdout.contains(userinfo_old) && !stdout.contains(userinfo_new),
+        "raw URL userinfo must never appear in stdout: stdout={stdout}"
+    );
+    assert!(
+        !err.contains(userinfo_old) && !err.contains(userinfo_new),
+        "raw URL userinfo must never appear in stderr: stderr={err}"
+    );
+}

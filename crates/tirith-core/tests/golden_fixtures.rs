@@ -550,6 +550,7 @@ const ALL_RULE_IDS: &[&str] = &[
     "mcp_duplicate_server_name",
     "mcp_overly_permissive",
     "mcp_suspicious_args",
+    "mcp_server_drift",
     // Ecosystem
     "git_typosquat",
     "docker_untrusted_registry",
@@ -762,6 +763,7 @@ fn test_rule_id_list_is_complete() {
         RuleId::McpDuplicateServerName,
         RuleId::McpOverlyPermissive,
         RuleId::McpSuspiciousArgs,
+        RuleId::McpServerDrift,
         RuleId::GitTyposquat,
         RuleId::DockerUntrustedRegistry,
         RuleId::PipUrlInstall,
@@ -866,6 +868,7 @@ fn test_no_url_rules_have_no_url_fixtures() {
         "mcp_suspicious_args",          // file context, no URL needed
         "mcp_overly_permissive",        // file context, no URL needed
         "mcp_duplicate_server_name",    // file context, no URL needed
+        "mcp_server_drift",             // mcp.lock FileScan, no URL needed
         "metadata_endpoint",            // bare IP: curl 169.254.169.254/path
         "private_network_access",       // bare IP: curl 10.0.0.1/path
         "credential_in_text",           // token/key in text, no URL needed

@@ -99,6 +99,21 @@ file_path = "mcp.json"
 expected_action = "allow"
 expected_rules = []
 
+# ── MCP lockfile drift ──────────────────────────────────────────────────
+# The committed .tirith/mcp.lock declares an MCP server (`drifted`), but the
+# scan is run against a (relative) lockfile path whose derived "repo root" has
+# no MCP configs — so the current inventory is empty, the inventory hashes
+# differ, and `mcp_server_drift` fires. This is the FileScan counterpart to
+# `tirith mcp verify`; severity Medium → Action::Warn.
+[[fixture]]
+name = "mcp_lockfile_drift_detected"
+min_milestone = 4
+input = '{"format_version":4,"inventory_hash":"0000000000000000000000000000000000000000000000000000000000000001","configs":[".mcp.json"],"servers":[{"name":"drifted","transport":{"kind":"stdio","command":"node","args":["s.js"]},"tools":[],"source_config":".mcp.json","hash":"0000000000000000000000000000000000000000000000000000000000000002"}]}'
+context = "file"
+file_path = ".tirith/mcp.lock"
+expected_action = "warn"
+expected_rules = ["mcp_server_drift"]
+
 [[fixture]]
 name = "prompt_injection_tool_invocation"
 min_milestone = 1

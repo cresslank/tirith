@@ -583,6 +583,17 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             ));
         }
 
+        // MCP lockfile drift: when the scan target is `.tirith/mcp.lock`, the
+        // module rebuilds the current inventory and diffs it against the
+        // lockfile's recorded one. Self-selecting by path; a non-mcp.lock
+        // file produces nothing.
+        if crate::rules::mcpdrift::is_mcp_lockfile(ctx.file_path.as_deref()) {
+            findings.extend(crate::rules::mcpdrift::check(
+                &ctx.input,
+                ctx.file_path.as_deref(),
+            ));
+        }
+
         if crate::rules::rendered::is_renderable_file(ctx.file_path.as_deref()) {
             // PDFs need their own parser; everything else is treated as text.
             let is_pdf = ctx

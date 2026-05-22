@@ -858,6 +858,554 @@ fn parse_tools(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<String> 
     tools
 }
 
+// ---------------------------------------------------------------------------
+// Drift detection
+// ---------------------------------------------------------------------------
+
+/// How a stdio server's `env` differs from what the lockfile recorded.
+///
+/// Each variant carries only the variable's **name** — the lockfile carries
+/// only a salted hash of the value (see [`McpEnvEntry`]), and a drift report is
+/// printed to a human and to `--format json`, so a raw value (which could be a
+/// credential) must never leave drift detection. The hash is folded into the
+/// per-server content hash, so a value swap surfaces as `ValueHashChanged` here
+/// without ever being decoded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpEnvChange {
+    /// The server now declares an env variable that the lockfile did not.
+    Added { name: String },
+    /// The lockfile declared an env variable that the server no longer does.
+    Removed { name: String },
+    /// The variable is present on both sides but its `value_hash` differs —
+    /// the underlying value changed (a rotated credential, a swapped flag).
+    ValueHashChanged { name: String },
+}
+
+/// How a server's transport differs from what the lockfile recorded.
+///
+/// The transport descriptor is the most security-relevant part of a server's
+/// definition: a swapped URL is a redirection, a swapped command is a rebound
+/// subprocess. Each variant captures *only* what is needed for a readable
+/// drift report — `KindChanged` records the two kinds plainly, the more
+/// specific variants record the structural shape of the change without
+/// repeating the raw URL / command (those flow through the higher-level
+/// server-changed entry).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpTransportChange {
+    /// The transport's *kind* changed (e.g. `stdio` → `url`).
+    KindChanged {
+        /// The previous kind, lowercase: `"url"` / `"stdio"` / `"unknown"`.
+        previous: String,
+        /// The current kind.
+        current: String,
+    },
+    /// Both sides are `url` and the stored URL bytes differ — the redacted
+    /// (userinfo-stripped) URL bytes the lockfile carries are not equal to
+    /// the current redacted URL.
+    UrlChanged,
+    /// Both sides are `url` and the `userinfo_hash` differs: a credential was
+    /// added, removed, or swapped. `added` / `removed` carry the literal
+    /// transition; a swap surfaces as both `Removed` and `Added` would mask
+    /// the diff, so the swap case is `Swapped`.
+    UserinfoAdded,
+    UserinfoRemoved,
+    UserinfoSwapped,
+    /// Both sides are `stdio` and the command bytes differ.
+    CommandChanged,
+    /// Both sides are `stdio` and the arg list differs (added / removed /
+    /// reordered).
+    ArgsChanged,
+    /// Both sides are `stdio` and one or more env variables added / removed /
+    /// changed value-hash. The per-variable detail rides in
+    /// [`McpServerDrift::env_changes`] for readability.
+    EnvChanged,
+}
+
+/// What kind of change a tool list saw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpToolsChangeKind {
+    /// The set of tool names is the same but the recorded order differs.
+    /// (Tool lists are sorted on parse, so this fires only when two sides
+    /// were sorted differently — a defensive variant; in practice `Set` is
+    /// what fires when the *declared* tools change.)
+    Reordered,
+    /// One or more tools were added.
+    Added,
+    /// One or more tools were removed.
+    Removed,
+    /// Both sides have tools but the set itself differs (additions and
+    /// removals together).
+    Set,
+}
+
+/// One server's drift entry — the headline change plus per-field detail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerDriftEntry {
+    /// The server's name (the key in the config's `mcpServers` / `servers`
+    /// object). Same on both sides for a `Changed` entry.
+    pub name: String,
+    /// Repo-relative path of the config the *current* inventory pulled the
+    /// server from; for a `Removed` server, the lockfile's `source_config`.
+    pub source_config: String,
+    /// The transport changes detected, sorted for determinism.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transport_changes: Vec<McpTransportChange>,
+    /// Per-variable env changes (stdio transport only), sorted by `name`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_changes: Vec<McpEnvChange>,
+    /// What kind of tool change, if any. `None` when the tool list is byte-equal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_change: Option<McpToolsChangeKind>,
+    /// Tool names added by the current inventory, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_added: Vec<String>,
+    /// Tool names removed since the lockfile was taken, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_removed: Vec<String>,
+}
+
+impl McpServerDriftEntry {
+    /// `true` when the entry records no per-field changes — used internally to
+    /// reject an empty `Changed` drift (a defensive check; in normal use a
+    /// `Changed` drift only exists when at least one field actually changed).
+    fn is_empty(&self) -> bool {
+        self.transport_changes.is_empty()
+            && self.env_changes.is_empty()
+            && self.tools_change.is_none()
+            && self.tools_added.is_empty()
+            && self.tools_removed.is_empty()
+    }
+}
+
+/// One drift between the current inventory and the loaded lockfile.
+///
+/// A `Vec<McpDrift>` is the structured shape both `tirith mcp verify` and
+/// `tirith mcp diff` consume. Sort order: `Removed` first (by name), then
+/// `Added` (by name), then `Changed` (by name) — `Removed` first because it
+/// is the most surprising / security-relevant case (a server that the
+/// lockfile expected is gone), and grouping `Added` and `Changed` by name
+/// makes the human output read top-to-bottom by server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpDrift {
+    /// A server in the lockfile is no longer in the current inventory.
+    Removed {
+        /// The server's name as the lockfile recorded it.
+        name: String,
+        /// Repo-relative source config the lockfile recorded.
+        source_config: String,
+    },
+    /// A server in the current inventory is not in the lockfile.
+    Added {
+        /// The server's name.
+        name: String,
+        /// Repo-relative source config the current inventory found.
+        source_config: String,
+    },
+    /// A server present on both sides has changed — its per-server `hash`
+    /// differs. The entry holds the per-field detail.
+    Changed(McpServerDriftEntry),
+}
+
+impl McpDrift {
+    /// Sort key for deterministic ordering: kind-bucket first (Removed = 0,
+    /// Added = 1, Changed = 2), then by `(name, source_config)` inside each
+    /// bucket. This is what makes a `Vec<McpDrift>` byte-stable.
+    fn sort_key(&self) -> (u8, String, String) {
+        match self {
+            McpDrift::Removed {
+                name,
+                source_config,
+            } => (0, name.clone(), source_config.clone()),
+            McpDrift::Added {
+                name,
+                source_config,
+            } => (1, name.clone(), source_config.clone()),
+            McpDrift::Changed(entry) => (2, entry.name.clone(), entry.source_config.clone()),
+        }
+    }
+
+    /// The server name this drift refers to.
+    pub fn name(&self) -> &str {
+        match self {
+            McpDrift::Removed { name, .. } => name,
+            McpDrift::Added { name, .. } => name,
+            McpDrift::Changed(entry) => &entry.name,
+        }
+    }
+}
+
+/// Compute the structured drift between the current inventory and the
+/// lockfile that was previously written.
+///
+/// **Fast path.** The lockfile carries an `inventory_hash` computed over the
+/// ordered concatenation of every server's content hash; the current
+/// inventory's *would-be* lockfile carries the same kind of hash. If those
+/// two hashes are byte-equal, the inventory is unchanged at every level — no
+/// server added, removed, or altered — so the drift is empty without doing
+/// any per-server work.
+///
+/// **Slow path.** When the two inventory hashes differ, every server is
+/// compared by `(name, source_config)` (deterministic, since both sides are
+/// sorted by that pair in `from_inventory`). A server on one side and not
+/// the other is `Added` / `Removed`; a server on both sides whose per-server
+/// `content_hash` differs is `Changed`, with `compute_changed_entry` filling
+/// in the per-field detail.
+///
+/// **A note on the `source_config` interaction.** `content_hash`
+/// deliberately excludes `source_config` — moving an unchanged server
+/// definition from `.mcp.json` to `.vscode/mcp.json` is a *non-event* in
+/// the chunk-1 schema. Since `inventory_hash` aggregates `content_hash`es,
+/// such a move leaves the inventory hash unchanged and the fast path
+/// returns empty drift. A repo that legitimately declares **two** distinct
+/// servers with the same name in different configs still works: each is a
+/// separate `(name, source_config)` entry in the lockfile, and changes are
+/// attributed to the entry that actually changed.
+///
+/// The returned `Vec<McpDrift>` is sorted deterministically — see
+/// [`McpDrift::sort_key`].
+///
+/// **Privacy.** Drift entries carry only **names**: server names, env
+/// variable names, tool names. The lockfile already strips env raw values
+/// and URL userinfos (replacing each with a salted hash); drift detection
+/// observes that the *hash* changed, never the underlying secret. A drift
+/// report is therefore safe to print to a terminal and to serialize as JSON.
+pub fn compute_drift(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift> {
+    // Compute the current inventory's would-be inventory hash. If it equals
+    // the lockfile's recorded one, nothing changed; skip the per-server
+    // comparison entirely.
+    let current_lock = McpLockfile::from_inventory(current);
+    if current_lock.inventory_hash == lock.inventory_hash {
+        return Vec::new();
+    }
+
+    // Walk both sides by sorted name. Both `current_lock.servers` and
+    // `lock.servers` are sorted by `(name, source_config)` — that is the
+    // invariant `from_inventory` establishes — so a merge walk yields the
+    // diff in O(n + m).
+    let mut drifts: Vec<McpDrift> = Vec::new();
+    let mut i = 0usize; // index into current_lock.servers
+    let mut j = 0usize; // index into lock.servers
+
+    while i < current_lock.servers.len() && j < lock.servers.len() {
+        let cur = &current_lock.servers[i];
+        let prev = &lock.servers[j];
+
+        let key_cur = (&cur.name, &cur.source_config);
+        let key_prev = (&prev.name, &prev.source_config);
+
+        match key_cur.cmp(&key_prev) {
+            std::cmp::Ordering::Less => {
+                // Current side has a server before the lockfile's next one —
+                // the lockfile doesn't have it. Added.
+                drifts.push(McpDrift::Added {
+                    name: cur.name.clone(),
+                    source_config: cur.source_config.clone(),
+                });
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                // Lockfile has a server before the current side's next one —
+                // current side doesn't have it. Removed.
+                drifts.push(McpDrift::Removed {
+                    name: prev.name.clone(),
+                    source_config: prev.source_config.clone(),
+                });
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                // Same (name, source_config). If the per-server content hash
+                // matches, the server is byte-identical — no drift. If the
+                // hashes differ, classify the per-field change.
+                if cur.hash != prev.hash {
+                    if let Some(entry) = compute_changed_entry(cur, prev) {
+                        drifts.push(McpDrift::Changed(entry));
+                    }
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    while i < current_lock.servers.len() {
+        let cur = &current_lock.servers[i];
+        drifts.push(McpDrift::Added {
+            name: cur.name.clone(),
+            source_config: cur.source_config.clone(),
+        });
+        i += 1;
+    }
+    while j < lock.servers.len() {
+        let prev = &lock.servers[j];
+        drifts.push(McpDrift::Removed {
+            name: prev.name.clone(),
+            source_config: prev.source_config.clone(),
+        });
+        j += 1;
+    }
+
+    drifts.sort_by_key(McpDrift::sort_key);
+    drifts
+}
+
+/// Classify the field-level change between two servers that share a
+/// `(name, source_config)` but have different per-server `hash` values.
+///
+/// Returns `Some(entry)` when at least one field-level change is detected.
+/// Returns `None` only in the defensive case where the hashes differ but no
+/// field-level cause is identified — that should not happen for well-formed
+/// inputs (`content_hash` is total over every field), and an empty `Changed`
+/// entry would be noise.
+fn compute_changed_entry(
+    current: &McpLockServer,
+    previous: &McpLockServer,
+) -> Option<McpServerDriftEntry> {
+    let mut transport_changes: Vec<McpTransportChange> = Vec::new();
+    let mut env_changes: Vec<McpEnvChange> = Vec::new();
+
+    match (&current.transport, &previous.transport) {
+        (
+            McpTransport::Url {
+                url: cur_url,
+                userinfo_hash: cur_userinfo,
+            },
+            McpTransport::Url {
+                url: prev_url,
+                userinfo_hash: prev_userinfo,
+            },
+        ) => {
+            if cur_url != prev_url {
+                transport_changes.push(McpTransportChange::UrlChanged);
+            }
+            match (cur_userinfo.as_deref(), prev_userinfo.as_deref()) {
+                (None, None) => {}
+                (Some(_), None) => {
+                    transport_changes.push(McpTransportChange::UserinfoAdded);
+                }
+                (None, Some(_)) => {
+                    transport_changes.push(McpTransportChange::UserinfoRemoved);
+                }
+                (Some(a), Some(b)) if a != b => {
+                    transport_changes.push(McpTransportChange::UserinfoSwapped);
+                }
+                _ => {}
+            }
+        }
+        (
+            McpTransport::Stdio {
+                command: cur_cmd,
+                args: cur_args,
+                env: cur_env,
+            },
+            McpTransport::Stdio {
+                command: prev_cmd,
+                args: prev_args,
+                env: prev_env,
+            },
+        ) => {
+            if cur_cmd != prev_cmd {
+                transport_changes.push(McpTransportChange::CommandChanged);
+            }
+            if cur_args != prev_args {
+                transport_changes.push(McpTransportChange::ArgsChanged);
+            }
+            env_changes = diff_env(cur_env, prev_env);
+            if !env_changes.is_empty() {
+                transport_changes.push(McpTransportChange::EnvChanged);
+            }
+        }
+        (cur, prev) => {
+            // Kind changed (stdio ↔ url, or either ↔ unknown). Encode the
+            // before/after kind directly so the human and JSON forms can
+            // render "stdio → url".
+            transport_changes.push(McpTransportChange::KindChanged {
+                previous: transport_kind_name(prev).to_string(),
+                current: transport_kind_name(cur).to_string(),
+            });
+        }
+    }
+
+    let (tools_change, tools_added, tools_removed) = diff_tools(&current.tools, &previous.tools);
+
+    // Transport changes are sorted so equal drifts compare equal regardless of
+    // detection order. The sort discriminates by serialized form so it is
+    // stable across enum variant additions.
+    transport_changes
+        .sort_by_key(|c| serde_json::to_string(c).unwrap_or_else(|_| format!("{c:?}")));
+
+    let entry = McpServerDriftEntry {
+        name: current.name.clone(),
+        source_config: current.source_config.clone(),
+        transport_changes,
+        env_changes,
+        tools_change,
+        tools_added,
+        tools_removed,
+    };
+
+    if entry.is_empty() {
+        None
+    } else {
+        Some(entry)
+    }
+}
+
+/// Lowercase short name of a transport kind, used in drift reports.
+fn transport_kind_name(t: &McpTransport) -> &'static str {
+    match t {
+        McpTransport::Url { .. } => "url",
+        McpTransport::Stdio { .. } => "stdio",
+        McpTransport::Unknown => "unknown",
+    }
+}
+
+/// Diff two env lists. Both are sorted by name (the invariant `parse_env`
+/// establishes), so a merge walk yields per-variable changes in O(n + m).
+/// Returned entries are themselves sorted by `name` for determinism.
+fn diff_env(current: &[McpEnvEntry], previous: &[McpEnvEntry]) -> Vec<McpEnvChange> {
+    let mut out: Vec<McpEnvChange> = Vec::new();
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < current.len() && j < previous.len() {
+        let cur = &current[i];
+        let prev = &previous[j];
+        match cur.name.cmp(&prev.name) {
+            std::cmp::Ordering::Less => {
+                out.push(McpEnvChange::Added {
+                    name: cur.name.clone(),
+                });
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(McpEnvChange::Removed {
+                    name: prev.name.clone(),
+                });
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                if cur.value_hash != prev.value_hash {
+                    out.push(McpEnvChange::ValueHashChanged {
+                        name: cur.name.clone(),
+                    });
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    while i < current.len() {
+        out.push(McpEnvChange::Added {
+            name: current[i].name.clone(),
+        });
+        i += 1;
+    }
+    while j < previous.len() {
+        out.push(McpEnvChange::Removed {
+            name: previous[j].name.clone(),
+        });
+        j += 1;
+    }
+    out
+}
+
+/// Diff two tool lists, returning the kind of change, the added tools, and
+/// the removed tools. Tool lists are sorted on parse, so a same-set / different
+/// order case can only arise from a hand-built inventory; the `Reordered`
+/// variant is recorded for completeness.
+fn diff_tools(
+    current: &[String],
+    previous: &[String],
+) -> (Option<McpToolsChangeKind>, Vec<String>, Vec<String>) {
+    if current == previous {
+        return (None, Vec::new(), Vec::new());
+    }
+
+    // Same set, different order → Reordered.
+    let mut cur_sorted = current.to_vec();
+    let mut prev_sorted = previous.to_vec();
+    cur_sorted.sort();
+    prev_sorted.sort();
+    if cur_sorted == prev_sorted {
+        return (Some(McpToolsChangeKind::Reordered), Vec::new(), Vec::new());
+    }
+
+    let cur_set: std::collections::BTreeSet<&str> = current.iter().map(|s| s.as_str()).collect();
+    let prev_set: std::collections::BTreeSet<&str> = previous.iter().map(|s| s.as_str()).collect();
+    let added: Vec<String> = cur_set
+        .difference(&prev_set)
+        .map(|s| (*s).to_string())
+        .collect();
+    let removed: Vec<String> = prev_set
+        .difference(&cur_set)
+        .map(|s| (*s).to_string())
+        .collect();
+
+    let kind = match (added.is_empty(), removed.is_empty()) {
+        (false, true) => McpToolsChangeKind::Added,
+        (true, false) => McpToolsChangeKind::Removed,
+        _ => McpToolsChangeKind::Set,
+    };
+    (Some(kind), added, removed)
+}
+
+/// Load a lockfile from disk and parse it.
+///
+/// Returns the parsed `McpLockfile` on success.
+///
+/// `Err` cases — surfaced via [`McpLockLoadError`] so a caller (`mcp verify`,
+/// `mcp diff`, a `tirith scan` FileScan dispatcher) can present each
+/// differently:
+///
+/// * [`McpLockLoadError::NotFound`] — the file does not exist. For `mcp
+///   verify` this is "no baseline yet, run `tirith mcp lock`", which is a
+///   usage error (exit 2). For a `scan` of `mcp.lock` it is "nothing to
+///   check" (the scan target was something else).
+/// * [`McpLockLoadError::Io`] — the file exists but could not be read
+///   (permission denied, etc.).
+/// * [`McpLockLoadError::Parse`] — the file is not valid JSON or does not
+///   match the [`McpLockfile`] schema.
+pub fn load_lockfile(path: &Path) -> Result<McpLockfile, McpLockLoadError> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(McpLockLoadError::NotFound);
+        }
+        Err(e) => return Err(McpLockLoadError::Io(e.to_string())),
+    };
+    parse_lockfile(&content)
+}
+
+/// Parse a lockfile from its on-disk JSON form.
+pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
+    serde_json::from_str(content).map_err(|e| McpLockLoadError::Parse(e.to_string()))
+}
+
+/// Why a lockfile could not be loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpLockLoadError {
+    /// The file does not exist (caller decides whether this is fatal).
+    NotFound,
+    /// The file exists but cannot be read (permission, encoding, …).
+    Io(String),
+    /// The file exists and was read but does not parse as a lockfile.
+    Parse(String),
+}
+
+impl std::fmt::Display for McpLockLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            McpLockLoadError::NotFound => write!(f, "lockfile not found"),
+            McpLockLoadError::Io(e) => write!(f, "could not read lockfile: {e}"),
+            McpLockLoadError::Parse(e) => write!(f, "could not parse lockfile: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for McpLockLoadError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2255,5 +2803,597 @@ mod tests {
         let parsed: McpLockfile = serde_json::from_str(&lock.render())
             .expect("lockfile with userinfo_hash must round-trip");
         assert_eq!(parsed, lock);
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunk 2 — drift detection.
+    //
+    // The drift core is what `tirith mcp verify` and `tirith mcp diff`
+    // consume, and what the new `RuleId::McpServerDrift` rule fires on. The
+    // tests below cover every category from the chunk-2 brief: added,
+    // removed, transport-change, env added/removed/value-change,
+    // tools-change, userinfo-change. Plus the fast-path: an unchanged
+    // inventory has empty drift.
+    // -----------------------------------------------------------------------
+
+    fn mk_inventory(servers: Vec<McpServerEntry>) -> McpInventory {
+        McpInventory {
+            servers,
+            configs: vec![".mcp.json".into()],
+            malformed_configs: vec![],
+        }
+    }
+
+    fn stdio_server(name: &str, command: &str) -> McpServerEntry {
+        McpServerEntry {
+            name: name.into(),
+            transport: McpTransport::Stdio {
+                command: command.into(),
+                args: vec![],
+                env: vec![],
+            },
+            tools: vec![],
+            source_config: ".mcp.json".into(),
+        }
+    }
+
+    #[test]
+    fn drift_is_empty_when_inventory_matches_lockfile() {
+        // Headline fast-path: same inventory, same hash, no drift.
+        let inv = mk_inventory(vec![stdio_server("s", "node")]);
+        let lock = McpLockfile::from_inventory(&inv);
+        let drifts = compute_drift(&inv, &lock);
+        assert!(
+            drifts.is_empty(),
+            "no-drift case must yield empty: {drifts:?}"
+        );
+    }
+
+    #[test]
+    fn drift_detects_server_added() {
+        let prev = mk_inventory(vec![stdio_server("a", "node")]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![stdio_server("a", "node"), stdio_server("b", "node")]);
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(drifts.len(), 1);
+        assert!(matches!(
+            &drifts[0],
+            McpDrift::Added { name, .. } if name == "b"
+        ));
+    }
+
+    #[test]
+    fn drift_detects_server_removed() {
+        let prev = mk_inventory(vec![stdio_server("a", "node"), stdio_server("b", "node")]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![stdio_server("a", "node")]);
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(drifts.len(), 1);
+        assert!(matches!(
+            &drifts[0],
+            McpDrift::Removed { name, .. } if name == "b"
+        ));
+    }
+
+    #[test]
+    fn drift_added_and_removed_sort_deterministically() {
+        // Removed sorts before Added. Within each bucket, sort by name.
+        let prev = mk_inventory(vec![stdio_server("zeta", "node")]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![
+            stdio_server("alpha", "node"),
+            stdio_server("beta", "node"),
+        ]);
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(drifts.len(), 3);
+        // Removed first.
+        assert!(matches!(&drifts[0], McpDrift::Removed { name, .. } if name == "zeta"));
+        // Then Added, by name.
+        assert!(matches!(&drifts[1], McpDrift::Added { name, .. } if name == "alpha"));
+        assert!(matches!(&drifts[2], McpDrift::Added { name, .. } if name == "beta"));
+    }
+
+    #[test]
+    fn drift_detects_transport_kind_change() {
+        let prev = mk_inventory(vec![stdio_server("s", "node")]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Url {
+                url: "https://x.example".into(),
+                userinfo_hash: None,
+            },
+            ..stdio_server("s", "node")
+        }]);
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(drifts.len(), 1);
+        match &drifts[0] {
+            McpDrift::Changed(entry) => {
+                assert_eq!(entry.name, "s");
+                assert_eq!(entry.transport_changes.len(), 1);
+                assert!(matches!(
+                    &entry.transport_changes[0],
+                    McpTransportChange::KindChanged { previous, current }
+                        if previous == "stdio" && current == "url"
+                ));
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_detects_command_change() {
+        let prev = mk_inventory(vec![stdio_server("s", "node")]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![stdio_server("s", "deno")]);
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(drifts.len(), 1);
+        match &drifts[0] {
+            McpDrift::Changed(entry) => {
+                assert!(entry
+                    .transport_changes
+                    .iter()
+                    .any(|c| matches!(c, McpTransportChange::CommandChanged)));
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_detects_args_change() {
+        let prev = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec!["a.js".into()],
+                env: vec![],
+            },
+            ..stdio_server("s", "node")
+        }]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec!["b.js".into()],
+                env: vec![],
+            },
+            ..stdio_server("s", "node")
+        }]);
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(drifts.len(), 1);
+        match &drifts[0] {
+            McpDrift::Changed(entry) => {
+                assert!(entry
+                    .transport_changes
+                    .iter()
+                    .any(|c| matches!(c, McpTransportChange::ArgsChanged)));
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_detects_env_added() {
+        let prev = mk_inventory(vec![stdio_server("s", "node")]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: vec![McpEnvEntry::from_raw("API_TOKEN", "v")],
+            },
+            ..stdio_server("s", "node")
+        }]);
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(drifts.len(), 1);
+        match &drifts[0] {
+            McpDrift::Changed(entry) => {
+                assert!(entry
+                    .transport_changes
+                    .iter()
+                    .any(|c| matches!(c, McpTransportChange::EnvChanged)));
+                assert_eq!(entry.env_changes.len(), 1);
+                assert!(matches!(
+                    &entry.env_changes[0],
+                    McpEnvChange::Added { name } if name == "API_TOKEN"
+                ));
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_detects_env_removed() {
+        let prev = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: vec![McpEnvEntry::from_raw("API_TOKEN", "v")],
+            },
+            ..stdio_server("s", "node")
+        }]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![stdio_server("s", "node")]);
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(drifts.len(), 1);
+        match &drifts[0] {
+            McpDrift::Changed(entry) => {
+                assert_eq!(entry.env_changes.len(), 1);
+                assert!(matches!(
+                    &entry.env_changes[0],
+                    McpEnvChange::Removed { name } if name == "API_TOKEN"
+                ));
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_detects_env_value_hash_change() {
+        // The headline drift property: a rotated credential surfaces as a
+        // value-hash change. The raw value never appears in the drift —
+        // only the variable's NAME does — exactly as it never appears in
+        // the lockfile.
+        let prev = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: vec![McpEnvEntry::from_raw("API_TOKEN", "old-credential-bytes")],
+            },
+            ..stdio_server("s", "node")
+        }]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: vec![McpEnvEntry::from_raw("API_TOKEN", "new-credential-bytes")],
+            },
+            ..stdio_server("s", "node")
+        }]);
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(drifts.len(), 1);
+        match &drifts[0] {
+            McpDrift::Changed(entry) => {
+                assert_eq!(entry.env_changes.len(), 1);
+                assert!(matches!(
+                    &entry.env_changes[0],
+                    McpEnvChange::ValueHashChanged { name } if name == "API_TOKEN"
+                ));
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+
+        // And no raw credential bytes leak into the drift's serialized form.
+        let serialized = serde_json::to_string(&drifts).unwrap();
+        assert!(!serialized.contains("old-credential-bytes"));
+        assert!(!serialized.contains("new-credential-bytes"));
+    }
+
+    #[test]
+    fn drift_detects_tools_added_and_removed() {
+        let prev = mk_inventory(vec![McpServerEntry {
+            tools: vec!["a".into(), "b".into()],
+            ..stdio_server("s", "node")
+        }]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![McpServerEntry {
+            tools: vec!["a".into(), "c".into()],
+            ..stdio_server("s", "node")
+        }]);
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(drifts.len(), 1);
+        match &drifts[0] {
+            McpDrift::Changed(entry) => {
+                assert_eq!(entry.tools_change, Some(McpToolsChangeKind::Set));
+                assert_eq!(entry.tools_added, vec!["c".to_string()]);
+                assert_eq!(entry.tools_removed, vec!["b".to_string()]);
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_detects_tools_only_added() {
+        let prev = mk_inventory(vec![McpServerEntry {
+            tools: vec!["a".into()],
+            ..stdio_server("s", "node")
+        }]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![McpServerEntry {
+            tools: vec!["a".into(), "b".into()],
+            ..stdio_server("s", "node")
+        }]);
+        let drifts = compute_drift(&cur, &lock);
+        match &drifts[0] {
+            McpDrift::Changed(entry) => {
+                assert_eq!(entry.tools_change, Some(McpToolsChangeKind::Added));
+                assert_eq!(entry.tools_added, vec!["b".to_string()]);
+                assert!(entry.tools_removed.is_empty());
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_detects_tools_only_removed() {
+        let prev = mk_inventory(vec![McpServerEntry {
+            tools: vec!["a".into(), "b".into()],
+            ..stdio_server("s", "node")
+        }]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![McpServerEntry {
+            tools: vec!["a".into()],
+            ..stdio_server("s", "node")
+        }]);
+        let drifts = compute_drift(&cur, &lock);
+        match &drifts[0] {
+            McpDrift::Changed(entry) => {
+                assert_eq!(entry.tools_change, Some(McpToolsChangeKind::Removed));
+                assert!(entry.tools_added.is_empty());
+                assert_eq!(entry.tools_removed, vec!["b".to_string()]);
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_detects_userinfo_added() {
+        // Prev: URL with no userinfo. Cur: URL with userinfo (a credential
+        // was added in the source config since the lockfile was taken).
+        let prev = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Url {
+                url: "https://host.example/sse".into(),
+                userinfo_hash: None,
+            },
+            ..stdio_server("s", "node")
+        }]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let (redacted, hash) = redact_url_userinfo("s", "https://user:token@host.example/sse");
+        let cur = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Url {
+                url: redacted,
+                userinfo_hash: hash,
+            },
+            ..stdio_server("s", "node")
+        }]);
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(drifts.len(), 1);
+        match &drifts[0] {
+            McpDrift::Changed(entry) => {
+                assert!(entry
+                    .transport_changes
+                    .iter()
+                    .any(|c| matches!(c, McpTransportChange::UserinfoAdded)));
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_detects_userinfo_removed() {
+        let (redacted, hash) = redact_url_userinfo("s", "https://user:token@host.example/sse");
+        let prev = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Url {
+                url: redacted,
+                userinfo_hash: hash,
+            },
+            ..stdio_server("s", "node")
+        }]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Url {
+                url: "https://host.example/sse".into(),
+                userinfo_hash: None,
+            },
+            ..stdio_server("s", "node")
+        }]);
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(drifts.len(), 1);
+        match &drifts[0] {
+            McpDrift::Changed(entry) => {
+                assert!(entry
+                    .transport_changes
+                    .iter()
+                    .any(|c| matches!(c, McpTransportChange::UserinfoRemoved)));
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_detects_userinfo_swapped() {
+        let (red_a, hash_a) = redact_url_userinfo("s", "https://user:tokenA@host.example/sse");
+        let prev = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Url {
+                url: red_a,
+                userinfo_hash: hash_a,
+            },
+            ..stdio_server("s", "node")
+        }]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let (red_b, hash_b) = redact_url_userinfo("s", "https://user:tokenB@host.example/sse");
+        let cur = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Url {
+                url: red_b,
+                userinfo_hash: hash_b,
+            },
+            ..stdio_server("s", "node")
+        }]);
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(drifts.len(), 1);
+        match &drifts[0] {
+            McpDrift::Changed(entry) => {
+                assert!(entry
+                    .transport_changes
+                    .iter()
+                    .any(|c| matches!(c, McpTransportChange::UserinfoSwapped)));
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+
+        // Drift carries no raw userinfo bytes — only the change classifier.
+        let serialized = serde_json::to_string(&drifts).unwrap();
+        assert!(!serialized.contains("tokenA"));
+        assert!(!serialized.contains("tokenB"));
+    }
+
+    #[test]
+    fn drift_detects_url_bytes_changed() {
+        // Same kind, no userinfo on either side, URL host differs.
+        let prev = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Url {
+                url: "https://old.example/sse".into(),
+                userinfo_hash: None,
+            },
+            ..stdio_server("s", "node")
+        }]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Url {
+                url: "https://new.example/sse".into(),
+                userinfo_hash: None,
+            },
+            ..stdio_server("s", "node")
+        }]);
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(drifts.len(), 1);
+        match &drifts[0] {
+            McpDrift::Changed(entry) => {
+                assert!(entry
+                    .transport_changes
+                    .iter()
+                    .any(|c| matches!(c, McpTransportChange::UrlChanged)));
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_sort_is_deterministic_across_inputs() {
+        // The same logical drift produced from two different input orderings
+        // must serialize identically.
+        let prev = mk_inventory(vec![stdio_server("a", "node"), stdio_server("b", "node")]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur1 = mk_inventory(vec![stdio_server("a", "node"), stdio_server("c", "node")]);
+        let cur2 = mk_inventory(vec![stdio_server("c", "node"), stdio_server("a", "node")]);
+        let d1 = compute_drift(&cur1, &lock);
+        let d2 = compute_drift(&cur2, &lock);
+        assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn drift_silent_when_unchanged_server_moves_between_configs() {
+        // `content_hash` deliberately excludes `source_config` — chunk 1's
+        // documented invariant — and `inventory_hash` is the ordered
+        // concatenation of `content_hash`es. So moving an unchanged server
+        // from one config file to another does NOT register as drift: the
+        // *content* is the same, only the location changed, and the chunk-1
+        // schema treated that as a non-event. The fast-path inventory_hash
+        // comparison cleanly catches this and short-circuits to no drift.
+        let prev = mk_inventory(vec![McpServerEntry {
+            source_config: ".mcp.json".into(),
+            ..stdio_server("s", "node")
+        }]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![McpServerEntry {
+            source_config: ".vscode/mcp.json".into(),
+            ..stdio_server("s", "node")
+        }]);
+        let drifts = compute_drift(&cur, &lock);
+        assert!(
+            drifts.is_empty(),
+            "moving an unchanged server between configs must be silent: {drifts:?}"
+        );
+    }
+
+    #[test]
+    fn drift_walk_handles_same_name_in_different_configs() {
+        // A repo can legitimately declare *two* servers with the same name
+        // in different config files (the lockfile sorts by
+        // `(name, source_config)` to handle this). When one of those servers
+        // changes its transport, only the changed entry surfaces as drift —
+        // the untouched twin stays clean.
+        let prev = mk_inventory(vec![
+            McpServerEntry {
+                source_config: ".mcp.json".into(),
+                ..stdio_server("s", "node")
+            },
+            McpServerEntry {
+                source_config: ".vscode/mcp.json".into(),
+                ..stdio_server("s", "node")
+            },
+        ]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![
+            // .mcp.json copy: unchanged.
+            McpServerEntry {
+                source_config: ".mcp.json".into(),
+                ..stdio_server("s", "node")
+            },
+            // .vscode copy: command rotated.
+            McpServerEntry {
+                source_config: ".vscode/mcp.json".into(),
+                ..stdio_server("s", "deno")
+            },
+        ]);
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(drifts.len(), 1);
+        match &drifts[0] {
+            McpDrift::Changed(entry) => {
+                assert_eq!(entry.name, "s");
+                assert_eq!(entry.source_config, ".vscode/mcp.json");
+                assert!(entry
+                    .transport_changes
+                    .iter()
+                    .any(|c| matches!(c, McpTransportChange::CommandChanged)));
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_lockfile_returns_not_found_when_missing() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("absent.lock");
+        let err = load_lockfile(&missing).unwrap_err();
+        assert_eq!(err, McpLockLoadError::NotFound);
+    }
+
+    #[test]
+    fn load_lockfile_returns_parse_error_on_malformed_json() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MCP_LOCK_FILENAME);
+        fs::write(&path, "not json at all").unwrap();
+        let err = load_lockfile(&path).unwrap_err();
+        assert!(matches!(err, McpLockLoadError::Parse(_)));
+    }
+
+    #[test]
+    fn load_lockfile_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MCP_LOCK_FILENAME);
+        let inv = mk_inventory(vec![stdio_server("s", "node")]);
+        let lock = McpLockfile::from_inventory(&inv);
+        fs::write(&path, lock.render()).unwrap();
+        let loaded = load_lockfile(&path).expect("round-trip must succeed");
+        assert_eq!(loaded, lock);
     }
 }

@@ -1,20 +1,29 @@
-//! `tirith mcp lock` — generate `.tirith/mcp.lock` from a repository's MCP
-//! configuration.
+//! `tirith mcp lock` / `tirith mcp verify` / `tirith mcp diff` — capture and
+//! govern the MCP servers a repository declares.
 //!
-//! This is the first command in the Milestone 4 (Agent & MCP governance) `mcp`
-//! subcommand group. It captures a deterministic inventory of every MCP server
-//! the repository declares — across `.mcp.json` and the IDE config variants —
-//! into a lockfile at `<repo_root>/.tirith/mcp.lock`. A later `mcp verify` /
-//! `mcp diff` (not yet implemented) will diff a live inventory against this
-//! committed lockfile to detect drift.
+//! These are the Milestone 4 (Agent & MCP governance) `mcp` subcommand group:
+//! `lock` writes the deterministic inventory baseline to
+//! `<repo_root>/.tirith/mcp.lock`; `verify` gates on drift (exit 1 when the
+//! committed lockfile no longer matches the current inventory); `diff` shows
+//! that drift informationally.
 //!
-//! It is a **local file operation**: it touches no network, and it is entirely
-//! off the tier-1/2/3 detection hot path. `mcp lock` writes one file
-//! (`mcp.lock`) and reads the repo's MCP configs — nothing else.
+//! Every command is a **local file operation**: it touches no network and is
+//! entirely off the tier-1/2/3 detection hot path. `lock` writes one file
+//! (`mcp.lock`); `verify` and `diff` read it. Discovery is repo-local only —
+//! user-level configs (`~/.claude/`, …) are never inventoried.
+//!
+//! **Privacy invariant.** Env values and URL userinfos are never persisted
+//! in `mcp.lock` (each is replaced with a salted hash; see `mcp_lock.rs`)
+//! and they are never **printed** by `verify` / `diff` either — the human
+//! and `--format json` outputs only ever name the variable / credential
+//! that changed, never its value or hash.
 
 use std::path::{Path, PathBuf};
 
-use tirith_core::mcp_lock::{self, McpInventory, McpLockfile, MCP_LOCK_FILENAME};
+use tirith_core::mcp_lock::{
+    self, McpDrift, McpEnvChange, McpInventory, McpLockLoadError, McpLockfile, McpServerDriftEntry,
+    McpToolsChangeKind, McpTransportChange, MCP_LOCK_FILENAME,
+};
 use tirith_core::policy;
 
 /// Run `tirith mcp lock`.
@@ -258,24 +267,427 @@ fn describe_transport(transport: &mcp_lock::McpTransport) -> String {
 
 /// Report an operational error, in the requested output format.
 fn report_error(json: bool, message: &str) {
+    report_error_for(json, "tirith mcp lock", message);
+}
+
+/// Print an error message in the requested output format, prefixed with the
+/// command's name. Used by `lock` / `verify` / `diff` so each command's error
+/// surface is honestly labelled.
+fn report_error_for(json: bool, command: &str, message: &str) {
     if json {
         #[derive(serde::Serialize)]
         struct ErrOut<'a> {
             schema_version: u32,
             error: &'a str,
         }
-        // A best-effort error envelope; the exit code (1) is the source of
-        // truth, so a failure to even print this is not separately handled.
+        // A best-effort error envelope; the exit code is the source of truth,
+        // so a failure to even print this is not separately handled.
+        let ctx = format!("{command}: failed to write JSON output");
         let _ = super::write_json_stdout(
             &ErrOut {
                 schema_version: 1,
                 error: message,
             },
-            "tirith mcp lock: failed to write JSON output",
+            &ctx,
         );
     } else {
-        eprintln!("tirith mcp lock: {message}");
+        eprintln!("{command}: {message}");
     }
+}
+
+// ===========================================================================
+// `tirith mcp verify` — gating drift check
+// ===========================================================================
+
+/// Run `tirith mcp verify`.
+///
+/// Loads the committed `.tirith/mcp.lock`, rebuilds the current MCP inventory,
+/// computes the structured drift, and reports it. Exit codes are the contract
+/// a CI integration depends on:
+///
+/// * `0` — no drift. The lockfile and the current inventory are identical at
+///   the inventory-hash level.
+/// * `1` — drift detected. The lockfile and the current inventory differ;
+///   the human / JSON output names the affected servers.
+/// * `2` — a *usage* error: no lockfile to verify against, the lockfile
+///   cannot be read or parsed, or the repository root could not be
+///   determined. Distinct from drift so a CI caller can distinguish "the
+///   lockfile is stale" (1) from "there is no lockfile to verify" (2).
+pub fn verify(json: bool) -> i32 {
+    let repo_root = match resolve_repo_root() {
+        Some(r) => r,
+        None => {
+            report_error_for(
+                json,
+                "tirith mcp verify",
+                "could not determine the repository root — run `tirith mcp verify` inside a \
+                 git repository, or from a directory whose ancestor has one",
+            );
+            return 2;
+        }
+    };
+    verify_for_root(&repo_root, json)
+}
+
+/// Verify against an explicit repo root.
+///
+/// Split out so tests can drive a verify against a tempdir without mutating
+/// process-wide environment variables. Production `verify(...)` resolves the
+/// root the same way `lock` does, then calls this.
+pub(crate) fn verify_for_root(repo_root: &Path, json: bool) -> i32 {
+    let lock_path = repo_root.join(".tirith").join(MCP_LOCK_FILENAME);
+    let lockfile = match mcp_lock::load_lockfile(&lock_path) {
+        Ok(l) => l,
+        Err(McpLockLoadError::NotFound) => {
+            report_error_for(
+                json,
+                "tirith mcp verify",
+                &format!(
+                    "no lockfile at {} — run `tirith mcp lock` first to capture a baseline",
+                    lock_path.display()
+                ),
+            );
+            return 2;
+        }
+        Err(e) => {
+            report_error_for(
+                json,
+                "tirith mcp verify",
+                &format!("{}: {e}", lock_path.display()),
+            );
+            return 2;
+        }
+    };
+
+    let inventory = mcp_lock::build_inventory(repo_root);
+    let drifts = mcp_lock::compute_drift(&inventory, &lockfile);
+
+    if json {
+        if !print_drift_json(
+            "tirith mcp verify",
+            repo_root,
+            &lock_path,
+            &lockfile,
+            &drifts,
+        ) {
+            return 2;
+        }
+    } else {
+        print_verify_human(&lock_path, &drifts);
+    }
+
+    if drifts.is_empty() {
+        0
+    } else {
+        1
+    }
+}
+
+/// Human-readable summary for `tirith mcp verify`.
+///
+/// Goes to stderr (the rest of the verdict surface follows that convention),
+/// with one line per drift entry. Env values and URL userinfos never appear
+/// — only the name of the variable / credential that changed.
+fn print_verify_human(lock_path: &Path, drifts: &[McpDrift]) {
+    if drifts.is_empty() {
+        eprintln!(
+            "tirith mcp verify: inventory matches {} (no drift).",
+            lock_path.display()
+        );
+        return;
+    }
+
+    let (added, removed, changed) = drift_kind_counts(drifts);
+    eprintln!(
+        "tirith mcp verify: drift detected against {} ({} added, {} removed, {} changed).",
+        lock_path.display(),
+        added,
+        removed,
+        changed,
+    );
+    print_drift_body(drifts);
+    eprintln!();
+    eprintln!("  re-run `tirith mcp lock` to refresh the lockfile once the change is intentional.");
+}
+
+// ===========================================================================
+// `tirith mcp diff` — informational drift report
+// ===========================================================================
+
+/// Run `tirith mcp diff`.
+///
+/// Same drift data as `verify`, presented as an informational diff. Always
+/// exits 0 (a usage error still exits 2 so a piped consumer can distinguish
+/// "no drift" from "I could not check").
+pub fn diff(json: bool) -> i32 {
+    let repo_root = match resolve_repo_root() {
+        Some(r) => r,
+        None => {
+            report_error_for(
+                json,
+                "tirith mcp diff",
+                "could not determine the repository root — run `tirith mcp diff` inside a \
+                 git repository, or from a directory whose ancestor has one",
+            );
+            return 2;
+        }
+    };
+    diff_for_root(&repo_root, json)
+}
+
+/// Diff against an explicit repo root.
+///
+/// Split out so tests can drive a diff against a tempdir without mutating
+/// process-wide environment variables.
+pub(crate) fn diff_for_root(repo_root: &Path, json: bool) -> i32 {
+    let lock_path = repo_root.join(".tirith").join(MCP_LOCK_FILENAME);
+    let lockfile = match mcp_lock::load_lockfile(&lock_path) {
+        Ok(l) => l,
+        Err(McpLockLoadError::NotFound) => {
+            report_error_for(
+                json,
+                "tirith mcp diff",
+                &format!(
+                    "no lockfile at {} — run `tirith mcp lock` first to capture a baseline",
+                    lock_path.display()
+                ),
+            );
+            return 2;
+        }
+        Err(e) => {
+            report_error_for(
+                json,
+                "tirith mcp diff",
+                &format!("{}: {e}", lock_path.display()),
+            );
+            return 2;
+        }
+    };
+
+    let inventory = mcp_lock::build_inventory(repo_root);
+    let drifts = mcp_lock::compute_drift(&inventory, &lockfile);
+
+    if json {
+        if !print_drift_json("tirith mcp diff", repo_root, &lock_path, &lockfile, &drifts) {
+            return 2;
+        }
+    } else {
+        print_diff_human(&lock_path, &drifts);
+    }
+
+    0
+}
+
+/// Human-readable summary for `tirith mcp diff`.
+fn print_diff_human(lock_path: &Path, drifts: &[McpDrift]) {
+    if drifts.is_empty() {
+        eprintln!(
+            "tirith mcp diff: inventory matches {} (no drift).",
+            lock_path.display()
+        );
+        return;
+    }
+
+    let (added, removed, changed) = drift_kind_counts(drifts);
+    eprintln!(
+        "tirith mcp diff: drift against {} ({} added, {} removed, {} changed).",
+        lock_path.display(),
+        added,
+        removed,
+        changed,
+    );
+    print_drift_body(drifts);
+}
+
+// ===========================================================================
+// shared drift presentation helpers (used by verify and diff)
+// ===========================================================================
+
+/// Count drifts by kind: `(added, removed, changed)`.
+fn drift_kind_counts(drifts: &[McpDrift]) -> (usize, usize, usize) {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    let mut changed = 0usize;
+    for d in drifts {
+        match d {
+            McpDrift::Added { .. } => added += 1,
+            McpDrift::Removed { .. } => removed += 1,
+            McpDrift::Changed(_) => changed += 1,
+        }
+    }
+    (added, removed, changed)
+}
+
+/// Render the per-drift body — used by both `verify` and `diff`. The block
+/// is identical between the two; only the headline differs.
+fn print_drift_body(drifts: &[McpDrift]) {
+    for d in drifts {
+        match d {
+            McpDrift::Removed {
+                name,
+                source_config,
+            } => {
+                eprintln!(
+                    "  - removed: {} (was in {})",
+                    escape_name(name),
+                    source_config
+                );
+            }
+            McpDrift::Added {
+                name,
+                source_config,
+            } => {
+                eprintln!("  + added: {} (from {})", escape_name(name), source_config);
+            }
+            McpDrift::Changed(entry) => {
+                eprintln!(
+                    "  ~ changed: {} (in {})",
+                    escape_name(&entry.name),
+                    entry.source_config
+                );
+                describe_changed_entry(entry);
+            }
+        }
+    }
+}
+
+/// Print the per-field detail of a `Changed` drift entry. Every printed name
+/// is **debug-escaped** (`{:?}`), so a maliciously-crafted server / env /
+/// tool name containing ANSI escapes, newlines, or other terminal control
+/// bytes cannot inject control sequences into the operator's terminal —
+/// same treatment as `describe_transport`'s env-name handling in `lock`.
+fn describe_changed_entry(entry: &McpServerDriftEntry) {
+    for change in &entry.transport_changes {
+        match change {
+            McpTransportChange::KindChanged { previous, current } => {
+                eprintln!("      - transport kind: {previous} → {current}");
+            }
+            McpTransportChange::UrlChanged => {
+                // The stored URL changed bytes; both sides are already
+                // userinfo-stripped in the lockfile, so naming the host
+                // here would only echo the redacted form. The diff is the
+                // structural fact; the lockfile has the bytes.
+                eprintln!("      - URL changed (redacted form recorded in mcp.lock)");
+            }
+            McpTransportChange::UserinfoAdded => {
+                eprintln!("      - URL userinfo added (credential present in source URL)");
+            }
+            McpTransportChange::UserinfoRemoved => {
+                eprintln!("      - URL userinfo removed");
+            }
+            McpTransportChange::UserinfoSwapped => {
+                eprintln!("      - URL userinfo changed (credential rotated)");
+            }
+            McpTransportChange::CommandChanged => {
+                eprintln!("      - stdio command changed");
+            }
+            McpTransportChange::ArgsChanged => {
+                eprintln!("      - stdio args changed");
+            }
+            McpTransportChange::EnvChanged => {
+                // The per-variable detail is printed below, in `env_changes`.
+                // The transport-level `EnvChanged` marker is the headline.
+            }
+        }
+    }
+
+    for env in &entry.env_changes {
+        match env {
+            McpEnvChange::Added { name } => {
+                eprintln!("      - env added: {}", escape_name(name));
+            }
+            McpEnvChange::Removed { name } => {
+                eprintln!("      - env removed: {}", escape_name(name));
+            }
+            McpEnvChange::ValueHashChanged { name } => {
+                eprintln!(
+                    "      - env value changed: {} (raw value never stored or printed)",
+                    escape_name(name)
+                );
+            }
+        }
+    }
+
+    if let Some(kind) = &entry.tools_change {
+        let label = match kind {
+            McpToolsChangeKind::Added => "added",
+            McpToolsChangeKind::Removed => "removed",
+            McpToolsChangeKind::Set => "changed (added + removed)",
+            McpToolsChangeKind::Reordered => "reordered",
+        };
+        eprintln!("      - tools: {label}");
+        for tool in &entry.tools_added {
+            eprintln!("          + {}", escape_name(tool));
+        }
+        for tool in &entry.tools_removed {
+            eprintln!("          - {}", escape_name(tool));
+        }
+    }
+}
+
+/// Debug-format a name. ANSI escapes / newlines / control bytes inside a
+/// server / env / tool name are rendered as `\u{1b}` / `\n` / … so a hostile
+/// or careless config cannot inject terminal control sequences when a drift
+/// is printed.
+fn escape_name(name: &str) -> String {
+    format!("{name:?}")
+}
+
+/// Shared JSON output for `verify` / `diff`. The envelope is identical so a
+/// machine consumer can switch between the two with the same parser; only
+/// the exit code distinguishes the gating verb (`verify`) from the
+/// informational verb (`diff`).
+///
+/// Returns `false` on a write failure so the caller can exit non-zero.
+fn print_drift_json(
+    command: &str,
+    repo_root: &Path,
+    lock_path: &Path,
+    lockfile: &McpLockfile,
+    drifts: &[McpDrift],
+) -> bool {
+    let (added, removed, changed) = drift_kind_counts(drifts);
+
+    #[derive(serde::Serialize)]
+    struct JsonOut<'a> {
+        /// Result-envelope schema version (independent of the lockfile's own
+        /// `format_version`).
+        schema_version: u32,
+        repo_root: String,
+        lock_path: String,
+        /// `lock` / `verify` / `diff` — so a piped consumer can tell which
+        /// command produced the document.
+        command: &'a str,
+        /// The lockfile's recorded `format_version` (so the consumer can
+        /// react to a schema bump independently of the envelope version).
+        lockfile_format_version: u32,
+        /// Total drift count.
+        drift_count: usize,
+        added_count: usize,
+        removed_count: usize,
+        changed_count: usize,
+        /// Whether the inventory matches the lockfile (i.e. `drift_count == 0`).
+        in_sync: bool,
+        /// The drift entries themselves, in stable order.
+        drifts: &'a [McpDrift],
+    }
+
+    let out = JsonOut {
+        schema_version: 1,
+        repo_root: repo_root.display().to_string(),
+        lock_path: lock_path.display().to_string(),
+        command,
+        lockfile_format_version: lockfile.format_version,
+        drift_count: drifts.len(),
+        added_count: added,
+        removed_count: removed,
+        changed_count: changed,
+        in_sync: drifts.is_empty(),
+        drifts,
+    };
+
+    let ctx = format!("{command}: failed to write JSON output");
+    super::write_json_stdout(&out, &ctx)
 }
 
 #[cfg(test)]
@@ -435,5 +847,153 @@ mod tests {
         write_lockfile(&lock_path, &lockfile).unwrap();
         let second = fs::read_to_string(&lock_path).unwrap();
         assert_eq!(first, second, "re-writing an unchanged lockfile is stable");
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunk 2 — `tirith mcp verify` / `tirith mcp diff` integration tests.
+    //
+    // These drive the `*_for_root` helpers against tempdir layouts so each
+    // test is fully isolated and the env-var-mutating production
+    // `resolve_repo_root` is not exercised here (it is covered by the
+    // existing `lock` tests).
+    // -----------------------------------------------------------------------
+
+    /// Build a repo with one MCP config and a matching lockfile.
+    fn repo_with_locked_mcp() -> tempfile::TempDir {
+        let repo = tempdir().unwrap();
+        fs::write(
+            repo.path().join(".mcp.json"),
+            r#"{ "mcpServers": { "s": { "command": "node" } } }"#,
+        )
+        .unwrap();
+        let inventory = mcp_lock::build_inventory(repo.path());
+        let lockfile = McpLockfile::from_inventory(&inventory);
+        let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
+        write_lockfile(&lock_path, &lockfile).expect("write");
+        repo
+    }
+
+    #[test]
+    fn verify_exits_zero_when_inventory_matches_lockfile() {
+        let repo = repo_with_locked_mcp();
+        let code = verify_for_root(repo.path(), false);
+        assert_eq!(code, 0, "no drift → exit 0");
+    }
+
+    #[test]
+    fn verify_exits_one_when_server_added() {
+        let repo = repo_with_locked_mcp();
+        // Add a new server to the config — now the inventory has drifted.
+        fs::write(
+            repo.path().join(".mcp.json"),
+            r#"{ "mcpServers": {
+                "s": { "command": "node" },
+                "t": { "command": "deno" }
+            } }"#,
+        )
+        .unwrap();
+        let code = verify_for_root(repo.path(), false);
+        assert_eq!(code, 1, "drift → exit 1");
+    }
+
+    #[test]
+    fn verify_exits_one_when_env_value_rotated() {
+        // Snapshot one server with an env value, then rotate the value in
+        // the config: the env value-hash flips, drift fires, exit 1.
+        let repo = tempdir().unwrap();
+        fs::write(
+            repo.path().join(".mcp.json"),
+            r#"{ "mcpServers": { "s": { "command": "node",
+                "env": { "API_TOKEN": "old" } } } }"#,
+        )
+        .unwrap();
+        let inventory = mcp_lock::build_inventory(repo.path());
+        write_lockfile(
+            &repo.path().join(".tirith").join(MCP_LOCK_FILENAME),
+            &McpLockfile::from_inventory(&inventory),
+        )
+        .unwrap();
+
+        fs::write(
+            repo.path().join(".mcp.json"),
+            r#"{ "mcpServers": { "s": { "command": "node",
+                "env": { "API_TOKEN": "new" } } } }"#,
+        )
+        .unwrap();
+        let code = verify_for_root(repo.path(), false);
+        assert_eq!(code, 1, "rotated env → drift → exit 1");
+    }
+
+    #[test]
+    fn verify_exits_two_when_lockfile_missing() {
+        // No `.tirith/mcp.lock` at all — that is a usage error, not drift.
+        let repo = tempdir().unwrap();
+        fs::write(
+            repo.path().join(".mcp.json"),
+            r#"{ "mcpServers": { "s": { "command": "node" } } }"#,
+        )
+        .unwrap();
+        let code = verify_for_root(repo.path(), false);
+        assert_eq!(code, 2, "missing lockfile → usage error → exit 2");
+    }
+
+    #[test]
+    fn verify_exits_two_when_lockfile_malformed() {
+        let repo = tempdir().unwrap();
+        let lockdir = repo.path().join(".tirith");
+        fs::create_dir_all(&lockdir).unwrap();
+        fs::write(lockdir.join(MCP_LOCK_FILENAME), "{ not valid json").unwrap();
+        let code = verify_for_root(repo.path(), false);
+        assert_eq!(code, 2, "malformed lockfile → exit 2");
+    }
+
+    #[test]
+    fn verify_with_json_exits_zero_when_inventory_matches() {
+        // JSON path must not regress the exit-code contract.
+        let repo = repo_with_locked_mcp();
+        let code = verify_for_root(repo.path(), true);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn diff_always_exits_zero_even_when_drift_present() {
+        let repo = repo_with_locked_mcp();
+        // Drift the inventory.
+        fs::write(
+            repo.path().join(".mcp.json"),
+            r#"{ "mcpServers": {
+                "s": { "command": "node" },
+                "t": { "command": "deno" }
+            } }"#,
+        )
+        .unwrap();
+        let code = diff_for_root(repo.path(), false);
+        assert_eq!(code, 0, "diff is informational — exit 0 even with drift");
+    }
+
+    #[test]
+    fn diff_no_drift_exits_zero() {
+        let repo = repo_with_locked_mcp();
+        let code = diff_for_root(repo.path(), false);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn diff_exits_two_when_lockfile_missing() {
+        // Even for the informational verb, no-lockfile is a usage error so
+        // a piped consumer can distinguish "no drift" from "nothing to diff".
+        let repo = tempdir().unwrap();
+        let code = diff_for_root(repo.path(), false);
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn escape_name_renders_control_bytes_safely() {
+        // A server / env / tool name carrying a control byte must NOT
+        // inject raw bytes into the operator's terminal — debug formatting
+        // escapes them.
+        let escaped = escape_name("\x1b[31mEVIL");
+        assert!(!escaped.contains('\x1b'), "raw ESC must not survive");
+        assert!(escaped.contains("\\u{1b}"));
     }
 }
