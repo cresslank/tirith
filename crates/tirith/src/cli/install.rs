@@ -209,7 +209,7 @@ fn run_package_manager(
         interactive,
         online: online_mode,
     };
-    let plan = install_txn::plan_install(&plan_request);
+    let mut plan = install_txn::plan_install(&plan_request);
 
     // --- INFORM ---------------------------------------------------------
     if json {
@@ -221,6 +221,36 @@ fn run_package_manager(
         }
     } else {
         print_plan_human(&plan, use_online);
+    }
+
+    // The gate must be decided *before* the audit is written: a BLOCK that is
+    // bypassed via `TIRITH=0` has to be recorded as bypassed. `--no-exec`
+    // never installs, so there is no bypass and no gate — its audit reflects
+    // the verdict as-is. The exit code on `--no-exec` still mirrors the
+    // verdict so a script can branch on it: 0 allow, 1 block, 2 warn.
+    let decision = if no_exec {
+        if !json {
+            eprintln!(
+                "tirith install: --no-exec — analysis only, '{}' was NOT run.",
+                plan.analysis_command
+            );
+        }
+        match plan.verdict.action {
+            Action::Allow => ProceedDecision::Stop(0),
+            Action::Block => ProceedDecision::Stop(1),
+            Action::Warn | Action::WarnAck => ProceedDecision::Stop(2),
+        }
+    } else {
+        // A block refuses; a warn needs acknowledgement; an allow proceeds.
+        decide_proceed(&plan.verdict, &policy, interactive, yes, json)
+    };
+
+    // If the gate bypassed a BLOCK via `TIRITH=0`, stamp the verdict so the
+    // audit entry records what actually happened — without this, a bypassed
+    // block would be logged as `bypass_honored: false`.
+    if matches!(decision, ProceedDecision::Go) && plan.verdict.action == Action::Block {
+        plan.verdict.bypass_requested = true;
+        plan.verdict.bypass_honored = true;
     }
 
     // Audit the verdict regardless of the decision — the analysis happened.
@@ -240,35 +270,11 @@ fn run_package_manager(
         }
     }
 
-    // `--no-exec` stops here: the user asked for analysis only. The
-    // transaction was analyzed, informed, and audited; nothing will be
-    // installed, so the proceed/refuse gate — which only governs whether the
-    // *real install runs* — does not apply. The exit code still reflects the
-    // verdict so a script can branch on it: 0 allow, 1 block, 2 warn.
-    if no_exec {
-        if !json {
-            eprintln!(
-                "tirith install: --no-exec — analysis only, '{}' was NOT run.",
-                plan.analysis_command
-            );
-        }
-        return match plan.verdict.action {
-            Action::Allow => 0,
-            Action::Block => 1,
-            Action::Warn | Action::WarnAck => 2,
-        };
+    match decision {
+        ProceedDecision::Stop(code) => code,
+        // --- RECORD then RUN --------------------------------------------
+        ProceedDecision::Go => run_and_record(&plan, cwd.as_deref(), json, &ProcessInstallRunner),
     }
-
-    // The gate. A block refuses; a warn needs acknowledgement; an allow
-    // proceeds. `decide_proceed` returns the exit code to use when NOT
-    // proceeding, or `Go` when the transaction should go ahead.
-    match decide_proceed(&plan.verdict, &policy, interactive, yes, json) {
-        ProceedDecision::Stop(code) => return code,
-        ProceedDecision::Go => {}
-    }
-
-    // --- RECORD then RUN ------------------------------------------------
-    run_and_record(&plan, cwd.as_deref(), json, &ProcessInstallRunner)
 }
 
 /// Outcome of the verdict gate.
@@ -509,7 +515,7 @@ fn run_url(
     // pipe-to-shell. Analyzing `curl <url> | sh` would make CurlPipeShell fire
     // on every URL and turn every URL install into a block. The real script
     // body is analyzed separately by `runner::run` after download.
-    let preflight = preflight_url(url, cwd.as_deref(), interactive);
+    let mut preflight = preflight_url(url, cwd.as_deref(), interactive);
 
     if json {
         // A JSON-write failure means the consumer never received the preflight
@@ -520,6 +526,24 @@ fn run_url(
     } else {
         print_url_preflight_human(url, &preflight);
     }
+
+    // Decide the block/bypass *before* auditing so a `TIRITH=0`-bypassed BLOCK
+    // is recorded as bypassed rather than logged as `bypass_honored: false`.
+    let blocked_and_refused = if preflight.action == Action::Block {
+        let bypass_set = std::env::var("TIRITH").ok().as_deref() == Some("0");
+        let bypass_allowed =
+            policy.allow_bypass_env && (interactive || policy.allow_bypass_env_noninteractive);
+        if bypass_set && bypass_allowed {
+            // Bypassed — stamp the verdict so the audit entry is honest.
+            preflight.bypass_requested = true;
+            preflight.bypass_honored = true;
+            false
+        } else {
+            true
+        }
+    } else {
+        false
+    };
 
     // A failed audit write does not abort the transaction, but the URL form
     // also claims to be recorded — surface a non-fatal notice on failure.
@@ -535,26 +559,21 @@ fn run_url(
         }
     }
 
-    // A blocking preflight refuses before any download happens.
-    if preflight.action == Action::Block {
-        let bypass_set = std::env::var("TIRITH").ok().as_deref() == Some("0");
-        let bypass_allowed =
-            policy.allow_bypass_env && (interactive || policy.allow_bypass_env_noninteractive);
-        if !(bypass_set && bypass_allowed) {
-            if !json {
-                eprintln!(
-                    "tirith install: refusing to download — the URL preflight \
-                     BLOCKED this transaction (see findings above)."
-                );
-            }
-            return 1;
-        }
+    // A blocking preflight that was not bypassed refuses before any download.
+    if blocked_and_refused {
         if !json {
             eprintln!(
-                "tirith install: URL preflight BLOCK bypassed via TIRITH=0 \
-                 (policy permits) — proceeding against advice."
+                "tirith install: refusing to download — the URL preflight \
+                 BLOCKED this transaction (see findings above)."
             );
         }
+        return 1;
+    }
+    if preflight.action == Action::Block && !json {
+        eprintln!(
+            "tirith install: URL preflight BLOCK bypassed via TIRITH=0 \
+             (policy permits) — proceeding against advice."
+        );
     }
 
     // A warning preflight is surfaced; `runner::run`'s own confirmation prompt
@@ -611,9 +630,11 @@ fn run_url(
         }
         Err(e) => {
             if json {
-                let err = serde_json::json!({ "error": e });
-                let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &err);
-                println!();
+                // Route through `write_json_stdout` so the trailing newline is
+                // a fallible write (no broken-pipe panic). The command is
+                // already failing, so a write failure does not change the
+                // exit code.
+                let _ = write_json_stdout(&serde_json::json!({ "error": e }));
             } else {
                 eprintln!("tirith install: {e}");
             }
@@ -640,6 +661,15 @@ fn run_url(
     2
 }
 
+/// Single-quote a value for a synthesized POSIX shell command, so it is
+/// analyzed as one argument. Any embedded single quote is closed, escaped, and
+/// reopened (`'\''`) — without this a URL containing `&`, `;`, a backtick, a
+/// space, or a quote would tokenize as shell syntax and produce spurious
+/// findings.
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// Analyze a URL as a download (not a pipe-to-shell) and return the verdict.
 ///
 /// Separated so it is unit-testable without touching the network — it only
@@ -648,8 +678,10 @@ fn preflight_url(url: &str, cwd: Option<&str>, interactive: bool) -> Verdict {
     let ctx = AnalysisContext {
         // A download shape: a legitimate installer URL must not trip the
         // pipe-to-shell rule here. The script body is analyzed for real by
-        // the runner after it is fetched.
-        input: format!("curl -fsSL {url}"),
+        // the runner after it is fetched. The URL is single-quoted so a URL
+        // containing shell metacharacters (`&`, `;`, backticks, spaces) is
+        // analyzed as a single argument, not as shell syntax.
+        input: format!("curl -fsSL {}", shell_single_quote(url)),
         shell: tirith_core::tokenize::ShellType::Posix,
         scan_context: ScanContext::Exec,
         raw_bytes: None,
@@ -759,13 +791,12 @@ fn print_plan_human(plan: &InstallPlan, online: bool) {
 /// Write `value` as pretty JSON to stdout. Returns `false` on a write failure
 /// (a broken pipe, a full disk) so the caller can exit non-zero — a piped
 /// consumer must not see truncated JSON paired with a success exit code.
+///
+/// Thin wrapper over [`super::write_json_stdout`] carrying the `tirith
+/// install` error prefix; the shared helper writes the body and the trailing
+/// newline through one locked handle with fallible ops (no broken-pipe panic).
 fn write_json_stdout<T: serde::Serialize>(value: &T) -> bool {
-    if serde_json::to_writer_pretty(std::io::stdout().lock(), value).is_err() {
-        eprintln!("tirith install: failed to write JSON output");
-        return false;
-    }
-    println!();
-    true
+    super::write_json_stdout(value, "tirith install: failed to write JSON output")
 }
 
 /// Render the analysis verdict for a package-manager install (JSON form).
@@ -1104,6 +1135,43 @@ mod tests {
         assert!(
             verdict.action != Action::Allow,
             "a raw-IP install URL should raise at least one finding"
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_metacharacters() {
+        // CR10: a URL with shell metacharacters must become one quoted token.
+        assert_eq!(
+            shell_single_quote("https://x.example/a?b=1&c=2"),
+            "'https://x.example/a?b=1&c=2'"
+        );
+        // An embedded single quote is closed/escaped/reopened.
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn preflight_url_with_shell_metacharacters_no_spurious_findings() {
+        // CR10: a benign https installer URL carrying `&`, `;`, and a space
+        // must not produce findings from the URL tokenizing as shell syntax.
+        // Quoting it makes `curl -fsSL '<url>'` analyze the URL as one arg.
+        let url = "https://get.example-tool.sh/install.sh?ref=a&v=1;x y";
+        let verdict = preflight_url(url, None, false);
+        assert_eq!(
+            verdict.action,
+            Action::Allow,
+            "a quoted benign installer URL must not raise shell-syntax findings: {:?}",
+            verdict.findings,
+        );
+    }
+
+    #[test]
+    fn preflight_url_quoting_preserves_real_detection() {
+        // The quoting must not hide a genuinely suspicious URL — a raw-IP URL
+        // is still flagged when it also contains shell metacharacters.
+        let verdict = preflight_url("http://203.0.113.5/install.sh?a=1&b=2", None, false);
+        assert!(
+            verdict.action != Action::Allow,
+            "quoting must not suppress a raw-IP finding"
         );
     }
 }

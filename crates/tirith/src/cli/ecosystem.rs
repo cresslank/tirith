@@ -197,12 +197,7 @@ fn print_json(report: &EcosystemScanReport) -> bool {
         schema_version: 1,
         report,
     };
-    if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
-        eprintln!("tirith ecosystem scan: failed to write JSON output");
-        return false;
-    }
-    println!();
-    true
+    super::write_json_stdout(&out, "tirith ecosystem scan: failed to write JSON output")
 }
 
 /// Render the human-readable report to stderr (the summary) and stdout (the

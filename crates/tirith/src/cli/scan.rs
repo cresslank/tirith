@@ -444,12 +444,7 @@ fn print_json_result(result: &scan::ScanResult) -> bool {
         files,
     };
 
-    if serde_json::to_writer_pretty(std::io::stdout().lock(), &output).is_err() {
-        eprintln!("tirith scan: failed to write JSON output");
-        return false;
-    }
-    println!();
-    true
+    super::write_json_stdout(&output, "tirith scan: failed to write JSON output")
 }
 
 /// Emit a single-file scan result as JSON. Returns `false` on a JSON-write
@@ -470,12 +465,7 @@ fn print_json_file_result(result: &scan::FileScanResult) -> bool {
         findings: &result.findings,
     };
 
-    if serde_json::to_writer_pretty(std::io::stdout().lock(), &output).is_err() {
-        eprintln!("tirith scan: failed to write JSON output");
-        return false;
-    }
-    println!();
-    true
+    super::write_json_stdout(&output, "tirith scan: failed to write JSON output")
 }
 
 fn print_human_result(result: &scan::ScanResult) {
@@ -547,12 +537,7 @@ fn print_sarif_result(result: &scan::ScanResult) -> bool {
         .collect();
 
     let sarif_json = sarif::to_sarif(&findings, version);
-    if serde_json::to_writer_pretty(std::io::stdout().lock(), &sarif_json).is_err() {
-        eprintln!("tirith scan: failed to write SARIF output");
-        return false;
-    }
-    println!();
-    true
+    super::write_json_stdout(&sarif_json, "tirith scan: failed to write SARIF output")
 }
 
 /// Emit a single-file scan result as SARIF. Returns `false` on a write failure.
@@ -572,12 +557,7 @@ fn print_sarif_file_result(result: &scan::FileScanResult) -> bool {
         .collect();
 
     let sarif_json = sarif::to_sarif(&findings, version);
-    if serde_json::to_writer_pretty(std::io::stdout().lock(), &sarif_json).is_err() {
-        eprintln!("tirith scan: failed to write SARIF output");
-        return false;
-    }
-    println!();
-    true
+    super::write_json_stdout(&sarif_json, "tirith scan: failed to write SARIF output")
 }
 
 fn print_human_file_result(result: &scan::FileScanResult) {

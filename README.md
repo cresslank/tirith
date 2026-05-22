@@ -132,7 +132,7 @@ Nothing. Zero output. You forget tirith is running.
 
 ## What it catches
 
-**90+ detection rules across 16 categories.**
+**110+ detection rules across 16 categories.**
 
 | Category | What it stops |
 |----------|--------------|
@@ -906,7 +906,7 @@ Disable: `export TIRITH_LOG=0`
 
 ## License
 
-**Core security coverage ships in the open-source tree.** All 80+ detection rules and the MCP server are available from source. The repository still contains legacy licensing and policy-server code paths, so avoid assuming that every runtime path is already tier-free.
+**Core security coverage ships in the open-source tree.** All 110+ detection rules and the MCP server are available from source. The repository still contains legacy licensing and policy-server code paths, so avoid assuming that every runtime path is already tier-free.
 
 tirith is dual-licensed:
 

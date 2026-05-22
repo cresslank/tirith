@@ -66,6 +66,26 @@ pub(crate) fn offline_env_active() -> bool {
         .unwrap_or(false)
 }
 
+/// Write `value` as pretty JSON to stdout, followed by a trailing newline.
+///
+/// The JSON body and the newline are both written through one locked stdout
+/// handle with fallible ops, so a broken pipe (SIGPIPE → `BrokenPipe`) is
+/// reported as `false` rather than panicking — a bare `println!()` for the
+/// newline would panic. `ctx` is the command-prefixed message printed to
+/// stderr on failure (e.g. `"tirith scan: failed to write JSON output"`).
+///
+/// Returns `false` on a write failure so the caller can exit non-zero — a
+/// piped consumer must not see truncated JSON paired with a success code.
+pub(crate) fn write_json_stdout<T: serde::Serialize>(value: &T, ctx: &str) -> bool {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    if serde_json::to_writer_pretty(&mut out, value).is_err() || writeln!(out).is_err() {
+        eprintln!("{ctx}");
+        return false;
+    }
+    true
+}
+
 /// Suggest the closest match from a list of candidates using Levenshtein distance.
 /// Returns `None` if no candidate is within `max_distance`.
 pub fn suggest_closest<'a>(

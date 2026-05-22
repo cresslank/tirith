@@ -98,8 +98,9 @@ fn run(
 
     // Registry-API signals — ONLY when `--online` was passed and offline mode
     // is not in force. The production client is the networked
-    // `HttpRegistryClient`; `gather_api` itself is offline-safe and degrades
-    // any failure to `ApiSignals::Unavailable`.
+    // `HttpRegistryClient`; `gather_api` itself is offline-safe — it reports
+    // `NotComputed` for an intentional offline override and degrades a real
+    // registry failure to `Unavailable`.
     let api = if online {
         let client = HttpRegistryClient::new();
         gather_api(&client, eco, trimmed_name, offline)
@@ -141,12 +142,15 @@ fn run(
 ///
 /// `offline_flag` carries the `--offline` flag; when it — or the
 /// `TIRITH_OFFLINE` env var — is set, this is a guaranteed no-op that returns
-/// [`ApiSignals::Unavailable`] WITHOUT making any network call, so an
+/// [`ApiSignals::NotComputed`] WITHOUT making any network call, so an
 /// `--online --offline` invocation (or `--online` under `TIRITH_OFFLINE=1`)
-/// stays purely local. Otherwise it delegates to
-/// [`registry_api::gather_api_signals`], which itself degrades any registry
-/// failure gracefully — this function never panics, never hangs beyond the
-/// client's timeout, and never blocks the caller.
+/// stays purely local. `NotComputed` (not `Unavailable`) is correct here: the
+/// lookup was *intentionally not attempted*, not attempted-and-failed —
+/// `Unavailable` would misreport an explicit offline override as a degraded
+/// online run. Otherwise it delegates to [`registry_api::gather_api_signals`],
+/// which itself degrades any registry failure gracefully — this function
+/// never panics, never hangs beyond the client's timeout, and never blocks
+/// the caller.
 ///
 /// `client` is a trait object so tests inject a fixture-fed fake and never
 /// touch the real registries.
@@ -157,10 +161,12 @@ fn gather_api(
     offline_flag: bool,
 ) -> ApiSignals {
     if offline_flag || super::offline_env_active() {
-        return ApiSignals::unavailable(
-            "offline mode is active (--offline / TIRITH_OFFLINE) — \
-             registry-API signals were skipped, scored with offline signals only",
-        );
+        return ApiSignals::NotComputed {
+            reason: "offline mode is active (--offline / TIRITH_OFFLINE) — \
+                     registry-API signals were intentionally skipped, scored \
+                     with offline signals only"
+                .to_string(),
+        };
     }
     registry_api::gather_api_signals(client, eco, name)
 }
@@ -385,12 +391,7 @@ fn print_json(breakdown: &RiskBreakdown, explain: bool) -> bool {
         api_signals: &breakdown.api_signals,
         risk_breakdown: if explain { Some(breakdown) } else { None },
     };
-    if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
-        eprintln!("tirith package: failed to write JSON output");
-        return false;
-    }
-    println!();
-    true
+    super::write_json_stdout(&out, "tirith package: failed to write JSON output")
 }
 
 fn print_human(breakdown: &RiskBreakdown, explain: bool) {
@@ -793,14 +794,16 @@ mod tests {
 
     #[test]
     fn gather_api_offline_flag_skips_network() {
-        // The exploding client would panic if reached — the `--offline` flag
-        // must short-circuit to Unavailable without calling `fetch`.
+        // CR12: the exploding client would panic if reached — the `--offline`
+        // flag must short-circuit *without* calling `fetch`, and report
+        // `NotComputed` (the lookup was intentionally not attempted), not
+        // `Unavailable` (which means an online lookup was attempted and failed).
         let sig = gather_api(&ExplodingClient, Ecosystem::Npm, "react", true);
         match sig {
-            ApiSignals::Unavailable { reason } => {
+            ApiSignals::NotComputed { reason } => {
                 assert!(reason.contains("offline"), "reason: {reason}");
             }
-            other => panic!("expected Unavailable, got {other:?}"),
+            other => panic!("expected NotComputed for an intentional offline skip, got {other:?}"),
         }
     }
 

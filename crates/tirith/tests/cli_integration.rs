@@ -3478,6 +3478,63 @@ fn install_no_exec_json_is_well_formed_and_not_sandboxed() {
     );
 }
 
+/// CR9: a BLOCK that is *not* bypassed must be audited with `bypass_honored`
+/// false — and a BLOCK reaches the audit at all. `--no-exec` refuses without
+/// running the install (no bypass), so the audited verdict is the plain
+/// BLOCK. This pins the audit-after-decision ordering: the entry exists and
+/// carries the BLOCK verdict. (The bypass-stamped path runs the real package
+/// manager, which a hermetic test cannot exercise.)
+#[test]
+fn install_block_is_audited_with_the_block_verdict() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    // `evil-package@1.0.0` is a known-malicious entry in the fixture threat DB
+    // — installing it BLOCKs deterministically.
+    let out = tirith()
+        .env("TIRITH_OFFLINE", "1")
+        .env("TIRITH_LOG", "1")
+        .env("TIRITH_THREATDB_PATH", test_threatdb_fixture())
+        .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH")
+        .env_remove("TIRITH_POLICY_ROOT")
+        // `data_dir()` (the audit-log location) honors XDG_DATA_HOME on Unix
+        // and %APPDATA% on Windows — set both so the log is isolated.
+        .env("XDG_DATA_HOME", &data_dir)
+        .env("APPDATA", &data_dir)
+        .args(["install", "--no-exec", "npm", "evil-package@1.0.0"])
+        .output()
+        .expect("failed to run tirith install");
+
+    // `--no-exec` exit code mirrors the verdict; the verdict is BLOCK → 1.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "installing a known-malicious package must analyze as BLOCK, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The audit log must record the transaction (audit-after-decision).
+    let log_path = data_dir.join("tirith").join("log.jsonl");
+    let log = fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("audit log {} not written: {e}", log_path.display()));
+    let entry: serde_json::Value = log
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("audit line is JSON"))
+        .find(|e| e["entry_type"] == "verdict")
+        .expect("a verdict audit entry must exist");
+    assert_eq!(
+        entry["action"], "Block",
+        "the audited action must be the BLOCK verdict: {entry}"
+    );
+    // `--no-exec` never installs, so there is no bypass — the audit reflects
+    // the verdict as-is.
+    assert_eq!(
+        entry["bypass_honored"], false,
+        "a non-bypassed BLOCK must be audited as bypass_honored=false: {entry}"
+    );
+}
+
 #[test]
 fn install_human_output_never_claims_sandboxing() {
     // Honest-framing guard: the human output may use the word "sandbox" ONLY
@@ -3750,8 +3807,10 @@ fn package_risk_is_offline_by_default() {
 #[test]
 fn package_risk_online_with_tirith_offline_env_is_honored() {
     // `--online` together with `TIRITH_OFFLINE=1` must NOT reach the network:
-    // the offline env var wins, and the registry-API state degrades to
-    // `unavailable` with an offline reason — no `available`, no hang.
+    // the offline env var wins. The registry-API state is reported as
+    // `not_computed` — the lookup was *intentionally not attempted* (CR12).
+    // `unavailable` would be wrong here: it means an online lookup was
+    // attempted and failed, which misrepresents an explicit offline override.
     let state = tempfile::tempdir().expect("state tempdir");
     let out = tirith_ecosystem(state.path())
         .args([
@@ -3768,13 +3827,14 @@ fn package_risk_online_with_tirith_offline_env_is_honored() {
     let json: serde_json::Value = serde_json::from_slice(&out.stdout)
         .expect("package risk --online --format json must produce valid JSON");
     assert_eq!(
-        json["api_signals"]["state"], "unavailable",
-        "TIRITH_OFFLINE must force `--online` to skip the registry: {json}"
+        json["api_signals"]["state"], "not_computed",
+        "TIRITH_OFFLINE must make `--online` report not_computed (an \
+         intentional skip), not unavailable (a failed lookup): {json}"
     );
     let reason = json["api_signals"]["reason"].as_str().unwrap_or("");
     assert!(
         reason.contains("offline"),
-        "the unavailable reason must explain offline mode, got: {reason}"
+        "the not_computed reason must explain offline mode, got: {reason}"
     );
 }
 
