@@ -110,6 +110,11 @@ pub struct RegistryMetadata {
 pub enum FetchError {
     /// The ecosystem has no registry API wired up here.
     UnsupportedEcosystem(Ecosystem),
+    /// The package name is not a safe single registry path segment — it
+    /// carries a `..` path segment or a stray `/`, either of which a URL
+    /// library would normalize into a request to a *different* registry path.
+    /// Rejected before any URL is built, so no request is ever issued.
+    InvalidName,
     /// A connect / timeout / transport error reaching the registry.
     Network(String),
     /// The registry returned a non-success HTTP status.
@@ -130,6 +135,12 @@ impl FetchError {
                 "the {eco} ecosystem has no registry API wired into tirith yet — \
                  registry-API signals are available for npm, pypi, and crates.io"
             ),
+            FetchError::InvalidName => {
+                "the package name is not a valid registry name (it contains a path-traversal \
+                 segment or a stray '/') — no registry request was made, scored with offline \
+                 signals only"
+                    .to_string()
+            }
             FetchError::Network(e) => {
                 format!("could not reach the registry ({e}) — scored with offline signals only")
             }
@@ -413,6 +424,17 @@ impl HttpRegistryClient {
 
 impl RegistryClient for HttpRegistryClient {
     fn fetch(&self, ecosystem: Ecosystem, name: &str) -> Result<RegistryMetadata, FetchError> {
+        // Reject a name that is not a safe registry path segment BEFORE any URL
+        // is built or any cache key is derived. A name carrying a `..` segment
+        // (e.g. `../../../x`) is interpolated straight into the registry URL,
+        // and `reqwest` / the `url` crate normalize the `..` away — turning the
+        // request into a GET against an arbitrary same-host path. `name` can
+        // come from untrusted manifest content under `ecosystem scan --online`,
+        // so this is a path-traversal sink; reject it up front.
+        if !is_safe_registry_name(name) {
+            return Err(FetchError::InvalidName);
+        }
+
         // Cache hit?
         if self.use_cache {
             if let Some(cached) = load_cache(ecosystem, name) {
@@ -754,10 +776,48 @@ struct CratesVersion {
 // shared helpers
 // ===========================================================================
 
+/// Whether `name` is a package name that can be safely interpolated into a
+/// registry URL path. This is a *security* gate, not a full name validator:
+/// it rejects exactly the shapes a URL library would re-interpret.
+///
+/// Rejected:
+///  * a `..` (or `.`) path segment — `url` / `reqwest` collapse `..` during
+///    normalization, so `../../../x` would request a *different* URL path
+///    (a same-host path-traversal);
+///  * an empty path segment (a leading / trailing / doubled `/`);
+///  * more than one `/`, or a single `/` on a name that is not an npm scope
+///    (`@scope/pkg`) — npm scoped names are the only registry names this
+///    module fetches that legitimately contain a `/`; PyPI and crates.io
+///    names never do.
+///
+/// A name that passes still goes through [`url_path_segment`], which
+/// percent-encodes every other non-URL-safe byte.
+fn is_safe_registry_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let slash_count = name.matches('/').count();
+    if slash_count > 1 {
+        return false;
+    }
+    // A single `/` is allowed only for an npm scope: `@scope/pkg`.
+    if slash_count == 1 && !name.starts_with('@') {
+        return false;
+    }
+    // No segment may be empty (catches leading/trailing/doubled `/`), and no
+    // segment may be a `.` / `..` relative-path component.
+    name.split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
 /// Percent-encode a package name for use as a single URL path segment.
 /// Scoped npm names (`@scope/pkg`) keep their `/` — the npm registry expects
 /// `@scope%2fpkg` actually, but a plain `@scope/pkg` path also resolves; we
 /// encode everything that is not URL-safe and leave `/` so a scoped path works.
+///
+/// Precondition: `name` has already passed [`is_safe_registry_name`]. This
+/// function does *not* collapse `..`, so passing an unvalidated name through
+/// it would leave a path-traversal sequence intact in the URL.
 fn url_path_segment(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
@@ -1199,6 +1259,58 @@ mod tests {
         assert_eq!(url_path_segment("@scope/pkg"), "@scope/pkg");
         // A space is not URL-safe and must be encoded.
         assert_eq!(url_path_segment("bad name"), "bad%20name");
+    }
+
+    #[test]
+    fn safe_registry_name_accepts_real_names() {
+        assert!(is_safe_registry_name("react"));
+        assert!(is_safe_registry_name("@scope/pkg"));
+        assert!(is_safe_registry_name("lodash.merge"));
+        assert!(is_safe_registry_name("some-crate_name"));
+        // A literal `..` substring with no surrounding `/` is a name
+        // component, not a path-traversal segment — kept.
+        assert!(is_safe_registry_name("a..b"));
+    }
+
+    #[test]
+    fn safe_registry_name_rejects_path_traversal() {
+        // F2: a `..` path segment must be rejected before any URL is built.
+        assert!(!is_safe_registry_name("../../../x"));
+        assert!(!is_safe_registry_name(".."));
+        assert!(!is_safe_registry_name("react/.."));
+        assert!(!is_safe_registry_name("@scope/.."));
+        assert!(!is_safe_registry_name("."));
+        // A stray / extra / empty `/` segment is also rejected.
+        assert!(!is_safe_registry_name("a/b/c"));
+        assert!(!is_safe_registry_name("not-a-scope/pkg"));
+        assert!(!is_safe_registry_name("/leading"));
+        assert!(!is_safe_registry_name("trailing/"));
+        assert!(!is_safe_registry_name("@scope//pkg"));
+        assert!(!is_safe_registry_name(""));
+    }
+
+    #[test]
+    fn fetch_rejects_traversal_name_without_a_request() {
+        // F2 end-to-end: a `../../../x` name fed to the production client must
+        // short-circuit to `InvalidName` BEFORE any URL is constructed — the
+        // guard runs ahead of the network, so this test issues no request.
+        // (A real fetch for a valid name would hit the network; an invalid
+        // name never reaches that path.)
+        let client = HttpRegistryClient::without_cache();
+        let err = client
+            .fetch(Ecosystem::Npm, "../../../etc/passwd")
+            .expect_err("a path-traversal name must not produce a request");
+        assert!(
+            matches!(err, FetchError::InvalidName),
+            "expected InvalidName, got {err:?}"
+        );
+        // The degradation reason is honest about why no request was made.
+        assert!(err.reason().contains("path-traversal"));
+        // And it surfaces as a graceful Unavailable, not a panic.
+        assert!(matches!(
+            gather_api_signals(&client, Ecosystem::Npm, "../../../etc/passwd"),
+            ApiSignals::Unavailable { .. }
+        ));
     }
 
     #[test]
