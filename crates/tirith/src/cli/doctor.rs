@@ -1128,16 +1128,13 @@ fn gather_ps_compat(detected_shell: &str) -> Option<PsCompatInfo> {
 /// availability check AND the PSReadLine probe so module detection
 /// always runs against the same interpreter we reported as found.
 fn detect_powershell_binary(detected_shell: &str) -> Option<&'static str> {
-    let candidates: [&str; 2] = match detected_shell {
+    let candidates: [&'static str; 2] = match detected_shell {
         "powershell" => ["powershell", "pwsh"],
         _ => ["pwsh", "powershell"],
     };
-    for candidate in candidates {
-        if probe_command_available(candidate) {
-            return Some(candidate);
-        }
-    }
-    None
+    candidates
+        .into_iter()
+        .find(|&candidate| probe_command_available(candidate))
 }
 
 /// Probe whether a PowerShell binary is available on PATH using a no-op
