@@ -306,7 +306,7 @@ arms:
 
 Lists per-origin counts from the audit log. Output:
 
-```
+```text
 $ tirith agent sessions
 tirith agent sessions: 685 verdict(s) across 5 origin group(s) in /Users/me/.local/share/tirith/log.jsonl.
 
@@ -339,7 +339,7 @@ redacted command, or `(c)` case-insensitive substring on the rendered
 origin label so an operator can search for `"claude-code"`. Up to 20
 matches surface, sorted newest-first.
 
-```
+```text
 $ tirith agent explain claude-code
 tirith agent explain: 3 match(es) for "claude-code" in /Users/me/.local/share/tirith/log.jsonl.
 
@@ -383,7 +383,7 @@ appending would suggest enforcement that does not exist yet. The
 operator pastes the snippet into `.tirith/policy.yaml` (or
 `.tirith/agent-policy.yaml.example`) themselves.
 
-```
+```text
 $ tirith agent allow --kind agent --tool claude-code
 tirith agent allow: valid matcher — paste the snippet below under `agent_rules.allow:` in your policy.
   (NOTE: agent_rules is observation-only today; chunk 3 wires enforcement.)
@@ -421,8 +421,11 @@ agent_rules:
 * `tool` is the optional caller-claimed payload — the `tool` slot on
   `Agent`, the `client_name` on `Mcp`, the `provider` on `Ci`, or the
   `name` on `Ide`. Case-sensitive exact match. A `tool` filter on
-  `human` / `gateway` is structurally meaningless and rejected by the
-  validator.
+  `human` / `gateway` is structurally meaningless: it is flagged by
+  `tirith policy validate` as a warning (a slightly stale policy still
+  loads — `policy validate` exits `0` unless a hard error fires) and
+  rejected by `tirith agent allow` as a hard error (exit `1`) so the
+  operator catches the mistake at scaffolding time.
 * The pure helper `policy::agent_decision(&policy, &origin) ->
   AgentDecision` walks `deny` first (first match → `Denied`) then
   `allow` (first match → `Allowed`); no match → `Unspecified`.
@@ -447,20 +450,26 @@ unless a live workload surfaces a concrete need. The minimal `Denied
 this untrusted MCP client from running anything") without committing
 the schema to questions we have not yet seen real telemetry for.
 
-**Origin-stamp invariant.** The verdict's `agent_origin` is now stamped
-**before** every `audit::log_verdict` call site:
+**Origin-stamp invariant.** Chunk 3 unified the model to **exactly one
+audit entry per caller path**, with `agent_origin` stamped on the verdict
+**before** that call. `engine::analyze_inner` (reached through
+`analyze_returning_policy`) **no longer audits** its own bypass fast-exit
+— pre-chunk-3 it called `audit::log_verdict` with the unstamped verdict,
+which on `tirith check` produced a double-log (engine entry → no origin;
+CLI entry → with origin). Audit responsibility now lives entirely with
+the caller, and the per-file change set is:
 
-* `cli/check.rs` — already stamping pre-chunk-3.
-* `cli/paste.rs` — stamping pre-chunk-3, but the bypass branch now
-  audits (it previously skipped, trusting the engine to have logged).
-* `cli/gateway.rs` — already stamping pre-chunk-3.
+* `cli/check.rs` — pre-chunk-3 this path already stamped origin and
+  audited; chunk 3 deduplicated by removing the engine-side write.
+* `cli/paste.rs` — stamping pre-chunk-3, but the bypass branch
+  previously SKIPPED audit (trusting `analyze()` to have logged); it
+  now audits the bypass branch explicitly so the entry carries origin.
 * `mcp/tools.rs::call_check_command` — stamping pre-chunk-3, but the
-  bypass branch now audits explicitly (same reason as `paste.rs`).
-* `engine::analyze_inner` — **no longer audits** its own bypass
-  fast-exit. Pre-chunk-3 it called `audit::log_verdict` with the
-  unstamped verdict, producing a double-log on `tirith check`
-  (engine entry → no origin; CLI entry → with origin). Chunk 3
-  moves audit responsibility entirely to the caller.
+  bypass branch previously skipped for the same reason; it now audits
+  explicitly (same shape as `paste.rs`).
+* `cli/gateway.rs` — already the singleton on this path via its own
+  `write_audit` / `write_audit_with_raw` helpers; no engine-side write
+  to remove, no caller-side gap to close.
 
 ## 6. Out of scope
 
