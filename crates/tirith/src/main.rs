@@ -2051,8 +2051,14 @@ fn run() {
             json,
         } => {
             let (_, want_json) = HumanJsonFormat::resolve(format, json);
-            let interactive =
-                !non_interactive && !want_json && is_terminal::is_terminal(std::io::stdout());
+            // Gate interactivity on BOTH stdout (so we don't write prompts
+            // into a pipe / log file) AND stdin (so we don't block reading
+            // from a closed/redirected stdin and "select interactive then
+            // terminate immediately"). The lab loop reads stdin per scenario.
+            let interactive = !non_interactive
+                && !want_json
+                && is_terminal::is_terminal(std::io::stdout())
+                && is_terminal::is_terminal(std::io::stdin());
             cli::lab::run(interactive, filter.as_deref(), want_json)
         }
 

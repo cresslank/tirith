@@ -108,7 +108,12 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool) -> i32 {
     };
 
     if filtered.is_empty() {
-        if let Some(tag) = filter {
+        if json {
+            // In JSON mode, emit an empty array so consumers can parse
+            // unambiguously. The empty-corpus / empty-filter case is still
+            // exit 0 — it's not a failure, just a no-op.
+            println!("[]");
+        } else if let Some(tag) = filter {
             println!("No scenarios match filter '{tag}'");
         } else {
             println!("Lab corpus is empty");
@@ -130,18 +135,18 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool) -> i32 {
             break;
         }
 
-        // Build the analysis context, skipping any scenario whose context
-        // string is unparseable so a typo in the corpus doesn't take down
-        // the whole run silently.
+        // Build the analysis context. An unknown context string in the
+        // corpus is a hard failure — silently skipping would let a typo
+        // mask a real corpus regression and still return exit 0.
         let scan_context = match scenario.context.as_str() {
             "exec" => ScanContext::Exec,
             "paste" => ScanContext::Paste,
             other => {
                 eprintln!(
-                    "tirith lab: scenario '{}' has unknown context '{}', skipping",
+                    "tirith lab: scenario '{}' has unknown context '{}' — corpus error",
                     scenario.name, other
                 );
-                continue;
+                return 1;
             }
         };
 
