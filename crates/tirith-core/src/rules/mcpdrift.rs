@@ -91,10 +91,14 @@ pub fn is_mcp_lockfile(path: Option<&Path>) -> bool {
 ///   `McpServerDrift` finding fires (severity High) naming the disallowed
 ///   tools. Fires alongside any other drift; never fires if no policy entry
 ///   exists for the server.
-/// * **Drift-side**: when an Added or Changed drift adds a tool that is not
-///   in the allowed set for a server listed in `mcp_allowed_tools`, the
-///   drift finding is **upgraded to High severity** (the default is Medium).
-///   Drift inside the allowed set keeps Medium.
+/// * **Drift-side**: when an Added or Changed drift introduces a tool that
+///   is not in the allowed set for a server listed in `mcp_allowed_tools`,
+///   the drift finding is **upgraded to High severity** (the default is
+///   Medium). For `Changed`, the inspected list is `tools_added`. For
+///   `Added`, the inspected list is the brand-new server's declared
+///   `tools` (every tool on a new server is effectively a fresh addition
+///   relative to the previous lockfile state). Drift inside the allowed
+///   set keeps Medium.
 pub fn check(
     content: &str,
     file_path: Option<&Path>,
@@ -175,18 +179,28 @@ fn drift_filter_trusted(
         .collect()
 }
 
-/// `true` when at least one `Added` drift, or the `tools_added` of a
-/// `Changed` drift, introduces a tool that is NOT in the
+/// `true` when at least one drift introduces a tool that is NOT in the
 /// `mcp_allowed_tools` set for that server. A server not listed in
-/// `mcp_allowed_tools` is unconstrained (returns false for that server).
+/// `mcp_allowed_tools` is unconstrained (its drift contributes nothing
+/// to the upgrade decision).
 ///
-/// An `Added` drift carries no per-tool detail at the `McpDrift::Added`
-/// level — it represents a whole new server entry. The newly-added server
-/// might still expose tools that the policy forbids; to decide that we
-/// would need to inspect the server's tool list at the time of the diff,
-/// which `compute_drift` does not surface for the Added kind. We therefore
-/// only escalate on `Changed` drifts whose `tools_added` is populated —
-/// the precise, non-ambiguous case.
+/// Two drift kinds carry "added tools" and both feed the severity ladder:
+///
+/// * **`Changed`** — the per-server `tools_added` field. A pre-existing
+///   server now exposes a tool the previous lockfile state did not.
+/// * **`Added`** — a brand-new server entry, whose declared `tools` list
+///   is treated as a fresh set of additions against the (implicit) empty
+///   previous state. Without surfacing the new server's tools here, an
+///   attacker could smuggle a disallowed tool by introducing a new server
+///   instead of mutating an existing one — exactly the asymmetry CodeRabbit
+///   flagged (`mcp_allowed_tools` ladder must cover both paths).
+///
+/// **Allowed-list semantics** (same on both paths):
+/// * A server unlisted in `mcp_allowed_tools` is unconstrained — its tools
+///   never trigger an upgrade.
+/// * A server listed with `[]` (empty allow-list) forbids *any* tool — every
+///   tool the server declares triggers an upgrade.
+/// * A server listed with a non-empty allow-list permits exactly those tools.
 fn any_added_tool_out_of_allowed(
     drifts: &[mcp_lock::McpDrift],
     mcp_allowed_tools: &HashMap<String, Vec<String>>,
@@ -195,14 +209,33 @@ fn any_added_tool_out_of_allowed(
         return false;
     }
     for d in drifts {
-        if let mcp_lock::McpDrift::Changed(entry) = d {
-            let Some(allowed) = mcp_allowed_tools.get(&entry.name) else {
-                continue;
-            };
-            for tool in &entry.tools_added {
-                if !allowed.iter().any(|a| a == tool) {
-                    return true;
+        match d {
+            mcp_lock::McpDrift::Changed(entry) => {
+                let Some(allowed) = mcp_allowed_tools.get(&entry.name) else {
+                    continue;
+                };
+                for tool in &entry.tools_added {
+                    if !allowed.iter().any(|a| a == tool) {
+                        return true;
+                    }
                 }
+            }
+            mcp_lock::McpDrift::Added { name, tools, .. } => {
+                // A brand-new server: every declared tool is effectively an
+                // "added" tool relative to the previous lockfile state. The
+                // same policy-set test the `Changed` arm runs applies here.
+                let Some(allowed) = mcp_allowed_tools.get(name) else {
+                    continue;
+                };
+                for tool in tools {
+                    if !allowed.iter().any(|a| a == tool) {
+                        return true;
+                    }
+                }
+            }
+            mcp_lock::McpDrift::Removed { .. } => {
+                // A removed server's tools do not get "added" anywhere; the
+                // upgrade ladder is about NEW exposure, never lost exposure.
             }
         }
     }
@@ -1148,6 +1181,209 @@ mod tests {
             .find(|f| f.description.contains("1 changed"))
             .expect("expected a drift finding");
         assert_eq!(drift.severity, Severity::High);
+    }
+
+    // -----------------------------------------------------------------------
+    // CodeRabbit follow-up — extend the `mcp_allowed_tools` severity ladder
+    // to the `Added` path. A brand-new server smuggling a disallowed tool
+    // must escalate the drift finding to High, mirroring the `Changed`
+    // path's `tools_added` check. (Before this fix, the ladder fired only
+    // on `Changed` and "added a server with a disallowed tool" silently
+    // stayed at Medium.)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn added_server_with_disallowed_tool_upgrades_to_high_severity() {
+        // Lockfile predates server "newcomer". The config then adds
+        // "newcomer" with a tool that is NOT in its `mcp_allowed_tools`
+        // entry. The drift finding for the addition must be High.
+        let repo = tempdir().unwrap();
+        // Step 1: lock with no servers (the baseline doesn't know about
+        // "newcomer" yet).
+        write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
+        let old_inv = mcp_lock::build_inventory(repo.path());
+        write_lockfile_for(repo.path(), &old_inv);
+
+        // Step 2: a brand-new server appears in the config, exposing
+        // "evil_tool" (which policy does not permit for "newcomer").
+        write_config(
+            repo.path(),
+            ".mcp.json",
+            r#"{ "mcpServers": { "newcomer": { "command": "node",
+                "tools": ["read", "evil_tool"] } } }"#,
+        );
+
+        let mut allowed = HashMap::new();
+        allowed.insert("newcomer".to_string(), vec!["read".to_string()]);
+
+        let lock_path = repo.path().join(".tirith").join("mcp.lock");
+        let content = fs::read_to_string(&lock_path).unwrap();
+        let findings = check(&content, Some(&lock_path), &[], &allowed);
+        let drift_finding = findings
+            .iter()
+            .find(|f| f.description.contains("1 added"))
+            .expect("expected a drift finding for the added server");
+        assert_eq!(
+            drift_finding.severity,
+            Severity::High,
+            "an Added server exposing a tool outside the allowed set must be \
+             High (symmetric with the Changed-path ladder): {:?}",
+            drift_finding,
+        );
+    }
+
+    #[test]
+    fn added_server_with_only_allowed_tools_stays_medium() {
+        // A brand-new server whose every tool IS in the policy's allowed
+        // set keeps the default Medium severity — the ladder must not
+        // upgrade indiscriminately on Added.
+        let repo = tempdir().unwrap();
+        write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
+        let old_inv = mcp_lock::build_inventory(repo.path());
+        write_lockfile_for(repo.path(), &old_inv);
+
+        write_config(
+            repo.path(),
+            ".mcp.json",
+            r#"{ "mcpServers": { "newcomer": { "command": "node",
+                "tools": ["read", "write"] } } }"#,
+        );
+
+        let mut allowed = HashMap::new();
+        allowed.insert(
+            "newcomer".to_string(),
+            vec!["read".to_string(), "write".to_string()],
+        );
+
+        let lock_path = repo.path().join(".tirith").join("mcp.lock");
+        let content = fs::read_to_string(&lock_path).unwrap();
+        let findings = check(&content, Some(&lock_path), &[], &allowed);
+        let drift_finding = findings
+            .iter()
+            .find(|f| f.description.contains("1 added"))
+            .expect("expected a drift finding for the added server");
+        assert_eq!(
+            drift_finding.severity,
+            Severity::Medium,
+            "an Added server with only allowed tools must stay Medium: {:?}",
+            drift_finding,
+        );
+    }
+
+    #[test]
+    fn added_server_unlisted_in_mcp_allowed_tools_stays_medium() {
+        // A brand-new server whose NAME does not appear in
+        // `mcp_allowed_tools` is unconstrained (same semantics as the
+        // Changed path's "server unlisted → no upgrade"). It surfaces as a
+        // drift but stays at the default Medium.
+        let repo = tempdir().unwrap();
+        write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
+        let old_inv = mcp_lock::build_inventory(repo.path());
+        write_lockfile_for(repo.path(), &old_inv);
+
+        write_config(
+            repo.path(),
+            ".mcp.json",
+            r#"{ "mcpServers": { "unconstrained-newcomer": { "command": "node",
+                "tools": ["anything", "goes"] } } }"#,
+        );
+
+        // Policy mentions a DIFFERENT server — the newcomer is unlisted
+        // and therefore not subject to per-server constraints.
+        let mut allowed = HashMap::new();
+        allowed.insert(
+            "different-server".to_string(),
+            vec!["only-this".to_string()],
+        );
+
+        let lock_path = repo.path().join(".tirith").join("mcp.lock");
+        let content = fs::read_to_string(&lock_path).unwrap();
+        let findings = check(&content, Some(&lock_path), &[], &allowed);
+        let drift_finding = findings
+            .iter()
+            .find(|f| f.description.contains("1 added"))
+            .expect("expected a drift finding for the added server");
+        assert_eq!(
+            drift_finding.severity,
+            Severity::Medium,
+            "an Added server unlisted in mcp_allowed_tools is unconstrained \
+             and must stay Medium: {:?}",
+            drift_finding,
+        );
+    }
+
+    #[test]
+    fn added_server_with_empty_allowed_tools_and_any_tool_is_high() {
+        // A brand-new server whose `mcp_allowed_tools` entry is the empty
+        // list `[]` (explicit "forbid every tool") exposing ANY tool must
+        // escalate to High — mirroring the Changed-path semantics
+        // documented in `empty_allowed_tools_for_server_forbids_any_new_tool`.
+        let repo = tempdir().unwrap();
+        write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
+        let old_inv = mcp_lock::build_inventory(repo.path());
+        write_lockfile_for(repo.path(), &old_inv);
+
+        write_config(
+            repo.path(),
+            ".mcp.json",
+            r#"{ "mcpServers": { "newcomer": { "command": "node",
+                "tools": ["any_tool"] } } }"#,
+        );
+
+        let mut allowed = HashMap::new();
+        allowed.insert("newcomer".to_string(), vec![]);
+
+        let lock_path = repo.path().join(".tirith").join("mcp.lock");
+        let content = fs::read_to_string(&lock_path).unwrap();
+        let findings = check(&content, Some(&lock_path), &[], &allowed);
+        let drift_finding = findings
+            .iter()
+            .find(|f| f.description.contains("1 added"))
+            .expect("expected a drift finding for the added server");
+        assert_eq!(
+            drift_finding.severity,
+            Severity::High,
+            "an Added server under an empty `[]` allow-list exposing any tool \
+             must be High: {:?}",
+            drift_finding,
+        );
+    }
+
+    #[test]
+    fn added_server_with_no_tools_stays_medium_even_under_empty_allow_list() {
+        // A brand-new server that declares NO tools — even when its
+        // `mcp_allowed_tools` entry is `[]` (forbid all) — does not
+        // trigger the upgrade: there is no exposed tool to flag.
+        // Guards against an over-eager "Added → always High" regression.
+        let repo = tempdir().unwrap();
+        write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
+        let old_inv = mcp_lock::build_inventory(repo.path());
+        write_lockfile_for(repo.path(), &old_inv);
+
+        write_config(
+            repo.path(),
+            ".mcp.json",
+            r#"{ "mcpServers": { "newcomer": { "command": "node" } } }"#,
+        );
+
+        let mut allowed = HashMap::new();
+        allowed.insert("newcomer".to_string(), vec![]);
+
+        let lock_path = repo.path().join(".tirith").join("mcp.lock");
+        let content = fs::read_to_string(&lock_path).unwrap();
+        let findings = check(&content, Some(&lock_path), &[], &allowed);
+        let drift_finding = findings
+            .iter()
+            .find(|f| f.description.contains("1 added"))
+            .expect("expected a drift finding for the added server");
+        assert_eq!(
+            drift_finding.severity,
+            Severity::Medium,
+            "an Added server with no declared tools must stay Medium even \
+             under an empty allow-list — there is no tool to violate the \
+             ladder: {:?}",
+            drift_finding,
+        );
     }
 
     // Keep an unused import quiet on the import block when compiling in

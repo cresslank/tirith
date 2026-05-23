@@ -536,6 +536,7 @@ fn print_drift_body(drifts: &[McpDrift]) {
             McpDrift::Added {
                 name,
                 source_config,
+                ..
             } => {
                 eprintln!("  + added: {} (from {})", escape_name(name), source_config);
             }

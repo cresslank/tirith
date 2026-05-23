@@ -1025,6 +1025,25 @@ pub enum McpDrift {
         name: String,
         /// Repo-relative source config the current inventory found.
         source_config: String,
+        /// The tools the new server declares, sorted and de-duplicated (the
+        /// same canonical form `McpServerEntry::tools` carries). Surfaced so
+        /// a policy gate — for example `scan.mcp_allowed_tools` — can
+        /// inspect the brand-new server's tool surface, mirroring the
+        /// `tools_added` field on `Changed`. An empty vec means the
+        /// newly-added server declared no tools (an MCP client treats that
+        /// as "all tools"); a non-empty vec lists each declared tool.
+        ///
+        /// **Privacy.** Like `tools_added` on `Changed`, this carries only
+        /// tool *names* — no values, no hashes — so a drift report can be
+        /// printed and serialized safely.
+        ///
+        /// **Wire shape.** Skipped on serialization when empty so an older
+        /// drift document (without the field) round-trips into a current
+        /// `Added` with `tools: vec![]`. This is a structural extension,
+        /// **not** a lockfile schema change — `.tirith/mcp.lock`'s
+        /// `format_version` is unchanged (still 4).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<String>,
     },
     /// A server present on both sides has changed — its per-server `hash`
     /// differs. The entry holds the per-field detail.
@@ -1044,6 +1063,7 @@ impl McpDrift {
             McpDrift::Added {
                 name,
                 source_config,
+                ..
             } => (1, name.clone(), source_config.clone()),
             McpDrift::Changed(entry) => (2, entry.name.clone(), entry.source_config.clone()),
         }
@@ -1121,10 +1141,14 @@ pub fn compute_drift(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift
         match key_cur.cmp(&key_prev) {
             std::cmp::Ordering::Less => {
                 // Current side has a server before the lockfile's next one —
-                // the lockfile doesn't have it. Added.
+                // the lockfile doesn't have it. Added. The new server's
+                // tool list rides along so a policy gate
+                // (`scan.mcp_allowed_tools`) can see what the brand-new
+                // server is exposing — mirroring `tools_added` on Changed.
                 drifts.push(McpDrift::Added {
                     name: cur.name.clone(),
                     source_config: cur.source_config.clone(),
+                    tools: cur.tools.clone(),
                 });
                 i += 1;
             }
@@ -1156,6 +1180,7 @@ pub fn compute_drift(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift
         drifts.push(McpDrift::Added {
             name: cur.name.clone(),
             source_config: cur.source_config.clone(),
+            tools: cur.tools.clone(),
         });
         i += 1;
     }
@@ -2987,6 +3012,113 @@ mod tests {
             &drifts[0],
             McpDrift::Added { name, .. } if name == "b"
         ));
+    }
+
+    #[test]
+    fn drift_added_carries_new_server_tools() {
+        // The Added drift surfaces the new server's tool list so a policy
+        // gate (`scan.mcp_allowed_tools`) can inspect what the brand-new
+        // server exposes — mirroring `tools_added` on Changed. Without
+        // this, an Added server smuggling a disallowed tool would slip
+        // through the severity ladder (the asymmetry CodeRabbit flagged).
+        let prev = mk_inventory(vec![stdio_server("a", "node")]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![
+            stdio_server("a", "node"),
+            McpServerEntry {
+                tools: vec!["read_file".into(), "write_file".into()],
+                ..stdio_server("b", "node")
+            },
+        ]);
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(drifts.len(), 1);
+        match &drifts[0] {
+            McpDrift::Added { name, tools, .. } => {
+                assert_eq!(name, "b");
+                // Tools are surfaced in their canonical (sorted) order —
+                // exactly the form `McpServerEntry::tools` carries.
+                assert_eq!(
+                    tools,
+                    &vec!["read_file".to_string(), "write_file".to_string()],
+                    "Added drift must carry the new server's declared tools",
+                );
+            }
+            other => panic!("expected Added with tools, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_added_with_no_tools_has_empty_tools_vec() {
+        // A new server that declares no tools yields an empty `tools` vec
+        // (not absent / null) — `compute_drift` always surfaces the list,
+        // even when it's empty, so consumers can branch on length without
+        // an Option dance.
+        let prev = mk_inventory(vec![stdio_server("a", "node")]);
+        let lock = McpLockfile::from_inventory(&prev);
+        let cur = mk_inventory(vec![stdio_server("a", "node"), stdio_server("b", "node")]);
+        let drifts = compute_drift(&cur, &lock);
+        match &drifts[0] {
+            McpDrift::Added { tools, .. } => {
+                assert!(
+                    tools.is_empty(),
+                    "no-tools-declared server must yield an empty Added.tools vec, got {tools:?}",
+                );
+            }
+            other => panic!("expected Added, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_added_serialization_omits_empty_tools_field() {
+        // The schema change is structural-only — when `tools` is empty
+        // the field is omitted from JSON, so a drift document produced
+        // by the previous version (which had no field) round-trips
+        // bit-identically into the new `Added` shape with `tools: []`.
+        // This is also the wire-shape proof that the lockfile schema
+        // (`format_version` = 4) is unaffected by this change.
+        let added = McpDrift::Added {
+            name: "newcomer".into(),
+            source_config: ".mcp.json".into(),
+            tools: vec![],
+        };
+        let json = serde_json::to_string(&added).unwrap();
+        assert!(
+            !json.contains("\"tools\""),
+            "an empty tools list must be omitted from JSON: {json}"
+        );
+
+        let with_tools = McpDrift::Added {
+            name: "newcomer".into(),
+            source_config: ".mcp.json".into(),
+            tools: vec!["read".into()],
+        };
+        let json = serde_json::to_string(&with_tools).unwrap();
+        assert!(
+            json.contains("\"tools\""),
+            "a non-empty tools list must be present in JSON: {json}"
+        );
+
+        // And an older drift document (without the `tools` field) parses
+        // cleanly with `tools` defaulting to an empty vec — the
+        // structural extension is backwards-compatible at the JSON layer.
+        let legacy = r#"{"kind":"added","name":"old","source_config":".mcp.json"}"#;
+        let parsed: McpDrift = serde_json::from_str(legacy).expect("legacy Added must parse");
+        match parsed {
+            McpDrift::Added {
+                name,
+                source_config,
+                tools,
+            } => {
+                assert_eq!(name, "old");
+                assert_eq!(source_config, ".mcp.json");
+                assert!(
+                    tools.is_empty(),
+                    "missing tools field must default to empty: {tools:?}"
+                );
+            }
+            other => panic!("expected Added, got {other:?}"),
+        }
     }
 
     #[test]
