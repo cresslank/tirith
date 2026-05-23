@@ -329,6 +329,28 @@ impl Action {
     }
 }
 
+impl std::str::FromStr for Action {
+    type Err = String;
+    /// Parse the strict lowercase tokens used by lab-corpus / fixture TOML.
+    /// Closed enum set: `allow`, `warn`, `block`, `warn_ack` — case-sensitive
+    /// on purpose, so a corpus typo like `"BLOCK"` or `"blocK"` (which used
+    /// to slip past the inline match-on-string and silently always-FAIL the
+    /// scenario) surfaces as a hard parse error instead. Centralised here so
+    /// callers (`lab.rs::run`, future consumers) share one parse table — the
+    /// existing `#[serde(rename_all = "snake_case")]` derive only handles
+    /// deserialization through serde; this is the explicit `&str` path used
+    /// by the corpus' `expected_action` field.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "allow" => Ok(Action::Allow),
+            "warn" => Ok(Action::Warn),
+            "block" => Ok(Action::Block),
+            "warn_ack" => Ok(Action::WarnAck),
+            other => Err(format!("unknown action: {other}")),
+        }
+    }
+}
+
 pub fn action_from_findings(findings: &[Finding]) -> Action {
     if findings.is_empty() {
         return Action::Allow;

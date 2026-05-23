@@ -966,22 +966,21 @@ fn detect_shell_tool_conflicts(profile: Option<&std::path::Path>) -> Vec<ShellTo
 /// PowerShell hook compatibility information for `tirith doctor --compat`.
 ///
 /// Reported when either `pwsh` (PowerShell 7+) or `powershell` (Windows
-/// PowerShell 5.1) is on PATH; absent on hosts without either binary.
+/// PowerShell 5.1) is on PATH; absent on hosts without either binary. The
+/// outer `Option<PsCompatInfo>` on `CompatReport.powershell_compat` carries
+/// the "no PowerShell binary at all" signal, so we do NOT need a separate
+/// `available: bool` field — and `binary` is always populated when this
+/// struct exists, so it is a plain `String`. Likewise, `tirith_status` is
+/// already surfaced by the parent `CompatReport.tirith_status` (both read
+/// the same env var), so we do not duplicate it here.
+///
 /// This is a diagnostic surface only — the shell-hook health gate in
 /// `tirith init` is authoritative for actual hook behavior.
 #[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
 struct PsCompatInfo {
-    /// A PowerShell binary was found on PATH (either `pwsh` or `powershell`).
-    available: bool,
     /// The resolved binary name — `"pwsh"` when PowerShell 7+ is installed,
-    /// `"powershell"` for Windows PowerShell 5.1 only. `None` when neither
-    /// was found.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    binary: Option<String>,
-    /// Value of `TIRITH_STATUS` in the current environment (set by the hook).
-    /// `None` means the hook has not run in this shell session.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tirith_status: Option<String>,
+    /// `"powershell"` for Windows PowerShell 5.1 only.
+    binary: String,
     /// PSReadLine module available to the resolved PowerShell binary
     /// (required for the key binding). `None` if no binary was found OR
     /// the probe timed out / errored.
@@ -1096,7 +1095,6 @@ fn gather_compat() -> CompatReport {
 /// the raw PID.
 fn gather_ps_compat(detected_shell: &str) -> Option<PsCompatInfo> {
     let binary = detect_powershell_binary(detected_shell)?;
-    let tirith_status = std::env::var("TIRITH_STATUS").ok();
     // The probe returns `Option<bool>` so we can distinguish three states:
     //   Some(true)  — PSReadLine module is present,
     //   Some(false) — PSReadLine module is NOT present,
@@ -1106,9 +1104,7 @@ fn gather_ps_compat(detected_shell: &str) -> Option<PsCompatInfo> {
     // Option directly to the field — no extra wrapping.
     let psreadline_available = probe_psreadline_available(binary);
     Some(PsCompatInfo {
-        available: true,
-        binary: Some(binary.to_string()),
-        tirith_status,
+        binary: binary.to_string(),
         psreadline_available,
         // hook_version_match: intentionally None until all shell hook files
         // carry a machine-parseable `# tirith-hook-version:` tag. See the
@@ -1137,34 +1133,40 @@ fn detect_powershell_binary(detected_shell: &str) -> Option<&'static str> {
         .find(|&candidate| probe_command_available(candidate))
 }
 
+/// Run a PowerShell command body with the discipline flags
+/// (`-NoProfile -NonInteractive`) and a 3-second timeout. Returns the
+/// completed `Output` on a clean exit, or `None` if the binary failed to
+/// spawn, the run timed out, or the wait errored.
+///
+/// `-NoProfile` is critical: `-NonInteractive` alone does NOT prevent profile
+/// loading, so without `-NoProfile` user-defined hooks could interfere with
+/// module detection (e.g. by mutating `$env:PSModulePath`) or cause spurious
+/// failures from profile errors. Centralising both flags here means the two
+/// PS probe call sites cannot drift on the discipline.
+///
+/// IMPORTANT: the argument list is PowerShell-specific — this is only valid
+/// for `pwsh` or `powershell.exe`. Calling with any other binary would pass
+/// nonsense arguments.
+fn run_powershell(binary: &str, body: &str) -> Option<std::process::Output> {
+    let mut cmd = std::process::Command::new(binary);
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", body]);
+    run_with_timeout(&mut cmd, std::time::Duration::from_secs(3))
+}
+
 /// Probe whether a PowerShell binary is available on PATH using a no-op
 /// command. We deliberately do NOT use `--version` here: Windows PowerShell
 /// 5.1 (`powershell.exe`) does not accept `--version`, only `pwsh` does.
 /// Microsoft recommends `$PSVersionTable.PSVersion` for 5.1 introspection;
-/// for a portable existence check, `-NoProfile -NonInteractive -Command
-/// "exit 0"` works on both `pwsh` and `powershell.exe`.
-///
-/// IMPORTANT: the argument list `-NoProfile -NonInteractive -Command` is
-/// PowerShell-specific. This function is intentionally scoped to PS-binary
-/// detection (used by `detect_powershell_binary`); reusing it for any
-/// non-PS binary would pass nonsense arguments. If a more general
-/// availability check is ever needed, add a separate function.
+/// for a portable existence check, `-Command "exit 0"` works on both
+/// `pwsh` and `powershell.exe`.
 fn probe_command_available(name: &str) -> bool {
-    // Use the shared `run_with_timeout` helper for the 3-second budget +
-    // safe child kill. Spawn failure (ENOENT — binary not on PATH) and
-    // timeout both collapse to `None` → `false`. A spawned child that
-    // exits non-zero is also treated as "not available", since the only
-    // success indicator is `status.success()`.
-    run_with_timeout(
-        std::process::Command::new(name)
-            .arg("-NoProfile")
-            .arg("-NonInteractive")
-            .arg("-Command")
-            .arg("exit 0"),
-        std::time::Duration::from_secs(3),
-    )
-    .map(|output| output.status.success())
-    .unwrap_or(false)
+    // Spawn failure (ENOENT — binary not on PATH) and timeout both collapse
+    // to `None` → `false`. A spawned child that exits non-zero is also
+    // treated as "not available", since the only success indicator is
+    // `status.success()`.
+    run_powershell(name, "exit 0")
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Probe whether PSReadLine is available to the resolved PowerShell binary.
@@ -1184,21 +1186,11 @@ fn probe_command_available(name: &str) -> bool {
 ///   the timeout budget, or stdout couldn't be read). Renders as "unknown
 ///   (probe failed or timed out)" in the human report; serializes as `null`
 ///   in the JSON report.
-///
-/// `-NoProfile` is critical: `-NonInteractive` alone does NOT prevent profile
-/// loading, so without `-NoProfile` user-defined hooks could interfere with
-/// module detection (e.g. by mutating `$env:PSModulePath`) or cause spurious
-/// probe failures from profile errors.
 fn probe_psreadline_available(binary: &str) -> Option<bool> {
-    let mut cmd = std::process::Command::new(binary);
-    cmd.arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-Command")
-        .arg("if (Get-Module -ListAvailable PSReadLine) { 'yes' } else { 'no' }");
-    // `run_with_timeout` returns `None` for spawn failure / timeout / wait
-    // error — propagate that as `None` (probe failed / unknown). Only when
-    // we have an `Output` do we classify the result.
-    let output = run_with_timeout(&mut cmd, std::time::Duration::from_secs(3))?;
+    let output = run_powershell(
+        binary,
+        "if (Get-Module -ListAvailable PSReadLine) { 'yes' } else { 'no' }",
+    )?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     Some(stdout.trim().eq_ignore_ascii_case("yes"))
 }
@@ -1888,19 +1880,14 @@ fn format_compat_human(r: &CompatReport) -> String {
 
     // PowerShell hook health — only emitted when a PowerShell binary
     // (`pwsh` or `powershell`) is on PATH. Same gating as the JSON field:
-    // hosts without PowerShell get no section.
+    // hosts without PowerShell get no section.  TIRITH_STATUS is intentionally
+    // NOT re-printed here: the parent report (`Shell hook mode`) already
+    // surfaces it from the same env var, and duplicating it would let a
+    // future refactor drift one copy from the other.
     if let Some(ps) = &r.powershell_compat {
         line("");
         line("--- PowerShell compat ---");
-        line(&format!(
-            "  binary:                {}",
-            ps.binary.as_deref().unwrap_or("(none)")
-        ));
-        line(&format!("  available:             {}", ps.available));
-        match ps.tirith_status.as_deref() {
-            Some(status) => line(&format!("  TIRITH_STATUS:         {status}")),
-            None => line("  TIRITH_STATUS:         (not set)"),
-        }
+        line(&format!("  binary:                {}", ps.binary));
         match ps.psreadline_available {
             Some(true) => line("  PSReadLine module:     yes"),
             Some(false) => line("  PSReadLine module:     no (key binding will not work)"),
@@ -3259,9 +3246,7 @@ mod tests {
     fn compat_report_with_ps(psreadline_available: Option<bool>) -> CompatReport {
         let mut r = compat_report_for("powershell", None);
         r.powershell_compat = Some(PsCompatInfo {
-            available: true,
-            binary: Some("pwsh".to_string()),
-            tirith_status: None,
+            binary: "pwsh".to_string(),
             psreadline_available,
             hook_version_match: None,
         });

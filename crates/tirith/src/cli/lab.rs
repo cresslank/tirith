@@ -25,7 +25,7 @@ use serde::Deserialize;
 use tirith_core::engine::{self, AnalysisContext};
 use tirith_core::extract::ScanContext;
 use tirith_core::tokenize::ShellType;
-use tirith_core::verdict::{Action, Finding, Severity};
+use tirith_core::verdict::{Action, Finding, RuleId, Severity};
 
 /// Embedded corpus. Path is 4 levels up from this file:
 ///   crates/tirith/src/cli/lab.rs
@@ -74,7 +74,7 @@ struct ScenarioResult<'a> {
     /// Only populated when `--score` is on so legacy consumers see no schema
     /// drift.
     #[serde(skip_serializing_if = "Option::is_none")]
-    score: Option<u32>,
+    score: Option<u8>,
     findings: Vec<FindingSummary>,
 }
 
@@ -85,8 +85,9 @@ struct ScenarioResult<'a> {
 ///
 /// Empty findings → 0 (allow). The function is intentionally cheap and
 /// explainable — no ML, no network, the score is a single `.max()` over the
-/// finding list.
-fn scenario_score(findings: &[Finding]) -> u32 {
+/// finding list. `u8` is the tightest fit for a 0-100 value with six discrete
+/// buckets — no caller has ever needed >255.
+fn scenario_score(findings: &[Finding]) -> u8 {
     findings
         .iter()
         .map(|f| match f.severity {
@@ -100,18 +101,39 @@ fn scenario_score(findings: &[Finding]) -> u32 {
         .unwrap_or(0)
 }
 
+/// One serialised finding row for `tirith lab --format json` / `--score`.
+///
+/// `rule_id` and `severity` hold the typed `RuleId` / `Severity` enums rather
+/// than free `String`s. JSON output is byte-identical: `RuleId` carries
+/// `#[serde(rename_all = "snake_case")]` and `Severity` carries
+/// `#[serde(rename_all = "UPPERCASE")]`, which is exactly what the previous
+/// `to_string()` calls emitted.
 #[derive(Debug, serde::Serialize)]
 struct FindingSummary {
-    rule_id: String,
-    severity: String,
+    rule_id: RuleId,
+    severity: Severity,
     title: String,
+}
+
+/// Validate an `expected_action` corpus string and return the typed [`Action`].
+///
+/// Thin wrapper around `Action::from_str` kept as a named helper so unit tests
+/// can pin the CLI-side parse contract (corpus authors only write the three
+/// lowercase tokens "allow"/"warn"/"block"). Centralising it here means a
+/// future expansion (e.g. accepting `warn_ack` for stricter scenarios) is one
+/// edit, not two.
+fn parse_expected_action(s: &str) -> Result<Action, String> {
+    s.parse::<Action>()
 }
 
 /// Public entry point for the `tirith lab` subcommand.
 ///
-/// Returns the process exit code: `0` on all-pass (or filter-empty), `1` on
-/// any failure (parse error, unparseable scenario, or expected_action
-/// mismatch).
+/// Returns the process exit code:
+///   - `0` — every scenario matched its `expected_action` (or filter is empty).
+///   - `1` — corpus parse error, unknown context/shell/expected_action in a
+///     scenario, or at least one scenario's verdict did not match.
+///   - `2` — interactive stdin read failed mid-loop (distinct from "scenario
+///     mismatch" so callers can tell a TTY break from a corpus failure).
 ///
 /// `score`: when true, each `ScenarioResult` gets a deterministic 0-100
 /// risk score (see [`scenario_score`]) and the human summary table grows
@@ -128,16 +150,13 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool, score: bool) -> 
 
     // Apply filter (substring-of-any-tag isn't what the spec asks for —
     // exact tag match is documented behavior and matches the corpus's tag
-    // taxonomy).
-    let filtered: Vec<&LabScenario> = if let Some(tag) = filter {
-        corpus
-            .scenarios
-            .iter()
-            .filter(|s| s.tags.iter().any(|t| t == tag))
-            .collect()
-    } else {
-        corpus.scenarios.iter().collect()
-    };
+    // taxonomy). `is_none_or` collapses the "no filter → keep" branch into
+    // the same `.filter` call.
+    let filtered: Vec<&LabScenario> = corpus
+        .scenarios
+        .iter()
+        .filter(|s| filter.is_none_or(|tag| s.tags.iter().any(|t| t == tag)))
+        .collect();
 
     if filtered.is_empty() {
         if json {
@@ -169,41 +188,51 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool, score: bool) -> 
 
         // Build the analysis context. An unknown context string in the
         // corpus is a hard failure — silently skipping would let a typo
-        // mask a real corpus regression and still return exit 0.
-        let scan_context = match scenario.context.as_str() {
-            "exec" => ScanContext::Exec,
-            "paste" => ScanContext::Paste,
-            other => {
+        // mask a real corpus regression and still return exit 0. Use the
+        // shared `FromStr` impls in tirith-core so this CLI and the
+        // `test_lab_corpus_reaches_tier3` safeguard parse from one place.
+        let scan_context = match scenario.context.parse::<ScanContext>() {
+            Ok(c) => c,
+            Err(_) => {
                 eprintln!(
                     "tirith lab: scenario '{}' has unknown context '{}' — corpus error",
-                    scenario.name, other
+                    scenario.name, scenario.context
                 );
                 return 1;
             }
         };
 
-        let shell = match scenario.shell.as_str() {
-            "posix" => ShellType::Posix,
-            "powershell" => ShellType::PowerShell,
-            other => {
+        let shell = match scenario.shell.parse::<ShellType>() {
+            Ok(s) => s,
+            Err(_) => {
                 // Mirror the unknown-context handling: hard-fail rather than
                 // coerce. A typo like `shell = "powershel"` (missing l) would
                 // silently route a PS scenario through POSIX tokenization and
                 // mask a real corpus regression.
                 eprintln!(
                     "tirith lab: scenario '{}' has unknown shell '{}' — corpus error",
-                    scenario.name, other
+                    scenario.name, scenario.shell
                 );
                 return 1;
             }
         };
 
-        let raw_bytes: Option<Vec<u8>> = if !scenario.raw_bytes.is_empty() {
-            Some(scenario.raw_bytes.clone())
-        } else if scan_context == ScanContext::Paste {
-            Some(scenario.input.as_bytes().to_vec())
-        } else {
-            None
+        // Validate `expected_action` up front (closes type-design C2). A
+        // corpus typo like `expected_action = "blocK"` previously slipped
+        // through and silently always-FAILed every scenario; now we fail-fast
+        // here with the same shape as the shell/context errors above.
+        if parse_expected_action(&scenario.expected_action).is_err() {
+            eprintln!(
+                "tirith lab: scenario '{}' has unknown expected_action '{}' — corpus error",
+                scenario.name, scenario.expected_action
+            );
+            return 1;
+        }
+
+        let raw_bytes: Option<Vec<u8>> = match (scenario.raw_bytes.as_slice(), scan_context) {
+            ([], ScanContext::Paste) => Some(scenario.input.as_bytes().to_vec()),
+            ([], _) => None,
+            (bytes, _) => Some(bytes.to_vec()),
         };
 
         let ctx = AnalysisContext {
@@ -243,9 +272,11 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool, score: bool) -> 
                     }
                 }
                 Err(e) => {
-                    eprintln!("tirith lab: stdin read failed: {e}");
-                    quit_early = true;
-                    continue;
+                    eprintln!(
+                        "tirith lab: stdin read failed at scenario '{}': {e} — aborting",
+                        scenario.name
+                    );
+                    return 2;
                 }
             }
         }
@@ -304,11 +335,7 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool, score: bool) -> 
         println!("Summary: {passed} passed, {failed} failed");
     }
 
-    if failed > 0 {
-        1
-    } else {
-        0
-    }
+    i32::from(failed > 0)
 }
 
 fn action_to_str(action: Action) -> &'static str {
@@ -321,8 +348,8 @@ fn action_to_str(action: Action) -> &'static str {
 
 fn summarize_finding(f: &Finding) -> FindingSummary {
     FindingSummary {
-        rule_id: f.rule_id.to_string(),
-        severity: f.severity.to_string(),
+        rule_id: f.rule_id,
+        severity: f.severity,
         title: f.title.clone(),
     }
 }
@@ -346,16 +373,27 @@ fn print_summary_table(results: &[ScenarioResult], passed: usize, failed: usize,
             "", "", "", "", "",
         );
         for r in results {
-            // `score` field is Some(_) whenever the caller passed
-            // --score; fall back to 0 defensively if a future caller ever
-            // passes score=true without populating per-result.
-            let s = r.score.unwrap_or(0);
+            // `score` field is Some(_) whenever the caller passed --score; if
+            // a future refactor leaves it unpopulated we still print 0, but we
+            // surface a contract-violation warning to stderr so the discrepancy
+            // is auditable instead of silently looking like a legitimate
+            // allow=0.
+            let score_str = match r.score {
+                Some(s) => s.to_string(),
+                None => {
+                    eprintln!(
+                        "tirith lab: internal — score expected but missing for scenario '{}'; printing 0",
+                        r.name
+                    );
+                    "0".to_string()
+                }
+            };
             println!(
                 "{:<name_width$}  {:<8}  {:<8}  {:<5}  {}",
                 r.name,
                 r.expected,
                 r.actual,
-                s,
+                score_str,
                 if r.pass { "PASS" } else { "FAIL" },
                 name_width = name_width
             );
@@ -422,10 +460,37 @@ mod tests {
 
     #[test]
     fn scenario_score_buckets_are_exact() {
-        assert_eq!(scenario_score(&[finding(Severity::Critical)]), 100);
-        assert_eq!(scenario_score(&[finding(Severity::High)]), 75);
-        assert_eq!(scenario_score(&[finding(Severity::Medium)]), 50);
-        assert_eq!(scenario_score(&[finding(Severity::Low)]), 25);
-        assert_eq!(scenario_score(&[finding(Severity::Info)]), 5);
+        assert_eq!(scenario_score(&[finding(Severity::Critical)]), 100u8);
+        assert_eq!(scenario_score(&[finding(Severity::High)]), 75u8);
+        assert_eq!(scenario_score(&[finding(Severity::Medium)]), 50u8);
+        assert_eq!(scenario_score(&[finding(Severity::Low)]), 25u8);
+        assert_eq!(scenario_score(&[finding(Severity::Info)]), 5u8);
+    }
+
+    // `parse_expected_action` is the type-design C2 fix for the CLI side:
+    // a corpus typo in `expected_action` previously silently always-FAILed
+    // every scenario; now we fail-fast inside `run`. Pin both happy and
+    // sad paths so a future refactor that loosens validation trips CI.
+    #[test]
+    fn parse_expected_action_accepts_known_tokens() {
+        // The three tokens the corpus actually uses today.
+        assert_eq!(parse_expected_action("allow"), Ok(Action::Allow));
+        assert_eq!(parse_expected_action("warn"), Ok(Action::Warn));
+        assert_eq!(parse_expected_action("block"), Ok(Action::Block));
+    }
+
+    #[test]
+    fn parse_expected_action_rejects_typos() {
+        // The exact regression class the CLI fail-fast guards against: a
+        // typo that previously slipped past the `actual == expected` string
+        // comparison and silently always-FAILed the scenario. We are
+        // deliberately strict-case so even a single-letter case slip
+        // ("blocK", "Allow") surfaces as a corpus error.
+        assert!(parse_expected_action("blocK").is_err());
+        assert!(parse_expected_action("Allow").is_err());
+        assert!(parse_expected_action("allwo").is_err());
+        assert!(parse_expected_action("").is_err());
+        assert!(parse_expected_action("warning").is_err());
+        assert!(parse_expected_action("deny").is_err());
     }
 }

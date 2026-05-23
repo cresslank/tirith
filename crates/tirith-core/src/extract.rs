@@ -16,6 +16,24 @@ pub enum ScanContext {
     FileScan,
 }
 
+impl std::str::FromStr for ScanContext {
+    type Err = String;
+    /// Parse the strict lowercase tokens used by lab corpus / fixture TOML.
+    /// Closed enum set: only `exec`, `paste`, `file_scan` — case-sensitive on
+    /// purpose so a typo like `"Exec"` or `"pAste"` surfaces as a hard parse
+    /// error rather than slipping through. Centralised here so callers
+    /// (`lab.rs`, `golden_fixtures.rs`, future consumers) all share one
+    /// parse table.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "exec" => Ok(ScanContext::Exec),
+            "paste" => Ok(ScanContext::Paste),
+            "file_scan" => Ok(ScanContext::FileScan),
+            other => Err(format!("unknown scan context: {other}")),
+        }
+    }
+}
+
 // Include generated Tier 1 patterns from build.rs declarative pattern table.
 #[allow(dead_code)]
 mod tier1_generated {

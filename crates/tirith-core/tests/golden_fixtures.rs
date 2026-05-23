@@ -1243,30 +1243,27 @@ fn test_lab_corpus_reaches_tier3() {
     );
 
     for scenario in &file.scenarios {
-        let shell = match scenario.shell.as_str() {
-            "posix" => ShellType::Posix,
-            "powershell" => ShellType::PowerShell,
-            other => panic!(
+        // Use the shared `FromStr` impls in tirith-core so this safeguard and
+        // `crates/tirith/src/cli/lab.rs::run` consume one parse table. Both
+        // sites still panic-on-unknown to surface corpus typos loudly.
+        let shell: ShellType = scenario.shell.parse().unwrap_or_else(|_| {
+            panic!(
                 "Lab scenario '{}': unknown shell '{}'",
-                scenario.name, other
-            ),
-        };
+                scenario.name, scenario.shell
+            )
+        });
 
-        let scan_context = match scenario.context.as_str() {
-            "exec" => ScanContext::Exec,
-            "paste" => ScanContext::Paste,
-            other => panic!(
+        let scan_context: ScanContext = scenario.context.parse().unwrap_or_else(|_| {
+            panic!(
                 "Lab scenario '{}': unknown context '{}'",
-                scenario.name, other
-            ),
-        };
+                scenario.name, scenario.context
+            )
+        });
 
-        let raw_bytes = if !scenario.raw_bytes.is_empty() {
-            Some(scenario.raw_bytes.clone())
-        } else if scan_context == ScanContext::Paste {
-            Some(scenario.input.as_bytes().to_vec())
-        } else {
-            None
+        let raw_bytes = match (scenario.raw_bytes.as_slice(), scan_context) {
+            ([], ScanContext::Paste) => Some(scenario.input.as_bytes().to_vec()),
+            ([], _) => None,
+            (bytes, _) => Some(bytes.to_vec()),
         };
 
         let ctx = AnalysisContext {
@@ -1284,15 +1281,12 @@ fn test_lab_corpus_reaches_tier3() {
 
         let verdict = engine::analyze(&ctx);
 
-        let expected = match scenario.expected_action.as_str() {
-            "allow" => Action::Allow,
-            "warn" => Action::Warn,
-            "block" => Action::Block,
-            other => panic!(
+        let expected: Action = scenario.expected_action.parse().unwrap_or_else(|_| {
+            panic!(
                 "Lab scenario '{}': unknown expected_action '{}'",
-                scenario.name, other
-            ),
-        };
+                scenario.name, scenario.expected_action
+            )
+        });
 
         // Bucket Warn/WarnAck together — both are user-visible warnings.
         let action_bucket = |a: Action| match a {
