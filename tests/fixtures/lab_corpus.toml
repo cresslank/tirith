@@ -183,7 +183,7 @@ raw_bytes = [27, 91, 51, 49, 109, 114, 101, 100, 32, 116, 101, 120, 116, 27, 91,
 
 [[scenario]]
 name = "terminal_hidden_multiline_paste"
-description = "Pasted text has an invisible second line that runs after Enter"
+description = "Pasted text containing a CRLF-injected install command that runs once the first visible line is committed."
 # Visible first line is benign; the CRLF + second line carries a curl|bash
 # payload. `check_hidden_multiline` flags the second line as a suspicious
 # command shape.

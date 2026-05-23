@@ -4,9 +4,9 @@
 //! `tirith_core::engine::analyze`, comparing each scenario's actual verdict
 //! against its declared `expected_action`. Three modes:
 //!
-//! * **interactive** (default when stdout is a TTY): for each scenario, show
-//!   the description and input, prompt for Enter, then print the verdict and
-//!   whether it matches the expectation.
+//! * **interactive** (default when both stdout and stdin are TTYs): for each
+//!   scenario, show the description and input, prompt for Enter, then print
+//!   the verdict and whether it matches the expectation.
 //! * **non-interactive** (`--non-interactive`): run all scenarios silently
 //!   and print a summary table.
 //! * **JSON** (`--format json`): emit a single JSON array of result objects
@@ -84,7 +84,7 @@ struct ScenarioResult<'a> {
 ///   Critical = 100, High = 75, Medium = 50, Low = 25, Info = 5.
 ///
 /// Empty findings → 0 (allow). The function is intentionally cheap and
-/// explainable — no ML, no network, the score sums by hand from the
+/// explainable — no ML, no network, the score is a single `.max()` over the
 /// finding list.
 fn scenario_score(findings: &[Finding]) -> u32 {
     findings
@@ -328,8 +328,7 @@ fn summarize_finding(f: &Finding) -> FindingSummary {
 }
 
 fn print_summary_table(results: &[ScenarioResult], passed: usize, failed: usize, score: bool) {
-    // Column widths chosen for the canonical 10-scenario corpus; long
-    // names just push the rest right rather than getting truncated.
+    // Column widths derived from the longest scenario name; never truncated.
     let name_width = results
         .iter()
         .map(|r| r.name.len())

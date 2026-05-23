@@ -19,16 +19,19 @@
 //! downstream policy.
 //!
 //! Only the *pipe* separators (`|`, `|&`) are skipped — non-pipe separators
-//! like `;`, `&&`, and `||` start fresh commands that `pipe_to_interpreter`
-//! does NOT match, so `check_inline_download_execute` still fires on them
-//! (e.g. `true; iex (iwr url)`).
+//! the PS tokenizer actually emits (`;`, `\n`, `-and`, `-or`) start fresh
+//! commands that `pipe_to_interpreter` does NOT match, so
+//! `check_inline_download_execute` still fires on them (e.g.
+//! `true; iex (iwr url)`).
 //!
-//! Note: PowerShell pre-7 does not tokenize `&&`/`||` as pipeline chain
-//! operators (PowerShell 7+ does). The PS tokenizer in `tokenize.rs`
-//! currently splits on `|`, `;`, `-and`, `-or`, and newline only. The
-//! `is_pipe_separator` guard is written to be correct for *any* future
-//! tokenizer addition: as long as the new separator string is anything
-//! other than `"|"` or `"|&"`, the rule will fire as intended.
+//! Note: the PS tokenizer in `tokenize.rs` currently splits on `|`, `;`,
+//! `-and`, `-or`, and newline only. PowerShell 7+ pipeline chain operators
+//! `&&` / `||` are a tokenizer gap (task #44 follow-up) — they are not
+//! emitted today, so `check_inline_download_execute` does not yet see chained
+//! `&&` / `||` forms as separate commands. The `is_pipe_separator` guard is
+//! written to be correct for *any* future tokenizer addition: as long as the
+//! new separator string is anything other than `"|"` or `"|&"`, the rule will
+//! fire as intended.
 //!
 //! The negative fixture `ps_iex_pipe_already_covered_not_double` in
 //! `tests/fixtures/command.toml` pins the pipe boundary — its
@@ -238,10 +241,12 @@ fn check_defender_exclusion(
 /// double-firing we skip segments whose `preceding_separator` is a pipe
 /// (`|` or `|&`).
 ///
-/// Non-pipe separators (`;`, `&&`, `||`, `\n`, `&`) DO produce independent
-/// commands that are *not* covered by `pipe_to_interpreter`, so this rule
-/// must still fire for `true; iex (iwr url)`,
-/// `echo start && iex (iwr url)`, and `cmd1 || iex (iwr url)`.
+/// Non-pipe separators that the PS tokenizer actually emits (`;`, `\n`,
+/// `-and`, `-or`) DO produce independent commands that are *not* covered by
+/// `pipe_to_interpreter`, so this rule must still fire for
+/// `true; iex (iwr url)` and `cmd1 -and iex (iwr url)`. PowerShell 7+ `&&` /
+/// `||` chain operators are a tokenizer gap (task #44 follow-up) and are not
+/// yet emitted as separators today.
 fn check_inline_download_execute(
     segments: &[tokenize::Segment],
     shell: ShellType,
@@ -249,8 +254,10 @@ fn check_inline_download_execute(
 ) {
     for seg in segments {
         // Pipe RHS is already covered by pipe_to_interpreter — skip it.
-        // Non-pipe separators (`;`, `&&`, `||`, etc.) start fresh commands
-        // that pipe_to_interpreter does NOT match, so we must keep checking.
+        // Non-pipe separators the PS tokenizer actually emits (`;`, `\n`,
+        // `-and`, `-or`) start fresh commands that pipe_to_interpreter does
+        // NOT match, so we must keep checking. (PowerShell 7+ `&&` / `||` are
+        // a tokenizer gap — task #44 follow-up — not emitted today.)
         if let Some(sep) = seg.preceding_separator.as_deref() {
             if is_pipe_separator(sep) {
                 continue;

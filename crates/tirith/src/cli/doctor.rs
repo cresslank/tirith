@@ -1176,10 +1176,10 @@ fn probe_command_available(name: &str) -> bool {
 ///
 /// Returns `Option<bool>` to preserve the three-state semantics promised by
 /// `PsCompatInfo::psreadline_available`:
-/// - `Some(true)` — probe completed AND output contains "yes".
-/// - `Some(false)` — probe completed AND output does NOT contain "yes" (the
-///   literal "no", or garbage / empty output from a profile error that
-///   escaped `-NoProfile`).
+/// - `Some(true)` — probe completed AND output trimmed equals (case-insensitive) "yes".
+/// - `Some(false)` — probe completed AND output trimmed equals (case-insensitive)
+///   something other than "yes" (the literal "no", or garbage / empty output from
+///   a profile error that escaped `-NoProfile`).
 /// - `None` — the probe never produced a usable result (spawn fail, killed by
 ///   the timeout budget, or stdout couldn't be read). Renders as "unknown
 ///   (probe failed or timed out)" in the human report; serializes as `null`

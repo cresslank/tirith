@@ -397,15 +397,15 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         id: "ps_defender_exclusion",
         tier1_exec_fragments: &[r"(?i:Add-MpPreference)\b"],
         tier1_paste_only_fragments: &[],
-        notes: "PowerShell Add-MpPreference -ExclusionPath — Defender exclusion",
+        notes: "PowerShell Add-MpPreference -ExclusionPath/-ExclusionProcess/-ExclusionExtension — Defender exclusion",
     },
     PatternEntry {
         id: "ps_iex_inline",
         // Accept both `iex (iwr ...)` (whitespace) and `iex(iwr ...)` (no
         // space before the opening paren) — PS treats them as semantically
-        // identical, so the gate must too. `[\s(]` covers both forms; a
-        // trailing word-boundary would not match `(` so we use a character
-        // class explicitly.
+        // identical, so the gate must too. `[\s(]` covers both forms;
+        // `\b` would also match before digits/hyphens (e.g. `iex2 ...`), so
+        // we use `[\s(]` to require an actual command boundary.
         tier1_exec_fragments: &[r"(?i:iex)[\s(]"],
         tier1_paste_only_fragments: &[],
         notes: "PowerShell iex as leading command (inline download-execute form)",
