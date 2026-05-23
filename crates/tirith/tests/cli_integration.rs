@@ -4628,3 +4628,124 @@ fn mcp_verify_does_not_leak_url_userinfo_on_drift() {
         "raw URL userinfo must never appear in stderr: stderr={err}"
     );
 }
+
+#[test]
+fn mcp_verify_userinfo_removal_without_path_does_not_drift() {
+    // CodeRabbit regression: when a config used to declare a bare-host URL
+    // **with** userinfo and the user strips the credential to leave a
+    // bare-host URL **without** userinfo, the endpoint did not actually
+    // change — only the credential did. The pre-fix behavior would surface
+    // a `UrlChanged` drift in addition to `UserinfoRemoved`, because
+    // `redact_url_userinfo` ran the userinfo-stripping path through
+    // `url::Url::as_str()` (which canonicalizes `https://host` to
+    // `https://host/`) but early-returned byte-verbatim on the no-userinfo
+    // path. Post-fix: both branches canonicalize, the stored URL bytes
+    // match across the lock/verify boundary, and only the real change
+    // (userinfo removal) appears in `transport_changes`.
+    //
+    // Note: "does not drift" here is shorthand for "does not double-count
+    // as a URL change". The userinfo removal is itself a real, security-
+    // relevant drift (the credential was stripped from the source config),
+    // so `verify` still exits 1 and surfaces a single `UserinfoRemoved`
+    // change — never `UrlChanged` alongside it.
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+
+    // Lock against a config that carries userinfo and has no path. The
+    // bare-host URL is what triggers `url::Url`'s default-`/` insertion,
+    // so the lockfile records `https://mcp.example.com/`.
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": { "s": { "url": "https://user:token@mcp.example.com" } } }"#,
+    )
+    .unwrap();
+    let (_o, _e, lock_code) = run_mcp_lock(repo.path(), iso.path(), &[]);
+    assert_eq!(lock_code, 0, "mcp lock must succeed");
+
+    // Now strip the credential and rewrite the config to point at the same
+    // bare-host endpoint with no userinfo.
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": { "s": { "url": "https://mcp.example.com" } } }"#,
+    )
+    .unwrap();
+
+    let (stdout, _err, code) =
+        run_mcp_subcommand("verify", repo.path(), iso.path(), &["--format", "json"]);
+    assert_eq!(code, 1, "userinfo removal is real drift and must exit 1");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("verify JSON");
+    assert_eq!(v["in_sync"], false);
+    assert_eq!(v["added_count"], 0);
+    assert_eq!(v["removed_count"], 0);
+    assert_eq!(
+        v["changed_count"], 1,
+        "exactly one server changed (the credential strip), no others"
+    );
+    let drifts = v["drifts"].as_array().expect("drifts array");
+    assert_eq!(drifts.len(), 1);
+    let entry = &drifts[0];
+    assert_eq!(entry["kind"], "changed");
+    assert_eq!(entry["name"], "s");
+    let changes = entry["transport_changes"]
+        .as_array()
+        .expect("transport_changes array");
+    // The load-bearing assertion: exactly ONE transport change, and that
+    // change is the userinfo removal — NOT `url_changed` alongside it.
+    assert_eq!(
+        changes.len(),
+        1,
+        "userinfo-only removal must produce a single transport change; \
+         got: {changes:?} (pre-fix bug surfaced `url_changed` here too)"
+    );
+    assert_eq!(
+        changes[0]["kind"], "userinfo_removed",
+        "the one transport change must be `userinfo_removed`; got: {:?}",
+        changes[0]
+    );
+    // Defensive: assert `url_changed` is nowhere in the changes array, in
+    // case a future schema rework alters the shape of an entry.
+    for change in changes {
+        assert_ne!(
+            change["kind"], "url_changed",
+            "url_changed must not appear alongside userinfo_removed when the \
+             endpoint did not change; full changes: {changes:?}"
+        );
+    }
+}
+
+#[test]
+fn mcp_verify_url_endpoint_change_still_drifts() {
+    // Companion to `mcp_verify_userinfo_removal_without_path_does_not_drift`:
+    // a real endpoint change (different host) must still surface as drift.
+    // The canonicalization fix must not weaken this — it only silences the
+    // spurious "userinfo removal also looks like UrlChanged" case.
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": { "s": { "url": "https://mcp.example.com" } } }"#,
+    )
+    .unwrap();
+    let (_o, _e, lock_code) = run_mcp_lock(repo.path(), iso.path(), &[]);
+    assert_eq!(lock_code, 0);
+
+    // Different host — same scheme, no path, no userinfo on either side.
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": { "s": { "url": "https://other.example.com" } } }"#,
+    )
+    .unwrap();
+
+    let (_stdout, err, code) = run_mcp_subcommand("verify", repo.path(), iso.path(), &[]);
+    assert_eq!(
+        code, 1,
+        "a real host change must register as drift: stderr={err}"
+    );
+    assert!(
+        err.contains("drift detected"),
+        "verify must announce drift on a real URL change; got: {err}"
+    );
+}

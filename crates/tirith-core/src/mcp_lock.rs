@@ -153,6 +153,14 @@ pub enum McpTransport {
     /// `null`), so "no credential" is structurally distinct on the wire from
     /// "credential present".
     ///
+    /// **The stored `url` is the canonical `url::Url::as_str()` form**
+    /// regardless of whether userinfo was present in the source — both
+    /// branches round-trip through the parser, so removing or adding a
+    /// credential from the source config does not surface as a spurious
+    /// `UrlChanged` drift alongside `UserinfoAdded` / `UserinfoRemoved`
+    /// (`url::Url` defaults a missing path to `/`, so a bare-host URL has
+    /// two textual shapes — only the canonical one ends up in the lockfile).
+    ///
     /// A URL that does not parse cleanly (so userinfo cannot be safely
     /// identified) is stored verbatim with `userinfo_hash = None`. This is
     /// the correct conservative behavior: stripping bytes from a string we
@@ -703,16 +711,26 @@ fn parse_transport(
 ///
 /// **Behavior.**
 /// * The URL parses cleanly with a non-empty userinfo → return the URL with
-///   `set_username("")` and `set_password(None)`, plus
-///   `Some(sha256(server_name || ':' || userinfo))`. `userinfo` is the
-///   exact `username[:password]` substring as parsed — percent-encoded
-///   bytes are hashed as-is, because that is what the original config
-///   declared and any byte-level difference must register as drift.
+///   `set_username("")` and `set_password(None)`, then re-serialize via
+///   `url::Url::as_str()`, plus `Some(sha256(server_name || ':' || userinfo))`.
+///   `userinfo` is the exact `username[:password]` substring as parsed —
+///   percent-encoded bytes are hashed as-is, because that is what the
+///   original config declared and any byte-level difference must register
+///   as drift.
 /// * The URL parses cleanly with no userinfo (the common case) → return the
-///   URL unchanged and `None`. An "all-zero userinfo" form like
-///   `https://:@host/` or `https://@host/` is normalized by `url::Url` to
-///   the no-userinfo form during parsing, so it is treated as the
-///   no-userinfo case — the user supplied nothing.
+///   **canonical** `url::Url::as_str()` form and `None`. The URL is
+///   round-tripped through the parser even though there is nothing to
+///   redact, so the stored bytes have the same shape whether the source URL
+///   carried userinfo or not. Without this symmetry, removing a credential
+///   from the source config would surface as a spurious `UrlChanged` drift
+///   alongside `UserinfoRemoved` (e.g. `https://host` locks as
+///   `https://host/` when userinfo was present, then a later verify against
+///   a stripped `https://host` source would diff `https://host/` vs
+///   `https://host` and flag two changes when semantically only one
+///   happened). An "all-zero userinfo" form like `https://:@host/` or
+///   `https://@host/` is normalized by `url::Url` to the no-userinfo form
+///   during parsing, so it is treated as the no-userinfo case — the user
+///   supplied nothing.
 /// * The URL does not parse → return the URL verbatim and `None`. Without a
 ///   safe parser we cannot identify the userinfo boundary, so we refuse to
 ///   modify the string. (A malformed URL is captured anyway: it is itself a
@@ -744,16 +762,19 @@ fn redact_url_userinfo(server_name: &str, url: &str) -> (String, Option<String>)
         (u, Some(p)) => Some(format!("{u}:{p}")),
     };
 
-    // Fast path: no userinfo at all → return the URL **verbatim**. We
-    // deliberately do NOT round-trip the bytes through `url::Url::as_str()`
-    // here, because `url` performs minor canonicalization (e.g. appending a
-    // trailing `/` to a bare-host URL) that the historic v1–v3 lockfile did
-    // not perform. The doc on this variant promised "the `url` is stored
-    // verbatim — canonicalization (if any) is the diff layer's job", and a
-    // URL with no userinfo is the case where there is nothing to redact, so
-    // we keep that promise.
+    // No userinfo: round-trip through `url::Url::as_str()` anyway, so the
+    // stored URL has the same canonical shape whether the source URL declared
+    // a userinfo or not. The userinfo-strip path below also emits
+    // `parsed.as_str()`, so going through the same canonicalization here is
+    // what keeps `compute_drift` from reporting a spurious `UrlChanged`
+    // alongside `UserinfoRemoved`. Concretely: `https://user:token@host`
+    // would lock as `https://host/` (url::Url appends a missing path
+    // default), and if we kept the no-userinfo case byte-verbatim, a later
+    // verify against a stripped `https://host` source would diff
+    // `https://host/` vs `https://host` and flag two changes when the
+    // endpoint did not actually change.
     let Some(raw_userinfo) = userinfo else {
-        return (url.to_string(), None);
+        return (parsed.as_str().to_string(), None);
     };
 
     // Same name-salted SHA-256 scheme as `McpEnvEntry::from_raw`: the server
@@ -1482,14 +1503,17 @@ mod tests {
     #[test]
     fn parse_url_wins_when_both_declared() {
         // A malformed config declaring both `url` and `command`: the URL (the
-        // higher-risk surface) is the one recorded.
+        // higher-risk surface) is the one recorded. The bare-host URL is
+        // canonicalized to its trailing-`/` form (the same shape it would
+        // take after userinfo stripping, so removing a credential never
+        // surfaces as a spurious `UrlChanged`).
         let content =
             r#"{ "mcpServers": { "both": { "url": "https://x.example", "command": "node" } } }"#;
         let entries = parse_mcp_config(content, ".mcp.json").unwrap();
         assert_eq!(
             entries[0].transport,
             McpTransport::Url {
-                url: "https://x.example".to_string(),
+                url: "https://x.example/".to_string(),
                 userinfo_hash: None,
             }
         );
@@ -2508,35 +2532,47 @@ mod tests {
     }
 
     #[test]
-    fn url_without_userinfo_stored_verbatim_with_no_hash() {
-        // The headline backward-compatibility property: a URL that carried
-        // no userinfo is stored byte-identical to the source string, and
-        // `userinfo_hash` is None (so it is omitted on serialization, not
-        // serialized as null). This is what keeps a v3-or-earlier lockfile
-        // bytewise-stable for the common case where no MCP URL has a
-        // credential.
-        for input in [
-            "https://x.example",
-            "https://mcp.example.com/sse",
-            "https://host:8443/path/to/mcp?x=1&y=2",
-            // `url::Url` normalizes `:@` and `@` away on parse — both of
-            // these declared no user-supplied userinfo and must round-trip
-            // verbatim.
-            "https://host.example/",
-            // A non-special / non-parseable string is held verbatim too —
-            // we refuse to mangle a URL we cannot parse.
-            "not a real url at all",
-        ] {
+    fn url_without_userinfo_stored_canonical_with_no_hash() {
+        // A URL that carried no userinfo is stored in the canonical
+        // `url::Url::as_str()` form (so the bytes match the shape the
+        // userinfo-strip path produces) and `userinfo_hash` is None (so it
+        // is omitted on serialization, not serialized as null). Two
+        // categories of inputs:
+        //   * `(input, expected_canonical)` for URLs `url::Url` accepts;
+        //   * unparseable strings, which fall back to the byte-verbatim
+        //     defensive branch.
+        let parseable: &[(&str, &str)] = &[
+            // Bare-host URLs gain the `url::Url`-default trailing `/`.
+            ("https://x.example", "https://x.example/"),
+            // URLs that are already canonical round-trip unchanged.
+            ("https://mcp.example.com/sse", "https://mcp.example.com/sse"),
+            (
+                "https://host:8443/path/to/mcp?x=1&y=2",
+                "https://host:8443/path/to/mcp?x=1&y=2",
+            ),
+            ("https://host.example/", "https://host.example/"),
+        ];
+        for (input, expected) in parseable {
             let (redacted, hash) = redact_url_userinfo("svc", input);
             assert_eq!(
-                redacted, input,
-                "a no-userinfo URL must be stored byte-identical: {input}"
+                redacted, *expected,
+                "a no-userinfo URL must canonicalize through url::Url::as_str(): \
+                 input={input}"
             );
             assert!(
                 hash.is_none(),
                 "a no-userinfo URL must have userinfo_hash = None: {input}"
             );
         }
+
+        // Unparseable strings are still held byte-verbatim — that is the
+        // defensive fallback for inputs `url::Url` cannot parse.
+        let (redacted, hash) = redact_url_userinfo("svc", "not a real url at all");
+        assert_eq!(
+            redacted, "not a real url at all",
+            "an unparseable URL must fall through to the byte-verbatim branch"
+        );
+        assert!(hash.is_none());
 
         // And on serialization, `userinfo_hash` is OMITTED — not written as
         // `"userinfo_hash": null` — for a no-userinfo URL.
@@ -2562,14 +2598,41 @@ mod tests {
     }
 
     #[test]
+    fn url_without_userinfo_canonicalization_pins_shape() {
+        // Regression pin for the canonical-shape contract: a bare-host URL
+        // **always** canonicalizes to the same trailing-`/` form as the
+        // userinfo-stripped version. This is the load-bearing property
+        // behind `mcp_verify_userinfo_removal_without_path_does_not_drift`:
+        // without it, `mcp lock` stores `https://host/` and a later
+        // userinfo-stripped `https://host` source would diff as
+        // `UrlChanged` + `UserinfoRemoved` instead of just
+        // `UserinfoRemoved`. Pinned explicitly so a future refactor cannot
+        // silently bring back the byte-verbatim early-return.
+        let (no_user, _) = redact_url_userinfo("s", "https://host");
+        let (with_user, _) = redact_url_userinfo("s", "https://user:token@host");
+        assert_eq!(no_user, "https://host/");
+        assert_eq!(with_user, "https://host/");
+        assert_eq!(
+            no_user, with_user,
+            "no-userinfo and userinfo-stripped forms of the same URL must be \
+             byte-identical after redaction"
+        );
+    }
+
+    #[test]
     fn url_normalized_empty_userinfo_treated_as_no_userinfo() {
         // `url::Url` parses `https://:@host/` and `https://@host/` by
         // discarding the empty userinfo. Our redaction observes
         // `username() == ""` and `password() == None`, treats it as the
-        // no-userinfo case, and stores the URL verbatim with no hash.
+        // no-userinfo case, and stores the canonical `url::Url::as_str()`
+        // form (which is the userinfo-free equivalent) with no hash.
         for input in ["https://:@host.example/", "https://@host.example/"] {
             let (redacted, hash) = redact_url_userinfo("svc", input);
-            assert_eq!(redacted, input);
+            assert_eq!(
+                redacted, "https://host.example/",
+                "an all-empty `:@` / `@` userinfo is normalized away by url::Url \
+                 to the bare-host canonical form: input={input}"
+            );
             assert!(
                 hash.is_none(),
                 "an all-empty `:@` / `@` userinfo is normalized away by url::Url \
@@ -2735,9 +2798,10 @@ mod tests {
 
     #[test]
     fn parse_mcp_config_url_no_userinfo_is_unchanged() {
-        // The backward-compat path: a URL declared with NO userinfo is
-        // stored verbatim in the parsed entry, and `userinfo_hash` is None
-        // (and therefore omitted from the serialized lockfile).
+        // The common path: a URL declared with NO userinfo is stored in the
+        // canonical `url::Url::as_str()` form (which for an already-canonical
+        // input is byte-identical), and `userinfo_hash` is None (and
+        // therefore omitted from the serialized lockfile).
         let content = r#"{
             "mcpServers": {
                 "remote": {
