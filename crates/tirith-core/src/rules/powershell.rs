@@ -24,20 +24,21 @@
 //! `check_inline_download_execute` still fires on them (e.g.
 //! `true; iex (iwr url)`).
 //!
-//! Note: the PS tokenizer in `tokenize.rs` currently splits on `|`, `;`,
-//! `-and`, `-or`, and newline only. PowerShell 7+ pipeline chain operators
-//! `&&` / `||` are a tokenizer gap (task #44 follow-up) — they are not
-//! emitted today, so `check_inline_download_execute` does not yet see chained
-//! `&&` / `||` forms as separate commands. The `is_pipe_separator` guard is
-//! written to be correct for *any* future tokenizer addition: as long as the
-//! new separator string is anything other than `"|"` or `"|&"`, the rule will
-//! fire as intended.
+//! Note: the PS tokenizer in `tokenize.rs` splits on `|`, `||`, `&&`, `;`,
+//! `-and`, `-or`, and newline. The `is_pipe_separator` guard suppresses only
+//! `"|"` and `"|&"` — all other separators (`||`, `&&`, `;`, `\n`, `-and`,
+//! `-or`) start fresh commands where `check_inline_download_execute` fires.
+//! PowerShell 5.1 doesn't support `&&`/`||` natively (the shell would emit a
+//! parse error), but tirith's detection runs on the input string before
+//! that parse — so we still flag the suspicious chained `iex` content
+//! correctly.
 //!
 //! The negative fixture `ps_iex_pipe_already_covered_not_double` in
 //! `tests/fixtures/command.toml` pins the pipe boundary — its
 //! `preceding_separator` is `Some("|")`, so `check_inline_download_execute`
-//! correctly skips it. The fixture `ps_iex_inline_after_semicolon_chained`
-//! pins the chained-`;` case (the immediate bug fix).
+//! correctly skips it. The fixtures `ps_iex_inline_after_semicolon_chained`,
+//! `ps_iex_inline_after_and_chained`, and `ps_iex_inline_after_or_chained`
+//! pin the chained-`;` / `&&` / `||` cases respectively.
 //!
 //! ## Engine wiring
 //!

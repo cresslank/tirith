@@ -275,6 +275,24 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
             }
             // Pipe
             '|' => {
+                // PS 7+ logical-OR chain operator (|| — semantically equivalent
+                // to bash ||). Must be checked before the single-pipe arm so
+                // we don't consume `||` as two single pipes (which would split
+                // `a || b` into three segments and lose the chain-op semantics
+                // `check_inline_download_execute` relies on).
+                if i + 1 < len && indexed[i + 1].1 == '|' {
+                    push_segment(
+                        &mut segments,
+                        &current,
+                        preceding_sep.take(),
+                        input,
+                        &mut search_cursor,
+                    );
+                    current.clear();
+                    preceding_sep = Some("||".to_string());
+                    i += 2;
+                    continue;
+                }
                 push_segment(
                     &mut segments,
                     &current,
@@ -299,6 +317,24 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                 current.clear();
                 preceding_sep = Some(";".to_string());
                 i += 1;
+                continue;
+            }
+            // PS 7+ logical-AND chain operator (&& — semantically equivalent
+            // to bash &&). The guard on the match arm ensures a bare `&`
+            // (PowerShell's call/background operator) falls through to the
+            // catch-all and is kept as part of the current segment — it's
+            // not a chain op on its own and is out of scope for this rule.
+            '&' if i + 1 < len && indexed[i + 1].1 == '&' => {
+                push_segment(
+                    &mut segments,
+                    &current,
+                    preceding_sep.take(),
+                    input,
+                    &mut search_cursor,
+                );
+                current.clear();
+                preceding_sep = Some("&&".to_string());
+                i += 2;
                 continue;
             }
             // Check for -and / -or operators (PowerShell logical)
@@ -729,6 +765,61 @@ mod tests {
         let segs = tokenize("echo `| not a pipe", ShellType::PowerShell);
         // backtick escapes the pipe
         assert_eq!(segs.len(), 1);
+    }
+
+    #[test]
+    fn ps_tokenizer_splits_on_double_ampersand() {
+        let segs = tokenize(
+            "Get-Date && Set-ExecutionPolicy Bypass",
+            ShellType::PowerShell,
+        );
+        assert_eq!(segs.len(), 2, "expected 2 segments, got {:?}", segs);
+        assert_eq!(segs[0].command.as_deref(), Some("Get-Date"));
+        assert_eq!(segs[1].preceding_separator.as_deref(), Some("&&"));
+        assert_eq!(segs[1].command.as_deref(), Some("Set-ExecutionPolicy"));
+    }
+
+    #[test]
+    fn ps_tokenizer_splits_on_double_pipe() {
+        let segs = tokenize(
+            "Get-Date || Set-ExecutionPolicy Bypass",
+            ShellType::PowerShell,
+        );
+        assert_eq!(segs.len(), 2, "expected 2 segments, got {:?}", segs);
+        assert_eq!(segs[0].command.as_deref(), Some("Get-Date"));
+        assert_eq!(segs[1].preceding_separator.as_deref(), Some("||"));
+        assert_eq!(segs[1].command.as_deref(), Some("Set-ExecutionPolicy"));
+    }
+
+    #[test]
+    fn ps_tokenizer_double_pipe_not_two_single_pipes() {
+        // Critical precedence check: `||` must be consumed as ONE separator,
+        // not two pipes producing three segments.
+        let segs = tokenize("a || b", ShellType::PowerShell);
+        assert_eq!(segs.len(), 2, "expected 2 segments (||), got {:?}", segs);
+        assert_eq!(segs[1].preceding_separator.as_deref(), Some("||"));
+    }
+
+    #[test]
+    fn ps_tokenizer_single_pipe_still_works() {
+        // Regression guard — the `||` lookahead must not break plain `|`.
+        let segs = tokenize("iwr url | iex", ShellType::PowerShell);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[1].preceding_separator.as_deref(), Some("|"));
+    }
+
+    #[test]
+    fn ps_tokenizer_bare_single_ampersand_not_separator() {
+        // Bare `&` (PS call / background operator) is NOT a chain operator on
+        // its own. Single `&` must fall through to the catch-all and be part
+        // of the current segment, so this tokenizes as ONE segment.
+        let segs = tokenize("Get-Job & Get-Process", ShellType::PowerShell);
+        assert_eq!(
+            segs.len(),
+            1,
+            "expected 1 segment (single & is not a separator), got {:?}",
+            segs
+        );
     }
 
     #[test]
