@@ -965,20 +965,26 @@ fn detect_shell_tool_conflicts(profile: Option<&std::path::Path>) -> Vec<ShellTo
 
 /// PowerShell hook compatibility information for `tirith doctor --compat`.
 ///
-/// Reported when `pwsh` is available on PATH; absent on hosts without
-/// PowerShell installed. This is a diagnostic surface only — the
-/// shell-hook health gate in `tirith init` is authoritative for actual
-/// hook behavior.
+/// Reported when either `pwsh` (PowerShell 7+) or `powershell` (Windows
+/// PowerShell 5.1) is on PATH; absent on hosts without either binary.
+/// This is a diagnostic surface only — the shell-hook health gate in
+/// `tirith init` is authoritative for actual hook behavior.
 #[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
 struct PsCompatInfo {
-    /// `pwsh` binary found on PATH.
-    pwsh_available: bool,
+    /// A PowerShell binary was found on PATH (either `pwsh` or `powershell`).
+    available: bool,
+    /// The resolved binary name — `"pwsh"` when PowerShell 7+ is installed,
+    /// `"powershell"` for Windows PowerShell 5.1 only. `None` when neither
+    /// was found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binary: Option<String>,
     /// Value of `TIRITH_STATUS` in the current environment (set by the hook).
     /// `None` means the hook has not run in this shell session.
     #[serde(skip_serializing_if = "Option::is_none")]
     tirith_status: Option<String>,
-    /// PSReadLine module available to pwsh (required for the key binding).
-    /// `None` if `pwsh` was not found OR the probe timed out / errored.
+    /// PSReadLine module available to the resolved PowerShell binary
+    /// (required for the key binding). `None` if no binary was found OR
+    /// the probe timed out / errored.
     #[serde(skip_serializing_if = "Option::is_none")]
     psreadline_available: Option<bool>,
     /// Hook version embedded in the binary matches the materialized hook
@@ -1071,27 +1077,30 @@ fn gather_compat() -> CompatReport {
 
 /// Detect PowerShell hook compatibility for the `tirith doctor --compat` report.
 ///
-/// Returns `None` on hosts where `pwsh` is not on PATH so that JSON consumers
-/// see no `powershell_compat` key (the field is `skip_serializing_if = "Option::is_none"`).
-/// When `pwsh` IS on PATH, returns `Some(PsCompatInfo { ... })` with:
+/// Returns `None` on hosts where neither `pwsh` nor `powershell` is on PATH so
+/// that JSON consumers see no `powershell_compat` key (the field is
+/// `skip_serializing_if = "Option::is_none"`). When a PowerShell binary IS on
+/// PATH, returns `Some(PsCompatInfo { ... })` with:
+///   - `binary` = the resolved binary name (`"pwsh"` preferred, else `"powershell"`),
 ///   - `tirith_status` from the current process env (set by the hook on session start),
-///   - `psreadline_available` from a 3s-budget probe of `Get-Module -ListAvailable PSReadLine`,
+///   - `psreadline_available` from a 3s-budget probe of `Get-Module -ListAvailable PSReadLine`
+///     against the *same* binary (so we don't probe `pwsh` then ask `powershell`
+///     about its modules),
 ///   - `hook_version_match` always `None` for now (see field doc).
 ///
-/// Timeout pattern: we spawn `pwsh` via `std::process::Command::spawn`, then
-/// a worker thread calls `wait_with_output()` and pushes the result through a
-/// `std::sync::mpsc` channel. The main thread waits with `recv_timeout(3s)`;
-/// on timeout we `child.kill()` and treat the probe as failed. This avoids
-/// pulling in a new dependency for a single 3s budget.
+/// Timeout pattern: we spawn the PowerShell binary via `std::process::Command::spawn`,
+/// poll `try_wait()` on a 50ms interval, and call `child.kill()` directly on the
+/// owned `Child` handle when the budget expires. This avoids the PID-reuse race
+/// of `libc::kill(pid, SIGKILL)`: `Child::kill()` is safe even if the child
+/// already exited (returns an ignored NotFound on Unix), and we never extract
+/// the raw PID.
 fn gather_ps_compat() -> Option<PsCompatInfo> {
-    let pwsh_available = probe_pwsh_available();
-    if !pwsh_available {
-        return None;
-    }
+    let binary = detect_powershell_binary()?;
     let tirith_status = std::env::var("TIRITH_STATUS").ok();
-    let psreadline_available = Some(probe_psreadline_available());
+    let psreadline_available = Some(probe_psreadline_available(binary));
     Some(PsCompatInfo {
-        pwsh_available,
+        available: true,
+        binary: Some(binary.to_string()),
         tirith_status,
         psreadline_available,
         // hook_version_match: intentionally None until all shell hook files
@@ -1101,25 +1110,48 @@ fn gather_ps_compat() -> Option<PsCompatInfo> {
     })
 }
 
-/// `pwsh --version` with a 3-second budget. Used to decide whether to emit
-/// a `powershell_compat` section at all.
-fn probe_pwsh_available() -> bool {
+/// Resolve the first available PowerShell binary on PATH. Tries `pwsh`
+/// (PowerShell 7+, cross-platform) first, then falls back to `powershell`
+/// (Windows PowerShell 5.1). Returns the static name to be used by both the
+/// availability check AND the PSReadLine probe, so module detection
+/// always runs against the same interpreter we reported as found.
+fn detect_powershell_binary() -> Option<&'static str> {
+    if probe_command_version_ok("pwsh") {
+        return Some("pwsh");
+    }
+    if probe_command_version_ok("powershell") {
+        return Some("powershell");
+    }
+    None
+}
+
+/// `<binary> --version` with a 3-second budget. `--version` does not load
+/// PowerShell profiles, so `-NoProfile` is not required here. Used to decide
+/// which (if any) PowerShell binary to surface in `powershell_compat`.
+fn probe_command_version_ok(binary: &str) -> bool {
     run_with_timeout(
-        std::process::Command::new("pwsh").arg("--version"),
+        std::process::Command::new(binary).arg("--version"),
         std::time::Duration::from_secs(3),
     )
     .map(|output| output.status.success())
     .unwrap_or(false)
 }
 
-/// Probe whether PSReadLine is available. Required for the Enter / Ctrl+V
-/// key bindings in `shell/lib/powershell-hook.ps1`. We deliberately ask
-/// pwsh to print a literal `yes` / `no` rather than relying on exit code,
-/// so a non-zero exit (e.g. PSReadLine missing AND `Get-Module` erroring on
-/// some hosts) is distinguishable from a clean negative.
-fn probe_psreadline_available() -> bool {
-    let mut cmd = std::process::Command::new("pwsh");
-    cmd.arg("-NonInteractive")
+/// Probe whether PSReadLine is available to the resolved PowerShell binary.
+/// Required for the Enter / Ctrl+V key bindings in
+/// `shell/lib/powershell-hook.ps1`. We deliberately ask the shell to print
+/// a literal `yes` / `no` rather than relying on exit code, so a non-zero
+/// exit (e.g. PSReadLine missing AND `Get-Module` erroring on some hosts) is
+/// distinguishable from a clean negative.
+///
+/// `-NoProfile` is critical: `-NonInteractive` alone does NOT prevent profile
+/// loading, so without `-NoProfile` user-defined hooks could interfere with
+/// module detection (e.g. by mutating `$env:PSModulePath`) or cause spurious
+/// probe failures from profile errors.
+fn probe_psreadline_available(binary: &str) -> bool {
+    let mut cmd = std::process::Command::new(binary);
+    cmd.arg("-NoProfile")
+        .arg("-NonInteractive")
         .arg("-Command")
         .arg("if (Get-Module -ListAvailable PSReadLine) { 'yes' } else { 'no' }");
     match run_with_timeout(&mut cmd, std::time::Duration::from_secs(3)) {
@@ -1131,50 +1163,50 @@ fn probe_psreadline_available() -> bool {
     }
 }
 
-/// Spawn `cmd`, wait up to `timeout` for output, kill on timeout.
-/// Returns `None` if spawn fails, the child cannot be waited on, or the
-/// timeout fires before output arrives.
+/// Spawn `cmd`, wait up to `timeout` for output, kill on timeout. Returns
+/// `None` if spawn fails, the child cannot be waited on, or the timeout
+/// fires before output arrives.
+///
+/// Uses a `try_wait`-based polling loop (50ms cadence) so the original
+/// `std::process::Child` handle stays in scope on the parent thread. On
+/// timeout we call `child.kill()` directly — which is safe even if the
+/// child already exited between the last `try_wait` and the kill call: it
+/// returns an `Os { kind: NotFound }` error in that case which we ignore.
+/// This avoids the PID-reuse race of extracting a raw PID and calling
+/// `libc::kill(pid, SIGKILL)` (the PID may have been recycled for an
+/// unrelated process by then).
 fn run_with_timeout(
     cmd: &mut std::process::Command,
     timeout: std::time::Duration,
 ) -> Option<std::process::Output> {
-    use std::sync::mpsc;
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null());
-    let child = cmd.spawn().ok()?;
-    // Worker thread reads the child to completion. If the parent times out
-    // first, it kills the child by id; the worker's `wait_with_output()`
-    // then returns and the channel send is best-effort (rx may be dropped).
-    let child_id = child.id();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = child.wait_with_output();
-        let _ = tx.send(result);
-    });
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(output)) => Some(output),
-        Ok(Err(_)) => None,
-        Err(_) => {
-            // Timeout fired. Best-effort kill by pid; if the child has
-            // already exited the kill is a no-op. We do not block for the
-            // worker thread; it will reap on its own.
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(child_id as libc::pid_t, libc::SIGKILL);
+    let mut child = cmd.spawn().ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            // Child exited cleanly within the budget — collect output.
+            Ok(Some(_status)) => return child.wait_with_output().ok(),
+            // Still running: check budget and either keep polling or kill.
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    // Safe even on race with child exiting just now: kill()
+                    // on an already-exited child returns NotFound which we ignore.
+                    let _ = child.kill();
+                    // Reap to avoid leaving a zombie; ignore the result —
+                    // the child is on its way out regardless.
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            #[cfg(windows)]
-            {
-                // Windows fallback: spawn `taskkill /F /PID <id>`. We don't
-                // wait for it; this is a best-effort cleanup on a diagnostic
-                // path.
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/F", "/PID", &child_id.to_string()])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
+            // Wait failed (rare, e.g. EINTR loop exhausted) — best-effort kill.
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
             }
-            None
         }
     }
 }
@@ -1814,12 +1846,17 @@ fn format_compat_human(r: &CompatReport) -> String {
         }
     }
 
-    // PowerShell hook health — only emitted when `pwsh` is on PATH. Same
-    // gating as the JSON field: hosts without PowerShell get no section.
+    // PowerShell hook health — only emitted when a PowerShell binary
+    // (`pwsh` or `powershell`) is on PATH. Same gating as the JSON field:
+    // hosts without PowerShell get no section.
     if let Some(ps) = &r.powershell_compat {
         line("");
         line("--- PowerShell compat ---");
-        line(&format!("  pwsh available:        {}", ps.pwsh_available));
+        line(&format!(
+            "  binary:                {}",
+            ps.binary.as_deref().unwrap_or("(none)")
+        ));
+        line(&format!("  available:             {}", ps.available));
         match ps.tirith_status.as_deref() {
             Some(status) => line(&format!("  TIRITH_STATUS:         {status}")),
             None => line("  TIRITH_STATUS:         (not set)"),
