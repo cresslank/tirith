@@ -81,15 +81,14 @@ scan:
 # even if the caller is on the allow list. See `rule_explanations.toml`
 # (`agent_denied_by_policy`) for the operator-facing description.
 #
-# Enforcement scope today: `tirith check`, the gateway request /
-# notification paths, and the MCP `tools/call_check_command` handler
-# invoke `apply_agent_rules` via `post_process_verdict`. `tirith paste`,
-# `tirith install`, `tirith ecosystem scan`, and the MCP
-# `tools/call_check_url` / `tools/call_check_paste` handlers stamp the
-# origin on the audit entry but do not yet enforce `agent_rules.deny`
-# — a follow-up commit on this PR extends enforcement to those
-# surfaces. The interactive `TIRITH=0` bypass also currently skips
-# `apply_agent_rules`; revisit that semantic in M5.
+# Enforcement scope: `apply_agent_rules` runs on every analysis path —
+# `tirith check`, the gateway request / notification paths, `tirith
+# paste`, `tirith install`, `tirith ecosystem scan`, and all MCP
+# `tools/call_check_*` handlers (`call_check_command`, `call_check_url`,
+# `call_check_paste`). The interactive `TIRITH=0` bypass currently
+# skips `apply_agent_rules` (pinned by
+# `agent_rules_deny_skipped_under_tirith_bypass_today`); revisit that
+# semantic in M5.
 #
 # Trust caveat: every signal feeding AgentOrigin is OPERATOR-TRUST,
 # never adversary-resistant — TIRITH_INTEGRATION, MCP clientInfo, CI
@@ -180,9 +179,10 @@ scan:
 # practice; `tirith agent policy init` scaffolds this block. A `deny`
 # match forces the verdict to Block and appends an
 # `agent_denied_by_policy` finding; `deny` beats any matching `allow`.
-# Enforcement is active on `tirith check` today; `tirith paste`,
-# `install`, `ecosystem scan`, and a few MCP handlers stamp origin but
-# do not yet enforce — a follow-up commit on this PR extends them.
+# Enforcement is active on every analysis path: `tirith check`, `paste`,
+# `install`, `ecosystem scan`, and all MCP `tools/call_check_*` handlers.
+# The interactive `TIRITH=0` bypass currently skips `agent_rules`;
+# revisit in M5.
 # agent_rules:
 #   allow:
 #     - kind: agent
@@ -255,11 +255,13 @@ scan:
 # A CI policy that wants to declare which callers are expected can list
 # them here. A `deny` match forces the verdict to Block and appends an
 # `agent_denied_by_policy` finding; `deny` beats any matching `allow`.
-# Enforcement runs on `tirith check` (the surface CI most often calls)
-# via `apply_agent_rules`; `tirith install`, `ecosystem scan`, and a
-# few MCP handlers stamp origin but do not yet enforce — a follow-up
-# commit on this PR extends them. `tirith agent sessions` shows the
-# AgentOrigins your CI actually sees.
+# Enforcement runs via `apply_agent_rules` on every analysis path:
+# `tirith check` (the surface CI most often calls), `install`, `ecosystem
+# scan`, `paste`, and all MCP `tools/call_check_*` handlers. The
+# interactive `TIRITH=0` bypass currently skips `agent_rules`; in CI
+# this combines with `allow_bypass_env: false` below to close that
+# path. `tirith agent sessions` shows the AgentOrigins your CI actually
+# sees.
 # agent_rules:
 #   allow:
 #     - kind: ci
@@ -355,14 +357,11 @@ scan:
 # origins. A `deny` match forces the verdict to Block and appends an
 # `agent_denied_by_policy` finding; `deny` beats any matching `allow`,
 # and `allow` is NOT a bypass — a verdict the engine already blocked
-# stays blocked even if the caller is on the allow list. Enforcement
-# is active on `tirith check`, the gateway, and the MCP
-# `tools/call_check_command` handler today; `tirith paste`, `install`,
-# `ecosystem scan`, and the MCP `tools/call_check_url` /
-# `tools/call_check_paste` handlers stamp origin but do not yet
-# enforce `deny` — a follow-up commit on this PR extends them. The
-# interactive `TIRITH=0` bypass also currently skips `agent_rules`;
-# revisit in M5.
+# stays blocked even if the caller is on the allow list. Enforcement is
+# active on every analysis path: `tirith check`, the gateway, `paste`,
+# `install`, `ecosystem scan`, and all MCP `tools/call_check_*`
+# handlers. The interactive `TIRITH=0` bypass currently skips
+# `agent_rules`; revisit in M5.
 # agent_rules:
 #   allow:
 #     - kind: agent

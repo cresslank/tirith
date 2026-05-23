@@ -663,11 +663,13 @@ policy schema. **Chunk 3 wired enforcement**: the engine consults
 `policy::agent_decision` through `escalation::apply_agent_rules` inside
 `post_process_verdict`, a `deny` match forces the action to Block and
 appends an `agent_denied_by_policy` finding, and `allow` is layered as
-an explicit non-bypass. Enforcement is active on `tirith check`, the
-gateway request/notification paths, and the MCP
-`tools/call_check_command` handler today; `tirith paste`, `install`,
-`ecosystem scan`, and the MCP `tools/call_check_url` /
-`tools/call_check_paste` handlers stamp origin for audit but do not yet
-route through `post_process_verdict` — a follow-up commit on this PR
-extends enforcement to those surfaces. The interactive `TIRITH=0`
-bypass also currently skips `apply_agent_rules`; revisit in M5.*
+an explicit non-bypass. Enforcement is active on every analysis path:
+`tirith check`, the gateway request/notification paths, `tirith paste`,
+`tirith install`, `tirith ecosystem scan`, and all MCP `tools/call_check_*`
+handlers (`call_check_command`, `call_check_url`, `call_check_paste`).
+The CLI / gateway / `call_check_command` sites route through
+`post_process_verdict`; `paste` / `install` / `ecosystem` /
+`call_check_url` / `call_check_paste` invoke `apply_agent_rules`
+directly after stamping origin. The interactive `TIRITH=0` bypass
+currently skips `apply_agent_rules` (pinned by
+`agent_rules_deny_skipped_under_tirith_bypass_today`); revisit in M5.*

@@ -709,13 +709,13 @@ fn render_agent_policy_scaffold_yaml(scaffold: &AgentPolicyScaffold) -> String {
     s.push_str("# the matched origin and policy file. A `deny` match beats any\n");
     s.push_str("# matching `allow`. `allow` is NOT a bypass — a verdict the engine\n");
     s.push_str("# already blocked stays blocked even if the caller is on the allow\n");
-    s.push_str("# list. Enforcement runs today on `tirith check`, the gateway, and\n");
-    s.push_str("# the MCP `tools/call_check_command` handler; `tirith paste`,\n");
-    s.push_str("# `install`, `ecosystem scan`, and the MCP `tools/call_check_url` /\n");
-    s.push_str("# `tools/call_check_paste` handlers stamp origin for audit but do\n");
-    s.push_str("# not yet enforce `deny` — a follow-up commit on this PR extends\n");
-    s.push_str("# them. The interactive `TIRITH=0` bypass also currently skips\n");
-    s.push_str("# `agent_rules`.\n");
+    s.push_str("# list. Enforcement runs on every analysis path: `tirith check`,\n");
+    s.push_str("# the gateway, `tirith paste`, `install`, `ecosystem scan`, and all\n");
+    s.push_str("# MCP `tools/call_check_*` handlers (`call_check_command`,\n");
+    s.push_str("# `call_check_url`, `call_check_paste`). The interactive `TIRITH=0`\n");
+    s.push_str("# bypass currently skips `agent_rules` (pinned by\n");
+    s.push_str("# `agent_rules_deny_skipped_under_tirith_bypass_today`); revisit\n");
+    s.push_str("# in M5.\n");
     s.push_str("#\n");
     s.push_str("# Trust model: every signal feeding AgentOrigin is OPERATOR-TRUST,\n");
     s.push_str("# never adversary-resistant — TIRITH_INTEGRATION, MCP clientInfo,\n");
@@ -817,8 +817,8 @@ fn print_policy_init_human(example_path: &Path, scaffold: &AgentPolicyScaffold) 
             scaffold.log_path,
         );
         eprintln!("  Every entry is commented out — uncomment the ones you wish to declare.");
-        eprintln!("  Enforcement is active on `tirith check`, the gateway, and the MCP `tools/call_check_command` handler;");
-        eprintln!("  paste / install / ecosystem-scan / MCP check_url / check_paste stamp origin for audit but do not yet enforce deny.");
+        eprintln!("  Enforcement is active on every analysis path: `tirith check`, the gateway, `paste`, `install`, `ecosystem scan`, and all MCP `tools/call_check_*` handlers.");
+        eprintln!("  The interactive `TIRITH=0` bypass currently skips `agent_rules` (pinned by `agent_rules_deny_skipped_under_tirith_bypass_today`); revisit in M5.");
     }
     eprintln!("  wrote {}", example_path.display());
     println!("{}", example_path.display());

@@ -146,13 +146,16 @@ pub struct Policy {
     /// NOT a bypass — a verdict the engine already blocked stays blocked.
     /// See [`agent_decision`] for the matching semantics.
     ///
-    /// Known scope limitations (fixed in follow-up commits on this PR): the
-    /// `tirith paste` / `install` / `ecosystem scan` paths and the MCP
-    /// `tools/call_check_url` / `tools/call_check_paste` handlers stamp
-    /// origin for audit but do not yet route through
-    /// `post_process_verdict`, so `deny` is currently scoped to `tirith
-    /// check`, the gateway, and `tools/call_check_command`. The
-    /// `TIRITH=0` interactive bypass also currently skips `apply_agent_rules`.
+    /// Enforcement runs on every analysis path: `tirith check`, the
+    /// gateway, `tirith paste`, `tirith install`, `tirith ecosystem scan`,
+    /// and the MCP `tools/call_check_*` handlers (`call_check_command`,
+    /// `call_check_url`, `call_check_paste`). The CLI / gateway / MCP
+    /// `call_check_command` sites route through `post_process_verdict`;
+    /// `paste` / `install` / `ecosystem` / `call_check_url` / `call_check_paste`
+    /// invoke `apply_agent_rules` directly after stamping origin. The
+    /// `TIRITH=0` interactive bypass currently skips `apply_agent_rules`
+    /// (pinned by `agent_rules_deny_skipped_under_tirith_bypass_today` in
+    /// the CLI integration tests); revisit in M5.
     ///
     /// See `docs/agent-governance-design.md` for the trust model:
     /// **operator-trust**, never adversary-resistant. The matching strings
