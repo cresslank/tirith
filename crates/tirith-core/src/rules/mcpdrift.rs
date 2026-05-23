@@ -177,15 +177,55 @@ fn finding_for_drift(drifts: &[mcp_lock::McpDrift]) -> Finding {
 /// distinct description so the operator can tell the two failure modes
 /// apart.
 ///
-/// The parse error's `Display` carries `serde_json`'s line/column message
-/// — useful for the operator, and free of file contents — so it can be
-/// safely included in the finding without leaking any of the lockfile's
-/// bytes back to the report consumer.
+/// **Privacy.** The description **does not** interpolate the underlying
+/// `serde_json::Error` message. `serde_json::Error`'s `Display` impl can
+/// echo the offending JSON value (`invalid type: string "...", expected
+/// ...`), and `.tirith/mcp.lock` is exactly the file we redact env values
+/// and URL userinfos out of (see `mcp_lock.rs`). A malformed lockfile
+/// containing a secret-shaped value — an unintentionally-committed
+/// credential, a partial config — would then surface that value in the
+/// finding's description: a privacy leak via diagnostic. So we name the
+/// failure category explicitly (`unparseable JSON`, etc.) and, when the
+/// upstream variant carries them, surface only the structurally-safe
+/// line/column numbers from `serde_json::Error` (both `usize`, neither
+/// can echo content). [`mcp_lock::parse_lockfile`] enforces the same
+/// invariant at the source by dropping the parser's message string at
+/// the boundary.
 fn finding_for_unparseable_lockfile(err: &mcp_lock::McpLockLoadError) -> Finding {
+    // Map the lock-load error to a structured (category, optional
+    // location) pair. The category names the failure plainly; the
+    // location, when present, is line/column numbers only — never a
+    // textual error message that could echo the lockfile's bytes.
+    let (category, location): (&str, Option<String>) = match err {
+        mcp_lock::McpLockLoadError::NotFound => {
+            // `check()` only constructs an unparseable finding from a
+            // `parse_lockfile` result on content the scan already read,
+            // so NotFound is not reachable here in practice. Named
+            // explicitly anyway so a future caller cannot accidentally
+            // surface a path string through the finding description.
+            ("missing baseline file", None)
+        }
+        mcp_lock::McpLockLoadError::Io(_) => {
+            // Suppress the inner io-error string — even though
+            // `std::io::Error` typically does not echo file contents,
+            // refusing to interpolate it removes a class of future
+            // diagnostic-leak regressions.
+            ("unreadable file", None)
+        }
+        mcp_lock::McpLockLoadError::Parse { line, column } => (
+            "unparseable JSON or schema mismatch",
+            Some(format!("line {line}, column {column}")),
+        ),
+    };
+    let location_suffix = match &location {
+        Some(loc) => format!(" at {loc}"),
+        None => String::new(),
+    };
+
     let detail = format!(
-        "MCP lockfile `.tirith/mcp.lock` could not be parsed ({err}); drift cannot be \
-         verified. The lockfile may have been tampered with, accidentally corrupted, or \
-         written by a newer tirith version with an incompatible schema."
+        "MCP lockfile `.tirith/mcp.lock` could not be parsed ({category}{location_suffix}); \
+         drift cannot be verified. The lockfile may have been tampered with, accidentally \
+         corrupted, or written by a newer tirith version with an incompatible schema."
     );
 
     Finding {
@@ -194,14 +234,14 @@ fn finding_for_unparseable_lockfile(err: &mcp_lock::McpLockLoadError) -> Finding
         title: "MCP lockfile is unparseable — drift cannot be verified".to_string(),
         description: format!(
             "The committed `.tirith/mcp.lock` is not valid JSON or does not match the \
-             expected lockfile schema ({err}). Because the baseline cannot be loaded, \
-             this scan cannot diff it against the current MCP-server inventory — drift \
-             that would otherwise have been caught is silently undetectable. The \
-             lockfile may have been tampered with, accidentally corrupted, or written \
-             by a future tirith version with an incompatible schema. Inspect \
-             `.tirith/mcp.lock` (it is a small JSON document), restore it from version \
-             control if it has been damaged, or re-run `tirith mcp lock` to refresh the \
-             baseline against the current inventory."
+             expected lockfile schema ({category}{location_suffix}). Because the baseline \
+             cannot be loaded, this scan cannot diff it against the current MCP-server \
+             inventory — drift that would otherwise have been caught is silently \
+             undetectable. The lockfile may have been tampered with, accidentally \
+             corrupted, or written by a future tirith version with an incompatible schema. \
+             Inspect `.tirith/mcp.lock` (it is a small JSON document), restore it from \
+             version control if it has been damaged, or re-run `tirith mcp lock` to \
+             refresh the baseline against the current inventory."
         ),
         evidence: vec![Evidence::Text { detail }],
         human_view: None,
@@ -403,6 +443,102 @@ mod tests {
         assert!(
             !serialized.contains("{not json"),
             "raw lockfile bytes leaked into finding: {serialized}"
+        );
+    }
+
+    #[test]
+    fn unparseable_finding_does_not_echo_serde_json_message() {
+        // Privacy invariant: `serde_json::Error`'s `Display` can include
+        // the offending JSON value (`invalid type: string "...",
+        // expected ...`). A `.tirith/mcp.lock` containing a
+        // secret-shaped value (an accidentally-committed credential, a
+        // partial config) would then surface that value through the
+        // finding description. The finding must NOT carry that error
+        // message — only the failure category and, optionally,
+        // line/column numbers.
+        let repo = tempdir().unwrap();
+        let lockdir = repo.path().join(".tirith");
+        fs::create_dir_all(&lockdir).unwrap();
+
+        // A distinctive credential-shaped value that serde_json would
+        // echo if we naively used `format!("{e}")`. The JSON below is
+        // syntactically valid but the wrong shape for the lockfile
+        // schema — serde_json's message for this failure mode is
+        // exactly the documented `invalid type: string "...",
+        // expected struct ...` form.
+        let secret = "ghp_LEAK_PROBE_DO_NOT_LET_THIS_INTO_THE_FINDING";
+        let body = format!(r#""{secret}""#);
+        fs::write(lockdir.join("mcp.lock"), &body).unwrap();
+
+        let lock_path = lockdir.join("mcp.lock");
+        let content = fs::read_to_string(&lock_path).unwrap();
+        let findings = check(&content, Some(&lock_path));
+        assert_eq!(findings.len(), 1);
+
+        let f = &findings[0];
+        // Direct probes on the description: the credential-shaped
+        // value, the literal substrings serde_json typically uses to
+        // frame the offending value, and the offending JSON content
+        // (the raw body bytes) must all be absent.
+        assert!(
+            !f.description.contains(secret),
+            "secret leaked into finding description: {}",
+            f.description,
+        );
+        assert!(
+            !f.description.contains("invalid type:"),
+            "serde_json's `invalid type:` framing leaked into description: {}",
+            f.description,
+        );
+        // We can't assert `!description.contains("expected")` outright
+        // because the legitimate prose already contains the word
+        // (e.g. "expected lockfile schema"). Assert the specific
+        // serde_json idiom `expected struct`/`expected one of`/
+        // `expected value` did not leak.
+        assert!(
+            !f.description.contains("expected struct"),
+            "serde_json's `expected struct ...` framing leaked into description: {}",
+            f.description,
+        );
+        assert!(
+            !f.description.contains("expected value"),
+            "serde_json's `expected value` framing leaked into description: {}",
+            f.description,
+        );
+        assert!(
+            !f.description.contains("expected one of"),
+            "serde_json's `expected one of ...` framing leaked into description: {}",
+            f.description,
+        );
+        assert!(
+            !f.description.contains(&body),
+            "raw lockfile bytes leaked into description: {}",
+            f.description,
+        );
+
+        // And likewise on the full serialized finding (evidence,
+        // detail, every field).
+        let serialized = serde_json::to_string(&findings).unwrap();
+        assert!(
+            !serialized.contains(secret),
+            "secret leaked into serialized finding: {serialized}"
+        );
+        assert!(
+            !serialized.contains("invalid type:"),
+            "serde_json's `invalid type:` framing leaked into serialized finding: {serialized}"
+        );
+        assert!(
+            !serialized.contains("expected struct"),
+            "serde_json's `expected struct` framing leaked into serialized finding: {serialized}"
+        );
+
+        // Sanity: the description still names the failure category and
+        // (when available) the safe line/column metadata, so the
+        // operator can act on the finding.
+        assert!(
+            f.description.contains("unparseable JSON") || f.description.contains("schema mismatch"),
+            "description must still name the failure category: {}",
+            f.description,
         );
     }
 

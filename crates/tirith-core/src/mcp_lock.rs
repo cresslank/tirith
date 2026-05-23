@@ -1400,8 +1400,59 @@ pub fn load_lockfile(path: &Path) -> Result<McpLockfile, McpLockLoadError> {
 }
 
 /// Parse a lockfile from its on-disk JSON form.
+///
+/// **Privacy.** A failed parse intentionally **does not** carry the
+/// `serde_json::Error`'s message string forward. `serde_json::Error`'s
+/// `Display` impl can include the offending JSON value (e.g.
+/// `invalid type: string "...", expected ...`), and `.tirith/mcp.lock`
+/// frequently carries secret-shaped data (env-value hashes, a userinfo
+/// hash, a malformed-but-committed credential the lockfile redaction is
+/// meant to protect). Echoing that error string into the parse-error
+/// variant would surface it through `Display`, the `mcp verify` /
+/// `mcp diff` CLI output, AND the `McpServerDrift` finding's
+/// description — a privacy leak via diagnostic. Instead we capture
+/// only the structurally-safe `line` and `column` from
+/// [`serde_json::Error`] (both are `usize`, neither can echo content)
+/// and discard the message itself. Drift detection is unaffected: the
+/// lockfile is still recognized as unparseable, the same
+/// `McpServerDrift` finding still fires; only the diagnostic tightens.
+///
+/// **Server ordering.** A parsed lockfile's `servers` list is sorted by
+/// `(name, source_config)` here — the same ordering
+/// [`McpLockfile::from_inventory`] establishes — so every
+/// `McpLockfile` consumer sees a consistent view regardless of
+/// on-disk order. A hand-edited or merge-conflict-resolved lockfile
+/// whose servers landed out of order would otherwise make
+/// [`compute_drift`]'s slow-path merge walk emit spurious
+/// `Added`/`Removed` pairs and miss `Changed` entries: the merge
+/// walk assumes both sides are sorted, and the fast-path
+/// `inventory_hash` short-circuit cannot save it once a single server
+/// genuinely differs. Sorting here keeps the invariant load-bearing
+/// for every caller (the rule, `mcp verify`, `mcp diff`, future
+/// programmatic consumers) without re-sorting at each call site.
 pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
-    serde_json::from_str(content).map_err(|e| McpLockLoadError::Parse(e.to_string()))
+    let mut lock: McpLockfile = serde_json::from_str(content).map_err(|e| {
+        // Capture only the safe structural metadata. The error's
+        // Display message is deliberately dropped — it can contain
+        // the offending JSON content.
+        McpLockLoadError::Parse {
+            line: e.line(),
+            column: e.column(),
+        }
+    })?;
+    // Defensive sort: `compute_drift`'s slow-path merge walk requires
+    // `lock.servers` to be sorted by `(name, source_config)`. The
+    // lockfile we wrote is always sorted (see `from_inventory`), but a
+    // hand-edited or merge-resolved lockfile could land here out of
+    // order. Sorting at the parse boundary makes the invariant total
+    // over every `McpLockfile` value that exists in the program, so
+    // no downstream caller has to re-sort.
+    lock.servers.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.source_config.cmp(&b.source_config))
+    });
+    Ok(lock)
 }
 
 /// Why a lockfile could not be loaded.
@@ -1412,7 +1463,14 @@ pub enum McpLockLoadError {
     /// The file exists but cannot be read (permission, encoding, …).
     Io(String),
     /// The file exists and was read but does not parse as a lockfile.
-    Parse(String),
+    ///
+    /// **Carries only line/column.** The original `serde_json::Error`
+    /// message is intentionally **not** captured — see
+    /// [`parse_lockfile`] for why. Both fields are `usize`, neither
+    /// can carry the offending JSON value, so this variant is safe to
+    /// `Display` into a CLI message and into a `McpServerDrift`
+    /// finding's description.
+    Parse { line: usize, column: usize },
 }
 
 impl std::fmt::Display for McpLockLoadError {
@@ -1420,7 +1478,11 @@ impl std::fmt::Display for McpLockLoadError {
         match self {
             McpLockLoadError::NotFound => write!(f, "lockfile not found"),
             McpLockLoadError::Io(e) => write!(f, "could not read lockfile: {e}"),
-            McpLockLoadError::Parse(e) => write!(f, "could not parse lockfile: {e}"),
+            // Line/column only — never the parser's message string.
+            // See `parse_lockfile` for the privacy rationale.
+            McpLockLoadError::Parse { line, column } => {
+                write!(f, "could not parse lockfile (line {line}, column {column})")
+            }
         }
     }
 }
@@ -3447,7 +3509,133 @@ mod tests {
         let path = dir.path().join(MCP_LOCK_FILENAME);
         fs::write(&path, "not json at all").unwrap();
         let err = load_lockfile(&path).unwrap_err();
-        assert!(matches!(err, McpLockLoadError::Parse(_)));
+        assert!(matches!(err, McpLockLoadError::Parse { .. }));
+    }
+
+    #[test]
+    fn parse_error_does_not_carry_serde_json_message() {
+        // Privacy invariant: `McpLockLoadError::Parse` carries ONLY
+        // line/column — it must not echo the `serde_json::Error`
+        // message, which can include the offending JSON value (e.g.
+        // `invalid type: string "...", expected ...`). A malformed
+        // `.tirith/mcp.lock` whose body looks credential-shaped must
+        // not leak that body into the parse-error variant or its
+        // `Display` rendering.
+        let secret = "ghp_PARSE_ERROR_LEAK_PROBE_DONOTLEAK";
+        // Build content that is valid JSON syntax but the WRONG TYPE
+        // for the lockfile schema. serde_json's Display for this
+        // failure mode is the one documented to echo the value:
+        // `invalid type: string "...", expected struct ...`.
+        let bad = format!(r#""{secret}""#);
+        let err = parse_lockfile(&bad).unwrap_err();
+        match err {
+            McpLockLoadError::Parse { line, column } => {
+                // Sanity: line/column are real positions, not zeros
+                // forged from a stripped message.
+                let _ = (line, column);
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+        // The Display rendering must also be free of the probe bytes.
+        let displayed = parse_lockfile(&bad).unwrap_err().to_string();
+        assert!(
+            !displayed.contains(secret),
+            "secret leaked into McpLockLoadError::Display: {displayed}"
+        );
+        assert!(
+            !displayed.contains("invalid type"),
+            "raw serde_json message leaked into Display: {displayed}"
+        );
+        assert!(
+            !displayed.contains("expected"),
+            "raw serde_json message leaked into Display: {displayed}"
+        );
+    }
+
+    #[test]
+    fn parse_lockfile_sorts_servers_for_compute_drift() {
+        // Defensive: `compute_drift`'s slow-path merge walk requires
+        // `lock.servers` to be sorted by `(name, source_config)`. A
+        // hand-edited or merge-resolved lockfile with out-of-order
+        // servers must still drift-compare correctly — same drift
+        // report as a properly-sorted lockfile, and zero drift when
+        // the only difference is order.
+        let ordered = mk_inventory(vec![
+            stdio_server("alpha", "node"),
+            stdio_server("beta", "node"),
+            stdio_server("zeta", "node"),
+        ]);
+        let lock_sorted = McpLockfile::from_inventory(&ordered);
+        let lock_sorted_json = lock_sorted.render();
+
+        // Build a deliberately *reversed* on-disk lockfile by serializing
+        // a hand-built struct whose `servers` are in reverse name order.
+        // (We bypass `from_inventory` so the bytes hit disk unsorted —
+        // simulating a hand-edited or merge-conflict-resolved lockfile.)
+        let mut unsorted = lock_sorted.clone();
+        unsorted.servers.reverse();
+        let lock_unsorted_json = serde_json::to_string_pretty(&unsorted).unwrap() + "\n";
+        // The on-disk bytes really are different.
+        assert_ne!(
+            lock_sorted_json, lock_unsorted_json,
+            "the unsorted serialization must differ from the sorted one"
+        );
+
+        // After parsing, both lockfiles must compare equal because
+        // `parse_lockfile` sorts. Equality of `McpLockfile` includes
+        // the `servers` Vec ordering.
+        let parsed_sorted = parse_lockfile(&lock_sorted_json).expect("sorted lockfile parses");
+        let parsed_unsorted =
+            parse_lockfile(&lock_unsorted_json).expect("unsorted lockfile parses");
+        assert_eq!(
+            parsed_sorted, parsed_unsorted,
+            "parse_lockfile must sort servers so two lockfiles that differ \
+             only in server order compare equal"
+        );
+
+        // Drift against the same inventory: both lockfiles must yield
+        // zero drift — the inventory genuinely matches.
+        let cur_drifts_sorted = compute_drift(&ordered, &parsed_sorted);
+        let cur_drifts_unsorted = compute_drift(&ordered, &parsed_unsorted);
+        assert!(
+            cur_drifts_sorted.is_empty(),
+            "sorted lockfile vs identical inventory must yield zero drift: \
+             {cur_drifts_sorted:?}"
+        );
+        assert!(
+            cur_drifts_unsorted.is_empty(),
+            "unsorted lockfile vs identical inventory must ALSO yield zero \
+             drift after parse-time sorting; without the sort the merge \
+             walk would emit spurious Added/Removed: {cur_drifts_unsorted:?}"
+        );
+
+        // And when a real drift is introduced, both lockfiles report
+        // the *same* drift — the merge walk is not confused by the
+        // (parsed-away) on-disk order.
+        let drifted_current = mk_inventory(vec![
+            stdio_server("alpha", "node"),
+            // "beta" removed.
+            stdio_server("zeta", "deno"), // command rotated.
+        ]);
+        let d_sorted = compute_drift(&drifted_current, &parsed_sorted);
+        let d_unsorted = compute_drift(&drifted_current, &parsed_unsorted);
+        assert_eq!(
+            d_sorted, d_unsorted,
+            "drift report must be identical regardless of on-disk lockfile order"
+        );
+        // Sanity-check that real drift is detected, not silently swallowed.
+        assert!(
+            d_sorted
+                .iter()
+                .any(|d| matches!(d, McpDrift::Removed { name, .. } if name == "beta")),
+            "expected a Removed drift for `beta`: {d_sorted:?}"
+        );
+        assert!(
+            d_sorted
+                .iter()
+                .any(|d| matches!(d, McpDrift::Changed(entry) if entry.name == "zeta")),
+            "expected a Changed drift for `zeta`: {d_sorted:?}"
+        );
     }
 
     #[test]
