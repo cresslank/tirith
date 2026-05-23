@@ -381,3 +381,52 @@ fn print_summary_table(results: &[ScenarioResult], passed: usize, failed: usize,
     println!();
     println!("Total: {passed} passed, {failed} failed");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tirith_core::verdict::{Finding, RuleId, Severity};
+
+    fn finding(severity: Severity) -> Finding {
+        Finding {
+            rule_id: RuleId::Base64DecodeExecute,
+            severity,
+            title: String::new(),
+            description: String::new(),
+            evidence: vec![],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }
+    }
+
+    #[test]
+    fn scenario_score_empty_is_zero() {
+        assert_eq!(scenario_score(&[]), 0);
+    }
+
+    #[test]
+    fn scenario_score_max_wins() {
+        let f = vec![
+            finding(Severity::Low),
+            finding(Severity::Critical),
+            finding(Severity::Medium),
+        ];
+        assert_eq!(scenario_score(&f), 100);
+    }
+
+    #[test]
+    fn scenario_score_info_is_5_not_0() {
+        assert_eq!(scenario_score(&[finding(Severity::Info)]), 5);
+    }
+
+    #[test]
+    fn scenario_score_buckets_are_exact() {
+        assert_eq!(scenario_score(&[finding(Severity::Critical)]), 100);
+        assert_eq!(scenario_score(&[finding(Severity::High)]), 75);
+        assert_eq!(scenario_score(&[finding(Severity::Medium)]), 50);
+        assert_eq!(scenario_score(&[finding(Severity::Low)]), 25);
+        assert_eq!(scenario_score(&[finding(Severity::Info)]), 5);
+    }
+}

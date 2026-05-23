@@ -3246,4 +3246,52 @@ mod tests {
             );
         }
     }
+
+    // ── PowerShell compat section in format_compat_human (M5 wave-end ──
+    // ── finding B: doctor --compat PS-success-path was untested) ──────
+    //
+    // The probe of `pwsh` only happens on hosts with PowerShell on PATH,
+    // so the success branches of `format_compat_human`'s PS section
+    // could not be exercised in CI. Build a `CompatReport` with the
+    // PS section pre-populated and assert each `psreadline_available`
+    // branch renders the expected human text.
+
+    fn compat_report_with_ps(psreadline_available: Option<bool>) -> CompatReport {
+        let mut r = compat_report_for("powershell", None);
+        r.powershell_compat = Some(PsCompatInfo {
+            available: true,
+            binary: Some("pwsh".to_string()),
+            tirith_status: None,
+            psreadline_available,
+            hook_version_match: None,
+        });
+        r
+    }
+
+    #[test]
+    fn compat_human_ps_psreadline_some_true_renders_yes() {
+        let out = format_compat_human(&compat_report_with_ps(Some(true)));
+        assert!(
+            out.contains("PSReadLine module: yes") || out.contains("PSReadLine module:     yes"),
+            "PSReadLine yes branch must render 'PSReadLine module: ... yes'; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn compat_human_ps_psreadline_some_false_renders_no_with_hint() {
+        let out = format_compat_human(&compat_report_with_ps(Some(false)));
+        assert!(
+            out.contains("no (key binding will not work)"),
+            "PSReadLine false branch must render 'no (key binding will not work)'; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn compat_human_ps_psreadline_none_renders_unknown() {
+        let out = format_compat_human(&compat_report_with_ps(None));
+        assert!(
+            out.contains("unknown (probe failed or timed out)"),
+            "PSReadLine None branch must render 'unknown (probe failed or timed out)'; got:\n{out}"
+        );
+    }
 }

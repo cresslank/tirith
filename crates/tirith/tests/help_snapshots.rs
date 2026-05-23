@@ -84,6 +84,7 @@ help_example_tests! {
     help_update     => (["update", "--help"], "tirith update --verify");
     help_update_rollback => (["update", "--help"], "tirith update --rollback");
     help_version    => (["version", "--help"], "tirith version --provenance");
+    help_lab        => (["lab", "--help"], "tirith lab --filter powershell");
 }
 
 #[test]

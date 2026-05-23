@@ -5796,3 +5796,172 @@ fn ecosystem_tirith_bypass_not_wired_so_deny_enforces_today() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ── tirith lab E2E (M5 wave-end review — finding A: zero lab integration tests) ──
+//
+// Six tests pin the public surface of `tirith lab` so future refactors that
+// silently break filter, --score, or JSON output trip CI. The lab corpus is
+// embedded at compile time so these tests are deterministic and offline.
+
+#[test]
+fn lab_non_interactive_happy_path() {
+    let out = tirith()
+        .args(["lab", "--non-interactive"])
+        .output()
+        .expect("failed to run tirith lab");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "lab --non-interactive should exit 0 on all-pass; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The full corpus is 27 scenarios at the time of writing; assert the
+    // summary line shape rather than a brittle exact total. If a scenario
+    // is added/removed, only the count changes — the test still catches a
+    // FAIL or a missing-summary regression.
+    assert!(
+        stdout.contains("Total:") && stdout.contains("passed,"),
+        "lab summary line must appear, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("0 failed"),
+        "lab corpus should have 0 failures today, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn lab_filter_powershell_narrows() {
+    let out = tirith()
+        .args(["lab", "--filter", "powershell", "--non-interactive"])
+        .output()
+        .expect("failed to run tirith lab --filter powershell");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Each scenario row prints PASS or FAIL; count them to verify the
+    // filter narrowed but kept a meaningful number of cases. The corpus
+    // has ≥4 powershell-tagged scenarios.
+    let row_count = stdout
+        .lines()
+        .filter(|l| l.contains("PASS") || l.contains("FAIL"))
+        .count();
+    assert!(
+        row_count >= 4,
+        "powershell filter should yield ≥4 scenarios, got {row_count} in:\n{stdout}"
+    );
+}
+
+#[test]
+fn lab_filter_no_match_empty_json() {
+    let out = tirith()
+        .args([
+            "lab",
+            "--filter",
+            "__no_such_tag__",
+            "--format",
+            "json",
+            "--non-interactive",
+        ])
+        .output()
+        .expect("failed to run tirith lab --filter __no_such_tag__ --format json");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "empty-filter is a no-op, not a failure; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Literal `[]\n` so downstream JSON parsers see an array of length 0.
+    assert_eq!(
+        out.stdout,
+        b"[]\n",
+        "empty-filter JSON output must be the literal `[]\\n`, got: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn lab_filter_no_match_human() {
+    let out = tirith()
+        .args(["lab", "--filter", "__no_such_tag__", "--non-interactive"])
+        .output()
+        .expect("failed to run tirith lab --filter __no_such_tag__");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("No scenarios match filter '__no_such_tag__'"),
+        "empty-filter human output must explain the no-match, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn lab_format_json_schema() {
+    let out = tirith()
+        .args(["lab", "--format", "json", "--non-interactive"])
+        .output()
+        .expect("failed to run tirith lab --format json");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "lab --format json should exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("lab --format json should emit valid JSON");
+    let arr = json
+        .as_array()
+        .expect("lab JSON output must be a top-level array");
+    assert!(!arr.is_empty(), "lab JSON should have ≥1 entry");
+    for (i, entry) in arr.iter().enumerate() {
+        for key in ["name", "expected", "actual", "pass", "findings"] {
+            assert!(
+                entry.get(key).is_some(),
+                "entry {i} missing required key '{key}': {entry}"
+            );
+        }
+        assert!(
+            entry["findings"].is_array(),
+            "entry {i} 'findings' must be an array: {entry}"
+        );
+    }
+}
+
+#[test]
+fn lab_score_adds_field() {
+    // With --score, every entry must carry an integer score in 0..=100.
+    let out = tirith()
+        .args(["lab", "--score", "--format", "json", "--non-interactive"])
+        .output()
+        .expect("failed to run tirith lab --score --format json");
+    assert_eq!(out.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("lab --score --format json should emit valid JSON");
+    let arr = json
+        .as_array()
+        .expect("lab JSON output must be a top-level array");
+    for (i, entry) in arr.iter().enumerate() {
+        let score = entry
+            .get("score")
+            .unwrap_or_else(|| panic!("entry {i} missing 'score' field with --score: {entry}"));
+        let n = score
+            .as_u64()
+            .unwrap_or_else(|| panic!("entry {i} 'score' must be an integer: {entry}"));
+        assert!(n <= 100, "entry {i} 'score'={n} must be ≤100: {entry}");
+    }
+
+    // Without --score, the schema must NOT carry a score key
+    // (skip_serializing_if = "Option::is_none" guards against drift).
+    let out2 = tirith()
+        .args(["lab", "--format", "json", "--non-interactive"])
+        .output()
+        .expect("failed to run tirith lab --format json (no --score)");
+    assert_eq!(out2.status.code(), Some(0));
+    let json2: serde_json::Value = serde_json::from_slice(&out2.stdout)
+        .expect("lab --format json without --score should emit valid JSON");
+    let arr2 = json2.as_array().expect("top-level array");
+    for (i, entry) in arr2.iter().enumerate() {
+        assert!(
+            entry.get("score").is_none(),
+            "entry {i} must NOT carry a 'score' key without --score: {entry}"
+        );
+    }
+}

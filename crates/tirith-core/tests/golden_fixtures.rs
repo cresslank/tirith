@@ -24,6 +24,13 @@ struct Fixture {
     shell: String,
     expected_action: String,
     expected_rules: Vec<String>,
+    /// Rule IDs that MUST NOT appear in the verdict. Use this to pin
+    /// double-fire boundaries — e.g. a fixture that should fire
+    /// `pipe_to_interpreter` but must NOT also fire
+    /// `ps_inline_download_execute`. The positive-only `expected_rules`
+    /// list would silently accept both, which is a regression risk.
+    #[serde(default)]
+    forbidden_rules: Vec<String>,
     #[serde(default)]
     raw_bytes: Vec<u8>,
     /// File path for file-scan context fixtures.
@@ -116,22 +123,33 @@ fn run_fixture(fixture: &Fixture) {
             .collect::<Vec<_>>()
     );
 
-    if !fixture.expected_rules.is_empty() {
-        let found_rules: Vec<String> = verdict
-            .findings
-            .iter()
-            .map(|f| f.rule_id.to_string())
-            .collect();
+    // Build the found_rules list once for both positive and negative
+    // assertions. A fixture can declare `forbidden_rules` without any
+    // `expected_rules` (purely negative coverage), so compute up-front.
+    let found_rules: Vec<String> = verdict
+        .findings
+        .iter()
+        .map(|f| f.rule_id.to_string())
+        .collect();
 
-        for expected_rule in &fixture.expected_rules {
-            assert!(
-                found_rules.contains(expected_rule),
-                "Fixture '{}': expected rule '{}' not found. Found rules: {:?}",
-                fixture.name,
-                expected_rule,
-                found_rules
-            );
-        }
+    for expected_rule in &fixture.expected_rules {
+        assert!(
+            found_rules.contains(expected_rule),
+            "Fixture '{}': expected rule '{}' not found. Found rules: {:?}",
+            fixture.name,
+            expected_rule,
+            found_rules
+        );
+    }
+
+    for forbidden in &fixture.forbidden_rules {
+        assert!(
+            !found_rules.contains(forbidden),
+            "Fixture '{}': forbidden rule '{}' was found in verdict. Findings: {:?}",
+            fixture.name,
+            forbidden,
+            found_rules
+        );
     }
 }
 

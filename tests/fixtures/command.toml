@@ -1556,6 +1556,10 @@ context = "exec"
 shell = "powershell"
 expected_action = "block"
 expected_rules = ["pipe_to_interpreter"]
+# Pin double-fire boundary: the pipe form must fire pipe_to_interpreter
+# and must NOT also fire ps_inline_download_execute. A future regression
+# that removes the preceding_separator skip would silently double-fire.
+forbidden_rules = ["ps_inline_download_execute"]
 
 # `;` chains produce independent commands — `pipe_to_interpreter` does NOT
 # match, so `ps_inline_download_execute` must still fire on the trailing
@@ -1585,3 +1589,48 @@ context = "exec"
 shell = "powershell"
 expected_action = "block"
 expected_rules = ["ps_defender_exclusion"]
+
+# `Set-ExecutionPolicy Unrestricted` is NOT currently flagged — the
+# `ps_set_execution_policy_bypass` rule scopes to `Bypass` only. Pin
+# that decision so a future rule expansion doesn't silently change
+# behavior without an updated fixture.
+[[fixture]]
+name = "ps_set_execution_policy_unrestricted_is_allow_or_warn"
+min_milestone = 5
+input = "Set-ExecutionPolicy Unrestricted"
+context = "exec"
+shell = "powershell"
+expected_action = "allow"
+expected_rules = []
+
+# Positive coverage for the -ExclusionProcess flag — the rule code
+# references it but no fixture pinned the behavior.
+[[fixture]]
+name = "ps_defender_exclusion_process"
+min_milestone = 5
+input = "Add-MpPreference -ExclusionProcess malware.exe"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_defender_exclusion"]
+
+# Joined form: `-ExecutionPolicy=Bypass` (some users / scripts write it
+# this way). The rule code handles it; this fixture pins the contract.
+[[fixture]]
+name = "ps_set_execution_policy_bypass_joined"
+min_milestone = 5
+input = "powershell -ExecutionPolicy=Bypass -Command \"echo hi\""
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+# Joined short-alias form: `-ep=Bypass`. Same intent, different syntax.
+[[fixture]]
+name = "ps_set_execution_policy_bypass_ep_joined"
+min_milestone = 5
+input = "powershell -ep=Bypass -Command \"echo hi\""
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
