@@ -1653,11 +1653,15 @@ classes of caller are producing which classes of verdict.
 Entries with no `agent_origin` field (pre-chunk-1 audit lines, hook
 telemetry, and any audit caller that did not stamp an origin before
 calling `audit::log_verdict`) land in an explicit `unknown` group rather
-than being silently dropped — honesty over apparent tidiness. Chunk 3
-fixed the engine's bypass path so the CLI / MCP / gateway caller is the
-single audit site (previously the engine logged once without origin,
-then the CLI logged again with origin — a double entry where one was
-attributed and the other was not).
+than being silently dropped — honesty over apparent tidiness. Origin
+attribution is best-effort and improves incrementally: chunk 3 removed
+the engine's bypass-path audit (previously the engine logged once
+without origin, then the CLI logged again with origin — a double entry
+where one was attributed and the other was not) and stamped origin on
+the `check`, `paste`, `install`, `ecosystem`, MCP, and gateway audit
+sites. Other audit-writing paths added in future work may still ship
+without origin until they adopt the same stamping pattern; those entries
+remain in the `unknown` group rather than being attributed by guess.
 
 Exit codes:
   0  the aggregation ran (zero or more groups reported).

@@ -203,6 +203,12 @@ struct AuditEntry<'a> {
     raw_rule_ids: Option<&'a [String]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<&'a str>,
+    /// M4 item 8 chunk 3 follow-up — every audit line emitted by the gateway
+    /// carries `agent_origin: gateway`. The gateway is the singleton path
+    /// here, so the value is constant. Previously the in-memory verdict was
+    /// stamped with `AgentOrigin::Gateway` but the serialized `AuditEntry`
+    /// lacked the field — persisted gateway lines were missing origin.
+    agent_origin: tirith_core::agent_origin::AgentOrigin,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -263,6 +269,12 @@ fn write_audit_with_raw(
         raw_decision,
         raw_rule_ids,
         session_id,
+        // The gateway is the only call site for this audit struct — every
+        // line it emits is, by definition, a gateway-path verdict. Stamping
+        // here (rather than threading the verdict's `agent_origin` through
+        // every call site) keeps the helper signature small and guarantees
+        // no gateway audit line ever ships without origin attribution.
+        agent_origin: tirith_core::agent_origin::AgentOrigin::Gateway,
     };
     match serde_json::to_string(&entry) {
         Ok(json) => eprintln!("{json}"),
@@ -1903,12 +1915,17 @@ policy:
             raw_decision: None,
             raw_rule_ids: None,
             session_id: None,
+            agent_origin: tirith_core::agent_origin::AgentOrigin::Gateway,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["decision"], "block");
         assert_eq!(parsed["findings_count"], 1);
         assert_eq!(parsed["tool_name"], "Bash");
+        // M4 item 8 chunk 3 follow-up — every gateway audit line carries
+        // `agent_origin: gateway` so an operator reading the JSONL log can
+        // attribute it to the gateway path without inference.
+        assert_eq!(parsed["agent_origin"]["kind"], "gateway");
     }
 
     #[test]
@@ -1929,6 +1946,7 @@ policy:
             raw_decision: None,
             raw_rule_ids: None,
             session_id: None,
+            agent_origin: tirith_core::agent_origin::AgentOrigin::Gateway,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: Value = serde_json::from_str(&json).unwrap();

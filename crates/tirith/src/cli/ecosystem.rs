@@ -96,7 +96,15 @@ pub fn scan(path: Option<&str>, online: bool, offline: bool, json: bool) -> i32 
         online: online_mode,
         is_allowlisted: &is_allowlisted,
     };
-    let report = ecosystem_scan::scan(&request);
+    let mut report = ecosystem_scan::scan(&request);
+
+    // M4 item 8 chunk 3 follow-up — stamp the resolved caller origin on the
+    // scan's verdict BEFORE the audit-log write below. The scan engine does
+    // not know the caller's identity by design; the CLI does. Without this
+    // stamp, `tirith ecosystem scan` audit lines would land in the
+    // `tirith agent sessions` "unknown" bucket.
+    let interactive = is_terminal::is_terminal(std::io::stderr());
+    report.verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
 
     // Audit-log the verdict, exactly as the other analysis commands do. The
     // "command" string identifies this as an ecosystem scan of the root. A

@@ -4919,3 +4919,133 @@ fn bypass_path_records_single_audit_entry_with_agent_origin() {
         "the tool field should carry the sanitized TIRITH_INTEGRATION value: {origin}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M4 item 8 chunk 3 follow-up — origin stamp on analysis-then-audit paths.
+//
+// `tirith install` and `tirith ecosystem scan` analyze, then write an audit
+// entry — these were two of the analysis-then-audit paths that previously
+// called `audit::log_verdict` WITHOUT first setting `verdict.agent_origin`.
+// Their audit lines would land in the `tirith agent sessions` "unknown"
+// bucket. The chunk-3 follow-up stamps `resolve_cli_origin(interactive)` on
+// the verdict before the audit write so the entry is attributed.
+//
+// Unix-gated for the same reason `install_block_is_audited_with_the_block_verdict`
+// is (audit log location resolves through `data_dir()` which honors
+// XDG_DATA_HOME on Unix but %APPDATA% on Windows — set both env vars to
+// isolate; the invariant is OS-independent).
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+#[test]
+fn install_audit_entry_carries_agent_origin() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    // `evil-package@1.0.0` is the same fixture used by
+    // `install_block_is_audited_with_the_block_verdict` — guaranteed BLOCK.
+    // Stamping TIRITH_INTEGRATION drives the origin into the `Agent` variant
+    // so the assertion is on a non-default value.
+    let out = tirith()
+        .env("TIRITH_OFFLINE", "1")
+        .env("TIRITH_LOG", "1")
+        .env("TIRITH_INTEGRATION", "claude-code-install-test")
+        .env("TIRITH_THREATDB_PATH", test_threatdb_fixture())
+        .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH")
+        .env_remove("TIRITH_POLICY_ROOT")
+        .env("XDG_DATA_HOME", &data_dir)
+        .env("APPDATA", &data_dir)
+        .args(["install", "--no-exec", "npm", "evil-package@1.0.0"])
+        .output()
+        .expect("failed to run tirith install");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "installing a known-malicious package must analyze as BLOCK, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let log_path = data_dir.join("tirith").join("log.jsonl");
+    let log = fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("audit log {} not written: {e}", log_path.display()));
+    let entry: serde_json::Value = log
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("audit line is JSON"))
+        .find(|e| e["entry_type"] == "verdict")
+        .expect("a verdict audit entry must exist");
+
+    // The chunk-3 follow-up contract: the install audit line must carry the
+    // origin the CLI stamped. Pre-follow-up the entry was missing the field.
+    let origin = entry
+        .get("agent_origin")
+        .unwrap_or_else(|| panic!("agent_origin missing from install audit entry: {entry}"));
+    assert_eq!(
+        origin["kind"], "agent",
+        "TIRITH_INTEGRATION should produce kind=agent: {origin}"
+    );
+    assert_eq!(
+        origin["tool"], "claude-code-install-test",
+        "the tool field should carry the sanitized TIRITH_INTEGRATION value: {origin}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ecosystem_scan_audit_entry_carries_agent_origin() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    // A trivial-but-clean project — any scan path produces an audit entry; we
+    // just need ONE entry to assert origin on.
+    let proj = tempfile::tempdir().expect("project tempdir");
+    fs::write(
+        proj.path().join("Cargo.toml"),
+        "[dependencies]\nmy-unique-internal-crate-xyzzy = \"1.0\"\n",
+    )
+    .expect("write Cargo.toml");
+
+    let out = tirith()
+        .env("TIRITH_OFFLINE", "1")
+        .env("TIRITH_LOG", "1")
+        .env("TIRITH_INTEGRATION", "claude-code-ecosystem-test")
+        .env("TIRITH_THREATDB_PATH", test_threatdb_fixture())
+        .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH")
+        .env_remove("TIRITH_POLICY_ROOT")
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
+        .env("XDG_DATA_HOME", &data_dir)
+        .env("APPDATA", &data_dir)
+        .args(["ecosystem", "scan", proj.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run tirith ecosystem scan");
+
+    // Clean project → exit 0; the audit must still record the verdict.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a clean ecosystem scan must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let log_path = data_dir.join("tirith").join("log.jsonl");
+    let log = fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("audit log {} not written: {e}", log_path.display()));
+    let entry: serde_json::Value = log
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("audit line is JSON"))
+        .find(|e| e["entry_type"] == "verdict")
+        .expect("a verdict audit entry must exist");
+
+    let origin = entry
+        .get("agent_origin")
+        .unwrap_or_else(|| panic!("agent_origin missing from ecosystem-scan audit entry: {entry}"));
+    assert_eq!(
+        origin["kind"], "agent",
+        "TIRITH_INTEGRATION should produce kind=agent: {origin}"
+    );
+    assert_eq!(
+        origin["tool"], "claude-code-ecosystem-test",
+        "the tool field should carry the sanitized TIRITH_INTEGRATION value: {origin}"
+    );
+}

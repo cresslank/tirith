@@ -211,6 +211,13 @@ fn run_package_manager(
     };
     let mut plan = install_txn::plan_install(&plan_request);
 
+    // M4 item 8 chunk 3 follow-up — stamp the resolved caller origin on the
+    // plan's verdict BEFORE the audit-log write below. The engine that built
+    // the plan does not know the caller's identity by design; the CLI does.
+    // Without this stamp, `tirith install` audit lines would land in the
+    // `tirith agent sessions` "unknown" bucket.
+    plan.verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
+
     // --- INFORM ---------------------------------------------------------
     if json {
         // A JSON-write failure means the consumer never received the analysis
@@ -516,6 +523,13 @@ fn run_url(
     // on every URL and turn every URL install into a block. The real script
     // body is analyzed separately by `runner::run` after download.
     let mut preflight = preflight_url(url, cwd.as_deref(), interactive);
+
+    // M4 item 8 chunk 3 follow-up — stamp the resolved caller origin on the
+    // preflight verdict BEFORE the audit-log write below. The engine that
+    // built the preflight does not know the caller's identity by design; the
+    // CLI does. Without this stamp, `tirith install url` audit lines would
+    // land in the `tirith agent sessions` "unknown" bucket.
+    preflight.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
 
     if json {
         // A JSON-write failure means the consumer never received the preflight

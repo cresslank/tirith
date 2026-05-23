@@ -450,14 +450,14 @@ unless a live workload surfaces a concrete need. The minimal `Denied
 this untrusted MCP client from running anything") without committing
 the schema to questions we have not yet seen real telemetry for.
 
-**Origin-stamp invariant.** Chunk 3 unified the model to **exactly one
-audit entry per caller path**, with `agent_origin` stamped on the verdict
-**before** that call. `engine::analyze_inner` (reached through
+**Origin-stamp invariant.** Chunk 3 unified the model toward **exactly
+one audit entry per caller path**, with `agent_origin` stamped on the
+verdict **before** that call. `engine::analyze_inner` (reached through
 `analyze_returning_policy`) **no longer audits** its own bypass fast-exit
 — pre-chunk-3 it called `audit::log_verdict` with the unstamped verdict,
 which on `tirith check` produced a double-log (engine entry → no origin;
 CLI entry → with origin). Audit responsibility now lives entirely with
-the caller, and the per-file change set is:
+the caller. The per-file change set is:
 
 * `cli/check.rs` — pre-chunk-3 this path already stamped origin and
   audited; chunk 3 deduplicated by removing the engine-side write.
@@ -467,9 +467,33 @@ the caller, and the per-file change set is:
 * `mcp/tools.rs::call_check_command` — stamping pre-chunk-3, but the
   bypass branch previously skipped for the same reason; it now audits
   explicitly (same shape as `paste.rs`).
-* `cli/gateway.rs` — already the singleton on this path via its own
-  `write_audit` / `write_audit_with_raw` helpers; no engine-side write
-  to remove, no caller-side gap to close.
+* `cli/install.rs` (both the package-manager and URL forms) and
+  `cli/ecosystem.rs` — these analysis-then-audit paths now also stamp
+  `agent_origin` via `resolve_cli_origin(interactive)` before
+  `audit::log_verdict`, so an `install` or `ecosystem scan` audit line
+  no longer lands in the `tirith agent sessions` "unknown" group.
+* `cli/gateway.rs` — the request and notification handlers stamp
+  `AgentOrigin::Gateway` on the in-memory raw verdict, and the local
+  `AuditEntry<'a>` serialized to stderr now includes an `agent_origin`
+  field (constant `AgentOrigin::Gateway`, since the gateway is the only
+  emitter of that struct). Pre-chunk-3-follow-up the local entry shape
+  lacked the field — the in-memory verdict carried origin, but the
+  persisted stderr JSONL line did not.
+
+**Known gap.** Origin attribution is best-effort and pin-fixed only at
+the audit sites above. A new analysis-then-audit path added in future
+work that calls `audit::log_verdict` without first setting
+`verdict.agent_origin` will land its entries in the "unknown" group;
+the audit aggregator (`tirith agent sessions`) is honest about this and
+reports them rather than guessing. The four `golden_fixtures.rs`
+safeguard tests do not cover this invariant — see the integration tests
+`bypass_path_records_single_audit_entry_with_agent_origin`,
+`install_audit_entry_carries_agent_origin`, and
+`ecosystem_scan_audit_entry_carries_agent_origin` in
+`crates/tirith/tests/cli_integration.rs`, plus
+`cli::gateway::tests::test_audit_entry_serializes_valid_json` (which
+pins the gateway's serialized `agent_origin: gateway` field) for the
+per-site pins.
 
 ## 6. Out of scope
 
