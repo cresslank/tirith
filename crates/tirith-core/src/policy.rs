@@ -233,9 +233,54 @@ pub struct ScanPolicyConfig {
     /// Additional config file paths to scan as priority files.
     #[serde(default)]
     pub additional_config_files: Vec<String>,
-    /// Trusted MCP server URLs (suppress McpUntrustedServer for these).
+    /// Trusted MCP server NAMES — the keys used in the `mcpServers` /
+    /// `servers` object of an MCP config file (e.g. `"github"`, `"fs"`), and
+    /// the same names the lockfile stores. A server name listed here:
+    ///
+    /// * Suppresses `mcp_insecure_server`, `mcp_untrusted_server`,
+    ///   `mcp_suspicious_args`, and `mcp_overly_permissive` findings for that
+    ///   server (the existing config-file MCP rules in
+    ///   `rules/configfile.rs`).
+    /// * Filters drift entries with this name out of the
+    ///   `mcp_server_drift` finding. If the only drift entries are for
+    ///   trusted servers, no drift finding fires; otherwise the trusted
+    ///   entries are removed and the rule surfaces only the untrusted ones.
+    ///
+    /// Names are case-sensitive and matched as literal strings — they are
+    /// MCP server identifiers, not URLs. (The field name predates the
+    /// per-name semantics; see `mcp_allowed_tools` below for the tighter
+    /// per-server tool gate.)
     #[serde(default)]
     pub trusted_mcp_servers: Vec<String>,
+    /// Per-server allowed-tools gate. Keys are MCP server names (the same
+    /// strings `trusted_mcp_servers` uses); values are the exact tool names
+    /// the server may expose.
+    ///
+    /// Two effects, both via the `mcp_server_drift` rule (no new RuleId —
+    /// drift detection is the natural home for "a tool appeared that
+    /// policy does not allow"):
+    ///
+    /// 1. **At drift time, on a newly-added tool.** When `mcp_server_drift`
+    ///    detects that the current inventory added a tool to a server whose
+    ///    name is a key here, and that tool is NOT in the listed set, the
+    ///    drift finding for that server is **upgraded to High severity**
+    ///    (the default drift severity is Medium). Drift inside the allowed
+    ///    set stays Medium; an `mcp_allowed_tools` entry of `[]` for a
+    ///    server therefore forbids ANY tool on that server (every new tool
+    ///    is out-of-set).
+    /// 2. **At lockfile load, on the lockfile's recorded tools.** When the
+    ///    lockfile itself records tools outside the allowed set — for
+    ///    example, the lockfile was refreshed against a config that already
+    ///    has a tool policy forbids — a `mcp_server_drift` finding fires
+    ///    (severity High) naming the disallowed tools. This catches the
+    ///    "snuck a tool past `tirith mcp lock`" failure mode.
+    ///
+    /// A server NOT listed here is unconstrained — `mcp_allowed_tools` is
+    /// an opt-in tightening. Combine with `trusted_mcp_servers` to first
+    /// declare a server trusted (suppress config-side noise) and then
+    /// declare which of its tools are acceptable.
+    #[serde(default)]
+    pub mcp_allowed_tools: HashMap<String, Vec<String>>,
     /// Glob patterns to ignore during scan.
     #[serde(default)]
     pub ignore_patterns: Vec<String>,

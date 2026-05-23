@@ -690,6 +690,442 @@ fn print_drift_json(
     super::write_json_stdout(&out, &ctx)
 }
 
+// ===========================================================================
+// `tirith mcp policy init` — scaffold a starter MCP policy
+// ===========================================================================
+
+/// Run `tirith mcp policy init`.
+///
+/// Reads the committed `.tirith/mcp.lock` and writes
+/// `.tirith/mcp-policy.yaml.example` — a scaffold of `scan.trusted_mcp_servers`
+/// and `scan.mcp_allowed_tools` entries (commented out) listing every server
+/// currently locked and the tools it currently exposes. The operator copies
+/// the file in, uncomments the entries they wish to declare, and merges them
+/// into `.tirith/policy.yaml` themselves.
+///
+/// A separate `.example` file is cleaner than mutating the operator's
+/// existing policy: the operator can `diff` it against their working
+/// `policy.yaml` and integrate the bits they want.
+///
+/// Determinism: running `mcp policy init` twice against the same lockfile
+/// produces a byte-identical file. The lockfile is sorted by
+/// `(name, source_config)` (see `mcp_lock::McpLockfile::from_inventory`), so
+/// the policy scaffold's server order is stable.
+///
+/// Exit codes:
+/// * `0` — the example policy was written (including the "no lockfile" case —
+///   a header-only example is still written so the operator has a starting
+///   point; the body lists nothing because there is nothing to list yet).
+/// * `1` — the lockfile is unparseable (the operator must fix or refresh it
+///   before generating policy from it), the repo root cannot be determined,
+///   or the example file cannot be written.
+/// * `2` — usage / argument error (e.g. an unrecognized `--format` value).
+///   Currently unused but reserved so future arg validation has a place to
+///   land without rewriting consumers.
+///
+/// `--format json` emits a planned-policy preview (the same scaffold the
+/// human form writes, plus the example file path and the lockfile path) so
+/// a CI integration can ingest the proposed policy without reading the
+/// example file off disk.
+pub fn policy_init(json: bool, force: bool) -> i32 {
+    let repo_root = match resolve_repo_root() {
+        Some(r) => r,
+        None => {
+            report_error_for(
+                json,
+                "tirith mcp policy init",
+                "could not determine the repository root — run `tirith mcp policy init` inside a \
+                 git repository, or from a directory whose ancestor has one",
+            );
+            return 1;
+        }
+    };
+    policy_init_for_root(&repo_root, json, force)
+}
+
+/// `policy init` against an explicit repo root. Split out so tests can drive
+/// the command against a tempdir without mutating process-wide environment
+/// variables.
+pub(crate) fn policy_init_for_root(repo_root: &Path, json: bool, force: bool) -> i32 {
+    let lock_path = repo_root.join(".tirith").join(MCP_LOCK_FILENAME);
+    let example_path = repo_root.join(".tirith").join("mcp-policy.yaml.example");
+
+    // Reject overwriting an existing example file unless --force is passed,
+    // mirroring `tirith policy init`. The operator may have edited the
+    // example to track their working policy.
+    if example_path.exists() && !force {
+        report_error_for(
+            json,
+            "tirith mcp policy init",
+            &format!(
+                "{} already exists (use --force to overwrite)",
+                example_path.display()
+            ),
+        );
+        return 1;
+    }
+
+    // Load the lockfile if present. A missing lockfile is NOT fatal — we
+    // still generate a header-only example so the operator has a starting
+    // point. A truly unparseable lockfile is fatal because we cannot tell
+    // what to list.
+    let lockfile_opt: Option<McpLockfile> = match mcp_lock::load_lockfile(&lock_path) {
+        Ok(l) => Some(l),
+        Err(McpLockLoadError::NotFound) => None,
+        Err(e) => {
+            report_error_for(
+                json,
+                "tirith mcp policy init",
+                &format!(
+                    "{}: {e}. Run `tirith mcp lock` to refresh the lockfile before generating \
+                     a policy scaffold from it.",
+                    lock_path.display()
+                ),
+            );
+            return 1;
+        }
+    };
+
+    // Build the scaffold. Both forms (human YAML, JSON preview) derive from
+    // this same structured shape, so they cannot drift apart.
+    let scaffold = build_policy_scaffold(lockfile_opt.as_ref());
+
+    // Ensure `.tirith/` exists.
+    if let Some(parent) = example_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            report_error_for(
+                json,
+                "tirith mcp policy init",
+                &format!("failed to create {}: {e}", parent.display()),
+            );
+            return 1;
+        }
+    }
+
+    let yaml_body = render_policy_scaffold_yaml(&scaffold);
+    if let Err(e) = std::fs::write(&example_path, &yaml_body) {
+        report_error_for(
+            json,
+            "tirith mcp policy init",
+            &format!("failed to write {}: {e}", example_path.display()),
+        );
+        return 1;
+    }
+
+    if json {
+        if !print_policy_init_json(repo_root, &lock_path, &example_path, &scaffold) {
+            return 1;
+        }
+    } else {
+        print_policy_init_human(&lock_path, &example_path, &scaffold);
+    }
+
+    0
+}
+
+/// The structured scaffold the human and JSON forms share. Each entry is one
+/// server name + the tool names the lockfile recorded for it.
+#[derive(Debug, Clone, serde::Serialize)]
+struct PolicyScaffold {
+    /// `true` when no lockfile was found — the human and JSON output report
+    /// this distinctly so the operator knows the scaffold is empty by
+    /// construction, not because every server got dropped.
+    lockfile_present: bool,
+    /// Servers in `(name, source_config)` order — the lockfile's own
+    /// canonical order.
+    servers: Vec<PolicyScaffoldServer>,
+}
+
+/// One server entry in the policy scaffold.
+#[derive(Debug, Clone, serde::Serialize)]
+struct PolicyScaffoldServer {
+    name: String,
+    source_config: String,
+    tools: Vec<String>,
+}
+
+/// Build the policy scaffold from a (possibly absent) lockfile.
+///
+/// A missing lockfile yields an empty `servers` list — the YAML / JSON
+/// scaffold is still emitted, with `lockfile_present: false`, so the
+/// operator sees the structure even before they run `mcp lock`.
+///
+/// **Deduplication.** A lockfile sorts servers by `(name, source_config)`,
+/// so the same name can legitimately appear twice in different configs
+/// (e.g. `.mcp.json` and `.vscode/mcp.json`). The scaffold's
+/// `trusted_mcp_servers` entry is a `name` only — keying off name alone
+/// would emit the same name twice. The body keeps the per-config detail
+/// for `mcp_allowed_tools` (one tools-list per server entry, even when
+/// names repeat), but the trusted-servers commented list deduplicates by
+/// name so the YAML is operator-friendly.
+fn build_policy_scaffold(lockfile: Option<&McpLockfile>) -> PolicyScaffold {
+    match lockfile {
+        Some(lock) => PolicyScaffold {
+            lockfile_present: true,
+            servers: lock
+                .servers
+                .iter()
+                .map(|s| PolicyScaffoldServer {
+                    name: s.name.clone(),
+                    source_config: s.source_config.clone(),
+                    tools: s.tools.clone(),
+                })
+                .collect(),
+        },
+        None => PolicyScaffold {
+            lockfile_present: false,
+            servers: Vec::new(),
+        },
+    }
+}
+
+/// Render the scaffold to its YAML on-disk form.
+///
+/// Every server's entry is **commented out** with `#` so importing the
+/// example into a working `policy.yaml` does not silently widen the
+/// operator's trust set — they must uncomment what they intend to trust.
+/// This matches `tirith policy init`'s convention: defaults are
+/// commented; the operator opts in.
+///
+/// Determinism: the lockfile is already sorted, so two invocations against
+/// the same lockfile produce the same bytes. A trailing newline is always
+/// emitted.
+fn render_policy_scaffold_yaml(scaffold: &PolicyScaffold) -> String {
+    // Header — explains what the file is, how to use it, and (critically)
+    // that the entries are commented out by design.
+    let mut s = String::new();
+    s.push_str("# Tirith MCP policy scaffold (example)\n");
+    s.push_str("# Generated by `tirith mcp policy init` from .tirith/mcp.lock.\n");
+    s.push_str("#\n");
+    s.push_str("# This is an EXAMPLE — every entry below is commented out. Copy the\n");
+    s.push_str("# entries you want into `.tirith/policy.yaml` (merging under any\n");
+    s.push_str("# existing `scan:` block) and uncomment them. Re-run\n");
+    s.push_str("# `tirith mcp policy init --force` after refreshing the lockfile to\n");
+    s.push_str("# regenerate this file from the current inventory.\n");
+    s.push_str("#\n");
+    s.push_str("# Documentation: https://tirith.dev/docs/policy#mcp\n");
+    s.push('\n');
+
+    if !scaffold.lockfile_present {
+        s.push_str("# No `.tirith/mcp.lock` was found — run `tirith mcp lock` first to\n");
+        s.push_str("# capture the inventory, then re-run this command to populate the\n");
+        s.push_str("# scaffold below.\n");
+        s.push('\n');
+    }
+
+    if scaffold.servers.is_empty() {
+        s.push_str("# The lockfile recorded no MCP servers, so there is nothing to\n");
+        s.push_str("# scaffold yet. The structure is shown below as a template:\n");
+        s.push_str("#\n");
+        s.push_str("# scan:\n");
+        s.push_str("#   trusted_mcp_servers:\n");
+        s.push_str("#     - example-server\n");
+        s.push_str("#   mcp_allowed_tools:\n");
+        s.push_str("#     example-server:\n");
+        s.push_str("#       - tool_a\n");
+        s.push_str("#       - tool_b\n");
+        return s;
+    }
+
+    s.push_str("scan:\n");
+
+    // `trusted_mcp_servers`: deduplicate by name, since the same server
+    // name can legitimately appear in two different source configs.
+    let mut seen_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    s.push_str("  # Server names that are trusted: every per-server MCP config\n");
+    s.push_str("  # finding (insecure URL, raw IP, suspicious args, wildcard tools,\n");
+    s.push_str("  # duplicate name) is suppressed for these, and drift on them does\n");
+    s.push_str("  # NOT raise the `mcp_server_drift` finding. Uncomment the names\n");
+    s.push_str("  # whose surface you have reviewed and accepted.\n");
+    s.push_str("  # trusted_mcp_servers:\n");
+    for server in &scaffold.servers {
+        if seen_names.insert(server.name.as_str()) {
+            s.push_str(&format!(
+                "  #   - {}    # from {}\n",
+                yaml_safe_scalar(&server.name),
+                yaml_safe_inline_comment(&server.source_config),
+            ));
+        }
+    }
+
+    // `mcp_allowed_tools`: per-server tool allow-list. Emit one entry per
+    // server (keyed by name); when the same name appears twice with
+    // different tool lists, prefer the union for the scaffold so the
+    // operator sees every tool the lockfile records.
+    s.push('\n');
+    s.push_str("  # Per-server allowed tools. The keys are MCP server names; the\n");
+    s.push_str("  # values are the tools the server may expose. A tool the lockfile\n");
+    s.push_str("  # records that is NOT in this set surfaces a finding (`mcp_server_drift`,\n");
+    s.push_str("  # severity High). Drift that adds a tool outside the set upgrades\n");
+    s.push_str("  # the drift finding from Medium to High. A server not listed here\n");
+    s.push_str("  # is unconstrained — the gate is opt-in.\n");
+    s.push_str("  # mcp_allowed_tools:\n");
+
+    let mut name_to_tools: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
+        std::collections::BTreeMap::new();
+    let mut name_to_first_source: std::collections::BTreeMap<&str, &str> =
+        std::collections::BTreeMap::new();
+    for server in &scaffold.servers {
+        let entry = name_to_tools.entry(server.name.as_str()).or_default();
+        for t in &server.tools {
+            entry.insert(t.as_str());
+        }
+        name_to_first_source
+            .entry(server.name.as_str())
+            .or_insert(server.source_config.as_str());
+    }
+    for (name, tools) in &name_to_tools {
+        let source = name_to_first_source.get(name).copied().unwrap_or("");
+        if tools.is_empty() {
+            s.push_str(&format!(
+                "  #   {}: []    # from {} — no tools declared\n",
+                yaml_safe_scalar(name),
+                yaml_safe_inline_comment(source),
+            ));
+        } else {
+            s.push_str(&format!(
+                "  #   {}:    # from {}\n",
+                yaml_safe_scalar(name),
+                yaml_safe_inline_comment(source),
+            ));
+            for tool in tools {
+                s.push_str(&format!("  #     - {}\n", yaml_safe_scalar(tool)));
+            }
+        }
+    }
+
+    s
+}
+
+/// Render a scalar (server name / tool name) for inclusion in a YAML
+/// document. Returns the input unmodified when it is safe as a bare
+/// scalar; quotes (`"..."`) and JSON-escapes when it contains a YAML
+/// special character, whitespace, or any non-printable byte.
+///
+/// This is **load-bearing for safety**: the lockfile carries server /
+/// tool names from arbitrary config files, and an attacker (or a
+/// careless author) can declare a name containing `:` (would split the
+/// YAML key), `#` (would split off the value as a comment), a newline
+/// (would break the document structure), or an ANSI escape (would
+/// reach the operator's terminal when the example is `cat`-ed). The
+/// quoted/escaped form is unambiguous in every case.
+fn yaml_safe_scalar(s: &str) -> String {
+    // Empty string must always be quoted — bare empty is invalid YAML.
+    if s.is_empty() {
+        return "\"\"".to_string();
+    }
+    // A string is safe as a bare scalar iff every byte is a printable
+    // ASCII non-special character. The set of "special" YAML indicators
+    // is conservative on purpose — we'd rather quote a safe string than
+    // emit ambiguous YAML.
+    let needs_quoting = s.bytes().any(|b| {
+        // Any byte that could break YAML structure or terminal output.
+        b == b':'
+            || b == b'#'
+            || b == b'-'
+            || b == b'?'
+            || b == b','
+            || b == b'['
+            || b == b']'
+            || b == b'{'
+            || b == b'}'
+            || b == b'&'
+            || b == b'*'
+            || b == b'!'
+            || b == b'|'
+            || b == b'>'
+            || b == b'\''
+            || b == b'"'
+            || b == b'%'
+            || b == b'@'
+            || b == b'`'
+            || b == b' '
+            || b == b'\t'
+            || b < 0x20
+            || b == 0x7f
+    });
+    if !needs_quoting {
+        return s.to_string();
+    }
+    // JSON-style escaping (a strict subset of YAML's double-quoted form
+    // — `serde_json::to_string` handles every control byte safely).
+    serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s.escape_debug()))
+}
+
+/// Render a string for use as an inline `#`-comment suffix. We don't
+/// embed source-config paths inside YAML keys (they are not keys), so
+/// the unsafe characters we worry about are the line-breakers
+/// (`\n`, `\r`) and ANSI escapes. The simplest correct rendering is
+/// Rust's `Debug` form, which always emits printable bytes only.
+fn yaml_safe_inline_comment(s: &str) -> String {
+    // If the string contains no control bytes, return it as-is for
+    // readability. Otherwise debug-escape the whole thing.
+    if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        format!("{s:?}")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Human-readable summary for `tirith mcp policy init`.
+fn print_policy_init_human(lock_path: &Path, example_path: &Path, scaffold: &PolicyScaffold) {
+    if !scaffold.lockfile_present {
+        eprintln!(
+            "tirith mcp policy init: no lockfile at {} — wrote a header-only scaffold.",
+            lock_path.display()
+        );
+        eprintln!(
+            "  Run `tirith mcp lock` first to capture the MCP inventory, then re-run this command."
+        );
+    } else {
+        let server_count = scaffold.servers.len();
+        let total_tool_count: usize = scaffold.servers.iter().map(|s| s.tools.len()).sum();
+        eprintln!(
+            "tirith mcp policy init: scaffolded {} server(s) and {} tool(s) from {}.",
+            server_count,
+            total_tool_count,
+            lock_path.display(),
+        );
+        eprintln!("  Every entry is commented out — uncomment the ones you wish to declare.");
+    }
+    eprintln!("  wrote {}", example_path.display());
+    println!("{}", example_path.display());
+}
+
+/// JSON output for `tirith mcp policy init`.
+fn print_policy_init_json(
+    repo_root: &Path,
+    lock_path: &Path,
+    example_path: &Path,
+    scaffold: &PolicyScaffold,
+) -> bool {
+    #[derive(serde::Serialize)]
+    struct JsonOut<'a> {
+        schema_version: u32,
+        repo_root: String,
+        lock_path: String,
+        example_path: String,
+        lockfile_present: bool,
+        server_count: usize,
+        tool_count: usize,
+        scaffold: &'a PolicyScaffold,
+    }
+
+    let total_tool_count: usize = scaffold.servers.iter().map(|s| s.tools.len()).sum();
+    let out = JsonOut {
+        schema_version: 1,
+        repo_root: repo_root.display().to_string(),
+        lock_path: lock_path.display().to_string(),
+        example_path: example_path.display().to_string(),
+        lockfile_present: scaffold.lockfile_present,
+        server_count: scaffold.servers.len(),
+        tool_count: total_tool_count,
+        scaffold,
+    };
+
+    super::write_json_stdout(&out, "tirith mcp policy init: failed to write JSON output")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -995,5 +1431,260 @@ mod tests {
         let escaped = escape_name("\x1b[31mEVIL");
         assert!(!escaped.contains('\x1b'), "raw ESC must not survive");
         assert!(escaped.contains("\\u{1b}"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunk 3 — `tirith mcp policy init` scaffolding.
+    // -----------------------------------------------------------------------
+
+    /// Build a repo with one stdio server declaring two tools, lockfile written.
+    fn repo_with_locked_server_and_tools() -> tempfile::TempDir {
+        let repo = tempdir().unwrap();
+        fs::write(
+            repo.path().join(".mcp.json"),
+            r#"{ "mcpServers": { "fs": { "command": "node",
+                "tools": ["read_file", "write_file"] } } }"#,
+        )
+        .unwrap();
+        let inventory = mcp_lock::build_inventory(repo.path());
+        let lockfile = McpLockfile::from_inventory(&inventory);
+        let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
+        write_lockfile(&lock_path, &lockfile).expect("write");
+        repo
+    }
+
+    #[test]
+    fn policy_init_writes_example_file_with_lockfile_content() {
+        let repo = repo_with_locked_server_and_tools();
+        let code = policy_init_for_root(repo.path(), false, false);
+        assert_eq!(code, 0, "policy init must succeed: exit code {code}");
+        let example_path = repo.path().join(".tirith").join("mcp-policy.yaml.example");
+        assert!(
+            example_path.is_file(),
+            ".tirith/mcp-policy.yaml.example must exist after policy init"
+        );
+        let body = fs::read_to_string(&example_path).unwrap();
+        // The server name and the tool names appear in the scaffold.
+        assert!(body.contains("fs"), "server name must appear: {body}");
+        assert!(body.contains("read_file"), "tool name must appear: {body}");
+        assert!(body.contains("write_file"), "tool name must appear: {body}");
+        // And every entry is commented out by design.
+        for needle in ["- fs", "fs:"] {
+            // Either appears, but only as a commented form (preceded by `#`).
+            let lines: Vec<&str> = body
+                .lines()
+                .filter(|l| l.contains(needle) && !l.trim_start().starts_with('#'))
+                .collect();
+            assert!(
+                lines.is_empty(),
+                "an uncommented `{needle}` slipped into the scaffold: {lines:?}",
+            );
+        }
+        // Includes the documentation header.
+        assert!(body.contains("Tirith MCP policy scaffold"));
+        assert!(body.contains("scan:"));
+        assert!(body.contains("trusted_mcp_servers"));
+        assert!(body.contains("mcp_allowed_tools"));
+    }
+
+    #[test]
+    fn policy_init_is_deterministic_for_same_lockfile() {
+        // Running policy_init twice against the same lockfile produces a
+        // byte-identical example file. --force lets us regenerate without
+        // pre-deleting.
+        let repo = repo_with_locked_server_and_tools();
+        let code = policy_init_for_root(repo.path(), false, false);
+        assert_eq!(code, 0);
+        let example_path = repo.path().join(".tirith").join("mcp-policy.yaml.example");
+        let first = fs::read_to_string(&example_path).unwrap();
+
+        let code = policy_init_for_root(repo.path(), false, true); // force overwrite
+        assert_eq!(code, 0);
+        let second = fs::read_to_string(&example_path).unwrap();
+
+        assert_eq!(
+            first, second,
+            "policy_init must produce byte-identical output across re-runs",
+        );
+    }
+
+    #[test]
+    fn policy_init_refuses_to_overwrite_without_force() {
+        let repo = repo_with_locked_server_and_tools();
+        let code = policy_init_for_root(repo.path(), false, false);
+        assert_eq!(code, 0);
+        // Second run without --force should fail with exit 1.
+        let code = policy_init_for_root(repo.path(), false, false);
+        assert_eq!(
+            code, 1,
+            "second policy_init without --force must refuse to overwrite",
+        );
+        // The example file is still the FIRST one (we didn't overwrite).
+        let example_path = repo.path().join(".tirith").join("mcp-policy.yaml.example");
+        assert!(example_path.is_file());
+    }
+
+    #[test]
+    fn policy_init_overwrites_with_force() {
+        let repo = repo_with_locked_server_and_tools();
+        let example_path = repo.path().join(".tirith").join("mcp-policy.yaml.example");
+        // Pre-create a sentinel that policy_init must overwrite.
+        fs::create_dir_all(example_path.parent().unwrap()).unwrap();
+        fs::write(&example_path, "SENTINEL").unwrap();
+
+        let code = policy_init_for_root(repo.path(), false, true);
+        assert_eq!(code, 0);
+        let body = fs::read_to_string(&example_path).unwrap();
+        assert!(!body.contains("SENTINEL"), "--force must overwrite");
+        assert!(body.contains("Tirith MCP policy scaffold"));
+    }
+
+    #[test]
+    fn policy_init_handles_missing_lockfile() {
+        // No .tirith/mcp.lock — policy_init still writes a header-only
+        // scaffold (the operator gets a starting point) and exits 0.
+        let repo = tempdir().unwrap();
+        let code = policy_init_for_root(repo.path(), false, false);
+        assert_eq!(code, 0, "missing lockfile must not be fatal");
+        let example_path = repo.path().join(".tirith").join("mcp-policy.yaml.example");
+        let body = fs::read_to_string(&example_path).unwrap();
+        assert!(body.contains("Tirith MCP policy scaffold"));
+        assert!(
+            body.contains("No `.tirith/mcp.lock` was found"),
+            "header should explain the missing-lockfile case: {body}",
+        );
+        // No server entries.
+        assert!(!body.contains("- fs"));
+    }
+
+    #[test]
+    fn policy_init_fails_on_unparseable_lockfile() {
+        // An unparseable lockfile IS fatal — we cannot tell what to list.
+        let repo = tempdir().unwrap();
+        let lock_dir = repo.path().join(".tirith");
+        fs::create_dir_all(&lock_dir).unwrap();
+        fs::write(lock_dir.join(MCP_LOCK_FILENAME), "{not valid json").unwrap();
+        let code = policy_init_for_root(repo.path(), false, false);
+        assert_eq!(
+            code, 1,
+            "unparseable lockfile must fail with exit 1: {code}",
+        );
+    }
+
+    #[test]
+    fn policy_init_handles_lockfile_with_no_servers() {
+        // A lockfile that was generated against a repo with no MCP configs
+        // (or all-empty MCP configs) lists zero servers. The scaffold
+        // emits a template form rather than nothing — the operator still
+        // gets to see what they would fill in.
+        let repo = tempdir().unwrap();
+        let inventory = mcp_lock::build_inventory(repo.path());
+        let lockfile = McpLockfile::from_inventory(&inventory);
+        let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
+        write_lockfile(&lock_path, &lockfile).unwrap();
+        let code = policy_init_for_root(repo.path(), false, false);
+        assert_eq!(code, 0);
+        let body = fs::read_to_string(repo.path().join(".tirith").join("mcp-policy.yaml.example"))
+            .unwrap();
+        assert!(
+            body.contains("The lockfile recorded no MCP servers"),
+            "scaffold should explain the empty case and emit a template: {body}",
+        );
+        // The template uses an "example-server" name so the operator sees
+        // the shape they should fill in.
+        assert!(body.contains("example-server"));
+    }
+
+    #[test]
+    fn policy_init_redacts_hostile_server_name() {
+        // A server name carrying ANSI escape / newline / backspace must
+        // NOT inject raw bytes into the example file (which would in turn
+        // inject when the operator `cat`s the file). yaml_safe_scalar
+        // quotes-and-escapes them.
+        let repo = tempdir().unwrap();
+        // Manually build a lockfile with a hostile name (bypass the
+        // JSON parser, which would also accept escapes).
+        let inv = mcp_lock::McpInventory {
+            servers: vec![mcp_lock::McpServerEntry {
+                name: "ev\x1b[31mil\nname".into(),
+                transport: mcp_lock::McpTransport::Stdio {
+                    command: "node".into(),
+                    args: vec![],
+                    env: vec![],
+                },
+                tools: vec!["weird\ntool".into()],
+                source_config: ".mcp.json".into(),
+            }],
+            configs: vec![".mcp.json".into()],
+            malformed_configs: vec![],
+        };
+        let lockfile = McpLockfile::from_inventory(&inv);
+        let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
+        write_lockfile(&lock_path, &lockfile).unwrap();
+
+        let code = policy_init_for_root(repo.path(), false, false);
+        assert_eq!(code, 0);
+        let body = fs::read_to_string(repo.path().join(".tirith").join("mcp-policy.yaml.example"))
+            .unwrap();
+        // No raw ESC, BS, or unescaped newline-in-a-token. (Newlines as
+        // line separators are fine — we check character context.)
+        for line in body.lines() {
+            assert!(
+                !line.contains('\x1b'),
+                "ESC byte leaked into scaffold line: {line:?}",
+            );
+            assert!(
+                !line.contains('\x08'),
+                "BS byte leaked into scaffold line: {line:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn policy_init_json_format_outputs_structured_preview() {
+        let repo = repo_with_locked_server_and_tools();
+        let code = policy_init_for_root(repo.path(), true, false);
+        assert_eq!(code, 0);
+        // The file is still on disk.
+        let example_path = repo.path().join(".tirith").join("mcp-policy.yaml.example");
+        assert!(example_path.is_file());
+    }
+
+    #[test]
+    fn build_policy_scaffold_dedups_repeated_server_names_in_yaml() {
+        // Two distinct lockfile entries for the same server name (a
+        // legal lockfile state) must not produce two `- name` lines in
+        // the `trusted_mcp_servers` block — that would be confusing
+        // duplication for the operator.
+        let scaffold = PolicyScaffold {
+            lockfile_present: true,
+            servers: vec![
+                PolicyScaffoldServer {
+                    name: "dup".to_string(),
+                    source_config: ".mcp.json".to_string(),
+                    tools: vec!["a".to_string()],
+                },
+                PolicyScaffoldServer {
+                    name: "dup".to_string(),
+                    source_config: ".vscode/mcp.json".to_string(),
+                    tools: vec!["b".to_string()],
+                },
+            ],
+        };
+        let yaml = render_policy_scaffold_yaml(&scaffold);
+        // Count the lines that look like `#   - dup` (a trusted-servers entry).
+        let trust_lines: Vec<&str> = yaml
+            .lines()
+            .filter(|l| l.trim_start().starts_with("#   - dup"))
+            .collect();
+        assert_eq!(
+            trust_lines.len(),
+            1,
+            "duplicate server name should appear once in trusted_mcp_servers: \
+             got {trust_lines:?}",
+        );
+        // And the mcp_allowed_tools block lists the UNION of tools across both entries.
+        assert!(yaml.contains("- a"));
+        assert!(yaml.contains("- b"));
     }
 }

@@ -413,6 +413,7 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
     let known_scan_fields = [
         "additional_config_files",
         "trusted_mcp_servers",
+        "mcp_allowed_tools",
         "ignore_patterns",
         "fail_on",
         "profiles",

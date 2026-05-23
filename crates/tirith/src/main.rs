@@ -1555,6 +1555,58 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+
+    /// Scaffold a starter MCP policy from .tirith/mcp.lock
+    #[command(
+        name = "policy",
+        after_help = "\
+Reads the committed .tirith/mcp.lock and writes .tirith/mcp-policy.yaml.example
+— a scaffold of `scan.trusted_mcp_servers` and `scan.mcp_allowed_tools` entries
+listing every server currently locked and the tools it currently exposes.
+
+Every entry in the example is commented out by design: copying the file
+straight into your policy must NEVER silently widen trust. The operator
+reviews the scaffold, uncomments the entries they intend to declare, and
+merges them into .tirith/policy.yaml.
+
+A separate .example file is cleaner than mutating an existing policy.yaml —
+you can diff the scaffold against your working policy and integrate the bits
+you want.
+
+Determinism: running `tirith mcp policy init` twice against the same lockfile
+produces a byte-identical example file. The lockfile is already sorted by
+(name, source_config), so server order is stable.
+
+Examples:
+  tirith mcp policy init
+  tirith mcp policy init --force            # overwrite an existing example
+  tirith mcp policy init --format json     # planned-policy preview"
+    )]
+    Policy {
+        #[command(subcommand)]
+        action: McpPolicyAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpPolicyAction {
+    /// Scaffold a starter MCP policy from the current lockfile
+    #[command(after_help = "\
+Examples:
+  tirith mcp policy init
+  tirith mcp policy init --force
+  tirith mcp policy init --format json")]
+    Init {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+        /// Overwrite an existing .tirith/mcp-policy.yaml.example
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1837,6 +1889,16 @@ fn run() {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::mcp::diff(json)
             }
+            McpAction::Policy { action } => match action {
+                McpPolicyAction::Init {
+                    format,
+                    json,
+                    force,
+                } => {
+                    let (_, json) = HumanJsonFormat::resolve(format, json);
+                    cli::mcp::policy_init(json, force)
+                }
+            },
         },
 
         Commands::Gateway { action } => match action {

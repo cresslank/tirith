@@ -47,9 +47,27 @@ blocklist: []
 #     min_findings: 3
 #     action: block
 
-# Glob patterns to ignore during scan
+# Scan configuration overrides.
 scan:
+  # Glob patterns to ignore during scan
   ignore_patterns: []
+
+  # MCP server names you trust. A name listed here suppresses every
+  # per-server MCP config finding (insecure transport, raw IP, suspicious
+  # args, wildcard tools, duplicate name) and exempts the server from
+  # drift detection via `tirith mcp verify` / the `mcp_server_drift` rule.
+  # Run `tirith mcp policy init` to scaffold this list from `.tirith/mcp.lock`.
+  # trusted_mcp_servers:
+  #   - my-trusted-server
+
+  # Per-server allowed tools. Keys are MCP server names; values are the
+  # tool names that server may expose. A tool the lockfile records that
+  # is NOT in this set raises a High-severity `mcp_server_drift` finding,
+  # and drift that adds a tool outside the set upgrades the drift finding
+  # from Medium to High. Servers not listed here are unconstrained.
+  # mcp_allowed_tools:
+  #   my-trusted-server:
+  #     - read_only
 "#;
 
 const MINIMAL_TEMPLATE: &str = r#"fail_mode: open
@@ -102,12 +120,19 @@ blocklist: []
 #     patterns:
 #       - "get.docker.com"
 
-# Glob patterns to ignore during `tirith scan`.
+# Scan configuration.
 scan:
   ignore_patterns:
     - "node_modules"
     - "target"
     - ".git"
+
+  # MCP server names you trust — suppresses per-server MCP config findings
+  # and drift detection for those names. See `tirith mcp policy init`.
+  # trusted_mcp_servers: []
+
+  # Per-server allowed tools — see `tirith mcp policy init` to scaffold.
+  # mcp_allowed_tools: {}
 "#;
 
 /// `ci-strict` — locked-down settings for an automated CI environment.
@@ -162,6 +187,15 @@ scan:
     - "node_modules"
     - "target"
     - ".git"
+
+  # MCP server names CI considers trusted. Keep this tight — a trusted name
+  # silences every per-server MCP config finding and exempts the server
+  # from drift detection in CI. Generate from `tirith mcp policy init`.
+  # trusted_mcp_servers: []
+
+  # Per-server allowed tools — a CI guardrail against an agent or merge
+  # smuggling a new MCP tool past the lockfile. See `tirith mcp policy init`.
+  # mcp_allowed_tools: {}
 "#;
 
 /// `ai-agent-heavy` — tuned for environments where AI agents run many
@@ -228,12 +262,23 @@ allowlist: []
 # URL / host patterns that are always blocked (overrides allowlist).
 blocklist: []
 
-# Glob patterns to ignore during `tirith scan`.
+# `tirith scan` configuration.
 scan:
   ignore_patterns:
     - "node_modules"
     - "target"
     - ".git"
+
+  # MCP server names you trust. Agents that load arbitrary MCP servers from
+  # their environment make a tight `trusted_mcp_servers` list especially
+  # valuable — every untrusted server raises findings, and drift on a
+  # trusted server is silent. Scaffold from `tirith mcp policy init`.
+  # trusted_mcp_servers: []
+
+  # Per-server allowed tools — pin the exact tool set you accept for each
+  # MCP server an agent may use. A new tool outside the set surfaces as a
+  # High-severity drift finding. See `tirith mcp policy init`.
+  # mcp_allowed_tools: {}
 "#;
 
 /// A curated starter policy selected via `tirith policy init --template`.

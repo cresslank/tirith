@@ -551,6 +551,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             ctx.file_path.as_deref(),
             ctx.repo_root.as_deref().map(std::path::Path::new),
             ctx.is_config_override,
+            &policy.scan.trusted_mcp_servers,
         ));
 
         if crate::rules::codefile::is_code_file(
@@ -587,10 +588,18 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         // module rebuilds the current inventory and diffs it against the
         // lockfile's recorded one. Self-selecting by path; a non-mcp.lock
         // file produces nothing.
+        //
+        // Policy: `trusted_mcp_servers` filters drift entries before a
+        // finding is built (a server the operator has trusted does not
+        // raise drift), and `mcp_allowed_tools` controls both the
+        // lockfile-side disallowed-tool finding and the per-server drift
+        // severity ladder. See `mcpdrift::check` for the precise semantics.
         if crate::rules::mcpdrift::is_mcp_lockfile(ctx.file_path.as_deref()) {
             findings.extend(crate::rules::mcpdrift::check(
                 &ctx.input,
                 ctx.file_path.as_deref(),
+                &policy.scan.trusted_mcp_servers,
+                &policy.scan.mcp_allowed_tools,
             ));
         }
 

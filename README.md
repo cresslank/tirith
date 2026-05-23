@@ -326,6 +326,8 @@ Run `tirith mcp-server` or use `tirith setup <tool> --with-mcp` to register tiri
 
 `tirith mcp verify` is the gating companion: it loads the committed lockfile, rebuilds the current inventory, and exits 1 when the two differ (0 when they match, 2 on a usage error such as a missing lockfile). `tirith mcp diff` shows the same drift informationally — always exits 0. Drift is also surfaced through `tirith scan` as the `mcp_server_drift` rule (Severity Medium), so a pre-commit hook or CI integration catches an MCP-surface change the same way it catches an un-pinned action. Env values and URL userinfos are never printed by `verify` / `diff` — only the names of the variables / credentials that changed.
 
+Two policy fields govern which servers and tools are accepted: `scan.trusted_mcp_servers` lists server names whose per-server MCP config findings are suppressed and whose drift is silenced, and `scan.mcp_allowed_tools` declares, per server, the exact tools the server may expose — a tool that lands in the lockfile outside that set surfaces a High-severity `mcp_server_drift` finding, and drift that adds a tool outside the set upgrades from Medium to High. `tirith mcp policy init` scaffolds a starter version of both blocks from the current lockfile into `.tirith/mcp-policy.yaml.example`, with every entry commented out so importing the example never silently widens trust.
+
 ### Config file scanning
 
 `tirith scan` detects prompt injection and hidden payloads in AI config files. It prioritizes and scans 50+ known AI config file patterns:
