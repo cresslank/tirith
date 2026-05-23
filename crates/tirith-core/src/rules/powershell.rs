@@ -259,14 +259,29 @@ fn check_inline_download_execute(
 
         let Some(ref cmd) = seg.command else { continue };
         let cmd_base = normalize_cmd_base(cmd, shell);
-        if cmd_base != "iex" && cmd_base != "invoke-expression" {
+        // Match both `iex (iwr ...)` (whitespace before `(`) — where the
+        // tokenizer gives us a clean `iex` command + arg starting with `(` —
+        // and `iex(iwr ...)` (no space before `(`) — where the tokenizer
+        // pulls the open-paren into the command token itself, producing e.g.
+        // `iex(iwr`. Both forms are semantically identical to PowerShell.
+        let is_iex_leading = cmd_base == "iex"
+            || cmd_base == "invoke-expression"
+            || cmd_base.starts_with("iex(")
+            || cmd_base.starts_with("invoke-expression(");
+        if !is_iex_leading {
             continue;
         }
 
-        let has_url_arg = seg.args.iter().any(|a| {
-            let n = normalize_shell_token(a.trim(), shell);
-            n.contains("://")
-        });
+        // The URL may be in the args (whitespace form), or in the command
+        // token itself when the no-space form has no whitespace before the
+        // URL (`iex(iwr` would have the URL split into the next token; but
+        // `iex(iwr,https://...)` or similar might pull `://` into the
+        // command token itself). Scan both surfaces.
+        let has_url_arg = cmd_base.contains("://")
+            || seg.args.iter().any(|a| {
+                let n = normalize_shell_token(a.trim(), shell);
+                n.contains("://")
+            });
         if !has_url_arg {
             continue;
         }

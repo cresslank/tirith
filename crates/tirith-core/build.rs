@@ -401,7 +401,12 @@ const PATTERN_TABLE: &[PatternEntry] = &[
     },
     PatternEntry {
         id: "ps_iex_inline",
-        tier1_exec_fragments: &[r"(?i:iex)\s"],
+        // Accept both `iex (iwr ...)` (whitespace) and `iex(iwr ...)` (no
+        // space before the opening paren) — PS treats them as semantically
+        // identical, so the gate must too. `[\s(]` covers both forms; a
+        // trailing word-boundary would not match `(` so we use a character
+        // class explicitly.
+        tier1_exec_fragments: &[r"(?i:iex)[\s(]"],
         tier1_paste_only_fragments: &[],
         notes: "PowerShell iex as leading command (inline download-execute form)",
     },
