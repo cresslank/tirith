@@ -67,6 +67,11 @@ pub struct AuditRecord {
     pub trust_ttl_expires: Option<String>,
     #[serde(default)]
     pub trust_scope: Option<String>,
+
+    /// M4 item 8 chunk 1: caller origin. Old log files without this field
+    /// parse cleanly (serde `default`).
+    #[serde(default)]
+    pub agent_origin: Option<crate::agent_origin::AgentOrigin>,
 }
 
 /// Filters for audit log queries.
@@ -625,6 +630,7 @@ mod tests {
                 trust_action: None,
                 trust_ttl_expires: None,
                 trust_scope: None,
+                agent_origin: None,
             },
             AuditRecord {
                 timestamp: "2026-01-15T10:01:00Z".into(),
@@ -651,6 +657,7 @@ mod tests {
                 trust_action: None,
                 trust_ttl_expires: None,
                 trust_scope: None,
+                agent_origin: None,
             },
             AuditRecord {
                 timestamp: "2026-01-16T12:00:00Z".into(),
@@ -677,6 +684,7 @@ mod tests {
                 trust_action: None,
                 trust_ttl_expires: None,
                 trust_scope: None,
+                agent_origin: None,
             },
         ]
     }
@@ -805,6 +813,7 @@ mod tests {
             trust_action: None,
             trust_ttl_expires: None,
             trust_scope: None,
+            agent_origin: None,
         }];
         let csv = export_csv(&records);
         let lines: Vec<&str> = csv.lines().collect();

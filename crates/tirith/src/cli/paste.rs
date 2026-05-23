@@ -78,6 +78,12 @@ pub fn run(
 
     let mut verdict = engine::analyze(&ctx);
 
+    // M4 item 8 chunk 1: best-effort origin attribution for the paste path.
+    // The CLI is the only place that knows whether the caller looked like a
+    // human, an agent (via TIRITH_INTEGRATION), or a CI runner.
+    // Observation-only — no policy gate consumes this.
+    verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
+
     let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
 
     // Audit must capture full detection BEFORE paranoia filtering (ADR-13:

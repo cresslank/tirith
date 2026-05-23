@@ -45,15 +45,21 @@ pub struct InitializeParams {
     pub protocol_version: String,
     #[allow(dead_code)]
     pub capabilities: Value,
-    #[allow(dead_code)]
+    /// MCP `initialize.clientInfo`. Read by the dispatcher to populate
+    /// [`AgentOrigin::Mcp`] (M4 item 8 chunk 1).
+    ///
+    /// [`AgentOrigin::Mcp`]: crate::agent_origin::AgentOrigin::Mcp
     pub client_info: Option<ClientInfo>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ClientInfo {
-    #[allow(dead_code)]
+    /// Caller-claimed client name (`"Claude Code"`, `"cursor"`, …). Not
+    /// verified; sanitized before it lands in [`AgentOrigin::Mcp`].
+    ///
+    /// [`AgentOrigin::Mcp`]: crate::agent_origin::AgentOrigin::Mcp
     pub name: String,
-    #[allow(dead_code)]
+    /// Caller-claimed client version. Optional and sanitized.
     pub version: Option<String>,
 }
 

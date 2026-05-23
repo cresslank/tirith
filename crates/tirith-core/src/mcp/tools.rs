@@ -211,7 +211,12 @@ fn call_check_command(args: &Value) -> ToolCallResult {
         clipboard_html: None,
     };
 
-    let (raw_verdict, policy) = engine::analyze_returning_policy(&ctx);
+    let (mut raw_verdict, policy) = engine::analyze_returning_policy(&ctx);
+
+    // M4 item 8 chunk 1 — observation-only. Stamp the MCP client origin on
+    // the raw verdict; post-processing clones it through to the effective
+    // verdict, and the audit entry picks it up automatically.
+    raw_verdict.agent_origin = super::origin::current();
 
     let mut verdict = if raw_verdict.bypass_honored {
         raw_verdict
@@ -273,6 +278,10 @@ fn call_check_url(args: &Value) -> ToolCallResult {
         crate::approval::apply_approval(&mut verdict, &meta);
     }
 
+    // M4 item 8 chunk 1 — observation-only. Even diagnostic tools that don't
+    // go through post_process_verdict still record their MCP caller.
+    verdict.agent_origin = super::origin::current();
+
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
     let structured = serde_json::to_value(&verdict)
         .map_err(|e| eprintln!("tirith: mcp: verdict serialization failed: {e}"))
@@ -318,6 +327,10 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
     if let Some(meta) = crate::approval::check_approval(&verdict, &policy) {
         crate::approval::apply_approval(&mut verdict, &meta);
     }
+
+    // M4 item 8 chunk 1 — observation-only. Stamp the MCP caller origin on
+    // the paste-diagnostic verdict the same way `check_command` does.
+    verdict.agent_origin = super::origin::current();
 
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
     let structured = serde_json::to_value(&verdict)

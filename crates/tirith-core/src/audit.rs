@@ -74,6 +74,13 @@ pub struct AuditEntry {
     pub trust_ttl_expires: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_scope: Option<String>,
+
+    /// Best-effort origin of the caller. Populated by [`log_verdict_with_raw`]
+    /// (via [`log_verdict_with_origin`]) for verdict entries; left `None` for
+    /// `hook_telemetry` and `trust_change` entries. Old log files without
+    /// this field still parse (serde-default on read).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_origin: Option<crate::agent_origin::AgentOrigin>,
 }
 
 /// Outcome of an audit-log append.
@@ -271,6 +278,11 @@ pub fn log_verdict_with_raw(
         trust_action: None,
         trust_ttl_expires: None,
         trust_scope: None,
+        // M4 item 8 chunk 1: observation-only. Carry the caller's
+        // self-identified origin through to the audit entry when the
+        // verdict path set one. Nothing reads this for enforcement today;
+        // it's recorded so downstream tooling can attribute verdicts.
+        agent_origin: verdict.agent_origin.clone(),
     };
 
     let line = match append_to_audit_log(&entry, log_path) {
@@ -332,6 +344,12 @@ pub fn log_hook_event(
         trust_action: None,
         trust_ttl_expires: None,
         trust_scope: None,
+        // Hook telemetry already carries `integration` (the hook name); we
+        // deliberately do NOT synthesize an `AgentOrigin::Agent` here because
+        // a hook event isn't a verdict — it's a probe / heartbeat from the
+        // shell hook. Chunk 2+ may revisit and emit a synthetic origin for
+        // hook events that originated from a known agent integration.
+        agent_origin: None,
     };
 
     // Telemetry / trust-change entries are best-effort; a write failure here is
@@ -377,6 +395,10 @@ pub fn log_trust_change(
         trust_action: Some(trust_action.to_string()),
         trust_ttl_expires: ttl_expires.map(String::from),
         trust_scope: Some(scope.to_string()),
+        // Trust changes are operator/admin actions, not commands attributed
+        // to an agent. Leaving `agent_origin` as `None` keeps the entry
+        // type's semantics clear.
+        agent_origin: None,
     };
 
     // Telemetry / trust-change entries are best-effort; a write failure here is
@@ -442,6 +464,7 @@ mod tests {
             approval_rule: None,
             approval_description: None,
             escalation_reason: None,
+            agent_origin: None,
         };
 
         // TIRITH_LOG=0 is an intentional skip, not a failure → Ok(()).
@@ -545,6 +568,7 @@ mod tests {
             approval_rule: None,
             approval_description: None,
             escalation_reason: None,
+            agent_origin: None,
         };
 
         let _ = log_verdict(&verdict, "echo hello", Some(log_path), None, &[]);
@@ -607,6 +631,7 @@ mod tests {
             approval_rule: None,
             approval_description: None,
             escalation_reason: None,
+            agent_origin: None,
         };
 
         // Refusing the symlink is a real write failure → Err, so the caller
@@ -676,6 +701,7 @@ mod tests {
             approval_rule: None,
             approval_description: None,
             escalation_reason: None,
+            agent_origin: None,
         };
 
         let result = log_verdict(&verdict, "test cmd", Some(log_path), None, &[]);
@@ -687,5 +713,153 @@ mod tests {
         unsafe { std::env::remove_var("TIRITH_LOG") };
         unsafe { std::env::remove_var("XDG_STATE_HOME") };
         unsafe { std::env::remove_var("APPDATA") };
+    }
+
+    /// M4 item 8 chunk 1 — the verdict's `agent_origin` must flow through
+    /// `log_verdict_with_raw` into the audit entry and survive the JSON
+    /// round-trip cleanly.
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_entry_carries_agent_origin() {
+        use crate::agent_origin::AgentOrigin;
+        use crate::audit_aggregator;
+
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.jsonl");
+        let state_home = dir.path().join("state");
+        unsafe {
+            std::env::set_var("TIRITH_LOG", "1");
+            std::env::set_var("XDG_STATE_HOME", &state_home);
+            std::env::set_var("APPDATA", &state_home);
+            std::env::remove_var("TIRITH_SERVER_URL");
+            std::env::remove_var("TIRITH_API_KEY");
+        }
+
+        let mut verdict = Verdict {
+            action: Action::Allow,
+            findings: vec![],
+            tier_reached: 1,
+            timings_ms: crate::verdict::Timings::default(),
+            bypass_requested: false,
+            bypass_honored: false,
+            bypass_available: false,
+            interactive_detected: false,
+            policy_path_used: None,
+            urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
+            escalation_reason: None,
+            agent_origin: None,
+        };
+        verdict.agent_origin = AgentOrigin::agent("claude-code", Some("1.2.3"));
+
+        log_verdict(&verdict, "echo hi", Some(log_path.clone()), None, &[])
+            .expect("audit write should succeed");
+
+        let read = audit_aggregator::read_log(&log_path).expect("read_log");
+        assert_eq!(read.records.len(), 1, "expected exactly one audit record");
+        let rec = &read.records[0];
+        match rec.agent_origin.as_ref().expect("agent_origin present") {
+            AgentOrigin::Agent { tool, version } => {
+                assert_eq!(tool, "claude-code");
+                assert_eq!(version.as_deref(), Some("1.2.3"));
+            }
+            other => panic!("expected Agent variant, got {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("TIRITH_LOG");
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var("APPDATA");
+        }
+    }
+
+    /// M4 item 8 chunk 1 — an old log line without an `agent_origin` field
+    /// must still parse cleanly (serde-default).
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_record_parses_legacy_line_without_agent_origin() {
+        use crate::audit_aggregator;
+
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("legacy.jsonl");
+
+        // A pre-chunk-1 audit line — no agent_origin field at all.
+        let legacy = r#"{"timestamp":"2026-04-10T12:00:00+00:00","session_id":"abc","action":"Allow","rule_ids":[],"command_redacted":"echo hi","bypass_requested":false,"bypass_honored":false,"interactive":false,"tier_reached":1,"entry_type":"verdict"}"#;
+        std::fs::write(&log_path, format!("{legacy}\n")).unwrap();
+
+        let read = audit_aggregator::read_log(&log_path).expect("read_log");
+        assert_eq!(read.records.len(), 1);
+        assert_eq!(read.skipped_lines, 0);
+        assert!(
+            read.records[0].agent_origin.is_none(),
+            "legacy line must parse with agent_origin = None"
+        );
+    }
+
+    /// M4 item 8 chunk 1 — a verdict with `agent_origin: None` must NOT
+    /// emit the field on the wire (kept clean via skip_serializing_if).
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_entry_omits_field_when_no_origin() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("noorigin.jsonl");
+        let state_home = dir.path().join("state");
+        unsafe {
+            std::env::set_var("TIRITH_LOG", "1");
+            std::env::set_var("XDG_STATE_HOME", &state_home);
+            std::env::set_var("APPDATA", &state_home);
+            std::env::remove_var("TIRITH_SERVER_URL");
+            std::env::remove_var("TIRITH_API_KEY");
+        }
+
+        let verdict = Verdict {
+            action: Action::Allow,
+            findings: vec![],
+            tier_reached: 1,
+            timings_ms: crate::verdict::Timings::default(),
+            bypass_requested: false,
+            bypass_honored: false,
+            bypass_available: false,
+            interactive_detected: false,
+            policy_path_used: None,
+            urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
+            escalation_reason: None,
+            agent_origin: None,
+        };
+        log_verdict(&verdict, "echo hi", Some(log_path.clone()), None, &[])
+            .expect("audit write should succeed");
+
+        let line = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            !line.contains("agent_origin"),
+            "the field must be omitted when None: line was {line}"
+        );
+
+        unsafe {
+            std::env::remove_var("TIRITH_LOG");
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var("APPDATA");
+        }
     }
 }

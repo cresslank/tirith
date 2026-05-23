@@ -616,8 +616,13 @@ fn handle_guarded_call(
 
     let timeout = Duration::from_millis(config.policy.timeout_ms);
     match rx.recv_timeout(timeout) {
-        Ok((raw_verdict, engine_policy)) => {
+        Ok((mut raw_verdict, engine_policy)) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+            // M4 item 8 chunk 1 — observation-only. Stamp the Gateway origin
+            // on the raw verdict so the audit entry records that this
+            // verdict came through the policy-enforcement gateway path.
+            raw_verdict.agent_origin = Some(tirith_core::agent_origin::AgentOrigin::Gateway);
 
             // Capture raw info before post-processing
             let raw_decision_str = format!("{:?}", raw_verdict.action).to_lowercase();
@@ -839,8 +844,12 @@ fn handle_guarded_notification(
 
     let timeout = Duration::from_millis(config.policy.timeout_ms);
     match rx.recv_timeout(timeout) {
-        Ok((raw_verdict, engine_policy)) => {
+        Ok((mut raw_verdict, engine_policy)) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+            // M4 item 8 chunk 1 — observation-only origin attribution on the
+            // notification path. Same Gateway tag the request path uses.
+            raw_verdict.agent_origin = Some(tirith_core::agent_origin::AgentOrigin::Gateway);
 
             let raw_decision_str = format!("{:?}", raw_verdict.action).to_lowercase();
             let raw_rule_ids_vec: Vec<String>;
@@ -2098,6 +2107,7 @@ policy:
             approval_rule: None,
             approval_description: None,
             escalation_reason: None,
+            agent_origin: None,
         };
 
         let resp = build_deny_response(Value::from(1), &verdict, 5.0);

@@ -317,6 +317,7 @@ mod tests {
             approval_rule: None,
             approval_description: None,
             escalation_reason: None,
+            agent_origin: None,
         }
     }
 

@@ -374,6 +374,19 @@ pub struct Verdict {
     /// Human-readable reason when escalation upgraded the action.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub escalation_reason: Option<String>,
+
+    /// Best-effort origin of the caller — *who* invoked tirith. **Observation
+    /// only** for now: M4 item 8 chunk 1 records this on the verdict and the
+    /// audit entry but no policy gate, no [`Action`] override, and no
+    /// [`RuleId`] consume it. See [`crate::agent_origin`] for the trust model.
+    ///
+    /// `None` means the caller path that produced this verdict has not yet
+    /// been wired through chunk 1 (engine-internal fast-exits, the gateway's
+    /// short-circuit path before classification, etc.) or did not have enough
+    /// signal to classify. Old JSON without this field still parses
+    /// (serde-default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_origin: Option<crate::agent_origin::AgentOrigin>,
 }
 
 /// Per-tier timing information.
@@ -406,6 +419,7 @@ impl Verdict {
             approval_rule: None,
             approval_description: None,
             escalation_reason: None,
+            agent_origin: None,
         }
     }
 
@@ -429,6 +443,7 @@ impl Verdict {
             approval_rule: None,
             approval_description: None,
             escalation_reason: None,
+            agent_origin: None,
         }
     }
 }

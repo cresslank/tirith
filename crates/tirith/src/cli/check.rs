@@ -73,6 +73,12 @@ pub fn run(
 
     let session_id = tirith_core::session::resolve_session_id();
 
+    // M4 item 8 chunk 1: best-effort origin attribution. Computed once from
+    // the current process env + the interactive flag tirith already derived,
+    // and stamped on the verdict so post-processing and the audit entry both
+    // see the same value. Observation-only — no policy gate consumes this.
+    let origin = tirith_core::agent_origin::resolve_cli_origin(interactive);
+
     // Daemon delegation skipped for --approval-check (needs local policy +
     // approval file writes) and --no-daemon. Local paths return the policy from
     // the engine to avoid a redundant Policy::discover() call; daemon path
@@ -105,6 +111,7 @@ pub fn run(
                         approval_rule: None,
                         approval_description: None,
                         escalation_reason: None,
+                        agent_origin: None,
                     },
                     None,
                 )
@@ -160,6 +167,11 @@ pub fn run(
         let (v, p) = engine::analyze_returning_policy(&ctx);
         (v, Some(p))
     };
+
+    // Stamp the resolved origin on the raw verdict so every later step
+    // (post-processing → effective → audit) sees it. `engine::analyze` does
+    // not know the caller's identity by design; the CLI does.
+    raw_verdict.agent_origin = Some(origin);
 
     // Bypass path audits and returns without post-processing.
     if raw_verdict.bypass_honored {

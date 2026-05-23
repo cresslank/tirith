@@ -324,6 +324,7 @@ mod tests {
             trust_action: None,
             trust_ttl_expires: None,
             trust_scope: None,
+            agent_origin: None,
         }
     }
 
