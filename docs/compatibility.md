@@ -132,6 +132,7 @@ The following detection rules apply when `--shell powershell` is passed to
 workflows. `tirith check`, `tirith paste`, `tirith score`, and the shell hook
 work on Windows with `pwsh`.
 
-`tirith doctor --compat` reports PowerShell hook health when `pwsh` is found
-on PATH: PSReadLine availability and the current `TIRITH_STATUS` value
-exported by the hook.
+`tirith doctor --compat` reports PowerShell hook health when `pwsh`
+(PowerShell 7+) or `powershell` (Windows PowerShell 5.1) is found on PATH:
+PSReadLine availability and the current `TIRITH_STATUS` value exported by
+the hook.

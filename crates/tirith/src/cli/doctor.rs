@@ -1097,7 +1097,14 @@ fn gather_compat() -> CompatReport {
 fn gather_ps_compat() -> Option<PsCompatInfo> {
     let binary = detect_powershell_binary()?;
     let tirith_status = std::env::var("TIRITH_STATUS").ok();
-    let psreadline_available = Some(probe_psreadline_available(binary));
+    // The probe returns `Option<bool>` so we can distinguish three states:
+    //   Some(true)  — PSReadLine module is present,
+    //   Some(false) — PSReadLine module is NOT present,
+    //   None        — the probe failed (spawn error, timeout, stdout-read fail).
+    // Collapsing the third case into Some(false) would lie to the operator that
+    // the module is missing when in fact we just could not check. Assign the
+    // Option directly to the field — no extra wrapping.
+    let psreadline_available = probe_psreadline_available(binary);
     Some(PsCompatInfo {
         available: true,
         binary: Some(binary.to_string()),
@@ -1116,21 +1123,39 @@ fn gather_ps_compat() -> Option<PsCompatInfo> {
 /// availability check AND the PSReadLine probe, so module detection
 /// always runs against the same interpreter we reported as found.
 fn detect_powershell_binary() -> Option<&'static str> {
-    if probe_command_version_ok("pwsh") {
+    if probe_command_available("pwsh") {
         return Some("pwsh");
     }
-    if probe_command_version_ok("powershell") {
+    if probe_command_available("powershell") {
         return Some("powershell");
     }
     None
 }
 
-/// `<binary> --version` with a 3-second budget. `--version` does not load
-/// PowerShell profiles, so `-NoProfile` is not required here. Used to decide
-/// which (if any) PowerShell binary to surface in `powershell_compat`.
-fn probe_command_version_ok(binary: &str) -> bool {
+/// Probe whether a PowerShell binary is available on PATH using a no-op
+/// command. We deliberately do NOT use `--version` here: Windows PowerShell
+/// 5.1 (`powershell.exe`) does not accept `--version`, only `pwsh` does.
+/// Microsoft recommends `$PSVersionTable.PSVersion` for 5.1 introspection;
+/// for a portable existence check, `-NoProfile -NonInteractive -Command
+/// "exit 0"` works on both `pwsh` and `powershell.exe`.
+///
+/// IMPORTANT: the argument list `-NoProfile -NonInteractive -Command` is
+/// PowerShell-specific. This function is intentionally scoped to PS-binary
+/// detection (used by `detect_powershell_binary`); reusing it for any
+/// non-PS binary would pass nonsense arguments. If a more general
+/// availability check is ever needed, add a separate function.
+fn probe_command_available(name: &str) -> bool {
+    // Use the shared `run_with_timeout` helper for the 3-second budget +
+    // safe child kill. Spawn failure (ENOENT — binary not on PATH) and
+    // timeout both collapse to `None` → `false`. A spawned child that
+    // exits non-zero is also treated as "not available", since the only
+    // success indicator is `status.success()`.
     run_with_timeout(
-        std::process::Command::new(binary).arg("--version"),
+        std::process::Command::new(name)
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg("exit 0"),
         std::time::Duration::from_secs(3),
     )
     .map(|output| output.status.success())
@@ -1144,23 +1169,33 @@ fn probe_command_version_ok(binary: &str) -> bool {
 /// exit (e.g. PSReadLine missing AND `Get-Module` erroring on some hosts) is
 /// distinguishable from a clean negative.
 ///
+/// Returns `Option<bool>` to preserve the three-state semantics promised by
+/// `PsCompatInfo::psreadline_available`:
+/// - `Some(true)` — probe completed AND output contains "yes".
+/// - `Some(false)` — probe completed AND output does NOT contain "yes" (the
+///   literal "no", or garbage / empty output from a profile error that
+///   escaped `-NoProfile`).
+/// - `None` — the probe never produced a usable result (spawn fail, killed by
+///   the timeout budget, or stdout couldn't be read). Renders as "unknown
+///   (probe failed or timed out)" in the human report; serializes as `null`
+///   in the JSON report.
+///
 /// `-NoProfile` is critical: `-NonInteractive` alone does NOT prevent profile
 /// loading, so without `-NoProfile` user-defined hooks could interfere with
 /// module detection (e.g. by mutating `$env:PSModulePath`) or cause spurious
 /// probe failures from profile errors.
-fn probe_psreadline_available(binary: &str) -> bool {
+fn probe_psreadline_available(binary: &str) -> Option<bool> {
     let mut cmd = std::process::Command::new(binary);
     cmd.arg("-NoProfile")
         .arg("-NonInteractive")
         .arg("-Command")
         .arg("if (Get-Module -ListAvailable PSReadLine) { 'yes' } else { 'no' }");
-    match run_with_timeout(&mut cmd, std::time::Duration::from_secs(3)) {
-        Some(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout.trim().eq_ignore_ascii_case("yes")
-        }
-        None => false,
-    }
+    // `run_with_timeout` returns `None` for spawn failure / timeout / wait
+    // error — propagate that as `None` (probe failed / unknown). Only when
+    // we have an `Output` do we classify the result.
+    let output = run_with_timeout(&mut cmd, std::time::Duration::from_secs(3))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Some(stdout.trim().eq_ignore_ascii_case("yes"))
 }
 
 /// Spawn `cmd`, wait up to `timeout` for output, kill on timeout. Returns
