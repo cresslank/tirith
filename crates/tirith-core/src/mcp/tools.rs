@@ -213,9 +213,13 @@ fn call_check_command(args: &Value) -> ToolCallResult {
 
     let (mut raw_verdict, policy) = engine::analyze_returning_policy(&ctx);
 
-    // M4 item 8 chunk 1 — observation-only. Stamp the MCP client origin on
-    // the raw verdict; post-processing clones it through to the effective
-    // verdict, and the audit entry picks it up automatically.
+    // M4 item 8. Stamp the MCP client origin on the raw verdict;
+    // post-processing (below) consults this via
+    // `escalation::apply_agent_rules` against the active policy's
+    // `agent_rules.deny`, then clones the origin through to the
+    // effective verdict, and the audit entry picks it up automatically.
+    // The `bypass_honored` branch skips post-processing, so deny does
+    // not currently enforce under bypass on this path.
     raw_verdict.agent_origin = super::origin::current();
 
     let mut verdict = if raw_verdict.bypass_honored {

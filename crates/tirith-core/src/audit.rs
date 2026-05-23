@@ -278,10 +278,11 @@ pub fn log_verdict_with_raw(
         trust_action: None,
         trust_ttl_expires: None,
         trust_scope: None,
-        // M4 item 8 chunk 1: observation-only. Carry the caller's
-        // self-identified origin through to the audit entry when the
-        // verdict path set one. Nothing reads this for enforcement today;
-        // it's recorded so downstream tooling can attribute verdicts.
+        // M4 item 8: carry the caller's self-identified origin through to
+        // the audit entry when the verdict path set one. The origin is
+        // already consulted for enforcement upstream of this call (see
+        // `escalation::apply_agent_rules`); the audit record preserves it
+        // so downstream tooling can attribute verdicts after the fact.
         agent_origin: verdict.agent_origin.clone(),
     };
 

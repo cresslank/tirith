@@ -382,10 +382,12 @@ fn validate_escalation_rules(policy: &crate::policy::Policy, issues: &mut Vec<Po
     }
 }
 
-/// Sanity-check the agent governance block (M4 item 8 chunk 2). This is
-/// **schema validation only** — the engine does not consume `agent_rules`
-/// yet, so the only feedback an operator can act on is "this matcher is
-/// shaped wrong".
+/// Sanity-check the agent governance block (M4 item 8). This is
+/// **schema validation only** — the engine consumes `agent_rules` at
+/// runtime via [`crate::escalation::apply_agent_rules`], but the
+/// validator's job is limited to flagging matchers shaped wrong
+/// (e.g. a `tool` filter on a payloadless kind), not predicting whether
+/// a matcher will ever fire in practice.
 ///
 /// Diagnostics:
 /// * A `tool` filter on a payloadless kind (`human`, `gateway`) is a

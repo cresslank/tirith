@@ -135,14 +135,24 @@ pub struct Policy {
     #[serde(default)]
     pub threat_intel: ThreatIntelConfig,
 
-    /// Per-agent governance rules (M4 item 8 chunk 2).
+    /// Per-agent governance rules (M4 item 8).
     ///
-    /// **Observation-only in chunk 2.** The schema is defined here and a pure
-    /// helper [`agent_decision`] is provided, but the engine does NOT consult
-    /// `agent_rules` to gate verdicts — that wiring lands in chunk 3. A
-    /// policy that populates `agent_rules` today loads cleanly, validates,
-    /// and changes no existing verdict's outcome (pinned by an integration
-    /// test).
+    /// The engine consults this block via
+    /// [`crate::escalation::apply_agent_rules`] inside
+    /// [`crate::escalation::post_process_verdict`]: a `deny` match against
+    /// [`crate::verdict::Verdict::agent_origin`] forces the action to
+    /// [`crate::verdict::Action::Block`] and appends a
+    /// [`crate::verdict::RuleId::AgentDeniedByPolicy`] finding. `allow` is
+    /// NOT a bypass — a verdict the engine already blocked stays blocked.
+    /// See [`agent_decision`] for the matching semantics.
+    ///
+    /// Known scope limitations (fixed in follow-up commits on this PR): the
+    /// `tirith paste` / `install` / `ecosystem scan` paths and the MCP
+    /// `tools/call_check_url` / `tools/call_check_paste` handlers stamp
+    /// origin for audit but do not yet route through
+    /// `post_process_verdict`, so `deny` is currently scoped to `tirith
+    /// check`, the gateway, and `tools/call_check_command`. The
+    /// `TIRITH=0` interactive bypass also currently skips `apply_agent_rules`.
     ///
     /// See `docs/agent-governance-design.md` for the trust model:
     /// **operator-trust**, never adversary-resistant. The matching strings
@@ -155,21 +165,26 @@ pub struct Policy {
 
 /// Per-agent governance rules — the policy surface for Milestone 4 item 8.
 ///
-/// **Chunk 2 ships the schema and a pure decision helper; the engine does
-/// NOT consult these rules to gate any verdict.** Chunk 3 wires
-/// [`agent_decision`] into the verdict pipeline. A policy populating
-/// `agent_rules` today is therefore additive and non-behavioral: it loads,
-/// validates, round-trips through YAML, and changes no outcome.
+/// The engine consults these rules via
+/// [`crate::escalation::apply_agent_rules`] inside
+/// [`crate::escalation::post_process_verdict`]. The pure decision helper
+/// [`agent_decision`] computes the outcome; the enforcement helper
+/// converts a `Denied` outcome into [`crate::verdict::Action::Block`]
+/// plus a [`crate::verdict::RuleId::AgentDeniedByPolicy`] finding.
 ///
-/// Two lists, evaluated in this order at match time (chunk 3+):
+/// Two lists, evaluated in this order:
 /// 1. **`deny`** — first match wins, returns [`AgentDecision::Denied`]. A
 ///    deny entry beats any allow entry, mirroring how `blocklist` beats
 ///    `allowlist` elsewhere in this policy.
 /// 2. **`allow`** — first match wins, returns [`AgentDecision::Allowed`].
+///    `allow` is NOT a bypass: a verdict the engine already blocked stays
+///    blocked even when the caller is on the allow list. Richer
+///    "trusted agent" semantics (severity overrides on `allow`, per-origin
+///    fail-mode tuning) are deferred pending real telemetry.
 ///
-/// No matcher in either list → [`AgentDecision::Unspecified`]. Chunk 3
-/// will decide what `Unspecified` means in the verdict pipeline (most
-/// likely: "fall through to the existing rule machinery unchanged").
+/// No matcher in either list → [`AgentDecision::Unspecified`], which
+/// leaves the verdict unchanged. A verdict with `agent_origin == None`
+/// is treated as `Unspecified` for the same reason.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentRules {
@@ -261,10 +276,11 @@ impl AgentOriginKind {
 
 /// The outcome of consulting [`AgentRules`] against an [`AgentOrigin`].
 ///
-/// Pure data; chunk 3 will decide how the engine consumes it. Chunk 2
-/// only computes and exposes the value — no code path inside the engine
-/// reads it yet, so a policy with a populated `agent_rules` block today
-/// changes no verdict.
+/// Pure data computed by [`agent_decision`]. The engine consumes the value
+/// via [`crate::escalation::apply_agent_rules`]: `Denied` forces
+/// [`crate::verdict::Action::Block`] and appends a
+/// [`crate::verdict::RuleId::AgentDeniedByPolicy`] finding; `Allowed` and
+/// `Unspecified` leave the verdict unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentDecision {
     /// The origin matched an `allow` matcher and no `deny` matcher (or
@@ -276,7 +292,9 @@ pub enum AgentDecision {
     Unspecified,
 }
 
-/// Pure decision helper. **Not consulted by the engine in chunk 2.**
+/// Pure decision helper. Consulted by the engine via
+/// [`crate::escalation::apply_agent_rules`] inside
+/// [`crate::escalation::post_process_verdict`].
 ///
 /// Evaluation order:
 /// 1. Walk `deny` in declaration order; first match → [`AgentDecision::Denied`].
@@ -1298,11 +1316,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // M4 item 8 chunk 2: agent governance schema. The engine does NOT consult
-    // `agent_rules` yet — chunk 3 wires it. These tests pin (a) the schema
-    // round-trips through YAML, (b) the pure `agent_decision` helper computes
-    // Denied/Allowed/Unspecified correctly, and (c) `AgentOriginKind` parses
-    // back and forth.
+    // M4 item 8: agent governance schema. These tests cover the data layer
+    // — (a) the schema round-trips through YAML, (b) the pure
+    // `agent_decision` helper computes Denied/Allowed/Unspecified correctly,
+    // and (c) `AgentOriginKind` parses back and forth. The enforcement
+    // splice (`apply_agent_rules` inside `post_process_verdict`) is covered
+    // by `crates/tirith-core/src/escalation.rs::tests`.
     // -----------------------------------------------------------------------
 
     #[test]

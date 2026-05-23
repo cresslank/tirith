@@ -320,9 +320,9 @@ tirith agent sessions: 685 verdict(s) across 5 origin group(s) in /Users/me/.loc
 * **Pure read** from `~/.local/share/tirith/log.jsonl` (override with
   `--log <path>`). Off the detection hot path; touches no network.
 * **Honest unattributed bucket** — entries without an `agent_origin`
-  (pre-chunk-1 lines, engine bypass-path entries that chunk 3 will fix,
-  hook telemetry routed in error) land in `"unknown"` rather than being
-  silently dropped.
+  (pre-chunk-1 lines, hook telemetry routed in error, and any future
+  analysis-then-audit path that does not yet stamp origin) land in
+  `"unknown"` rather than being silently dropped.
 * **Hook telemetry filtered out** — only `entry_type: "verdict"` rows
   contribute; hook events have their own `integration` field and are
   not verdicts by design.
@@ -378,15 +378,15 @@ operator reviews and uncomments what they intend to declare.
 
 Validates an `(kind, tool?)` matcher and **prints the YAML snippet**
 the operator pastes under `agent_rules.allow:`. **Does NOT mutate any
-policy file** — agent_rules is observation-only today, and silently
-appending would suggest enforcement that does not exist yet. The
-operator pastes the snippet into `.tirith/policy.yaml` (or
-`.tirith/agent-policy.yaml.example`) themselves.
+policy file** — the operator integrates the snippet themselves so an
+honest review precedes any widening of trust (mirrors `tirith mcp
+policy init`). The snippet is pasted into `.tirith/policy.yaml` (or
+`.tirith/agent-policy.yaml.example`).
 
 ```text
 $ tirith agent allow --kind agent --tool claude-code
 tirith agent allow: valid matcher — paste the snippet below under `agent_rules.allow:` in your policy.
-  (NOTE: agent_rules is observation-only today; chunk 3 wires enforcement.)
+  (NOTE: `allow` is not a bypass — a verdict the engine already blocked stays blocked even when the caller is on the allow list. `deny` beats `allow`.)
 
     - kind: agent
       tool: claude-code
@@ -627,8 +627,17 @@ add a `--show-origin` flag at that point.
 ---
 
 *Chunk 1 shipped the design, the type, the field, and the populate-only
-plumbing. **Chunk 2 ships the inspection surface** — `tirith agent
+plumbing. Chunk 2 added the inspection surface — `tirith agent
 sessions / explain / policy init / allow` — and the `agent_rules`
-policy schema, still observation-only. Chunk 3 is where the engine
-consults `policy::agent_decision` and per-agent governance becomes
-enforcement.*
+policy schema. **Chunk 3 wired enforcement**: the engine consults
+`policy::agent_decision` through `escalation::apply_agent_rules` inside
+`post_process_verdict`, a `deny` match forces the action to Block and
+appends an `agent_denied_by_policy` finding, and `allow` is layered as
+an explicit non-bypass. Enforcement is active on `tirith check`, the
+gateway request/notification paths, and the MCP
+`tools/call_check_command` handler today; `tirith paste`, `install`,
+`ecosystem scan`, and the MCP `tools/call_check_url` /
+`tools/call_check_paste` handlers stamp origin for audit but do not yet
+route through `post_process_verdict` — a follow-up commit on this PR
+extends enforcement to those surfaces. The interactive `TIRITH=0`
+bypass also currently skips `apply_agent_rules`; revisit in M5.*

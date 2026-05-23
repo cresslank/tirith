@@ -1,16 +1,21 @@
 //! Per-MCP-session origin state.
 //!
-//! M4 item 8 chunk 1, observation-only side. The MCP server (`tirith
-//! mcp-server`) is a stdio process: one client connects, runs through
-//! `initialize` once, then issues `tools/call` requests for the rest of the
-//! session. The [`AgentOrigin::Mcp`] payload — derived from
-//! `initialize.clientInfo` — is therefore process-scoped: stable for the
-//! lifetime of the MCP server process.
+//! M4 item 8. The MCP server (`tirith mcp-server`) is a stdio process:
+//! one client connects, runs through `initialize` once, then issues
+//! `tools/call` requests for the rest of the session. The
+//! [`AgentOrigin::Mcp`] payload — derived from `initialize.clientInfo`
+//! — is therefore process-scoped: stable for the lifetime of the MCP
+//! server process.
 //!
 //! [`AgentOrigin::Mcp`]: crate::agent_origin::AgentOrigin::Mcp
 //!
-//! The dispatcher writes the origin once when it handles `initialize`; the
-//! tools layer reads it when constructing each verdict.
+//! The dispatcher writes the origin once when it handles `initialize`;
+//! the tools layer reads it when constructing each verdict, where the
+//! `tools/call_check_command` handler routes through
+//! [`crate::escalation::apply_agent_rules`] and enforces
+//! `agent_rules.deny`. The `tools/call_check_url` /
+//! `tools/call_check_paste` handlers stamp origin for audit but do not
+//! yet enforce `deny` — a follow-up commit on this PR extends them.
 
 use std::sync::RwLock;
 

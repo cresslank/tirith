@@ -631,9 +631,13 @@ fn handle_guarded_call(
         Ok((mut raw_verdict, engine_policy)) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
-            // M4 item 8 chunk 1 — observation-only. Stamp the Gateway origin
-            // on the raw verdict so the audit entry records that this
-            // verdict came through the policy-enforcement gateway path.
+            // M4 item 8. Stamp the Gateway origin on the raw verdict so the
+            // audit entry records that this verdict came through the
+            // policy-enforcement gateway path. `post_process_verdict`
+            // (below) consults this via `escalation::apply_agent_rules`
+            // against the active policy's `agent_rules.deny`; the
+            // `TIRITH=0` bypass branch skips post-processing, so deny
+            // does not currently enforce under bypass.
             raw_verdict.agent_origin = Some(tirith_core::agent_origin::AgentOrigin::Gateway);
 
             // Capture raw info before post-processing
@@ -859,8 +863,10 @@ fn handle_guarded_notification(
         Ok((mut raw_verdict, engine_policy)) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
-            // M4 item 8 chunk 1 — observation-only origin attribution on the
-            // notification path. Same Gateway tag the request path uses.
+            // M4 item 8. Same Gateway origin attribution the request path
+            // uses, applied to the notification path. `post_process_verdict`
+            // consults this via `escalation::apply_agent_rules`; bypass
+            // skips post-processing on this path too.
             raw_verdict.agent_origin = Some(tirith_core::agent_origin::AgentOrigin::Gateway);
 
             let raw_decision_str = format!("{:?}", raw_verdict.action).to_lowercase();

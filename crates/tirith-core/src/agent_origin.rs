@@ -1,16 +1,20 @@
 //! Agent origin — *who* invoked tirith.
 //!
-//! This module is the **observability layer** for Milestone 4 item 8 ("Agent
-//! governance — per-agent identity + policy"), chunk 1. It defines a single
-//! data type, [`AgentOrigin`], that records the best-effort answer to *"what
+//! This module is the **identity layer** for Milestone 4 item 8 ("Agent
+//! governance — per-agent identity + policy"). It defines a single data
+//! type, [`AgentOrigin`], that records the best-effort answer to *"what
 //! kind of caller produced this verdict?"* and threads it through
 //! [`crate::verdict::Verdict`] and [`crate::audit::AuditEntry`].
 //!
-//! It does **NOT** enforce anything. There is no policy gate, no [`RuleId`],
-//! no [`Verdict::action`] change driven by [`AgentOrigin`] — that work lands
-//! in subsequent chunks once the design has been observed in real telemetry.
-//! Today, populating [`Verdict::agent_origin`] only changes which JSON field
-//! a downstream audit consumer sees; it changes no exit code and no behavior.
+//! It does **NOT** enforce anything on its own — enforcement lives in
+//! [`crate::escalation::apply_agent_rules`], which consults
+//! [`crate::policy::agent_decision`] against the stored origin and, on a
+//! `deny` match, forces [`Verdict::action`] to
+//! [`crate::verdict::Action::Block`] and appends a
+//! [`crate::verdict::RuleId::AgentDeniedByPolicy`] finding. Populating
+//! [`Verdict::agent_origin`] is what makes that enforcement reachable;
+//! engine paths that do not stamp an origin are treated as
+//! [`crate::policy::AgentDecision::Unspecified`] (no behavior change).
 //!
 //! [`RuleId`]: crate::verdict::RuleId
 //! [`Verdict::action`]: crate::verdict::Verdict#structfield.action

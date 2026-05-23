@@ -1,20 +1,23 @@
 //! `tirith agent sessions / explain / policy init / allow` — agent governance
 //! observability surface.
 //!
-//! This is the chunk-2 CLI surface for Milestone 4 item 8 (Agent Governance).
-//! Chunk 1 added the [`AgentOrigin`] type and threaded it through every verdict
-//! and audit entry; chunk 2 makes that recorded signal **inspectable** and
-//! adds the policy schema chunk 3 will gate on.
+//! This is the CLI surface for Milestone 4 item 8 (Agent Governance).
+//! The [`AgentOrigin`] type and its plumbing through every verdict and
+//! audit entry record *who* invoked tirith; this module makes that signal
+//! **inspectable** and surfaces the `agent_rules` policy schema that the
+//! engine consults via `tirith_core::escalation::apply_agent_rules` inside
+//! `tirith_core::escalation::post_process_verdict`.
 //!
-//! Nothing in this module enforces policy. `tirith agent allow` validates a
-//! matcher and prints the YAML snippet the operator should paste — it
-//! intentionally does NOT mutate `.tirith/policy.yaml`, because the engine
-//! does not consume `agent_rules` yet. Silently appending would suggest a
-//! behavior that does not exist; chunk 3 lands the wiring.
+//! `tirith agent allow` validates a matcher and prints the YAML snippet
+//! the operator should paste — it intentionally does NOT mutate
+//! `.tirith/policy.yaml`. The operator integrates the snippet themselves
+//! the same way they integrate `tirith mcp policy init`'s example output,
+//! so an honest review precedes any widening of trust.
 //!
-//! Like every other observability surface, every command is a **local file
-//! operation**: it touches no network and is off the tier-1/2/3 detection
-//! hot path.
+//! Like every other observability surface, every command in this module is
+//! a **local file operation**: it touches no network and is off the
+//! tier-1/2/3 detection hot path. The runtime enforcement of `agent_rules`
+//! lives in `escalation.rs`, not here.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -675,11 +678,19 @@ fn render_agent_policy_scaffold_yaml(scaffold: &AgentPolicyScaffold) -> String {
     s.push_str("# `tirith agent policy init --force` to regenerate from the latest\n");
     s.push_str("# audit log.\n");
     s.push_str("#\n");
-    s.push_str("# IMPORTANT: agent_rules is OBSERVATION-ONLY in this release\n");
-    s.push_str("# (M4 item 8 chunk 2). Loading a policy with agent_rules populated\n");
-    s.push_str("# changes no verdict's outcome today; chunk 3 will wire the policy\n");
-    s.push_str("# into verdict gating. Until then, `tirith agent allow` / this\n");
-    s.push_str("# scaffold are useful for observability, not enforcement.\n");
+    s.push_str("# How `agent_rules` is enforced (M4 item 8): when the verdict's\n");
+    s.push_str("# `agent_origin` matches a `deny` entry, the verdict is forced to\n");
+    s.push_str("# Block and an `agent_denied_by_policy` finding is appended naming\n");
+    s.push_str("# the matched origin and policy file. A `deny` match beats any\n");
+    s.push_str("# matching `allow`. `allow` is NOT a bypass — a verdict the engine\n");
+    s.push_str("# already blocked stays blocked even if the caller is on the allow\n");
+    s.push_str("# list. Enforcement runs today on `tirith check`, the gateway, and\n");
+    s.push_str("# the MCP `tools/call_check_command` handler; `tirith paste`,\n");
+    s.push_str("# `install`, `ecosystem scan`, and the MCP `tools/call_check_url` /\n");
+    s.push_str("# `tools/call_check_paste` handlers stamp origin for audit but do\n");
+    s.push_str("# not yet enforce `deny` — a follow-up commit on this PR extends\n");
+    s.push_str("# them. The interactive `TIRITH=0` bypass also currently skips\n");
+    s.push_str("# `agent_rules`.\n");
     s.push_str("#\n");
     s.push_str("# Trust model: every signal feeding AgentOrigin is OPERATOR-TRUST,\n");
     s.push_str("# never adversary-resistant — TIRITH_INTEGRATION, MCP clientInfo,\n");
@@ -781,7 +792,8 @@ fn print_policy_init_human(example_path: &Path, scaffold: &AgentPolicyScaffold) 
             scaffold.log_path,
         );
         eprintln!("  Every entry is commented out — uncomment the ones you wish to declare.");
-        eprintln!("  REMEMBER: agent_rules is observation-only today (chunk 2); enforcement lands in chunk 3.");
+        eprintln!("  Enforcement is active on `tirith check`, the gateway, and the MCP `tools/call_check_command` handler;");
+        eprintln!("  paste / install / ecosystem-scan / MCP check_url / check_paste stamp origin for audit but do not yet enforce deny.");
     }
     eprintln!("  wrote {}", example_path.display());
     println!("{}", example_path.display());
@@ -878,7 +890,7 @@ pub fn allow(kind_str: &str, tool: Option<&str>, json: bool) -> i32 {
         }
     } else {
         eprintln!("tirith agent allow: valid matcher — paste the snippet below under `agent_rules.allow:` in your policy.");
-        eprintln!("  (NOTE: agent_rules is observation-only today; chunk 3 wires enforcement.)");
+        eprintln!("  (NOTE: `allow` is not a bypass — a verdict the engine already blocked stays blocked even when the caller is on the allow list. `deny` beats `allow`.)");
         eprintln!();
         // Print snippet to stdout so it can be captured / piped into a file.
         print!("{snippet}");

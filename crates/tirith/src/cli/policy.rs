@@ -69,21 +69,34 @@ scan:
   #   my-trusted-server:
   #     - read_only
 
-# Per-agent governance rules — M4 item 8 chunk 2 (observation-only today).
+# Per-agent governance rules — M4 item 8 (enforcement).
 #
-# `agent_rules` lets a policy declare which AgentOrigin variants it would
-# allow or deny, where `AgentOrigin` is the recorded caller — Human,
-# Agent, Mcp, Gateway, Ci, or Ide. The signal is captured today (see
-# `tirith agent sessions`) but the engine does NOT yet gate verdicts on
-# these rules — chunk 3 wires that. Populating `agent_rules` now is
-# additive: the policy loads, validates, and changes no existing
-# verdict's outcome.
+# `agent_rules` lets a policy declare which AgentOrigin variants it
+# allows or denies, where `AgentOrigin` is the recorded caller — Human,
+# Agent, Mcp, Gateway, Ci, or Ide. A `deny` match forces the verdict to
+# Block and appends an `agent_denied_by_policy` finding naming the
+# matched origin and policy file; a `deny` entry beats any matching
+# `allow` entry, mirroring how `blocklist` beats `allowlist`. `allow`
+# is NOT a bypass — a verdict the engine already blocked stays blocked
+# even if the caller is on the allow list. See `rule_explanations.toml`
+# (`agent_denied_by_policy`) for the operator-facing description.
+#
+# Enforcement scope today: `tirith check`, the gateway request /
+# notification paths, and the MCP `tools/call_check_command` handler
+# invoke `apply_agent_rules` via `post_process_verdict`. `tirith paste`,
+# `tirith install`, `tirith ecosystem scan`, and the MCP
+# `tools/call_check_url` / `tools/call_check_paste` handlers stamp the
+# origin on the audit entry but do not yet enforce `agent_rules.deny`
+# — a follow-up commit on this PR extends enforcement to those
+# surfaces. The interactive `TIRITH=0` bypass also currently skips
+# `apply_agent_rules`; revisit that semantic in M5.
 #
 # Trust caveat: every signal feeding AgentOrigin is OPERATOR-TRUST,
 # never adversary-resistant — TIRITH_INTEGRATION, MCP clientInfo, CI
 # env vars are all settable by any process running as the user. Use
-# `agent_rules` for filtering, dashboarding, and observability; layer
-# real authentication elsewhere if the decision must withstand a
+# `agent_rules` for operator-trust scoping ("I do not run my MCP
+# server's commands on traffic my CI ran"), not adversarial security;
+# layer real authentication elsewhere if the decision must withstand a
 # hostile environment.
 #
 # Run `tirith agent policy init` to scaffold this block from the local
@@ -162,11 +175,14 @@ scan:
   # Per-server allowed tools — see `tirith mcp policy init` to scaffold.
   # mcp_allowed_tools: {}
 
-# Per-agent governance — M4 item 8 chunk 2 (observation-only).
+# Per-agent governance — M4 item 8 (enforcement).
 # `tirith agent sessions` shows which AgentOrigin variants you see in
-# practice; `tirith agent policy init` scaffolds this block. Loading
-# `agent_rules` does not change any verdict's outcome today — chunk 3
-# will wire enforcement.
+# practice; `tirith agent policy init` scaffolds this block. A `deny`
+# match forces the verdict to Block and appends an
+# `agent_denied_by_policy` finding; `deny` beats any matching `allow`.
+# Enforcement is active on `tirith check` today; `tirith paste`,
+# `install`, `ecosystem scan`, and a few MCP handlers stamp origin but
+# do not yet enforce — a follow-up commit on this PR extends them.
 # agent_rules:
 #   allow:
 #     - kind: agent
@@ -235,11 +251,15 @@ scan:
   # smuggling a new MCP tool past the lockfile. See `tirith mcp policy init`.
   # mcp_allowed_tools: {}
 
-# Per-agent governance — M4 item 8 chunk 2 (observation-only).
+# Per-agent governance — M4 item 8 (enforcement).
 # A CI policy that wants to declare which callers are expected can list
-# them here; loading `agent_rules` does not change verdict outcomes
-# today — chunk 3 will wire enforcement. `tirith agent sessions` shows
-# the AgentOrigins your CI actually sees.
+# them here. A `deny` match forces the verdict to Block and appends an
+# `agent_denied_by_policy` finding; `deny` beats any matching `allow`.
+# Enforcement runs on `tirith check` (the surface CI most often calls)
+# via `apply_agent_rules`; `tirith install`, `ecosystem scan`, and a
+# few MCP handlers stamp origin but do not yet enforce — a follow-up
+# commit on this PR extends them. `tirith agent sessions` shows the
+# AgentOrigins your CI actually sees.
 # agent_rules:
 #   allow:
 #     - kind: ci
@@ -328,12 +348,21 @@ scan:
   # High-severity drift finding. See `tirith mcp policy init`.
   # mcp_allowed_tools: {}
 
-# Per-agent governance — M4 item 8 chunk 2 (observation-only).
-# An agent-heavy environment benefits most from per-origin policy. Today
-# this block is observation-only — `tirith agent sessions` shows which
-# agents have invoked tirith, `tirith agent policy init` scaffolds this
-# block from observed origins. Chunk 3 will wire enforcement; until
-# then, populating `agent_rules` does not change any verdict's outcome.
+# Per-agent governance — M4 item 8 (enforcement).
+# An agent-heavy environment benefits most from per-origin policy.
+# `tirith agent sessions` shows which agents have invoked tirith;
+# `tirith agent policy init` scaffolds this block from observed
+# origins. A `deny` match forces the verdict to Block and appends an
+# `agent_denied_by_policy` finding; `deny` beats any matching `allow`,
+# and `allow` is NOT a bypass — a verdict the engine already blocked
+# stays blocked even if the caller is on the allow list. Enforcement
+# is active on `tirith check`, the gateway, and the MCP
+# `tools/call_check_command` handler today; `tirith paste`, `install`,
+# `ecosystem scan`, and the MCP `tools/call_check_url` /
+# `tools/call_check_paste` handlers stamp origin but do not yet
+# enforce `deny` — a follow-up commit on this PR extends them. The
+# interactive `TIRITH=0` bypass also currently skips `agent_rules`;
+# revisit in M5.
 # agent_rules:
 #   allow:
 #     - kind: agent

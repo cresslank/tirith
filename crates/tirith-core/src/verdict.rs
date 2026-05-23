@@ -380,16 +380,23 @@ pub struct Verdict {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub escalation_reason: Option<String>,
 
-    /// Best-effort origin of the caller — *who* invoked tirith. **Observation
-    /// only** for now: M4 item 8 chunk 1 records this on the verdict and the
-    /// audit entry but no policy gate, no [`Action`] override, and no
-    /// [`RuleId`] consume it. See [`crate::agent_origin`] for the trust model.
+    /// Best-effort origin of the caller — *who* invoked tirith. M4 item 8
+    /// records this on the verdict and the audit entry; the policy schema
+    /// `agent_rules` is consulted against it by
+    /// [`crate::escalation::apply_agent_rules`] inside
+    /// [`crate::escalation::post_process_verdict`], where a `deny` match
+    /// forces [`Action::Block`] and appends a
+    /// [`RuleId::AgentDeniedByPolicy`] finding. See
+    /// [`crate::agent_origin`] for the trust model (caller-claimed,
+    /// operator-trust, never adversary-resistant).
     ///
-    /// `None` means the caller path that produced this verdict has not yet
-    /// been wired through chunk 1 (engine-internal fast-exits, the gateway's
-    /// short-circuit path before classification, etc.) or did not have enough
-    /// signal to classify. Old JSON without this field still parses
-    /// (serde-default).
+    /// `None` means the caller path that produced this verdict has not been
+    /// wired (engine-internal fast-exits, the gateway's short-circuit path
+    /// before classification, etc.) or did not have enough signal to
+    /// classify. `apply_agent_rules` treats `None` as
+    /// [`crate::policy::AgentDecision::Unspecified`] — no enforcement
+    /// effect, an engine path that never set an origin has nothing to match
+    /// against. Old JSON without this field still parses (serde-default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_origin: Option<crate::agent_origin::AgentOrigin>,
 }

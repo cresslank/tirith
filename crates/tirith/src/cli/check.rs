@@ -73,10 +73,14 @@ pub fn run(
 
     let session_id = tirith_core::session::resolve_session_id();
 
-    // M4 item 8 chunk 1: best-effort origin attribution. Computed once from
-    // the current process env + the interactive flag tirith already derived,
-    // and stamped on the verdict so post-processing and the audit entry both
-    // see the same value. Observation-only — no policy gate consumes this.
+    // M4 item 8: best-effort origin attribution. Computed once from the
+    // current process env + the interactive flag tirith already derived,
+    // and stamped on the verdict so post-processing and the audit entry
+    // both see the same value. `post_process_verdict` consults this via
+    // `escalation::apply_agent_rules` against the active policy's
+    // `agent_rules.deny` (note: the `TIRITH=0` bypass branch below skips
+    // `post_process_verdict`, so `agent_rules.deny` does not currently
+    // enforce under bypass — to be addressed separately).
     let origin = tirith_core::agent_origin::resolve_cli_origin(interactive);
 
     // Daemon delegation skipped for --approval-check (needs local policy +
