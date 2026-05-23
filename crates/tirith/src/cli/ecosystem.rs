@@ -111,7 +111,15 @@ pub fn scan(path: Option<&str>, online: bool, offline: bool, json: bool) -> i32 
     // `post_process_verdict`, so without this call deny would stamp but
     // not enforce on the directory-level supply-chain surface. The
     // helper is a no-op on `Allowed`/`Unspecified`.
-    tirith_core::escalation::apply_agent_rules(&mut report.verdict, &policy);
+    //
+    // M4 PR #120 fix-6 (Greptile P1): mirror the bypass-skip branch the
+    // hot paths in `check`/`gateway` use — under `TIRITH=0`, the raw
+    // verdict already wins and `apply_agent_rules` must NOT silently
+    // re-Block. Pinned by
+    // `ecosystem_agent_rules_deny_skipped_under_tirith_bypass_today`.
+    if !report.verdict.bypass_honored {
+        tirith_core::escalation::apply_agent_rules(&mut report.verdict, &policy);
+    }
 
     // Audit-log the verdict, exactly as the other analysis commands do. The
     // "command" string identifies this as an ecosystem scan of the root. A

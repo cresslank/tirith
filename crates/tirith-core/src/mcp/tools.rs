@@ -289,9 +289,6 @@ fn call_check_url(args: &Value) -> ToolCallResult {
 
     // Diagnostic tool — use paranoia filter + approval only, no escalation/session recording
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
-    if let Some(meta) = crate::approval::check_approval(&verdict, &policy) {
-        crate::approval::apply_approval(&mut verdict, &meta);
-    }
 
     // M4 item 8 chunk 3 follow-up — stamp the MCP client origin so the
     // verdict carries the caller's identity for both observation and
@@ -306,7 +303,29 @@ fn call_check_url(args: &Value) -> ToolCallResult {
     // enforce on `tirith_check_command` but silently fail on
     // `tirith_check_url`. The helper is a no-op on
     // `Allowed`/`Unspecified`.
-    crate::escalation::apply_agent_rules(&mut verdict, &policy);
+    //
+    // M4 PR #120 fix-6 (Greptile P1): mirror the bypass-skip branch the
+    // hot paths in `check`/`gateway`/`call_check_command` use — under
+    // `TIRITH=0`, the raw verdict already wins and `apply_agent_rules`
+    // must NOT silently re-Block. Pinned by
+    // `agent_rules_deny_skipped_under_tirith_bypass_today` and the
+    // per-surface mirrors.
+    if !verdict.bypass_honored {
+        crate::escalation::apply_agent_rules(&mut verdict, &policy);
+    }
+
+    // M4 PR #120 fix-6 (CodeRabbit Major): derive approval AFTER
+    // `apply_agent_rules` and ONLY when the verdict is not already
+    // Block. Otherwise a denied MCP client would receive both
+    // `action: block` AND `requires_approval` / `approval_*` metadata,
+    // which gives conflicting client instructions ("Block this" plus
+    // "Ask the user to approve"). Pinned by
+    // `mcp_check_url_deny_does_not_emit_approval_metadata`.
+    if verdict.action != crate::verdict::Action::Block {
+        if let Some(meta) = crate::approval::check_approval(&verdict, &policy) {
+            crate::approval::apply_approval(&mut verdict, &meta);
+        }
+    }
 
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
     let structured = serde_json::to_value(&verdict)
@@ -350,9 +369,6 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
 
     // Diagnostic tool — use paranoia filter + approval only, no escalation/session recording
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
-    if let Some(meta) = crate::approval::check_approval(&verdict, &policy) {
-        crate::approval::apply_approval(&mut verdict, &meta);
-    }
 
     // M4 item 8 chunk 3 follow-up — stamp the MCP caller origin on the
     // paste-diagnostic verdict the same way `check_command` does.
@@ -364,7 +380,24 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
     // session bookkeeping), so without this call deny would stamp but
     // not enforce on the MCP-side clipboard-poisoning surface. The
     // helper is a no-op on `Allowed`/`Unspecified`.
-    crate::escalation::apply_agent_rules(&mut verdict, &policy);
+    //
+    // M4 PR #120 fix-6 (Greptile P1): mirror the bypass-skip branch the
+    // hot paths use — under `TIRITH=0`, the raw verdict already wins and
+    // `apply_agent_rules` must NOT silently re-Block.
+    if !verdict.bypass_honored {
+        crate::escalation::apply_agent_rules(&mut verdict, &policy);
+    }
+
+    // M4 PR #120 fix-6 (CodeRabbit Major): derive approval AFTER
+    // `apply_agent_rules` and ONLY when the verdict is not already
+    // Block. Otherwise a denied MCP client would receive both
+    // `action: block` AND `requires_approval` / `approval_*` metadata.
+    // Pinned by `mcp_check_paste_deny_does_not_emit_approval_metadata`.
+    if verdict.action != crate::verdict::Action::Block {
+        if let Some(meta) = crate::approval::check_approval(&verdict, &policy) {
+            crate::approval::apply_approval(&mut verdict, &meta);
+        }
+    }
 
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
     let structured = serde_json::to_value(&verdict)
@@ -883,6 +916,148 @@ mod tests {
             has_deny_finding,
             "AgentDeniedByPolicy finding must be present: {structured}"
         );
+    }
+
+    /// Seed a `.tirith/policy.yaml` with BOTH a deny matcher AND an
+    /// approval rule targeting `plain_http_to_sink`. Used by the
+    /// "deny does not emit approval metadata" tests below: a plain
+    /// HTTP URL in sink context would otherwise raise PlainHttpToSink
+    /// (HIGH) and match the approval rule. The CodeRabbit Major fix
+    /// reorders the MCP handler so `apply_agent_rules` runs BEFORE
+    /// `check_approval`, and `check_approval` is gated on `action !=
+    /// Block`. With deny firing the verdict is Block, and the response
+    /// must NOT carry `requires_approval` / `approval_*` fields.
+    fn seed_mcp_deny_plus_approval_policy(client: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tirith_dir = dir.path().join(".tirith");
+        std::fs::create_dir_all(&tirith_dir).expect("create .tirith dir");
+        let policy = format!(
+            "agent_rules:\n  \
+             deny:\n    \
+             - kind: mcp\n      \
+               name: {client}\n\
+             approval_rules:\n  \
+             - rule_ids: [\"plain_http_to_sink\"]\n    \
+               timeout_secs: 60\n    \
+               fallback: \"block\"\n"
+        );
+        std::fs::write(tirith_dir.join("policy.yaml"), policy).expect("write policy");
+        dir
+    }
+
+    /// M4 PR #120 fix-6 (CodeRabbit Major) — pin that the
+    /// `call_check_url` handler does NOT emit approval metadata when
+    /// the verdict is denied. Before fix-6, the handler computed
+    /// `check_approval` / `apply_approval` BEFORE `apply_agent_rules`,
+    /// so a denied MCP client received both `action: block` and
+    /// `requires_approval` / `approval_*` fields — conflicting client
+    /// instructions ("Block this" plus "Ask the user to approve").
+    /// Fix-6 reorders the pipeline so apply_agent_rules runs first
+    /// and approval is only derived when the verdict isn't already Block.
+    #[test]
+    fn mcp_check_url_deny_does_not_emit_approval_metadata() {
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _origin_guard = super::super::origin::reset_for_test();
+
+        super::super::origin::set_from_initialize(Some(&super::super::types::ClientInfo {
+            name: "hostile-mcp-client".to_string(),
+            version: None,
+        }));
+
+        let policy_dir = seed_mcp_deny_plus_approval_policy("hostile-mcp-client");
+        let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", policy_dir.path());
+
+        // Plain HTTP URL in sink context — would normally raise
+        // PlainHttpToSink (HIGH), which matches the approval rule and
+        // would normally populate the approval_* metadata. With the
+        // deny matcher in play the verdict is Block and approval must
+        // NOT be derived.
+        let resp = call_check_url(&json!({"url": "http://example.com/install.sh"}));
+        assert!(!resp.is_error, "tool dispatch must succeed: {resp:?}");
+        let structured = resp
+            .structured_content
+            .expect("structured_content must be present");
+
+        // Pin (1) — verdict is Block (deny enforced).
+        assert_eq!(
+            structured["action"], "block",
+            "deny matcher must produce Block verdict: {structured}"
+        );
+
+        // Pin (2) — NO approval metadata. The fields may be absent
+        // entirely (serde `skip_serializing_if = "Option::is_none"`)
+        // OR explicitly null; both are acceptable. The pin is that
+        // they are NOT a populated approval contract.
+        let requires_approval = structured.get("requires_approval");
+        assert!(
+            requires_approval.is_none() || requires_approval == Some(&json!(null)),
+            "denied verdict MUST NOT emit requires_approval=true: {structured}"
+        );
+        for key in [
+            "approval_timeout_secs",
+            "approval_fallback",
+            "approval_rule",
+            "approval_description",
+        ] {
+            let v = structured.get(key);
+            assert!(
+                v.is_none() || v == Some(&json!(null)),
+                "denied verdict MUST NOT emit `{key}`: {structured}"
+            );
+        }
+    }
+
+    /// M4 PR #120 fix-6 (CodeRabbit Major) — paired with
+    /// `mcp_check_url_deny_does_not_emit_approval_metadata` above; the
+    /// paste handler had the same reorder bug.
+    #[test]
+    fn mcp_check_paste_deny_does_not_emit_approval_metadata() {
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _origin_guard = super::super::origin::reset_for_test();
+
+        super::super::origin::set_from_initialize(Some(&super::super::types::ClientInfo {
+            name: "hostile-mcp-client".to_string(),
+            version: None,
+        }));
+
+        let policy_dir = seed_mcp_deny_plus_approval_policy("hostile-mcp-client");
+        let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", policy_dir.path());
+
+        // Paste content with a plain HTTP URL — normally raises
+        // PlainHttpToSink (matches the approval rule). Under deny,
+        // verdict must be Block with no approval_* metadata.
+        let resp = call_check_paste(&json!({"content": "curl http://example.com/install.sh"}));
+        assert!(!resp.is_error, "tool dispatch must succeed: {resp:?}");
+        let structured = resp
+            .structured_content
+            .expect("structured_content must be present");
+
+        assert_eq!(
+            structured["action"], "block",
+            "deny matcher must produce Block verdict on paste: {structured}"
+        );
+
+        let requires_approval = structured.get("requires_approval");
+        assert!(
+            requires_approval.is_none() || requires_approval == Some(&json!(null)),
+            "denied paste verdict MUST NOT emit requires_approval=true: {structured}"
+        );
+        for key in [
+            "approval_timeout_secs",
+            "approval_fallback",
+            "approval_rule",
+            "approval_description",
+        ] {
+            let v = structured.get(key);
+            assert!(
+                v.is_none() || v == Some(&json!(null)),
+                "denied paste verdict MUST NOT emit `{key}`: {structured}"
+            );
+        }
     }
 
     /// M4 item 8 chunk 3 follow-up — paired with `mcp_check_url_*` above.

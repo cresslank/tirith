@@ -225,7 +225,15 @@ fn run_package_manager(
     // on `tirith check` but silently fail on `tirith install npm
     // evil-pkg` (a package-management hostile surface). The helper is a
     // no-op on `Allowed`/`Unspecified`.
-    tirith_core::escalation::apply_agent_rules(&mut plan.verdict, &policy);
+    //
+    // M4 PR #120 fix-6 (Greptile P1): mirror the bypass-skip branch the
+    // hot paths in `check`/`gateway` use — under `TIRITH=0`, the raw
+    // verdict already wins and `apply_agent_rules` must NOT silently
+    // re-Block. Pinned by
+    // `install_agent_rules_deny_skipped_under_tirith_bypass_today`.
+    if !plan.verdict.bypass_honored {
+        tirith_core::escalation::apply_agent_rules(&mut plan.verdict, &policy);
+    }
 
     // --- INFORM ---------------------------------------------------------
     if json {
@@ -523,7 +531,6 @@ fn run_url(
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.display().to_string());
-    let policy = Policy::discover(cwd.as_deref());
     let interactive = is_terminal::is_terminal(std::io::stderr());
 
     // --- ANALYZE: URL preflight ----------------------------------------
@@ -531,7 +538,16 @@ fn run_url(
     // pipe-to-shell. Analyzing `curl <url> | sh` would make CurlPipeShell fire
     // on every URL and turn every URL install into a block. The real script
     // body is analyzed separately by `runner::run` after download.
-    let mut preflight = preflight_url(url, cwd.as_deref(), interactive);
+    //
+    // M4 PR #120 fix-6 (CodeRabbit Major TOCTOU): `preflight_url` returns
+    // BOTH the verdict AND the policy snapshot it discovered, so the
+    // surrounding bypass-decision, `apply_agent_rules`, and audit-log
+    // calls below all run against the SAME policy snapshot as the
+    // analysis. Previously the surrounding code called
+    // `Policy::discover` a second time, which let a `.tirith/policy.yaml`
+    // change on disk between the two reads cause analysis and enforcement
+    // to run under different policies.
+    let (mut preflight, policy) = preflight_url(url, cwd.as_deref(), interactive);
 
     // M4 item 8 chunk 3 follow-up — stamp the resolved caller origin on the
     // preflight verdict BEFORE the audit-log write below. The engine that
@@ -549,7 +565,16 @@ fn run_url(
     // `TIRITH=0` (consistent with how the regular pipeline behaves —
     // finding A in the M4 PR #120 wave-end review tracks the
     // bypass-skips-agent-rules gap).
-    tirith_core::escalation::apply_agent_rules(&mut preflight, &policy);
+    //
+    // M4 PR #120 fix-6 (Greptile P1): mirror the bypass-skip branch the
+    // hot paths use — under `TIRITH=0`, the raw verdict already wins and
+    // `apply_agent_rules` must NOT silently re-Block. The pin is
+    // `install_agent_rules_deny_skipped_under_tirith_bypass_today`
+    // (covers both pkg and url forms via the pkg test; the url-form
+    // pin is `install_url_agent_rules_deny_skipped_under_tirith_bypass_today`).
+    if !preflight.bypass_honored {
+        tirith_core::escalation::apply_agent_rules(&mut preflight, &policy);
+    }
 
     if json {
         // A JSON-write failure means the consumer never received the preflight
@@ -708,7 +733,7 @@ fn shell_single_quote(value: &str) -> String {
 ///
 /// Separated so it is unit-testable without touching the network — it only
 /// runs the offline `engine::analyze`, no fetch.
-fn preflight_url(url: &str, cwd: Option<&str>, interactive: bool) -> Verdict {
+fn preflight_url(url: &str, cwd: Option<&str>, interactive: bool) -> (Verdict, Policy) {
     let ctx = AnalysisContext {
         // A download shape: a legitimate installer URL must not trip the
         // pipe-to-shell rule here. The script body is analyzed for real by
@@ -726,7 +751,13 @@ fn preflight_url(url: &str, cwd: Option<&str>, interactive: bool) -> Verdict {
         is_config_override: false,
         clipboard_html: None,
     };
-    engine::analyze(&ctx)
+    // M4 PR #120 fix-6 (CodeRabbit Major TOCTOU): return the policy
+    // discovered by the engine so the caller's subsequent
+    // `apply_agent_rules` / bypass / audit calls all share the same
+    // policy snapshot. Previously the caller ran `Policy::discover`
+    // separately, opening a TOCTOU window if `.tirith/policy.yaml`
+    // changed on disk between reads.
+    engine::analyze_returning_policy(&ctx)
 }
 
 // ===========================================================================
@@ -1152,7 +1183,8 @@ mod tests {
     fn preflight_url_plain_installer_does_not_block() {
         // A plain https installer URL, analyzed as a *download*, must not be
         // blocked — analyzing it as a pipe-to-shell would. Offline, no network.
-        let verdict = preflight_url("https://get.example-tool.sh/install.sh", None, false);
+        let (verdict, _policy) =
+            preflight_url("https://get.example-tool.sh/install.sh", None, false);
         assert_ne!(
             verdict.action,
             Action::Block,
@@ -1165,7 +1197,7 @@ mod tests {
     fn preflight_url_raw_ip_is_flagged() {
         // A raw-IP URL is suspicious and the preflight should surface it
         // (raw_ip_url rule) — still offline, no fetch.
-        let verdict = preflight_url("http://203.0.113.5/install.sh", None, false);
+        let (verdict, _policy) = preflight_url("http://203.0.113.5/install.sh", None, false);
         assert!(
             verdict.action != Action::Allow,
             "a raw-IP install URL should raise at least one finding"
@@ -1189,7 +1221,7 @@ mod tests {
         // must not produce findings from the URL tokenizing as shell syntax.
         // Quoting it makes `curl -fsSL '<url>'` analyze the URL as one arg.
         let url = "https://get.example-tool.sh/install.sh?ref=a&v=1;x y";
-        let verdict = preflight_url(url, None, false);
+        let (verdict, _policy) = preflight_url(url, None, false);
         assert_eq!(
             verdict.action,
             Action::Allow,
@@ -1202,7 +1234,8 @@ mod tests {
     fn preflight_url_quoting_preserves_real_detection() {
         // The quoting must not hide a genuinely suspicious URL — a raw-IP URL
         // is still flagged when it also contains shell metacharacters.
-        let verdict = preflight_url("http://203.0.113.5/install.sh?a=1&b=2", None, false);
+        let (verdict, _policy) =
+            preflight_url("http://203.0.113.5/install.sh?a=1&b=2", None, false);
         assert!(
             verdict.action != Action::Allow,
             "quoting must not suppress a raw-IP finding"

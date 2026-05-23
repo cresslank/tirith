@@ -878,8 +878,16 @@ pub fn allow(kind_str: &str, tool: Option<&str>, json: bool) -> i32 {
         return 1;
     }
 
-    // Empty tool string is the same matches-nothing trap — reject it.
-    if matches!(tool, Some("")) {
+    // M4 PR #120 fix-6 (CodeRabbit Minor): the `--tool` payload must be
+    // run through the same `sanitize_caller_label` pipeline that
+    // stored agent origins are ingested with — otherwise a matcher
+    // emitted from `tirith agent allow --tool "  claude-code  "`
+    // never matches the stored origin (which had its whitespace
+    // stripped at ingest). The empty-check below is moved AFTER
+    // sanitization for the same reason: `--tool "   "` sanitizes to
+    // "" and must fall into the empty-string rejection arm.
+    let name = tool.map(tirith_core::agent_origin::sanitize_caller_label);
+    if matches!(name.as_deref(), Some("")) {
         report_error(
             json,
             "tirith agent allow",
@@ -888,10 +896,7 @@ pub fn allow(kind_str: &str, tool: Option<&str>, json: bool) -> i32 {
         return 1;
     }
 
-    let matcher = AgentMatcher {
-        kind,
-        name: tool.map(|s| s.to_string()),
-    };
+    let matcher = AgentMatcher { kind, name };
 
     let snippet = render_allow_snippet(&matcher);
 
@@ -1686,6 +1691,51 @@ mod tests {
     fn allow_rejects_empty_tool_string() {
         let code = allow("agent", Some(""), false);
         assert_eq!(code, 1);
+    }
+
+    /// M4 PR #120 fix-6 (CodeRabbit Minor) — pin that
+    /// `tirith agent allow --tool "  claude-code  "` sanitizes the
+    /// payload through `sanitize_caller_label` (the same pipeline that
+    /// stored origins go through at ingest) so the emitted matcher
+    /// actually matches the stored origin "claude-code". Before fix-6,
+    /// the whitespace slipped through into the matcher payload and the
+    /// matcher would never match any real-world origin.
+    #[test]
+    fn tirith_agent_allow_normalizes_whitespace_payload() {
+        // The CLI top-level `allow` function only prints + returns an
+        // exit code, so to pin the actual matcher we exercise the same
+        // sanitize_caller_label call on a whitespace-padded input and
+        // assert the result is the trimmed form. That is the
+        // sanitization pin; the wiring into `allow` is covered by the
+        // `..._accepts_whitespace_padded_tool` exit-code test below.
+        let sanitized = tirith_core::agent_origin::sanitize_caller_label("  claude-code  ");
+        assert_eq!(sanitized, "claude-code");
+    }
+
+    /// M4 PR #120 fix-6 (CodeRabbit Minor) — paired with
+    /// `tirith_agent_allow_normalizes_whitespace_payload`. The CLI top-
+    /// level `allow` must accept a whitespace-padded tool (sanitizing it
+    /// down to "claude-code") and exit 0, NOT reject it as an empty
+    /// payload after sanitization (because "claude-code" is non-empty).
+    #[test]
+    fn allow_accepts_whitespace_padded_tool() {
+        let code = allow("agent", Some("  claude-code  "), false);
+        assert_eq!(
+            code, 0,
+            "--tool with surrounding whitespace must sanitize and succeed"
+        );
+    }
+
+    /// M4 PR #120 fix-6 (CodeRabbit Minor) — a whitespace-only tool
+    /// sanitizes to "" and must fall into the empty-string rejection
+    /// arm (same exit code as `Some("")` directly).
+    #[test]
+    fn allow_rejects_whitespace_only_tool() {
+        let code = allow("agent", Some("   "), false);
+        assert_eq!(
+            code, 1,
+            "--tool of only whitespace sanitizes to empty and must reject"
+        );
     }
 
     #[test]

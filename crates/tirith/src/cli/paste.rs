@@ -93,7 +93,17 @@ pub fn run(
     // untrusted agent would see deny enforce on `tirith check` but
     // silently fail on `tirith paste` (a clipboard-poisoning hostile
     // surface). The helper is a no-op on `Allowed`/`Unspecified`.
-    tirith_core::escalation::apply_agent_rules(&mut verdict, &policy);
+    //
+    // M4 PR #120 fix-6 (Greptile P1): mirror the bypass-skip branch the
+    // hot paths in `check`/`gateway` use — under `TIRITH=0`, the raw
+    // verdict already wins and `apply_agent_rules` must NOT silently
+    // re-Block. The pin
+    // `paste_agent_rules_deny_skipped_under_tirith_bypass_today`
+    // covers this; the `check` mirror is
+    // `agent_rules_deny_skipped_under_tirith_bypass_today`.
+    if !verdict.bypass_honored {
+        tirith_core::escalation::apply_agent_rules(&mut verdict, &policy);
+    }
 
     // Audit must capture full detection BEFORE paranoia filtering (ADR-13:
     // engine always detects everything; paranoia is an output-layer filter).
