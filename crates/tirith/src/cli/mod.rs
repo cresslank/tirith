@@ -160,6 +160,7 @@ pub mod threatdb_cmd;
 pub mod trust;
 pub mod warnings;
 pub mod why;
+pub mod yaml;
 
 #[cfg(unix)]
 pub mod fetch;

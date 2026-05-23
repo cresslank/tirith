@@ -855,6 +855,7 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("private_key_exposed", "PrivateKeyExposed"),
     // Policy
     ("policy_blocklisted", "PolicyBlocklisted"),
+    ("agent_denied_by_policy", "AgentDeniedByPolicy"),
     // Custom
     ("custom_rule_match", "CustomRuleMatch"),
     // License/infrastructure

@@ -4815,3 +4815,107 @@ fn scan_surfaces_mcp_server_drift_on_malformed_lockfile() {
         "raw lockfile bytes must not appear in the scan output; got: {stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M4 item 8 chunk 3 — bypass-path origin stamp + single audit entry.
+//
+// Pre-chunk-3, when `TIRITH=0` was honored, `engine::analyze_inner` called
+// `audit::log_verdict` itself, BEFORE the CLI had a chance to stamp the
+// verdict's `agent_origin`. Then `cli/check.rs` also called `log_verdict`,
+// producing two audit lines — the engine's (no origin) and the CLI's
+// (with origin). This test pins the chunk-3 fix:
+//   1. exactly ONE verdict audit entry is recorded per bypassed check;
+//   2. that entry carries the `agent_origin` field; and
+//   3. `bypass_honored: true` flows through.
+//
+// Unix-gated for the same reason `install_block_is_audited_with_the_block_verdict`
+// is (audit log location resolves through `data_dir()` which honors
+// XDG_DATA_HOME on Unix but %APPDATA% on Windows — set both env vars to
+// isolate; the chunk-3 invariant is OS-independent).
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+#[test]
+fn bypass_path_records_single_audit_entry_with_agent_origin() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    // `--interactive` flips the bypass policy to allow it (Policy::default
+    // sets `allow_bypass_env: true`, `allow_bypass_env_noninteractive: false`).
+    // Stamping TIRITH_INTEGRATION drives the origin into the `Agent` variant
+    // so we can assert on a non-default value.
+    let out = tirith()
+        .env("TIRITH", "0")
+        .env("TIRITH_INTEGRATION", "claude-code-test")
+        .env("TIRITH_LOG", "1")
+        .env_remove("TIRITH_POLICY_ROOT")
+        .env("XDG_DATA_HOME", &data_dir)
+        .env("APPDATA", &data_dir)
+        .args([
+            "check",
+            "--no-daemon",
+            "--interactive",
+            "--shell",
+            "posix",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ])
+        .output()
+        .expect("failed to run tirith check");
+
+    // The verdict is bypassed → exit 0. The command on its own would
+    // otherwise block (curl|bash heuristic). If we got something else,
+    // dump stderr so the failure is debuggable.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "bypassed check must exit 0 (allow). stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let log_path = data_dir.join("tirith").join("log.jsonl");
+    let log = fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("audit log {} not written: {e}", log_path.display()));
+
+    // Count verdict entries. Pre-chunk-3 there would be TWO (engine + CLI);
+    // chunk 3 collapses to ONE.
+    let verdict_entries: Vec<serde_json::Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|e| e["entry_type"] == "verdict")
+        .collect();
+
+    assert_eq!(
+        verdict_entries.len(),
+        1,
+        "exactly ONE verdict audit entry must be recorded for the bypass path \
+         (chunk 3 closed the engine's double-log gap); got {} entries:\n{}",
+        verdict_entries.len(),
+        verdict_entries
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+
+    let entry = &verdict_entries[0];
+    assert_eq!(
+        entry["bypass_honored"], true,
+        "the single audit entry must reflect bypass_honored=true: {entry}"
+    );
+
+    // The chunk-3 contract: the bypass-path audit line must carry the
+    // origin the CLI stamped. Pre-chunk-3 the engine's audit line had
+    // `agent_origin: None` because the engine doesn't know caller identity.
+    let origin = entry
+        .get("agent_origin")
+        .unwrap_or_else(|| panic!("agent_origin missing from bypass-path entry: {entry}"));
+    assert_eq!(
+        origin["kind"], "agent",
+        "TIRITH_INTEGRATION should produce kind=agent: {origin}"
+    );
+    assert_eq!(
+        origin["tool"], "claude-code-test",
+        "the tool field should carry the sanitized TIRITH_INTEGRATION value: {origin}"
+    );
+}

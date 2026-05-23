@@ -88,19 +88,21 @@ pub fn run(
 
     // Audit must capture full detection BEFORE paranoia filtering (ADR-13:
     // engine always detects everything; paranoia is an output-layer filter).
-    // Skip if bypass was honored — analyze() already logged it.
-    if !verdict.bypass_honored {
-        let event_id = uuid::Uuid::new_v4().to_string();
-        // Best-effort audit on the `paste` hot path — a write failure must not
-        // change behavior, so the Result is intentionally dropped.
-        let _ = tirith_core::audit::log_verdict(
-            &verdict,
-            &ctx.input,
-            None,
-            Some(event_id),
-            &policy.dlp_custom_patterns,
-        );
-    }
+    // M4 item 8 chunk 3 — bypass-honored verdicts are now logged here too,
+    // because the engine no longer audits its own bypass path (so the CLI
+    // can stamp `agent_origin` on the verdict before the audit line
+    // is written). Pre-chunk-3 this branch SKIPPED audit when bypass was
+    // honored, trusting `analyze()` to have logged.
+    let event_id = uuid::Uuid::new_v4().to_string();
+    // Best-effort audit on the `paste` hot path — a write failure must not
+    // change behavior, so the Result is intentionally dropped.
+    let _ = tirith_core::audit::log_verdict(
+        &verdict,
+        &ctx.input,
+        None,
+        Some(event_id),
+        &policy.dlp_custom_patterns,
+    );
 
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
 

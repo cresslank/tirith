@@ -912,27 +912,11 @@ fn find_repo_root_or_cwd() -> Result<PathBuf, String> {
     Ok(policy::find_repo_root(Some(&cwd_str)).unwrap_or(cwd))
 }
 
-/// Render a YAML scalar safely — quote-and-escape when needed. Mirrors the
-/// `mcp::yaml_safe_scalar` rules locally so this module is self-contained
-/// (the mcp helper is module-private and could be moved to a shared spot
-/// later; today, duplicating the safety rules here keeps each command's
-/// rendering audit-able in one place).
-const YAML_NEEDS_QUOTING_BYTES: &[u8] = b":#-?,[]{}&*!|>'\"%@` \t";
-
-fn yaml_safe_scalar(s: &str) -> String {
-    if s.is_empty() {
-        return "\"\"".to_string();
-    }
-    let needs_quoting = s
-        .bytes()
-        .any(|b| YAML_NEEDS_QUOTING_BYTES.contains(&b) || b < 0x20 || b == 0x7f);
-    if !needs_quoting {
-        return s.to_string();
-    }
-    serde_json::to_string(s)
-        .map(|json| json.replace('\u{7f}', "\\u007F"))
-        .unwrap_or_else(|_| format!("\"{}\"", s.escape_debug()))
-}
+// `yaml_safe_scalar` is the YAML-scalar safety helper formerly duplicated
+// here and in `cli/mcp.rs`. M4 item 8 chunk 3 consolidates both copies into
+// `crate::cli::yaml::safe_scalar`. The thin local alias preserves the
+// original name so the existing call sites and tests stay terse.
+use crate::cli::yaml::safe_scalar as yaml_safe_scalar;
 
 fn report_error(json: bool, command: &str, message: &str) {
     if json {

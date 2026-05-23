@@ -1137,78 +1137,18 @@ fn render_policy_scaffold_yaml(scaffold: &PolicyScaffold) -> String {
     s
 }
 
-/// Bytes that force a YAML scalar to be quoted rather than emitted as a
-/// bare plain scalar.
-///
-/// The list is the union of:
-/// * YAML's reserved indicator set (`:` would split a key, `#` would
-///   start a comment, `-` could start a sequence, `?`/`,`/`[`/`]`/`{`/`}`
-///   are flow-style structure, `&`/`*` are anchors/aliases, `!` is a
-///   tag, `|`/`>` are block-scalar indicators, `'`/`"` are quote
-///   markers, `%` is a directive, `@`/`` ` `` are reserved for future
-///   use);
-/// * whitespace (`space`, `\t`) — leading or embedded whitespace can
-///   confuse plain-scalar parsing rules.
-///
-/// **Control bytes** (`b < 0x20` and `0x7f` DEL) are checked separately
-/// in [`yaml_safe_scalar`] — they too force quoting, and at the same
-/// time prevent terminal-injection when the operator `cat`s the
-/// example file.
-const YAML_NEEDS_QUOTING_BYTES: &[u8] = b":#-?,[]{}&*!|>'\"%@` \t";
-
-/// Render a scalar (server name / tool name) for inclusion in a YAML
-/// document. Returns the input unmodified when it is safe as a bare
-/// scalar; quotes (`"..."`) and JSON-escapes when it contains a YAML
-/// special character, whitespace, or any non-printable byte.
-///
-/// This is **load-bearing for safety**: the lockfile carries server /
-/// tool names from arbitrary config files, and an attacker (or a
-/// careless author) can declare a name containing `:` (would split the
-/// YAML key), `#` (would split off the value as a comment), a newline
-/// (would break the document structure), or an ANSI escape (would
-/// reach the operator's terminal when the example is `cat`-ed). The
-/// quoted/escaped form is unambiguous in every case.
-fn yaml_safe_scalar(s: &str) -> String {
-    // Empty string must always be quoted — bare empty is invalid YAML.
-    if s.is_empty() {
-        return "\"\"".to_string();
-    }
-    // A string is safe as a bare scalar iff every byte is a printable
-    // ASCII non-special character. The set of "special" YAML indicators
-    // is centralized in `YAML_NEEDS_QUOTING_BYTES`; control bytes are
-    // checked separately so a future indicator change does not have to
-    // remember to keep the `< 0x20` / `== 0x7f` guards too.
-    let needs_quoting = s
-        .bytes()
-        .any(|b| YAML_NEEDS_QUOTING_BYTES.contains(&b) || b < 0x20 || b == 0x7f);
-    if !needs_quoting {
-        return s.to_string();
-    }
-    // JSON-style escaping (a strict subset of YAML's double-quoted form
-    // — `serde_json::to_string` handles every C0 control byte safely).
-    // Post-process for DEL (`\u{7f}`): JSON treats DEL as printable, so it
-    // ends up as a literal byte in the output, but YAML 1.2 §5.7 rejects
-    // a literal DEL inside a double-quoted scalar. Replace with `` so
-    // the YAML round-trip is exact — pinned by `yaml_safe_scalar_round_trips_del`.
-    serde_json::to_string(s)
-        .map(|json| json.replace('\u{7f}', "\\u007F"))
-        .unwrap_or_else(|_| format!("\"{}\"", s.escape_debug()))
-}
-
-/// Render a string for use as an inline `#`-comment suffix. We don't
-/// embed source-config paths inside YAML keys (they are not keys), so
-/// the unsafe characters we worry about are the line-breakers
-/// (`\n`, `\r`) and ANSI escapes. The simplest correct rendering is
-/// Rust's `Debug` form, which always emits printable bytes only.
-fn yaml_safe_inline_comment(s: &str) -> String {
-    // If the string contains no control bytes, return it as-is for
-    // readability. Otherwise debug-escape the whole thing.
-    if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
-        format!("{s:?}")
-    } else {
-        s.to_string()
-    }
-}
+// M4 item 8 chunk 3 — the YAML safety helpers (`yaml_safe_scalar`,
+// `yaml_safe_inline_comment`, `YAML_NEEDS_QUOTING_BYTES`) used to live as
+// two byte-identical copies in this file and `cli/agent.rs`. They are now
+// centralized in `crate::cli::yaml`. The thin aliases below preserve the
+// original names so the round-trip tests at the bottom of this module
+// (which form the most thorough round-trip suite in the repo) keep
+// reading naturally without renaming every reference.
+#[cfg(test)]
+use crate::cli::yaml::YAML_NEEDS_QUOTING_BYTES;
+use crate::cli::yaml::{
+    safe_inline_comment as yaml_safe_inline_comment, safe_scalar as yaml_safe_scalar,
+};
 
 /// Human-readable summary for `tirith mcp policy init`.
 fn print_policy_init_human(lock_path: &Path, example_path: &Path, scaffold: &PolicyScaffold) {

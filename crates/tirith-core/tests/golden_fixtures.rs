@@ -613,6 +613,7 @@ const ALL_RULE_IDS: &[&str] = &[
     "pdf_hidden_text",
     // Policy
     "policy_blocklisted",
+    "agent_denied_by_policy",
     // Custom rules
     "custom_rule_match",
     // License/infrastructure
@@ -646,10 +647,15 @@ fn load_all_fixtures() -> Vec<(String, Fixture)> {
 /// Rules that depend on runtime state and cannot be tested via static fixtures.
 /// - proxy_env_set: requires HTTP_PROXY/HTTPS_PROXY env vars to be set
 /// - policy_blocklisted: requires a blocklist file in policy config
+/// - agent_denied_by_policy: requires an `agent_rules.deny` matcher in policy
+///   (M4 item 8 chunk 3 — covered by dedicated tests in
+///   `crates/tirith-core/src/policy.rs` and
+///   `crates/tirith-core/src/escalation.rs`)
 /// - license_required: emitted by license infrastructure, not detection rules
 const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "proxy_env_set",
     "policy_blocklisted",
+    "agent_denied_by_policy",
     "command_network_deny",
     "license_required",
     "custom_rule_match",  // requires custom_rules in policy (Team-only)
@@ -820,6 +826,7 @@ fn test_rule_id_list_is_complete() {
         RuleId::PdfHiddenText,
         RuleId::CustomRuleMatch,
         RuleId::PolicyBlocklisted,
+        RuleId::AgentDeniedByPolicy,
         RuleId::LicenseRequired,
     ];
 

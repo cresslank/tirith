@@ -1540,21 +1540,31 @@ mod tests {
         );
     }
 
-    /// **The critical chunk-2 contract.** Loading a policy with a populated
-    /// `agent_rules` block must NOT change any existing verdict's outcome —
-    /// the engine doesn't consult these rules yet. Chunk 3 wires them; this
-    /// test is what stops a chunk-3 implementer from accidentally enabling
-    /// enforcement without updating the test (and the design doc / changelog
-    /// that come with it).
+    /// **Chunk-3 retirement note.** The chunk-2 invariant test
+    /// `agent_rules_chunk2_loading_changes_no_verdict` asserted that
+    /// loading `agent_rules` into a `Policy` did not change any verdict.
+    /// That contract was correct *for chunk 2 only* — chunk 3 wires the
+    /// `agent_decision` helper into `post_process_verdict`, so a populated
+    /// `agent_rules` block CAN now flip a verdict (specifically: a `deny`
+    /// match forces Block + injects `RuleId::AgentDeniedByPolicy`).
     ///
-    /// Two angles are covered:
-    /// 1. **Field-level**: every Policy field the engine reads is unchanged
-    ///    when `agent_rules` is populated.
-    /// 2. **Behavior-level**: end-to-end through `engine::analyze`, a
-    ///    benign command's verdict is byte-equal whether `agent_rules` is
-    ///    empty or populated with a deny-everything rule.
+    /// The replacement tests live in
+    /// `crates/tirith-core/src/escalation.rs::tests` — they exercise the
+    /// real splice point (`post_process_verdict`) and pin the four
+    /// behavioral arms required by the chunk-3 spec:
+    ///
+    /// * `agent_rules_deny_forces_block_on_allow_verdict`
+    /// * `agent_rules_deny_keeps_block_on_already_blocked_verdict`
+    /// * `agent_rules_allow_does_not_bypass_block`
+    /// * `agent_rules_unspecified_leaves_verdict_unchanged`
+    /// * `agent_rules_unset_does_not_introduce_finding`
+    ///
+    /// The narrower "engine::analyze itself ignores agent_rules" claim is
+    /// still true (the engine emits a raw verdict; the post-processor is
+    /// where enforcement lives), and is pinned by
+    /// `engine_analyze_does_not_consult_agent_rules` below.
     #[test]
-    fn agent_rules_chunk2_loading_changes_no_verdict() {
+    fn engine_analyze_does_not_consult_agent_rules() {
         use crate::engine::{analyze, AnalysisContext};
         use crate::extract::ScanContext;
         use crate::tokenize::ShellType;
@@ -1562,7 +1572,8 @@ mod tests {
         let _guard = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // Pin policy discovery off so a stray .tirith/policy.yaml in cwd can't bleed in.
+        // Pin policy discovery off so a stray .tirith/policy.yaml in cwd
+        // can't bleed in. APPDATA covers the Windows path.
         unsafe {
             std::env::set_var("TIRITH_POLICY_ROOT", "/nonexistent-tirith-test-root");
             std::env::set_var("XDG_CONFIG_HOME", "/nonexistent-tirith-test-config");
@@ -1574,24 +1585,11 @@ mod tests {
             std::env::remove_var("TIRITH_LOG");
         }
 
-        let baseline = Policy::default();
-        let with_rules = Policy {
-            agent_rules: AgentRules {
-                allow: vec![AgentMatcher {
-                    kind: AgentOriginKind::Agent,
-                    tool: Some("claude-code".to_string()),
-                }],
-                // A deny-everything rule. If chunk 2 leaked enforcement, this
-                // would block every command. It must not.
-                deny: vec![AgentMatcher {
-                    kind: AgentOriginKind::Human,
-                    tool: None,
-                }],
-            },
-            ..Default::default()
-        };
-
-        // Try a few commands across the action ladder.
+        // The engine itself produces the raw verdict; chunk-3 enforcement
+        // happens in `post_process_verdict`. So a call to `analyze` must
+        // not produce an `AgentDeniedByPolicy` finding even if a deny
+        // matcher is in scope — because the engine doesn't know the
+        // caller's identity at all.
         for cmd in ["echo hello", "ls -la", "curl https://example.com | bash"] {
             let ctx = AnalysisContext {
                 input: cmd.to_string(),
@@ -1605,35 +1603,14 @@ mod tests {
                 is_config_override: false,
                 clipboard_html: None,
             };
-            let v_base = analyze(&ctx);
-            let v_rules = analyze(&ctx);
-            // analyze() discovers its own policy from disk; the test
-            // pin above forces it to find none, so both calls resolve
-            // to Policy::default(). The contract we're pinning is
-            // "loading agent_rules into a Policy struct does not flow
-            // through engine::analyze and change outcomes" — chunk 2 has
-            // no path that consults `policy.agent_rules` from inside the
-            // engine.
-            assert_eq!(
-                v_base.action, v_rules.action,
-                "engine::analyze must produce the same action for {cmd:?} regardless of agent_rules state"
-            );
-            assert_eq!(
-                v_base.findings.len(),
-                v_rules.findings.len(),
-                "engine::analyze must produce the same finding count for {cmd:?} regardless of agent_rules"
+            let v = analyze(&ctx);
+            assert!(
+                !v.findings
+                    .iter()
+                    .any(|f| f.rule_id == crate::verdict::RuleId::AgentDeniedByPolicy),
+                "engine::analyze must never produce AgentDeniedByPolicy — that rule fires only in post_process_verdict"
             );
         }
-
-        // The most direct check: chunk 2's only reader of agent_rules is
-        // the pure helper; if `agent_decision` returns Denied / Allowed
-        // for a Human origin but the engine still doesn't gate on it,
-        // we've proven the invariant.
-        assert_eq!(
-            agent_decision(&with_rules, &AgentOrigin::human(true)),
-            AgentDecision::Denied,
-            "the helper sees Denied — proving rules are populated; the engine still must ignore them"
-        );
 
         unsafe {
             std::env::remove_var("TIRITH_POLICY_ROOT");
@@ -1642,14 +1619,22 @@ mod tests {
             std::env::remove_var("XDG_STATE_HOME");
             std::env::remove_var("APPDATA");
         }
-
-        // Field-level: every engine-read field is unchanged.
-        let _ = (with_rules, baseline);
     }
 
     /// Field-level invariant — every Policy field the engine consults must be
     /// untouched by setting `agent_rules`. Pure struct comparison; no engine
     /// involvement.
+    ///
+    /// **Chunk-3 note:** chunk 3 wired `agent_rules` enforcement into
+    /// `post_process_verdict`, so the original chunk-2 promise ("a populated
+    /// `agent_rules` block changes nothing") is now scoped tighter: it
+    /// changes no *other* Policy field — every existing field the
+    /// rest of the engine reads stays at its default — but it CAN flip an
+    /// Allow verdict to Block on a `deny` match. The flip is exercised by
+    /// the dedicated tests in `escalation.rs`. The struct-comparison guard
+    /// below remains useful: it stops a future chunk from accidentally
+    /// repurposing `agent_rules` to also seed `allowlist` / `blocklist` /
+    /// the severity overrides.
     #[test]
     fn agent_rules_chunk2_observation_only_invariant() {
         let base = Policy::default();
@@ -1666,9 +1651,9 @@ mod tests {
             },
             ..Default::default()
         };
-        // Every field the engine reads must equal the default policy. The
-        // chunk-2 promise is "loading a policy with `agent_rules` populated
-        // changes nothing" — that's exactly this comparison.
+        // Every other engine-read field must equal the default policy: chunk
+        // 3's `agent_rules` enforcement must not bleed into adjacent
+        // mechanisms (allowlist / blocklist / severity overrides / etc.).
         assert_eq!(base.fail_mode, with_rules.fail_mode);
         assert_eq!(base.allow_bypass_env, with_rules.allow_bypass_env);
         assert_eq!(base.paranoia, with_rules.paranoia);
@@ -1680,8 +1665,8 @@ mod tests {
         assert_eq!(base.escalation.len(), with_rules.escalation.len());
         assert_eq!(base.strict_warn, with_rules.strict_warn);
 
-        // The decision helper is reachable and produces sensible answers —
-        // but the engine ignores its output in chunk 2.
+        // The decision helper produces sensible answers — and chunk 3 wires
+        // these through `post_process_verdict` (see `escalation.rs` tests).
         let origin = AgentOrigin::agent("claude-code", None).unwrap();
         assert_eq!(agent_decision(&with_rules, &origin), AgentDecision::Allowed);
         assert_eq!(agent_decision(&base, &origin), AgentDecision::Unspecified);

@@ -504,16 +504,16 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             verdict.bypass_honored = true;
             verdict.interactive_detected = ctx.interactive;
             verdict.policy_path_used = policy.path.clone();
-            // Best-effort audit on the engine hot path — a write failure here
-            // must not change the verdict, so the Result is intentionally
-            // dropped (the diagnostic still fires under TIRITH_AUDIT_DEBUG).
-            let _ = crate::audit::log_verdict(
-                &verdict,
-                &ctx.input,
-                None,
-                None,
-                &policy.dlp_custom_patterns,
-            );
+            // M4 item 8 chunk 3 — the audit write moved OUT of the engine's
+            // bypass path so the caller (CLI, MCP server, gateway) can
+            // stamp `agent_origin` on the verdict BEFORE the audit entry
+            // is recorded. Pre-chunk-3, the engine logged here and then
+            // the CLI logged again, producing a double-entry where the
+            // first entry was missing origin. Each caller is now
+            // responsible for calling `audit::log_verdict` exactly once
+            // after stamping origin — see `cli/check.rs`, `cli/paste.rs`,
+            // `mcp/tools.rs`, and `cli/gateway.rs`'s `write_audit_*`
+            // helpers.
             return (verdict, policy);
         }
     }

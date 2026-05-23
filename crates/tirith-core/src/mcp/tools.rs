@@ -219,6 +219,17 @@ fn call_check_command(args: &Value) -> ToolCallResult {
     raw_verdict.agent_origin = super::origin::current();
 
     let mut verdict = if raw_verdict.bypass_honored {
+        // M4 item 8 chunk 3 — the engine no longer audits its own bypass
+        // path; the caller does. Log the bypass-honored verdict here so
+        // the audit entry carries the MCP client origin we just stamped.
+        // Best-effort — a write failure must not change the verdict.
+        let _ = crate::audit::log_verdict(
+            &raw_verdict,
+            command,
+            None,
+            None,
+            &policy.dlp_custom_patterns,
+        );
         raw_verdict
     } else {
         let session_id = crate::session::resolve_session_id();

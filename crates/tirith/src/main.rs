@@ -1651,9 +1651,13 @@ Allow / Warn / Block histogram so an operator can see at a glance which
 classes of caller are producing which classes of verdict.
 
 Entries with no `agent_origin` field (pre-chunk-1 audit lines, hook
-telemetry, the engine's bypass-path log; chunk 3 closes this gap) land in
-an explicit `unknown` group rather than being silently dropped — honesty
-over apparent tidiness.
+telemetry, and any audit caller that did not stamp an origin before
+calling `audit::log_verdict`) land in an explicit `unknown` group rather
+than being silently dropped — honesty over apparent tidiness. Chunk 3
+fixed the engine's bypass path so the CLI / MCP / gateway caller is the
+single audit site (previously the engine logged once without origin,
+then the CLI logged again with origin — a double entry where one was
+attributed and the other was not).
 
 Exit codes:
   0  the aggregation ran (zero or more groups reported).

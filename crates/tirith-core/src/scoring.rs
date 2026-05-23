@@ -179,6 +179,7 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::HighEntropySecret
         | RuleId::PrivateKeyExposed
         | RuleId::PolicyBlocklisted
+        | RuleId::AgentDeniedByPolicy
         | RuleId::CustomRuleMatch
         | RuleId::LicenseRequired => false,
     }

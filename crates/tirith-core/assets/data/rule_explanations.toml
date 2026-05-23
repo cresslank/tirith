@@ -1203,6 +1203,17 @@ examples_good = []
 false_positive_guidance = "If this is a false positive, update the blocklist in your .tirith/policy.yaml."
 remediation = "Check your policy blocklist configuration. Remove the entry if the match is not intended."
 
+[[rule]]
+id = "agent_denied_by_policy"
+title = "Caller denied by agent_rules"
+category = "policy"
+severity_rationale = "High — the caller's identity matched a `deny` matcher in `agent_rules`, so the operator explicitly does not trust commands from this origin. The action is forced to Block regardless of any detection finding."
+description = "The verdict's `agent_origin` (the caller-claimed identity of who invoked tirith — `human`, `agent`, `mcp`, `gateway`, `ci`, or `ide`) matched a `deny` entry in your `.tirith/policy.yaml` `agent_rules.deny:` block. This is a policy-enforced block, not a heuristic detection. A `deny` match beats any `allow` match. The agent identity is caller-claimed (operator-trust), not adversary-resistant — see `docs/agent-governance-design.md` §1 for the threat model."
+examples_bad = []
+examples_good = []
+false_positive_guidance = "If this is a false positive, remove the matching entry from `agent_rules.deny` in your `.tirith/policy.yaml`, or add a more specific `allow` entry. Use `tirith agent allow --kind <kind> [--tool <name>]` to validate and print the YAML snippet to paste."
+remediation = "Review your `agent_rules` configuration in `.tirith/policy.yaml`. The finding's description names which matcher fired and which policy file it lives in. If the caller should be trusted, either narrow the deny matcher (e.g. add a `tool:` filter) or move it to `allow`."
+
 # ── Custom rules ────────────────────────────────────────────────────────
 
 [[rule]]

@@ -157,6 +157,11 @@ pub enum RuleId {
 
     // Policy rules
     PolicyBlocklisted,
+    /// M4 item 8 chunk 3 — the verdict's caller `AgentOrigin` matched a
+    /// `deny` matcher in `agent_rules`. Forces the verdict's [`Action`] to
+    /// [`Action::Block`] regardless of any detection finding. See
+    /// `policy::agent_decision` and `docs/agent-governance-design.md` §5.
+    AgentDeniedByPolicy,
 
     // Custom rules
     CustomRuleMatch,

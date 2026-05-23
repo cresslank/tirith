@@ -10,9 +10,10 @@ recorded here.
 * Chunk 1 (observability scaffolding) — **shipped**.
 * Chunk 2 (CLI surface + `agent_rules` policy schema, observation-only) —
   **shipped** (see §5).
-* Chunk 3 (per-agent verdict gating) — planned.
+* Chunk 3 (per-agent verdict gating, bypass-path origin stamp, shared YAML
+  helper consolidation) — **shipped** (see §5 and §6).
 
-The companion code through chunk 2 is observation-only:
+The companion code through chunk 2 was observation-only:
 
 - `crates/tirith-core/src/agent_origin.rs` — the [`AgentOrigin`](#3-the-agentorigin-type)
   type and the CLI-side environment resolver.
@@ -24,7 +25,20 @@ The companion code through chunk 2 is observation-only:
 - `crates/tirith/src/cli/check.rs`, `paste.rs`, `gateway.rs` — populate
   the origin on the verdict before it reaches the audit layer.
 
-Nothing in chunk 1 gates a verdict, changes an [`Action`], or adds a `RuleId`.
+Chunk 3 turns observation into enforcement:
+
+- `crates/tirith-core/src/escalation.rs` — `apply_agent_rules` and the
+  splice into `post_process_verdict`.
+- `crates/tirith-core/src/verdict.rs` — new `RuleId::AgentDeniedByPolicy`
+  variant, wired through `scoring.rs`, `build.rs`'s `EXPECTED_RULES`,
+  `golden_fixtures.rs`'s `ALL_RULE_IDS` + `EXTERNALLY_TRIGGERED_RULES`,
+  and `assets/data/rule_explanations.toml`.
+- `crates/tirith-core/src/engine.rs` — bypass-path audit removed (the
+  caller now owns the single audit write site) so `agent_origin` reaches
+  the audit log on bypassed BLOCKs.
+- `crates/tirith/src/cli/yaml.rs` — new shared module hosting
+  `yaml_safe_scalar` / `yaml_safe_inline_comment` / `YAML_NEEDS_QUOTING_BYTES`;
+  `cli/mcp.rs` and `cli/agent.rs` are thin importers.
 
 ## 1. Threat model & motivation
 
@@ -270,15 +284,23 @@ to work: the verdict's `agent_origin` defaults to `None`, the audit entry's
 `agent_origin` is then `None`, and `#[serde(skip_serializing_if =
 "Option::is_none")]` keeps the field out of the JSON line.
 
-## 5. CLI surface (shipped in chunk 2)
+## 5. CLI surface (shipped in chunk 2; enforcement wired in chunk 3)
 
 The roadmap names four commands. **Chunk 2 ships all four** plus the
-matching `agent_rules` policy schema. Chunk 2 is **observation-only**:
-the engine does not consult `agent_rules` to gate verdicts, and a
-populated policy changes no existing outcome. Chunk 3 wires
-enforcement; the safeguard test
-`agent_rules_chunk2_loading_changes_no_verdict` is the regression check
-a chunk-3 implementer must explicitly retire.
+matching `agent_rules` policy schema. **Chunk 3 wires enforcement**:
+`post_process_verdict` now consults `policy::agent_decision` against
+the verdict's `agent_origin` and forces the action to `Block` (with a
+fresh `RuleId::AgentDeniedByPolicy` finding) on a `deny` match. The
+chunk-2 safeguard test `agent_rules_chunk2_loading_changes_no_verdict`
+was retired in chunk 3; the replacement tests in
+`crates/tirith-core/src/escalation.rs::tests` pin the four behavioral
+arms:
+
+* `agent_rules_deny_forces_block_on_allow_verdict`
+* `agent_rules_deny_keeps_block_on_already_blocked_verdict`
+* `agent_rules_allow_does_not_bypass_block`
+* `agent_rules_unspecified_leaves_verdict_unchanged`
+* `agent_rules_unset_does_not_introduce_finding` (the regression guard)
 
 ### `tirith agent sessions`
 
@@ -380,7 +402,8 @@ Validation rules:
 
 ### Policy schema — `agent_rules`
 
-Chunk 2 adds the schema; chunk 3 will consume it.
+Chunk 2 added the schema; **chunk 3 consumes it in
+`post_process_verdict`**.
 
 ```yaml
 agent_rules:
@@ -403,7 +426,41 @@ agent_rules:
 * The pure helper `policy::agent_decision(&policy, &origin) ->
   AgentDecision` walks `deny` first (first match → `Denied`) then
   `allow` (first match → `Allowed`); no match → `Unspecified`.
-  **Not consulted by the engine in chunk 2.** Chunk 3 wires it.
+
+#### Chunk-3 enforcement semantics
+
+`crate::escalation::apply_agent_rules` consumes the helper inside
+`post_process_verdict` after escalation and before warning recording:
+
+| `agent_decision` returns | Effect on the verdict |
+|---|---|
+| `Denied { matcher }` | `action = Block`; a fresh `Finding { rule_id: RuleId::AgentDeniedByPolicy, severity: High, … }` is appended naming the matched origin (Debug-escaped) and the policy file path. Existing detection findings are preserved. |
+| `Allowed { matcher }` | No behavior change. `allow` is **not** a bypass — a verdict the engine already blocked stays blocked. |
+| `Unspecified` | No behavior change. |
+| (`verdict.agent_origin == None`) | Treated as `Unspecified` — an engine path that never set an origin has nothing to match against. |
+
+**Chunk-3 minimal cut.** Richer matcher payloads — `severity` overrides
+on `allow` (a trusted agent's Medium becomes Low), `approval_required:
+true`, `fail_mode: closed` per-origin — are deferred to a future chunk
+unless a live workload surfaces a concrete need. The minimal `Denied
+→ Block` semantics covers the immediate operator use case ("block
+this untrusted MCP client from running anything") without committing
+the schema to questions we have not yet seen real telemetry for.
+
+**Origin-stamp invariant.** The verdict's `agent_origin` is now stamped
+**before** every `audit::log_verdict` call site:
+
+* `cli/check.rs` — already stamping pre-chunk-3.
+* `cli/paste.rs` — stamping pre-chunk-3, but the bypass branch now
+  audits (it previously skipped, trusting the engine to have logged).
+* `cli/gateway.rs` — already stamping pre-chunk-3.
+* `mcp/tools.rs::call_check_command` — stamping pre-chunk-3, but the
+  bypass branch now audits explicitly (same reason as `paste.rs`).
+* `engine::analyze_inner` — **no longer audits** its own bypass
+  fast-exit. Pre-chunk-3 it called `audit::log_verdict` with the
+  unstamped verdict, producing a double-log on `tirith check`
+  (engine entry → no origin; CLI entry → with origin). Chunk 3
+  moves audit responsibility entirely to the caller.
 
 ## 6. Out of scope
 
@@ -421,25 +478,33 @@ agent_rules:
 
 ### For chunk 2 (CLI surface + policy schema)
 
-- **Policy enforcement.** No `Action` is changed; no `RuleId` is added;
-  no `tirith.lock` file (mcp or otherwise) gains an agent-origin field.
-  The engine does **not** consult `agent_rules` to gate a verdict —
-  chunk 3 wires `policy::agent_decision` into the verdict pipeline. The
-  regression test `agent_rules_chunk2_loading_changes_no_verdict`
-  (in `crates/tirith-core/src/policy.rs`) is the contract chunk 3 must
-  explicitly retire when it lands enforcement.
-- **Mutating an existing policy file.** `tirith agent allow` prints
-  the YAML snippet to paste; it does NOT append to
+- **Policy enforcement.** Resolved in chunk 3.
+- **Mutating an existing policy file.** `tirith agent allow` still
+  only prints the YAML snippet to paste; it does NOT append to
   `.tirith/policy.yaml`. The operator integrates it themselves, the
-  same as with `tirith mcp policy init`'s example file.
+  same as with `tirith mcp policy init`'s example file. Chunk 3 did
+  not change this discipline.
 - **Normalizing caller-claimed strings.** Q2 stays open; case-sensitive
-  exact matching is the chunk-2 contract.
-- **Fixing the engine's bypass-path double-log.** When `TIRITH=0` is
-  honored, the engine emits an audit line **inside**
-  `analyze_returning_policy` (before the CLI gets a chance to set
-  origin), then the CLI emits a second line with the origin
-  populated. Pre-existing M3 issue; chunk 3 enforcement work picks it
-  up.
+  exact matching remains the contract through chunk 3.
+- **Fixing the engine's bypass-path double-log.** Resolved in chunk 3
+  — the engine no longer audits its own bypass fast-exit; the CLI /
+  MCP / gateway callers are the single audit site and stamp
+  `agent_origin` before logging.
+
+### For chunk 3 (per-agent verdict gating)
+
+- **Richer matcher payloads.** `severity` overrides on `allow`,
+  `approval_required: true`, per-origin `fail_mode` — all deferred. The
+  chunk-3 contract is the minimal `Denied → Block` semantics; an
+  `Allowed` matcher does not change verdict behavior beyond suppressing
+  the chunk-3 deny check itself (and even then only because
+  `agent_decision` returns `Allowed` before `Unspecified`).
+- **Synthesizing an origin onto hook telemetry entries.** Still
+  deferred (same reason as chunk 1's exclusion).
+- **A signed / cryptographically-attested agent identity.** Still
+  deferred to M5 supply-chain work. Chunk 3's enforcement layers on
+  top of caller-claimed signals, with the same trust posture chunks 1
+  and 2 documented.
 
 ## 7. Open questions / decisions deferred
 
