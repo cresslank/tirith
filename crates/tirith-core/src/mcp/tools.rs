@@ -284,8 +284,13 @@ fn call_check_url(args: &Value) -> ToolCallResult {
         clipboard_html: None,
     };
 
-    let mut verdict = engine::analyze(&ctx);
-    let policy = crate::policy::Policy::discover(None);
+    // PR #120 fix-8 (CodeRabbit Major): use the same engine API as
+    // `call_check_command` so analysis and enforcement / approval /
+    // audit all see the same Policy snapshot. The split
+    // `engine::analyze(&ctx)` + `Policy::discover(None)` pair allowed a
+    // mid-call edit of `.tirith/policy.yaml` to swap the policy out
+    // from under the rest of the pipeline.
+    let (mut verdict, policy) = engine::analyze_returning_policy(&ctx);
 
     // Diagnostic tool — use paranoia filter + approval only, no escalation/session recording
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
@@ -380,8 +385,10 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
         clipboard_html: None,
     };
 
-    let mut verdict = engine::analyze(&ctx);
-    let policy = crate::policy::Policy::discover(None);
+    // PR #120 fix-8 (CodeRabbit Major): single Policy snapshot for
+    // analysis + enforcement + approval + audit. See `call_check_url`
+    // for the rationale.
+    let (mut verdict, policy) = engine::analyze_returning_policy(&ctx);
 
     // Diagnostic tool — use paranoia filter + approval only, no escalation/session recording
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
