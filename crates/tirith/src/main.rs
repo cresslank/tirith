@@ -222,6 +222,7 @@ Examples:
 Examples:
   tirith lab
   tirith lab --filter powershell
+  tirith lab --score
   tirith lab --non-interactive
   tirith lab --format json")]
     Lab {
@@ -232,6 +233,11 @@ Examples:
         /// Non-interactive: run all scenarios without prompting
         #[arg(long)]
         non_interactive: bool,
+
+        /// Include a deterministic 0-100 risk score per scenario
+        /// (Critical=100, High=75, Medium=50, Low=25, Info=5; max wins).
+        #[arg(long)]
+        score: bool,
 
         /// Output format (default: human)
         #[arg(long, value_enum)]
@@ -2047,6 +2053,7 @@ fn run() {
         Commands::Lab {
             filter,
             non_interactive,
+            score,
             format,
             json,
         } => {
@@ -2059,7 +2066,7 @@ fn run() {
                 && !want_json
                 && is_terminal::is_terminal(std::io::stdout())
                 && is_terminal::is_terminal(std::io::stdin());
-            cli::lab::run(interactive, filter.as_deref(), want_json)
+            cli::lab::run(interactive, filter.as_deref(), want_json, score)
         }
 
         Commands::Score {

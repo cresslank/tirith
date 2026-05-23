@@ -25,7 +25,7 @@ use serde::Deserialize;
 use tirith_core::engine::{self, AnalysisContext};
 use tirith_core::extract::ScanContext;
 use tirith_core::tokenize::ShellType;
-use tirith_core::verdict::{Action, Finding};
+use tirith_core::verdict::{Action, Finding, Severity};
 
 /// Embedded corpus. Path is 4 levels up from this file:
 ///   crates/tirith/src/cli/lab.rs
@@ -70,7 +70,34 @@ struct ScenarioResult<'a> {
     expected: &'a str,
     actual: &'a str,
     pass: bool,
+    /// Deterministic risk score 0-100, derived from the max finding severity.
+    /// Only populated when `--score` is on so legacy consumers see no schema
+    /// drift.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score: Option<u32>,
     findings: Vec<FindingSummary>,
+}
+
+/// Compute the deterministic risk score 0-100 from a scenario's findings.
+///
+/// The score is the max severity mapped to a fixed bucket:
+///   Critical = 100, High = 75, Medium = 50, Low = 25, Info = 5.
+///
+/// Empty findings → 0 (allow). The function is intentionally cheap and
+/// explainable — no ML, no network, the score sums by hand from the
+/// finding list.
+fn scenario_score(findings: &[Finding]) -> u32 {
+    findings
+        .iter()
+        .map(|f| match f.severity {
+            Severity::Critical => 100,
+            Severity::High => 75,
+            Severity::Medium => 50,
+            Severity::Low => 25,
+            Severity::Info => 5,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -85,7 +112,12 @@ struct FindingSummary {
 /// Returns the process exit code: `0` on all-pass (or filter-empty), `1` on
 /// any failure (parse error, unparseable scenario, or expected_action
 /// mismatch).
-pub fn run(interactive: bool, filter: Option<&str>, json: bool) -> i32 {
+///
+/// `score`: when true, each `ScenarioResult` gets a deterministic 0-100
+/// risk score (see [`scenario_score`]) and the human summary table grows
+/// a `Score` column. JSON gains a `score` field per entry (omitted
+/// otherwise via `skip_serializing_if`).
+pub fn run(interactive: bool, filter: Option<&str>, json: bool, score: bool) -> i32 {
     let corpus: LabCorpus = match toml::from_str(LAB_CORPUS) {
         Ok(c) => c,
         Err(e) => {
@@ -240,11 +272,17 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool) -> i32 {
             }
         }
 
+        let scenario_score_value = if score {
+            Some(scenario_score(&verdict.findings))
+        } else {
+            None
+        };
         results.push(ScenarioResult {
             name: scenario.name.as_str(),
             expected,
             actual,
             pass,
+            score: scenario_score_value,
             findings: verdict.findings.iter().map(summarize_finding).collect(),
         });
     }
@@ -259,7 +297,7 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool) -> i32 {
             return 1;
         }
     } else if !interactive {
-        print_summary_table(&results, passed, failed);
+        print_summary_table(&results, passed, failed, score);
     } else {
         // Interactive: print a trailing summary line.
         println!();
@@ -289,7 +327,7 @@ fn summarize_finding(f: &Finding) -> FindingSummary {
     }
 }
 
-fn print_summary_table(results: &[ScenarioResult], passed: usize, failed: usize) {
+fn print_summary_table(results: &[ScenarioResult], passed: usize, failed: usize, score: bool) {
     // Column widths chosen for the canonical 10-scenario corpus; long
     // names just push the rest right rather than getting truncated.
     let name_width = results
@@ -299,20 +337,46 @@ fn print_summary_table(results: &[ScenarioResult], passed: usize, failed: usize)
         .unwrap_or(4)
         .max(4);
 
-    println!(
-        "{:<name_width$}  {:<8}  {:<8}  result",
-        "name", "expected", "actual"
-    );
-    println!("{:-<name_width$}  {:-<8}  {:-<8}  {:-<6}", "", "", "", "",);
-    for r in results {
+    if score {
         println!(
-            "{:<name_width$}  {:<8}  {:<8}  {}",
-            r.name,
-            r.expected,
-            r.actual,
-            if r.pass { "PASS" } else { "FAIL" },
-            name_width = name_width
+            "{:<name_width$}  {:<8}  {:<8}  {:<5}  result",
+            "name", "expected", "actual", "score"
         );
+        println!(
+            "{:-<name_width$}  {:-<8}  {:-<8}  {:-<5}  {:-<6}",
+            "", "", "", "", "",
+        );
+        for r in results {
+            // `score` field is Some(_) whenever the caller passed
+            // --score; fall back to 0 defensively if a future caller ever
+            // passes score=true without populating per-result.
+            let s = r.score.unwrap_or(0);
+            println!(
+                "{:<name_width$}  {:<8}  {:<8}  {:<5}  {}",
+                r.name,
+                r.expected,
+                r.actual,
+                s,
+                if r.pass { "PASS" } else { "FAIL" },
+                name_width = name_width
+            );
+        }
+    } else {
+        println!(
+            "{:<name_width$}  {:<8}  {:<8}  result",
+            "name", "expected", "actual"
+        );
+        println!("{:-<name_width$}  {:-<8}  {:-<8}  {:-<6}", "", "", "", "",);
+        for r in results {
+            println!(
+                "{:<name_width$}  {:<8}  {:<8}  {}",
+                r.name,
+                r.expected,
+                r.actual,
+                if r.pass { "PASS" } else { "FAIL" },
+                name_width = name_width
+            );
+        }
     }
     println!();
     println!("Total: {passed} passed, {failed} failed");
