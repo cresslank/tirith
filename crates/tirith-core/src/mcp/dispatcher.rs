@@ -266,6 +266,20 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
     0
 }
 
+/// Pull `clientInfo` out of an `initialize` request's raw `params` JSON.
+///
+/// Deliberately independent of `InitializeParams` deserialization: a payload
+/// with a non-conforming `protocolVersion` (or any unrelated field) still
+/// surfaces its `clientInfo` to the origin store, as long as `clientInfo`
+/// itself is well-formed. A malformed `clientInfo` returns `None` and the
+/// caller falls back to `"unknown-mcp-client"` in `set_from_initialize`.
+fn extract_client_info(params: &Option<Value>) -> Option<ClientInfo> {
+    params
+        .as_ref()
+        .and_then(|p| p.get("clientInfo"))
+        .and_then(|ci| serde_json::from_value::<ClientInfo>(ci.clone()).ok())
+}
+
 fn handle_initialize(params: &Option<Value>) -> Value {
     let requested_version = params
         .as_ref()
@@ -278,15 +292,17 @@ fn handle_initialize(params: &Option<Value>) -> Value {
 
     // M4 item 8 chunk 1 — observation-only. Capture the caller-supplied
     // `clientInfo` so subsequent tool calls can stamp `AgentOrigin::Mcp` on
-    // their verdicts. The full `initialize` params are parsed
-    // best-effort: a malformed payload yields `None` and the origin store
-    // records `"unknown-mcp-client"` (still "this is an MCP caller", just
+    // their verdicts. We pull `clientInfo` directly from the raw JSON so an
+    // unrelated `InitializeParams` field that fails to deserialize (a non-
+    // conforming `protocolVersion`, a future required field, …) does not
+    // strip attribution off a payload whose `clientInfo` was perfectly
+    // valid. A malformed `clientInfo` itself still falls through to the
+    // `None` branch in `set_from_initialize`, which records
+    // `"unknown-mcp-client"` (still "this is an MCP caller", just
     // anonymous). Nothing here gates the response — `initialize` succeeds
     // regardless.
-    let init_params: Option<super::types::InitializeParams> = params
-        .as_ref()
-        .and_then(|p| serde_json::from_value(p.clone()).ok());
-    super::origin::set_from_initialize(init_params.as_ref().and_then(|p| p.client_info.as_ref()));
+    let client_info = extract_client_info(params);
+    super::origin::set_from_initialize(client_info.as_ref());
 
     let result = InitializeResult {
         protocol_version: version,
@@ -396,7 +412,16 @@ mod tests {
     use super::*;
     use std::io::BufReader;
 
+    /// Drive a full dispatcher session over an in-memory transport.
+    ///
+    /// Acquires the origin-store serial lock for the duration of the
+    /// session: any input that includes an `initialize` request will write
+    /// `MCP_ORIGIN`, and we must not race with `mcp::origin::tests::*` cases
+    /// that read or reset it. Acquiring the lock unconditionally is cheap
+    /// and keeps every dispatcher test on the same mutex without having to
+    /// remember which paths touch the global.
     fn run_session(input: &str) -> (String, String) {
+        let _serial = super::super::origin::serial_lock();
         let reader = BufReader::new(input.as_bytes());
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -524,13 +549,9 @@ mod tests {
     /// M4 item 8 chunk 1 — the dispatcher must capture `initialize.clientInfo`
     /// and surface it as `agent_origin` on every subsequent tool call.
     ///
-    /// The session always begins with our `init_msg` (which sends
-    /// `clientInfo.name = "test"`), so by the time the tool call runs in
-    /// the *same* session the origin store reflects this client. We do not
-    /// reset the global store here — `MCP_ORIGIN` is process-global and
-    /// other tests in this module run in parallel with us, but every one of
-    /// them also sends `"test"` as the client name, so the value is stable
-    /// regardless of ordering.
+    /// `MCP_ORIGIN` is process-global; `run_session` already acquires the
+    /// origin-store serial lock so this read-after-write is race-free
+    /// against `mcp::origin::tests::*`.
     #[test]
     fn test_mcp_origin_is_stamped_on_tool_verdict() {
         let input = format!(
@@ -696,5 +717,56 @@ mod tests {
         assert_eq!(resps.len(), 2);
         assert_eq!(resps[1]["id"], Value::Null);
         assert_eq!(resps[1]["result"], json!({}));
+    }
+
+    /// CodeRabbit Minor (cid 3292343379): an `initialize` payload that
+    /// fails the *full* `InitializeParams` deserialization for an unrelated
+    /// reason (here: a non-conforming `protocolVersion` shape) must still
+    /// surface its `clientInfo` to the origin store. Pure-function test
+    /// over `extract_client_info` so no global state is involved.
+    #[test]
+    fn extract_client_info_survives_malformed_protocol_version() {
+        // protocolVersion is an integer; the wrapping `InitializeParams`
+        // would fail to deserialize. clientInfo itself is valid.
+        let raw = json!({
+            "protocolVersion": 12345,
+            "capabilities": {},
+            "clientInfo": {"name": "Cursor", "version": "0.42"}
+        });
+        let params = Some(raw.clone());
+        let ci = extract_client_info(&params).expect("clientInfo should be extracted");
+        assert_eq!(ci.name, "Cursor");
+        assert_eq!(ci.version.as_deref(), Some("0.42"));
+
+        // Sanity: confirm the wider parse would indeed have failed.
+        assert!(
+            serde_json::from_value::<InitializeParams>(raw).is_err(),
+            "the regression this guards is the full parse failing"
+        );
+    }
+
+    #[test]
+    fn extract_client_info_returns_none_when_absent() {
+        let params = Some(json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {}
+        }));
+        assert!(extract_client_info(&params).is_none());
+    }
+
+    #[test]
+    fn extract_client_info_returns_none_for_malformed_client_info() {
+        // clientInfo present but shape doesn't match (`name` is wrong type).
+        let params = Some(json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": 42}
+        }));
+        assert!(extract_client_info(&params).is_none());
+    }
+
+    #[test]
+    fn extract_client_info_returns_none_for_none_params() {
+        assert!(extract_client_info(&None).is_none());
     }
 }

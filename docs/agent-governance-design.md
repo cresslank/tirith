@@ -8,7 +8,7 @@ recorded here.
 
 The companion code is observation-only:
 
-- `crates/tirith-core/src/agent_origin.rs` — the [`AgentOrigin`](#agentorigin)
+- `crates/tirith-core/src/agent_origin.rs` — the [`AgentOrigin`](#3-the-agentorigin-type)
   type and the CLI-side environment resolver.
 - `crates/tirith-core/src/verdict.rs` — `Verdict.agent_origin: Option<AgentOrigin>`.
 - `crates/tirith-core/src/audit.rs` — `AuditEntry.agent_origin: Option<AgentOrigin>`,
