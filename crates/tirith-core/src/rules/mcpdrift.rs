@@ -23,10 +23,16 @@
 //! `mcp_lock.rs`); this module observes the *hash* changed, never the
 //! underlying secret.
 //!
-//! **Malformed input is never fatal.** A `.tirith/mcp.lock` that does not
-//! parse, an unreadable repo root, or an inventory rebuild that fails (a
-//! malformed config inside the repo) yields zero findings rather than a
-//! panic — the same convention `configfile` / `cifile` / `aifile` follow.
+//! **Malformed lockfile is itself a finding.** A `.tirith/mcp.lock` that
+//! does not parse cannot be diffed against the current inventory, so drift
+//! cannot be verified — exactly the failure mode an attacker would use to
+//! hide an MCP-surface change behind a deliberately broken lockfile. The
+//! rule therefore emits a `McpServerDrift` finding (same severity as a
+//! drift) when the committed lockfile is unparseable, naming the parse
+//! failure without echoing any of the file's bytes. An unreadable repo
+//! root, or an inventory rebuild that fails because of a malformed config
+//! file, still yields zero findings — those are operational conditions, not
+//! a tampered baseline.
 
 use std::path::Path;
 
@@ -74,12 +80,16 @@ pub fn check(content: &str, file_path: Option<&Path>) -> Vec<Finding> {
         return Vec::new();
     }
 
-    // Parse the lockfile. A malformed lockfile is not this rule's concern —
-    // the `tirith mcp verify` command and the `mcp lock` writer own that
-    // surface; here we silently skip.
+    // Parse the lockfile. A malformed lockfile is itself a security signal:
+    // the committed baseline cannot be diffed against the current inventory,
+    // so drift cannot be verified. An attacker who altered the MCP surface
+    // and then corrupted the lockfile would silently bypass scan-time
+    // governance if we returned no findings. Emit the same `McpServerDrift`
+    // rule as a drift detection — same severity, distinct description — so
+    // the safeguard tests and rule_explanations entry need no schema change.
     let lockfile = match mcp_lock::parse_lockfile(content) {
         Ok(l) => l,
-        Err(_) => return Vec::new(),
+        Err(e) => return vec![finding_for_unparseable_lockfile(&e)],
     };
 
     // Derive the repo root: `<repo>/.tirith/mcp.lock` → `<repo>`.
@@ -147,6 +157,51 @@ fn finding_for_drift(drifts: &[mcp_lock::McpDrift]) -> Finding {
              reviewed before commit. Run `tirith mcp diff` (informational) or \
              `tirith mcp verify` (gating) to see the exact drift, then re-run \
              `tirith mcp lock` to refresh the lockfile."
+        ),
+        evidence: vec![Evidence::Text { detail }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    }
+}
+
+/// Build the finding fired when `.tirith/mcp.lock` cannot be parsed.
+///
+/// The lockfile is the committed baseline a `tirith scan` diffs the current
+/// inventory against. A baseline that doesn't parse cannot be diffed, so
+/// drift cannot be verified — exactly the silent-failure mode that would
+/// let an attacker hide an MCP-surface change behind a corrupted lockfile.
+/// Surface it explicitly: same `RuleId` and severity as a drift finding so
+/// the existing verdict / scoring / explanation paperwork stays unchanged,
+/// distinct description so the operator can tell the two failure modes
+/// apart.
+///
+/// The parse error's `Display` carries `serde_json`'s line/column message
+/// — useful for the operator, and free of file contents — so it can be
+/// safely included in the finding without leaking any of the lockfile's
+/// bytes back to the report consumer.
+fn finding_for_unparseable_lockfile(err: &mcp_lock::McpLockLoadError) -> Finding {
+    let detail = format!(
+        "MCP lockfile `.tirith/mcp.lock` could not be parsed ({err}); drift cannot be \
+         verified. The lockfile may have been tampered with, accidentally corrupted, or \
+         written by a newer tirith version with an incompatible schema."
+    );
+
+    Finding {
+        rule_id: RuleId::McpServerDrift,
+        severity: Severity::Medium,
+        title: "MCP lockfile is unparseable — drift cannot be verified".to_string(),
+        description: format!(
+            "The committed `.tirith/mcp.lock` is not valid JSON or does not match the \
+             expected lockfile schema ({err}). Because the baseline cannot be loaded, \
+             this scan cannot diff it against the current MCP-server inventory — drift \
+             that would otherwise have been caught is silently undetectable. The \
+             lockfile may have been tampered with, accidentally corrupted, or written \
+             by a future tirith version with an incompatible schema. Inspect \
+             `.tirith/mcp.lock` (it is a small JSON document), restore it from version \
+             control if it has been damaged, or re-run `tirith mcp lock` to refresh the \
+             baseline against the current inventory."
         ),
         evidence: vec![Evidence::Text { detail }],
         human_view: None,
@@ -298,8 +353,14 @@ mod tests {
     }
 
     #[test]
-    fn check_skips_unparseable_lockfile_quietly() {
-        // A malformed lockfile is not this rule's concern.
+    fn check_fires_when_lockfile_is_malformed_json() {
+        // A malformed lockfile is itself a security signal: the committed
+        // baseline cannot be diffed against the current inventory, so drift
+        // cannot be verified. Returning no findings here would let an
+        // attacker hide an MCP-surface change behind a deliberately broken
+        // lockfile. The rule fires with the same RuleId (no schema change)
+        // and severity (Medium → Warn) as a drift finding, with a distinct
+        // description naming the parse failure.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -313,7 +374,65 @@ mod tests {
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
         let findings = check(&content, Some(&lock_path));
-        assert!(findings.is_empty(), "malformed lockfile → no finding");
+        assert_eq!(
+            findings.len(),
+            1,
+            "malformed lockfile must fire one finding"
+        );
+        assert_eq!(findings[0].rule_id, RuleId::McpServerDrift);
+        assert_eq!(findings[0].severity, Severity::Medium);
+        assert!(
+            findings[0].title.contains("unparseable"),
+            "unparseable-lockfile title should name the failure mode: {:?}",
+            findings[0].title,
+        );
+        assert!(
+            findings[0]
+                .description
+                .contains("`.tirith/mcp.lock` is not valid JSON")
+                || findings[0]
+                    .description
+                    .contains("does not match the expected lockfile schema"),
+            "description should name the parse failure: {:?}",
+            findings[0].description,
+        );
+
+        // The finding must not echo the lockfile's raw bytes — only the
+        // parse-error metadata (line/column) is safe to surface.
+        let serialized = serde_json::to_string(&findings).unwrap();
+        assert!(
+            !serialized.contains("{not json"),
+            "raw lockfile bytes leaked into finding: {serialized}"
+        );
+    }
+
+    #[test]
+    fn check_fires_on_lockfile_with_unknown_schema_fields() {
+        // A lockfile that is valid JSON but does not match the expected
+        // schema (e.g. produced by a future tirith with an incompatible
+        // shape, or hand-crafted by an attacker) must also surface — same
+        // verification-impossible failure mode.
+        let repo = tempdir().unwrap();
+        write_config(
+            repo.path(),
+            ".mcp.json",
+            r#"{ "mcpServers": { "s": { "command": "node" } } }"#,
+        );
+        let lockdir = repo.path().join(".tirith");
+        fs::create_dir_all(&lockdir).unwrap();
+        // Valid JSON, but missing every required field.
+        fs::write(lockdir.join("mcp.lock"), r#"{"unrelated":true}"#).unwrap();
+
+        let lock_path = repo.path().join(".tirith").join("mcp.lock");
+        let content = fs::read_to_string(&lock_path).unwrap();
+        let findings = check(&content, Some(&lock_path));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, RuleId::McpServerDrift);
+        assert!(
+            findings[0].title.contains("unparseable"),
+            "schema mismatch is treated as unparseable: {:?}",
+            findings[0].title,
+        );
     }
 
     #[test]

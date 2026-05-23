@@ -433,3 +433,35 @@ fn paste_conflict_json_and_format() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("cannot be used with"));
 }
+
+#[test]
+fn help_mcp_diff_documents_exit_codes() {
+    // `tirith mcp diff` exits 0 on a normal run (whether drift is present
+    // or not — `diff` is informational, not gating), but exits 2 on usage
+    // errors (no lockfile, malformed lockfile, unresolvable repo root).
+    // The help string must spell both out so the documented contract
+    // matches the integration tests in `cli_integration::mcp_diff_*`.
+    let out = tirith().args(["mcp", "diff", "--help"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        stdout.contains("Exit codes:"),
+        "mcp diff --help must document its exit codes, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("0  normal"),
+        "mcp diff --help must document exit 0 as normal, got:\n{stdout}"
+    );
+    // Normalize whitespace so the help-formatter's reflow does not break the
+    // substring assertion — the contract is "drift presence does not affect
+    // the exit code", not the exact phrasing.
+    let collapsed: String = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        collapsed.contains("whether drift is present or not"),
+        "mcp diff --help must note that 0 covers both drift and no-drift, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("2  usage error"),
+        "mcp diff --help must document exit 2 on usage error, got:\n{stdout}"
+    );
+}

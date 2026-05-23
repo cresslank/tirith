@@ -1528,16 +1528,21 @@ Examples:
     /// Show the drift between the current MCP inventory and .tirith/mcp.lock (informational)
     #[command(after_help = "\
 Shows the same drift `tirith mcp verify` computes, but as an informational
-diff — always exits 0, never gates a CI build. Use it to inspect what an
-edit to an MCP config will do before running `tirith mcp lock` to refresh
-the committed lockfile.
+diff — never gates a CI build. Use it to inspect what an edit to an MCP
+config will do before running `tirith mcp lock` to refresh the committed
+lockfile.
 
 The human output groups drifts as added / removed / changed, naming each
 server by its declared name. Env values and URL userinfos are never printed
 — only that the variable / credential changed, and only on a per-name basis.
 
-Exit code:
-  0  always — `diff` is informational. Use `verify` to gate.
+Exit codes:
+  0  normal — `diff` is informational, so this exit code is returned whether
+     drift is present or not. Use `tirith mcp verify` to gate.
+  2  usage error — no lockfile to diff against, cannot read it, the
+     repository root could not be determined, or another operational failure.
+     Distinct from 0 so a piped consumer can tell \"no drift\" apart from
+     \"there was nothing to compare\".
 
 Examples:
   tirith mcp diff

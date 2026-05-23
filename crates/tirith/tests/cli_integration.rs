@@ -4749,3 +4749,69 @@ fn mcp_verify_url_endpoint_change_still_drifts() {
         "verify must announce drift on a real URL change; got: {err}"
     );
 }
+
+#[test]
+fn scan_surfaces_mcp_server_drift_on_malformed_lockfile() {
+    // A planted `.tirith/mcp.lock` that is not valid JSON must surface as
+    // an `mcp_server_drift` finding when `tirith scan` walks the repo —
+    // not be silently swallowed. A silently-skipped malformed lockfile is
+    // exactly the failure mode an attacker would use to hide MCP-surface
+    // drift behind a deliberately broken baseline.
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    // A valid MCP config — drift detection would otherwise fire on the
+    // server-added case; we want the malformed-lockfile-only signal here.
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": { "s": { "command": "node" } } }"#,
+    )
+    .unwrap();
+    fs::create_dir_all(repo.path().join(".tirith")).unwrap();
+    let lockfile_garbage = "{not valid json — tampered baseline";
+    fs::write(
+        repo.path().join(".tirith").join("mcp.lock"),
+        lockfile_garbage,
+    )
+    .unwrap();
+
+    let out = tirith()
+        .args(["scan", "--format", "json", repo.path().to_str().unwrap()])
+        .env("XDG_CONFIG_HOME", iso.path())
+        .env("XDG_STATE_HOME", iso.path())
+        .env("XDG_CACHE_HOME", iso.path())
+        .env("XDG_DATA_HOME", iso.path())
+        .env("APPDATA", iso.path())
+        .output()
+        .expect("failed to run tirith scan");
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("scan --format json must produce valid JSON");
+
+    let mut rule_ids: Vec<String> = Vec::new();
+    let mut finding_paths: Vec<String> = Vec::new();
+    collect_scan_findings(&json, &mut rule_ids, &mut finding_paths);
+
+    assert!(
+        rule_ids.iter().any(|r| r == "mcp_server_drift"),
+        "scan must surface `mcp_server_drift` for a malformed `.tirith/mcp.lock`; \
+         got rules: {rule_ids:?}"
+    );
+    assert!(
+        finding_paths.iter().any(|p| p.ends_with("mcp.lock")),
+        "the finding must be reported against `.tirith/mcp.lock`; \
+         got paths: {finding_paths:?}"
+    );
+
+    // The finding must name the parse-failure mode, not echo the raw
+    // garbage bytes of the lockfile.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("unparseable") || stdout.contains("not valid JSON"),
+        "finding description should name the parse failure; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("tampered baseline"),
+        "raw lockfile bytes must not appear in the scan output; got: {stdout}"
+    );
+}

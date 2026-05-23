@@ -114,6 +114,21 @@ file_path = ".tirith/mcp.lock"
 expected_action = "warn"
 expected_rules = ["mcp_server_drift"]
 
+# A `.tirith/mcp.lock` whose contents are not valid JSON cannot be diffed
+# against the current inventory, so drift cannot be verified — exactly the
+# failure mode an attacker would use to hide an MCP-surface change behind
+# a deliberately broken lockfile. The rule fires with the same `RuleId`
+# and severity as a drift detection so existing scoring / verdict /
+# safeguard-test paperwork stays unchanged.
+[[fixture]]
+name = "mcp_lockfile_unparseable"
+min_milestone = 4
+input = '{not valid json'
+context = "file"
+file_path = ".tirith/mcp.lock"
+expected_action = "warn"
+expected_rules = ["mcp_server_drift"]
+
 [[fixture]]
 name = "prompt_injection_tool_invocation"
 min_milestone = 1
