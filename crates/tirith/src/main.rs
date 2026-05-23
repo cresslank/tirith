@@ -491,10 +491,14 @@ command. `tirith agent policy init` scaffolds an opt-in
 `.tirith/agent-policy.yaml.example` from observed origins. `tirith agent
 allow` validates and emits a matcher snippet for the policy.
 
-**No enforcement in this release.** Chunk 2 ships the surface and the
-policy schema; chunk 3 wires `agent_rules` into verdict gating. A policy
-populated with `agent_rules` today still loads, validates, and changes
-no existing verdict's outcome — by design.
+**Enforcement is live.** Chunk 2 shipped the surface and the policy
+schema; chunk 3 wired `agent_rules` into verdict gating via
+`escalation::apply_agent_rules`. A non-bypass verdict whose
+`agent_origin` matches a `deny` entry is now forced to Block (with a
+`RuleId::AgentDeniedByPolicy` finding attached); a matching `allow` is
+recorded but does NOT bypass an existing Block (`allow` is reserved for
+richer matcher payloads in a future chunk). Test changes in a non-CI
+shell before rolling out.
 
 Examples:
   tirith agent sessions
@@ -1737,10 +1741,12 @@ Examples:
 Validates a `(kind, tool?)` matcher pair and emits the YAML snippet to paste
 into `agent_rules.allow` under `.tirith/policy.yaml` (or
 `.tirith/agent-policy.yaml.example`). **Does NOT mutate the policy** — the
-operator copies the printed snippet into the file they wish to edit. This
-keeps the chunk-2 surface honest: `agent_rules` is observation-only today,
-and silently appending to a policy file would suggest enforcement that does
-not exist yet.
+operator copies the printed snippet into the file they wish to edit. Since
+chunk 3 made `agent_rules` a live enforcement gate (a matching `deny`
+forces a Block), keeping `allow` (the print-only command) separate from
+any file mutation lets the operator review and place the snippet
+deliberately rather than have a CLI silently extend a policy that now
+affects live verdicts.
 
 `kind` must be one of `human` / `agent` / `mcp` / `gateway` / `ci` / `ide`.
 `tool` is optional and applies only when the kind carries a caller-claimed
