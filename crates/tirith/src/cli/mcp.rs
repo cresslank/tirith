@@ -1154,8 +1154,14 @@ fn yaml_safe_scalar(s: &str) -> String {
         return s.to_string();
     }
     // JSON-style escaping (a strict subset of YAML's double-quoted form
-    // — `serde_json::to_string` handles every control byte safely).
-    serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s.escape_debug()))
+    // — `serde_json::to_string` handles every C0 control byte safely).
+    // Post-process for DEL (`\u{7f}`): JSON treats DEL as printable, so it
+    // ends up as a literal byte in the output, but YAML 1.2 §5.7 rejects
+    // a literal DEL inside a double-quoted scalar. Replace with `` so
+    // the YAML round-trip is exact — pinned by `yaml_safe_scalar_round_trips_del`.
+    serde_json::to_string(s)
+        .map(|json| json.replace('\u{7f}', "\\u007F"))
+        .unwrap_or_else(|_| format!("\"{}\"", s.escape_debug()))
 }
 
 /// Render a string for use as an inline `#`-comment suffix. We don't
@@ -2022,7 +2028,7 @@ mod tests {
     }
 
     #[test]
-    fn yaml_safe_scalar_does_not_round_trip_del_documents_known_gap() {
+    fn yaml_safe_scalar_round_trips_del() {
         // Documents the production-code gap surfaced while landing F13:
         // `yaml_safe_scalar` uses `serde_json::to_string`, which (per the
         // JSON spec) emits DEL (`\x7f`) as the raw byte rather than a
@@ -2045,12 +2051,18 @@ mod tests {
             scalar.starts_with('"') && scalar.ends_with('"'),
             "DEL must still be quoted (forces quoting): {scalar:?}",
         );
-        let doc = format!("k: {scalar}\n");
-        let parsed: Result<serde_yaml::Value, _> = serde_yaml::from_str(&doc);
         assert!(
-            parsed.is_err(),
-            "DEL currently does NOT round-trip through serde_yaml — fixing yaml_safe_scalar to \
-             escape DEL as `\\u007F` should flip this assertion. doc: {doc:?}",
+            !scalar.contains('\u{7f}'),
+            "DEL must be escaped, not embedded as a raw byte: {scalar:?}",
+        );
+        let doc = format!("k: {scalar}\n");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&doc).expect(
+            "DEL must round-trip through the \\u007F escape (yaml_safe_scalar's DEL post-process)",
+        );
+        assert_eq!(
+            parsed.get("k").and_then(|v| v.as_str()),
+            Some("\u{7f}"),
+            "round-tripped value must byte-equal the input DEL",
         );
     }
 }
