@@ -476,6 +476,37 @@ Examples:
         action: McpAction,
     },
 
+    /// Inspect and govern per-agent identity (observability surface)
+    #[command(after_help = "\
+Surfaces the agent governance signal recorded with every tirith verdict:
+`AgentOrigin` — Human / Agent / Mcp / Gateway / Ci / Ide — captured from
+`TIRITH_INTEGRATION`, MCP `clientInfo`, CI heuristics, and the gateway code
+path. Every signal is **operator-trust** (caller-claimed); see
+docs/agent-governance-design.md for the honest threat model.
+
+`tirith agent sessions` lists recent audit log entries grouped by origin
+with per-group counts, last-seen timestamps, and a (Allow / Warn / Block)
+histogram. `tirith agent explain` drills into one session ID or partial
+command. `tirith agent policy init` scaffolds an opt-in
+`.tirith/agent-policy.yaml.example` from observed origins. `tirith agent
+allow` validates and emits a matcher snippet for the policy.
+
+**No enforcement in this release.** Chunk 2 ships the surface and the
+policy schema; chunk 3 wires `agent_rules` into verdict gating. A policy
+populated with `agent_rules` today still loads, validates, and changes
+no existing verdict's outcome — by design.
+
+Examples:
+  tirith agent sessions
+  tirith agent sessions --format json
+  tirith agent explain claude-code
+  tirith agent policy init
+  tirith agent allow --kind agent --tool claude-code")]
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+
     /// MCP gateway proxy — intercepts shell tool calls for security analysis
     #[command(after_help = "\
 Examples:
@@ -1610,6 +1641,175 @@ Examples:
 }
 
 #[derive(Subcommand)]
+enum AgentAction {
+    /// List recent audit-log sessions grouped by agent origin
+    #[command(after_help = "\
+Reads the local JSONL audit log (default: $XDG_DATA_HOME/tirith/log.jsonl)
+and aggregates every `verdict` entry by its recorded `AgentOrigin`. For
+each origin group it reports the entry count, last-seen timestamp, and an
+Allow / Warn / Block histogram so an operator can see at a glance which
+classes of caller are producing which classes of verdict.
+
+Entries with no `agent_origin` field (pre-chunk-1 audit lines, hook
+telemetry, the engine's bypass-path log; chunk 3 closes this gap) land in
+an explicit `unknown` group rather than being silently dropped — honesty
+over apparent tidiness.
+
+Exit codes:
+  0  the aggregation ran (zero or more groups reported).
+  1  the audit log could not be read, or the JSON output could not be
+     written.
+  2  usage error (none defined today; reserved).
+
+Examples:
+  tirith agent sessions
+  tirith agent sessions --format json")]
+    Sessions {
+        /// Path to the audit log JSONL file (default: $XDG_DATA_HOME/tirith/log.jsonl)
+        #[arg(long)]
+        log: Option<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Explain the agent-origin attribution chain for a session or command
+    #[command(after_help = "\
+Given a session ID (an exact session id from `tirith agent sessions`) or a
+command substring, locates the matching `verdict` entries in the audit log
+and prints the attribution chain: `AgentOrigin`, redacted command, action,
+timestamps, and the rule IDs that fired.
+
+Search is **exact on session id, substring (case-insensitive) on command**.
+Up to 20 matching entries are shown. With `--format json` the structured
+payload carries every match, sorted newest-first.
+
+Exit codes:
+  0  one or more entries matched.
+  1  no matches, or the audit log could not be read, or the JSON output
+     could not be written.
+
+Examples:
+  tirith agent explain sess-abc123
+  tirith agent explain curl
+  tirith agent explain claude-code --format json")]
+    Explain {
+        /// Session ID or command substring to search for
+        session_id_or_command: String,
+        /// Path to the audit log JSONL file (default: $XDG_DATA_HOME/tirith/log.jsonl)
+        #[arg(long)]
+        log: Option<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Scaffold an opt-in starter agent-governance policy from observed origins
+    #[command(
+        name = "policy",
+        after_help = "\
+Examples:
+  tirith agent policy init
+  tirith agent policy init --force
+  tirith agent policy init --format json"
+    )]
+    Policy {
+        #[command(subcommand)]
+        action: AgentPolicyAction,
+    },
+
+    /// Validate an agent-matcher and print the policy snippet to add
+    #[command(after_help = "\
+Validates a `(kind, tool?)` matcher pair and emits the YAML snippet to paste
+into `agent_rules.allow` under `.tirith/policy.yaml` (or
+`.tirith/agent-policy.yaml.example`). **Does NOT mutate the policy** — the
+operator copies the printed snippet into the file they wish to edit. This
+keeps the chunk-2 surface honest: `agent_rules` is observation-only today,
+and silently appending to a policy file would suggest enforcement that does
+not exist yet.
+
+`kind` must be one of `human` / `agent` / `mcp` / `gateway` / `ci` / `ide`.
+`tool` is optional and applies only when the kind carries a caller-claimed
+payload (`agent`, `mcp`, `ci`, `ide`) — a tool filter on `human` or
+`gateway` matches nothing and is rejected up-front.
+
+Exit codes:
+  0  the matcher is valid; the snippet was printed.
+  1  the matcher is invalid, or the JSON output could not be written.
+  2  usage error (none defined today; reserved).
+
+Examples:
+  tirith agent allow --kind agent --tool claude-code
+  tirith agent allow --kind mcp --tool Cursor
+  tirith agent allow --kind human
+  tirith agent allow --kind agent --tool claude-code --format json")]
+    Allow {
+        /// Origin kind: human, agent, mcp, gateway, ci, ide
+        #[arg(long)]
+        kind: String,
+        /// Caller-claimed payload to match (tool name / client name / provider / IDE name).
+        /// Optional; omit to match every origin of the given kind.
+        #[arg(long)]
+        tool: Option<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentPolicyAction {
+    /// Scaffold .tirith/agent-policy.yaml.example from observed audit-log origins
+    #[command(after_help = "\
+Reads the local audit log, collects every distinct `AgentOrigin` it has
+recorded, and writes `.tirith/agent-policy.yaml.example` listing every
+observed origin as a **commented-out** entry under `agent_rules.allow`.
+The operator reviews the scaffold, uncomments the entries they intend to
+declare, and merges them into `.tirith/policy.yaml` themselves.
+
+Commented-out by design — importing the example must NEVER silently widen
+trust. Mirrors the `tirith mcp policy init` convention.
+
+Determinism: server / kind groups are sorted (kind, then payload), so two
+runs against the same audit log produce a byte-identical scaffold.
+
+Exit codes:
+  0  the example was written (a missing or empty audit log still writes a
+     header-only template so the operator has a starting point).
+  1  the repo root could not be determined, the example file already
+     exists without `--force`, the audit log is unreadable, or the file
+     could not be written.
+
+Examples:
+  tirith agent policy init
+  tirith agent policy init --force
+  tirith agent policy init --format json")]
+    Init {
+        /// Path to the audit log JSONL file (default: $XDG_DATA_HOME/tirith/log.jsonl)
+        #[arg(long)]
+        log: Option<String>,
+        /// Overwrite an existing .tirith/agent-policy.yaml.example
+        #[arg(long)]
+        force: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ThreatDbAction {
     /// Download or update the threat intelligence database
     #[command(after_help = "\
@@ -1899,6 +2099,42 @@ fn run() {
                     cli::mcp::policy_init(json, force)
                 }
             },
+        },
+
+        Commands::Agent { action } => match action {
+            AgentAction::Sessions { log, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::agent::sessions(log.as_deref(), json)
+            }
+            AgentAction::Explain {
+                session_id_or_command,
+                log,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::agent::explain(&session_id_or_command, log.as_deref(), json)
+            }
+            AgentAction::Policy { action } => match action {
+                AgentPolicyAction::Init {
+                    log,
+                    force,
+                    format,
+                    json,
+                } => {
+                    let (_, json) = HumanJsonFormat::resolve(format, json);
+                    cli::agent::policy_init(log.as_deref(), force, json)
+                }
+            },
+            AgentAction::Allow {
+                kind,
+                tool,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::agent::allow(&kind, tool.as_deref(), json)
+            }
         },
 
         Commands::Gateway { action } => match action {

@@ -68,6 +68,34 @@ scan:
   # mcp_allowed_tools:
   #   my-trusted-server:
   #     - read_only
+
+# Per-agent governance rules — M4 item 8 chunk 2 (observation-only today).
+#
+# `agent_rules` lets a policy declare which AgentOrigin variants it would
+# allow or deny, where `AgentOrigin` is the recorded caller — Human,
+# Agent, Mcp, Gateway, Ci, or Ide. The signal is captured today (see
+# `tirith agent sessions`) but the engine does NOT yet gate verdicts on
+# these rules — chunk 3 wires that. Populating `agent_rules` now is
+# additive: the policy loads, validates, and changes no existing
+# verdict's outcome.
+#
+# Trust caveat: every signal feeding AgentOrigin is OPERATOR-TRUST,
+# never adversary-resistant — TIRITH_INTEGRATION, MCP clientInfo, CI
+# env vars are all settable by any process running as the user. Use
+# `agent_rules` for filtering, dashboarding, and observability; layer
+# real authentication elsewhere if the decision must withstand a
+# hostile environment.
+#
+# Run `tirith agent policy init` to scaffold this block from the local
+# audit log's observed origins.
+# agent_rules:
+#   allow:
+#     - kind: agent
+#       tool: claude-code
+#     - kind: human
+#   deny:
+#     - kind: agent
+#       tool: untrusted-tool
 "#;
 
 const MINIMAL_TEMPLATE: &str = r#"fail_mode: open
@@ -133,6 +161,16 @@ scan:
 
   # Per-server allowed tools — see `tirith mcp policy init` to scaffold.
   # mcp_allowed_tools: {}
+
+# Per-agent governance — M4 item 8 chunk 2 (observation-only).
+# `tirith agent sessions` shows which AgentOrigin variants you see in
+# practice; `tirith agent policy init` scaffolds this block. Loading
+# `agent_rules` does not change any verdict's outcome today — chunk 3
+# will wire enforcement.
+# agent_rules:
+#   allow:
+#     - kind: agent
+#       tool: claude-code
 "#;
 
 /// `ci-strict` — locked-down settings for an automated CI environment.
@@ -196,6 +234,16 @@ scan:
   # Per-server allowed tools — a CI guardrail against an agent or merge
   # smuggling a new MCP tool past the lockfile. See `tirith mcp policy init`.
   # mcp_allowed_tools: {}
+
+# Per-agent governance — M4 item 8 chunk 2 (observation-only).
+# A CI policy that wants to declare which callers are expected can list
+# them here; loading `agent_rules` does not change verdict outcomes
+# today — chunk 3 will wire enforcement. `tirith agent sessions` shows
+# the AgentOrigins your CI actually sees.
+# agent_rules:
+#   allow:
+#     - kind: ci
+#       tool: github-actions
 "#;
 
 /// `ai-agent-heavy` — tuned for environments where AI agents run many
@@ -279,6 +327,22 @@ scan:
   # MCP server an agent may use. A new tool outside the set surfaces as a
   # High-severity drift finding. See `tirith mcp policy init`.
   # mcp_allowed_tools: {}
+
+# Per-agent governance — M4 item 8 chunk 2 (observation-only).
+# An agent-heavy environment benefits most from per-origin policy. Today
+# this block is observation-only — `tirith agent sessions` shows which
+# agents have invoked tirith, `tirith agent policy init` scaffolds this
+# block from observed origins. Chunk 3 will wire enforcement; until
+# then, populating `agent_rules` does not change any verdict's outcome.
+# agent_rules:
+#   allow:
+#     - kind: agent
+#       tool: claude-code
+#     - kind: agent
+#       tool: cursor
+#   deny:
+#     - kind: agent
+#       tool: untrusted-agent
 "#;
 
 /// A curated starter policy selected via `tirith policy init --template`.

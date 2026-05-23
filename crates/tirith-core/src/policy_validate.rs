@@ -57,6 +57,7 @@ pub fn validate(yaml: &str) -> Vec<PolicyIssue> {
     validate_network_entries(&policy, &mut issues);
     validate_action_overrides(&policy, &mut issues);
     validate_escalation_rules(&policy, &mut issues);
+    validate_agent_rules(&policy, &mut issues);
 
     // Typo guard: flag fields that aren't part of the Policy schema.
     validate_unknown_fields(yaml, &mut issues);
@@ -381,6 +382,58 @@ fn validate_escalation_rules(policy: &crate::policy::Policy, issues: &mut Vec<Po
     }
 }
 
+/// Sanity-check the agent governance block (M4 item 8 chunk 2). This is
+/// **schema validation only** — the engine does not consume `agent_rules`
+/// yet, so the only feedback an operator can act on is "this matcher is
+/// shaped wrong".
+///
+/// Diagnostics:
+/// * A `tool` filter on a payloadless kind (`human`, `gateway`) is a
+///   warning — it matches nothing by construction. The decision helper
+///   in `policy.rs` is deterministic about that, but the operator most
+///   likely meant a different `kind` or no `tool` filter at all.
+/// * An empty `tool` string (`tool: ""`) is a warning — a zero-length
+///   match accepts only a payload that itself sanitized to empty, which
+///   the `AgentOrigin` constructors reject up-front.
+fn validate_agent_rules(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {
+    for (list_name, list) in [
+        ("agent_rules.allow", &policy.agent_rules.allow),
+        ("agent_rules.deny", &policy.agent_rules.deny),
+    ] {
+        for (i, matcher) in list.iter().enumerate() {
+            // Payload filter on a payloadless kind.
+            if matcher.tool.is_some()
+                && matches!(
+                    matcher.kind,
+                    crate::policy::AgentOriginKind::Human | crate::policy::AgentOriginKind::Gateway
+                )
+            {
+                issues.push(PolicyIssue {
+                    level: IssueLevel::Warning,
+                    message: format!(
+                        "{list_name}[{i}]: a `tool` filter on `kind: {}` matches nothing — \
+                         that variant carries no caller-claimed payload",
+                        matcher.kind.as_str()
+                    ),
+                    field: Some(format!("{list_name}[{i}].tool")),
+                });
+            }
+
+            // Empty payload string.
+            if matches!(matcher.tool.as_deref(), Some("")) {
+                issues.push(PolicyIssue {
+                    level: IssueLevel::Warning,
+                    message: format!(
+                        "{list_name}[{i}]: `tool: \"\"` matches nothing — the AgentOrigin \
+                         constructors reject an empty caller-claimed payload"
+                    ),
+                    field: Some(format!("{list_name}[{i}].tool")),
+                });
+            }
+        }
+    }
+}
+
 fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
     let known_top_level = [
         "fail_mode",
@@ -407,6 +460,8 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
         "policy_server_api_key",
         "policy_fetch_fail_mode",
         "enforce_fail_mode",
+        "threat_intel",
+        "agent_rules",
     ];
 
     // Known fields for nested objects
@@ -578,6 +633,92 @@ custom_rules:
                 .iter()
                 .any(|i| i.message.contains("scan.profiles.ci.nope")),
             "nested profile typo should be flagged: {issues:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M4 item 8 chunk 2: agent_rules schema validation.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_agent_rules_valid_kinds_no_warnings() {
+        let yaml = "agent_rules:\n  allow:\n    - kind: agent\n      tool: claude-code\n    - kind: mcp\n  deny:\n    - kind: ci\n      tool: github-actions\n";
+        let issues = validate(yaml);
+        assert!(
+            issues.iter().all(|i| i.level != IssueLevel::Error),
+            "valid agent_rules must produce no errors: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_agent_rules_tool_filter_on_human_warns() {
+        let yaml = "agent_rules:\n  allow:\n    - kind: human\n      tool: xyz\n";
+        let issues = validate(yaml);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.message.contains("matches nothing") && i.message.contains("human")),
+            "tool filter on `kind: human` must warn: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_agent_rules_tool_filter_on_gateway_warns() {
+        let yaml = "agent_rules:\n  deny:\n    - kind: gateway\n      tool: anywhere\n";
+        let issues = validate(yaml);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.message.contains("matches nothing") && i.message.contains("gateway")),
+            "tool filter on `kind: gateway` must warn: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_agent_rules_empty_tool_string_warns() {
+        let yaml = "agent_rules:\n  allow:\n    - kind: agent\n      tool: \"\"\n";
+        let issues = validate(yaml);
+        assert!(
+            issues.iter().any(|i| i.message.contains("`tool: \"\"`")),
+            "empty tool string must warn: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_agent_rules_unknown_kind_is_yaml_parse_error() {
+        // An unknown kind cannot deserialize — that's a structural YAML
+        // error and we surface it through the parse path.
+        let yaml = "agent_rules:\n  allow:\n    - kind: telepathy\n";
+        let issues = validate(yaml);
+        assert!(
+            issues.iter().any(|i| i.level == IssueLevel::Error),
+            "unknown kind must surface a parse error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_threat_intel_no_longer_unknown_field() {
+        // Regression: a policy declaring threat_intel must NOT trigger the
+        // "unknown field" warning.
+        let yaml = "threat_intel:\n  osv_enabled: true\n";
+        let issues = validate(yaml);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.message.contains("unknown field 'threat_intel'")),
+            "threat_intel must be a known top-level field: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_agent_rules_no_longer_unknown_field() {
+        let yaml = "agent_rules:\n  allow: []\n  deny: []\n";
+        let issues = validate(yaml);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.message.contains("unknown field 'agent_rules'")),
+            "agent_rules must be a known top-level field: {issues:?}"
         );
     }
 }

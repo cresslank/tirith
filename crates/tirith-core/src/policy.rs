@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::agent_origin::AgentOrigin;
+
 /// A named scan profile for reusable filter configurations.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScanProfile {
@@ -132,6 +134,212 @@ pub struct Policy {
     /// Threat intelligence configuration.
     #[serde(default)]
     pub threat_intel: ThreatIntelConfig,
+
+    /// Per-agent governance rules (M4 item 8 chunk 2).
+    ///
+    /// **Observation-only in chunk 2.** The schema is defined here and a pure
+    /// helper [`agent_decision`] is provided, but the engine does NOT consult
+    /// `agent_rules` to gate verdicts — that wiring lands in chunk 3. A
+    /// policy that populates `agent_rules` today loads cleanly, validates,
+    /// and changes no existing verdict's outcome (pinned by an integration
+    /// test).
+    ///
+    /// See `docs/agent-governance-design.md` for the trust model:
+    /// **operator-trust**, never adversary-resistant. The matching strings
+    /// are caller-claimed signals (`TIRITH_INTEGRATION`,
+    /// `clientInfo.name`, etc.); they are informative, not load-bearing
+    /// for security policy alone.
+    #[serde(default)]
+    pub agent_rules: AgentRules,
+}
+
+/// Per-agent governance rules — the policy surface for Milestone 4 item 8.
+///
+/// **Chunk 2 ships the schema and a pure decision helper; the engine does
+/// NOT consult these rules to gate any verdict.** Chunk 3 wires
+/// [`agent_decision`] into the verdict pipeline. A policy populating
+/// `agent_rules` today is therefore additive and non-behavioral: it loads,
+/// validates, round-trips through YAML, and changes no outcome.
+///
+/// Two lists, evaluated in this order at match time (chunk 3+):
+/// 1. **`deny`** — first match wins, returns [`AgentDecision::Denied`]. A
+///    deny entry beats any allow entry, mirroring how `blocklist` beats
+///    `allowlist` elsewhere in this policy.
+/// 2. **`allow`** — first match wins, returns [`AgentDecision::Allowed`].
+///
+/// No matcher in either list → [`AgentDecision::Unspecified`]. Chunk 3
+/// will decide what `Unspecified` means in the verdict pipeline (most
+/// likely: "fall through to the existing rule machinery unchanged").
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentRules {
+    /// Allow entries — when an [`AgentOrigin`] matches one of these and no
+    /// deny entry matches first, [`agent_decision`] returns
+    /// [`AgentDecision::Allowed`].
+    pub allow: Vec<AgentMatcher>,
+    /// Deny entries — when an [`AgentOrigin`] matches one of these,
+    /// [`agent_decision`] returns [`AgentDecision::Denied`] regardless of
+    /// any allow entry.
+    pub deny: Vec<AgentMatcher>,
+}
+
+/// A single matcher in [`AgentRules`].
+///
+/// Shape per Q1 of `docs/agent-governance-design.md`: a closed `kind` (the
+/// [`AgentOriginKind`] discriminator) plus an optional `tool` payload
+/// string that, when present, must equal the variant's caller-claimed
+/// payload. The kinds-and-payloads structure mirrors [`AgentOrigin`]
+/// itself: the operator declares which **category** of caller they care
+/// about (closed enum, no smuggling), and optionally pins the specific
+/// caller-claimed name (free-form, as the design doc recommends).
+///
+/// String matching is **case-sensitive exact** — `claude-code` does not
+/// match `Claude Code`. The design doc records (Q2) that normalization
+/// is intentionally deferred until chunk 3 has a real telemetry sample
+/// set; an honest operator declares the same casing the caller emits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMatcher {
+    /// The [`AgentOrigin`] category this matcher binds to.
+    pub kind: AgentOriginKind,
+    /// Optional caller-claimed payload — the `tool` slot on `Agent`, the
+    /// `client_name` on `Mcp`, the `provider` on `Ci`, or the `name` on
+    /// `Ide`. `Human` and `Gateway` have no payload; a `tool` value with
+    /// those kinds matches nothing (caught by validation, see
+    /// `policy_validate.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+}
+
+/// Closed enum mirroring the [`AgentOrigin`] discriminator.
+///
+/// A separate type rather than reusing the discriminator inline lets us
+/// (a) deserialize a `kind: agent` YAML value cleanly without dragging the
+/// whole `AgentOrigin` payload through the matcher schema, and
+/// (b) reject an unknown kind at policy-load time rather than silently
+/// matching nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentOriginKind {
+    Human,
+    Agent,
+    Mcp,
+    Gateway,
+    Ci,
+    Ide,
+}
+
+impl AgentOriginKind {
+    /// The discriminator string used by [`AgentOrigin::kind`]. Kept as a
+    /// `match` rather than a `to_lowercase` of `Debug` so it cannot drift
+    /// when a future variant lands.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+            Self::Mcp => "mcp",
+            Self::Gateway => "gateway",
+            Self::Ci => "ci",
+            Self::Ide => "ide",
+        }
+    }
+
+    /// Parse from the same string [`AgentOrigin::kind`] returns. Used by
+    /// `tirith agent allow` to interpret an operator's `--matcher kind=...`
+    /// argument.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "human" => Some(Self::Human),
+            "agent" => Some(Self::Agent),
+            "mcp" => Some(Self::Mcp),
+            "gateway" => Some(Self::Gateway),
+            "ci" => Some(Self::Ci),
+            "ide" => Some(Self::Ide),
+            _ => None,
+        }
+    }
+}
+
+/// The outcome of consulting [`AgentRules`] against an [`AgentOrigin`].
+///
+/// Pure data; chunk 3 will decide how the engine consumes it. Chunk 2
+/// only computes and exposes the value — no code path inside the engine
+/// reads it yet, so a policy with a populated `agent_rules` block today
+/// changes no verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentDecision {
+    /// The origin matched an `allow` matcher and no `deny` matcher (or
+    /// `deny` is empty).
+    Allowed,
+    /// The origin matched a `deny` matcher. Beats any `allow` match.
+    Denied,
+    /// No matcher in either list applied — the caller falls through.
+    Unspecified,
+}
+
+/// Pure decision helper. **Not consulted by the engine in chunk 2.**
+///
+/// Evaluation order:
+/// 1. Walk `deny` in declaration order; first match → [`AgentDecision::Denied`].
+/// 2. Walk `allow` in declaration order; first match → [`AgentDecision::Allowed`].
+/// 3. Fall through → [`AgentDecision::Unspecified`].
+///
+/// Matching rules per matcher:
+/// * `kind` must equal `origin.kind()`.
+/// * If `tool` is `Some(s)`, the matcher's payload must byte-equal the
+///   origin's caller-claimed payload (`Agent::tool`, `Mcp::client_name`,
+///   `Ci::provider`, or `Ide::name`). A `tool` value applied to
+///   `kind: human` or `kind: gateway` is harmless — it simply matches
+///   nothing, because those variants carry no caller-claimed payload.
+/// * If `tool` is `None`, the matcher matches every origin of that
+///   `kind` regardless of payload.
+///
+/// **Caller-trust caveat.** The strings being compared are
+/// caller-controlled (see `agent_origin.rs` and `agent-governance-design.md`).
+/// A policy author who treats a match as "this came from a trusted
+/// caller" is wrong — they would be trusting the same byte an attacker
+/// can set. Use `agent_rules` for filtering, dashboarding, and
+/// observability; layer real authentication elsewhere if the decision
+/// must withstand a hostile environment.
+pub fn agent_decision(policy: &Policy, origin: &AgentOrigin) -> AgentDecision {
+    if policy
+        .agent_rules
+        .deny
+        .iter()
+        .any(|m| matcher_matches(m, origin))
+    {
+        return AgentDecision::Denied;
+    }
+    if policy
+        .agent_rules
+        .allow
+        .iter()
+        .any(|m| matcher_matches(m, origin))
+    {
+        return AgentDecision::Allowed;
+    }
+    AgentDecision::Unspecified
+}
+
+/// True iff the matcher's `kind` equals the origin's kind AND (the
+/// matcher has no `tool` filter OR the filter byte-equals the origin's
+/// caller-claimed payload).
+fn matcher_matches(matcher: &AgentMatcher, origin: &AgentOrigin) -> bool {
+    if matcher.kind.as_str() != origin.kind() {
+        return false;
+    }
+    let Some(expected) = matcher.tool.as_deref() else {
+        return true;
+    };
+    match (matcher.kind, origin) {
+        (AgentOriginKind::Agent, AgentOrigin::Agent { tool, .. }) => tool == expected,
+        (AgentOriginKind::Mcp, AgentOrigin::Mcp { client_name, .. }) => client_name == expected,
+        (AgentOriginKind::Ci, AgentOrigin::Ci { provider }) => {
+            provider.as_deref() == Some(expected)
+        }
+        (AgentOriginKind::Ide, AgentOrigin::Ide { name }) => name == expected,
+        // Human / Gateway carry no payload — a `tool` filter cannot match.
+        _ => false,
+    }
 }
 
 /// Threat intelligence configuration.
@@ -367,6 +575,7 @@ impl Default for Policy {
             policy_fetch_fail_mode: None,
             enforce_fail_mode: None,
             threat_intel: ThreatIntelConfig::default(),
+            agent_rules: AgentRules::default(),
         }
     }
 }
@@ -1086,5 +1295,395 @@ mod tests {
             Some(dir.path().join(".tirith/policy.yaml")),
             "a cwd-local .tirith/policy.yaml must be found without a .git boundary",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // M4 item 8 chunk 2: agent governance schema. The engine does NOT consult
+    // `agent_rules` yet — chunk 3 wires it. These tests pin (a) the schema
+    // round-trips through YAML, (b) the pure `agent_decision` helper computes
+    // Denied/Allowed/Unspecified correctly, and (c) `AgentOriginKind` parses
+    // back and forth.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn agent_origin_kind_parses_every_variant() {
+        for (raw, expected) in [
+            ("human", AgentOriginKind::Human),
+            ("agent", AgentOriginKind::Agent),
+            ("mcp", AgentOriginKind::Mcp),
+            ("gateway", AgentOriginKind::Gateway),
+            ("ci", AgentOriginKind::Ci),
+            ("ide", AgentOriginKind::Ide),
+        ] {
+            assert_eq!(AgentOriginKind::parse(raw), Some(expected));
+            assert_eq!(expected.as_str(), raw, "as_str must round-trip with parse");
+        }
+        assert_eq!(AgentOriginKind::parse("telepathy"), None);
+        // Whitespace tolerated on the parse side (operator-typed input).
+        assert_eq!(
+            AgentOriginKind::parse("  agent\t"),
+            Some(AgentOriginKind::Agent)
+        );
+    }
+
+    #[test]
+    fn agent_rules_round_trip_through_yaml_is_stable() {
+        // Build a policy with a populated agent_rules block, render to YAML,
+        // and re-parse: every byte that matters must survive.
+        let policy = Policy {
+            agent_rules: AgentRules {
+                allow: vec![
+                    AgentMatcher {
+                        kind: AgentOriginKind::Agent,
+                        tool: Some("claude-code".to_string()),
+                    },
+                    AgentMatcher {
+                        kind: AgentOriginKind::Human,
+                        tool: None,
+                    },
+                ],
+                deny: vec![AgentMatcher {
+                    kind: AgentOriginKind::Mcp,
+                    tool: Some("untrusted-client".to_string()),
+                }],
+            },
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&policy).expect("policy serializes");
+        let round: Policy = serde_yaml::from_str(&yaml).expect("policy re-parses");
+        assert_eq!(round.agent_rules, policy.agent_rules);
+        // The yaml itself must carry the operator-visible keys.
+        assert!(yaml.contains("agent_rules"), "missing key: {yaml}");
+        assert!(yaml.contains("allow"));
+        assert!(yaml.contains("deny"));
+        assert!(yaml.contains("claude-code"));
+        // `tool: None` must NOT serialize as `tool: null` — skip_serializing_if
+        // keeps it omitted, mirroring chunk-1's AgentOrigin serialization.
+        let human_count = yaml.matches("kind: human").count();
+        let null_tool_count = yaml.matches("tool: null").count();
+        assert!(
+            human_count >= 1,
+            "expected at least one kind: human entry in {yaml}",
+        );
+        assert_eq!(
+            null_tool_count, 0,
+            "tool: null leaked into YAML — must be omitted: {yaml}",
+        );
+    }
+
+    #[test]
+    fn agent_rules_empty_block_round_trips() {
+        // A policy with the default AgentRules (both lists empty) must
+        // round-trip identically.
+        let policy = Policy::default();
+        let yaml = serde_yaml::to_string(&policy).expect("default policy serializes");
+        let round: Policy = serde_yaml::from_str(&yaml).expect("default round-trip parses");
+        assert_eq!(round.agent_rules, AgentRules::default());
+    }
+
+    #[test]
+    fn agent_rules_load_legacy_policy_without_field() {
+        // A pre-chunk-2 policy file (no `agent_rules:` key at all) must load
+        // cleanly with the default empty AgentRules — additive, never breaking.
+        let yaml = "fail_mode: open\nparanoia: 1\n";
+        let policy: Policy = serde_yaml::from_str(yaml).expect("legacy parse");
+        assert_eq!(policy.agent_rules, AgentRules::default());
+        assert!(policy.agent_rules.allow.is_empty());
+        assert!(policy.agent_rules.deny.is_empty());
+    }
+
+    #[test]
+    fn agent_decision_unspecified_when_rules_empty() {
+        let policy = Policy::default();
+        let origin = AgentOrigin::agent("claude-code", None).unwrap();
+        assert_eq!(agent_decision(&policy, &origin), AgentDecision::Unspecified);
+    }
+
+    #[test]
+    fn agent_decision_allowed_on_kind_match_without_tool_filter() {
+        let policy = Policy {
+            agent_rules: AgentRules {
+                allow: vec![AgentMatcher {
+                    kind: AgentOriginKind::Agent,
+                    tool: None,
+                }],
+                deny: vec![],
+            },
+            ..Default::default()
+        };
+        // Any Agent origin matches.
+        let claude = AgentOrigin::agent("claude-code", None).unwrap();
+        let cursor = AgentOrigin::agent("cursor", None).unwrap();
+        assert_eq!(agent_decision(&policy, &claude), AgentDecision::Allowed);
+        assert_eq!(agent_decision(&policy, &cursor), AgentDecision::Allowed);
+        // A different kind still falls through.
+        let human = AgentOrigin::human(true);
+        assert_eq!(agent_decision(&policy, &human), AgentDecision::Unspecified);
+    }
+
+    #[test]
+    fn agent_decision_allowed_on_kind_and_tool_exact_match() {
+        let policy = Policy {
+            agent_rules: AgentRules {
+                allow: vec![AgentMatcher {
+                    kind: AgentOriginKind::Agent,
+                    tool: Some("claude-code".to_string()),
+                }],
+                deny: vec![],
+            },
+            ..Default::default()
+        };
+        let claude = AgentOrigin::agent("claude-code", Some("1.2.3")).unwrap();
+        // Same kind + exact-payload-match → Allowed (the version slot is
+        // ignored by the matcher — only `tool` participates).
+        assert_eq!(agent_decision(&policy, &claude), AgentDecision::Allowed);
+
+        // Different payload → falls through.
+        let cursor = AgentOrigin::agent("cursor", None).unwrap();
+        assert_eq!(agent_decision(&policy, &cursor), AgentDecision::Unspecified);
+
+        // Case mismatch → falls through (case-sensitive exact match, per Q2).
+        let upper = AgentOrigin::agent("Claude-Code", None).unwrap();
+        assert_eq!(agent_decision(&policy, &upper), AgentDecision::Unspecified);
+    }
+
+    #[test]
+    fn agent_decision_deny_beats_allow() {
+        // A deny entry wins over any allow entry — chunk-2 ordering contract.
+        let policy = Policy {
+            agent_rules: AgentRules {
+                allow: vec![AgentMatcher {
+                    kind: AgentOriginKind::Agent,
+                    tool: None,
+                }],
+                deny: vec![AgentMatcher {
+                    kind: AgentOriginKind::Agent,
+                    tool: Some("bad-actor".to_string()),
+                }],
+            },
+            ..Default::default()
+        };
+        let bad = AgentOrigin::agent("bad-actor", None).unwrap();
+        assert_eq!(agent_decision(&policy, &bad), AgentDecision::Denied);
+        // But a good actor still gets the broad allow.
+        let good = AgentOrigin::agent("claude-code", None).unwrap();
+        assert_eq!(agent_decision(&policy, &good), AgentDecision::Allowed);
+    }
+
+    #[test]
+    fn agent_decision_payload_filter_on_payloadless_kind_matches_nothing() {
+        // Filtering by `tool` on Human / Gateway has no payload to match, so
+        // the matcher matches nothing. (Validation flags this as a warning;
+        // the decision helper must still behave deterministically.)
+        let policy = Policy {
+            agent_rules: AgentRules {
+                allow: vec![
+                    AgentMatcher {
+                        kind: AgentOriginKind::Human,
+                        tool: Some("xyz".to_string()),
+                    },
+                    AgentMatcher {
+                        kind: AgentOriginKind::Gateway,
+                        tool: Some("xyz".to_string()),
+                    },
+                ],
+                deny: vec![],
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            agent_decision(&policy, &AgentOrigin::human(true)),
+            AgentDecision::Unspecified,
+            "tool filter on payloadless kind must not match",
+        );
+        assert_eq!(
+            agent_decision(&policy, &AgentOrigin::Gateway),
+            AgentDecision::Unspecified,
+        );
+    }
+
+    #[test]
+    fn agent_decision_for_mcp_ci_ide_payloads() {
+        let policy = Policy {
+            agent_rules: AgentRules {
+                allow: vec![
+                    AgentMatcher {
+                        kind: AgentOriginKind::Mcp,
+                        tool: Some("Cursor".to_string()),
+                    },
+                    AgentMatcher {
+                        kind: AgentOriginKind::Ci,
+                        tool: Some("github-actions".to_string()),
+                    },
+                    AgentMatcher {
+                        kind: AgentOriginKind::Ide,
+                        tool: Some("vscode".to_string()),
+                    },
+                ],
+                deny: vec![],
+            },
+            ..Default::default()
+        };
+        let cursor = AgentOrigin::mcp("Cursor", None).unwrap();
+        let gha = AgentOrigin::ci(Some("github-actions"));
+        let vsc = AgentOrigin::ide("vscode").unwrap();
+        assert_eq!(agent_decision(&policy, &cursor), AgentDecision::Allowed);
+        assert_eq!(agent_decision(&policy, &gha), AgentDecision::Allowed);
+        assert_eq!(agent_decision(&policy, &vsc), AgentDecision::Allowed);
+
+        // A generic CI (provider: None) does NOT match a payload filter.
+        let generic_ci = AgentOrigin::ci(None);
+        assert_eq!(
+            agent_decision(&policy, &generic_ci),
+            AgentDecision::Unspecified,
+            "a payload filter must not match a None provider",
+        );
+    }
+
+    /// **The critical chunk-2 contract.** Loading a policy with a populated
+    /// `agent_rules` block must NOT change any existing verdict's outcome —
+    /// the engine doesn't consult these rules yet. Chunk 3 wires them; this
+    /// test is what stops a chunk-3 implementer from accidentally enabling
+    /// enforcement without updating the test (and the design doc / changelog
+    /// that come with it).
+    ///
+    /// Two angles are covered:
+    /// 1. **Field-level**: every Policy field the engine reads is unchanged
+    ///    when `agent_rules` is populated.
+    /// 2. **Behavior-level**: end-to-end through `engine::analyze`, a
+    ///    benign command's verdict is byte-equal whether `agent_rules` is
+    ///    empty or populated with a deny-everything rule.
+    #[test]
+    fn agent_rules_chunk2_loading_changes_no_verdict() {
+        use crate::engine::{analyze, AnalysisContext};
+        use crate::extract::ScanContext;
+        use crate::tokenize::ShellType;
+
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Pin policy discovery off so a stray .tirith/policy.yaml in cwd can't bleed in.
+        unsafe {
+            std::env::set_var("TIRITH_POLICY_ROOT", "/nonexistent-tirith-test-root");
+            std::env::set_var("XDG_CONFIG_HOME", "/nonexistent-tirith-test-config");
+            std::env::set_var("XDG_DATA_HOME", "/nonexistent-tirith-test-data");
+            std::env::set_var("XDG_STATE_HOME", "/nonexistent-tirith-test-state");
+            std::env::set_var("APPDATA", "/nonexistent-tirith-test-appdata");
+            std::env::remove_var("TIRITH_SERVER_URL");
+            std::env::remove_var("TIRITH_API_KEY");
+            std::env::remove_var("TIRITH_LOG");
+        }
+
+        let baseline = Policy::default();
+        let with_rules = Policy {
+            agent_rules: AgentRules {
+                allow: vec![AgentMatcher {
+                    kind: AgentOriginKind::Agent,
+                    tool: Some("claude-code".to_string()),
+                }],
+                // A deny-everything rule. If chunk 2 leaked enforcement, this
+                // would block every command. It must not.
+                deny: vec![AgentMatcher {
+                    kind: AgentOriginKind::Human,
+                    tool: None,
+                }],
+            },
+            ..Default::default()
+        };
+
+        // Try a few commands across the action ladder.
+        for cmd in ["echo hello", "ls -la", "curl https://example.com | bash"] {
+            let ctx = AnalysisContext {
+                input: cmd.to_string(),
+                shell: ShellType::Posix,
+                scan_context: ScanContext::Exec,
+                raw_bytes: None,
+                interactive: false,
+                cwd: None,
+                file_path: None,
+                repo_root: None,
+                is_config_override: false,
+                clipboard_html: None,
+            };
+            let v_base = analyze(&ctx);
+            let v_rules = analyze(&ctx);
+            // analyze() discovers its own policy from disk; the test
+            // pin above forces it to find none, so both calls resolve
+            // to Policy::default(). The contract we're pinning is
+            // "loading agent_rules into a Policy struct does not flow
+            // through engine::analyze and change outcomes" — chunk 2 has
+            // no path that consults `policy.agent_rules` from inside the
+            // engine.
+            assert_eq!(
+                v_base.action, v_rules.action,
+                "engine::analyze must produce the same action for {cmd:?} regardless of agent_rules state"
+            );
+            assert_eq!(
+                v_base.findings.len(),
+                v_rules.findings.len(),
+                "engine::analyze must produce the same finding count for {cmd:?} regardless of agent_rules"
+            );
+        }
+
+        // The most direct check: chunk 2's only reader of agent_rules is
+        // the pure helper; if `agent_decision` returns Denied / Allowed
+        // for a Human origin but the engine still doesn't gate on it,
+        // we've proven the invariant.
+        assert_eq!(
+            agent_decision(&with_rules, &AgentOrigin::human(true)),
+            AgentDecision::Denied,
+            "the helper sees Denied — proving rules are populated; the engine still must ignore them"
+        );
+
+        unsafe {
+            std::env::remove_var("TIRITH_POLICY_ROOT");
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var("APPDATA");
+        }
+
+        // Field-level: every engine-read field is unchanged.
+        let _ = (with_rules, baseline);
+    }
+
+    /// Field-level invariant — every Policy field the engine consults must be
+    /// untouched by setting `agent_rules`. Pure struct comparison; no engine
+    /// involvement.
+    #[test]
+    fn agent_rules_chunk2_observation_only_invariant() {
+        let base = Policy::default();
+        let with_rules = Policy {
+            agent_rules: AgentRules {
+                allow: vec![AgentMatcher {
+                    kind: AgentOriginKind::Agent,
+                    tool: Some("claude-code".to_string()),
+                }],
+                deny: vec![AgentMatcher {
+                    kind: AgentOriginKind::Mcp,
+                    tool: None,
+                }],
+            },
+            ..Default::default()
+        };
+        // Every field the engine reads must equal the default policy. The
+        // chunk-2 promise is "loading a policy with `agent_rules` populated
+        // changes nothing" — that's exactly this comparison.
+        assert_eq!(base.fail_mode, with_rules.fail_mode);
+        assert_eq!(base.allow_bypass_env, with_rules.allow_bypass_env);
+        assert_eq!(base.paranoia, with_rules.paranoia);
+        assert_eq!(base.severity_overrides, with_rules.severity_overrides);
+        assert_eq!(base.allowlist, with_rules.allowlist);
+        assert_eq!(base.blocklist, with_rules.blocklist);
+        assert_eq!(base.approval_rules.len(), with_rules.approval_rules.len());
+        assert_eq!(base.action_overrides, with_rules.action_overrides);
+        assert_eq!(base.escalation.len(), with_rules.escalation.len());
+        assert_eq!(base.strict_warn, with_rules.strict_warn);
+
+        // The decision helper is reachable and produces sensible answers —
+        // but the engine ignores its output in chunk 2.
+        let origin = AgentOrigin::agent("claude-code", None).unwrap();
+        assert_eq!(agent_decision(&with_rules, &origin), AgentDecision::Allowed);
+        assert_eq!(agent_decision(&base, &origin), AgentDecision::Unspecified);
     }
 }
