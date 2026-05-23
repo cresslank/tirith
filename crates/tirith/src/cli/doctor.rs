@@ -1048,7 +1048,7 @@ fn gather_compat() -> CompatReport {
     let info = gather_info();
     let profile = info.shell_profile.as_ref().map(std::path::PathBuf::from);
     let shell_tools = detect_shell_tool_conflicts(profile.as_deref());
-    let powershell_compat = gather_ps_compat();
+    let powershell_compat = gather_ps_compat(&info.detected_shell);
 
     CompatReport {
         version: info.version,
@@ -1094,8 +1094,8 @@ fn gather_compat() -> CompatReport {
 /// of `libc::kill(pid, SIGKILL)`: `Child::kill()` is safe even if the child
 /// already exited (returns an ignored NotFound on Unix), and we never extract
 /// the raw PID.
-fn gather_ps_compat() -> Option<PsCompatInfo> {
-    let binary = detect_powershell_binary()?;
+fn gather_ps_compat(detected_shell: &str) -> Option<PsCompatInfo> {
+    let binary = detect_powershell_binary(detected_shell)?;
     let tirith_status = std::env::var("TIRITH_STATUS").ok();
     // The probe returns `Option<bool>` so we can distinguish three states:
     //   Some(true)  — PSReadLine module is present,
@@ -1117,17 +1117,25 @@ fn gather_ps_compat() -> Option<PsCompatInfo> {
     })
 }
 
-/// Resolve the first available PowerShell binary on PATH. Tries `pwsh`
-/// (PowerShell 7+, cross-platform) first, then falls back to `powershell`
-/// (Windows PowerShell 5.1). Returns the static name to be used by both the
-/// availability check AND the PSReadLine probe, so module detection
+/// Resolve the PowerShell binary on PATH that best matches the operator's
+/// active shell. If the operator's `detected_shell` is `powershell`
+/// (Windows PowerShell 5.1) we probe `powershell` first and only fall back
+/// to `pwsh` — otherwise the doctor would report PSReadLine health from a
+/// runtime DIFFERENT from the one the operator is actually running in,
+/// which is silently misleading. For `detected_shell == "pwsh"` (or any
+/// other value — Unix shells, missing info) we keep the original
+/// pwsh-first order. Returns the static name to be used by both the
+/// availability check AND the PSReadLine probe so module detection
 /// always runs against the same interpreter we reported as found.
-fn detect_powershell_binary() -> Option<&'static str> {
-    if probe_command_available("pwsh") {
-        return Some("pwsh");
-    }
-    if probe_command_available("powershell") {
-        return Some("powershell");
+fn detect_powershell_binary(detected_shell: &str) -> Option<&'static str> {
+    let candidates: [&str; 2] = match detected_shell {
+        "powershell" => ["powershell", "pwsh"],
+        _ => ["pwsh", "powershell"],
+    };
+    for candidate in candidates {
+        if probe_command_available(candidate) {
+            return Some(candidate);
+        }
     }
     None
 }
