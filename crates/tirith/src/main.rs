@@ -1699,6 +1699,80 @@ Examples:
         #[command(subcommand)]
         action: McpPolicyAction,
     },
+
+    /// Explain one MCP server entry in .tirith/mcp.lock
+    #[command(after_help = "\
+Loads `.tirith/mcp.lock` and prints what the lockfile records for the
+named server: declared tools (or the wildcard \"all tools\" state when
+the source config omitted the `tools` key), the redacted transport,
+injected environment variable **names** (never values), and the
+capabilities the lockfile implies. Env values and URL userinfos are
+never printed — the lockfile stores only their salted hashes and this
+explainer respects the same boundary `verify` and `diff` enforce.
+
+Server lookup is **case-sensitive exact**. When the named server is
+missing, the explainer suggests the closest match by prefix and then
+edit distance so a typo doesn't strand the operator.
+
+Exit codes:
+  0  the server was found and its details were printed.
+  1  the lockfile is missing or unreadable, the server name was not found,
+     or JSON output could not be written.
+  2  usage error (none defined today; reserved).
+
+Examples:
+  tirith mcp explain my-server
+  tirith mcp explain my-server --format json")]
+    Explain {
+        /// Server name as recorded in .tirith/mcp.lock (case-sensitive exact)
+        server: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Show a per-permission view of every server in .tirith/mcp.lock
+    #[command(after_help = "\
+Loads `.tirith/mcp.lock` and aggregates a per-capability view across every
+locked MCP server. For each capability the lockfile implies (network,
+process-spawn, filesystem-read-via-stdio, environment-secret, github-api,
+runtime-tool-wildcard, …) the report lists which servers declare it.
+
+Capabilities are **derived from the lockfile's structure**, not parsed
+from a permissions key — the MCP lockfile schema today does not store an
+explicit capabilities/permissions list per server, so this view infers
+them from the transport (`url` ⇒ network, `stdio` ⇒ process-spawn) plus
+heuristics over env names (`*_TOKEN`, `*_KEY`, `*_SECRET`, `GITHUB_*`,
+`OPENAI_API_KEY`, …) and tool declarations (omitted ⇒ runtime-tool
+wildcard). The derivation is informational and explicit: every signal is
+labelled with the field it came from so an operator can correlate the
+finding back to the lockfile entry.
+
+Wildcards (a server with the `tools` key omitted, which an MCP client
+treats as \"may call any runtime-exposed tool\") and unbounded
+permissions surface in a separate `wildcards:` section so the operator
+sees broad-trust servers at a glance.
+
+Exit codes:
+  0  the aggregation was produced (zero or more capability groups).
+  1  the lockfile is missing or unreadable, or JSON output could not
+     be written.
+  2  usage error (none defined today; reserved).
+
+Examples:
+  tirith mcp permissions
+  tirith mcp permissions --format json")]
+    Permissions {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2294,6 +2368,18 @@ fn run() {
                     cli::mcp::policy_init(json, force)
                 }
             },
+            McpAction::Explain {
+                server,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::mcp::explain(&server, json)
+            }
+            McpAction::Permissions { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::mcp::permissions(json)
+            }
         },
 
         Commands::Agent { action } => match action {

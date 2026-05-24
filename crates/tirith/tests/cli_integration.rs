@@ -6108,3 +6108,168 @@ fn agent_block_requires_pattern() {
     // Clap fails with exit 2 for missing required positional.
     assert_eq!(out.status.code(), Some(2));
 }
+
+// ===========================================================================
+// M6 ch3 — `tirith mcp explain` / `tirith mcp permissions`
+//
+// Smoke tests: confirm the subcommand wires up, errors honestly when the
+// lockfile is missing, finds a planted server, and emits the per-capability
+// JSON aggregation.
+// ===========================================================================
+
+#[test]
+fn mcp_explain_errors_without_lockfile() {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let out = tirith()
+        .env("TIRITH_POLICY_ROOT", tmpdir.path())
+        .args(["mcp", "explain", "my-server"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no lockfile at"),
+        "stderr should say the lockfile is missing: {stderr}"
+    );
+}
+
+#[test]
+fn mcp_explain_finds_planted_server() {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let tirith_dir = tmpdir.path().join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    let lockfile_body = r#"{
+      "format_version": 5,
+      "inventory_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "configs": [".mcp.json"],
+      "servers": [
+        {
+          "name": "github",
+          "transport": {
+            "kind": "stdio",
+            "command": "npx",
+            "args": ["@modelcontextprotocol/server-github"],
+            "env": [
+              {"name": "GITHUB_TOKEN", "value_hash": "abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abcd"}
+            ]
+          },
+          "tools": [],
+          "tools_declared": false,
+          "source_config": ".mcp.json",
+          "hash": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        }
+      ]
+    }"#;
+    fs::write(tirith_dir.join("mcp.lock"), lockfile_body).unwrap();
+
+    let out = tirith()
+        .env("TIRITH_POLICY_ROOT", tmpdir.path())
+        .args(["mcp", "explain", "github", "--format", "json"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("mcp explain --format json must parse");
+    assert_eq!(v["name"], "github");
+    assert_eq!(v["transport"]["kind"], "stdio");
+    let env_names = v["transport"]["env_names"]
+        .as_array()
+        .expect("env_names array");
+    assert_eq!(env_names.len(), 1);
+    assert_eq!(env_names[0], "GITHUB_TOKEN");
+    let caps = v["capabilities"].as_array().expect("capabilities array");
+    assert!(caps.iter().any(|c| c == "github-api"));
+    assert!(caps.iter().any(|c| c == "runtime-tool-wildcard"));
+}
+
+#[test]
+fn mcp_explain_suggests_close_match_on_typo() {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let tirith_dir = tmpdir.path().join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    let lockfile_body = r#"{
+      "format_version": 5,
+      "inventory_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "configs": [".mcp.json"],
+      "servers": [
+        {
+          "name": "github",
+          "transport": {"kind": "url", "url": "https://example/mcp"},
+          "tools": ["a"],
+          "tools_declared": true,
+          "source_config": ".mcp.json",
+          "hash": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        }
+      ]
+    }"#;
+    fs::write(tirith_dir.join("mcp.lock"), lockfile_body).unwrap();
+
+    let out = tirith()
+        .env("TIRITH_POLICY_ROOT", tmpdir.path())
+        .args(["mcp", "explain", "githubbb"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("did you mean") && stderr.contains("github"),
+        "stderr must suggest the closest server: {stderr}"
+    );
+}
+
+#[test]
+fn mcp_permissions_aggregates_by_capability() {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let tirith_dir = tmpdir.path().join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    let lockfile_body = r#"{
+      "format_version": 5,
+      "inventory_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "configs": [".mcp.json"],
+      "servers": [
+        {
+          "name": "github",
+          "transport": {
+            "kind": "stdio",
+            "command": "npx",
+            "args": [],
+            "env": [
+              {"name": "GITHUB_TOKEN", "value_hash": "abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abcd"}
+            ]
+          },
+          "tools": [],
+          "tools_declared": false,
+          "source_config": ".mcp.json",
+          "hash": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        },
+        {
+          "name": "weather",
+          "transport": {"kind": "url", "url": "https://example/mcp"},
+          "tools": ["get_weather"],
+          "tools_declared": true,
+          "source_config": ".mcp.json",
+          "hash": "cafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00d"
+        }
+      ]
+    }"#;
+    fs::write(tirith_dir.join("mcp.lock"), lockfile_body).unwrap();
+
+    let out = tirith()
+        .env("TIRITH_POLICY_ROOT", tmpdir.path())
+        .args(["mcp", "permissions", "--format", "json"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("mcp permissions --format json must parse");
+    assert_eq!(v["server_count"], 2);
+    let groups = v["groups"].as_array().expect("groups array");
+    let cap_names: Vec<&str> = groups
+        .iter()
+        .map(|g| g["capability"].as_str().unwrap())
+        .collect();
+    assert!(cap_names.contains(&"network"));
+    assert!(cap_names.contains(&"process-spawn"));
+    assert!(cap_names.contains(&"github-api"));
+    assert!(cap_names.contains(&"runtime-tool-wildcard"));
+}

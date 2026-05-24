@@ -21,8 +21,8 @@
 use std::path::{Path, PathBuf};
 
 use tirith_core::mcp_lock::{
-    self, McpDrift, McpEnvChange, McpInventory, McpLockLoadError, McpLockfile, McpServerDriftEntry,
-    McpToolsChangeKind, McpTransportChange, MCP_LOCK_FILENAME,
+    self, McpDrift, McpEnvChange, McpInventory, McpLockLoadError, McpLockServer, McpLockfile,
+    McpServerDriftEntry, McpToolsChangeKind, McpTransport, McpTransportChange, MCP_LOCK_FILENAME,
 };
 use tirith_core::policy;
 
@@ -1290,6 +1290,557 @@ fn print_policy_init_json(
     };
 
     super::write_json_stdout(&out, "tirith mcp policy init: failed to write JSON output")
+}
+
+// ===========================================================================
+// `tirith mcp explain` — print one server's lockfile entry
+// ===========================================================================
+
+/// Run `tirith mcp explain <server>`.
+///
+/// Loads `.tirith/mcp.lock`, finds the named server (case-sensitive exact),
+/// and prints its declared tools, redacted transport, env-variable
+/// **names** (never values — the lockfile stores only hashes), and the
+/// inferred capabilities. The same redaction `verify` / `diff` apply to
+/// transports and env values applies here: URL userinfos are absent
+/// (already stripped at lock time) and env values are unreachable from the
+/// lockfile (already replaced with salted hashes at lock time).
+///
+/// Exit codes:
+/// * `0` — the server was found and printed.
+/// * `1` — the lockfile is missing or unreadable, the server name was not
+///   found, or the JSON output could not be written.
+/// * `2` — usage error (none defined today; reserved for symmetry with
+///   `verify` / `diff`).
+pub fn explain(server: &str, json: bool) -> i32 {
+    let repo_root = match resolve_repo_root() {
+        Some(r) => r,
+        None => {
+            report_error_for(
+                json,
+                "tirith mcp explain",
+                "could not determine the repository root — run `tirith mcp explain` inside a \
+                 git repository, or from a directory whose ancestor has one",
+            );
+            return 1;
+        }
+    };
+
+    let lock_path = repo_root.join(".tirith").join(MCP_LOCK_FILENAME);
+    let lockfile = match mcp_lock::load_lockfile(&lock_path) {
+        Ok(l) => l,
+        Err(McpLockLoadError::NotFound) => {
+            report_error_for(
+                json,
+                "tirith mcp explain",
+                &format!(
+                    "no lockfile at {} — run `tirith mcp lock` first to capture a baseline",
+                    lock_path.display()
+                ),
+            );
+            return 1;
+        }
+        Err(e) => {
+            report_error_for(
+                json,
+                "tirith mcp explain",
+                &format!("{}: {e}", lock_path.display()),
+            );
+            return 1;
+        }
+    };
+
+    // Case-sensitive exact lookup — matches every other byte-equal site
+    // in the lockfile schema (matchers, env names, server identity).
+    let entry = lockfile.servers.iter().find(|s| s.name == server);
+    let Some(entry) = entry else {
+        let suggestions = suggest_server_names(&lockfile.servers, server);
+        let msg = if suggestions.is_empty() {
+            format!("server {server:?} not found in {}", lock_path.display())
+        } else {
+            format!(
+                "server {server:?} not found in {} (did you mean: {})",
+                lock_path.display(),
+                suggestions.join(", ")
+            )
+        };
+        report_error_for(json, "tirith mcp explain", &msg);
+        return 1;
+    };
+
+    if json {
+        if !print_explain_json(&lock_path, entry) {
+            return 1;
+        }
+    } else {
+        print_explain_human(&lock_path, entry);
+    }
+    0
+}
+
+/// Suggest server names close to `query`. Prefix matches first
+/// (alphabetical), then up to two Levenshtein-near names within distance
+/// 3. Bounded to four total so the error message stays short.
+fn suggest_server_names(servers: &[McpLockServer], query: &str) -> Vec<String> {
+    let mut prefix: Vec<&str> = servers
+        .iter()
+        .filter(|s| s.name.starts_with(query))
+        .map(|s| s.name.as_str())
+        .collect();
+    prefix.sort();
+    prefix.truncate(4);
+
+    if prefix.len() >= 2 {
+        return prefix.into_iter().map(escape_name).collect();
+    }
+
+    // Fall through to edit-distance suggestions for the remaining slots.
+    let mut distance: Vec<(usize, &str)> = servers
+        .iter()
+        .filter(|s| !prefix.contains(&s.name.as_str()))
+        .map(|s| {
+            (
+                tirith_core::util::levenshtein(query, &s.name),
+                s.name.as_str(),
+            )
+        })
+        .filter(|(d, _)| *d <= 3)
+        .collect();
+    distance.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    distance.truncate(4 - prefix.len());
+
+    let mut out: Vec<String> = prefix.into_iter().map(escape_name).collect();
+    out.extend(distance.into_iter().map(|(_, n)| escape_name(n)));
+    out
+}
+
+/// Stable, env-only view of a server's transport — surfaces the
+/// information `tirith mcp explain` exposes (named env vars, sanitized
+/// command/args, redacted URL) without re-exposing the underlying
+/// `McpTransport` enum's value-carrying form.
+#[derive(serde::Serialize)]
+struct TransportView<'a> {
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    userinfo_present: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    args: Option<&'a [String]>,
+    /// Just the env-variable **names**. The lockfile stores only hashes
+    /// for the values; this view never reaches a raw value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    env_names: Option<Vec<&'a str>>,
+}
+
+impl<'a> TransportView<'a> {
+    fn from_transport(t: &'a McpTransport) -> Self {
+        match t {
+            McpTransport::Url { url, userinfo_hash } => Self {
+                kind: "url",
+                url: Some(url),
+                userinfo_present: Some(userinfo_hash.is_some()),
+                command: None,
+                args: None,
+                env_names: None,
+            },
+            McpTransport::Stdio { command, args, env } => Self {
+                kind: "stdio",
+                url: None,
+                userinfo_present: None,
+                command: Some(command),
+                args: Some(args.as_slice()),
+                env_names: Some(env.iter().map(|e| e.name.as_str()).collect()),
+            },
+            McpTransport::Unknown => Self {
+                kind: "unknown",
+                url: None,
+                userinfo_present: None,
+                command: None,
+                args: None,
+                env_names: None,
+            },
+        }
+    }
+}
+
+fn print_explain_json(lock_path: &Path, entry: &McpLockServer) -> bool {
+    #[derive(serde::Serialize)]
+    struct Out<'a> {
+        schema_version: u32,
+        lock_path: String,
+        name: &'a str,
+        source_config: &'a str,
+        content_hash: &'a str,
+        transport: TransportView<'a>,
+        tools_declared: bool,
+        tools: &'a [String],
+        capabilities: Vec<&'static str>,
+    }
+    let caps = derive_capabilities(entry);
+    let out = Out {
+        schema_version: 1,
+        lock_path: lock_path.display().to_string(),
+        name: &entry.name,
+        source_config: &entry.source_config,
+        content_hash: &entry.hash,
+        transport: TransportView::from_transport(&entry.transport),
+        tools_declared: entry.tools_declared,
+        tools: entry.tools.as_slice(),
+        capabilities: caps,
+    };
+    super::write_json_stdout(&out, "tirith mcp explain: failed to write JSON output")
+}
+
+fn print_explain_human(lock_path: &Path, entry: &McpLockServer) {
+    eprintln!(
+        "tirith mcp explain: {} (from {})",
+        escape_name(&entry.name),
+        lock_path.display(),
+    );
+    eprintln!();
+    eprintln!("  source config: {:?}", entry.source_config);
+    eprintln!("  content hash:  {}", entry.hash);
+    eprintln!();
+    eprintln!("  transport:");
+    match &entry.transport {
+        McpTransport::Url { url, userinfo_hash } => {
+            eprintln!("    kind: url");
+            eprintln!("    url:  {}", escape_name(url));
+            if userinfo_hash.is_some() {
+                eprintln!(
+                    "    (credentials in source URL — stored as a salted hash, never echoed)"
+                );
+            }
+        }
+        McpTransport::Stdio { command, args, env } => {
+            eprintln!("    kind: stdio");
+            eprintln!("    command: {}", escape_name(command));
+            if !args.is_empty() {
+                let arg_strs: Vec<String> = args.iter().map(|a| escape_name(a)).collect();
+                eprintln!("    args:    {}", arg_strs.join(" "));
+            }
+            if env.is_empty() {
+                eprintln!("    env:     (none declared)");
+            } else {
+                eprintln!("    env:     (names only — values are stored as salted hashes)");
+                for e in env {
+                    eprintln!("      - {}", escape_name(&e.name));
+                }
+            }
+        }
+        McpTransport::Unknown => {
+            eprintln!("    kind: unknown — the source config declared neither url nor command");
+        }
+    }
+    eprintln!();
+    if !entry.tools_declared {
+        eprintln!("  tools: (omitted in source — MCP clients treat this as \"all runtime tools\")");
+    } else if entry.tools.is_empty() {
+        eprintln!("  tools: (explicit empty — no tools allowed)");
+    } else {
+        eprintln!("  tools ({}):", entry.tools.len());
+        for t in &entry.tools {
+            eprintln!("    - {}", escape_name(t));
+        }
+    }
+    eprintln!();
+    let caps = derive_capabilities(entry);
+    eprintln!("  capabilities (derived from the lockfile structure):");
+    if caps.is_empty() {
+        eprintln!("    (none inferred)");
+    } else {
+        for c in &caps {
+            eprintln!("    - {c}");
+        }
+    }
+}
+
+// ===========================================================================
+// `tirith mcp permissions` — per-capability aggregation across all servers
+// ===========================================================================
+
+/// Capability tags surfaced by `tirith mcp permissions`.
+///
+/// Derived from the lockfile structure rather than parsed from a
+/// permissions key — the MCP lockfile schema does not store an explicit
+/// capability list per server today. Each tag below names both the field
+/// the derivation reads and the security-relevant property the tag
+/// describes.
+///
+/// The list is closed and small on purpose: every tag costs an English
+/// label in the human output and a string in the JSON envelope, so
+/// expanding the surface beyond what the lockfile structurally
+/// distinguishes risks the output drifting from the data.
+const CAP_NETWORK: &str = "network";
+const CAP_PROCESS_SPAWN: &str = "process-spawn";
+const CAP_ENV_SECRET: &str = "env-secret";
+const CAP_GITHUB_API: &str = "github-api";
+const CAP_OPENAI_API: &str = "openai-api";
+const CAP_AWS: &str = "aws";
+const CAP_RUNTIME_TOOL_WILDCARD: &str = "runtime-tool-wildcard";
+const CAP_UNKNOWN_TRANSPORT: &str = "unknown-transport";
+
+/// Derive the capability tag set for one locked server.
+///
+/// Returns an ordered, deduplicated list. The ordering is stable (the
+/// declaration order of the `caps` Vec) so two equal inputs produce a
+/// byte-identical JSON tag list.
+fn derive_capabilities(entry: &McpLockServer) -> Vec<&'static str> {
+    let mut caps: Vec<&'static str> = Vec::new();
+    let mut push = |c: &'static str| {
+        if !caps.contains(&c) {
+            caps.push(c);
+        }
+    };
+
+    match &entry.transport {
+        McpTransport::Url { .. } => push(CAP_NETWORK),
+        McpTransport::Stdio { env, .. } => {
+            push(CAP_PROCESS_SPAWN);
+            for e in env {
+                if env_name_is_secret_shaped(&e.name) {
+                    push(CAP_ENV_SECRET);
+                }
+                if env_name_matches_github(&e.name) {
+                    push(CAP_GITHUB_API);
+                }
+                if env_name_matches_openai(&e.name) {
+                    push(CAP_OPENAI_API);
+                }
+                if env_name_matches_aws(&e.name) {
+                    push(CAP_AWS);
+                }
+            }
+        }
+        McpTransport::Unknown => push(CAP_UNKNOWN_TRANSPORT),
+    }
+
+    if !entry.tools_declared {
+        push(CAP_RUNTIME_TOOL_WILDCARD);
+    }
+
+    caps
+}
+
+/// `*_TOKEN` / `*_KEY` / `*_SECRET` / `*_PASSWORD` heuristic — broad,
+/// known to over-match, but better than missing the common case. Names
+/// are compared ASCII-case-insensitive.
+fn env_name_is_secret_shaped(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.ends_with("_TOKEN")
+        || upper.ends_with("_KEY")
+        || upper.ends_with("_SECRET")
+        || upper.ends_with("_PASSWORD")
+        || upper.ends_with("_API_KEY")
+        || upper == "TOKEN"
+        || upper == "API_KEY"
+}
+
+fn env_name_matches_github(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.starts_with("GITHUB_") || upper == "GH_TOKEN" || upper == "GHE_TOKEN"
+}
+
+fn env_name_matches_openai(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.starts_with("OPENAI_")
+}
+
+fn env_name_matches_aws(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.starts_with("AWS_")
+}
+
+/// Run `tirith mcp permissions`.
+///
+/// Loads `.tirith/mcp.lock` and aggregates a per-capability view across
+/// every locked server. Output groups servers by the capability they
+/// imply (network / stdio-process / env-secret / github-api / …) so an
+/// operator can see "every server that can talk to the network" or
+/// "every server that requires a secret env" at a glance.
+///
+/// `wildcards:` lists servers whose `tools` key was omitted in the
+/// source config — an MCP client treats that as "any tool the server
+/// runtime exposes", which is a wildcard the operator may not have
+/// intended.
+///
+/// Exit codes:
+/// * `0` — the aggregation was printed.
+/// * `1` — the lockfile is missing or unreadable, or the JSON output
+///   could not be written.
+/// * `2` — usage error (none defined today; reserved).
+pub fn permissions(json: bool) -> i32 {
+    let repo_root = match resolve_repo_root() {
+        Some(r) => r,
+        None => {
+            report_error_for(
+                json,
+                "tirith mcp permissions",
+                "could not determine the repository root — run `tirith mcp permissions` inside \
+                 a git repository, or from a directory whose ancestor has one",
+            );
+            return 1;
+        }
+    };
+
+    let lock_path = repo_root.join(".tirith").join(MCP_LOCK_FILENAME);
+    let lockfile = match mcp_lock::load_lockfile(&lock_path) {
+        Ok(l) => l,
+        Err(McpLockLoadError::NotFound) => {
+            report_error_for(
+                json,
+                "tirith mcp permissions",
+                &format!(
+                    "no lockfile at {} — run `tirith mcp lock` first to capture a baseline",
+                    lock_path.display()
+                ),
+            );
+            return 1;
+        }
+        Err(e) => {
+            report_error_for(
+                json,
+                "tirith mcp permissions",
+                &format!("{}: {e}", lock_path.display()),
+            );
+            return 1;
+        }
+    };
+
+    let aggregation = aggregate_permissions(&lockfile.servers);
+
+    if json {
+        let ok = print_permissions_json(&lock_path, &aggregation);
+        if !ok {
+            return 1;
+        }
+    } else {
+        print_permissions_human(&lock_path, &aggregation);
+    }
+    0
+}
+
+/// One capability group in the permissions aggregation — the capability
+/// tag and every server that declared it.
+#[derive(Debug, Clone, serde::Serialize)]
+struct PermissionGroup {
+    capability: &'static str,
+    /// Servers that declared the capability, sorted by name for
+    /// deterministic output.
+    servers: Vec<String>,
+    /// True when the capability is unbounded — currently only set for
+    /// `runtime-tool-wildcard` (an omitted `tools` key) and
+    /// `unknown-transport`. Surfaces in a separate `wildcards:` block.
+    wildcard: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct PermissionsAggregation {
+    /// Total servers in the lockfile (informational).
+    server_count: usize,
+    /// Capability groups sorted by (a) named capability alphabetical,
+    /// (b) wildcard capabilities last. Wildcards are separated in the
+    /// human print but kept in the same list for the JSON consumer.
+    groups: Vec<PermissionGroup>,
+}
+
+fn aggregate_permissions(servers: &[McpLockServer]) -> PermissionsAggregation {
+    use std::collections::BTreeMap;
+    let mut by_cap: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for s in servers {
+        for c in derive_capabilities(s) {
+            by_cap.entry(c).or_default().push(s.name.clone());
+        }
+    }
+    let groups: Vec<PermissionGroup> = by_cap
+        .into_iter()
+        .map(|(capability, mut names)| {
+            names.sort();
+            names.dedup();
+            PermissionGroup {
+                wildcard: capability_is_wildcard(capability),
+                capability,
+                servers: names,
+            }
+        })
+        .collect();
+    PermissionsAggregation {
+        server_count: servers.len(),
+        groups,
+    }
+}
+
+fn capability_is_wildcard(cap: &str) -> bool {
+    matches!(cap, "runtime-tool-wildcard" | "unknown-transport")
+}
+
+fn print_permissions_json(lock_path: &Path, agg: &PermissionsAggregation) -> bool {
+    #[derive(serde::Serialize)]
+    struct Out<'a> {
+        schema_version: u32,
+        lock_path: String,
+        server_count: usize,
+        capability_count: usize,
+        groups: &'a [PermissionGroup],
+    }
+    let out = Out {
+        schema_version: 1,
+        lock_path: lock_path.display().to_string(),
+        server_count: agg.server_count,
+        capability_count: agg.groups.len(),
+        groups: &agg.groups,
+    };
+    super::write_json_stdout(&out, "tirith mcp permissions: failed to write JSON output")
+}
+
+fn print_permissions_human(lock_path: &Path, agg: &PermissionsAggregation) {
+    eprintln!(
+        "tirith mcp permissions: {} server(s) in {}",
+        agg.server_count,
+        lock_path.display(),
+    );
+    if agg.groups.is_empty() {
+        eprintln!();
+        eprintln!(
+            "  no capabilities inferred (the lockfile is empty or all servers have an \
+unknown transport)."
+        );
+        return;
+    }
+    let (named, wildcards): (Vec<_>, Vec<_>) = agg.groups.iter().partition(|g| !g.wildcard);
+    if !named.is_empty() {
+        eprintln!();
+        eprintln!("  capabilities:");
+        for g in &named {
+            eprintln!(
+                "    - {} ({} server{})",
+                g.capability,
+                g.servers.len(),
+                if g.servers.len() == 1 { "" } else { "s" },
+            );
+            for n in &g.servers {
+                eprintln!("        - {}", escape_name(n));
+            }
+        }
+    }
+    if !wildcards.is_empty() {
+        eprintln!();
+        eprintln!("  wildcards / unbounded permissions:");
+        for g in &wildcards {
+            eprintln!(
+                "    - {} ({} server{})",
+                g.capability,
+                g.servers.len(),
+                if g.servers.len() == 1 { "" } else { "s" },
+            );
+            for n in &g.servers {
+                eprintln!("        - {}", escape_name(n));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
