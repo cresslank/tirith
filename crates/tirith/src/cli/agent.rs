@@ -941,6 +941,312 @@ fn render_allow_snippet(m: &AgentMatcher) -> String {
 }
 
 // ===========================================================================
+// `tirith agent block` — emit a deny-list YAML snippet
+// ===========================================================================
+
+/// `tirith agent block --kind <k> [--tool <t>] <pattern>`
+///
+/// Validates the matcher exactly like [`allow`] does, then prints the YAML
+/// snippet the operator pastes under `agent_rules.deny:` in their policy.
+/// The `command_pattern` positional is captured but NOT folded into the
+/// emitted matcher — the engine schema today matches on `(kind, name)`
+/// only; the pattern is rendered as a YAML comment beside the snippet so
+/// the operator has a record of what the deny rule is meant to cover when
+/// the schema is later extended.
+///
+/// Schema honesty: the codebase's [`AgentMatcher`] does not carry
+/// `command`, `action`, or `payload` fields. The deny semantic is purely
+/// structural — any matcher listed under `agent_rules.deny` forces a
+/// `Block`, beating any allow entry. Emitting an unsupported `action:
+/// block` / `command:` line would either be silently dropped by serde
+/// (`deny_unknown_fields` is not currently set on `AgentMatcher`) or
+/// reject the policy at load. Either way it would mislead an operator;
+/// this command renders only the fields the engine consumes today.
+pub fn block(kind_str: &str, payload: Option<&str>, command_pattern: &str, json: bool) -> i32 {
+    let Some(kind) = AgentOriginKind::parse(kind_str) else {
+        report_error(
+            json,
+            "tirith agent block",
+            &format!(
+                "unknown kind {:?} (valid: human, agent, mcp, gateway, ci, ide)",
+                kind_str
+            ),
+        );
+        return 1;
+    };
+
+    if payload.is_some() && matches!(kind, AgentOriginKind::Human | AgentOriginKind::Gateway) {
+        report_error(
+            json,
+            "tirith agent block",
+            &format!(
+                "kind: {} carries no caller-claimed payload — a --tool filter would match nothing",
+                kind.as_str()
+            ),
+        );
+        return 1;
+    }
+
+    // Same caller-label sanitization the `allow` path applies — keeps the
+    // matcher byte-comparable against stored origins, which were also
+    // ingested through `sanitize_caller_label`.
+    let name = payload.map(tirith_core::agent_origin::sanitize_caller_label);
+    if matches!(name.as_deref(), Some("")) {
+        report_error(
+            json,
+            "tirith agent block",
+            "--tool must not be empty (an empty payload matches nothing)",
+        );
+        return 1;
+    }
+
+    if command_pattern.trim().is_empty() {
+        report_error(
+            json,
+            "tirith agent block",
+            "<pattern> must not be empty — pass `*` to mean \"all commands\"",
+        );
+        return 1;
+    }
+
+    let matcher = AgentMatcher { kind, name };
+    let snippet = render_block_snippet(&matcher, command_pattern);
+
+    if json {
+        #[derive(serde::Serialize)]
+        struct Out<'a> {
+            schema_version: u32,
+            matcher: &'a AgentMatcher,
+            /// The pattern the operator typed. Echoed back so a machine
+            /// consumer can correlate the snippet with the operator's
+            /// intent. Not yet honored by the engine matcher — see the
+            /// `command_pattern_supported` field.
+            command_pattern: &'a str,
+            /// Whether `command_pattern` is enforced by the engine's
+            /// `apply_agent_rules` today. Always `false` in this release —
+            /// the engine matches on `(kind, name)` only; the pattern is
+            /// captured for documentation and forward compatibility.
+            command_pattern_supported: bool,
+            snippet: &'a str,
+            /// Honest reminder: this command does NOT mutate any policy file.
+            applied: bool,
+        }
+        let out = Out {
+            schema_version: 1,
+            matcher: &matcher,
+            command_pattern,
+            command_pattern_supported: false,
+            snippet: &snippet,
+            applied: false,
+        };
+        if !super::write_json_stdout(&out, "tirith agent block: failed to write JSON output") {
+            return 1;
+        }
+    } else {
+        eprintln!("tirith agent block: valid matcher — paste the snippet below under `agent_rules.deny:` in your policy.");
+        eprintln!("  (NOTE: `deny` is enforced on every analysis path — see `tirith agent allow --help` for the enforcement scope. `deny` beats `allow`.)");
+        eprintln!("  (NOTE: today the engine matches on `(kind, name)` only; the <pattern> arg is rendered as a YAML comment for operator documentation. Per-command matching is a planned extension.)");
+        eprintln!();
+        // Print snippet to stdout so it can be captured / piped into a file.
+        print!("{snippet}");
+    }
+    0
+}
+
+/// Render the matcher as the YAML list-item snippet an operator pastes
+/// under `agent_rules.deny`. Two-space indentation matches the
+/// `tirith policy init` template's `deny:` block.
+///
+/// The `pattern` is rendered as a YAML comment immediately above the
+/// matcher (`# command pattern: <pattern>`) so it is preserved in version
+/// control without changing the engine-consumed structure. The comment
+/// runs through `yaml_safe_scalar` so a hostile pattern carrying ANSI
+/// escapes or newlines cannot inject into adjacent YAML lines.
+fn render_block_snippet(m: &AgentMatcher, pattern: &str) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "    # command pattern: {}\n",
+        yaml_safe_scalar(pattern)
+    ));
+    s.push_str(&format!("    - kind: {}\n", m.kind.as_str()));
+    if let Some(t) = m.name.as_deref() {
+        s.push_str(&format!("      name: {}\n", yaml_safe_scalar(t)));
+    }
+    s
+}
+
+// ===========================================================================
+// `tirith agent current` — print the running process's claimed origin
+// ===========================================================================
+
+/// `tirith agent current` — report the [`AgentOrigin`] the engine would
+/// attribute to this process if it ran a verdict right now.
+///
+/// Uses the same resolver `tirith check` uses (`resolve_cli_origin`),
+/// fed with the same interactive detection logic
+/// (`TIRITH_INTERACTIVE=1` overrides, otherwise `stderr.is_terminal()`).
+///
+/// This is observability, not enforcement: every signal is
+/// caller-claimed and settable by any process running as the user. Use
+/// it to debug agent-rules / hook integration ("what is tirith
+/// attributing me as?") not as authentication.
+pub fn current(json: bool) -> i32 {
+    // Mirror `cli::check`'s interactive detection — env var override
+    // first, otherwise the stderr-TTY heuristic. We have no
+    // `--interactive` / `--non-interactive` flag here; this command
+    // does not run analysis, so the env var is the operator's only
+    // override channel.
+    let interactive = if let Ok(val) = std::env::var("TIRITH_INTERACTIVE") {
+        val == "1"
+    } else {
+        is_terminal::is_terminal(std::io::stderr())
+    };
+
+    let origin = tirith_core::agent_origin::resolve_cli_origin(interactive);
+
+    if json {
+        let signals = current_signals(interactive);
+        #[derive(serde::Serialize)]
+        struct Out<'a> {
+            schema_version: u32,
+            kind: &'a str,
+            origin: &'a AgentOrigin,
+            signals: &'a CurrentSignalsOwned,
+        }
+        let out = Out {
+            schema_version: 1,
+            kind: origin.kind(),
+            origin: &origin,
+            signals: &signals,
+        };
+        if !super::write_json_stdout(&out, "tirith agent current: failed to write JSON output") {
+            return 1;
+        }
+    } else {
+        print_current_human(&origin, interactive);
+    }
+    0
+}
+
+/// Gather the per-signal snapshot used by `current --format json`.
+/// Pulled into its own helper so the JSON path stays narrow and the
+/// stringly-typed env-var lookups live in one place.
+fn current_signals(interactive: bool) -> CurrentSignalsOwned {
+    let tirith_integration = std::env::var("TIRITH_INTEGRATION").ok().and_then(|raw| {
+        let s = tirith_core::agent_origin::sanitize_caller_label(&raw);
+        (!s.is_empty()).then_some(s)
+    });
+    let tirith_integration_version =
+        std::env::var("TIRITH_INTEGRATION_VERSION")
+            .ok()
+            .and_then(|raw| {
+                let s = tirith_core::agent_origin::sanitize_caller_version(&raw);
+                (!s.is_empty()).then_some(s)
+            });
+    let ci_provider = tirith_core::agent_origin::detect_ci_provider();
+    let ci_generic = std::env::var("CI")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    // The raw value of `TIRITH_INTERACTIVE` is reported verbatim (rather
+    // than the resolved bool) so the operator can see exactly what they
+    // set. Bounded to a tiny fixed set ("0" / "1" / other) — anything
+    // longer is debug-escaped.
+    let tirith_interactive_env = std::env::var("TIRITH_INTERACTIVE").ok().map(|v| {
+        if v == "0" || v == "1" {
+            v
+        } else {
+            format!("{v:?}")
+        }
+    });
+    CurrentSignalsOwned {
+        tirith_integration,
+        tirith_integration_version,
+        ci_provider,
+        ci_generic,
+        interactive,
+        tirith_interactive_env,
+    }
+}
+
+#[derive(serde::Serialize)]
+struct CurrentSignalsOwned {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tirith_integration: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tirith_integration_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ci_provider: Option<String>,
+    ci_generic: bool,
+    interactive: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tirith_interactive_env: Option<String>,
+}
+
+fn print_current_human(origin: &AgentOrigin, interactive: bool) {
+    println!("kind: {}", origin.kind());
+    match origin {
+        AgentOrigin::Human { interactive: i } => {
+            println!("interactive: {i}");
+        }
+        AgentOrigin::Agent { tool, version } => {
+            println!("payload: {}", yaml_safe_scalar(tool));
+            if let Some(v) = version {
+                println!("version: {}", yaml_safe_scalar(v));
+            }
+        }
+        AgentOrigin::Mcp {
+            client_name,
+            client_version,
+        } => {
+            println!("payload: {}", yaml_safe_scalar(client_name));
+            if let Some(v) = client_version {
+                println!("version: {}", yaml_safe_scalar(v));
+            }
+        }
+        AgentOrigin::Gateway => {}
+        AgentOrigin::Ci { provider } => {
+            if let Some(p) = provider {
+                println!("payload: {}", yaml_safe_scalar(p));
+            } else {
+                println!("payload: (generic CI)");
+            }
+        }
+        AgentOrigin::Ide { name } => {
+            println!("payload: {}", yaml_safe_scalar(name));
+        }
+    }
+    println!();
+    println!("signals:");
+    if let Ok(raw) = std::env::var("TIRITH_INTEGRATION") {
+        let sanitized = tirith_core::agent_origin::sanitize_caller_label(&raw);
+        if !sanitized.is_empty() {
+            println!("  TIRITH_INTEGRATION: {}", yaml_safe_scalar(&sanitized));
+        }
+    }
+    if let Ok(raw) = std::env::var("TIRITH_INTEGRATION_VERSION") {
+        let sanitized = tirith_core::agent_origin::sanitize_caller_version(&raw);
+        if !sanitized.is_empty() {
+            println!(
+                "  TIRITH_INTEGRATION_VERSION: {}",
+                yaml_safe_scalar(&sanitized)
+            );
+        }
+    }
+    if let Some(p) = tirith_core::agent_origin::detect_ci_provider() {
+        println!("  CI provider: {p}");
+    } else if std::env::var("CI").is_ok_and(|v| !v.trim().is_empty()) {
+        println!("  CI: generic (no named provider env was set)");
+    }
+    println!("  interactive: {interactive}");
+    println!();
+    println!(
+        "note: every signal above is caller-claimed (settable by any process \
+running as the user). This report identifies an honest caller's category — \
+it never authenticates a hostile one."
+    );
+}
+
+// ===========================================================================
 // helpers — repo root, error reporting, YAML escaping
 // ===========================================================================
 

@@ -1856,6 +1856,90 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+
+    /// Validate an agent-matcher and print the deny snippet to add
+    #[command(after_help = "\
+Validates a `(kind, tool?)` matcher pair and emits the YAML snippet to paste
+into `agent_rules.deny` under `.tirith/policy.yaml`. A `<pattern>` positional
+is also accepted and echoed back as a comment beside the snippet — it is NOT
+written into the matcher itself, because the engine's `agent_rules` schema
+today matches only on `(kind, name)`; per-command pattern filtering on the
+agent path is a planned extension that does not yet land in
+`apply_agent_rules`. The pattern serves as operator documentation: what the
+deny rule is supposed to cover when the schema gains command matching.
+
+**Does NOT mutate `.tirith/policy.yaml`** — same operator-paste discipline
+that `tirith agent allow` follows: the operator copies the snippet into the
+file they wish to edit so a CLI never silently extends an enforcement-active
+policy. `deny` beats `allow`, so adding a matcher here forces a Block whenever
+the engine's verdict applies (per the agent-governance enforcement scope
+described under `tirith agent allow`).
+
+`kind` must be one of `human` / `agent` / `mcp` / `gateway` / `ci` / `ide`.
+`tool` is optional and applies only when the kind carries a caller-claimed
+payload (`agent`, `mcp`, `ci`, `ide`) — a tool filter on `human` or
+`gateway` matches nothing and is rejected up-front.
+
+Exit codes:
+  0  the matcher is valid; the snippet was printed.
+  1  the matcher is invalid, or the JSON output could not be written.
+  2  usage error (none defined today; reserved).
+
+Examples:
+  tirith agent block --kind agent --tool untrusted-tool \"curl|bash\"
+  tirith agent block --kind mcp --tool sketchy-server \"*\"
+  tirith agent block --kind agent --tool untrusted-tool \"*\" --format json")]
+    Block {
+        /// Origin kind: human, agent, mcp, gateway, ci, ide
+        #[arg(long)]
+        kind: String,
+        /// Caller-claimed payload to match (tool name / client name / provider / IDE name).
+        /// Optional; omit to match every origin of the given kind. Stored on
+        /// the variant under the spec name `payload` though it surfaces on
+        /// the command line as `--tool` for symmetry with `tirith agent allow`.
+        #[arg(long = "tool")]
+        payload: Option<String>,
+        /// Command pattern this deny rule is conceptually scoped to. Echoed
+        /// back as a YAML comment for operator documentation; not yet folded
+        /// into the matcher itself (the engine schema matches only on
+        /// `(kind, name)` today).
+        command_pattern: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Print the current process's claimed agent origin
+    #[command(after_help = "\
+Resolves the current process's [`AgentOrigin`] the same way `tirith check`
+does (via `tirith_core::agent_origin::resolve_cli_origin`) and prints what
+the engine would attribute this caller as. Useful for shell hooks and CI
+debugging: it answers \"what does tirith think I am right now?\" without
+having to run a verdict-producing command and inspect the audit log.
+
+The signal is **caller-claimed**: `TIRITH_INTEGRATION` and the CI-provider
+env vars are settable by any process running as the user, so this report
+identifies an honest caller's category, never authenticates a hostile one.
+
+Exit codes:
+  0  the origin was printed.
+  1  the JSON output could not be written.
+
+Examples:
+  tirith agent current
+  TIRITH_INTEGRATION=claude-code tirith agent current
+  tirith agent current --format json")]
+    Current {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2245,6 +2329,20 @@ fn run() {
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::agent::allow(&kind, tool.as_deref(), json)
+            }
+            AgentAction::Block {
+                kind,
+                payload,
+                command_pattern,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::agent::block(&kind, payload.as_deref(), &command_pattern, json)
+            }
+            AgentAction::Current { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::agent::current(json)
             }
         },
 

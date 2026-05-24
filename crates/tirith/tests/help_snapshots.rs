@@ -80,6 +80,8 @@ help_example_tests! {
     help_mcp_diff   => (["mcp", "diff", "--help"], "tirith mcp diff --format json");
     help_mcp_policy => (["mcp", "policy", "--help"], "tirith mcp policy init");
     help_mcp_policy_init => (["mcp", "policy", "init", "--help"], "tirith mcp policy init --format json");
+    help_agent_current   => (["agent", "current", "--help"], "tirith agent current");
+    help_agent_block     => (["agent", "block", "--help"], "tirith agent block --kind agent --tool untrusted-tool");
     help_verify_self => (["verify-self", "--help"], "tirith verify-self --format json");
     help_update     => (["update", "--help"], "tirith update --verify");
     help_update_rollback => (["update", "--help"], "tirith update --rollback");

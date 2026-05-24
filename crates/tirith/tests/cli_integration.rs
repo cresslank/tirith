@@ -5994,3 +5994,117 @@ fn lab_score_adds_field() {
         );
     }
 }
+
+// ===========================================================================
+// M6 ch3 — `tirith agent current` / `tirith agent block`
+//
+// Smoke tests for the new agent subcommands. The cli/agent.rs unit tests
+// cover the validation logic; these confirm wiring + happy-path output
+// shape through process invocation.
+// ===========================================================================
+
+#[test]
+fn agent_current_runs_and_reports_origin() {
+    let out = tirith()
+        .env_remove("TIRITH_INTEGRATION")
+        .env_remove("TIRITH_INTEGRATION_VERSION")
+        .env("TIRITH_INTERACTIVE", "0")
+        .args(["agent", "current"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("kind:"),
+        "human form must surface `kind:`: {stdout}"
+    );
+}
+
+#[test]
+fn agent_current_json_carries_origin_envelope() {
+    let out = tirith()
+        .env("TIRITH_INTEGRATION", "claude-code")
+        .env("TIRITH_INTERACTIVE", "0")
+        .args(["agent", "current", "--format", "json"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("agent current --format json must parse");
+    assert_eq!(v["kind"], "agent");
+    assert_eq!(v["origin"]["tool"], "claude-code");
+    assert_eq!(v["signals"]["tirith_integration"], "claude-code");
+}
+
+#[test]
+fn agent_block_emits_deny_snippet() {
+    let out = tirith()
+        .args([
+            "agent",
+            "block",
+            "--kind",
+            "agent",
+            "--tool",
+            "untrusted-tool",
+            "curl|bash",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("agent_rules.deny"),
+        "stderr should reference the deny block: {stderr}"
+    );
+    assert!(
+        stdout.contains("- kind: agent"),
+        "stdout snippet should declare the matcher: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"untrusted-tool\""),
+        "stdout snippet must include the matcher name: {stdout}"
+    );
+    assert!(
+        stdout.contains("command pattern:"),
+        "stdout snippet must include the pattern comment: {stdout}"
+    );
+}
+
+#[test]
+fn agent_block_rejects_invalid_kind() {
+    let out = tirith()
+        .args(["agent", "block", "--kind", "bogus", "any"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown kind"),
+        "stderr should name the invalid kind: {stderr}"
+    );
+}
+
+#[test]
+fn agent_block_rejects_payload_on_payloadless_kind() {
+    let out = tirith()
+        .args(["agent", "block", "--kind", "human", "--tool", "x", "*"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no caller-claimed payload"),
+        "stderr should explain the payloadless-kind error: {stderr}"
+    );
+}
+
+#[test]
+fn agent_block_requires_pattern() {
+    let out = tirith()
+        .args(["agent", "block", "--kind", "agent"])
+        .output()
+        .expect("failed to run tirith");
+    // Clap fails with exit 2 for missing required positional.
+    assert_eq!(out.status.code(), Some(2));
+}
