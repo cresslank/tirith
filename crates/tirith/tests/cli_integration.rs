@@ -6273,3 +6273,72 @@ fn mcp_permissions_aggregates_by_capability() {
     assert!(cap_names.contains(&"github-api"));
     assert!(cap_names.contains(&"runtime-tool-wildcard"));
 }
+
+// ===========================================================================
+// M6 ch3 — `tirith explain --finding <id>`
+//
+// Resolves a finding ID (`<event_id>:<index>`) from the audit log to a rule,
+// then explains it the same way `--rule` does. The ArgGroup makes --rule
+// and --finding mutually exclusive at clap parse time.
+// ===========================================================================
+
+#[test]
+fn explain_finding_resolves_event_id_to_rule() {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmpdir.path().join("data");
+    fs::create_dir_all(data_dir.join("tirith")).unwrap();
+    let log_line = r#"{"timestamp":"2026-05-25T10:00:00+00:00","session_id":"sess-1","action":"Block","rule_ids":["curl_pipe_shell"],"command_redacted":"x","bypass_requested":false,"bypass_honored":false,"interactive":false,"event_id":"evt-test-finding","tier_reached":3,"entry_type":"verdict"}"#;
+    fs::write(
+        data_dir.join("tirith").join("log.jsonl"),
+        format!("{log_line}\n"),
+    )
+    .unwrap();
+
+    let out = tirith()
+        .env("XDG_DATA_HOME", &data_dir)
+        .env("APPDATA", &data_dir)
+        .args(["explain", "--finding", "evt-test-finding:0"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("curl_pipe_shell"),
+        "stdout must resolve to the rule the finding mapped to: {stdout}"
+    );
+}
+
+#[test]
+fn explain_finding_rejects_malformed_id() {
+    let out = tirith()
+        .args(["explain", "--finding", "not-a-valid-id"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("malformed finding ID"),
+        "stderr must name the malformed-id error: {stderr}"
+    );
+}
+
+#[test]
+fn explain_rule_and_finding_conflict_at_parse_time() {
+    let out = tirith()
+        .args(["explain", "--rule", "curl_pipe_shell", "--finding", "x:0"])
+        .output()
+        .expect("failed to run tirith");
+    // Clap fails with exit 2 for argument conflicts.
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn explain_fix_without_rule_or_finding_is_rejected() {
+    // The ArgGroup makes --rule and --finding the only valid companions for
+    // --fix; using --fix alone surfaces a clap "required argument" error.
+    let out = tirith()
+        .args(["explain", "--fix"])
+        .output()
+        .expect("failed to run tirith");
+    assert_ne!(out.status.code(), Some(0));
+}

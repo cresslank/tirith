@@ -293,27 +293,44 @@ Examples:
     },
 
     /// Show documentation for a detection rule
-    #[command(after_help = "\
+    #[command(
+        after_help = "\
 Examples:
   tirith explain --rule pipe_to_interpreter
   tirith explain --rule curl_pipe_shell --fix
-  tirith explain --list --category terminal")]
+  tirith explain --finding evt-abc:0
+  tirith explain --list --category terminal",
+        // `--rule`, `--list`, and `--finding` are three mutually exclusive
+        // selectors. `--fix` needs at least one of `--rule`/`--finding`
+        // (set as `requires` on the flag) and conflicts with `--list`. The
+        // ArgGroup carries the exact-one-of semantics for `--rule` /
+        // `--finding` so a stale `--rule X --finding Y` invocation surfaces
+        // a clear usage error rather than silently picking one.
+        group = clap::ArgGroup::new("explain_target")
+            .args(["rule", "finding"])
+            .multiple(false)
+            .required(false)
+    )]
     Explain {
         /// Rule ID to explain (e.g., pipe_to_interpreter)
         #[arg(long, conflicts_with = "list")]
         rule: Option<String>,
 
         /// List all rules, optionally filtered by category
-        #[arg(long, conflicts_with = "rule")]
+        #[arg(long)]
         list: bool,
 
         /// Filter --list by category (hostname, path, transport, terminal, command, etc.)
         #[arg(long, requires = "list")]
         category: Option<String>,
 
+        /// Resolve a finding ID (format `<event_id>:<index>`) from the audit log to its rule, then explain it.
+        #[arg(long, value_name = "FINDING_ID", conflicts_with = "list")]
+        finding: Option<String>,
+
         /// Show only the rule's remediation ("what to do instead").
-        /// Requires --rule; not valid with --list.
-        #[arg(long, requires = "rule", conflicts_with = "list")]
+        /// Requires --rule or --finding; not valid with --list.
+        #[arg(long, requires = "explain_target", conflicts_with = "list")]
         fix: bool,
 
         /// Output format (default: human)
@@ -2294,12 +2311,20 @@ fn run() {
             rule,
             list,
             category,
+            finding,
             fix,
             format,
             json,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::explain::run(rule.as_deref(), list, category.as_deref(), fix, json)
+            cli::explain::run(
+                rule.as_deref(),
+                list,
+                category.as_deref(),
+                finding.as_deref(),
+                fix,
+                json,
+            )
         }
 
         Commands::Why { format, json } => {
