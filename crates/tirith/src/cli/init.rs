@@ -152,7 +152,9 @@ fn normalize_shell_name(name: &str) -> Option<&'static str> {
         Some("bash")
     } else if base.contains("fish") {
         Some("fish")
-    } else if base.contains("pwsh") || base.contains("powershell") {
+    } else if base.contains("pwsh") {
+        Some("pwsh")
+    } else if base.contains("powershell") {
         Some("powershell")
     } else if base == "nu" || base == "nu.exe" || base.contains("nushell") {
         Some("nushell")
@@ -373,8 +375,24 @@ mod tests {
     #[test]
     fn normalize_shell_name_supports_case_insensitive_names() {
         assert_eq!(normalize_shell_name("BASH"), Some("bash"));
-        assert_eq!(normalize_shell_name("PwSh"), Some("powershell"));
+        assert_eq!(normalize_shell_name("PwSh"), Some("pwsh"));
         assert_eq!(normalize_shell_name("PowerShell"), Some("powershell"));
+    }
+
+    #[test]
+    fn normalize_shell_name_distinguishes_pwsh_and_windows_powershell() {
+        // PowerShell 7+ (pwsh) — preserved as a distinct label so the displayed
+        // runtime matches `tirith doctor --compat`. The hook script
+        // (powershell-hook.ps1) is the same for both runtimes, so the install
+        // path still works; only the label differs.
+        assert_eq!(normalize_shell_name("/usr/local/bin/pwsh"), Some("pwsh"));
+        // Windows PowerShell 5.1 — the legacy runtime, distinct from pwsh.
+        assert_eq!(
+            normalize_shell_name("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
+            Some("powershell")
+        );
+        // Non-PowerShell shells are unaffected by the split.
+        assert_eq!(normalize_shell_name("/bin/bash"), Some("bash"));
     }
 
     #[test]

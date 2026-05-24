@@ -371,25 +371,65 @@ pub fn export_json(records: &[AuditRecord]) -> String {
 }
 
 /// Export records as CSV (RFC 4180 compliant). Only supports verdict entries.
+///
+/// `agent_origin` is appended as the last column so existing CSV consumers
+/// see no column-position shift. The JSON export already carries the field;
+/// CSV now exposes a compact stringification per variant
+/// (`human(interactive)` / `agent:<tool>` / `mcp:<client_name>` / `gateway` /
+/// `ci:<provider>` / `ide:<name>` / empty for `None`). Compliance dashboards
+/// consuming CSV no longer lose agent attribution.
 pub fn export_csv(records: &[AuditRecord]) -> String {
     let mut out = String::new();
     out.push_str(
-        "timestamp,session_id,action,rule_ids,command_redacted,bypass_requested,tier_reached\n",
+        "timestamp,session_id,action,rule_ids,command_redacted,bypass_requested,tier_reached,agent_origin\n",
     );
     for r in records {
         let rules = r.rule_ids.join(";");
+        let origin = agent_origin_csv_render(&r.agent_origin);
         out.push_str(&format!(
-            "{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{}\n",
             csv_escape(&r.timestamp),
             csv_escape(&r.session_id),
             csv_escape(&r.action),
             csv_escape(&rules),
             csv_escape(&r.command_redacted),
             r.bypass_requested,
-            r.tier_reached
+            r.tier_reached,
+            csv_escape(&origin),
         ));
     }
     out
+}
+
+/// Render an [`AgentOrigin`] for the CSV `agent_origin` cell.
+///
+/// Variants collapse to a `kind:payload` shape so dashboards can split on `:`
+/// without parsing JSON. `None` (old log rows that predate the field) yields
+/// an empty cell.
+fn agent_origin_csv_render(origin: &Option<crate::agent_origin::AgentOrigin>) -> String {
+    use crate::agent_origin::AgentOrigin;
+    match origin {
+        None => String::new(),
+        Some(AgentOrigin::Human { interactive: true }) => "human(interactive)".to_string(),
+        Some(AgentOrigin::Human { interactive: false }) => "human".to_string(),
+        Some(AgentOrigin::Agent { tool, version }) => match version {
+            Some(v) => format!("agent:{tool}@{v}"),
+            None => format!("agent:{tool}"),
+        },
+        Some(AgentOrigin::Mcp {
+            client_name,
+            client_version,
+        }) => match client_version {
+            Some(v) => format!("mcp:{client_name}@{v}"),
+            None => format!("mcp:{client_name}"),
+        },
+        Some(AgentOrigin::Gateway) => "gateway".to_string(),
+        Some(AgentOrigin::Ci { provider }) => match provider {
+            Some(p) => format!("ci:{p}"),
+            None => "ci".to_string(),
+        },
+        Some(AgentOrigin::Ide { name }) => format!("ide:{name}"),
+    }
 }
 
 /// Escape a field for RFC 4180 CSV: if it contains commas, double quotes,
@@ -819,6 +859,142 @@ mod tests {
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains("\"echo \"\"hello, world\"\"\""));
+    }
+
+    #[test]
+    fn test_export_csv_includes_agent_origin_column() {
+        use crate::agent_origin::AgentOrigin;
+
+        // A record with an MCP agent_origin, and one without (None).
+        let mut records = vec![
+            AuditRecord {
+                timestamp: "2026-01-15T10:00:00Z".into(),
+                session_id: "sess-001".into(),
+                action: "Block".into(),
+                rule_ids: vec!["test_rule".into()],
+                command_redacted: "cmd".into(),
+                bypass_requested: false,
+                bypass_honored: false,
+                interactive: true,
+                policy_path: None,
+                event_id: None,
+                tier_reached: 3,
+                entry_type: "verdict".into(),
+                event: None,
+                integration: None,
+                hook_type: None,
+                detail: None,
+                elapsed_ms: None,
+                raw_action: None,
+                raw_rule_ids: None,
+                trust_pattern: None,
+                trust_rule_id: None,
+                trust_action: None,
+                trust_ttl_expires: None,
+                trust_scope: None,
+                agent_origin: Some(AgentOrigin::Mcp {
+                    client_name: "Cursor".into(),
+                    client_version: Some("0.42".into()),
+                }),
+            },
+            AuditRecord {
+                timestamp: "2026-01-15T10:01:00Z".into(),
+                session_id: "sess-001".into(),
+                action: "Allow".into(),
+                rule_ids: vec![],
+                command_redacted: "ls".into(),
+                bypass_requested: false,
+                bypass_honored: false,
+                interactive: false,
+                policy_path: None,
+                event_id: None,
+                tier_reached: 1,
+                entry_type: "verdict".into(),
+                event: None,
+                integration: None,
+                hook_type: None,
+                detail: None,
+                elapsed_ms: None,
+                raw_action: None,
+                raw_rule_ids: None,
+                trust_pattern: None,
+                trust_rule_id: None,
+                trust_action: None,
+                trust_ttl_expires: None,
+                trust_scope: None,
+                agent_origin: None,
+            },
+        ];
+        // Append rows for the remaining variants so we exercise each branch.
+        let base = records[1].clone();
+        let mut push_variant = |origin: AgentOrigin| {
+            let mut r = base.clone();
+            r.agent_origin = Some(origin);
+            records.push(r);
+        };
+        push_variant(AgentOrigin::Human { interactive: true });
+        push_variant(AgentOrigin::Human { interactive: false });
+        push_variant(AgentOrigin::Agent {
+            tool: "claude-code".into(),
+            version: Some("1.2.3".into()),
+        });
+        push_variant(AgentOrigin::Agent {
+            tool: "claude-code".into(),
+            version: None,
+        });
+        push_variant(AgentOrigin::Gateway);
+        push_variant(AgentOrigin::Ci {
+            provider: Some("github-actions".into()),
+        });
+        push_variant(AgentOrigin::Ci { provider: None });
+        push_variant(AgentOrigin::Ide {
+            name: "vscode".into(),
+        });
+
+        let csv = export_csv(&records);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert!(
+            lines[0].ends_with(",agent_origin"),
+            "header should end with agent_origin column: {}",
+            lines[0]
+        );
+        // MCP row: last column is "mcp:Cursor@0.42".
+        assert!(
+            lines[1].ends_with(",mcp:Cursor@0.42"),
+            "MCP row last column should be mcp:Cursor@0.42, got: {}",
+            lines[1]
+        );
+        // None row: empty cell (the line ends with a bare comma).
+        assert!(
+            lines[2].ends_with(','),
+            "None row should leave the agent_origin cell empty, got: {}",
+            lines[2]
+        );
+        // Remaining variants.
+        assert!(
+            lines[3].ends_with(",human(interactive)"),
+            "row 3: {}",
+            lines[3]
+        );
+        assert!(lines[4].ends_with(",human"), "row 4: {}", lines[4]);
+        assert!(
+            lines[5].ends_with(",agent:claude-code@1.2.3"),
+            "row 5: {}",
+            lines[5]
+        );
+        assert!(
+            lines[6].ends_with(",agent:claude-code"),
+            "row 6: {}",
+            lines[6]
+        );
+        assert!(lines[7].ends_with(",gateway"), "row 7: {}", lines[7]);
+        assert!(
+            lines[8].ends_with(",ci:github-actions"),
+            "row 8: {}",
+            lines[8]
+        );
+        assert!(lines[9].ends_with(",ci"), "row 9: {}", lines[9]);
+        assert!(lines[10].ends_with(",ide:vscode"), "row 10: {}", lines[10]);
     }
 
     #[test]
