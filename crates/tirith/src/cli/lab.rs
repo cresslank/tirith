@@ -1,6 +1,6 @@
 //! `tirith lab` — adversarial training mode (experimental).
 //!
-//! Runs the curated corpus at `tests/fixtures/lab_corpus.toml` through
+//! Runs the curated corpus at `crates/tirith/assets/lab_corpus.toml` through
 //! `tirith_core::engine::analyze`, comparing each scenario's actual verdict
 //! against its declared `expected_action`. Three modes:
 //!
@@ -27,14 +27,15 @@ use tirith_core::extract::ScanContext;
 use tirith_core::tokenize::ShellType;
 use tirith_core::verdict::{Action, Finding, RuleId, Severity};
 
-/// Embedded corpus. Path is 4 levels up from this file:
+/// Embedded corpus. Lives inside the `tirith` crate so `cargo package` can
+/// see it (`include_str!` paths that reach outside the manifest directory
+/// make the crate unpackageable). Path is 3 levels up from this file:
 ///   crates/tirith/src/cli/lab.rs
 ///     -> crates/tirith/src/cli/
 ///     -> crates/tirith/src/
 ///     -> crates/tirith/
-///     -> crates/
-///     -> <workspace root>/tests/fixtures/lab_corpus.toml
-const LAB_CORPUS: &str = include_str!("../../../../tests/fixtures/lab_corpus.toml");
+///     -> crates/tirith/assets/lab_corpus.toml
+const LAB_CORPUS: &str = include_str!("../../assets/lab_corpus.toml");
 
 #[derive(Debug, Deserialize)]
 struct LabCorpus {

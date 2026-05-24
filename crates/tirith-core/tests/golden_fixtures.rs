@@ -1196,11 +1196,16 @@ fn test_tier1_matches_all_interpreters() {
 // ---------------------------------------------------------------------------
 // Lab corpus safeguard (M5 / Chunk 3)
 //
-// The `tirith lab` corpus at tests/fixtures/lab_corpus.toml doubles as a
-// fixture set: every non-allow scenario must produce at least one finding
+// The `tirith lab` corpus at crates/tirith/assets/lab_corpus.toml doubles as
+// a fixture set: every non-allow scenario must produce at least one finding
 // (i.e. tier-3 rules actually ran). This catches the same class of bug as
 // `test_tier1_does_not_gate_findings` but for the lab corpus, ensuring future
 // corpus expansion does not silently lose detection coverage.
+//
+// The corpus lives inside the `tirith` crate (so `cargo package -p tirith`
+// can embed it via `include_str!`); this test reads it via a
+// `CARGO_MANIFEST_DIR`-relative path that walks across the workspace into the
+// sibling crate.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -1231,7 +1236,14 @@ fn default_lab_shell() -> String {
 
 #[test]
 fn test_lab_corpus_reaches_tier3() {
-    let path = fixtures_dir().join("lab_corpus.toml");
+    // CARGO_MANIFEST_DIR is `crates/tirith-core`; walk to the workspace root
+    // and into the sibling `tirith` crate where the corpus now lives.
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("tirith")
+        .join("assets")
+        .join("lab_corpus.toml");
     let content = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("Failed to read {}: {}", path.display(), e));
     let file: LabCorpusFile = toml::from_str(&content)
