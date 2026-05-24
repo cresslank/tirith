@@ -795,8 +795,22 @@ fn strip_keyword_ci<'a>(code: &'a str, keyword: &str) -> Option<&'a str> {
     if code.len() < keyword.len() + 1 {
         return None;
     }
-    let (head, tail) = code.split_at(keyword.len());
-    if head.eq_ignore_ascii_case(keyword) && tail.starts_with(|c: char| c.is_whitespace()) {
+    // PR #121 fix-list item 4 (second site, missed by the initial pass):
+    // `code.split_at(keyword.len())` panics on a `&str` when `keyword.len()`
+    // lands inside a multi-byte UTF-8 character (e.g. `modulé` with keyword
+    // `module` — `split_at(6)` lands inside the `é` codepoint at bytes 5..7).
+    //
+    // Switch to a byte-level prefix check first. `eq_ignore_ascii_case` on
+    // `[u8]` matches keyword bytes against the leading bytes of `code` without
+    // demanding a char boundary; only ASCII bytes can compare-equal to the
+    // (always-ASCII) keyword, so a matching head guarantees `keyword.len()`
+    // sits on a char boundary, and `&code[keyword.len()..]` is then sound.
+    let head_bytes = &code.as_bytes()[..keyword.len()];
+    if !head_bytes.eq_ignore_ascii_case(keyword.as_bytes()) {
+        return None;
+    }
+    let tail = &code[keyword.len()..];
+    if tail.starts_with(|c: char| c.is_whitespace()) {
         Some(tail.trim_start())
     } else {
         None
