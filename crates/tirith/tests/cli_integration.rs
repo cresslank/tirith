@@ -4087,10 +4087,10 @@ fn mcp_lock_writes_lockfile_for_planted_config() {
     // The lockfile records both servers, deterministically sorted by name.
     let contents = fs::read_to_string(&lock_path).unwrap();
     let lock: serde_json::Value = serde_json::from_str(&contents).expect("lockfile must be JSON");
-    // format_version 4 — the URL transport now strips userinfo and stores a
-    // `userinfo_hash` (sha256 of `server_name || ':' || userinfo`); env
-    // entries continued from v3 still carry `{ name, value_hash }`.
-    assert_eq!(lock["format_version"], 4);
+    // format_version 5 — folds `tools_declared` into the per-server
+    // content_hash. v4 added URL userinfo redaction (`userinfo_hash`) and v3
+    // hashed env values; both still serialize through unchanged at v5.
+    assert_eq!(lock["format_version"], 5);
     let servers = lock["servers"].as_array().expect("servers array");
     assert_eq!(servers.len(), 2);
     assert_eq!(servers[0]["name"], "filesystem");
@@ -4248,9 +4248,11 @@ fn mcp_lock_does_not_leak_url_userinfo_into_committed_file() {
         !lock_text.contains("@mcp.example.com"),
         "the userinfo `@` boundary leaked into the committed mcp.lock:\n{lock_text}"
     );
-    // The schema bumped to format_version 4 for this fix.
+    // The schema bumped to format_version 5 (which folds `tools_declared`
+    // into the per-server content_hash); v4's URL userinfo redaction is
+    // preserved through the bump.
     let lock: serde_json::Value = serde_json::from_str(lock_text).expect("lockfile must be JSON");
-    assert_eq!(lock["format_version"], 4);
+    assert_eq!(lock["format_version"], 5);
 
     // The URL transport stores the redacted URL and carries the
     // `userinfo_hash` field; it does NOT carry a plaintext userinfo /
@@ -4490,7 +4492,7 @@ fn mcp_verify_json_emits_envelope() {
     assert_eq!(v["in_sync"], true);
     assert_eq!(v["drift_count"], 0);
     assert_eq!(v["command"], "tirith mcp verify");
-    assert_eq!(v["lockfile_format_version"], 4);
+    assert_eq!(v["lockfile_format_version"], 5);
 }
 
 #[test]

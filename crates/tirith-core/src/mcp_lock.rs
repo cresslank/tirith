@@ -85,7 +85,25 @@ use sha2::{Digest, Sha256};
 ///   v3, and `.tirith/mcp.lock` is designed to be committed — so the raw
 ///   userinfo never lands in the file. A v3 lockfile is not byte-comparable
 ///   to a v4 one.
-pub const MCP_LOCK_FORMAT_VERSION: u32 = 4;
+/// * `5` — the per-server `tools_declared` flag is now folded into the
+///   per-server `content_hash`. Pre-v5, `tools_declared` was deliberately
+///   excluded from the hash: a server flipping `"tools": []` to omitted
+///   (or vice-versa) silently passed drift detection because both shapes
+///   collapsed into the same canonical `tools: []` list and the
+///   `tools_declared` distinction was carried but not hashed. v5 folds the
+///   serialized form of the declaration state into the content hash so
+///   that flip now registers as drift. The on-disk shape is otherwise
+///   unchanged from v4 — every field still serializes the same way — but
+///   the recomputed `content_hash` / `inventory_hash` values differ, so a
+///   v4 lockfile is not byte-comparable to a v5 one. A v4 lockfile loaded
+///   in a v5 build is tagged with a migration marker (see
+///   [`LockfileSchema`]); [`compute_drift`] skips the normal per-server
+///   comparison for migration-tagged lockfiles and returns a single
+///   [`McpDrift::SchemaUpgradeRequired`] entry instructing the operator
+///   to run `tirith mcp lock --force` once to regenerate. This avoids the
+///   phantom-drift storm that would otherwise fire on the first v5 run
+///   against an existing v4 baseline.
+pub const MCP_LOCK_FORMAT_VERSION: u32 = 5;
 
 /// Basename of the lockfile, written under `<repo_root>/.tirith/`.
 pub const MCP_LOCK_FILENAME: &str = "mcp.lock";
@@ -179,10 +197,16 @@ pub enum McpTransport {
     /// (`url::Url` defaults a missing path to `/`, so a bare-host URL has
     /// two textual shapes — only the canonical one ends up in the lockfile).
     ///
-    /// A URL that does not parse cleanly (so userinfo cannot be safely
-    /// identified) is stored verbatim with `userinfo_hash = None`. This is
-    /// the correct conservative behavior: stripping bytes from a string we
-    /// cannot parse could itself mangle the input.
+    /// A URL that does not parse cleanly has its userinfo
+    /// best-effort-stripped (replaced with `***@` when the scheme +
+    /// authority + userinfo shape is recognizable) and a salted hash
+    /// of the original userinfo bytes is stored, so credential
+    /// add/remove drift still surfaces for malformed URLs. A
+    /// malformed URL that does not look authority-shaped is preserved
+    /// as-is with `userinfo_hash = None` — stripping bytes from a
+    /// string whose structure we cannot parse could itself mangle
+    /// diagnostic context. See [`redact_url_userinfo`] for the full
+    /// stripping logic.
     Url {
         url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -284,22 +308,34 @@ pub struct McpServerEntry {
     /// (which an MCP client treats as "all tools"), OR the config declared
     /// `"tools": []` — distinguish the two via [`Self::tools_declared`].
     pub tools: Vec<String>,
-    /// Whether the source config carried a `tools` key. `true` for
-    /// `"tools": []` and `"tools": [...]`; `false` for an omitted key or
-    /// a malformed shape. The lockfile schema is unchanged
-    /// (`format_version` still 4); this field rides on existing entries
-    /// with `#[serde(default = "default_tools_declared")]` so an older
-    /// lockfile (which had no field) round-trips with the value `true`
-    /// — preserving the pre-change semantics that empty `tools` was
-    /// always interpreted as "declared empty". Going forward, freshly-
-    /// written lockfiles distinguish the two states.
+    /// Whether the source config carried a `tools` key. `true` for any
+    /// shape where the operator wrote a `tools` key — including
+    /// [`DeclaredTools::Invalid`] (a malformed `tools` value is still a
+    /// declaration *attempt*, just shaped wrong), [`DeclaredTools::EmptyDeclared`]
+    /// (`"tools": []`), and [`DeclaredTools::Declared`] (`"tools": [...]`).
+    /// `false` only when the source config omitted the `tools` key
+    /// entirely ([`DeclaredTools::Omitted`]). See
+    /// [`DeclaredTools::was_declared`] for the canonical predicate.
     ///
-    /// **Not folded into [`Self::content_hash`].** Adding this field to
-    /// the hash would make a new tirith binary produce a different
-    /// per-server hash than an old binary did for the same config, and
-    /// the lockfile would surface a spurious `Changed` drift on every
-    /// upgrade. The field is informational / audit-side; the hash
-    /// continues to derive from the canonical tools vec only.
+    /// **Folded into [`Self::content_hash`] from `format_version: 5` onward.**
+    /// Pre-v5 this field rode on entries with
+    /// `#[serde(default = "default_tools_declared")]` but was deliberately
+    /// **excluded** from `content_hash`, so a server flipping
+    /// `"tools": []` to omitted (or vice-versa) silently passed drift
+    /// detection (both shapes flatten to the canonical empty `tools:
+    /// Vec<String>`). v5 folds the serialized form of the field into the
+    /// hash so the flip now registers as drift. A v4 lockfile loaded in
+    /// a v5 build is tagged with [`LockfileSchema::LegacyV4Migration`]
+    /// rather than rejected outright (see [`parse_lockfile`]), and
+    /// [`compute_drift`] short-circuits to a migration prompt so the
+    /// first v5 run against an existing v4 baseline doesn't fire phantom
+    /// drift.
+    ///
+    /// Backward compatibility: older lockfiles without this field still
+    /// deserialize with `tools_declared: true` (the
+    /// `default_tools_declared` helper), preserving the pre-change
+    /// semantics that an empty `tools` list could come from either
+    /// omitted or explicit empty.
     #[serde(default = "default_tools_declared")]
     pub tools_declared: bool,
     /// Repo-relative path of the config file this entry was parsed from.
@@ -375,6 +411,23 @@ impl McpServerEntry {
         hash_field(&mut hasher, &(self.tools.len() as u64).to_le_bytes());
         for tool in &self.tools {
             hash_field(&mut hasher, tool.as_bytes());
+        }
+        // `tools_declared` joined the per-server hash in `format_version: 5`.
+        // Pre-v5, a server flipping `"tools": []` to omitted (or vice-versa)
+        // collapsed to an identical canonical `tools: Vec<String>` and hashed
+        // identically, so the flip went undetected. Folding the byte `\x01`
+        // (declared) / `\x00` (omitted) into the hasher makes that flip
+        // register as drift. The length-prefixed framing established for
+        // every preceding field keeps the encoding unambiguous over any
+        // byte content — a 1-byte declaration tag at the end never collides
+        // with anything earlier in the stream. See [`MCP_LOCK_FORMAT_VERSION`]
+        // history note for v5 for the migration path (legacy v4 lockfiles
+        // are tagged with [`LockfileSchema::LegacyV4Migration`] so the first
+        // v5 run against an existing baseline does not fire phantom drift).
+        if self.tools_declared {
+            hasher.update(b"\x01");
+        } else {
+            hasher.update(b"\x00");
         }
         hex_lower(&hasher.finalize())
     }
@@ -500,11 +553,11 @@ pub struct McpInventory {
     ///
     /// **Additive field, not a lockfile schema bump.** This field rides
     /// on `McpInventory`, which is the in-process discovery structure —
-    /// it is NOT part of the on-disk `McpLockfile` shape. The lockfile's
-    /// `format_version` is unchanged (still 4). Consumers that want to
-    /// surface the rejections (the `mcp lock` CLI summary, an
-    /// integration ingesting the JSON output) read it directly from
-    /// `McpInventory::rejected_configs`.
+    /// it is NOT part of the on-disk `McpLockfile` shape, so its
+    /// introduction did not require a `MCP_LOCK_FORMAT_VERSION` bump.
+    /// Consumers that want to surface the rejections (the `mcp lock`
+    /// CLI summary, an integration ingesting the JSON output) read it
+    /// directly from `McpInventory::rejected_configs`.
     pub rejected_configs: Vec<RejectedConfig>,
 }
 
@@ -535,15 +588,51 @@ pub struct McpLockServer {
     /// Whether the source config carried a `tools` key. See
     /// [`McpServerEntry::tools_declared`] for the rationale. Serialized
     /// with `#[serde(default = "default_tools_declared")]` so a legacy
-    /// lockfile (no field) deserializes with the value `true`. **Not
-    /// folded into [`Self::hash`]** — the per-server hash continues to
-    /// derive from the canonical tools vec only.
+    /// lockfile (no field) deserializes with the value `true`.
+    ///
+    /// **Folded into [`Self::hash`] from `format_version: 5` onward.**
+    /// Pre-v5, this field was excluded from the per-server hash so a
+    /// `"tools": []` ↔ omitted flip silently passed drift detection. v5
+    /// folds it into [`McpServerEntry::content_hash`]; a v4 lockfile
+    /// loaded in a v5 build is tagged via
+    /// [`LockfileSchema::LegacyV4Migration`] so
+    /// [`compute_drift`] surfaces a one-time migration prompt instead of
+    /// phantom drift.
     #[serde(default = "default_tools_declared")]
     pub tools_declared: bool,
     /// Repo-relative path of the config file the server was declared in.
     pub source_config: String,
     /// Per-server content hash (see [`McpServerEntry::content_hash`]).
     pub hash: String,
+}
+
+/// In-memory schema-state tag attached to a parsed lockfile.
+///
+/// Not part of the on-disk lockfile shape — never serialized, never
+/// deserialized — but carried alongside an [`McpLockfile`] value so
+/// downstream consumers (notably [`compute_drift`]) can short-circuit the
+/// drift comparison for a legacy lockfile that needs a one-time
+/// regeneration.
+///
+/// The variant is set inside [`parse_lockfile`] based on the file's
+/// declared `format_version`. A lockfile built freshly via
+/// [`McpLockfile::from_inventory`] is always `Current`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LockfileSchema {
+    /// The lockfile's `format_version` matches [`MCP_LOCK_FORMAT_VERSION`];
+    /// drift detection runs normally.
+    #[default]
+    Current,
+    /// The lockfile was written with `format_version: 4`. The on-disk
+    /// shape is identical to v5, but the hashes inside were computed
+    /// without folding `tools_declared` into [`McpServerEntry::content_hash`]
+    /// — so a v5 build's recomputed hashes will differ from the stored
+    /// ones for every server, even when nothing about the MCP inventory
+    /// changed. [`compute_drift`] sees this tag and returns a single
+    /// [`McpDrift::SchemaUpgradeRequired`] entry instructing the operator
+    /// to run `tirith mcp lock --force` once, rather than firing phantom
+    /// drift on every existing server.
+    LegacyV4Migration,
 }
 
 /// The `.tirith/mcp.lock` document.
@@ -565,6 +654,14 @@ pub struct McpLockfile {
     pub configs: Vec<String>,
     /// Every locked MCP server, sorted by `(name, source_config)`.
     pub servers: Vec<McpLockServer>,
+    /// In-memory schema-state tag — `LegacyV4Migration` when the lockfile
+    /// was parsed from a v4 file, `Current` otherwise. Never serialized;
+    /// `#[serde(skip)]` with a `Default` impl returning `Current` so a
+    /// freshly-constructed `McpLockfile` (and any future
+    /// [`Serialize`]/[`Deserialize`] round-trip) lands in the `Current`
+    /// state.
+    #[serde(skip)]
+    pub schema_state: LockfileSchema,
 }
 
 impl McpLockfile {
@@ -612,6 +709,7 @@ impl McpLockfile {
             inventory_hash,
             configs,
             servers,
+            schema_state: LockfileSchema::Current,
         }
     }
 
@@ -1149,10 +1247,15 @@ fn parse_transport(
 ///   `https://@host/` is normalized by `url::Url` to the no-userinfo form
 ///   during parsing, so it is treated as the no-userinfo case — the user
 ///   supplied nothing.
-/// * The URL does not parse → return the URL verbatim and `None`. Without a
-///   safe parser we cannot identify the userinfo boundary, so we refuse to
-///   modify the string. (A malformed URL is captured anyway: it is itself a
-///   finding-worthy oddity a later `mcp verify` should see.)
+/// * The URL does not parse → best-effort-strip the userinfo (the
+///   `***@` form when the scheme + authority + userinfo shape is
+///   recognizable) and store a salted hash of the original userinfo
+///   bytes — see [`strip_userinfo_best_effort`]. Credential add/remove
+///   drift still surfaces for malformed URLs because the hash flips.
+///   A malformed URL that does not look authority-shaped is preserved
+///   as-is with `userinfo_hash = None` (a malformed URL is captured
+///   anyway: it is itself a finding-worthy oddity a later `mcp verify`
+///   should see).
 ///
 /// Returns `(redacted_url, userinfo_hash)`. The raw userinfo lives only as
 /// the local `userinfo` String for the duration of the hash computation and
@@ -1573,11 +1676,13 @@ impl McpServerDriftEntry {
 /// One drift between the current inventory and the loaded lockfile.
 ///
 /// A `Vec<McpDrift>` is the structured shape both `tirith mcp verify` and
-/// `tirith mcp diff` consume. Sort order: `Removed` first (by name), then
-/// `Added` (by name), then `Changed` (by name) — `Removed` first because it
-/// is the most surprising / security-relevant case (a server that the
-/// lockfile expected is gone), and grouping `Added` and `Changed` by name
-/// makes the human output read top-to-bottom by server.
+/// `tirith mcp diff` consume. Sort order: `SchemaUpgradeRequired` first
+/// (there is at most one and it short-circuits the comparison), then
+/// `Removed` (by name), then `Added` (by name), then `Changed` (by name)
+/// — `Removed` first among real-drift kinds because it is the most
+/// surprising / security-relevant case (a server that the lockfile
+/// expected is gone), and grouping `Added` and `Changed` by name makes
+/// the human output read top-to-bottom by server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpDrift {
@@ -1609,41 +1714,67 @@ pub enum McpDrift {
         /// **Wire shape.** Skipped on serialization when empty so an older
         /// drift document (without the field) round-trips into a current
         /// `Added` with `tools: vec![]`. This is a structural extension,
-        /// **not** a lockfile schema change — `.tirith/mcp.lock`'s
-        /// `format_version` is unchanged (still 4).
+        /// **not** a lockfile schema change.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tools: Vec<String>,
     },
     /// A server present on both sides has changed — its per-server `hash`
     /// differs. The entry holds the per-field detail.
     Changed(McpServerDriftEntry),
+    /// The lockfile parses cleanly but was written with an older
+    /// `format_version` whose hashing rules differ from the current
+    /// build's. [`compute_drift`] emits this as a single entry instead
+    /// of comparing per-server hashes — every recomputed hash would
+    /// differ from the stored one and produce a phantom-drift storm
+    /// even when the MCP inventory is unchanged. The operator runs
+    /// `tirith mcp lock --force` once to regenerate; subsequent runs
+    /// take the normal drift path.
+    SchemaUpgradeRequired {
+        /// The `format_version` value the lockfile carried.
+        from_version: u32,
+        /// The `format_version` this build of tirith writes
+        /// ([`MCP_LOCK_FORMAT_VERSION`]).
+        to_version: u32,
+    },
 }
 
 impl McpDrift {
-    /// Sort key for deterministic ordering: kind-bucket first (Removed = 0,
-    /// Added = 1, Changed = 2), then by `(name, source_config)` inside each
-    /// bucket. This is what makes a `Vec<McpDrift>` byte-stable.
+    /// Sort key for deterministic ordering: kind-bucket first
+    /// (SchemaUpgradeRequired = 0, Removed = 1, Added = 2, Changed = 3),
+    /// then by `(name, source_config)` inside each bucket. This is what
+    /// makes a `Vec<McpDrift>` byte-stable. `SchemaUpgradeRequired`
+    /// carries no server name, so its name/source_config sort fields
+    /// are empty strings — there is at most one such entry in a drift
+    /// vec (it short-circuits the per-server comparison), so a tie-
+    /// break against another `SchemaUpgradeRequired` cannot happen.
     fn sort_key(&self) -> (u8, String, String) {
         match self {
+            McpDrift::SchemaUpgradeRequired { .. } => (0, String::new(), String::new()),
             McpDrift::Removed {
                 name,
                 source_config,
-            } => (0, name.clone(), source_config.clone()),
+            } => (1, name.clone(), source_config.clone()),
             McpDrift::Added {
                 name,
                 source_config,
                 ..
-            } => (1, name.clone(), source_config.clone()),
-            McpDrift::Changed(entry) => (2, entry.name.clone(), entry.source_config.clone()),
+            } => (2, name.clone(), source_config.clone()),
+            McpDrift::Changed(entry) => (3, entry.name.clone(), entry.source_config.clone()),
         }
     }
 
-    /// The server name this drift refers to.
+    /// The server name this drift refers to. `SchemaUpgradeRequired`
+    /// has no server name; it returns an empty string. Callers that
+    /// filter drift by server (e.g. trust filtering, allowed-tools
+    /// matching) inspect this — the empty string is never a real MCP
+    /// server name, so an `mcp_allowed_tools` / `trusted_mcp_servers`
+    /// match against an empty key is structurally impossible.
     pub fn name(&self) -> &str {
         match self {
             McpDrift::Removed { name, .. } => name,
             McpDrift::Added { name, .. } => name,
             McpDrift::Changed(entry) => &entry.name,
+            McpDrift::SchemaUpgradeRequired { .. } => "",
         }
     }
 }
@@ -1684,6 +1815,24 @@ impl McpDrift {
 /// observes that the *hash* changed, never the underlying secret. A drift
 /// report is therefore safe to print to a terminal and to serialize as JSON.
 pub fn compute_drift(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift> {
+    // Migration short-circuit. A lockfile parsed from a legacy
+    // `format_version: 4` carries `LockfileSchema::LegacyV4Migration`
+    // because its stored hashes were computed under the pre-v5 rules
+    // (tools_declared excluded). Every server's recomputed v5 hash
+    // would differ from the stored v4 hash even when nothing in the
+    // MCP inventory changed, so the normal drift walk would fire a
+    // phantom-drift storm. Surface a single migration entry instead;
+    // the operator runs `tirith mcp lock --force` once and subsequent
+    // runs use the normal drift path. The `current` inventory is
+    // intentionally NOT inspected here — there's no useful per-server
+    // comparison to do until the baseline is regenerated.
+    if matches!(lock.schema_state, LockfileSchema::LegacyV4Migration) {
+        return vec![McpDrift::SchemaUpgradeRequired {
+            from_version: lock.format_version,
+            to_version: MCP_LOCK_FORMAT_VERSION,
+        }];
+    }
+
     // Compute the current inventory's would-be inventory hash. If it equals
     // the lockfile's recorded one, nothing changed; skip the per-server
     // comparison entirely.
@@ -2028,10 +2177,27 @@ pub fn load_lockfile(path: &Path) -> Result<McpLockfile, McpLockLoadError> {
 /// schema vN, re-run `tirith mcp lock` to refresh / upgrade tirith")
 /// rather than a generic parse-error. This is the schema-evolution gate
 /// the [`MCP_LOCK_FORMAT_VERSION`] doc-comment promises: a legacy v3-shape
-/// lockfile (no `userinfo_hash`, raw env values) deserializes into a v4
+/// lockfile (no `userinfo_hash`, raw env values) deserializes into a v4+
 /// `McpLockfile` shape because the missing fields default — but the
 /// `format_version: 3` field is preserved and the check fires here, so
 /// the operator is never silently confused by a half-migrated baseline.
+///
+/// **v4 → v5 migration.** A `format_version: 4` lockfile is the one
+/// exception to the strict-equality gate: its on-disk shape is
+/// identical to v5 (no new fields), only the stored hashes were
+/// computed without folding `tools_declared` in. Rejecting it with
+/// `UnsupportedVersion` would force every existing v4 baseline into an
+/// `mcp lock --force` regeneration through an "incompatible schema"
+/// finding — louder than necessary for a hash-semantics-only bump. The
+/// parser instead **accepts** a v4 lockfile but tags the in-memory
+/// [`McpLockfile`] with [`LockfileSchema::LegacyV4Migration`]. The
+/// recompute-on-parse pass below still recomputes every hash from the
+/// lockfile's data (using the v5 hashing rules) — so the lockfile's
+/// hashes are coherent for v5 internally — but [`compute_drift`] sees
+/// the migration tag and returns a single
+/// [`McpDrift::SchemaUpgradeRequired`] entry pointing the operator at
+/// `tirith mcp lock --force`. After one regeneration, the lockfile is
+/// `format_version: 5` and subsequent runs use the normal drift path.
 ///
 /// **Server ordering.** A parsed lockfile's `servers` list is sorted by
 /// `(name, source_config)` here — the same ordering
@@ -2083,22 +2249,36 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
     // raw env values, missing `value_hash`) does not produce a
     // misleading `Parse` failure when its underlying issue is a
     // schema-version mismatch.
-    if probe.format_version != MCP_LOCK_FORMAT_VERSION {
-        return Err(McpLockLoadError::UnsupportedVersion {
-            found: probe.format_version,
-            supported: MCP_LOCK_FORMAT_VERSION,
-        });
-    }
+    //
+    // `format_version: 4` is the carve-out: its on-disk shape is
+    // identical to v5 (no new fields), so it deserializes cleanly into
+    // an `McpLockfile`. We accept it here and tag the result with
+    // `LockfileSchema::LegacyV4Migration` so `compute_drift` can short-
+    // circuit to a migration prompt rather than fire phantom drift on
+    // every existing server. See the function-level docs for the full
+    // contract.
+    let schema_state = match probe.format_version {
+        v if v == MCP_LOCK_FORMAT_VERSION => LockfileSchema::Current,
+        4 => LockfileSchema::LegacyV4Migration,
+        _ => {
+            return Err(McpLockLoadError::UnsupportedVersion {
+                found: probe.format_version,
+                supported: MCP_LOCK_FORMAT_VERSION,
+            });
+        }
+    };
 
     // Second pass: full deserialize. This time the version is the
-    // current one, so any failure here is a genuine corruption /
-    // schema-mismatch within the current schema (a malformed entry,
-    // a non-string where a string was required, …) — `Parse`.
+    // current one (or v4, whose on-disk shape is identical), so any
+    // failure here is a genuine corruption / schema-mismatch within
+    // the v5 schema (a malformed entry, a non-string where a string
+    // was required, …) — `Parse`.
     let mut lock: McpLockfile =
         serde_json::from_str(content).map_err(|e| McpLockLoadError::Parse {
             line: e.line(),
             column: e.column(),
         })?;
+    lock.schema_state = schema_state;
     // Defensive sort: `compute_drift`'s slow-path merge walk requires
     // `lock.servers` to be sorted by `(name, source_config)`. The
     // lockfile we wrote is always sorted (see `from_inventory`), but a
@@ -2130,11 +2310,11 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
             name: server.name.clone(),
             transport: server.transport.clone(),
             tools: server.tools.clone(),
-            // `tools_declared` is not folded into `content_hash` (see
-            // [`McpServerEntry::tools_declared`]'s docstring), so its
-            // value here doesn't affect the recomputed hash — pick
-            // `true` for parity with `default_tools_declared` so the
-            // temporary entry resembles a freshly-built one.
+            // `tools_declared` IS folded into `content_hash` from v5
+            // onward (see [`McpServerEntry::tools_declared`]'s
+            // docstring), so the deserialized field value
+            // (`default_tools_declared = true` for legacy entries
+            // missing the field) flows through to the recompute.
             tools_declared: server.tools_declared,
             source_config: server.source_config.clone(),
         }
@@ -2946,14 +3126,17 @@ mod tests {
     }
 
     #[test]
-    fn lockfile_format_version_is_4() {
-        // v4 extends the salted-hash redaction to the URL transport's
-        // userinfo (`https://user:token@host/` is stored as `https://host/`
-        // with a `userinfo_hash` of `sha256(server_name || ':' || userinfo)`).
-        // A URL with no userinfo serializes with `userinfo_hash` omitted.
-        assert_eq!(MCP_LOCK_FORMAT_VERSION, 4);
+    fn lockfile_format_version_is_5() {
+        // v5 folds `tools_declared` into the per-server `content_hash`.
+        // Pre-v5 a server flipping `"tools": []` to omitted silently passed
+        // drift detection because both shapes collapsed into the same
+        // canonical empty `tools: Vec<String>`; v5 captures the flip in
+        // the hash. v4 lockfiles are accepted at parse time and tagged
+        // with `LockfileSchema::LegacyV4Migration` so `compute_drift`
+        // surfaces a one-time migration prompt instead of phantom drift.
+        assert_eq!(MCP_LOCK_FORMAT_VERSION, 5);
         let lock = McpLockfile::from_inventory(&McpInventory::default());
-        assert_eq!(lock.format_version, 4);
+        assert_eq!(lock.format_version, 5);
     }
 
     #[test]
@@ -3855,8 +4038,9 @@ mod tests {
         // the field is omitted from JSON, so a drift document produced
         // by the previous version (which had no field) round-trips
         // bit-identically into the new `Added` shape with `tools: []`.
-        // This is also the wire-shape proof that the lockfile schema
-        // (`format_version` = 4) is unaffected by this change.
+        // This is wire-shape proof that the lockfile schema (the
+        // current `MCP_LOCK_FORMAT_VERSION`) is unaffected by the
+        // structural `tools` extension on `McpDrift::Added`.
         let added = McpDrift::Added {
             name: "newcomer".into(),
             source_config: ".mcp.json".into(),
@@ -4877,14 +5061,155 @@ mod tests {
         // 3. Carry no file-content fragments (only the two `u32`s).
         let err = McpLockLoadError::UnsupportedVersion {
             found: 999,
-            supported: 4,
+            supported: MCP_LOCK_FORMAT_VERSION,
         };
         let msg = format!("{err}");
         assert!(msg.contains("999"), "missing `found` version: {msg}");
-        assert!(msg.contains("4"), "missing `supported` version: {msg}");
+        assert!(
+            msg.contains(&MCP_LOCK_FORMAT_VERSION.to_string()),
+            "missing `supported` version: {msg}"
+        );
         assert!(
             msg.contains("tirith mcp lock") || msg.contains("upgrade tirith"),
             "missing operator remediation guidance: {msg}",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // v5 — `tools_declared` is folded into the per-server `content_hash`,
+    // and a `format_version: 4` lockfile is accepted at parse time with a
+    // `LockfileSchema::LegacyV4Migration` tag so `compute_drift` surfaces
+    // a one-time migration prompt instead of phantom drift on every
+    // server.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn content_hash_includes_tools_declared() {
+        // A server with `tools_declared = false` (the source config
+        // omitted the `tools` key) must hash differently from an
+        // otherwise-identical server with `tools_declared = true`
+        // (the source config carried `"tools": []`). Before v5 the two
+        // hashed identically because both canonicalize to the same
+        // empty `tools: Vec<String>` and `tools_declared` was excluded
+        // from the per-server hash; the flip silently passed drift
+        // detection. v5 folds the flag in so the flip registers.
+        let omitted = McpServerEntry {
+            name: "s".into(),
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: vec![],
+            },
+            tools: vec![],
+            tools_declared: false,
+            source_config: ".mcp.json".into(),
+        };
+        let declared_empty = McpServerEntry {
+            tools_declared: true,
+            ..omitted.clone()
+        };
+        assert_ne!(
+            omitted.content_hash(),
+            declared_empty.content_hash(),
+            "v5: tools_declared must contribute to content_hash so an \
+             omitted→declared-empty flip is detected as drift",
+        );
+    }
+
+    #[test]
+    fn parse_lockfile_v4_triggers_migration_message() {
+        // A `format_version: 4` lockfile parses cleanly — its on-disk
+        // shape is identical to v5 — and `compute_drift` returns a
+        // single `SchemaUpgradeRequired` entry pointing the operator at
+        // `tirith mcp lock --force`. No per-server drift entries are
+        // emitted; the v4 stored hashes would all differ from the v5
+        // recomputed hashes even when nothing about the MCP inventory
+        // changed, so phantom drift is short-circuited.
+        let body = r#"{
+            "format_version": 4,
+            "inventory_hash": "abc",
+            "configs": [".mcp.json"],
+            "servers": [
+                {
+                    "name": "s",
+                    "transport": {"kind": "stdio", "command": "node", "args": [], "env": []},
+                    "tools": [],
+                    "source_config": ".mcp.json",
+                    "hash": "deadbeef"
+                }
+            ]
+        }"#;
+        let parsed = parse_lockfile(body).expect("v4 lockfile must parse");
+        assert_eq!(parsed.schema_state, LockfileSchema::LegacyV4Migration);
+        assert_eq!(parsed.format_version, 4);
+
+        // Build a current inventory matching the locked server. Without
+        // the migration short-circuit, compute_drift would either find
+        // no drift (since the data is identical) OR (more realistically)
+        // find drift because v4's hash for the empty-tools-omitted case
+        // differs from v5's. The migration tag forces the short-circuit.
+        let inv = mk_inventory(vec![stdio_server("s", "node")]);
+        let drifts = compute_drift(&inv, &parsed);
+        assert_eq!(drifts.len(), 1, "expected exactly one migration entry");
+        match &drifts[0] {
+            McpDrift::SchemaUpgradeRequired {
+                from_version,
+                to_version,
+            } => {
+                assert_eq!(*from_version, 4);
+                assert_eq!(*to_version, MCP_LOCK_FORMAT_VERSION);
+            }
+            other => panic!("expected SchemaUpgradeRequired, got {other:?}"),
+        }
+        // No phantom Added/Removed/Changed drift entries surface alongside
+        // the migration entry.
+        assert!(
+            !drifts.iter().any(|d| matches!(
+                d,
+                McpDrift::Added { .. } | McpDrift::Removed { .. } | McpDrift::Changed(_)
+            )),
+            "no per-server drift may fire under the legacy-v4 migration short-circuit: {drifts:?}",
+        );
+    }
+
+    #[test]
+    fn parse_lockfile_v5_normal_drift_works() {
+        // Regression check: a v5 lockfile still flows through the
+        // normal drift path. The migration short-circuit only fires on
+        // `LockfileSchema::LegacyV4Migration`.
+        let inv_before = mk_inventory(vec![stdio_server("s", "node")]);
+        let lock = McpLockfile::from_inventory(&inv_before);
+        let body = lock.render();
+        let parsed = parse_lockfile(&body).expect("v5 lockfile must parse");
+        assert_eq!(parsed.schema_state, LockfileSchema::Current);
+        assert_eq!(parsed.format_version, MCP_LOCK_FORMAT_VERSION);
+
+        // No-op drift first: the same inventory must produce empty drift
+        // (proving the fast-path inventory_hash short-circuit is reached).
+        let drifts_same = compute_drift(&inv_before, &parsed);
+        assert!(
+            drifts_same.is_empty(),
+            "unchanged v5 inventory must produce no drift: {drifts_same:?}",
+        );
+
+        // Now mutate the inventory and verify real drift fires.
+        let inv_after = mk_inventory(vec![stdio_server("s", "node"), stdio_server("t", "node")]);
+        let drifts_changed = compute_drift(&inv_after, &parsed);
+        assert!(
+            !drifts_changed.is_empty(),
+            "mutated v5 inventory must produce drift",
+        );
+        assert!(
+            drifts_changed
+                .iter()
+                .any(|d| matches!(d, McpDrift::Added { name, .. } if name == "t")),
+            "expected an Added drift for server t: {drifts_changed:?}",
+        );
+        assert!(
+            !drifts_changed
+                .iter()
+                .any(|d| matches!(d, McpDrift::SchemaUpgradeRequired { .. })),
+            "v5 drift must NOT contain SchemaUpgradeRequired: {drifts_changed:?}",
         );
     }
 

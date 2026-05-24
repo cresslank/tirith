@@ -150,8 +150,8 @@ fn print_json(
         /// oversized, unreadable, …) behind an "empty lockfile" result;
         /// surfacing this list makes the skip visible.
         ///
-        /// Additive on the result envelope only — the lockfile's own
-        /// `format_version` is unchanged (still 4).
+        /// Additive on the result envelope only — its presence does not
+        /// require a lockfile schema bump.
         rejected_configs: &'a [mcp_lock::RejectedConfig],
         servers_locked: usize,
         /// The lockfile document that was written.
@@ -708,7 +708,12 @@ fn print_diff_human(lock_path: &Path, drifts: &[McpDrift]) {
 // shared drift presentation helpers (used by verify and diff)
 // ===========================================================================
 
-/// Count drifts by kind: `(added, removed, changed)`.
+/// Count drifts by kind: `(added, removed, changed)`. A
+/// [`McpDrift::SchemaUpgradeRequired`] entry does not contribute to any of
+/// the three buckets — it's a migration prompt, not a per-server drift —
+/// so the call sites that pair these counts with the `drift_count` from
+/// `drifts.len()` correctly show "N drift entries, of which 0 added /
+/// removed / changed" when the only entry is a migration prompt.
 fn drift_kind_counts(drifts: &[McpDrift]) -> (usize, usize, usize) {
     let mut added = 0usize;
     let mut removed = 0usize;
@@ -718,6 +723,7 @@ fn drift_kind_counts(drifts: &[McpDrift]) -> (usize, usize, usize) {
             McpDrift::Added { .. } => added += 1,
             McpDrift::Removed { .. } => removed += 1,
             McpDrift::Changed(_) => changed += 1,
+            McpDrift::SchemaUpgradeRequired { .. } => {}
         }
     }
     (added, removed, changed)
@@ -752,6 +758,16 @@ fn print_drift_body(drifts: &[McpDrift]) {
                     entry.source_config
                 );
                 describe_changed_entry(entry);
+            }
+            McpDrift::SchemaUpgradeRequired {
+                from_version,
+                to_version,
+            } => {
+                eprintln!(
+                    "  ! schema upgrade required: lockfile written with format_version={from_version}, \
+                     this tirith writes format_version={to_version}. Run `tirith mcp lock --force` to \
+                     regenerate; drift comparison is skipped for this run."
+                );
             }
         }
     }
