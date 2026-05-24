@@ -72,6 +72,11 @@ pub const MAX_WALK_ENTRIES: usize = 50_000;
 /// summary records the truncation.
 pub const MAX_DEPENDENCIES: usize = 5_000;
 
+/// Default cap on installed-tree entries (one entry = one installed package
+/// directory). Configurable via `--max-installed-entries` on the CLI; the
+/// engine accepts `0` to mean "unbounded" (caller has acknowledged the cost).
+pub const DEFAULT_MAX_INSTALLED_ENTRIES: usize = 5_000;
+
 /// Directory names never descended into — build output and vendored trees
 /// hold installed *content*, not a project's declared manifests, and would
 /// otherwise dominate the walk.
@@ -145,7 +150,7 @@ impl ManifestKind {
     ///
     /// `requirements.txt` matching is loosened to any `requirements*.txt`
     /// (e.g. `requirements-dev.txt`) since split requirement files are common.
-    fn from_file_name(name: &str) -> Option<ManifestKind> {
+    pub fn from_file_name(name: &str) -> Option<ManifestKind> {
         match name {
             "package.json" => Some(ManifestKind::NpmPackageJson),
             "package-lock.json" => Some(ManifestKind::NpmPackageLock),
@@ -1344,6 +1349,12 @@ pub struct ScanNote {
 pub struct EcosystemScanReport {
     /// The scan root (directory or file) the scan was given.
     pub scan_root: String,
+    /// Which mode the scan ran in — `"manifests"`, `"installed"`, or
+    /// `"specific_lockfile"`. Surfaced as a top-level JSON field so a piped
+    /// consumer can tell which surface produced the report; the two CLI
+    /// surfaces (`ecosystem scan --installed` and `package scan --installed`)
+    /// emit byte-identical output for the same cwd.
+    pub mode: &'static str,
     /// The manifest files discovered and parsed.
     pub manifests: Vec<String>,
     /// Total declared dependencies discovered across all manifests.
@@ -1376,6 +1387,44 @@ pub enum OnlineMode<'a> {
     Resolver(&'a dyn Fn(Ecosystem, &str) -> ApiSignals),
 }
 
+/// What an `ecosystem_scan` operates on.
+///
+/// The engine has one entry point ([`scan`]); the mode picks which set of
+/// inputs feeds the per-package scoring loop. Two CLI surfaces (`tirith
+/// ecosystem scan --installed` and `tirith package scan`) call into the same
+/// `scan` function and only differ in which mode they pass — that is why a
+/// future reimplementation of `package scan` would diverge from
+/// `ecosystem scan --installed` and the byte-identical-JSON test catches it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ScanMode {
+    /// Walk the project root and discover dependency *manifests*
+    /// (`package.json`, `Cargo.toml`, `requirements*.txt`, ...). This is the
+    /// shipping behavior — manifests declare what a project intends to install.
+    #[default]
+    Manifests,
+    /// Walk *installed* trees instead — `node_modules/<pkg>/package.json`,
+    /// `site-packages/<dist-info>/METADATA`, `vendor/<pkg>/` for Go modules,
+    /// and the workspace `Cargo.lock` for Rust. This reports what is *actually*
+    /// on disk, which can drift from the manifest's intent.
+    Installed,
+    /// Use the given file as a lockfile and parse it directly with the
+    /// existing manifest parser. The path is the same value `ecosystem scan
+    /// <path>` already accepts; the variant exists so `tirith package scan
+    /// --lockfile <path>` matches the spec wording.
+    SpecificLockfile(PathBuf),
+}
+
+impl ScanMode {
+    /// The short, stable label for `--format json`'s top-level `mode` field.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScanMode::Manifests => "manifests",
+            ScanMode::Installed => "installed",
+            ScanMode::SpecificLockfile(_) => "specific_lockfile",
+        }
+    }
+}
+
 /// Inputs to [`scan`] — kept in a struct so the signature stays stable as
 /// options are added.
 pub struct ScanRequest<'a> {
@@ -1389,6 +1438,14 @@ pub struct ScanRequest<'a> {
     /// A predicate that returns `true` when a `(ecosystem, name)` pair is
     /// allowlisted by policy and its findings must be suppressed.
     pub is_allowlisted: &'a dyn Fn(Ecosystem, &str) -> bool,
+    /// Which kind of input the scan operates on. Defaults to [`ScanMode::Manifests`]
+    /// for backward compatibility — every shipping `ecosystem scan` call site
+    /// can omit it via `..Default::default()`.
+    pub mode: ScanMode,
+    /// Cap on the number of installed-package entries examined in
+    /// [`ScanMode::Installed`]. `0` means unbounded (the CLI surfaces this
+    /// behind a confirmation prompt). Ignored for the other modes.
+    pub installed_max_entries: usize,
 }
 
 /// Run an `ecosystem scan` over `request.root` and return the full report.
@@ -1398,7 +1455,6 @@ pub struct ScanRequest<'a> {
 /// folds in the [`slopsquat`] heuristic, and assembles a [`Verdict`]. It never
 /// panics; a malformed manifest is skipped with a note, not an error.
 pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
-    let manifests = discover_manifests(request.root);
     let mut notes: Vec<ScanNote> = Vec::new();
 
     if request.db.is_none() {
@@ -1411,60 +1467,28 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
         });
     }
 
-    if manifests.is_empty() {
-        notes.push(ScanNote {
-            manifest: None,
-            note: "no dependency manifests found (looked for package.json, \
-                   package-lock.json, requirements*.txt, pyproject.toml, Cargo.toml, \
-                   go.mod, Gemfile)."
-                .to_string(),
-        });
-    }
-
-    // Parse every manifest into its declared dependencies.
     let root_display = request.root.display().to_string();
-    let mut declared: Vec<(DeclaredDependency, String)> = Vec::new();
-    let mut manifest_labels: Vec<String> = Vec::new();
-    for manifest in &manifests {
-        let rel = relative_label(request.root, &manifest.path);
-        manifest_labels.push(rel.clone());
-        let text = match std::fs::read_to_string(&manifest.path) {
-            Ok(t) => t,
-            Err(e) => {
-                notes.push(ScanNote {
-                    manifest: Some(rel.clone()),
-                    note: format!("could not read manifest: {e}"),
-                });
-                continue;
-            }
-        };
-        // A `None` means the manifest is malformed (un-parseable JSON / TOML);
-        // a `Some(empty)` means it parsed but declares nothing. The two get
-        // distinct notes so the report is honest about which it was.
-        match parse_manifest(manifest.kind, &text) {
-            None => {
-                notes.push(ScanNote {
-                    manifest: Some(rel.clone()),
-                    note: format!(
-                        "the {} manifest could not be parsed (malformed JSON / TOML) — \
-                         its dependencies were not assessed.",
-                        manifest.kind.label()
-                    ),
-                });
-            }
-            Some(deps) => {
-                if deps.is_empty() {
-                    notes.push(ScanNote {
-                        manifest: Some(rel.clone()),
-                        note: "the manifest parsed but declares no dependencies.".to_string(),
-                    });
-                }
-                for dep in deps {
-                    declared.push((dep, rel.clone()));
-                }
-            }
-        }
-    }
+
+    // Dispatch on mode. Each branch returns (manifest_labels, declared_deps).
+    // The downstream scoring + verdict assembly is mode-independent — that is
+    // the load-bearing invariant the byte-identical-JSON test pins.
+    let (mut manifest_labels, mut declared) = match &request.mode {
+        ScanMode::Manifests => collect_from_manifests(request, &mut notes),
+        ScanMode::Installed => collect_from_installed_tree(request, &mut notes),
+        ScanMode::SpecificLockfile(path) => collect_from_specific_lockfile(path, &mut notes),
+    };
+
+    // Stable order: the assembled labels and declared list must match across
+    // runs and across CLI surfaces. The walkers already sort their inputs, but
+    // sorting again at the dispatch boundary is cheap and removes any reliance
+    // on per-walker ordering.
+    manifest_labels.sort();
+    manifest_labels.dedup();
+    declared.sort_by(|(a, am), (b, bm)| {
+        am.cmp(bm)
+            .then_with(|| a.ecosystem.to_string().cmp(&b.ecosystem.to_string()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
     let dependency_count = declared.len();
     let truncated = declared.len() > MAX_DEPENDENCIES;
@@ -1546,7 +1570,606 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
         online,
         notes,
         verdict,
+        mode: request.mode.as_str(),
     }
+}
+
+// ===========================================================================
+// per-mode collectors — all three return (manifest_labels, declared_deps)
+// in the same shape so the downstream scoring loop is mode-independent.
+// ===========================================================================
+
+/// Walk `request.root` for dependency manifests and parse each one. This is
+/// the shipping `ecosystem scan` behavior, extracted unchanged so the
+/// mode-dispatch in [`scan`] stays mechanical.
+fn collect_from_manifests(
+    request: &ScanRequest,
+    notes: &mut Vec<ScanNote>,
+) -> (Vec<String>, Vec<(DeclaredDependency, String)>) {
+    let manifests = discover_manifests(request.root);
+    if manifests.is_empty() {
+        notes.push(ScanNote {
+            manifest: None,
+            note: "no dependency manifests found (looked for package.json, \
+                   package-lock.json, requirements*.txt, pyproject.toml, Cargo.toml, \
+                   go.mod, Gemfile)."
+                .to_string(),
+        });
+    }
+
+    let mut declared: Vec<(DeclaredDependency, String)> = Vec::new();
+    let mut manifest_labels: Vec<String> = Vec::new();
+    for manifest in &manifests {
+        let rel = relative_label(request.root, &manifest.path);
+        manifest_labels.push(rel.clone());
+        parse_one_manifest(manifest, &rel, &mut declared, notes);
+    }
+    (manifest_labels, declared)
+}
+
+/// Read a single lockfile by path (the `--lockfile <path>` form of
+/// `package scan`). The path is parsed with the existing manifest parser; an
+/// unrecognized file produces a clear note rather than an empty scan.
+fn collect_from_specific_lockfile(
+    path: &Path,
+    notes: &mut Vec<ScanNote>,
+) -> (Vec<String>, Vec<(DeclaredDependency, String)>) {
+    if !path.exists() {
+        notes.push(ScanNote {
+            manifest: None,
+            note: format!("lockfile not found: {}", path.display()),
+        });
+        return (Vec::new(), Vec::new());
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        notes.push(ScanNote {
+            manifest: None,
+            note: format!("lockfile has no readable file name: {}", path.display()),
+        });
+        return (Vec::new(), Vec::new());
+    };
+    let Some(kind) = ManifestKind::from_file_name(name) else {
+        notes.push(ScanNote {
+            manifest: None,
+            note: format!(
+                "lockfile '{}' is not a recognized manifest format (expected one of \
+                 package.json, package-lock.json, requirements*.txt, pyproject.toml, \
+                 Cargo.toml, go.mod, Gemfile).",
+                path.display()
+            ),
+        });
+        return (Vec::new(), Vec::new());
+    };
+    let discovered = DiscoveredManifest {
+        path: path.to_path_buf(),
+        kind,
+    };
+    let label = path.display().to_string();
+    let mut declared: Vec<(DeclaredDependency, String)> = Vec::new();
+    parse_one_manifest(&discovered, &label, &mut declared, notes);
+    (vec![label], declared)
+}
+
+/// Walk installed-tree directories under `request.root` and synthesize
+/// per-package declarations. Looks for:
+///
+///   * `node_modules/<scope?>/<pkg>/package.json` (npm)
+///   * `site-packages/<dist>-<ver>.dist-info/METADATA` (PyPI)
+///   * `vendor/<host>/<owner>/<mod>/` (Go modules)
+///   * the workspace `Cargo.lock` at the root (Rust)
+///
+/// The walk respects `request.installed_max_entries`. When the cap fires, a
+/// note records the truncation so the caller can re-run with a larger cap.
+fn collect_from_installed_tree(
+    request: &ScanRequest,
+    notes: &mut Vec<ScanNote>,
+) -> (Vec<String>, Vec<(DeclaredDependency, String)>) {
+    let mut declared: Vec<(DeclaredDependency, String)> = Vec::new();
+    let mut manifest_labels: Vec<String> = Vec::new();
+    let cap = if request.installed_max_entries == 0 {
+        usize::MAX
+    } else {
+        request.installed_max_entries
+    };
+    let mut truncated_at: Option<usize> = None;
+
+    // Helper for label-stable manifest path display (root-relative when under
+    // root, else absolute). Mirrors `relative_label`.
+    let label_for = |p: &Path| -> String { relative_label(request.root, p) };
+
+    // --- npm: node_modules/<scope?>/<pkg>/package.json ---------------------
+    let node_modules = request.root.join("node_modules");
+    if node_modules.is_dir() {
+        walk_node_modules(
+            &node_modules,
+            cap,
+            &mut declared,
+            &mut manifest_labels,
+            &mut truncated_at,
+            &label_for,
+        );
+    }
+
+    // --- PyPI: site-packages/<dist>-<ver>.dist-info/METADATA --------------
+    // Prefer an in-tree site-packages; the CLI honors `VIRTUAL_ENV` separately
+    // and passes that directory as the scan root when set.
+    for sp in find_site_packages_dirs(request.root) {
+        if truncated_at.is_some() {
+            break;
+        }
+        walk_site_packages(
+            &sp,
+            cap,
+            &mut declared,
+            &mut manifest_labels,
+            &mut truncated_at,
+            &label_for,
+        );
+    }
+
+    // --- Go: vendor/<host>/<owner>/<mod>/ ----------------------------------
+    if truncated_at.is_none() {
+        let vendor = request.root.join("vendor");
+        if vendor.is_dir() {
+            walk_vendor_go(
+                &vendor,
+                cap,
+                &mut declared,
+                &mut manifest_labels,
+                &mut truncated_at,
+                &label_for,
+            );
+        }
+    }
+
+    // --- Rust: Cargo.lock at the workspace root ----------------------------
+    if truncated_at.is_none() {
+        let lock = request.root.join("Cargo.lock");
+        if lock.is_file() {
+            if let Ok(text) = std::fs::read_to_string(&lock) {
+                let label = label_for(&lock);
+                manifest_labels.push(label.clone());
+                for dep in parse_cargo_lock(&text) {
+                    if declared.len() >= cap {
+                        truncated_at = Some(cap);
+                        break;
+                    }
+                    declared.push((dep, label.clone()));
+                }
+            }
+        }
+    }
+
+    if let Some(at) = truncated_at {
+        notes.push(ScanNote {
+            manifest: None,
+            note: format!(
+                "results truncated at {at} installed entries; pass \
+                 `--max-installed-entries 0` to disable the cap (slow)."
+            ),
+        });
+    }
+
+    if declared.is_empty() && manifest_labels.is_empty() {
+        notes.push(ScanNote {
+            manifest: None,
+            note: "no installed-tree packages found under the scan root (looked for \
+                   node_modules/, site-packages/, vendor/ for Go modules, and Cargo.lock)."
+                .to_string(),
+        });
+    }
+
+    (manifest_labels, declared)
+}
+
+/// Parse one [`DiscoveredManifest`] into declared dependencies and push them
+/// onto `out`. Records a note on any read or parse failure so a partly-broken
+/// project still reports the manifests it could read.
+fn parse_one_manifest(
+    manifest: &DiscoveredManifest,
+    rel: &str,
+    out: &mut Vec<(DeclaredDependency, String)>,
+    notes: &mut Vec<ScanNote>,
+) {
+    let text = match std::fs::read_to_string(&manifest.path) {
+        Ok(t) => t,
+        Err(e) => {
+            notes.push(ScanNote {
+                manifest: Some(rel.to_string()),
+                note: format!("could not read manifest: {e}"),
+            });
+            return;
+        }
+    };
+    match parse_manifest(manifest.kind, &text) {
+        None => {
+            notes.push(ScanNote {
+                manifest: Some(rel.to_string()),
+                note: format!(
+                    "the {} manifest could not be parsed (malformed JSON / TOML) — \
+                     its dependencies were not assessed.",
+                    manifest.kind.label()
+                ),
+            });
+        }
+        Some(deps) => {
+            if deps.is_empty() {
+                notes.push(ScanNote {
+                    manifest: Some(rel.to_string()),
+                    note: "the manifest parsed but declares no dependencies.".to_string(),
+                });
+            }
+            for dep in deps {
+                out.push((dep, rel.to_string()));
+            }
+        }
+    }
+}
+
+/// Walk `node_modules/` for installed npm packages. Handles both bare
+/// `node_modules/<pkg>/package.json` and scoped `node_modules/@scope/<pkg>/package.json`.
+fn walk_node_modules(
+    root: &Path,
+    cap: usize,
+    declared: &mut Vec<(DeclaredDependency, String)>,
+    manifest_labels: &mut Vec<String>,
+    truncated_at: &mut Option<usize>,
+    label_for: &dyn Fn(&Path) -> String,
+) {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(root)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort();
+    for entry in entries {
+        if truncated_at.is_some() {
+            return;
+        }
+        let dir_name = match entry.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if dir_name == ".bin" || dir_name == ".cache" {
+            continue;
+        }
+        if dir_name.starts_with('@') {
+            // Scoped: recurse one level.
+            let mut sub: Vec<PathBuf> = std::fs::read_dir(&entry)
+                .map(|rd| {
+                    rd.filter_map(Result::ok)
+                        .map(|e| e.path())
+                        .filter(|p| p.is_dir())
+                        .collect()
+                })
+                .unwrap_or_default();
+            sub.sort();
+            for s in sub {
+                if truncated_at.is_some() {
+                    return;
+                }
+                read_node_package(&s, cap, declared, manifest_labels, truncated_at, label_for);
+            }
+        } else {
+            read_node_package(
+                &entry,
+                cap,
+                declared,
+                manifest_labels,
+                truncated_at,
+                label_for,
+            );
+        }
+    }
+}
+
+/// Read one installed npm package's `package.json` and emit a single
+/// [`DeclaredDependency`] for that package (NOT its sub-dependencies — the
+/// installed-tree mode is about what is on disk, and each installed package
+/// is itself one entry).
+fn read_node_package(
+    pkg_dir: &Path,
+    cap: usize,
+    declared: &mut Vec<(DeclaredDependency, String)>,
+    manifest_labels: &mut Vec<String>,
+    truncated_at: &mut Option<usize>,
+    label_for: &dyn Fn(&Path) -> String,
+) {
+    if declared.len() >= cap {
+        *truncated_at = Some(cap);
+        return;
+    }
+    let manifest = pkg_dir.join("package.json");
+    if !manifest.is_file() {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        return;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let name = json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && is_plausible_package_name(s));
+    let Some(name) = name else { return };
+    let version = json
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
+    let label = label_for(&manifest);
+    manifest_labels.push(label.clone());
+    declared.push((
+        DeclaredDependency {
+            name: name.to_string(),
+            ecosystem: Ecosystem::Npm,
+            version,
+            dev: false,
+        },
+        label,
+    ));
+}
+
+/// Find `site-packages` directories under `root`. Returns at most a handful —
+/// venv layouts always have one or two — so we don't bound the walk further.
+fn find_site_packages_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    // Common layouts: <root>/lib/python*/site-packages, <root>/Lib/site-packages
+    // (Windows venv), and <root>/site-packages directly. We don't recurse into
+    // arbitrary subdirs — venv layouts are well-defined.
+    let candidates: Vec<PathBuf> = vec![
+        root.join("site-packages"),
+        root.join("Lib").join("site-packages"),
+    ];
+    for c in candidates {
+        if c.is_dir() {
+            found.push(c);
+        }
+    }
+    // <root>/lib/python*/site-packages
+    let lib = root.join("lib");
+    if lib.is_dir() {
+        if let Ok(rd) = std::fs::read_dir(&lib) {
+            let mut subs: Vec<PathBuf> = rd
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_dir()
+                        && p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with("python"))
+                })
+                .collect();
+            subs.sort();
+            for s in subs {
+                let sp = s.join("site-packages");
+                if sp.is_dir() {
+                    found.push(sp);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Walk a `site-packages` directory for `*.dist-info/METADATA` entries.
+fn walk_site_packages(
+    root: &Path,
+    cap: usize,
+    declared: &mut Vec<(DeclaredDependency, String)>,
+    manifest_labels: &mut Vec<String>,
+    truncated_at: &mut Option<usize>,
+    label_for: &dyn Fn(&Path) -> String,
+) {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(root)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_dir()
+                        && p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.ends_with(".dist-info"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort();
+    for dist_info in entries {
+        if truncated_at.is_some() {
+            return;
+        }
+        if declared.len() >= cap {
+            *truncated_at = Some(cap);
+            return;
+        }
+        let metadata = dist_info.join("METADATA");
+        if !metadata.is_file() {
+            continue;
+        }
+        let Some((name, version)) = read_dist_info_metadata(&metadata) else {
+            continue;
+        };
+        let label = label_for(&metadata);
+        manifest_labels.push(label.clone());
+        declared.push((
+            DeclaredDependency {
+                name,
+                ecosystem: Ecosystem::PyPI,
+                version,
+                dev: false,
+            },
+            label,
+        ));
+    }
+}
+
+/// Parse a PEP 566 METADATA file enough to extract the `Name:` and `Version:`
+/// header values. Header order is undefined; both are independent.
+fn read_dist_info_metadata(path: &Path) -> Option<(String, Option<String>)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut name: Option<String> = None;
+    let mut version: Option<String> = None;
+    // METADATA headers stop at the first blank line — body is the package
+    // description we don't need.
+    for line in text.lines() {
+        if line.is_empty() {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("Name:") {
+            let val = rest.trim();
+            if !val.is_empty() && is_plausible_package_name(val) {
+                name = Some(val.to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix("Version:") {
+            let val = rest.trim();
+            if !val.is_empty() {
+                version = Some(val.to_string());
+            }
+        }
+    }
+    name.map(|n| (n, version))
+}
+
+/// Walk `vendor/` for vendored Go modules — directories whose `.go` file count
+/// suggests an actual module, with names shaped like `host/owner/repo` paths.
+fn walk_vendor_go(
+    root: &Path,
+    cap: usize,
+    declared: &mut Vec<(DeclaredDependency, String)>,
+    manifest_labels: &mut Vec<String>,
+    truncated_at: &mut Option<usize>,
+    label_for: &dyn Fn(&Path) -> String,
+) {
+    // Go vendoring: each leaf module directory is `vendor/<host>/<owner>/<mod>`
+    // (e.g. `vendor/github.com/spf13/cobra`). We treat any dir three deep from
+    // `vendor/` as a candidate module (the typical depth); the `modules.txt`
+    // sibling is the authoritative list when present, and we prefer it.
+    let modules_txt = root.join("modules.txt");
+    if modules_txt.is_file() {
+        let text = std::fs::read_to_string(&modules_txt).unwrap_or_default();
+        let label = label_for(&modules_txt);
+        manifest_labels.push(label.clone());
+        for line in text.lines() {
+            let trimmed = line.trim();
+            // `# host/owner/mod v1.2.3` is a module header line; skip comments
+            // and explicit lines without a `#` prefix.
+            let Some(rest) = trimmed.strip_prefix("# ") else {
+                continue;
+            };
+            let mut parts = rest.split_whitespace();
+            let Some(module) = parts.next() else { continue };
+            if module.is_empty() || !is_plausible_package_name(module) {
+                continue;
+            }
+            let version = parts.next().map(str::to_string);
+            if declared.len() >= cap {
+                *truncated_at = Some(cap);
+                return;
+            }
+            declared.push((
+                DeclaredDependency {
+                    name: module.to_string(),
+                    ecosystem: Ecosystem::Go,
+                    version,
+                    dev: false,
+                },
+                label.clone(),
+            ));
+        }
+        return;
+    }
+    // Fallback: walk depth-3 directories under `vendor/`.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for host in read_sorted_dirs(root) {
+        if truncated_at.is_some() {
+            return;
+        }
+        for owner in read_sorted_dirs(&host) {
+            if truncated_at.is_some() {
+                return;
+            }
+            for mod_dir in read_sorted_dirs(&owner) {
+                if declared.len() >= cap {
+                    *truncated_at = Some(cap);
+                    return;
+                }
+                let rel = match mod_dir.strip_prefix(root) {
+                    Ok(p) => p.display().to_string(),
+                    Err(_) => continue,
+                };
+                if !seen.insert(rel.clone()) {
+                    continue;
+                }
+                let label = label_for(&mod_dir);
+                manifest_labels.push(label.clone());
+                declared.push((
+                    DeclaredDependency {
+                        name: rel,
+                        ecosystem: Ecosystem::Go,
+                        version: None,
+                        dev: false,
+                    },
+                    label,
+                ));
+            }
+        }
+    }
+}
+
+/// Sorted list of immediate subdirectories of `p`.
+fn read_sorted_dirs(p: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(p)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|x| x.is_dir())
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// Parse a `Cargo.lock` file into one [`DeclaredDependency`] per
+/// resolved `[[package]]` entry. The lockfile format is stable TOML.
+fn parse_cargo_lock(text: &str) -> Vec<DeclaredDependency> {
+    let Ok(doc) = toml::from_str::<toml::Value>(text) else {
+        return Vec::new();
+    };
+    let mut out: Vec<DeclaredDependency> = Vec::new();
+    let mut seen: BTreeSet<(String, Option<String>)> = BTreeSet::new();
+    let Some(packages) = doc.get("package").and_then(|p| p.as_array()) else {
+        return out;
+    };
+    for pkg in packages {
+        let Some(name) = pkg.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !is_plausible_package_name(name) {
+            continue;
+        }
+        let version = pkg
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty());
+        if seen.insert((name.to_string(), version.clone())) {
+            out.push(DeclaredDependency {
+                name: name.to_string(),
+                ecosystem: Ecosystem::Crates,
+                version,
+                dev: false,
+            });
+        }
+    }
+    out
 }
 
 /// Score one declared dependency into a [`DependencyAssessment`].
@@ -2350,6 +2973,8 @@ gem 'toplevelgem'
             db: None,
             online: OnlineMode::Off,
             is_allowlisted: &never_allowlisted,
+            mode: ScanMode::Manifests,
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
         };
         let report = scan(&request);
         assert_eq!(report.manifests.len(), 2, "both manifests discovered");
@@ -2400,6 +3025,8 @@ gem 'toplevelgem'
             db: None,
             online: OnlineMode::Off,
             is_allowlisted: &never_allowlisted,
+            mode: ScanMode::Manifests,
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
         };
         let report = scan(&request);
         assert_eq!(report.dependency_count, 0);
@@ -2427,6 +3054,8 @@ gem 'toplevelgem'
             db: None,
             online: OnlineMode::Off,
             is_allowlisted: &allow_all,
+            mode: ScanMode::Manifests,
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
         };
         let report = scan(&request);
         assert_eq!(report.allowlisted_count(), 1);
@@ -2463,6 +3092,8 @@ gem 'toplevelgem'
             db: None,
             online: OnlineMode::Resolver(&resolver),
             is_allowlisted: &never_allowlisted,
+            mode: ScanMode::Manifests,
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
         };
         let report = scan(&request);
         assert!(report.online);
@@ -2471,6 +3102,307 @@ gem 'toplevelgem'
             *calls.borrow(),
             1,
             "the resolver must be memoized per distinct package"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M6 ch2 — installed-tree mode fixtures
+    //
+    // Four fixtures requested by the chunk plan: positive node_modules with a
+    // slopsquat-shaped name (the strongest signal we can fire without an
+    // on-disk signed threat DB), allow-clean node_modules, positive lockfile,
+    // and allow-clean lockfile. They live here next to the engine they pin —
+    // `tests/fixtures/ecosystem.toml` is the *command-line* fixture format
+    // (`tirith check ...`) and would not match the file-tree shape these
+    // need. Installed-mode + signed-threat-DB block fixtures are exercised by
+    // the integration tests in `crates/tirith/tests/cli_integration.rs`,
+    // which load the test fixture DB via env var.
+    // -----------------------------------------------------------------------
+
+    fn never_allow(_eco: Ecosystem, _name: &str) -> bool {
+        false
+    }
+
+    #[test]
+    fn installed_mode_positive_node_modules_surfaces_assessment() {
+        // A node_modules/<pkg>/package.json — without a threat DB the
+        // assessment cannot fire a name-based finding, but the engine must
+        // surface the package as a `DeclaredDependency` with the right
+        // ecosystem and version, and the mode field must read `"installed"`.
+        // The matching "malicious-name BLOCK" assertion lives in the
+        // integration test that loads the signed threat-DB fixture (see
+        // `crates/tirith/tests/cli_integration.rs::ecosystem_scan_installed_*`).
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("node_modules").join("evil-package");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"evil-package","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let request = ScanRequest {
+            root: dir.path(),
+            db: None,
+            online: OnlineMode::Off,
+            is_allowlisted: &never_allow,
+            mode: ScanMode::Installed,
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+        };
+        let report = scan(&request);
+        assert_eq!(report.mode, "installed");
+        assert_eq!(report.dependency_count, 1);
+        assert_eq!(report.assessments[0].dependency.name, "evil-package");
+        assert_eq!(
+            report.assessments[0].dependency.version,
+            Some("1.0.0".to_string())
+        );
+        assert_eq!(report.assessments[0].dependency.ecosystem, Ecosystem::Npm);
+    }
+
+    #[test]
+    fn installed_mode_clean_node_modules_allows() {
+        // Three benign packages in node_modules — none known-malicious, none
+        // slopsquat-shaped → verdict ALLOW. The wider integration suite uses
+        // the signed test threat DB to verify the BLOCK side of this case.
+        let dir = tempfile::tempdir().unwrap();
+        for (pkg, version) in [
+            ("react", "18.2.0"),
+            ("left-pad", "1.3.0"),
+            ("lodash", "4.17.21"),
+        ] {
+            let p = dir.path().join("node_modules").join(pkg);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(
+                p.join("package.json"),
+                format!(r#"{{"name":"{pkg}","version":"{version}"}}"#),
+            )
+            .unwrap();
+        }
+
+        let request = ScanRequest {
+            root: dir.path(),
+            db: None,
+            online: OnlineMode::Off,
+            is_allowlisted: &never_allow,
+            mode: ScanMode::Installed,
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+        };
+        let report = scan(&request);
+        assert_eq!(report.mode, "installed");
+        assert_eq!(report.dependency_count, 3);
+        assert_eq!(
+            report.verdict.action,
+            Action::Allow,
+            "three benign packages must ALLOW; findings: {:?}",
+            report.verdict.findings,
+        );
+    }
+
+    #[test]
+    fn specific_lockfile_with_named_dep_surfaces_assessment() {
+        // A package-lock.json that pins a package by name is parsed via
+        // SpecificLockfile mode and surfaces one DeclaredDependency per
+        // resolved package. mode field reads "specific_lockfile".
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile = dir.path().join("package-lock.json");
+        std::fs::write(
+            &lockfile,
+            r#"{
+              "name": "demo",
+              "lockfileVersion": 3,
+              "packages": {
+                "": {"name":"demo","version":"1.0.0"},
+                "node_modules/evil-package": {"version":"1.0.0"}
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let request = ScanRequest {
+            root: &lockfile,
+            db: None,
+            online: OnlineMode::Off,
+            is_allowlisted: &never_allow,
+            mode: ScanMode::SpecificLockfile(lockfile.clone()),
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+        };
+        let report = scan(&request);
+        assert_eq!(report.mode, "specific_lockfile");
+        assert_eq!(report.dependency_count, 1);
+        assert_eq!(report.assessments[0].dependency.name, "evil-package");
+    }
+
+    #[test]
+    fn specific_lockfile_clean_allows() {
+        // Same shape as above but with clean dependencies → ALLOW.
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile = dir.path().join("package-lock.json");
+        std::fs::write(
+            &lockfile,
+            r#"{
+              "name": "demo",
+              "lockfileVersion": 3,
+              "packages": {
+                "": {"name":"demo","version":"1.0.0"},
+                "node_modules/react": {"version":"18.2.0"},
+                "node_modules/lodash": {"version":"4.17.21"}
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let request = ScanRequest {
+            root: &lockfile,
+            db: None,
+            online: OnlineMode::Off,
+            is_allowlisted: &never_allow,
+            mode: ScanMode::SpecificLockfile(lockfile.clone()),
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+        };
+        let report = scan(&request);
+        assert_eq!(report.mode, "specific_lockfile");
+        assert_eq!(report.dependency_count, 2);
+        assert_eq!(
+            report.verdict.action,
+            Action::Allow,
+            "two clean deps in a lockfile must ALLOW: {:?}",
+            report.verdict.findings,
+        );
+    }
+
+    #[test]
+    fn installed_mode_respects_max_entries_cap() {
+        // Five packages under node_modules, cap at 2 → only 2 scored, and a
+        // truncation note recorded.
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a-pkg", "b-pkg", "c-pkg", "d-pkg", "e-pkg"] {
+            let p = dir.path().join("node_modules").join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(
+                p.join("package.json"),
+                format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+            )
+            .unwrap();
+        }
+
+        let request = ScanRequest {
+            root: dir.path(),
+            db: None,
+            online: OnlineMode::Off,
+            is_allowlisted: &never_allow,
+            mode: ScanMode::Installed,
+            // The MIN_INSTALLED_ENTRIES check lives at the CLI; the engine
+            // accepts any non-zero cap.
+            installed_max_entries: 2,
+        };
+        let report = scan(&request);
+        assert_eq!(
+            report.dependency_count, 2,
+            "the cap must stop the walk early"
+        );
+        assert!(
+            report.notes.iter().any(|n| n.note.contains("truncated")),
+            "a truncation note must be recorded: {:?}",
+            report.notes
+        );
+    }
+
+    #[test]
+    fn installed_mode_reads_dist_info_metadata() {
+        // A synthetic site-packages with one `.dist-info/METADATA` entry must
+        // be discovered as a PyPI dependency.
+        let dir = tempfile::tempdir().unwrap();
+        let dist = dir
+            .path()
+            .join("site-packages")
+            .join("flask-3.0.0.dist-info");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(
+            dist.join("METADATA"),
+            "Metadata-Version: 2.1\nName: flask\nVersion: 3.0.0\n\nA tiny WSGI framework.\n",
+        )
+        .unwrap();
+
+        let request = ScanRequest {
+            root: dir.path(),
+            db: None,
+            online: OnlineMode::Off,
+            is_allowlisted: &never_allow,
+            mode: ScanMode::Installed,
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+        };
+        let report = scan(&request);
+        assert_eq!(report.dependency_count, 1);
+        assert_eq!(report.assessments[0].dependency.name, "flask");
+        assert_eq!(report.assessments[0].dependency.ecosystem, Ecosystem::PyPI);
+    }
+
+    #[test]
+    fn installed_mode_parses_cargo_lock_at_root() {
+        // A workspace Cargo.lock at the scan root must be picked up in
+        // installed mode and emit one DeclaredDependency per `[[package]]`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.lock"),
+            r#"version = 3
+[[package]]
+name = "anyhow"
+version = "1.0.86"
+
+[[package]]
+name = "thiserror"
+version = "1.0.61"
+"#,
+        )
+        .unwrap();
+
+        let request = ScanRequest {
+            root: dir.path(),
+            db: None,
+            online: OnlineMode::Off,
+            is_allowlisted: &never_allow,
+            mode: ScanMode::Installed,
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+        };
+        let report = scan(&request);
+        assert_eq!(
+            report.dependency_count, 2,
+            "Cargo.lock declares two packages: {:?}",
+            report.assessments
+        );
+        for a in &report.assessments {
+            assert_eq!(a.dependency.ecosystem, Ecosystem::Crates);
+        }
+    }
+
+    #[test]
+    fn specific_lockfile_with_unrecognized_file_records_note() {
+        // A bogus path passed via SpecificLockfile must surface a note rather
+        // than crash. A piped consumer sees mode=specific_lockfile and
+        // dependency_count=0, plus an explanatory note.
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = dir.path().join("not-a-lockfile.json");
+        std::fs::write(&bogus, "{}").unwrap();
+
+        let request = ScanRequest {
+            root: &bogus,
+            db: None,
+            online: OnlineMode::Off,
+            is_allowlisted: &never_allow,
+            mode: ScanMode::SpecificLockfile(bogus.clone()),
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+        };
+        let report = scan(&request);
+        assert_eq!(report.mode, "specific_lockfile");
+        assert_eq!(report.dependency_count, 0);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.note.contains("not a recognized manifest format")),
+            "must record a 'not recognized' note for an unknown file: {:?}",
+            report.notes
         );
     }
 }

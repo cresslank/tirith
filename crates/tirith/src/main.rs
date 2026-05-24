@@ -1,6 +1,8 @@
 mod assets;
 mod cli;
 
+use std::path::PathBuf;
+
 use crate::cli::{HumanJsonFormat, HumanJsonSarifFormat};
 use clap::{Parser, Subcommand};
 
@@ -1584,6 +1586,57 @@ Offline by default. --online adds the registry-API provenance factors (see
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+    /// Scan installed packages or a specific lockfile for supply-chain risk
+    #[command(after_help = "\
+Examples:
+  tirith package scan                              (--installed against cwd)
+  tirith package scan --installed
+  tirith package scan --lockfile package-lock.json
+  tirith package scan --installed --online
+  tirith package scan --format json --installed
+
+Spec-named CLI surface for the directory-level supply-chain scan. Thin
+wrapper over `tirith ecosystem scan` — both CLIs route through the same
+engine, and produce byte-identical JSON for the same cwd. --installed walks
+installed trees (node_modules/, site-packages/, vendor/, Cargo.lock).
+--lockfile <path> targets a specific lockfile and reuses the manifest parser.
+The two are mutually exclusive; if neither is passed, --installed against cwd
+is assumed.")]
+    Scan {
+        /// Scan installed trees (node_modules/, site-packages/, vendor/,
+        /// Cargo.lock) instead of declared-dependency manifests.
+        #[arg(long, conflicts_with = "lockfile")]
+        installed: bool,
+        /// Scan a specific lockfile. Mutually exclusive with --installed.
+        #[arg(long, value_name = "PATH", conflicts_with = "installed")]
+        lockfile: Option<PathBuf>,
+        /// Optional project directory to scan (rarely needed — the wrapper
+        /// defaults to cwd). Mutually exclusive with --lockfile.
+        #[arg(long, value_name = "PATH", conflicts_with = "lockfile")]
+        path: Option<PathBuf>,
+        /// Also consult each package's registry API (npm / PyPI / crates.io)
+        /// for provenance signals. Off by default.
+        #[arg(long)]
+        online: bool,
+        /// Force offline scoring even if --online is passed. Also honored via
+        /// the TIRITH_OFFLINE environment variable.
+        #[arg(long)]
+        offline: bool,
+        /// Cap the installed-tree walk at N entries. 0 means unbounded.
+        /// Default 5000; valid range 100-200000 (or 0).
+        #[arg(long, default_value_t = 5000)]
+        max_installed_entries: usize,
+        /// Do not prompt for confirmation under --installed --online when the
+        /// estimated network call count is large. Pass this in CI.
+        #[arg(long)]
+        non_interactive: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1594,6 +1647,8 @@ Examples:
   tirith ecosystem scan
   tirith ecosystem scan ./my-project
   tirith ecosystem scan --online ./my-project
+  tirith ecosystem scan --installed ./my-project
+  tirith ecosystem scan --installed --max-installed-entries 0  (unbounded)
   tirith ecosystem scan --format json ./my-project
 
 Discovers package.json / package-lock.json, requirements*.txt / pyproject.toml,
@@ -1602,7 +1657,14 @@ deterministic package-risk engine and checked for the slopsquat (AI-hallucinated
 name) pattern. Offline by default — name and typosquat signals come from the
 local threat database. --online additionally consults the registry API for
 provenance signals; it is ignored under --offline / TIRITH_OFFLINE and a
-registry failure degrades gracefully. Findings respect the policy allowlist.")]
+registry failure degrades gracefully. Findings respect the policy allowlist.
+
+--installed switches to scanning *installed* trees instead — walking
+node_modules/<pkg>/package.json, site-packages/<dist-info>/METADATA,
+vendor/<pkg>/ for Go modules, and the workspace Cargo.lock. This reports what
+is actually on disk, which can drift from the manifest's intent. Use
+--max-installed-entries to cap the walk (default 5000; pass 0 to disable
+the cap, which is slow on large trees).")]
     Scan {
         /// Project directory to scan (or a single manifest file).
         /// Defaults to the current directory.
@@ -1617,6 +1679,18 @@ registry failure degrades gracefully. Findings respect the policy allowlist.")]
         /// the TIRITH_OFFLINE environment variable.
         #[arg(long)]
         offline: bool,
+        /// Scan installed trees (node_modules/, site-packages/, vendor/,
+        /// Cargo.lock) instead of declared-dependency manifests.
+        #[arg(long)]
+        installed: bool,
+        /// Cap the installed-tree walk at N entries. 0 means unbounded.
+        /// Default 5000; valid range 100-200000 (or 0).
+        #[arg(long, default_value_t = 5000)]
+        max_installed_entries: usize,
+        /// Do not prompt for confirmation under --installed --online when the
+        /// estimated network call count is large. Pass this in CI.
+        #[arg(long)]
+        non_interactive: bool,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -2781,6 +2855,29 @@ fn run() {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::package::explain(&ecosystem, &name, path.as_deref(), online, offline, json)
             }
+            PackageAction::Scan {
+                installed,
+                lockfile,
+                path,
+                online,
+                offline,
+                max_installed_entries,
+                non_interactive,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::package::scan(
+                    installed,
+                    lockfile.as_deref(),
+                    path.as_deref(),
+                    online,
+                    offline,
+                    max_installed_entries,
+                    non_interactive,
+                    json,
+                )
+            }
         },
 
         Commands::Ecosystem { action } => match action {
@@ -2788,11 +2885,22 @@ fn run() {
                 path,
                 online,
                 offline,
+                installed,
+                max_installed_entries,
+                non_interactive,
                 format,
                 json,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::ecosystem::scan(path.as_deref(), online, offline, json)
+                cli::ecosystem::scan(
+                    path.as_deref(),
+                    online,
+                    offline,
+                    installed,
+                    max_installed_entries,
+                    non_interactive,
+                    json,
+                )
             }
         },
 

@@ -1,6 +1,12 @@
 //! `tirith package risk` and `tirith package explain` — provenance /
 //! maintainer-risk scoring for a package.
 //!
+//! `tirith package scan` is the spec-named CLI surface for the directory-level
+//! supply-chain scan. It is a thin wrapper over [`super::ecosystem::scan`] —
+//! the underlying engine is `tirith_core::ecosystem_scan::scan`. Both surfaces
+//! pass the same [`ScanMode`] and the byte-identical-JSON CLI test pins that
+//! one engine implementation serves both CLIs.
+//!
 //! These commands score a package the way `tirith score` scores a URL: a
 //! deterministic, fully explainable sum of named factors.
 //!
@@ -20,6 +26,78 @@ use tirith_core::package_risk::{
 };
 use tirith_core::registry_api::{self, HttpRegistryClient, RegistryClient};
 use tirith_core::threatdb::{Ecosystem, ThreatDb};
+
+/// Run `tirith package scan` — the spec-named CLI surface for the
+/// directory-level supply-chain scan. A **thin wrapper** over
+/// [`super::ecosystem::scan`]; both CLIs route through the same engine
+/// (`tirith_core::ecosystem_scan::scan`). The byte-identical-JSON test in
+/// `crates/tirith/tests/cli_integration.rs` pins that invariant.
+///
+/// `installed` and `lockfile` are mutually exclusive (clap enforces this).
+/// When neither is set and `path` is `None`, the wrapper defaults to
+/// `--installed` against cwd — the natural reading of the spec.
+///
+/// `max_installed_entries` caps the installed-tree walk (mirrors the same
+/// flag on `ecosystem scan`). `non_interactive` suppresses the network-call
+/// confirmation prompt that `--installed --online` raises against a large
+/// tree.
+#[allow(clippy::too_many_arguments)]
+pub fn scan(
+    installed: bool,
+    lockfile: Option<&Path>,
+    path: Option<&Path>,
+    online: bool,
+    offline: bool,
+    max_installed_entries: usize,
+    non_interactive: bool,
+    json: bool,
+) -> i32 {
+    // Resolve the scan target. Precedence:
+    //   1. --lockfile <path>       → SpecificLockfile (handled by the engine
+    //                                 once routed through `pick_mode`).
+    //   2. --installed             → installed-tree walk under cwd, unless
+    //                                 `path` overrides.
+    //   3. positional path          → manifests walk under that path.
+    //   4. nothing                  → default to --installed against cwd
+    //                                 (the spec's natural reading).
+    let (effective_path, effective_installed): (PathBuf, bool) = match (lockfile, installed, path) {
+        (Some(lock), false, None) => (lock.to_path_buf(), false),
+        (None, true, None) => (
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            true,
+        ),
+        (None, true, Some(p)) => (p.to_path_buf(), true),
+        (None, false, Some(p)) => (p.to_path_buf(), false),
+        (None, false, None) => (
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            true,
+        ),
+        (Some(_), true, _) => {
+            // Defense in depth — clap's `conflicts_with` should already block
+            // this; if we somehow get here, fail with the same usage error
+            // clap would have produced.
+            eprintln!("tirith package scan: --installed and --lockfile are mutually exclusive.");
+            return 2;
+        }
+        (Some(_), false, Some(_)) => {
+            // --lockfile + --path is also a conflict the user could only
+            // construct programmatically; reject explicitly so the wrapper
+            // never silently drops one of the operator's inputs.
+            eprintln!("tirith package scan: --lockfile and --path are mutually exclusive.");
+            return 2;
+        }
+    };
+
+    super::ecosystem::scan(
+        effective_path.to_str(),
+        online,
+        offline,
+        effective_installed,
+        max_installed_entries,
+        non_interactive,
+        json,
+    )
+}
 
 /// Run `tirith package risk <ecosystem> <name>`.
 ///

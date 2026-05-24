@@ -3951,6 +3951,291 @@ fn ecosystem_scan_no_manifest_directory_is_handled_cleanly() {
 }
 
 // ---------------------------------------------------------------------------
+// M6 ch2 — `ecosystem scan --installed` + `package scan` (spec-named wrapper)
+//
+// The four smokes below pin the wrapper as a thin shell over the same engine.
+// The byte-identical-JSON test is the load-bearing one — if a future
+// contributor reimplements `package scan`, that test catches it. The other
+// three smokes cover the other CLI surfaces that ship as part of the chunk.
+// ---------------------------------------------------------------------------
+
+/// Build a minimal synthetic `node_modules/` tree of three known packages under
+/// `dir`. Returns the directory so the test can `.path()` it.
+fn build_installed_node_modules_fixture(dir: &std::path::Path) {
+    let nm = dir.join("node_modules");
+    for (pkg, version) in [
+        ("react", "18.2.0"),
+        ("left-pad", "1.3.0"),
+        ("lodash", "4.17.21"),
+    ] {
+        let pkg_dir = nm.join(pkg);
+        fs::create_dir_all(&pkg_dir).expect("create node_modules/<pkg>");
+        let manifest = format!(r#"{{"name":"{pkg}","version":"{version}"}}"#);
+        fs::write(pkg_dir.join("package.json"), manifest).expect("write package.json");
+    }
+}
+
+#[test]
+fn ecosystem_scan_installed_walks_node_modules() {
+    // The installed-tree walker discovers three packages under a synthetic
+    // `node_modules/`. With offline forced and a fixture DB, none of the
+    // three names is malicious, so the scan must exit 0 and report
+    // `dependency_count = 3`.
+    let proj = tempfile::tempdir().expect("project tempdir");
+    build_installed_node_modules_fixture(proj.path());
+
+    let state = tempfile::tempdir().expect("state tempdir");
+    let out = tirith_ecosystem(state.path())
+        .args([
+            "ecosystem",
+            "scan",
+            "--installed",
+            "--non-interactive",
+            "--format",
+            "json",
+            proj.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run tirith ecosystem scan --installed");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a clean installed-tree scan must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("ecosystem scan --installed must emit valid JSON");
+    assert_eq!(
+        json["mode"], "installed",
+        "JSON envelope must carry mode=installed: {json}"
+    );
+    assert_eq!(
+        json["dependency_count"], 3,
+        "the three synthetic packages must be discovered: {json}"
+    );
+}
+
+#[test]
+fn package_scan_installed_works_like_ecosystem_scan() {
+    // `tirith package scan --installed` is a thin wrapper — exit code and
+    // counts must mirror `ecosystem scan --installed` for the same cwd.
+    let proj = tempfile::tempdir().expect("project tempdir");
+    build_installed_node_modules_fixture(proj.path());
+
+    let state = tempfile::tempdir().expect("state tempdir");
+    let out = tirith_ecosystem(state.path())
+        .args([
+            "package",
+            "scan",
+            "--installed",
+            "--non-interactive",
+            "--format",
+            "json",
+            "--path",
+            proj.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run tirith package scan --installed");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a clean installed-tree scan must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("package scan --installed must emit valid JSON");
+    assert_eq!(json["mode"], "installed");
+    assert_eq!(
+        json["dependency_count"], 3,
+        "the wrapper must see the same three packages: {json}"
+    );
+}
+
+#[test]
+fn package_scan_with_lockfile_parses_npm_lock() {
+    // `tirith package scan --lockfile <path>` matches the spec wording. The
+    // lockfile is parsed with the existing manifest parser; the resolved
+    // mode must read `specific_lockfile` in the JSON envelope.
+    let proj = tempfile::tempdir().expect("project tempdir");
+    let lockfile = proj.path().join("package-lock.json");
+    // lockfile v2/v3 packages map, keyed by install path.
+    fs::write(
+        &lockfile,
+        r#"{
+  "name": "demo",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {"name": "demo", "version": "1.0.0"},
+    "node_modules/react": {"version": "18.2.0"},
+    "node_modules/lodash": {"version": "4.17.21"}
+  }
+}"#,
+    )
+    .expect("write package-lock.json");
+
+    let state = tempfile::tempdir().expect("state tempdir");
+    let out = tirith_ecosystem(state.path())
+        .args([
+            "package",
+            "scan",
+            "--lockfile",
+            lockfile.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run tirith package scan --lockfile");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a clean lockfile scan must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("package scan --lockfile must emit valid JSON");
+    assert_eq!(
+        json["mode"], "specific_lockfile",
+        "lockfile mode must surface as specific_lockfile: {json}"
+    );
+    assert_eq!(
+        json["dependency_count"], 2,
+        "the lockfile declares two packages: {json}"
+    );
+}
+
+#[test]
+fn ecosystem_scan_lockfile_path_arg_still_works() {
+    // The shipping path-arg form must keep behaving the same — passing a
+    // single lockfile file as the positional arg is the original way to do
+    // what `--lockfile` does. This test pins that no behavior changed.
+    let proj = tempfile::tempdir().expect("project tempdir");
+    let lockfile = proj.path().join("package-lock.json");
+    fs::write(
+        &lockfile,
+        r#"{
+  "name": "demo",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {"name": "demo", "version": "1.0.0"},
+    "node_modules/react": {"version": "18.2.0"}
+  }
+}"#,
+    )
+    .expect("write package-lock.json");
+
+    let state = tempfile::tempdir().expect("state tempdir");
+    let out = tirith_ecosystem(state.path())
+        .args([
+            "ecosystem",
+            "scan",
+            "--format",
+            "json",
+            lockfile.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run tirith ecosystem scan <lockfile>");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the path-arg form must still exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("ecosystem scan <lockfile> must emit valid JSON");
+    assert_eq!(
+        json["mode"], "specific_lockfile",
+        "a single-file path-arg must resolve to specific_lockfile: {json}"
+    );
+    assert_eq!(json["dependency_count"], 1);
+}
+
+#[test]
+fn ecosystem_scan_installed_and_package_scan_installed_produce_identical_json() {
+    // The load-bearing parity test for M6 ch2. Two CLI surfaces, one engine —
+    // `tirith ecosystem scan --installed` and `tirith package scan
+    // --installed` MUST emit byte-identical JSON when given the same cwd. If
+    // a future contributor reimplements `package scan`, this test catches it.
+    let proj = tempfile::tempdir().expect("project tempdir");
+    build_installed_node_modules_fixture(proj.path());
+
+    let state_a = tempfile::tempdir().expect("state-a tempdir");
+    let state_b = tempfile::tempdir().expect("state-b tempdir");
+
+    let a = tirith_ecosystem(state_a.path())
+        .args([
+            "ecosystem",
+            "scan",
+            "--installed",
+            "--non-interactive",
+            "--format",
+            "json",
+            proj.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run tirith ecosystem scan --installed");
+    let b = tirith_ecosystem(state_b.path())
+        .args([
+            "package",
+            "scan",
+            "--installed",
+            "--non-interactive",
+            "--format",
+            "json",
+            "--path",
+            proj.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run tirith package scan --installed");
+
+    assert_eq!(
+        a.status.code(),
+        Some(0),
+        "ecosystem scan --installed exited non-zero: stderr {}",
+        String::from_utf8_lossy(&a.stderr)
+    );
+    assert_eq!(
+        b.status.code(),
+        Some(0),
+        "package scan --installed exited non-zero: stderr {}",
+        String::from_utf8_lossy(&b.stderr)
+    );
+    assert_eq!(
+        a.stdout, b.stdout,
+        "ecosystem scan --installed and package scan --installed MUST share one engine \
+         and emit byte-identical JSON. The wrapper test pins this invariant."
+    );
+}
+
+#[test]
+fn package_scan_installed_and_lockfile_are_mutually_exclusive() {
+    // clap's `conflicts_with` enforces this — the CLI must refuse the
+    // combination at parse time with a usage error (exit 2). The plan
+    // explicitly calls for this acceptance criterion.
+    let proj = tempfile::tempdir().expect("project tempdir");
+    let lockfile = proj.path().join("package-lock.json");
+    fs::write(&lockfile, r#"{"packages":{}}"#).expect("write lockfile");
+
+    let state = tempfile::tempdir().expect("state tempdir");
+    let out = tirith_ecosystem(state.path())
+        .args([
+            "package",
+            "scan",
+            "--installed",
+            "--lockfile",
+            lockfile.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run tirith package scan with conflicting flags");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "clap must reject --installed + --lockfile with exit 2 (usage error), \
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // `tirith package risk` / `tirith package explain` — offline by default.
 // Same isolation as the ecosystem-scan tests (offline forced, fixture DB,
 // isolated state) — no test reaches the network or installs anything.

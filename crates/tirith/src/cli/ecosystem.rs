@@ -18,10 +18,12 @@
 //! package is suppressed). `--format json` emits the full machine-readable
 //! report.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+use tirith_core::ecosystem_scan::DEFAULT_MAX_INSTALLED_ENTRIES;
 use tirith_core::ecosystem_scan::{
-    self, DependencyAssessment, EcosystemScanReport, OnlineMode, ScanRequest,
+    self, DependencyAssessment, EcosystemScanReport, OnlineMode, ScanMode, ScanRequest,
 };
 use tirith_core::package_risk::ApiSignals;
 use tirith_core::policy::Policy;
@@ -29,12 +31,33 @@ use tirith_core::registry_api::{self, HttpRegistryClient};
 use tirith_core::threatdb::{Ecosystem, ThreatDb};
 use tirith_core::verdict::Action;
 
+/// Lower bound for `--max-installed-entries`. Anything below this cap is
+/// pointless for a real project and almost certainly a typo.
+pub const MIN_INSTALLED_ENTRIES: usize = 100;
+
+/// Upper bound for `--max-installed-entries`. Beyond this the walk is no
+/// longer "bounded"; pass `0` (the explicit unbounded sentinel) instead.
+pub const MAX_INSTALLED_ENTRIES: usize = 200_000;
+
+/// Network-call threshold above which `--installed --online` prompts for
+/// confirmation. Below this we proceed without asking — a few API calls
+/// against a tiny installed tree is not enough to surprise an operator.
+pub const ONLINE_PROMPT_THRESHOLD: usize = 100;
+
 /// Run `tirith ecosystem scan [path]`.
 ///
 /// `path` is the project directory (or a single manifest file) to scan;
 /// it defaults to the current directory. `online` opts into the registry-API
 /// provenance signals; `offline` (or `TIRITH_OFFLINE`) forces offline scoring
-/// even when `online` is set.
+/// even when `online` is set. `installed` switches to installed-tree mode —
+/// walking `node_modules/`, `site-packages/`, `vendor/`, and `Cargo.lock`
+/// instead of declared-dependency manifests.
+///
+/// `max_installed_entries` caps the installed-tree walk (default
+/// [`DEFAULT_MAX_INSTALLED_ENTRIES`]; pass `0` to disable the cap).
+///
+/// `non_interactive` suppresses the `--installed --online` confirmation
+/// prompt — useful in CI where stdin/stderr are not a TTY.
 ///
 /// Exit codes mirror `tirith scan`:
 /// * `0` — no findings (or every finding allowlisted);
@@ -43,7 +66,16 @@ use tirith_core::verdict::Action;
 /// * `2` — only advisory (WARN-level) findings, **or** a usage error (the
 ///   given path does not exist). Exit `2` keeps a usage error distinct from a
 ///   `1` BLOCK finding, exactly as `tirith install` does.
-pub fn scan(path: Option<&str>, online: bool, offline: bool, json: bool) -> i32 {
+#[allow(clippy::too_many_arguments)]
+pub fn scan(
+    path: Option<&str>,
+    online: bool,
+    offline: bool,
+    installed: bool,
+    max_installed_entries: usize,
+    non_interactive: bool,
+    json: bool,
+) -> i32 {
     let scan_root: PathBuf = path
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -58,6 +90,28 @@ pub fn scan(path: Option<&str>, online: bool, offline: bool, json: bool) -> i32 
         // exit 1 (= a BLOCK-level finding).
         return 2;
     }
+
+    // Validate the entries cap. `0` is the explicit unbounded sentinel; any
+    // other value must sit within the documented range.
+    if max_installed_entries != 0
+        && !(MIN_INSTALLED_ENTRIES..=MAX_INSTALLED_ENTRIES).contains(&max_installed_entries)
+    {
+        eprintln!(
+            "tirith ecosystem scan: --max-installed-entries must be 0 (unbounded) \
+             or between {MIN_INSTALLED_ENTRIES} and {MAX_INSTALLED_ENTRIES}; got \
+             {max_installed_entries}."
+        );
+        return 2;
+    }
+
+    let installed_effective = installed || env_force_installed();
+
+    // Pick the engine mode from the CLI surface. `installed` wins over a
+    // manifest-only walk. When `path` points at a single file and that file
+    // is recognized as a lockfile, we keep the shipping behavior (path-arg
+    // form treats it as a specific lockfile) — but only when the operator has
+    // NOT asked for `--installed`.
+    let mode = pick_mode(&scan_root, installed_effective);
 
     // Threat DB — offline name / typosquat signals. `None` is not an error:
     // the scan still runs (weaker), and a note records the missing DB.
@@ -93,6 +147,26 @@ pub fn scan(path: Option<&str>, online: bool, offline: bool, json: bool) -> i32 
         registry_api::gather_api_signals(&http_client, eco, name)
     };
 
+    // `--installed --online` against a large tree could fire thousands of API
+    // calls. Estimate the call count from a quick count of installed entries
+    // and prompt the operator when it exceeds the threshold. The prompt is
+    // skipped under `--non-interactive` (CI) and when stderr is not a TTY.
+    if use_online && matches!(mode, ScanMode::Installed) && !non_interactive {
+        let estimate = estimate_installed_entries(&scan_root, max_installed_entries);
+        if estimate > ONLINE_PROMPT_THRESHOLD
+            && !super::confirm(
+                &format!(
+                    "tirith ecosystem scan: --installed --online would make ~{estimate} \
+                 network calls against package registries; proceed?"
+                ),
+                false,
+            )
+        {
+            eprintln!("tirith ecosystem scan: aborted by operator at confirmation prompt.");
+            return 2;
+        }
+    }
+
     let online_mode = if use_online {
         OnlineMode::Resolver(&resolver)
     } else {
@@ -104,6 +178,8 @@ pub fn scan(path: Option<&str>, online: bool, offline: bool, json: bool) -> i32 
         db: db.as_deref(),
         online: online_mode,
         is_allowlisted: &is_allowlisted,
+        mode: mode.clone(),
+        installed_max_entries: max_installed_entries,
     };
     let mut report = ecosystem_scan::scan(&request);
 
@@ -136,12 +212,14 @@ pub fn scan(path: Option<&str>, online: bool, offline: bool, json: bool) -> i32 
     }
 
     // Audit-log the verdict, exactly as the other analysis commands do. The
-    // "command" string identifies this as an ecosystem scan of the root. A
+    // "command" string identifies this as an ecosystem scan of the root, with
+    // the resolved mode appended so an audit reader can tell the
+    // manifests / installed / specific-lockfile passes apart at a glance. A
     // failed audit write does not abort the scan, but it must not be silent —
     // surface it as a non-fatal notice.
     if let Err(e) = tirith_core::audit::log_verdict(
         &report.verdict,
-        &format!("ecosystem scan {}", report.scan_root),
+        &format!("ecosystem scan ({}) {}", report.mode, report.scan_root),
         None,
         None,
         &policy.dlp_custom_patterns,
@@ -344,6 +422,113 @@ fn highest_risk_dependency(report: &EcosystemScanReport) -> Option<&DependencyAs
         .filter(|a| a.risk.score > 0)
 }
 
+/// Resolve the effective [`ScanMode`] from the CLI surface.
+///
+/// Precedence:
+///  1. `--installed` (or the test-only `TIRITH_FORCE_INSTALLED` env var) →
+///     [`ScanMode::Installed`].
+///  2. `path` points at a single file recognized as a manifest →
+///     [`ScanMode::SpecificLockfile`] (the path-arg form of `--lockfile`).
+///  3. Otherwise → [`ScanMode::Manifests`] (the shipping default).
+pub(crate) fn pick_mode(scan_root: &Path, installed: bool) -> ScanMode {
+    if installed {
+        return ScanMode::Installed;
+    }
+    if scan_root.is_file() {
+        if let Some(name) = scan_root.file_name().and_then(|n| n.to_str()) {
+            if ecosystem_scan::ManifestKind::from_file_name(name).is_some() {
+                return ScanMode::SpecificLockfile(scan_root.to_path_buf());
+            }
+        }
+    }
+    ScanMode::Manifests
+}
+
+/// `true` when the `TIRITH_FORCE_INSTALLED` env var is set — used only by
+/// tests to drive the installed-tree mode without re-shimming `Args`.
+fn env_force_installed() -> bool {
+    std::env::var("TIRITH_FORCE_INSTALLED")
+        .ok()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Cheap upper-bound estimate of how many installed packages the engine would
+/// score in [`ScanMode::Installed`]. Used only to size the `--online`
+/// confirmation prompt — it does not need to be exact.
+pub(crate) fn estimate_installed_entries(root: &Path, cap: usize) -> usize {
+    let mut count = 0usize;
+    // Fast: just count immediate children of node_modules + site-packages.
+    let nm = root.join("node_modules");
+    if let Ok(rd) = std::fs::read_dir(&nm) {
+        for e in rd.flatten() {
+            if !e.file_type().map(|f| f.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let Some(name) = e.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if name.starts_with('@') {
+                if let Ok(sub) = std::fs::read_dir(e.path()) {
+                    count += sub.count();
+                }
+            } else {
+                count += 1;
+            }
+            if cap > 0 && count > cap {
+                return cap;
+            }
+        }
+    }
+    for sp in find_site_packages_for_estimate(root) {
+        if let Ok(rd) = std::fs::read_dir(sp) {
+            count += rd
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.ends_with(".dist-info"))
+                })
+                .count();
+        }
+        if cap > 0 && count > cap {
+            return cap;
+        }
+    }
+    count
+}
+
+/// Mirror of the core's `find_site_packages_dirs` for the CLI-side estimator.
+/// Kept here so the CLI does not need to expose the core helper.
+fn find_site_packages_for_estimate(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let cands = [
+        root.join("site-packages"),
+        root.join("Lib").join("site-packages"),
+    ];
+    for c in cands {
+        if c.is_dir() {
+            out.push(c);
+        }
+    }
+    let lib = root.join("lib");
+    if let Ok(rd) = std::fs::read_dir(&lib) {
+        for e in rd.flatten() {
+            let Some(name) = e.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !name.starts_with("python") {
+                continue;
+            }
+            let sp = e.path().join("site-packages");
+            if sp.is_dir() {
+                out.push(sp);
+            }
+        }
+    }
+    out
+}
+
 /// Check whether a given path looks like a project that `ecosystem scan` can
 /// meaningfully scan — used by the doctor / help, currently only by tests.
 #[cfg(test)]
@@ -456,6 +641,9 @@ mod tests {
             Some("/definitely/not/a/real/path/xyzzy-ecosystem"),
             false,
             false,
+            false,
+            DEFAULT_MAX_INSTALLED_ENTRIES,
+            true,
             true,
         );
         assert_eq!(code, 2);
@@ -471,7 +659,15 @@ mod tests {
             "[dependencies]\nmy-unique-internal-crate = \"1.0\"\n",
         )
         .unwrap();
-        let code = scan(dir.path().to_str(), false, false, true);
+        let code = scan(
+            dir.path().to_str(),
+            false,
+            false,
+            false,
+            DEFAULT_MAX_INSTALLED_ENTRIES,
+            true,
+            true,
+        );
         assert_eq!(code, 0, "a project with no flagged deps must exit 0");
     }
 
@@ -535,11 +731,57 @@ mod tests {
         // allowlist suppresses it). The threat DB is absent here so a clean
         // baseline already exits 0 regardless; this is a smoke that the new
         // wiring does not regress the happy path.
-        let code = scan(target.path().to_str(), false, false, true);
+        let code = scan(
+            target.path().to_str(),
+            false,
+            false,
+            false,
+            DEFAULT_MAX_INSTALLED_ENTRIES,
+            true,
+            true,
+        );
         assert_eq!(
             code, 0,
             "ecosystem scan with allowlisted dep must exit 0 (policy discovery \
              from scan target)"
+        );
+    }
+
+    #[test]
+    fn scan_max_installed_entries_out_of_range_is_usage_error() {
+        let dir = tempdir().unwrap();
+        // Below the minimum.
+        let too_low = scan(dir.path().to_str(), false, false, true, 10, true, true);
+        assert_eq!(too_low, 2, "below-min --max-installed-entries must exit 2");
+        // Above the maximum.
+        let too_high = scan(dir.path().to_str(), false, false, true, 300_000, true, true);
+        assert_eq!(too_high, 2, "above-max --max-installed-entries must exit 2");
+    }
+
+    #[test]
+    fn pick_mode_recognizes_lockfile_path_arg() {
+        let dir = tempdir().unwrap();
+        let lock = dir.path().join("package-lock.json");
+        fs::write(&lock, "{}").unwrap();
+        let mode = pick_mode(&lock, false);
+        assert!(
+            matches!(mode, ScanMode::SpecificLockfile(_)),
+            "a single-file path-arg recognized as a lockfile must become SpecificLockfile, got {mode:?}"
+        );
+        let installed_wins = pick_mode(&lock, true);
+        assert!(
+            matches!(installed_wins, ScanMode::Installed),
+            "--installed must win over a single-file path-arg, got {installed_wins:?}"
+        );
+    }
+
+    #[test]
+    fn pick_mode_defaults_to_manifests_for_directory() {
+        let dir = tempdir().unwrap();
+        let mode = pick_mode(dir.path(), false);
+        assert!(
+            matches!(mode, ScanMode::Manifests),
+            "a directory must default to manifests mode, got {mode:?}"
         );
     }
 }
