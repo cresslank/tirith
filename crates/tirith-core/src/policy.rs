@@ -33,6 +33,13 @@ fn find_policy_in_dir(dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Default `schema_version` for serde — shipping policies omit the field
+/// and we treat them as v1. `u32::default()` is 0, which would falsely flag
+/// them as "older than any registered migration".
+fn default_schema_version() -> u32 {
+    1
+}
+
 /// Policy configuration loaded from YAML.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -40,6 +47,13 @@ pub struct Policy {
     /// Path this policy was loaded from.
     #[serde(skip)]
     pub path: Option<String>,
+
+    /// Schema version of the policy file (M5.5 chunk F3). Shipping policies
+    /// omit this field; they're treated as v1 via [`default_schema_version`].
+    /// Forward migrations live in [`crate::policy_migrations`] and run on
+    /// the raw YAML before deserialization, so newer fields are reachable.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
 
     /// Fail mode: "open" (default) or "closed".
     pub fail_mode: FailMode,
@@ -589,6 +603,7 @@ impl Default for Policy {
     fn default() -> Self {
         Self {
             path: None,
+            schema_version: default_schema_version(),
             fail_mode: FailMode::Open,
             allow_bypass_env: true,
             allow_bypass_env_noninteractive: false,
@@ -662,7 +677,10 @@ impl Policy {
         match crate::policy_client::fetch_remote_policy(&server_url, &api_key) {
             Ok(yaml) => {
                 let _ = cache_remote_policy(&yaml);
-                match serde_yaml::from_str::<Policy>(&yaml) {
+                // Run schema migrations on the raw YAML before deserialization
+                // (M5.5 chunk F3). Registry is empty at M5.5 so this is a
+                // no-op for shipping policies; later waves rely on it.
+                match Self::try_parse_yaml(&yaml) {
                     Ok(mut p) => {
                         p.path = Some(format!("remote:{server_url}"));
                         // Retain connection details so audit upload can reuse them.
@@ -753,24 +771,48 @@ impl Policy {
     }
 
     fn load_from_path(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(content) => match serde_yaml::from_str::<Policy>(&content) {
-                Ok(mut p) => {
-                    p.path = Some(path.display().to_string());
-                    p
-                }
-                Err(e) => {
-                    eprintln!(
-                        "tirith: warning: failed to parse policy at {}: {e}",
-                        path.display(),
-                    );
-                    Policy::default()
-                }
-            },
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
             Err(e) => {
                 eprintln!(
                     "tirith: warning: cannot read policy at {}: {e}",
                     path.display()
+                );
+                return Policy::default();
+            }
+        };
+        Self::load_from_yaml(&content, Some(&path.display().to_string()))
+    }
+
+    /// Parse YAML text into a `Policy`, running schema migrations first.
+    ///
+    /// Returns `Err(message)` instead of printing+falling back; callers
+    /// that want fail-mode-aware handling (e.g. the remote-policy fetch
+    /// path) use this. Local-file loading uses [`Self::load_from_yaml`]
+    /// which wraps this with the existing warn-and-default behavior.
+    pub fn try_parse_yaml(content: &str) -> Result<Self, String> {
+        let mut value: serde_yaml::Value =
+            serde_yaml::from_str(content).map_err(|e| format!("yaml parse error: {e}"))?;
+        crate::policy_migrations::migrate_forward(&mut value)
+            .map_err(|e| format!("migration error: {e}"))?;
+        serde_yaml::from_value::<Policy>(value).map_err(|e| format!("deserialize error: {e}"))
+    }
+
+    /// Load a policy from YAML text, running schema migrations first.
+    ///
+    /// Public so tests (and future remote-fetch paths) can exercise the
+    /// migrate-then-deserialize sequence without going through the file
+    /// system.
+    pub fn load_from_yaml(content: &str, source: Option<&str>) -> Self {
+        match Self::try_parse_yaml(content) {
+            Ok(mut p) => {
+                p.path = source.map(|s| s.to_string());
+                p
+            }
+            Err(e) => {
+                eprintln!(
+                    "tirith: warning: policy load failed{}: {e}",
+                    source.map(|s| format!(" at {s}")).unwrap_or_default(),
                 );
                 Policy::default()
             }
@@ -1179,6 +1221,54 @@ fn load_cached_remote_policy() -> Option<Policy> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----------------------------- M5.5 F3 schema_version round-trips -----
+
+    #[test]
+    fn shipping_policy_without_schema_version_loads_as_v1() {
+        // Mirrors a pre-M5.5 `.tirith/policy.yaml`: no schema_version
+        // field at all. The loader must default to v1 and parse the
+        // shipping fields cleanly.
+        let yaml = "fail_mode: open\nparanoia: 2\n";
+        let p = Policy::load_from_yaml(yaml, Some("test"));
+        assert_eq!(p.schema_version, 1);
+        assert_eq!(p.paranoia, 2);
+        assert_eq!(p.path.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn explicit_schema_version_v1_loads() {
+        let yaml = "schema_version: 1\nparanoia: 3\n";
+        let p = Policy::load_from_yaml(yaml, None);
+        assert_eq!(p.schema_version, 1);
+        assert_eq!(p.paranoia, 3);
+    }
+
+    #[test]
+    fn future_schema_version_falls_back_to_default() {
+        // A policy declaring a version newer than this binary supports
+        // must NOT silently drop fields. The loader prints the migration
+        // error and returns `Policy::default()` (which itself is v1).
+        // This pins the no-silent-drop invariant from the F3 design.
+        let yaml = "schema_version: 9999\nparanoia: 4\n";
+        let p = Policy::load_from_yaml(yaml, Some("synthetic"));
+        // Did NOT keep the file's paranoia=4 because deserialization
+        // was aborted before that field was read.
+        assert_ne!(
+            p.paranoia, 4,
+            "future-version policy must not be silently honored",
+        );
+        assert_eq!(
+            p.schema_version,
+            crate::policy_migrations::CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn default_policy_carries_schema_version_v1() {
+        let p = Policy::default();
+        assert_eq!(p.schema_version, 1);
+    }
 
     #[test]
     fn test_allowlist_domain_matches_subdomain() {

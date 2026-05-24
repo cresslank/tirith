@@ -23,6 +23,7 @@ pub mod package_risk;
 pub mod parse;
 pub mod policy;
 pub mod policy_client;
+pub mod policy_migrations;
 pub mod policy_validate;
 pub mod receipt;
 pub mod redact;

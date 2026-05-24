@@ -1,0 +1,227 @@
+//! Policy schema migration registry (M5.5 chunk F3).
+//!
+//! Tirith policies carry a `schema_version: u32` field. When the field is
+//! absent (shipping `policy.yaml` files written before M5.5), the loader
+//! treats the policy as `v1` for backward compatibility.
+//!
+//! Migrations operate on the **raw `serde_yaml::Value` BEFORE deserializing
+//! into the typed `Policy` struct**. This matters: typed deserialization
+//! discards fields the struct does not know about, so a migration that runs
+//! after deserialization cannot see (let alone rename) those fields.
+//!
+//! At M5.5 the registry is empty — every shipping policy is `v1` and
+//! `CURRENT_SCHEMA_VERSION` equals `1`. Each later wave that changes the
+//! policy shape bumps the version and registers a forward migration here.
+//!
+//! Loaders accept any version ≤ `CURRENT_SCHEMA_VERSION`; a policy file
+//! whose `schema_version` exceeds the registered maximum fails with a
+//! clear message asking the user to upgrade the tirith binary, rather
+//! than silently dropping unknown fields.
+
+use serde_yaml::Value;
+
+/// The schema version this tirith build understands.
+///
+/// Bump this every time a later wave changes the policy shape AND
+/// registers a migration in [`MIGRATIONS`].
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+/// A single forward migration `from → to`.
+///
+/// The migration function mutates the raw `serde_yaml::Value` in place so
+/// later, typed deserialization sees the new shape. It MUST be idempotent
+/// (re-running on an already-migrated value is a no-op).
+#[derive(Clone, Copy)]
+pub struct Migration {
+    pub from: u32,
+    pub to: u32,
+    pub run: fn(&mut Value),
+}
+
+/// Registered forward migrations.
+///
+/// Order: each entry's `to` MUST equal the next entry's `from`, walking
+/// from 1 up to [`CURRENT_SCHEMA_VERSION`]. The validator
+/// [`validate_migration_chain`] is called from a unit test.
+pub const MIGRATIONS: &[Migration] = &[];
+
+/// Migrate a raw policy `Value` forward to the version this binary
+/// understands.
+///
+/// Returns `Ok(())` after a no-op when the policy is already at
+/// [`CURRENT_SCHEMA_VERSION`]. Returns `Err(MigrationError::FutureVersion)`
+/// when the policy declares a `schema_version` greater than this binary
+/// supports — so we never quietly drop fields a newer tirith added.
+pub fn migrate_forward(value: &mut Value) -> Result<(), MigrationError> {
+    let mut current = detect_schema_version(value);
+
+    if current > CURRENT_SCHEMA_VERSION {
+        return Err(MigrationError::FutureVersion {
+            policy_version: current,
+            supported_version: CURRENT_SCHEMA_VERSION,
+        });
+    }
+
+    while current < CURRENT_SCHEMA_VERSION {
+        let migration = MIGRATIONS
+            .iter()
+            .find(|m| m.from == current)
+            .ok_or(MigrationError::MissingMigration { from: current })?;
+        (migration.run)(value);
+        current = migration.to;
+        set_schema_version(value, current);
+    }
+    Ok(())
+}
+
+/// Read the policy's declared `schema_version`, defaulting to `1` when the
+/// field is absent (the shipping convention for pre-M5.5 policies).
+pub fn detect_schema_version(value: &Value) -> u32 {
+    value
+        .as_mapping()
+        .and_then(|m| m.get(Value::String("schema_version".to_string())))
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(1)
+}
+
+fn set_schema_version(value: &mut Value, version: u32) {
+    if let Some(map) = value.as_mapping_mut() {
+        map.insert(
+            Value::String("schema_version".to_string()),
+            Value::Number(version.into()),
+        );
+    }
+}
+
+/// Errors returned by [`migrate_forward`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationError {
+    /// The policy declares a schema version newer than this tirith binary.
+    /// The user should upgrade tirith rather than have us silently drop
+    /// fields we don't recognise.
+    FutureVersion {
+        policy_version: u32,
+        supported_version: u32,
+    },
+    /// The migration chain is incomplete — no registered migration
+    /// advances `from` to any later version. This is a build-time bug if it
+    /// fires, because the chain is enforced by a unit test.
+    MissingMigration { from: u32 },
+}
+
+impl std::fmt::Display for MigrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MigrationError::FutureVersion {
+                policy_version,
+                supported_version,
+            } => write!(
+                f,
+                "policy schema v{policy_version} requires a newer tirith binary; \
+                 this build supports schema v{supported_version}. Upgrade tirith \
+                 (or remove the `schema_version` field to load as v1)."
+            ),
+            MigrationError::MissingMigration { from } => write!(
+                f,
+                "internal error: no registered migration from policy schema v{from}; \
+                 this is a tirith bug — please report it."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MigrationError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_value(version: Option<u32>) -> Value {
+        let mut map = serde_yaml::Mapping::new();
+        if let Some(v) = version {
+            map.insert(
+                Value::String("schema_version".to_string()),
+                Value::Number(v.into()),
+            );
+        }
+        map.insert(
+            Value::String("paranoia".to_string()),
+            Value::Number(2.into()),
+        );
+        Value::Mapping(map)
+    }
+
+    #[test]
+    fn migration_chain_is_continuous() {
+        // The `to` of entry N MUST equal the `from` of entry N+1, walking
+        // from 1 to CURRENT_SCHEMA_VERSION.
+        let mut expected = 1u32;
+        for m in MIGRATIONS {
+            assert_eq!(
+                m.from, expected,
+                "migration chain broken: expected from={expected}, got {}",
+                m.from
+            );
+            assert!(
+                m.to > m.from,
+                "migration must move forward: from={} to={}",
+                m.from,
+                m.to
+            );
+            expected = m.to;
+        }
+        if !MIGRATIONS.is_empty() {
+            assert_eq!(
+                expected, CURRENT_SCHEMA_VERSION,
+                "migration chain stops at v{expected} but CURRENT_SCHEMA_VERSION is v{CURRENT_SCHEMA_VERSION}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_field_defaults_to_v1() {
+        let v = make_value(None);
+        assert_eq!(detect_schema_version(&v), 1);
+    }
+
+    #[test]
+    fn explicit_v1_field_works() {
+        let v = make_value(Some(1));
+        assert_eq!(detect_schema_version(&v), 1);
+    }
+
+    #[test]
+    fn future_version_rejected_with_clear_error() {
+        let mut v = make_value(Some(CURRENT_SCHEMA_VERSION + 10));
+        let err = migrate_forward(&mut v).expect_err("should fail forward");
+        match err {
+            MigrationError::FutureVersion {
+                policy_version,
+                supported_version,
+            } => {
+                assert_eq!(policy_version, CURRENT_SCHEMA_VERSION + 10);
+                assert_eq!(supported_version, CURRENT_SCHEMA_VERSION);
+            }
+            other => panic!("expected FutureVersion, got {other:?}"),
+        }
+        // Display should mention upgrade
+        let msg = format!("{err}");
+        assert!(msg.contains("Upgrade tirith") || msg.contains("upgrade tirith"));
+    }
+
+    #[test]
+    fn v1_policy_migrates_noop_to_current() {
+        // At M5.5, CURRENT_SCHEMA_VERSION == 1, so v1 → v1 is a no-op.
+        let mut v = make_value(None);
+        let before = v.clone();
+        migrate_forward(&mut v).expect("v1 should migrate cleanly");
+        // Ensure schema_version field is present after migrate (if chain ran).
+        if CURRENT_SCHEMA_VERSION > 1 {
+            assert_eq!(detect_schema_version(&v), CURRENT_SCHEMA_VERSION);
+        } else {
+            // No-op: shape unchanged.
+            assert_eq!(v, before);
+        }
+    }
+}
