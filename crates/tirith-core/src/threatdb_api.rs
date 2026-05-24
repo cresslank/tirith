@@ -683,6 +683,19 @@ fn ecosystem_label(ecosystem: Ecosystem) -> Option<&'static str> {
         Ecosystem::Maven => Some("maven"),
         Ecosystem::NuGet => Some("nuget"),
         Ecosystem::Packagist => Some("packagist"),
+        // M6 ch1 — distro / docker backends have no upstream threat-feed
+        // ecosystem label today (no OSV / deps.dev / ecosystems.org
+        // equivalent), so they map to `None`. The downstream HTTP threat
+        // adapters that consult these tables fall through to "skip" for
+        // these ecosystems, which is the right no-data behavior until feed
+        // wiring extends.
+        Ecosystem::Apt
+        | Ecosystem::Brew
+        | Ecosystem::Dnf
+        | Ecosystem::Yum
+        | Ecosystem::Pacman
+        | Ecosystem::Scoop
+        | Ecosystem::Docker => None,
     }
 }
 
@@ -696,6 +709,13 @@ fn osv_ecosystem_name(ecosystem: Ecosystem) -> Option<&'static str> {
         Ecosystem::Maven => Some("Maven"),
         Ecosystem::NuGet => Some("NuGet"),
         Ecosystem::Packagist => Some("Packagist"),
+        Ecosystem::Apt
+        | Ecosystem::Brew
+        | Ecosystem::Dnf
+        | Ecosystem::Yum
+        | Ecosystem::Pacman
+        | Ecosystem::Scoop
+        | Ecosystem::Docker => None,
     }
 }
 
@@ -709,6 +729,13 @@ fn deps_system_name(ecosystem: Ecosystem) -> Option<&'static str> {
         Ecosystem::Maven => Some("maven"),
         Ecosystem::NuGet => Some("nuget"),
         Ecosystem::Packagist => None,
+        Ecosystem::Apt
+        | Ecosystem::Brew
+        | Ecosystem::Dnf
+        | Ecosystem::Yum
+        | Ecosystem::Pacman
+        | Ecosystem::Scoop
+        | Ecosystem::Docker => None,
     }
 }
 
@@ -722,6 +749,13 @@ fn ecosystems_registry_name(ecosystem: Ecosystem) -> Option<&'static str> {
         Ecosystem::Maven => None,
         Ecosystem::NuGet => Some("nuget.org"),
         Ecosystem::Packagist => Some("packagist.org"),
+        Ecosystem::Apt
+        | Ecosystem::Brew
+        | Ecosystem::Dnf
+        | Ecosystem::Yum
+        | Ecosystem::Pacman
+        | Ecosystem::Scoop
+        | Ecosystem::Docker => None,
     }
 }
 

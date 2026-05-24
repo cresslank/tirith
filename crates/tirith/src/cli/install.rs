@@ -50,7 +50,15 @@ use tirith_core::style::Stream;
 use tirith_core::threatdb::{Ecosystem, ThreatDb};
 use tirith_core::verdict::{Action, Verdict};
 
-/// Which install source the `<npm|pip|cargo|url>` positional selects.
+/// Which install source the `<source>` positional selects.
+///
+/// **M6 ch1** — extended with eight distro/docker/go backends:
+/// `apt`, `brew`, `dnf`, `yum`, `pacman`, `scoop`, `docker`, `go`. These ship
+/// command-complete but signal-weak: today no registry adapter exists for
+/// them, so `--online` provenance signals degrade to `Unavailable` with the
+/// honest reason `"no registry adapter for <eco>"`. The CLI prints a banner
+/// to that effect on every `tirith install <backend>` invocation (and embeds
+/// it in JSON), so the operator is never surprised by silent weak coverage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum InstallSource {
     /// `npm install <pkg...>`
@@ -59,6 +67,27 @@ pub enum InstallSource {
     Pip,
     /// `cargo install <pkg...>`
     Cargo,
+    /// `apt-get install <pkg...>` — Debian/Ubuntu. (M6 ch1 — no registry
+    /// adapter; signals are command-shape + threat-DB name match only.)
+    Apt,
+    /// `brew install <pkg...>` — Homebrew. (M6 ch1 — no registry adapter.)
+    Brew,
+    /// `dnf install <pkg...>` — Fedora / RHEL 8+. (M6 ch1 — no registry adapter.)
+    Dnf,
+    /// `yum install <pkg...>` — RHEL 7 and earlier. (M6 ch1 — no registry adapter.)
+    Yum,
+    /// `pacman -S <pkg...>` — Arch / Manjaro. (M6 ch1 — no registry adapter.)
+    Pacman,
+    /// `scoop install <pkg...>` — Windows-only at the real-run step; the
+    /// `--no-exec` dry-run path works on every OS. (M6 ch1 — no registry
+    /// adapter.)
+    Scoop,
+    /// `docker pull <image>[:<tag>|@<digest>]` — image refs are parsed with
+    /// the engine's existing Docker parser. (M6 ch1 — no registry adapter.)
+    Docker,
+    /// `go install <module>[@<version>]` — version defaults to `latest`.
+    /// (M6 ch1 — no registry adapter for the Go module proxy yet.)
+    Go,
     /// Download and run an install script from a URL (delegates to the
     /// existing `tirith run` safe download-and-run machinery).
     Url,
@@ -72,6 +101,14 @@ impl InstallSource {
             InstallSource::Npm => Some(PackageManager::Npm),
             InstallSource::Pip => Some(PackageManager::Pip),
             InstallSource::Cargo => Some(PackageManager::Cargo),
+            InstallSource::Apt => Some(PackageManager::Apt),
+            InstallSource::Brew => Some(PackageManager::Brew),
+            InstallSource::Dnf => Some(PackageManager::Dnf),
+            InstallSource::Yum => Some(PackageManager::Yum),
+            InstallSource::Pacman => Some(PackageManager::Pacman),
+            InstallSource::Scoop => Some(PackageManager::Scoop),
+            InstallSource::Docker => Some(PackageManager::Docker),
+            InstallSource::Go => Some(PackageManager::Go),
             InstallSource::Url => None,
         }
     }
@@ -357,13 +394,50 @@ fn run_package_manager(
             code
         }
         // --- RECORD then RUN --------------------------------------------
-        ProceedDecision::Go => run_and_record(
-            &plan,
-            cwd.as_deref(),
-            json,
-            use_online,
-            &ProcessInstallRunner,
-        ),
+        ProceedDecision::Go => {
+            // M6 ch1 — Scoop is Windows-only at the real-run step. The
+            // dry-run / analysis path (above, via --no-exec or a verdict
+            // that stops the gate) runs on every OS so an operator on
+            // macOS / Linux can review Scoop scripts without ceremony, but
+            // we refuse to actually invoke `scoop install foo` outside
+            // Windows — silently succeeding (or worse, failing inside the
+            // child) would be a surprise-execution footgun.
+            if plan.manager.is_windows_only_runtime() && !cfg!(target_os = "windows") {
+                if !json {
+                    eprintln!(
+                        "tirith install: refusing to run '{}' — {} is Windows-only \
+                         at the real-run step. Use `--no-exec` to analyze on this OS, \
+                         or run the command from a Windows host.",
+                        plan.analysis_command,
+                        plan.manager.label(),
+                    );
+                } else {
+                    let _ = emit_combined_json(
+                        &plan,
+                        use_online,
+                        Some(OutcomeRecord {
+                            ran: false,
+                            exit_code: None,
+                            checkpoint_id: None,
+                            stdout: None,
+                            stderr: None,
+                            spawn_error: Some(format!(
+                                "{} is Windows-only at the real-run step",
+                                plan.manager.label()
+                            )),
+                        }),
+                    );
+                }
+                return 2;
+            }
+            run_and_record(
+                &plan,
+                cwd.as_deref(),
+                json,
+                use_online,
+                &ProcessInstallRunner,
+            )
+        }
     }
 }
 
@@ -633,6 +707,12 @@ fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeR
         packages: Vec<PackageOut<'a>>,
         verdict: &'a Verdict,
         notes: &'a [String],
+        // M6 ch1 — for backends with no registry adapter, the same banner
+        // string the human output shows is embedded here so a JSON consumer
+        // can detect signal-weak coverage without re-deriving it from the
+        // manager name. Field absent for managers with full registry signals.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signals_note: Option<&'a str>,
     }
     #[derive(serde::Serialize)]
     struct OutcomeEnvelope<'a> {
@@ -679,6 +759,13 @@ fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeR
         })
         .collect();
 
+    // M6 ch1 — keep the banner owned at this scope so the borrow inside the
+    // envelope outlives the move into `CombinedEnvelope`.
+    let signals_banner_owned: Option<String> = if plan.manager.lacks_registry_adapter() {
+        Some(plan.manager.no_registry_adapter_banner())
+    } else {
+        None
+    };
     let analysis = AnalysisEnvelope {
         kind: "install_analysis",
         manager: plan.manager.label(),
@@ -688,6 +775,7 @@ fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeR
         packages,
         verdict: &plan.verdict,
         notes: &plan.notes,
+        signals_note: signals_banner_owned.as_deref(),
     };
 
     // Keep `spawn_error` owned at this scope so the borrow inside the
@@ -1003,6 +1091,14 @@ fn example_package(manager: PackageManager) -> &'static str {
         PackageManager::Npm => "left-pad",
         PackageManager::Pip => "requests",
         PackageManager::Cargo => "ripgrep",
+        PackageManager::Apt => "nginx",
+        PackageManager::Brew => "ripgrep",
+        PackageManager::Dnf => "httpd",
+        PackageManager::Yum => "httpd",
+        PackageManager::Pacman => "firefox",
+        PackageManager::Scoop => "neovim",
+        PackageManager::Docker => "alpine:latest",
+        PackageManager::Go => "github.com/spf13/cobra@latest",
     }
 }
 
@@ -1014,6 +1110,13 @@ fn print_plan_human(plan: &InstallPlan, online: bool) {
         plan.analysis_command
     );
     eprintln!("  (pre-execution install-risk analysis — not a sandbox)");
+    // M6 ch1 — when the manager has no registry adapter, surface the
+    // "signals are weak" banner up front so the operator sees the coverage
+    // gap before they read the verdict line. Same text shape for every new
+    // backend; matches the string the JSON envelope embeds.
+    if plan.manager.lacks_registry_adapter() {
+        eprintln!("  {}", plan.manager.no_registry_adapter_banner());
+    }
     eprintln!();
 
     // Per-package risk scores.
@@ -1265,6 +1368,42 @@ mod tests {
         assert_eq!(
             InstallSource::Cargo.package_manager(),
             Some(PackageManager::Cargo)
+        );
+        // M6 ch1 — the 8 new distro/docker/go backends map one-to-one onto
+        // `PackageManager`. A missing arm here would have a corresponding
+        // `package_manager()` panic at runtime; pinning the table catches
+        // it at compile-test time.
+        assert_eq!(
+            InstallSource::Apt.package_manager(),
+            Some(PackageManager::Apt)
+        );
+        assert_eq!(
+            InstallSource::Brew.package_manager(),
+            Some(PackageManager::Brew)
+        );
+        assert_eq!(
+            InstallSource::Dnf.package_manager(),
+            Some(PackageManager::Dnf)
+        );
+        assert_eq!(
+            InstallSource::Yum.package_manager(),
+            Some(PackageManager::Yum)
+        );
+        assert_eq!(
+            InstallSource::Pacman.package_manager(),
+            Some(PackageManager::Pacman)
+        );
+        assert_eq!(
+            InstallSource::Scoop.package_manager(),
+            Some(PackageManager::Scoop)
+        );
+        assert_eq!(
+            InstallSource::Docker.package_manager(),
+            Some(PackageManager::Docker)
+        );
+        assert_eq!(
+            InstallSource::Go.package_manager(),
+            Some(PackageManager::Go)
         );
         assert_eq!(InstallSource::Url.package_manager(), None);
     }

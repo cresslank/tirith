@@ -42,6 +42,15 @@ use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Verdict};
 /// The `url` form of `tirith install` is intentionally absent here: it is not
 /// a package-manager transaction and is handled by the CLI through
 /// [`crate::runner`] directly.
+///
+/// **M6 ch1** — extended with eight distro/docker/go backends. These ship
+/// command-complete (the right argv is built, the verdict carries the right
+/// `manager` label, threat-DB and command-shape rules run) but **signal-weak**:
+/// no registry adapter is wired for them, so `--online` provenance signals
+/// degrade to [`crate::package_risk::ApiSignals::Unavailable`] with the honest
+/// reason `"no registry adapter for <eco>"`. The CLI surfaces a banner saying
+/// so on every `tirith install <backend>` invocation, and threat-DB lookups
+/// for these ecosystems return empty until feed wiring extends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageManager {
     /// `npm install <pkg...>`
@@ -50,40 +59,143 @@ pub enum PackageManager {
     Pip,
     /// `cargo install <pkg...>`
     Cargo,
+    /// `apt-get install <pkg...>` — Debian/Ubuntu. The scriptable interface is
+    /// `apt-get`, not `apt` (per Debian docs `apt` is meant for interactive
+    /// use). One variant ↔ one program: there is no `apt`-vs-`apt-get`
+    /// ambiguity at the dispatch level.
+    Apt,
+    /// `brew install <pkg...>` — Homebrew, macOS / Linuxbrew.
+    Brew,
+    /// `dnf install <pkg...>` — Fedora / RHEL 8+.
+    Dnf,
+    /// `yum install <pkg...>` — RHEL 7 and earlier, still common in CI images.
+    Yum,
+    /// `pacman -S <pkg...>` — Arch / Manjaro. argv[1] is `-S` (the Sync
+    /// op flag), not a positional subcommand; this is encoded through
+    /// [`Self::install_subcommand`] so the generic argv builder stays
+    /// untouched.
+    Pacman,
+    /// `scoop install <pkg...>` — Windows-only command-line installer. The
+    /// dry-run analysis path runs on every OS; the real-run path is gated
+    /// behind `cfg!(target_os = "windows")` by the CLI so a Linux/macOS
+    /// operator cannot accidentally trigger a half-broken install.
+    Scoop,
+    /// `docker pull <image>[:<tag>|@<digest>]` — pulls an image; the install
+    /// subcommand is `pull`, not `install`. Image refs are parsed by
+    /// [`crate::parse::parse_docker_ref`] (the existing engine code path).
+    Docker,
+    /// `go install <module>[@<version>]` — the version suffix defaults to
+    /// `@latest` if not supplied, mirroring `go install`'s own default. Module
+    /// path parsing is local (a small split on `@`).
+    Go,
 }
 
 impl PackageManager {
     /// The program name to invoke (argv[0] of the real install).
+    ///
+    /// **One variant ↔ exactly one program.** No `"apt"|"apt-get"`
+    /// ambiguity: `Apt` always maps to `apt-get` because that is the
+    /// scriptable interface; `apt` itself is documented as for interactive
+    /// use only.
     pub fn program(self) -> &'static str {
         match self {
             PackageManager::Npm => "npm",
             PackageManager::Pip => "pip",
             PackageManager::Cargo => "cargo",
+            PackageManager::Apt => "apt-get",
+            PackageManager::Brew => "brew",
+            PackageManager::Dnf => "dnf",
+            PackageManager::Yum => "yum",
+            PackageManager::Pacman => "pacman",
+            PackageManager::Scoop => "scoop",
+            PackageManager::Docker => "docker",
+            PackageManager::Go => "go",
         }
     }
 
-    /// The install subcommand for this manager (`npm install`, `pip install`,
-    /// `cargo install`).
+    /// The install subcommand for this manager.
+    ///
+    /// Most are `install`. Docker uses `pull`. Pacman uses `-S` (the Sync
+    /// op flag — `pacman` has no positional subcommand). Encoding pacman's
+    /// `-S` through this method means [`build_argv`] stays generic: it
+    /// inserts `argv[1] = install_subcommand`, and that just happens to be
+    /// a flag for pacman.
     pub fn install_subcommand(self) -> &'static str {
-        // All three happen to use `install`; kept as a method so a future
-        // manager with a different verb (e.g. a hypothetical `add`) is a
-        // one-line change, not a scattered edit.
-        "install"
+        match self {
+            PackageManager::Docker => "pull",
+            PackageManager::Pacman => "-S",
+            // npm / pip / cargo / apt-get / brew / dnf / yum / scoop / go.
+            _ => "install",
+        }
     }
 
     /// The registry [`Ecosystem`] this manager installs from — the ecosystem
     /// the package-risk scorer is keyed on.
+    ///
+    /// The distro/docker/go ecosystems are present so the scorer's
+    /// per-package output can carry the right label; today no registry
+    /// adapter exists for them so `--online` signals degrade.
     pub fn ecosystem(self) -> Ecosystem {
         match self {
             PackageManager::Npm => Ecosystem::Npm,
             PackageManager::Pip => Ecosystem::PyPI,
             PackageManager::Cargo => Ecosystem::Crates,
+            PackageManager::Apt => Ecosystem::Apt,
+            PackageManager::Brew => Ecosystem::Brew,
+            PackageManager::Dnf => Ecosystem::Dnf,
+            PackageManager::Yum => Ecosystem::Yum,
+            PackageManager::Pacman => Ecosystem::Pacman,
+            PackageManager::Scoop => Ecosystem::Scoop,
+            PackageManager::Docker => Ecosystem::Docker,
+            PackageManager::Go => Ecosystem::Go,
         }
     }
 
-    /// Human label for output.
+    /// Human label for output. By default the same as [`Self::program`] —
+    /// for `Apt` we return `"apt"` instead of `"apt-get"` because that is
+    /// the user-facing CLI name even though `apt-get` is the scriptable
+    /// program we invoke.
     pub fn label(self) -> &'static str {
-        self.program()
+        match self {
+            PackageManager::Apt => "apt",
+            other => other.program(),
+        }
+    }
+
+    /// `true` when this manager has **no registry adapter** wired into
+    /// [`crate::registry_api`] today, so `--online` provenance signals
+    /// degrade to [`crate::package_risk::ApiSignals::Unavailable`] with the
+    /// reason `"no registry adapter for <eco>"`. The CLI uses this to
+    /// print a one-line "signals are weak" banner on every invocation.
+    ///
+    /// **Source of truth** lives in [`crate::registry_api`]'s `fetch`
+    /// dispatch; this method must agree with it. A future PR that wires an
+    /// adapter for one of these ecosystems flips this method's return value
+    /// to `false`, then the banner disappears.
+    pub fn lacks_registry_adapter(self) -> bool {
+        // Today only npm / pypi / crates.io have adapters.
+        !matches!(
+            self,
+            PackageManager::Npm | PackageManager::Pip | PackageManager::Cargo
+        )
+    }
+
+    /// The one-line banner printed (and embedded in JSON) when this manager
+    /// has no registry adapter. The plan's verbatim text is reproduced here.
+    pub fn no_registry_adapter_banner(self) -> String {
+        format!(
+            "note: registry-API provenance signals for {} are not available \
+             (no registry adapter); analysis relies on threat-DB name match \
+             and command-shape rules only",
+            self.label()
+        )
+    }
+
+    /// `true` when this manager runs the real install only on Windows
+    /// (currently just Scoop). The dry-run / analysis path runs on every
+    /// OS; the real-run path is gated by the CLI.
+    pub fn is_windows_only_runtime(self) -> bool {
+        matches!(self, PackageManager::Scoop)
     }
 }
 
@@ -263,8 +375,30 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
 
     // --- (2) + (3) package extraction and package-risk scoring ----------
     // Reuse the existing extractor rather than re-parsing the command line.
+    // For Npm / Pip / Cargo this is sufficient — the generic extractor
+    // recognizes those commands. For Docker and Go the manager-specific
+    // parser is authoritative (it parses image refs / module paths with
+    // versions, including the implicit-`latest` default for both), so for
+    // those two managers we *replace* the generic extractor's output with
+    // the manager-specific output to avoid emitting two PlannedPackage
+    // entries for the same `(ecosystem, name)`. For Apt / Brew / Dnf / Yum
+    // / Pacman / Scoop there is no public per-package registry to score
+    // against in M6 ch1 and the manager-specific parser intentionally
+    // returns empty — the verdict for those backends is command-shape
+    // analysis + the no-registry-adapter banner.
     let segments = tokenize::tokenize(&analysis_command, ShellType::Posix);
-    let extracted = threatintel::extract_packages(&segments);
+    let extracted: Vec<PackageRef> = match manager {
+        PackageManager::Docker | PackageManager::Go => {
+            extract_packages_manager_specific(manager, request.user_args)
+        }
+        _ => threatintel::extract_packages(&segments),
+    };
+
+    // M6 ch1 — the `schemeless_to_sink` false positive on `go install
+    // <module>` / `docker pull <image>` is suppressed at the engine layer
+    // in `extract.rs` (docker has a long-standing carve-out; go got one in
+    // M6 ch1 alongside this code). No additional install-side filtering
+    // needed here.
 
     // Keep only packages for this manager's ecosystem. `extract_packages`
     // recognizes every install command it sees; the synthesized command only
@@ -290,13 +424,30 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
     }
 
     if planned.is_empty() {
-        notes.push(format!(
-            "no installable package name found on the command line for {} — \
-             scoring covered the command shape only. A manifest-driven install \
-             (e.g. a lockfile or requirements file) has no package argument to \
-             score; run `tirith ecosystem scan` to assess a project's manifests.",
-            manager.label()
-        ));
+        // M6 ch1 — when the manager has no registry adapter (apt / brew /
+        // dnf / yum / pacman / scoop), we DO NOT score per-package risk
+        // even though a package name was given. The "no installable package
+        // name" wording would be confusing for `apt-get install nginx`
+        // (`nginx` IS the name — we just have no adapter). Use a
+        // backend-honest note in that case; for npm/pip/cargo keep the
+        // existing manifest-form pointer.
+        let note = if manager.lacks_registry_adapter() && !request.user_args.is_empty() {
+            format!(
+                "{} has no registry adapter wired into tirith yet, so per-package \
+                 risk scoring did NOT run (threat-DB name match + command-shape \
+                 rules only). The banner above carries the same signal.",
+                manager.label(),
+            )
+        } else {
+            format!(
+                "no installable package name found on the command line for {} — \
+                 scoring covered the command shape only. A manifest-driven install \
+                 (e.g. a lockfile or requirements file) has no package argument to \
+                 score; run `tirith ecosystem scan` to assess a project's manifests.",
+                manager.label(),
+            )
+        };
+        notes.push(note);
 
         // PR #121 fix-list item 1 — close the manifest-form install bypass.
         // Previously, when `planned.is_empty()` AND the user invoked a
@@ -560,6 +711,132 @@ pub fn build_argv(manager: PackageManager, user_args: &[String]) -> InstallArgv 
         program: manager.program().to_string(),
         args,
     }
+}
+
+/// M6 ch1 — manager-specific package extraction for the install backends
+/// the generic [`threatintel::extract_packages`] does not recognize.
+///
+/// Today this covers:
+///
+///  * `Docker` — parses `<image>[:<tag>|@<digest>]` arguments into
+///    [`PackageRef`]s keyed at `Ecosystem::Docker`. Uses
+///    [`crate::parse::parse_docker_ref`] (the existing engine code path) so
+///    a digest form, a registry prefix, and an implicit `library/` namespace
+///    all round-trip through one parser.
+///  * `Go` — parses `<module>[@<version>]` arguments into [`PackageRef`]s
+///    keyed at `Ecosystem::Go`, defaulting the version to `latest` when
+///    absent (mirroring `go install`'s own implicit default). Note the
+///    generic extractor *also* recognizes `go install pkg@v1`, so for
+///    explicit-version forms there is some overlap — the dedupe by
+///    `(ecosystem, name)` in the scoring loop tolerates duplicates.
+///
+/// For `Npm`, `Pip`, `Cargo`, `Apt`, `Brew`, `Dnf`, `Yum`, `Pacman`, `Scoop`
+/// this returns an empty vector: the first three are covered by the
+/// generic extractor; the last six have no public per-package registry to
+/// score against in M6 ch1 and intentionally produce no PackageRef. The
+/// verdict for those is command-shape analysis + the no-registry-adapter
+/// banner, not silent name-scoring.
+fn extract_packages_manager_specific(
+    manager: PackageManager,
+    user_args: &[String],
+) -> Vec<PackageRef> {
+    match manager {
+        PackageManager::Docker => parse_docker_specs(user_args),
+        PackageManager::Go => parse_go_specs(user_args),
+        // The covered-or-no-op managers — explicit so a future manager forces
+        // a decision here rather than silently inheriting "no extraction".
+        PackageManager::Npm
+        | PackageManager::Pip
+        | PackageManager::Cargo
+        | PackageManager::Apt
+        | PackageManager::Brew
+        | PackageManager::Dnf
+        | PackageManager::Yum
+        | PackageManager::Pacman
+        | PackageManager::Scoop => Vec::new(),
+    }
+}
+
+/// Parse Docker image-ref arguments into [`PackageRef`]s.
+///
+/// Accepts:
+///  * `<image>` (e.g. `alpine`) — implicit `library/` namespace, version
+///    `latest` (Docker's own default).
+///  * `<image>:<tag>` (e.g. `alpine:3.18`).
+///  * `<image>@<digest>` (e.g. `alpine@sha256:abcdef...`).
+///  * `<registry>/<image>[:tag|@digest]` (e.g. `ghcr.io/owner/img:v1`).
+///
+/// Tokens that start with `-` (flags) are skipped. The package `name` is the
+/// canonical `<registry-or-empty>/<image>` (with an implicit `library/`
+/// namespace expanded), and `version` carries the tag — or `sha256:...`
+/// when the spec used a digest form, prefixed so the audit line distinguishes.
+fn parse_docker_specs(user_args: &[String]) -> Vec<PackageRef> {
+    use crate::parse::{parse_docker_ref, UrlLike};
+    let mut out = Vec::new();
+    for arg in user_args {
+        if arg.starts_with('-') {
+            continue;
+        }
+        if let UrlLike::DockerRef {
+            registry,
+            image,
+            tag,
+            digest,
+        } = parse_docker_ref(arg)
+        {
+            let name = match registry {
+                Some(reg) => format!("{reg}/{image}"),
+                None => image,
+            };
+            let version = match (tag, digest) {
+                (_, Some(d)) => Some(d),
+                (Some(t), None) => Some(t),
+                (None, None) => Some("latest".to_string()),
+            };
+            out.push(PackageRef {
+                ecosystem: Ecosystem::Docker,
+                name,
+                version,
+            });
+        }
+    }
+    out
+}
+
+/// Parse Go module-spec arguments into [`PackageRef`]s.
+///
+/// Accepts:
+///  * `<module>` (e.g. `github.com/spf13/cobra`) — version defaults to
+///    `latest`, mirroring `go install`'s own implicit default.
+///  * `<module>@<version>` (e.g. `github.com/spf13/cobra@latest`,
+///    `github.com/spf13/cobra@v1.8.0`).
+///
+/// Tokens that start with `-` (flags) are skipped. A module path is
+/// minimally validated: it must contain at least one `.` or `/` to look
+/// like an import path. Otherwise the token is ignored (a plain word like
+/// `nginx` is not a Go module).
+fn parse_go_specs(user_args: &[String]) -> Vec<PackageRef> {
+    let mut out = Vec::new();
+    for arg in user_args {
+        if arg.starts_with('-') {
+            continue;
+        }
+        let (name, version) = match arg.rsplit_once('@') {
+            Some((n, v)) if !n.is_empty() && !v.is_empty() => (n, Some(v.to_string())),
+            _ => (arg.as_str(), Some("latest".to_string())),
+        };
+        // Conservative shape check — a Go module path is dotted or has a
+        // slash. `nginx` is rejected as a likely typo from a wrong source.
+        if !name.contains('.') && !name.contains('/') {
+            continue;
+        }
+        out.push(PackageRef {
+            ecosystem: Ecosystem::Go,
+            name: name.to_string(),
+            version,
+        });
+    }
+    out
 }
 
 /// Gather the [`PackageSignals`] for one package: name signals from the threat
@@ -1239,5 +1516,291 @@ mod tests {
         };
         let signals = crate::registry_api::gather_api_signals(&client, Ecosystem::Npm, "x");
         assert!(matches!(signals, ApiSignals::Available { .. }));
+    }
+
+    // ── M6 ch1 — distro / docker / go backends ─────────────────────────────
+
+    #[test]
+    fn package_manager_m6_ch1_program_label_and_ecosystem_mapping() {
+        // One variant ↔ one program. `Apt` maps to `apt-get` (the
+        // scriptable interface), not `apt`; its `label()` shows `apt` for
+        // the user-facing string.
+        assert_eq!(PackageManager::Apt.program(), "apt-get");
+        assert_eq!(PackageManager::Apt.label(), "apt");
+        assert_eq!(PackageManager::Brew.program(), "brew");
+        assert_eq!(PackageManager::Dnf.program(), "dnf");
+        assert_eq!(PackageManager::Yum.program(), "yum");
+        assert_eq!(PackageManager::Pacman.program(), "pacman");
+        assert_eq!(PackageManager::Scoop.program(), "scoop");
+        assert_eq!(PackageManager::Docker.program(), "docker");
+        assert_eq!(PackageManager::Go.program(), "go");
+
+        // install_subcommand: most use `install`; pacman uses `-S`; docker
+        // uses `pull`. argv[1] = install_subcommand by build_argv contract.
+        assert_eq!(PackageManager::Apt.install_subcommand(), "install");
+        assert_eq!(PackageManager::Brew.install_subcommand(), "install");
+        assert_eq!(PackageManager::Dnf.install_subcommand(), "install");
+        assert_eq!(PackageManager::Yum.install_subcommand(), "install");
+        assert_eq!(PackageManager::Pacman.install_subcommand(), "-S");
+        assert_eq!(PackageManager::Scoop.install_subcommand(), "install");
+        assert_eq!(PackageManager::Docker.install_subcommand(), "pull");
+        assert_eq!(PackageManager::Go.install_subcommand(), "install");
+
+        // Ecosystem mapping — each variant maps to its dedicated Ecosystem
+        // (Apt..=Docker), Go maps to the existing Ecosystem::Go.
+        assert_eq!(PackageManager::Apt.ecosystem(), Ecosystem::Apt);
+        assert_eq!(PackageManager::Brew.ecosystem(), Ecosystem::Brew);
+        assert_eq!(PackageManager::Dnf.ecosystem(), Ecosystem::Dnf);
+        assert_eq!(PackageManager::Yum.ecosystem(), Ecosystem::Yum);
+        assert_eq!(PackageManager::Pacman.ecosystem(), Ecosystem::Pacman);
+        assert_eq!(PackageManager::Scoop.ecosystem(), Ecosystem::Scoop);
+        assert_eq!(PackageManager::Docker.ecosystem(), Ecosystem::Docker);
+        assert_eq!(PackageManager::Go.ecosystem(), Ecosystem::Go);
+    }
+
+    #[test]
+    fn lacks_registry_adapter_matches_registry_api_dispatch() {
+        // Source of truth lives in `registry_api`'s `fetch` dispatch — these
+        // assertions pin the two in agreement. A future PR that wires an
+        // adapter must flip this method, or the banner becomes a lie.
+        assert!(!PackageManager::Npm.lacks_registry_adapter());
+        assert!(!PackageManager::Pip.lacks_registry_adapter());
+        assert!(!PackageManager::Cargo.lacks_registry_adapter());
+        assert!(PackageManager::Apt.lacks_registry_adapter());
+        assert!(PackageManager::Brew.lacks_registry_adapter());
+        assert!(PackageManager::Dnf.lacks_registry_adapter());
+        assert!(PackageManager::Yum.lacks_registry_adapter());
+        assert!(PackageManager::Pacman.lacks_registry_adapter());
+        assert!(PackageManager::Scoop.lacks_registry_adapter());
+        assert!(PackageManager::Docker.lacks_registry_adapter());
+        assert!(PackageManager::Go.lacks_registry_adapter());
+    }
+
+    #[test]
+    fn no_registry_adapter_banner_uses_manager_label() {
+        // The banner text is fixed and machine-readable — downstream tests
+        // / docs consumers depend on the exact wording.
+        let banner = PackageManager::Apt.no_registry_adapter_banner();
+        assert!(
+            banner.contains("apt"),
+            "banner must mention 'apt' (label, not 'apt-get'): {banner}"
+        );
+        assert!(
+            banner.contains("no registry adapter"),
+            "banner must call out the gap explicitly: {banner}"
+        );
+        assert!(
+            banner.contains("threat-DB name match and command-shape rules only"),
+            "banner must list the fallback signals: {banner}"
+        );
+        // Docker banner uses the docker label.
+        let dbanner = PackageManager::Docker.no_registry_adapter_banner();
+        assert!(dbanner.contains("docker"));
+    }
+
+    #[test]
+    fn build_argv_apt_inserts_install_subcommand() {
+        let argv = build_argv(PackageManager::Apt, &["nginx".to_string()]);
+        assert_eq!(argv.program, "apt-get");
+        assert_eq!(argv.args, vec!["install", "nginx"]);
+        assert_eq!(argv.display(), "apt-get install nginx");
+    }
+
+    #[test]
+    fn build_argv_pacman_inserts_sync_flag_at_argv1() {
+        // pacman has no positional subcommand — argv[1] is `-S` (Sync).
+        // build_argv is generic: install_subcommand("-S") goes at argv[1].
+        let argv = build_argv(PackageManager::Pacman, &["firefox".to_string()]);
+        assert_eq!(argv.program, "pacman");
+        assert_eq!(argv.args, vec!["-S", "firefox"]);
+        assert_eq!(argv.display(), "pacman -S firefox");
+    }
+
+    #[test]
+    fn build_argv_docker_uses_pull_not_install() {
+        let argv = build_argv(PackageManager::Docker, &["alpine:latest".to_string()]);
+        assert_eq!(argv.program, "docker");
+        assert_eq!(argv.args, vec!["pull", "alpine:latest"]);
+    }
+
+    #[test]
+    fn parse_docker_specs_handles_tag_digest_and_implicit_namespace() {
+        // Implicit `library/` namespace, no tag → version defaults to `latest`.
+        let pkgs = parse_docker_specs(&["alpine".to_string()]);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].ecosystem, Ecosystem::Docker);
+        assert_eq!(pkgs[0].name, "library/alpine");
+        assert_eq!(pkgs[0].version.as_deref(), Some("latest"));
+
+        // Explicit tag.
+        let pkgs = parse_docker_specs(&["alpine:3.18".to_string()]);
+        assert_eq!(pkgs[0].version.as_deref(), Some("3.18"));
+
+        // Digest form — version carries `sha256:...` so the audit row
+        // distinguishes immutable vs mutable refs.
+        let pkgs = parse_docker_specs(&["alpine@sha256:abcdef0123456789".to_string()]);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].version.as_deref(), Some("sha256:abcdef0123456789"));
+
+        // Registry prefix preserved.
+        let pkgs = parse_docker_specs(&["ghcr.io/owner/img:v1".to_string()]);
+        assert_eq!(pkgs[0].name, "ghcr.io/owner/img");
+        assert_eq!(pkgs[0].version.as_deref(), Some("v1"));
+
+        // Flags are skipped.
+        let pkgs =
+            parse_docker_specs(&["--platform=linux/amd64".to_string(), "alpine".to_string()]);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "library/alpine");
+    }
+
+    #[test]
+    fn parse_go_specs_defaults_version_to_latest() {
+        // No `@version` → defaults to `latest`.
+        let pkgs = parse_go_specs(&["github.com/spf13/cobra".to_string()]);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].ecosystem, Ecosystem::Go);
+        assert_eq!(pkgs[0].name, "github.com/spf13/cobra");
+        assert_eq!(pkgs[0].version.as_deref(), Some("latest"));
+
+        // Explicit @latest.
+        let pkgs = parse_go_specs(&["github.com/spf13/cobra@latest".to_string()]);
+        assert_eq!(pkgs[0].version.as_deref(), Some("latest"));
+
+        // Explicit @v1.8.0.
+        let pkgs = parse_go_specs(&["github.com/spf13/cobra@v1.8.0".to_string()]);
+        assert_eq!(pkgs[0].version.as_deref(), Some("v1.8.0"));
+
+        // A bare word that does not look like a module path is skipped —
+        // `nginx` is not a Go module, even though it might be a Go binary
+        // someone confused.
+        let pkgs = parse_go_specs(&["nginx".to_string()]);
+        assert!(
+            pkgs.is_empty(),
+            "non-module-shaped names must not be parsed"
+        );
+
+        // Flags are skipped.
+        let pkgs = parse_go_specs(&["-v".to_string(), "github.com/x/y".to_string()]);
+        assert_eq!(pkgs.len(), 1);
+    }
+
+    #[test]
+    fn plan_install_apt_emits_banner_via_lacks_registry_adapter() {
+        // M6 ch1 acceptance — an apt install plan reaches ALLOW (the
+        // command-shape rules don't fire on `apt-get install nginx`), the
+        // packages list is empty (no registry adapter, no scoring), and the
+        // manager carries the lacks-registry-adapter flag so the CLI shows
+        // the banner.
+        let req = PlanRequest {
+            manager: PackageManager::Apt,
+            user_args: &["nginx".to_string()],
+            db: None,
+            policy: &empty_policy(),
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        };
+        let plan = plan_install(&req);
+        assert_eq!(
+            plan.verdict.action,
+            Action::Allow,
+            "apt-get install nginx must Allow: {:?}",
+            plan.verdict.findings,
+        );
+        assert!(
+            plan.packages.is_empty(),
+            "apt has no registry adapter — no scoring"
+        );
+        assert!(plan.manager.lacks_registry_adapter());
+    }
+
+    #[test]
+    fn plan_install_docker_pull_extracts_image_ref() {
+        let req = PlanRequest {
+            manager: PackageManager::Docker,
+            user_args: &["alpine:latest".to_string()],
+            db: None,
+            policy: &empty_policy(),
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        };
+        let plan = plan_install(&req);
+        assert_eq!(plan.argv.display(), "docker pull alpine:latest");
+        assert_eq!(
+            plan.verdict.action,
+            Action::Allow,
+            "docker pull alpine:latest must Allow: {:?}",
+            plan.verdict.findings,
+        );
+        assert_eq!(plan.packages.len(), 1, "docker image ref must be extracted");
+        assert_eq!(plan.packages[0].reference.ecosystem, Ecosystem::Docker);
+        assert_eq!(plan.packages[0].reference.name, "library/alpine");
+        assert_eq!(
+            plan.packages[0].reference.version.as_deref(),
+            Some("latest")
+        );
+    }
+
+    #[test]
+    fn plan_install_go_install_extracts_module_with_default_latest() {
+        // No `@version` — the manager-specific parser defaults to `latest`,
+        // mirroring `go install`'s own behavior.
+        let req = PlanRequest {
+            manager: PackageManager::Go,
+            user_args: &["github.com/spf13/cobra".to_string()],
+            db: None,
+            policy: &empty_policy(),
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        };
+        let plan = plan_install(&req);
+        assert_eq!(
+            plan.verdict.action,
+            Action::Allow,
+            "go install github.com/spf13/cobra must Allow (no schemeless-sink FP): {:?}",
+            plan.verdict.findings,
+        );
+        assert_eq!(plan.packages.len(), 1);
+        assert_eq!(plan.packages[0].reference.name, "github.com/spf13/cobra");
+        assert_eq!(
+            plan.packages[0].reference.version.as_deref(),
+            Some("latest")
+        );
+    }
+
+    #[test]
+    fn plan_install_distro_no_registry_adapter_note_is_specific() {
+        // For distro backends the "no installable package name" note would be
+        // misleading (nginx IS the name — we just have no adapter). The note
+        // must instead say so explicitly so the operator isn't confused.
+        let req = PlanRequest {
+            manager: PackageManager::Brew,
+            user_args: &["ripgrep".to_string()],
+            db: None,
+            policy: &empty_policy(),
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        };
+        let plan = plan_install(&req);
+        assert!(
+            plan.notes.iter().any(|n| n.contains("no registry adapter")),
+            "the note must point at the missing-adapter gap: {:?}",
+            plan.notes,
+        );
+        // The legacy "no installable package name" wording must NOT appear
+        // for a backend with a name on the command line.
+        assert!(
+            !plan
+                .notes
+                .iter()
+                .any(|n| n.contains("no installable package name")),
+            "distro backends with a name on the command line must NOT show the \
+             misleading legacy note: {:?}",
+            plan.notes,
+        );
     }
 }

@@ -540,10 +540,32 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
                 // host:/home/user/` trips on both the local filename (`.asdf`
                 // TLD shape) and the remote spec (`host:path` shape).
                 let is_remote_copy = matches!(cmd.name.as_str(), "scp" | "rsync");
+                // M6 ch1 — `go install <module>` / `go get <module>` take a
+                // Go module path as a positional. That path looks like a
+                // schemeless host/path (`github.com/spf13/cobra`), so the
+                // schemeless-in-sink rule would fire on every `go install`,
+                // turning `tirith install go ...` into a forced WARN.
+                // Carve out args AFTER the `install` / `get` subcommand for
+                // the `go` command; the args before (the subcommand itself
+                // and any flags) are unaffected. A scheme-full URL still
+                // gets caught by URL_REGEX earlier in this function.
+                let go_install_skip_from = if cmd.name == "go" {
+                    cmd.args
+                        .iter()
+                        .position(|a| matches!(a.to_lowercase().as_str(), "install" | "get"))
+                        .map(|pos| pos + 1)
+                } else {
+                    None
+                };
                 for (arg_idx, arg) in cmd.args.iter().enumerate() {
                     // Skip args that are output-file flag values
                     if is_output_flag_value(&cmd.name, cmd.args, arg_idx) {
                         continue;
+                    }
+                    if let Some(skip_from) = go_install_skip_from {
+                        if arg_idx >= skip_from {
+                            continue;
+                        }
                     }
                     let clean = strip_quotes(arg);
                     if is_remote_copy {

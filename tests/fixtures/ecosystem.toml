@@ -498,3 +498,77 @@ input = "brew tap homebrew/cask-fonts"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# ── M6 ch1 — distro / docker / go install backends ─────────────────────
+#
+# Minimal positive fixtures that pin the analyzer accepts the command
+# shape `tirith install` synthesizes for each new backend. The verdict is
+# ALLOW for every line: no command-shape rule should fire on a benign
+# `apt-get install nginx` form, and the M6 ch1 "no registry adapter"
+# banner is a CLI-level concern (no rule fires from it). These backends
+# share extraction with the existing install-command rules, so a
+# regression that turned the plain forms into WARN would block adoption.
+
+[[fixture]]
+name = "install_apt_plain_pkg_allow"
+min_milestone = 6
+input = "apt-get install nginx"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "install_brew_plain_pkg_allow"
+min_milestone = 6
+input = "brew install ripgrep"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "install_dnf_plain_pkg_allow"
+min_milestone = 6
+input = "dnf install httpd"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "install_yum_plain_pkg_allow"
+min_milestone = 6
+input = "yum install httpd"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "install_pacman_plain_pkg_allow"
+min_milestone = 6
+input = "pacman -S firefox"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "install_scoop_plain_pkg_allow"
+min_milestone = 6
+input = "scoop install neovim"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "install_docker_pull_plain_allow"
+min_milestone = 6
+input = "docker pull alpine:latest"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "install_go_install_plain_allow"
+min_milestone = 6
+input = "go install github.com/spf13/cobra@latest"
+context = "exec"
+expected_action = "allow"
+expected_rules = []

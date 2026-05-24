@@ -61,6 +61,12 @@ static VERIFY_KEY_BYTES: &[u8; PUBLIC_KEY_LENGTH] =
     include_bytes!("../assets/keys/threatdb-verify.pub");
 
 /// Package ecosystem identifiers, encoded as a single byte in the DB.
+///
+/// **Discriminants are part of the on-disk threat-DB binary format and must
+/// stay stable.** Variants `Npm..=Packagist` (0..=7) ship in every signed DB.
+/// `Apt..=Docker` (8..=14) were added in M6 ch1 for the distro/docker/go
+/// `tirith install` backends; no signed DB currently emits these byte values,
+/// but the decoder accepts them so a future feed wiring is a one-line change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum Ecosystem {
@@ -72,6 +78,16 @@ pub enum Ecosystem {
     Maven = 5,
     NuGet = 6,
     Packagist = 7,
+    // M6 ch1 — distro / docker backends for `tirith install`. These ship
+    // command-complete but signal-weak: no registry adapter, so threat-DB
+    // lookups for them are empty until feed wiring extends.
+    Apt = 8,
+    Brew = 9,
+    Dnf = 10,
+    Yum = 11,
+    Pacman = 12,
+    Scoop = 13,
+    Docker = 14,
 }
 
 impl std::fmt::Display for Ecosystem {
@@ -85,6 +101,13 @@ impl std::fmt::Display for Ecosystem {
             Ecosystem::Maven => write!(f, "maven"),
             Ecosystem::NuGet => write!(f, "nuget"),
             Ecosystem::Packagist => write!(f, "packagist"),
+            Ecosystem::Apt => write!(f, "apt"),
+            Ecosystem::Brew => write!(f, "brew"),
+            Ecosystem::Dnf => write!(f, "dnf"),
+            Ecosystem::Yum => write!(f, "yum"),
+            Ecosystem::Pacman => write!(f, "pacman"),
+            Ecosystem::Scoop => write!(f, "scoop"),
+            Ecosystem::Docker => write!(f, "docker"),
         }
     }
 }
@@ -100,6 +123,13 @@ impl Ecosystem {
             5 => Some(Self::Maven),
             6 => Some(Self::NuGet),
             7 => Some(Self::Packagist),
+            8 => Some(Self::Apt),
+            9 => Some(Self::Brew),
+            10 => Some(Self::Dnf),
+            11 => Some(Self::Yum),
+            12 => Some(Self::Pacman),
+            13 => Some(Self::Scoop),
+            14 => Some(Self::Docker),
             _ => None,
         }
     }
@@ -116,6 +146,13 @@ impl Ecosystem {
             "maven" => Some(Self::Maven),
             "nuget" => Some(Self::NuGet),
             "packagist" => Some(Self::Packagist),
+            "apt" | "apt-get" => Some(Self::Apt),
+            "brew" | "homebrew" => Some(Self::Brew),
+            "dnf" => Some(Self::Dnf),
+            "yum" => Some(Self::Yum),
+            "pacman" => Some(Self::Pacman),
+            "scoop" => Some(Self::Scoop),
+            "docker" | "oci" => Some(Self::Docker),
             _ => None,
         }
     }
@@ -2913,5 +2950,67 @@ mod tests {
         }
         assert_eq!(bd.typosquat_count, 0);
         assert_eq!(bd.popular_count, 0);
+    }
+
+    /// M6 ch1 — the `Ecosystem` discriminants are part of the on-disk threat-DB
+    /// binary format. A renumber would silently misread every signed DB shipped
+    /// to date (a record with byte `4` would round-trip to a different variant
+    /// than the one CI wrote). Pin them contiguously at the values they ship at.
+    ///
+    /// `Apt..=Docker` (8..=14) were added in M6 ch1 — they extend the sequence
+    /// rather than reusing earlier values, which is what keeps existing DBs
+    /// readable.
+    #[test]
+    fn test_ecosystem_discriminants_are_contiguous() {
+        // Existing (must NEVER change — they are written by signed DBs).
+        assert_eq!(Ecosystem::Npm as u8, 0);
+        assert_eq!(Ecosystem::PyPI as u8, 1);
+        assert_eq!(Ecosystem::RubyGems as u8, 2);
+        assert_eq!(Ecosystem::Crates as u8, 3);
+        assert_eq!(Ecosystem::Go as u8, 4);
+        assert_eq!(Ecosystem::Maven as u8, 5);
+        assert_eq!(Ecosystem::NuGet as u8, 6);
+        assert_eq!(Ecosystem::Packagist as u8, 7);
+        // M6 ch1 additions — appended, not inserted.
+        assert_eq!(Ecosystem::Apt as u8, 8);
+        assert_eq!(Ecosystem::Brew as u8, 9);
+        assert_eq!(Ecosystem::Dnf as u8, 10);
+        assert_eq!(Ecosystem::Yum as u8, 11);
+        assert_eq!(Ecosystem::Pacman as u8, 12);
+        assert_eq!(Ecosystem::Scoop as u8, 13);
+        assert_eq!(Ecosystem::Docker as u8, 14);
+        // `from_u8` decodes every value back to its variant, and unknown
+        // bytes return `None` (so a future DB with a higher byte value is
+        // tolerated as "ignored" rather than mis-decoded).
+        for v in 0u8..=14 {
+            let eco = Ecosystem::from_u8(v).expect("must decode");
+            assert_eq!(eco as u8, v, "round-trip failed for byte {v}");
+        }
+        assert!(Ecosystem::from_u8(255).is_none());
+    }
+
+    /// M6 ch1 — threat-DB lookups for the new ecosystems (no feed wiring yet)
+    /// must return empty without panicking. Pins the graceful-no-data path so
+    /// `tirith install apt nginx` does not crash on a populated DB that simply
+    /// carries no `apt` records.
+    #[test]
+    fn test_new_ecosystem_lookups_are_empty_no_panic() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+        for eco in [
+            Ecosystem::Apt,
+            Ecosystem::Brew,
+            Ecosystem::Dnf,
+            Ecosystem::Yum,
+            Ecosystem::Pacman,
+            Ecosystem::Scoop,
+            Ecosystem::Docker,
+        ] {
+            assert!(db.check_package(eco, "nginx", Some("1.0.0")).is_none());
+            assert!(db.check_package(eco, "nginx", None).is_none());
+            assert!(!db.is_popular_package(eco, "nginx"));
+            assert!(db.check_typosquat(eco, "nginx").is_none());
+            assert!(db.check_popular_distance(eco, "nginx").is_none());
+        }
     }
 }

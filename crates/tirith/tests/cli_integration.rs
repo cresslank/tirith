@@ -3649,6 +3649,152 @@ fn install_url_extra_args_is_usage_error() {
 }
 
 // ---------------------------------------------------------------------------
+// M6 ch1 — distro / docker / go install backends.
+//
+// Each smoke test runs `tirith install <backend> <pkg> --no-exec`. Acceptance:
+//   * exits 0 — the dry-run path reaches ALLOW for a benign package;
+//   * stderr carries the no-registry-adapter banner (signal-weak coverage is
+//     explicit, not silent);
+//   * `--format json` carries `analysis.manager == <backend label>` and
+//     `analysis.signals_note` is the same banner string;
+//   * no real install is invoked (the binary spawned by `tirith install` is
+//     never reached because `--no-exec` short-circuits before run-and-record).
+//
+// `TIRITH_OFFLINE=1` is inherited from `tirith_install()` so even a stray
+// `--online` would be a no-op.
+// ---------------------------------------------------------------------------
+
+/// Drive a `tirith install <backend> <pkg> --no-exec` smoke test and assert
+/// the M6 ch1 invariants: exit 0, banner on stderr, banner in JSON.
+///
+/// `backend` is the source token (`apt`, `brew`, …). `pkg` is one example
+/// package per backend; `manager_label` is the human label `tirith install`
+/// reports back (`apt-get` vs `apt`, etc. — see `PackageManager::label`).
+fn run_install_backend_smoke(backend: &str, pkg: &str, manager_label: &str) {
+    // Human form — banner on stderr, exit 0.
+    let out = tirith_install()
+        .args(["install", "--no-exec", backend, pkg])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run tirith install {backend}: {e}"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "`tirith install --no-exec {backend} {pkg}` must exit 0, \
+         got exit={:?}, stderr:\n{stderr}",
+        out.status.code(),
+    );
+    assert!(
+        stderr.contains("no registry adapter"),
+        "{backend}: stderr must carry the no-registry-adapter banner, got:\n{stderr}",
+    );
+    assert!(
+        stderr.contains(manager_label),
+        "{backend}: banner must mention the manager label '{manager_label}', got:\n{stderr}",
+    );
+
+    // JSON form — banner embedded in `analysis.signals_note`, exit 0.
+    let out = tirith_install()
+        .args(["install", "--no-exec", "--format", "json", backend, pkg])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run tirith install --format json {backend}: {e}"));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "`tirith install --no-exec --format json {backend} {pkg}` must exit 0, \
+         got exit={:?}, stderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "{backend}: --format json must produce valid JSON, parse error: {e}\nstdout:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+        )
+    });
+    assert_eq!(json["kind"], "install");
+    let analysis = &json["analysis"];
+    assert_eq!(
+        analysis["manager"], manager_label,
+        "{backend}: analysis.manager must be '{manager_label}', got: {analysis}",
+    );
+    assert_eq!(
+        analysis["sandboxed"], false,
+        "{backend}: must never claim to sandbox"
+    );
+    let signals_note = analysis["signals_note"].as_str().unwrap_or_else(|| {
+        panic!("{backend}: analysis.signals_note must be present, got: {analysis}")
+    });
+    assert!(
+        signals_note.contains("no registry adapter"),
+        "{backend}: signals_note must carry the no-registry-adapter banner, got: {signals_note}",
+    );
+    assert!(
+        json["outcome"].is_null(),
+        "{backend}: --no-exec must report outcome: null, got: {}",
+        json["outcome"],
+    );
+}
+
+#[test]
+fn install_apt_smoke() {
+    run_install_backend_smoke("apt", "nginx", "apt");
+}
+
+#[test]
+fn install_brew_smoke() {
+    run_install_backend_smoke("brew", "ripgrep", "brew");
+}
+
+#[test]
+fn install_dnf_smoke() {
+    run_install_backend_smoke("dnf", "httpd", "dnf");
+}
+
+#[test]
+fn install_yum_smoke() {
+    run_install_backend_smoke("yum", "httpd", "yum");
+}
+
+#[test]
+fn install_pacman_smoke() {
+    run_install_backend_smoke("pacman", "firefox", "pacman");
+}
+
+#[test]
+fn install_scoop_smoke() {
+    // Acceptance criterion explicitly calls out scoop must exit 0 on macOS
+    // too — the dry-run path is OS-independent; the real-run path is gated.
+    run_install_backend_smoke("scoop", "neovim", "scoop");
+}
+
+#[test]
+fn install_docker_smoke_tag() {
+    run_install_backend_smoke("docker", "alpine:latest", "docker");
+}
+
+#[test]
+fn install_docker_smoke_digest() {
+    // Digest form `alpine@sha256:abc...` must parse, exit 0, banner present.
+    run_install_backend_smoke(
+        "docker",
+        "alpine@sha256:abcdef0123456789012345678901234567890123456789012345678901234567",
+        "docker",
+    );
+}
+
+#[test]
+fn install_go_smoke_explicit_version() {
+    run_install_backend_smoke("go", "github.com/spf13/cobra@latest", "go");
+}
+
+#[test]
+fn install_go_smoke_default_version() {
+    // No `@version` — the parser defaults to `latest` (matching `go install`).
+    run_install_backend_smoke("go", "github.com/spf13/cobra", "go");
+}
+
+// ---------------------------------------------------------------------------
 // `tirith ecosystem scan` — project dependency-manifest supply-chain scan.
 //
 // Every test runs the real binary but MUST NOT hit the network:

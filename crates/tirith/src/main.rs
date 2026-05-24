@@ -170,6 +170,21 @@ the URL analysis. A block refuses (bypass per policy); a warn requires
 acknowledgement; an allow proceeds. Offline by default — `--online` adds
 registry-API provenance signals; `--offline` / TIRITH_OFFLINE forces offline.
 
+Backends (M6 ch1): npm, pip, cargo, apt, brew, dnf, yum, pacman, scoop,
+docker, go, url. Today only npm / pip / cargo have a registry adapter wired
+in, so `--online` provenance signals are available for those three only;
+apt / brew / dnf / yum / pacman / scoop / docker / go ship command-complete
+but signal-weak — analysis relies on the threat-DB name match and the
+command-shape rules. A banner on every invocation says so plainly.
+
+Privilege escalation: apt / dnf / yum typically need root (`sudo apt-get
+install -y foo`). tirith does NOT auto-insert sudo — silent escalation would
+be a surprise-execution footgun. Run the command itself with sudo when
+required.
+
+OS gating: scoop is Windows-only at the real-run step (the `--no-exec`
+dry-run path still works on every OS, so review-on-Mac is fine).
+
 tirith's own flags (--online, --offline, --no-exec, --yes, --format, --sha256)
 go BEFORE the <source>; everything AFTER the source is passed verbatim to the
 package manager (so `--save-dev` reaches npm, not tirith).
@@ -180,9 +195,18 @@ Examples:
   tirith install --yes cargo ripgrep
   tirith install --no-exec npm some-pkg       # analyze only, do not install
   tirith install npm some-pkg --save-dev      # --save-dev is passed to npm
+  tirith install apt nginx                    # M6 ch1: signal-weak banner
+  tirith install brew ripgrep
+  tirith install docker alpine:latest
+  tirith install docker alpine@sha256:abcdef0123...
+  tirith install go github.com/spf13/cobra@latest
+  tirith install scoop neovim                 # --no-exec on non-Windows
   tirith install url https://get.example-tool.sh")]
     Install {
-        /// What to install: a package manager (npm, pip, cargo) or a URL
+        /// What to install: npm, pip, cargo, apt, brew, dnf, yum, pacman,
+        /// scoop, docker, go, or url. The distro/docker/go backends ship
+        /// command-complete but signal-weak (no registry-API adapter); the
+        /// CLI prints a banner saying so on every invocation.
         #[arg(value_enum)]
         source: cli::install::InstallSource,
 

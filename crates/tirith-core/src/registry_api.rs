@@ -127,10 +127,14 @@ impl FetchError {
     /// An honest, human-readable explanation for [`ApiSignals::Unavailable`].
     pub fn reason(&self) -> String {
         match self {
-            FetchError::UnsupportedEcosystem(eco) => format!(
-                "the {eco} ecosystem has no registry API wired into tirith yet — \
-                 registry-API signals are available for npm, pypi, and crates.io"
-            ),
+            FetchError::UnsupportedEcosystem(eco) => {
+                // M6 ch1 — short, machine-friendly reason for the
+                // distro/docker/go ecosystems whose `tirith install` backends
+                // ship command-complete but signal-weak. The CLI surfaces
+                // this verbatim as `api signals: unavailable — no registry
+                // adapter for <eco>`.
+                format!("no registry adapter for {eco}")
+            }
             FetchError::InvalidName => {
                 "the package name is not a valid registry name (it contains a path-traversal \
                  segment or a stray '/') — no registry request was made, scored with offline \
