@@ -2200,6 +2200,9 @@ fn assess_dependency(
     let signals = PackageSignals {
         ecosystem: dep.ecosystem,
         name: dep.name.clone(),
+        // M6 ch6 — manifest-declared version (when the manifest specifies one)
+        // is carried through to OSV correlation downstream.
+        version: dep.version.clone(),
         threat_db_missing: request.db.is_none(),
         name_vs_popular: name_vs_popular.clone(),
         malicious_typosquat_of,
@@ -2731,6 +2734,7 @@ gem 'toplevelgem'
         let signals = PackageSignals {
             ecosystem: Ecosystem::Npm,
             name: name.to_string(),
+            version: None,
             threat_db_missing: false,
             name_vs_popular,
             malicious_typosquat_of,
@@ -2848,6 +2852,7 @@ gem 'toplevelgem'
         // We build a fully-loaded `ApiProvenance` so the api_factors stack
         // enough points to cross the High threshold (>= 51). The package name
         // is unknown to the (absent) threat DB, so name signals fire nothing.
+        #[allow(deprecated)]
         let provenance = package_risk::ApiProvenance {
             source: "npm".to_string(),
             package_age_days: Some(1),
@@ -2858,10 +2863,12 @@ gem 'toplevelgem'
             has_source_repo: Some(false),
             yanked_or_deprecated: true,
             latest_version: Some("9.9.9".to_string()),
+            ..Default::default()
         };
         let signals = PackageSignals {
             ecosystem: Ecosystem::Npm,
             name: "totally-unknown-pkg".to_string(),
+            version: None,
             threat_db_missing: false,
             name_vs_popular: NameVsPopular::Unknown,
             malicious_typosquat_of: None,
@@ -2919,6 +2926,7 @@ gem 'toplevelgem'
         let signals = PackageSignals {
             ecosystem: Ecosystem::Npm,
             name: "ordinary-pkg".to_string(),
+            version: None,
             threat_db_missing: false,
             name_vs_popular: NameVsPopular::Unknown,
             malicious_typosquat_of: None,

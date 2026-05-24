@@ -104,12 +104,18 @@ fn npm_404_degrades_to_unavailable() {
         .create();
 
     let client = HttpRegistryClient::with_base_url_for_test(&server.url());
-    // The full signal-gathering path must degrade a 404 to Unavailable.
-    let sig =
+    // The full signal-gathering path must degrade a 404 to Unavailable AND
+    // surface a positive `PackageExistence::NotFound` (M6 ch6).
+    let (sig, existence) =
         tirith_core::registry_api::gather_api_signals(&client, Ecosystem::Npm, "ghost-package");
     assert!(
         matches!(sig, ApiSignals::Unavailable { .. }),
         "a 404 must degrade to ApiSignals::Unavailable, not crash"
+    );
+    assert_eq!(
+        existence,
+        tirith_core::package_risk::PackageExistence::NotFound,
+        "M6 ch6: a 404 must surface as NotFound, distinct from Unknown"
     );
 }
 
@@ -123,8 +129,14 @@ fn npm_500_degrades_to_unavailable() {
         .create();
 
     let client = HttpRegistryClient::with_base_url_for_test(&server.url());
-    let sig = tirith_core::registry_api::gather_api_signals(&client, Ecosystem::Npm, "broken");
+    let (sig, existence) =
+        tirith_core::registry_api::gather_api_signals(&client, Ecosystem::Npm, "broken");
     assert!(matches!(sig, ApiSignals::Unavailable { .. }));
+    assert_eq!(
+        existence,
+        tirith_core::package_risk::PackageExistence::Unknown,
+        "M6 ch6: a 500 is honest no-data (Unknown), not a positive NotFound"
+    );
 }
 
 #[test]
@@ -137,7 +149,8 @@ fn npm_garbage_body_degrades_to_unavailable() {
         .create();
 
     let client = HttpRegistryClient::with_base_url_for_test(&server.url());
-    let sig = tirith_core::registry_api::gather_api_signals(&client, Ecosystem::Npm, "weird");
+    let (sig, _existence) =
+        tirith_core::registry_api::gather_api_signals(&client, Ecosystem::Npm, "weird");
     assert!(
         matches!(sig, ApiSignals::Unavailable { .. }),
         "an unparseable body must degrade gracefully"
@@ -260,7 +273,7 @@ fn online_score_folds_in_api_factors_end_to_end() {
         .create();
 
     let client = HttpRegistryClient::with_base_url_for_test(&server.url());
-    let api =
+    let (api, _existence) =
         tirith_core::registry_api::gather_api_signals(&client, Ecosystem::Crates, "evil-crate");
     assert!(matches!(api, ApiSignals::Available { .. }));
 
@@ -268,6 +281,7 @@ fn online_score_folds_in_api_factors_end_to_end() {
     let signals = PackageSignals {
         ecosystem: Ecosystem::Crates,
         name: "evil-crate".to_string(),
+        version: None,
         threat_db_missing: true,
         name_vs_popular: NameVsPopular::Unknown,
         malicious_typosquat_of: None,
@@ -315,7 +329,8 @@ fn unsupported_ecosystem_degrades_without_network() {
     // even attempt a request (the mock server has no matching route).
     let server = mockito::Server::new();
     let client = HttpRegistryClient::with_base_url_for_test(&server.url());
-    let sig = tirith_core::registry_api::gather_api_signals(&client, Ecosystem::Go, "anything");
+    let (sig, _existence) =
+        tirith_core::registry_api::gather_api_signals(&client, Ecosystem::Go, "anything");
     match sig {
         ApiSignals::Unavailable { reason } => {
             assert!(
@@ -357,11 +372,14 @@ fn npm_ownerless_established_package_flags_ownership() {
         "npm exposes maintainers; this package lists zero"
     );
     let prov = tirith_core::registry_api::provenance_from_metadata(&meta);
-    assert_eq!(
-        prov.ownership_transferred,
-        Some(true),
-        "an ownerless established npm package must flag the ownership signal"
-    );
+    #[allow(deprecated)]
+    {
+        assert_eq!(
+            prov.ownership_transferred,
+            Some(true),
+            "an ownerless established npm package must flag the ownership signal"
+        );
+    }
 }
 
 #[test]
@@ -392,14 +410,18 @@ fn pypi_ownership_signal_is_unknown_not_false_positive() {
         "the PyPI API carries no maintainers field"
     );
     let prov = tirith_core::registry_api::provenance_from_metadata(&meta);
-    assert_eq!(
-        prov.ownership_transferred, None,
-        "PyPI ownership must be unknown, not a false-positive transfer"
-    );
+    #[allow(deprecated)]
+    {
+        assert_eq!(
+            prov.ownership_transferred, None,
+            "PyPI ownership must be unknown, not a false-positive transfer"
+        );
+    }
     // And therefore no ownership factor in the score.
     let signals = PackageSignals {
         ecosystem: Ecosystem::PyPI,
         name: "flask".to_string(),
+        version: None,
         threat_db_missing: true,
         name_vs_popular: NameVsPopular::KnownPopular,
         malicious_typosquat_of: None,
@@ -430,7 +452,7 @@ fn npm_response_over_size_cap_degrades() {
         .create();
 
     let client = HttpRegistryClient::with_base_url_for_test(&server.url());
-    let sig =
+    let (sig, _existence) =
         tirith_core::registry_api::gather_api_signals(&client, Ecosystem::Npm, "huge-package");
     assert!(
         matches!(sig, ApiSignals::Unavailable { .. }),

@@ -872,6 +872,9 @@ fn gather_package_signals(
     PackageSignals {
         ecosystem: eco,
         name: pkg.name.clone(),
+        // M6 ch6 — carry version through from the install-extractor's parse
+        // so OSV correlation can pin to (eco, name, version) downstream.
+        version: pkg.version.clone(),
         threat_db_missing: db.is_none(),
         name_vs_popular,
         malicious_typosquat_of,
@@ -1366,6 +1369,7 @@ mod tests {
         // source repo, yanked. That stacks to a high aggregate score with no
         // name tell — exactly the chunk-6 value the engine alone misses.
         use crate::package_risk::ApiProvenance;
+        #[allow(deprecated)]
         let provenance = ApiProvenance {
             source: "npm".to_string(),
             package_age_days: Some(1),
@@ -1376,6 +1380,7 @@ mod tests {
             has_source_repo: Some(false),
             yanked_or_deprecated: true,
             latest_version: Some("9.9.9".to_string()),
+            ..Default::default()
         };
         let resolver = |_eco: Ecosystem, _name: &str| ApiSignals::Available {
             provenance: provenance.clone(),
@@ -1461,6 +1466,7 @@ mod tests {
         let signals = PackageSignals {
             ecosystem: Ecosystem::Npm,
             name: "raect".to_string(),
+            version: None,
             threat_db_missing: false,
             name_vs_popular: NameVsPopular::NearPopular {
                 popular_name: "react".to_string(),
@@ -1491,6 +1497,7 @@ mod tests {
         let signals = PackageSignals {
             ecosystem: Ecosystem::PyPI,
             name: "reqeusts".to_string(),
+            version: None,
             threat_db_missing: false,
             name_vs_popular: NameVsPopular::Unknown,
             malicious_typosquat_of: Some("requests".to_string()),
@@ -1514,7 +1521,8 @@ mod tests {
                 ..Default::default()
             }),
         };
-        let signals = crate::registry_api::gather_api_signals(&client, Ecosystem::Npm, "x");
+        let (signals, _existence) =
+            crate::registry_api::gather_api_signals(&client, Ecosystem::Npm, "x");
         assert!(matches!(signals, ApiSignals::Available { .. }));
     }
 

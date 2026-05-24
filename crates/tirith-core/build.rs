@@ -877,6 +877,23 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("threat_cisa_kev", "ThreatCisaKev"),
     ("threat_suspicious_package", "ThreatSuspiciousPackage"),
     ("threat_safe_browsing", "ThreatSafeBrowsing"),
+    // Package reputation rules (M6 ch6) — 7 new signal-driven rule IDs.
+    ("package_not_found_in_registry", "PackageNotFoundInRegistry"),
+    (
+        "package_maintainer_change_recent",
+        "PackageMaintainerChangeRecent",
+    ),
+    (
+        "package_ownership_transferred",
+        "PackageOwnershipTransferred",
+    ),
+    ("package_osv_advisory_active", "PackageOsvAdvisoryActive"),
+    ("package_dependency_confusion", "PackageDependencyConfusion"),
+    (
+        "package_install_script_network_call",
+        "PackageInstallScriptNetworkCall",
+    ),
+    ("package_repo_mismatch", "PackageRepoMismatch"),
     // Rendered content
     ("hidden_css_content", "HiddenCssContent"),
     ("hidden_color_content", "HiddenColorContent"),

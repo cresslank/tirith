@@ -160,19 +160,28 @@ fn run(
         return 2;
     }
 
+    // M6 ch6 — `<name>[@<version>]` parsing. Carries `version: Option<String>`
+    // into the signals so OSV correlation can match a version-pinned advisory.
+    // Bare `<name>` still works (the version is `None`).
+    let (parsed_name, parsed_version) = package_risk::parse_name_and_version(trimmed_name);
+    if parsed_name.is_empty() {
+        eprintln!("tirith package: package name must not be empty.");
+        return 2;
+    }
+
     let db = ThreatDb::cached();
     let threat_db_missing = db.is_none();
 
     // Name signals — from the local threat DB only.
-    let name_vs_popular = package_risk::classify_name(db.as_deref(), eco, trimmed_name);
+    let name_vs_popular = package_risk::classify_name(db.as_deref(), eco, &parsed_name);
     let malicious_typosquat_of = db
         .as_deref()
-        .and_then(|db| db.check_typosquat(eco, trimmed_name))
+        .and_then(|db| db.check_typosquat(eco, &parsed_name))
         .map(|ts| ts.target_name);
 
     // Content signals — only from locally-available package content. tirith
     // never downloads the package to obtain these.
-    let content_signals = gather_content_signals(eco, trimmed_name, path);
+    let content_signals = gather_content_signals(eco, &parsed_name, path);
 
     // Registry-API signals — ONLY when `--online` was passed and offline mode
     // is not in force. The production client is the networked
@@ -181,7 +190,13 @@ fn run(
     // registry failure to `Unavailable`.
     let api = if online {
         let client = HttpRegistryClient::new();
-        gather_api(&client, eco, trimmed_name, offline)
+        gather_api(
+            &client,
+            eco,
+            &parsed_name,
+            parsed_version.as_deref(),
+            offline,
+        )
     } else {
         // No `--online`: the default offline state.
         ApiSignals::offline()
@@ -189,7 +204,8 @@ fn run(
 
     let signals = PackageSignals {
         ecosystem: eco,
-        name: trimmed_name.to_string(),
+        name: parsed_name,
+        version: parsed_version,
         threat_db_missing,
         name_vs_popular,
         malicious_typosquat_of,
@@ -236,6 +252,7 @@ fn gather_api(
     client: &dyn RegistryClient,
     eco: Ecosystem,
     name: &str,
+    version: Option<&str>,
     offline_flag: bool,
 ) -> ApiSignals {
     if offline_flag || super::offline_env_active() {
@@ -246,7 +263,64 @@ fn gather_api(
                 .to_string(),
         };
     }
-    registry_api::gather_api_signals(client, eco, name)
+    // M6 ch6 — `gather_api_signals` returns `(ApiSignals, PackageExistence)`.
+    // Fold the existence value into the provenance before returning so the
+    // public seam stays a single `ApiSignals`. When the call fails but
+    // existence is still positively `NotFound`, upgrade to an Available
+    // provenance carrying just the existence value so the policy gate
+    // (`PackageNotFoundInRegistry`) can read it.
+    let (mut signals, existence) = registry_api::gather_api_signals(client, eco, name);
+    use tirith_core::package_risk::{ApiProvenance, PackageExistence};
+
+    let nf = matches!(existence, PackageExistence::NotFound);
+    if let ApiSignals::Available { provenance } = &mut signals {
+        provenance.package_existence = existence;
+        // Snapshot-store write — reuses the fetched response, no extra call.
+        let _ = tirith_core::registry_history::record_snapshot(eco, name, provenance);
+        // Diff against the previous snapshot, when one exists.
+        if let Some(history) = tirith_core::registry_history::diff_recent(eco, name) {
+            provenance.maintainer_change_history = Some(history.clone());
+            if history.is_full_ownership_transfer() {
+                provenance.ownership_transfer =
+                    Some(tirith_core::registry_history::synthesize_transfer(&history));
+            }
+        }
+        // OSV correlation through the shipping `threatdb_api.rs` cache.
+        // Requires a version to do anything useful.
+        if let Some(v) = version {
+            let advs = tirith_core::osv_correlation::for_package(eco, name, v);
+            if !advs.is_empty() {
+                provenance.osv_advisories = Some(advs);
+            }
+        }
+        // Dep-confusion (offline-safe heuristic).
+        let policy = tirith_core::policy::Policy::discover(None);
+        let dc = tirith_core::dep_confusion::evaluate(eco, name, &policy);
+        if dc.risk {
+            provenance.dep_confusion = Some(dc);
+        }
+        // Repo-mismatch is online-only and only attempted for known git hosts.
+        if let Some(repo_url) = provenance.repository_url_for_check() {
+            let rm = tirith_core::repo_mismatch::verify(&repo_url, eco, name);
+            provenance.repo_mismatch = Some(rm);
+        }
+    } else if nf {
+        let mut prov = ApiProvenance {
+            source: eco.to_string(),
+            package_existence: PackageExistence::NotFound,
+            ..Default::default()
+        };
+        let policy = tirith_core::policy::Policy::discover(None);
+        let dc = tirith_core::dep_confusion::evaluate(eco, name, &policy);
+        if dc.risk {
+            prov.dep_confusion = Some(dc);
+        }
+        // We intentionally do NOT correlate OSV / write a snapshot for a
+        // package that does not exist; both would be incoherent.
+        let _ = version;
+        signals = ApiSignals::Available { provenance: prov };
+    }
+    signals
 }
 
 // --- content inspection (offline, filesystem-only) -------------------------
@@ -581,6 +655,7 @@ fn print_api_provenance_human(p: &ApiProvenance) {
         (Some(v), None) => println!("               - latest version: {v}"),
         (None, _) => println!("               - latest version: unknown"),
     }
+    #[allow(deprecated)]
     match p.ownership_transferred {
         Some(true) => {
             println!("               - ownership: no listed owners (established package)")
@@ -796,6 +871,7 @@ mod tests {
         let signals = PackageSignals {
             ecosystem: Ecosystem::Npm,
             name: "react".to_string(),
+            version: None,
             threat_db_missing: false,
             name_vs_popular: NameVsPopular::KnownPopular,
             malicious_typosquat_of: None,
@@ -815,6 +891,7 @@ mod tests {
         let signals = PackageSignals {
             ecosystem: Ecosystem::Npm,
             name: "raect".to_string(),
+            version: None,
             threat_db_missing: false,
             name_vs_popular: NameVsPopular::NearPopular {
                 popular_name: "react".to_string(),
@@ -876,7 +953,7 @@ mod tests {
         // flag must short-circuit *without* calling `fetch`, and report
         // `NotComputed` (the lookup was intentionally not attempted), not
         // `Unavailable` (which means an online lookup was attempted and failed).
-        let sig = gather_api(&ExplodingClient, Ecosystem::Npm, "react", true);
+        let sig = gather_api(&ExplodingClient, Ecosystem::Npm, "react", None, true);
         match sig {
             ApiSignals::NotComputed { reason } => {
                 assert!(reason.contains("offline"), "reason: {reason}");
@@ -893,7 +970,7 @@ mod tests {
             ..Default::default()
         };
         let client = FakeClient { result: Ok(meta) };
-        let sig = gather_api(&client, Ecosystem::Npm, "react", false);
+        let sig = gather_api(&client, Ecosystem::Npm, "react", None, false);
         assert!(matches!(sig, ApiSignals::Available { .. }));
     }
 
@@ -902,7 +979,7 @@ mod tests {
         let client = FakeClient {
             result: Err(FetchError::Network("connection refused".to_string())),
         };
-        let sig = gather_api(&client, Ecosystem::Npm, "react", false);
+        let sig = gather_api(&client, Ecosystem::Npm, "react", None, false);
         assert!(matches!(sig, ApiSignals::Unavailable { .. }));
     }
 
@@ -921,6 +998,7 @@ mod tests {
 
     #[test]
     fn available_provenance_drives_api_factors_and_human_output() {
+        #[allow(deprecated)]
         let provenance = ApiProvenance {
             source: "pypi".to_string(),
             package_age_days: Some(2),
@@ -931,10 +1009,12 @@ mod tests {
             has_source_repo: Some(false),
             yanked_or_deprecated: true,
             latest_version: Some("9.9.9".to_string()),
+            ..Default::default()
         };
         let s = PackageSignals {
             ecosystem: Ecosystem::PyPI,
             name: "p".to_string(),
+            version: None,
             threat_db_missing: true,
             name_vs_popular: NameVsPopular::Unknown,
             malicious_typosquat_of: None,

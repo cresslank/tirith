@@ -281,8 +281,41 @@ fn run_package_manager(
     // offline-safe — it degrades any registry failure to `Unavailable`.
     let use_online = online && !offline && !super::offline_env_active();
     let http_client = HttpRegistryClient::new();
-    let resolver =
-        |eco: Ecosystem, name: &str| registry_api::gather_api_signals(&http_client, eco, name);
+    // M6 ch6 — `gather_api_signals` now returns `(ApiSignals, PackageExistence)`.
+    // The install path folds existence into the provenance so the policy gate
+    // for `PackageNotFoundInRegistry` can read it directly. A standalone
+    // `Unavailable` with a positive 404 is upgraded to `Available` carrying
+    // only the existence value, mirroring the `tirith package risk` path.
+    let resolver = |eco: Ecosystem, name: &str| {
+        let (mut signals, existence) = registry_api::gather_api_signals(&http_client, eco, name);
+        use tirith_core::package_risk::{ApiProvenance, PackageExistence};
+        match &mut signals {
+            tirith_core::package_risk::ApiSignals::Available { provenance } => {
+                provenance.package_existence = existence;
+                // Dep-confusion heuristic (offline-safe).
+                let dc = tirith_core::dep_confusion::evaluate(eco, name, &policy);
+                if dc.risk {
+                    provenance.dep_confusion = Some(dc);
+                }
+            }
+            tirith_core::package_risk::ApiSignals::Unavailable { .. }
+                if matches!(existence, PackageExistence::NotFound) =>
+            {
+                let mut prov = ApiProvenance {
+                    source: eco.to_string(),
+                    package_existence: PackageExistence::NotFound,
+                    ..Default::default()
+                };
+                let dc = tirith_core::dep_confusion::evaluate(eco, name, &policy);
+                if dc.risk {
+                    prov.dep_confusion = Some(dc);
+                }
+                signals = tirith_core::package_risk::ApiSignals::Available { provenance: prov };
+            }
+            _ => {}
+        }
+        signals
+    };
     let online_mode = if use_online {
         OnlineMode::Resolver(&resolver)
     } else {

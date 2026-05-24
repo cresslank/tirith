@@ -146,6 +146,44 @@ pub enum RuleId {
     ThreatSuspiciousPackage,
     ThreatSafeBrowsing,
 
+    // Package reputation rules (M6 ch6) — emitted by package_risk /
+    // install_txn / ecosystem_scan when the registry-API path returns one of
+    // the seven new signals. Tier-1 attach via the existing
+    // `install_command` / package extractor; no new PATTERN_TABLE entry.
+    /// M6 ch6 — the registry positively reports the package does not exist
+    /// (HTTP 404). Distinct from `ApiSignals::Unavailable` (timeout /
+    /// unsupported registry / offline), which carries no "exists" claim.
+    /// Medium baseline; elevated to Block via ch7 `block_not_found: true`.
+    PackageNotFoundInRegistry,
+    /// M6 ch6 — `MaintainerChangeHistory` diff between the two most recent
+    /// local snapshots shows added or removed maintainers within the
+    /// recency window. Medium severity.
+    PackageMaintainerChangeRecent,
+    /// M6 ch6 — registry snapshot diff confirms a *real* ownership transfer
+    /// (every previous maintainer is gone; non-empty new set). Distinct
+    /// from the inferred `ApiProvenance::ownership_transferred` flag (which
+    /// is `zero owners` only), now superseded by snapshot-vs-snapshot diff.
+    /// Medium severity.
+    PackageOwnershipTransferred,
+    /// M6 ch6 — OSV correlation through the shipping `threatdb_api.rs`
+    /// cache surfaced an active advisory for `(eco, name, version)`. High
+    /// severity when CVSS ≥ 7.
+    PackageOsvAdvisoryActive,
+    /// M6 ch6 — dependency-confusion heuristic: the package name matches
+    /// an operator-supplied internal name AND tirith fetched it from the
+    /// public registry, OR an `@org` scope is reserved but the package
+    /// lives in the public registry. High severity.
+    PackageDependencyConfusion,
+    /// M6 ch6 — install-script heuristic found a network call or shell
+    /// spawn inside an npm `preinstall`/`install`/`postinstall`/`prepare`
+    /// script, a `setup.py` body, or a `build.rs` body. Medium severity;
+    /// heuristic, document the false-positive risk.
+    PackageInstallScriptNetworkCall,
+    /// M6 ch6 — registry-claimed repository URL fails verification under
+    /// `--online`: dead host, parses as a non-git URL, or hosted manifest
+    /// does not mention the package name. High severity.
+    PackageRepoMismatch,
+
     // Rendered content rules
     HiddenCssContent,
     HiddenColorContent,

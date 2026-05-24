@@ -149,6 +149,21 @@ pub struct Policy {
     #[serde(default)]
     pub threat_intel: ThreatIntelConfig,
 
+    /// **M6 ch6 — temporary top-level field for the dependency-confusion
+    /// heuristic's operator-supplied internal-name list.**
+    ///
+    /// Each entry is a name pattern. A trailing `*` is a wildcard: `@org/*`
+    /// matches every `@org/<anything>` resolution on the public registry.
+    /// When the heuristic finds a public-registry resolution matching a
+    /// pattern, it emits `PackageDependencyConfusion`.
+    ///
+    /// **Ch7 will move this under `package_policy.internal_package_names`
+    /// alongside the rest of `PackagePolicy` and add a migration. For M6 ch6
+    /// it ships at the top level so the dep-confusion signal does not depend
+    /// on ch7.**
+    #[serde(default)]
+    pub internal_package_names: Vec<String>,
+
     /// Per-agent governance rules (M4 item 8).
     ///
     /// The engine consults this block via
@@ -629,6 +644,7 @@ impl Default for Policy {
             policy_fetch_fail_mode: None,
             enforce_fail_mode: None,
             threat_intel: ThreatIntelConfig::default(),
+            internal_package_names: Vec::new(),
             agent_rules: AgentRules::default(),
         }
     }

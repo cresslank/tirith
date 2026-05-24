@@ -32,7 +32,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 
-use crate::package_risk::{ApiProvenance, ApiSignals, VERY_NEW_PACKAGE_DAYS};
+use crate::package_risk::{ApiProvenance, ApiSignals, PackageExistence, VERY_NEW_PACKAGE_DAYS};
 use crate::policy;
 use crate::threatdb::Ecosystem;
 
@@ -185,22 +185,64 @@ pub trait RegistryClient {
 // ===========================================================================
 
 /// Gather registry-API provenance for a package using `client`, returning the
-/// [`ApiSignals`] the package-risk scorer folds into the breakdown.
+/// [`ApiSignals`] AND the [`PackageExistence`] (M6 ch6).
 ///
-/// On a successful fetch this is [`ApiSignals::Available`]; on **any**
-/// [`FetchError`] it is [`ApiSignals::Unavailable`] with an honest reason —
-/// the caller's score then degrades gracefully to offline signals only. This
-/// function never panics and never blocks beyond the client's own timeout.
+/// `PackageExistence` is honestly distinct from `ApiSignals::Unavailable`: a
+/// positive HTTP 404 sets `NotFound`, every other failure (transport,
+/// timeout, unsupported registry) sets `Unknown`. Successful fetches always
+/// set `Exists`. Callers fold the existence value into the provenance
+/// (`ApiProvenance::package_existence`) before scoring.
+///
+/// Side effect (best-effort, M6 ch6): on a successful fetch this also writes
+/// one snapshot row to [`crate::registry_history`] using the fetched data —
+/// no extra request, just reuse.
+///
+/// On any [`FetchError`] the returned `ApiSignals` is `Unavailable` with an
+/// honest reason. This function never panics and never blocks beyond the
+/// client's own timeout.
 pub fn gather_api_signals(
     client: &dyn RegistryClient,
     ecosystem: Ecosystem,
     name: &str,
-) -> ApiSignals {
+) -> (ApiSignals, PackageExistence) {
     match client.fetch(ecosystem, name) {
-        Ok(meta) => ApiSignals::Available {
-            provenance: provenance_from_metadata(&meta),
-        },
-        Err(e) => ApiSignals::unavailable(e.reason()),
+        Ok(meta) => {
+            // M6 ch6 — record a snapshot from this fetched response. Reuses the
+            // existing API response; no extra request is made.
+            let maintainers: Vec<crate::package_risk::MaintainerRef> = meta
+                .maintainers
+                .as_ref()
+                .map(|m| {
+                    m.iter()
+                        .map(|s| crate::package_risk::MaintainerRef {
+                            id: s.to_lowercase(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let _ = crate::registry_history::record_snapshot_with_maintainers(
+                ecosystem,
+                name,
+                maintainers,
+                meta.latest_version.clone(),
+                meta.repository_url.clone(),
+            );
+
+            let mut provenance = provenance_from_metadata(&meta);
+            provenance.package_existence = PackageExistence::Exists;
+            (
+                ApiSignals::Available { provenance },
+                PackageExistence::Exists,
+            )
+        }
+        Err(FetchError::NotFound) => (
+            ApiSignals::unavailable(FetchError::NotFound.reason()),
+            PackageExistence::NotFound,
+        ),
+        Err(e) => (
+            ApiSignals::unavailable(e.reason()),
+            PackageExistence::Unknown,
+        ),
     }
 }
 
@@ -249,6 +291,7 @@ pub fn provenance_from_metadata(meta: &RegistryMetadata) -> ApiProvenance {
     // `Some(false)` (the field exists but holds no usable URL).
     let has_source_repo = meta.repository_url.as_deref().map(is_usable_repo_url);
 
+    #[allow(deprecated)] // M6 ch6 grace period — the field is still emitted
     ApiProvenance {
         source: meta.source.clone(),
         package_age_days,
@@ -259,6 +302,7 @@ pub fn provenance_from_metadata(meta: &RegistryMetadata) -> ApiProvenance {
         has_source_repo,
         yanked_or_deprecated: meta.yanked_or_deprecated,
         latest_version: meta.latest_version.clone(),
+        ..Default::default()
     }
 }
 
@@ -1017,8 +1061,9 @@ mod tests {
         let client = FakeClient {
             result: Ok(meta_clean()),
         };
-        let sig = gather_api_signals(&client, Ecosystem::Npm, "react");
+        let (sig, existence) = gather_api_signals(&client, Ecosystem::Npm, "react");
         assert!(matches!(sig, ApiSignals::Available { .. }));
+        assert_eq!(existence, PackageExistence::Exists);
     }
 
     #[test]
@@ -1026,24 +1071,28 @@ mod tests {
         let client = FakeClient {
             result: Err(FetchError::Network("connection refused".to_string())),
         };
-        let sig = gather_api_signals(&client, Ecosystem::Npm, "react");
+        let (sig, existence) = gather_api_signals(&client, Ecosystem::Npm, "react");
         match sig {
             ApiSignals::Unavailable { reason } => {
                 assert!(reason.contains("connection refused"));
             }
             other => panic!("expected Unavailable, got {other:?}"),
         }
+        assert_eq!(existence, PackageExistence::Unknown);
     }
 
     #[test]
-    fn gather_unavailable_on_not_found() {
+    fn gather_unavailable_on_not_found_sets_existence_not_found() {
         let client = FakeClient {
             result: Err(FetchError::NotFound),
         };
-        assert!(matches!(
-            gather_api_signals(&client, Ecosystem::Npm, "nope"),
-            ApiSignals::Unavailable { .. }
-        ));
+        let (sig, existence) = gather_api_signals(&client, Ecosystem::Npm, "nope");
+        assert!(matches!(sig, ApiSignals::Unavailable { .. }));
+        assert_eq!(
+            existence,
+            PackageExistence::NotFound,
+            "404 must surface as NotFound, distinct from Unknown"
+        );
     }
 
     #[test]
@@ -1054,10 +1103,13 @@ mod tests {
         let client = FakeClient {
             result: Err(FetchError::UnsupportedEcosystem(Ecosystem::Go)),
         };
-        assert!(matches!(
-            gather_api_signals(&client, Ecosystem::Go, "x"),
-            ApiSignals::Unavailable { .. }
-        ));
+        let (sig, existence) = gather_api_signals(&client, Ecosystem::Go, "x");
+        assert!(matches!(sig, ApiSignals::Unavailable { .. }));
+        assert_eq!(
+            existence,
+            PackageExistence::Unknown,
+            "unsupported ecosystem reports Unknown, never NotFound"
+        );
     }
 
     #[test]
@@ -1121,6 +1173,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn ownership_transfer_inferred_for_ownerless_old_package() {
         // npm-shaped: `maintainers` is `Some` (the field exists) but empty.
         let mut m = meta_clean();
@@ -1142,6 +1195,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn ownership_unknown_when_registry_omits_maintainers() {
         // A PyPI / crates.io-shaped response: `maintainers` is `None` — the
         // registry API has no maintainer field — so an ownerless package must
@@ -1304,10 +1358,8 @@ mod tests {
         // The degradation reason is honest about why no request was made.
         assert!(err.reason().contains("path-traversal"));
         // And it surfaces as a graceful Unavailable, not a panic.
-        assert!(matches!(
-            gather_api_signals(&client, Ecosystem::Npm, "../../../etc/passwd"),
-            ApiSignals::Unavailable { .. }
-        ));
+        let (sig, _existence) = gather_api_signals(&client, Ecosystem::Npm, "../../../etc/passwd");
+        assert!(matches!(sig, ApiSignals::Unavailable { .. }));
     }
 
     #[test]

@@ -616,6 +616,14 @@ const ALL_RULE_IDS: &[&str] = &[
     "threat_cisa_kev",
     "threat_suspicious_package",
     "threat_safe_browsing",
+    // Package reputation rules (M6 ch6)
+    "package_not_found_in_registry",
+    "package_maintainer_change_recent",
+    "package_ownership_transferred",
+    "package_osv_advisory_active",
+    "package_dependency_confusion",
+    "package_install_script_network_call",
+    "package_repo_mismatch",
     // Rendered content
     "hidden_css_content",
     "hidden_color_content",
@@ -696,6 +704,19 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "threat_cisa_kev",           // requires live CISA KEV correlation
     "threat_suspicious_package", // requires live package-health lookups
     "threat_safe_browsing",      // requires a Google Safe Browsing API key
+    // M6 ch6 — package reputation rules emitted by package_risk /
+    // install_txn / ecosystem_scan paths, NOT by the engine. They require
+    // an `--online` registry-API run (or a recorded snapshot store) that
+    // static engine fixtures cannot produce; covered by unit tests in
+    // their own modules plus the ecosystem-fixture rows that document the
+    // signal shape.
+    "package_not_found_in_registry",
+    "package_maintainer_change_recent",
+    "package_ownership_transferred",
+    "package_osv_advisory_active",
+    "package_dependency_confusion",
+    "package_install_script_network_call",
+    "package_repo_mismatch",
 ];
 
 #[test]
@@ -837,6 +858,14 @@ fn test_rule_id_list_is_complete() {
         RuleId::ThreatCisaKev,
         RuleId::ThreatSuspiciousPackage,
         RuleId::ThreatSafeBrowsing,
+        // Package reputation rules (M6 ch6)
+        RuleId::PackageNotFoundInRegistry,
+        RuleId::PackageMaintainerChangeRecent,
+        RuleId::PackageOwnershipTransferred,
+        RuleId::PackageOsvAdvisoryActive,
+        RuleId::PackageDependencyConfusion,
+        RuleId::PackageInstallScriptNetworkCall,
+        RuleId::PackageRepoMismatch,
         RuleId::HiddenCssContent,
         RuleId::HiddenColorContent,
         RuleId::HiddenHtmlAttribute,

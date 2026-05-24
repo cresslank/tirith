@@ -572,3 +572,79 @@ input = "go install github.com/spf13/cobra@latest"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# ── M6 ch6 — package reputation signals (7 fixtures, one per new rule) ──
+#
+# These rules are emitted by `package_risk`/`install_txn`/`ecosystem_scan`
+# in response to registry-API signals or snapshot-store state — NOT by the
+# static engine pipeline that `tirith check` fixtures exercise. The static
+# tier-1 → tier-3 path the safeguard tests verify cannot synthesize these
+# signals (they require either a fresh registry response, two recorded
+# snapshots, an OSV cache row, or an online repo-URL verification), so the
+# fixtures below pin the *negative* shape: an exec-context command that
+# names the relevant package does NOT spuriously fire the new rule. The
+# rules themselves are listed in EXTERNALLY_TRIGGERED_RULES in
+# `crates/tirith-core/tests/golden_fixtures.rs` and exercised by unit
+# tests in their respective modules:
+#   - registry_history     — diff_two_snapshots
+#   - osv_correlation       — for_package + parse_cvss3_base
+#   - dep_confusion         — evaluate
+#   - install_script_analysis — analyze_script_text
+#   - repo_mismatch         — verify
+#   - package_risk          — api_factors_*_adds_factor tests
+
+[[fixture]]
+name = "m6_ch6_package_not_found_static_path_does_not_fire"
+min_milestone = 6
+input = "npm install some-package-name"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "m6_ch6_package_maintainer_change_static_path_does_not_fire"
+min_milestone = 6
+input = "npm install react"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "m6_ch6_package_ownership_transferred_static_path_does_not_fire"
+min_milestone = 6
+input = "npm install ownership-transfer-test"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "m6_ch6_package_osv_advisory_active_static_path_does_not_fire"
+min_milestone = 6
+input = "pip install vulnerable-package-name==1.0.0"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "m6_ch6_package_dependency_confusion_static_path_does_not_fire"
+min_milestone = 6
+input = "npm install @my-company/internal-helper"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "m6_ch6_package_install_script_network_call_static_path_does_not_fire"
+min_milestone = 6
+input = "npm install some-install-script-package"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "m6_ch6_package_repo_mismatch_static_path_does_not_fire"
+min_milestone = 6
+input = "cargo install some-crate-name"
+context = "exec"
+expected_action = "allow"
+expected_rules = []

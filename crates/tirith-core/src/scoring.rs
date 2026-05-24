@@ -184,7 +184,18 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::PolicyBlocklisted
         | RuleId::AgentDeniedByPolicy
         | RuleId::CustomRuleMatch
-        | RuleId::LicenseRequired => false,
+        | RuleId::LicenseRequired
+        // M6 ch6 — package reputation rules. These are NOT threat-DB driven
+        // (no local malicious-name match); they're signal-driven, surfaced
+        // from the registry-API path (and the snapshot store). They are
+        // structural reputation signals, not threat-intel hits.
+        | RuleId::PackageNotFoundInRegistry
+        | RuleId::PackageMaintainerChangeRecent
+        | RuleId::PackageOwnershipTransferred
+        | RuleId::PackageOsvAdvisoryActive
+        | RuleId::PackageDependencyConfusion
+        | RuleId::PackageInstallScriptNetworkCall
+        | RuleId::PackageRepoMismatch => false,
     }
 }
 

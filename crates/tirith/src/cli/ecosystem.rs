@@ -143,8 +143,35 @@ pub fn scan(
     // package declared in two manifests is fetched at most once.
     let use_online = online && !offline && !super::offline_env_active();
     let http_client = HttpRegistryClient::new();
+    // M6 ch6 — `gather_api_signals` now returns `(ApiSignals, PackageExistence)`;
+    // fold existence into the provenance the way `tirith install` does so the
+    // policy gate (`PackageNotFoundInRegistry`) can read it.
     let resolver = |eco: Ecosystem, name: &str| -> ApiSignals {
-        registry_api::gather_api_signals(&http_client, eco, name)
+        let (mut signals, existence) = registry_api::gather_api_signals(&http_client, eco, name);
+        use tirith_core::package_risk::{ApiProvenance, PackageExistence};
+        match &mut signals {
+            ApiSignals::Available { provenance } => {
+                provenance.package_existence = existence;
+                let dc = tirith_core::dep_confusion::evaluate(eco, name, &policy);
+                if dc.risk {
+                    provenance.dep_confusion = Some(dc);
+                }
+            }
+            ApiSignals::Unavailable { .. } if matches!(existence, PackageExistence::NotFound) => {
+                let mut prov = ApiProvenance {
+                    source: eco.to_string(),
+                    package_existence: PackageExistence::NotFound,
+                    ..Default::default()
+                };
+                let dc = tirith_core::dep_confusion::evaluate(eco, name, &policy);
+                if dc.risk {
+                    prov.dep_confusion = Some(dc);
+                }
+                signals = ApiSignals::Available { provenance: prov };
+            }
+            _ => {}
+        }
+        signals
     };
 
     // `--installed --online` against a large tree could fire thousands of API

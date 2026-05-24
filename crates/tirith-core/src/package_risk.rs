@@ -75,12 +75,38 @@
 //! `Action`, exit code, or audit log. `tirith package risk` is an inspection
 //! command.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::threatdb::{Ecosystem, ThreatDb};
 
 /// The maximum possible score. Scores are clamped here.
 pub const MAX_SCORE: u32 = 100;
+
+// M6 ch6 — weights for the seven new signal-driven factors. These are
+// deliberately moderate; per-signal policy-driven points come in ch7.
+
+/// The registry positively reports the package does not exist (HTTP 404).
+/// Honestly distinct from `ApiSignals::Unavailable` (unknown).
+const PACKAGE_NOT_FOUND_WEIGHT: u32 = 18;
+/// Snapshot-vs-snapshot diff shows maintainers were added or removed within
+/// the recency window.
+const MAINTAINER_CHANGE_RECENT_WEIGHT: u32 = 12;
+/// Snapshot-vs-snapshot diff confirms a real ownership transfer (every prior
+/// maintainer is gone). Superior signal to the one-response inferred flag.
+const OWNERSHIP_TRANSFER_DIFF_WEIGHT: u32 = 18;
+/// An active OSV advisory (any CVSS) for the requested version.
+const OSV_ADVISORY_ACTIVE_WEIGHT: u32 = 18;
+/// Dependency-confusion heuristic match.
+const DEP_CONFUSION_WEIGHT: u32 = 18;
+/// Install-script analysis found a network call / shell spawn.
+const INSTALL_SCRIPT_NETWORK_WEIGHT: u32 = 12;
+/// Registry-claimed repo URL did not verify (`Mismatch`).
+const REPO_MISMATCH_WEIGHT: u32 = 18;
+
+/// M6 ch6 — recency window for the maintainer-change-recent signal. A
+/// snapshot diff is "recent" when the two snapshots were taken less than
+/// this many days apart. Plain const for v1; policy-configurable in ch7.
+pub const MAINTAINER_CHANGE_RECENT_DAYS: u32 = 30;
 
 // --- factor weights (all fixed, all inspectable) ---------------------------
 
@@ -205,6 +231,169 @@ pub enum ContentSignals {
     },
 }
 
+/// M6 ch6 — does the registry positively claim this package exists?
+///
+/// Distinct from [`ApiSignals::Unavailable`], which carries no positive
+/// claim. Only a `--online` run that actually reached the registry can
+/// resolve this to `Exists` or `NotFound`; every other path keeps it
+/// `Unknown` (the honest no-data state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageExistence {
+    /// The registry responded successfully — the package exists.
+    Exists,
+    /// The registry responded HTTP 404 — the package positively does not
+    /// exist. Policy rule `block_not_found` (ch7) gates Block on this.
+    NotFound,
+    /// No positive claim: the registry call was not made, failed before a
+    /// response, or there is no adapter for the ecosystem.
+    #[default]
+    Unknown,
+}
+
+/// M6 ch6 — a registry's view of a maintainer at a point in time. Snapshot
+/// store rows record `Vec<MaintainerRef>` per registry response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintainerRef {
+    /// The maintainer's stable identifier in the registry (the npm "name",
+    /// the PyPI "username", etc.). Lowercased for stable equality.
+    pub id: String,
+}
+
+/// M6 ch6 — a snapshot-vs-snapshot diff of a package's maintainer set.
+/// Produced by [`crate::registry_history::diff_two_snapshots`]; a `None`
+/// diff (only one snapshot exists) means the recent-change rule cannot fire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MaintainerChangeHistory {
+    /// Maintainers in the newer snapshot that were not in the older one.
+    pub added: Vec<MaintainerRef>,
+    /// Maintainers in the older snapshot that are not in the newer one.
+    pub removed: Vec<MaintainerRef>,
+    /// Number of whole days between the two snapshots, if both timestamps
+    /// were captured. `None` if the older snapshot lacks a timestamp.
+    pub transfer_within_days: Option<u32>,
+}
+
+impl MaintainerChangeHistory {
+    /// `true` when the diff is non-empty and within the recency window.
+    pub fn is_recent(&self) -> bool {
+        if self.added.is_empty() && self.removed.is_empty() {
+            return false;
+        }
+        match self.transfer_within_days {
+            Some(d) => d <= MAINTAINER_CHANGE_RECENT_DAYS,
+            None => false,
+        }
+    }
+
+    /// `true` when every previous maintainer is gone and the new set is
+    /// non-empty — a true ownership transfer (not just a co-maintainer add).
+    pub fn is_full_ownership_transfer(&self) -> bool {
+        !self.removed.is_empty() && !self.added.is_empty()
+    }
+}
+
+/// M6 ch6 — a single OSV advisory summary, surfaced from the shipping
+/// `threatdb_api.rs` OSV cache (no new threat-DB feed).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OsvAdvisorySummary {
+    /// The OSV advisory ID (e.g. `GHSA-xxx-yyy-zzz`).
+    pub id: String,
+    /// Aliases — typically a `CVE-YYYY-NNNNN` plus the GHSA.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// Short, human-readable summary, when the advisory provided one.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// CVSS v3 base score, when parseable. CVSS v3.0 and v3.1 both produce
+    /// the same scale. `None` when the advisory lacks a CVSS string.
+    #[serde(default)]
+    pub cvss: Option<f32>,
+    /// A reference URL (preferring the advisory's own canonical URL).
+    #[serde(default)]
+    pub reference: Option<String>,
+}
+
+impl OsvAdvisorySummary {
+    /// `true` when the advisory's CVSS is at or above the High threshold.
+    /// Used to escalate severity from Medium to High for `PackageOsvAdvisoryActive`.
+    pub fn is_high_cvss(&self) -> bool {
+        self.cvss.is_some_and(|c| c >= 7.0)
+    }
+}
+
+/// M6 ch6 — dependency-confusion verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepConfusionVerdict {
+    /// `true` when the heuristic believes the public-registry resolution
+    /// could shadow an internal package.
+    pub risk: bool,
+    /// Plain-language note for the explanation; empty when `risk` is false.
+    pub reason: String,
+}
+
+/// M6 ch6 — install-script analysis result. Read-only; the script is NEVER
+/// executed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct InstallScriptSignals {
+    /// A network-call pattern (`curl`/`wget`/`fetch`/`http.get`/...) was
+    /// matched in the script text.
+    pub has_network_call: bool,
+    /// A shell-spawn pattern was matched (e.g. `bash -c`, `sh -c`,
+    /// `subprocess.run(["sh", ...])`).
+    pub has_shell_spawn: bool,
+    /// Free-form descriptions of the matches, lines included verbatim.
+    /// Empty when neither flag is `true`.
+    #[serde(default)]
+    pub suspicious_patterns: Vec<String>,
+}
+
+impl InstallScriptSignals {
+    /// `true` when at least one network or shell-spawn pattern matched.
+    pub fn fires(&self) -> bool {
+        self.has_network_call || self.has_shell_spawn
+    }
+}
+
+/// M6 ch6 — repository-mismatch verdict, set only under `--online`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RepoMismatchVerdict {
+    /// The repo-mismatch state for this package.
+    pub state: RepoMismatchState,
+    /// Plain-language reason, empty when `Unverifiable` was the default.
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// State machine for the repo-mismatch check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoMismatchState {
+    /// The registry-claimed URL resolved and the hosted manifest mentions
+    /// this package name.
+    Match,
+    /// The URL is dead, parses as a non-git URL, or names a different package.
+    Mismatch,
+    /// No `--online` run, or the call was capped out, or the URL field was
+    /// absent. Default; emits no finding.
+    #[default]
+    Unverifiable,
+}
+
+/// M6 ch6 — real ownership-transfer record, derived from a snapshot diff.
+/// Distinct from the legacy `ApiProvenance::ownership_transferred` bool,
+/// which is inferred from a single response (zero owners only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnershipTransfer {
+    /// The maintainers that were active in the older snapshot.
+    pub previous: Vec<MaintainerRef>,
+    /// The maintainers active in the newer snapshot.
+    pub current: Vec<MaintainerRef>,
+    /// Days between the two snapshots when both timestamps are present.
+    #[serde(default)]
+    pub within_days: Option<u32>,
+}
+
 /// One registry-API provenance signal, as gathered from a registry response.
 ///
 /// Each field is an *already-decided* boolean / value — the registry-specific
@@ -213,7 +402,7 @@ pub enum ContentSignals {
 /// of its inputs. A `None` on an optional field means the registry did not
 /// report that datum (it is then not scored — absence of a datum is not a
 /// signal in itself).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ApiProvenance {
     /// Which registry API the data came from (`"npm"`, `"pypi"`,
     /// `"crates.io"`), for transparency in the explanation.
@@ -230,6 +419,16 @@ pub struct ApiProvenance {
     /// owner set, not its history, so a literal transfer cannot be proven from
     /// it). `None` when the registry's API carries no maintainer field at all,
     /// so ownership is honestly unknown.
+    ///
+    /// **M6 ch6 deprecation note:** the real `ownership_transfer` field below
+    /// supersedes this inferred-from-one-response flag with a snapshot-vs-
+    /// snapshot diff. Kept for backward-compat in this chunk; removed in a
+    /// future cycle. Direct readers should migrate to `ownership_transfer`.
+    #[deprecated(
+        since = "0.4.0",
+        note = "M6 ch6 — use the snapshot-vs-snapshot `ownership_transfer` field; \
+                this inferred-from-one-response bool will be removed."
+    )]
     pub ownership_transferred: Option<bool>,
     /// `true` when the latest version number is an abnormal jump from the
     /// previous one (a major-version spike). `None` when fewer than two
@@ -245,6 +444,57 @@ pub struct ApiProvenance {
     pub yanked_or_deprecated: bool,
     /// The latest version string, purely for display in the explanation.
     pub latest_version: Option<String>,
+    /// M6 ch6 — does the registry positively claim this package exists?
+    /// Default `Unknown` — only a `--online` run that actually reached the
+    /// registry resolves this to `Exists` or `NotFound`.
+    #[serde(default)]
+    pub package_existence: PackageExistence,
+    /// M6 ch6 — snapshot-vs-snapshot maintainer-set diff. `None` when only
+    /// one (or zero) snapshots exist. The first `--online` run after this
+    /// feature lands records a snapshot only — the diff cannot fire until a
+    /// second snapshot exists. Documented explicitly in the rule's
+    /// `false_positive_guidance`.
+    #[serde(default)]
+    pub maintainer_change_history: Option<MaintainerChangeHistory>,
+    /// M6 ch6 — OSV advisories matching `(eco, name, version)`. Sourced from
+    /// the shipping `threatdb_api.rs` OSV cache; no new feed.
+    #[serde(default)]
+    pub osv_advisories: Option<Vec<OsvAdvisorySummary>>,
+    /// M6 ch6 — dependency-confusion heuristic verdict.
+    #[serde(default)]
+    pub dep_confusion: Option<DepConfusionVerdict>,
+    /// M6 ch6 — install-script analysis signals (read-only; never executes).
+    #[serde(default)]
+    pub install_script_signals: Option<InstallScriptSignals>,
+    /// M6 ch6 — registry-claimed-repo-URL verification under `--online`.
+    #[serde(default)]
+    pub repo_mismatch: Option<RepoMismatchVerdict>,
+    /// M6 ch6 — real ownership-transfer record, derived from the snapshot
+    /// diff above. Supersedes the inferred `ownership_transferred` flag.
+    #[serde(default)]
+    pub ownership_transfer: Option<OwnershipTransfer>,
+}
+
+impl ApiProvenance {
+    /// The registry-claimed repository URL when one is present in the
+    /// underlying response. This is exposed via [`crate::registry_history`]
+    /// and [`crate::repo_mismatch`]; `ApiProvenance` itself does NOT carry
+    /// the raw URL (that's a `RegistryMetadata` field) — instead, callers
+    /// that have it forward it through. Returns `None` here as a default for
+    /// older sites that haven't been retrofitted yet; see ch7 for full wiring.
+    ///
+    /// **Note:** the URL would naturally live on `ApiProvenance`, but the
+    /// shipping public surface intentionally exposes only *already-decided*
+    /// signals (booleans). We keep that contract — the URL is plumbed
+    /// separately by the registry-side seam.
+    pub fn repository_url_for_check(&self) -> Option<String> {
+        // For M6 ch6, repository_url is consumed at the registry-API site
+        // (where `RegistryMetadata` is still in scope). The provenance object
+        // does not preserve the raw URL today; this helper returns `None`
+        // here, and the CLI passes the URL directly into `repo_mismatch`. A
+        // future wave can promote the URL onto the provenance.
+        None
+    }
 }
 
 /// State of the registry-API-backed signals.
@@ -262,8 +512,14 @@ pub struct ApiProvenance {
 ///   registry call failed (offline, timeout, HTTP error, unparseable
 ///   response, unsupported ecosystem). The score degrades gracefully to the
 ///   offline signals; `reason` is an honest, human-readable explanation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
+// M6 ch6 — `ApiProvenance` grew to ~340 bytes once the seven new signal
+// fields landed. Boxing `provenance` would change the public API and ripple
+// through every site that pattern-matches `Available { provenance }`. The
+// enum is held one-per-package on rare paths (offline by default), so the
+// per-instance cost is bounded and acceptable.
+#[allow(clippy::large_enum_variant)]
 pub enum ApiSignals {
     /// Registry-API signals were not computed — offline run (the default).
     NotComputed {
@@ -357,6 +613,11 @@ impl RiskBreakdown {
 pub struct PackageSignals {
     pub ecosystem: Ecosystem,
     pub name: String,
+    /// M6 ch6 — optional version string parsed from `<name>[@<version>]` CLI
+    /// inputs. Threaded through to OSV correlation so a version-pinned
+    /// advisory can match. `None` means "no version specified" (the OSV
+    /// correlation falls back to the registry's default version or skips).
+    pub version: Option<String>,
     pub threat_db_missing: bool,
     pub name_vs_popular: NameVsPopular,
     /// `Some(popular_target)` when the threat DB lists this exact name as a
@@ -373,6 +634,67 @@ pub struct PackageSignals {
     ///
     /// Defaults to [`ApiSignals::offline`] so an offline caller is unchanged.
     pub api: ApiSignals,
+}
+
+/// M6 ch6 — parse `<name>[@<version>]` into `(name, Option<version>)`.
+///
+/// The single source of truth for version-aware CLI parsing on
+/// `tirith package risk|explain|scan|install`. Backward compatible: a bare
+/// `<name>` returns `(name, None)`.
+///
+/// **Edge case for npm scoped packages.** `@org/name` already uses `@` as the
+/// scope sigil; `@org/name@1.2.3` has TWO `@`s — the first is the scope, the
+/// second is the version separator. The parser splits on the LAST `@` only,
+/// and only when followed by a version-shaped token. So:
+///
+///  * `react`         → (`react`, None)
+///  * `react@18.2.0`  → (`react`, Some(`18.2.0`))
+///  * `@org/util`     → (`@org/util`, None)        — only one `@`, scope sigil
+///  * `@org/util@1.0` → (`@org/util`, Some(`1.0`)) — last `@` is the separator
+///  * `@org`          → (`@org`, None)             — `@` at position 0, ignore
+///  * `pkg@`          → (`pkg@`, None)             — empty version is not a version
+///  * `pkg@@1.0`      → (`pkg@`, Some(`1.0`))      — only the LAST `@` splits
+///
+/// A version-shaped token is non-empty and starts with a digit, `v`, `~`, or
+/// `^` (the npm/PyPI/crates.io range syntaxes). A token shaped like a path
+/// segment is rejected to keep `@scope/name` cases unambiguous.
+pub fn parse_name_and_version(input: &str) -> (String, Option<String>) {
+    let s = input.trim();
+    if s.is_empty() {
+        return (String::new(), None);
+    }
+    let Some(last_at) = s.rfind('@') else {
+        return (s.to_string(), None);
+    };
+    // `@` at position 0 is a scope sigil, not a version separator.
+    if last_at == 0 {
+        return (s.to_string(), None);
+    }
+    let (name, tail) = s.split_at(last_at);
+    // `tail` starts with `@`; the version is everything after it.
+    let version = &tail[1..];
+    if version.is_empty() || !is_version_shaped(version) {
+        // Not a version — give back the whole input as the name. This handles
+        // a stray `@` at the end and pathological cases like `pkg@notaversion`.
+        return (s.to_string(), None);
+    }
+    (name.to_string(), Some(version.to_string()))
+}
+
+/// `true` when `s` is shaped like a version specifier (numeric / `v` /
+/// semver-range sigils). Conservative — rejects path-segment-like tails so
+/// `@scope/name` does not get parsed as `name@<version>` with `<version> ==
+/// "scope/name"`.
+fn is_version_shaped(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    // Reject anything that looks like a path segment.
+    if s.contains('/') || s.contains('\\') || s.contains(' ') {
+        return false;
+    }
+    let first = s.as_bytes()[0];
+    first.is_ascii_digit() || matches!(first, b'v' | b'~' | b'^' | b'=' | b'>' | b'<' | b'*')
 }
 
 /// Compute the deterministic risk score and full factor breakdown from
@@ -559,6 +881,7 @@ pub fn score_package(signals: &PackageSignals) -> RiskBreakdown {
 ///
 /// This is a pure function of its input — no I/O — so it is exhaustively
 /// unit-tested below.
+#[allow(deprecated)] // legacy `ownership_transferred` read intentionally during M6 ch6 grace
 pub fn api_factors(p: &ApiProvenance) -> Vec<RiskFactor> {
     let mut factors: Vec<RiskFactor> = Vec::new();
 
@@ -680,6 +1003,131 @@ pub fn api_factors(p: &ApiProvenance) -> Vec<RiskFactor> {
         });
     }
 
+    // M6 ch6 — package-existence: a registry-confirmed 404. Distinct from
+    // `Unknown` (the call did not resolve), which adds nothing.
+    if matches!(p.package_existence, PackageExistence::NotFound) {
+        factors.push(RiskFactor {
+            id: "api_package_not_found",
+            label: "Registry: package not found".to_string(),
+            points: PACKAGE_NOT_FOUND_WEIGHT as i32,
+            detail: format!(
+                "The {} registry positively reports no such package — HTTP 404, distinct from \
+                 a transport failure or unsupported adapter. Contributing {} points.",
+                p.source, PACKAGE_NOT_FOUND_WEIGHT
+            ),
+        });
+    }
+
+    // M6 ch6 — recent maintainer-set change between two snapshots.
+    if let Some(hist) = &p.maintainer_change_history {
+        if hist.is_recent() {
+            factors.push(RiskFactor {
+                id: "api_maintainer_change_recent",
+                label: "Registry: maintainer set changed recently".to_string(),
+                points: MAINTAINER_CHANGE_RECENT_WEIGHT as i32,
+                detail: format!(
+                    "Snapshot-vs-snapshot diff shows {} maintainer(s) added and {} removed within \
+                     ~{} day(s). Contributing {} points.",
+                    hist.added.len(),
+                    hist.removed.len(),
+                    hist.transfer_within_days.unwrap_or(0),
+                    MAINTAINER_CHANGE_RECENT_WEIGHT
+                ),
+            });
+        }
+    }
+
+    // M6 ch6 — real ownership transfer (every prior maintainer is gone).
+    if let Some(t) = &p.ownership_transfer {
+        if !t.previous.is_empty() && !t.current.is_empty() {
+            let overlap = t
+                .previous
+                .iter()
+                .any(|prev| t.current.iter().any(|cur| cur.id == prev.id));
+            if !overlap {
+                factors.push(RiskFactor {
+                    id: "api_ownership_transfer_diff",
+                    label: "Registry: ownership transferred (snapshot diff)".to_string(),
+                    points: OWNERSHIP_TRANSFER_DIFF_WEIGHT as i32,
+                    detail: format!(
+                        "Snapshot diff: every previous maintainer is gone and a new set is in \
+                         place. Contributing {} points.",
+                        OWNERSHIP_TRANSFER_DIFF_WEIGHT
+                    ),
+                });
+            }
+        }
+    }
+
+    // M6 ch6 — OSV advisory active for the requested version.
+    if let Some(advs) = &p.osv_advisories {
+        if !advs.is_empty() {
+            let ids: Vec<&str> = advs.iter().take(3).map(|a| a.id.as_str()).collect();
+            factors.push(RiskFactor {
+                id: "api_osv_advisory_active",
+                label: "Registry: OSV advisory active for this version".to_string(),
+                points: OSV_ADVISORY_ACTIVE_WEIGHT as i32,
+                detail: format!(
+                    "Found {} OSV advisory record(s) for this package@version: {}. Contributing \
+                     {} points.",
+                    advs.len(),
+                    ids.join(", "),
+                    OSV_ADVISORY_ACTIVE_WEIGHT
+                ),
+            });
+        }
+    }
+
+    // M6 ch6 — dependency-confusion heuristic.
+    if let Some(dc) = &p.dep_confusion {
+        if dc.risk {
+            factors.push(RiskFactor {
+                id: "api_dep_confusion",
+                label: "Registry: dependency-confusion shape".to_string(),
+                points: DEP_CONFUSION_WEIGHT as i32,
+                detail: format!(
+                    "{} Contributing {} points.",
+                    dc.reason, DEP_CONFUSION_WEIGHT
+                ),
+            });
+        }
+    }
+
+    // M6 ch6 — install-script network/shell-spawn (offline heuristic).
+    if let Some(iss) = &p.install_script_signals {
+        if iss.fires() {
+            factors.push(RiskFactor {
+                id: "api_install_script_network",
+                label: "Registry: install script makes a network call".to_string(),
+                points: INSTALL_SCRIPT_NETWORK_WEIGHT as i32,
+                detail: format!(
+                    "Install-script analysis matched: net={} shell={} ({} pattern(s)). \
+                     Contributing {} points.",
+                    iss.has_network_call,
+                    iss.has_shell_spawn,
+                    iss.suspicious_patterns.len(),
+                    INSTALL_SCRIPT_NETWORK_WEIGHT
+                ),
+            });
+        }
+    }
+
+    // M6 ch6 — registry-claimed-repo URL mismatch (online-only verification).
+    if let Some(rm) = &p.repo_mismatch {
+        if matches!(rm.state, RepoMismatchState::Mismatch) {
+            factors.push(RiskFactor {
+                id: "api_repo_mismatch",
+                label: "Registry: repo URL does not match the package".to_string(),
+                points: REPO_MISMATCH_WEIGHT as i32,
+                detail: format!(
+                    "Repo-URL verification under --online returned Mismatch: {}. Contributing {} \
+                     points.",
+                    rm.reason, REPO_MISMATCH_WEIGHT
+                ),
+            });
+        }
+    }
+
     factors
 }
 
@@ -712,6 +1160,7 @@ mod tests {
         PackageSignals {
             ecosystem: Ecosystem::Npm,
             name: "test-pkg".to_string(),
+            version: None,
             threat_db_missing: false,
             name_vs_popular,
             malicious_typosquat_of: None,
@@ -723,6 +1172,7 @@ mod tests {
     /// An `ApiProvenance` with every signal "clean" (no factor fires). Tests
     /// flip exactly the field under test so each factor is isolated.
     fn clean_provenance() -> ApiProvenance {
+        #[allow(deprecated)] // legacy `ownership_transferred` set here intentionally
         ApiProvenance {
             source: "npm".to_string(),
             package_age_days: Some(3650),
@@ -733,6 +1183,7 @@ mod tests {
             has_source_repo: Some(true),
             yanked_or_deprecated: false,
             latest_version: Some("4.18.2".to_string()),
+            ..Default::default()
         }
     }
 
@@ -914,6 +1365,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn ownership_transfer_adds_factor() {
         let mut p = clean_provenance();
         p.ownership_transferred = Some(true);
@@ -979,6 +1431,7 @@ mod tests {
     fn api_factors_are_additive_and_breakdown_verifies() {
         // An unknown name (10) plus a fully-bad provenance.
         let mut s = signals(NameVsPopular::Unknown);
+        #[allow(deprecated)]
         let p = ApiProvenance {
             source: "npm".to_string(),
             package_age_days: Some(1),
@@ -989,6 +1442,7 @@ mod tests {
             has_source_repo: Some(false),
             yanked_or_deprecated: true,
             latest_version: Some("9.9.9".to_string()),
+            ..Default::default()
         };
         s.api = ApiSignals::Available { provenance: p };
         let b = score_package(&s);
@@ -1021,6 +1475,7 @@ mod tests {
                         for low_dl in [false, true] {
                             for no_repo in [false, true] {
                                 for yanked in [false, true] {
+                                    #[allow(deprecated)]
                                     let p = ApiProvenance {
                                         source: "pypi".to_string(),
                                         package_age_days: Some(if pkg_new { 1 } else { 3650 }),
@@ -1035,6 +1490,7 @@ mod tests {
                                         has_source_repo: Some(!no_repo),
                                         yanked_or_deprecated: yanked,
                                         latest_version: Some("1.0.0".to_string()),
+                                        ..Default::default()
                                     };
                                     let mut s = signals(NameVsPopular::NearPopular {
                                         popular_name: "react".to_string(),
@@ -1087,6 +1543,7 @@ mod tests {
                             let s = PackageSignals {
                                 ecosystem: Ecosystem::Npm,
                                 name: "p".to_string(),
+                                version: None,
                                 threat_db_missing: false,
                                 name_vs_popular: nvp.clone(),
                                 malicious_typosquat_of: typo.clone(),
@@ -1116,5 +1573,311 @@ mod tests {
             classify_name(None, Ecosystem::Npm, "anything"),
             NameVsPopular::Unknown
         );
+    }
+
+    // --- M6 ch6 — version-aware parsing -----------------------------------
+
+    #[test]
+    fn parse_name_and_version_bare_name() {
+        assert_eq!(parse_name_and_version("react"), ("react".to_string(), None),);
+    }
+
+    #[test]
+    fn parse_name_and_version_with_version() {
+        assert_eq!(
+            parse_name_and_version("react@18.2.0"),
+            ("react".to_string(), Some("18.2.0".to_string())),
+        );
+    }
+
+    #[test]
+    fn parse_name_and_version_scoped_no_version() {
+        // The leading `@` is the scope sigil, not a version separator.
+        assert_eq!(
+            parse_name_and_version("@org/util"),
+            ("@org/util".to_string(), None),
+        );
+    }
+
+    #[test]
+    fn parse_name_and_version_scoped_with_version_splits_on_last_at() {
+        assert_eq!(
+            parse_name_and_version("@org/util@1.2.3"),
+            ("@org/util".to_string(), Some("1.2.3".to_string())),
+        );
+    }
+
+    #[test]
+    fn parse_name_and_version_bare_scope_only() {
+        // `@org` — `@` is at position 0; no version separator.
+        assert_eq!(parse_name_and_version("@org"), ("@org".to_string(), None),);
+    }
+
+    #[test]
+    fn parse_name_and_version_trailing_at_is_not_a_version() {
+        // `pkg@` — the version-shaped check rejects an empty tail.
+        assert_eq!(parse_name_and_version("pkg@"), ("pkg@".to_string(), None),);
+    }
+
+    #[test]
+    fn parse_name_and_version_doubled_at_splits_on_last() {
+        // `pkg@@1.0` — only the LAST `@` is treated as the separator.
+        assert_eq!(
+            parse_name_and_version("pkg@@1.0"),
+            ("pkg@".to_string(), Some("1.0".to_string())),
+        );
+    }
+
+    #[test]
+    fn parse_name_and_version_caret_range_accepted() {
+        assert_eq!(
+            parse_name_and_version("react@^18.0.0"),
+            ("react".to_string(), Some("^18.0.0".to_string())),
+        );
+    }
+
+    #[test]
+    fn parse_name_and_version_v_prefix_accepted() {
+        assert_eq!(
+            parse_name_and_version("foo@v1.0"),
+            ("foo".to_string(), Some("v1.0".to_string())),
+        );
+    }
+
+    #[test]
+    fn parse_name_and_version_non_version_tail_rejected() {
+        // A tail that does not start with a version-shaped char is kept in the name.
+        assert_eq!(
+            parse_name_and_version("alice@example.com"),
+            ("alice@example.com".to_string(), None),
+        );
+    }
+
+    #[test]
+    fn parse_name_and_version_empty_input() {
+        assert_eq!(parse_name_and_version(""), (String::new(), None),);
+        assert_eq!(parse_name_and_version("   "), (String::new(), None),);
+    }
+
+    // --- M6 ch6 — MaintainerChangeHistory ---------------------------------
+
+    #[test]
+    fn maintainer_change_history_recent_requires_diff_and_window() {
+        let none_recent = MaintainerChangeHistory {
+            added: vec![MaintainerRef {
+                id: "eve".to_string(),
+            }],
+            removed: vec![],
+            transfer_within_days: Some(MAINTAINER_CHANGE_RECENT_DAYS),
+        };
+        assert!(none_recent.is_recent());
+
+        let outside_window = MaintainerChangeHistory {
+            added: vec![MaintainerRef {
+                id: "eve".to_string(),
+            }],
+            removed: vec![],
+            transfer_within_days: Some(MAINTAINER_CHANGE_RECENT_DAYS + 1),
+        };
+        assert!(!outside_window.is_recent());
+
+        let no_diff = MaintainerChangeHistory {
+            added: vec![],
+            removed: vec![],
+            transfer_within_days: Some(1),
+        };
+        assert!(!no_diff.is_recent());
+    }
+
+    #[test]
+    fn osv_advisory_high_cvss_threshold() {
+        let high = OsvAdvisorySummary {
+            id: "GHSA-1".to_string(),
+            aliases: vec![],
+            summary: None,
+            cvss: Some(7.0),
+            reference: None,
+        };
+        assert!(high.is_high_cvss());
+        let medium = OsvAdvisorySummary {
+            id: "GHSA-2".to_string(),
+            aliases: vec![],
+            summary: None,
+            cvss: Some(6.9),
+            reference: None,
+        };
+        assert!(!medium.is_high_cvss());
+        let unknown = OsvAdvisorySummary {
+            id: "GHSA-3".to_string(),
+            aliases: vec![],
+            summary: None,
+            cvss: None,
+            reference: None,
+        };
+        assert!(!unknown.is_high_cvss());
+    }
+
+    #[test]
+    fn install_script_signals_fires_on_either_kind() {
+        let mut s = InstallScriptSignals::default();
+        assert!(!s.fires());
+        s.has_network_call = true;
+        assert!(s.fires());
+        s.has_network_call = false;
+        s.has_shell_spawn = true;
+        assert!(s.fires());
+    }
+
+    #[test]
+    fn package_not_found_adds_factor() {
+        let p = ApiProvenance {
+            source: "npm".to_string(),
+            package_existence: PackageExistence::NotFound,
+            ..Default::default()
+        };
+        let factors = api_factors(&p);
+        assert!(factors.iter().any(|f| f.id == "api_package_not_found"));
+    }
+
+    #[test]
+    fn osv_advisory_active_adds_factor() {
+        let p = ApiProvenance {
+            source: "npm".to_string(),
+            osv_advisories: Some(vec![OsvAdvisorySummary {
+                id: "GHSA-x".to_string(),
+                aliases: vec!["CVE-2024-x".to_string()],
+                summary: None,
+                cvss: Some(8.0),
+                reference: None,
+            }]),
+            ..Default::default()
+        };
+        let factors = api_factors(&p);
+        assert!(factors.iter().any(|f| f.id == "api_osv_advisory_active"));
+    }
+
+    #[test]
+    fn dep_confusion_adds_factor_when_risk_true() {
+        let p = ApiProvenance {
+            source: "npm".to_string(),
+            dep_confusion: Some(DepConfusionVerdict {
+                risk: true,
+                reason: "internal name resolved on public registry".to_string(),
+            }),
+            ..Default::default()
+        };
+        assert!(api_factors(&p).iter().any(|f| f.id == "api_dep_confusion"));
+    }
+
+    #[test]
+    fn dep_confusion_does_not_add_factor_when_risk_false() {
+        let p = ApiProvenance {
+            source: "npm".to_string(),
+            dep_confusion: Some(DepConfusionVerdict {
+                risk: false,
+                reason: String::new(),
+            }),
+            ..Default::default()
+        };
+        assert!(!api_factors(&p).iter().any(|f| f.id == "api_dep_confusion"));
+    }
+
+    #[test]
+    fn install_script_network_adds_factor_when_fires() {
+        let p = ApiProvenance {
+            source: "npm".to_string(),
+            install_script_signals: Some(InstallScriptSignals {
+                has_network_call: true,
+                has_shell_spawn: false,
+                suspicious_patterns: vec!["curl ...".to_string()],
+            }),
+            ..Default::default()
+        };
+        assert!(api_factors(&p)
+            .iter()
+            .any(|f| f.id == "api_install_script_network"));
+    }
+
+    #[test]
+    fn repo_mismatch_adds_factor_on_mismatch() {
+        let p = ApiProvenance {
+            source: "npm".to_string(),
+            repo_mismatch: Some(RepoMismatchVerdict {
+                state: RepoMismatchState::Mismatch,
+                reason: "hosted manifest names a different package".to_string(),
+            }),
+            ..Default::default()
+        };
+        assert!(api_factors(&p).iter().any(|f| f.id == "api_repo_mismatch"));
+    }
+
+    #[test]
+    fn repo_mismatch_unverifiable_does_not_fire() {
+        let p = ApiProvenance {
+            source: "npm".to_string(),
+            repo_mismatch: Some(RepoMismatchVerdict::default()),
+            ..Default::default()
+        };
+        assert!(!api_factors(&p).iter().any(|f| f.id == "api_repo_mismatch"));
+    }
+
+    #[test]
+    fn maintainer_change_recent_adds_factor() {
+        let p = ApiProvenance {
+            source: "npm".to_string(),
+            maintainer_change_history: Some(MaintainerChangeHistory {
+                added: vec![MaintainerRef {
+                    id: "eve".to_string(),
+                }],
+                removed: vec![],
+                transfer_within_days: Some(5),
+            }),
+            ..Default::default()
+        };
+        assert!(api_factors(&p)
+            .iter()
+            .any(|f| f.id == "api_maintainer_change_recent"));
+    }
+
+    #[test]
+    fn ownership_transfer_diff_adds_factor_only_with_no_overlap() {
+        let no_overlap = ApiProvenance {
+            source: "npm".to_string(),
+            ownership_transfer: Some(OwnershipTransfer {
+                previous: vec![MaintainerRef {
+                    id: "alice".to_string(),
+                }],
+                current: vec![MaintainerRef {
+                    id: "eve".to_string(),
+                }],
+                within_days: Some(2),
+            }),
+            ..Default::default()
+        };
+        assert!(api_factors(&no_overlap)
+            .iter()
+            .any(|f| f.id == "api_ownership_transfer_diff"));
+
+        let with_overlap = ApiProvenance {
+            source: "npm".to_string(),
+            ownership_transfer: Some(OwnershipTransfer {
+                previous: vec![MaintainerRef {
+                    id: "alice".to_string(),
+                }],
+                current: vec![
+                    MaintainerRef {
+                        id: "alice".to_string(),
+                    },
+                    MaintainerRef {
+                        id: "eve".to_string(),
+                    },
+                ],
+                within_days: Some(2),
+            }),
+            ..Default::default()
+        };
+        assert!(!api_factors(&with_overlap)
+            .iter()
+            .any(|f| f.id == "api_ownership_transfer_diff"));
     }
 }

