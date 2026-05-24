@@ -263,12 +263,22 @@ pub fn check(
     }
 
     if !drifts_after_trust.is_empty() {
-        // A migration-prompt drift entry is not real drift; it's a one-time
-        // signal that the lockfile's `format_version` predates the current
-        // build's hashing rules and needs `tirith mcp lock --force` once.
-        // Emit a distinct finding (Medium, same `RuleId::McpServerDrift`) so
-        // the operator gets a clear migration instruction instead of a
-        // generic-drift finding listing a server they didn't change.
+        // A migration-prompt drift entry is a schema-wide signal, not
+        // per-server drift: it tells the operator the lockfile's
+        // `format_version` predates the current build's hashing rules and
+        // needs `tirith mcp lock --force` once. Emit a distinct finding
+        // (Medium, same `RuleId::McpServerDrift`) so the operator gets a
+        // clear migration instruction.
+        //
+        // **Important:** the migration prompt does NOT short-circuit the
+        // per-server drift finding. `compute_drift` runs v4-compatible
+        // drift detection alongside the migration prompt (see
+        // `mcp_lock::compute_drift`'s v4 branch), so any real drift in a
+        // v4 lockfile — URL changed, command changed, env or tools
+        // added/removed, server added/removed — is still reported as
+        // its own finding. Without this, a malicious config change made
+        // during the v4→v5 migration window would slip silently into the
+        // operator's `tirith mcp lock --force` regeneration.
         let migration_entry = drifts_after_trust.iter().find_map(|d| match d {
             mcp_lock::McpDrift::SchemaUpgradeRequired {
                 from_version,
@@ -281,16 +291,26 @@ pub fn check(
                 from_version,
                 to_version,
             ));
-        } else {
+        }
+
+        // Per-server drift (Added / Removed / Changed) is reported in
+        // its own finding, independent of the migration prompt. Filter
+        // out the schema-wide migration entry so it does not contribute
+        // to the per-server change counts or get listed as a "server
+        // name" in the summary.
+        let per_server_drifts: Vec<mcp_lock::McpDrift> = drifts_after_trust
+            .into_iter()
+            .filter(|d| !matches!(d, mcp_lock::McpDrift::SchemaUpgradeRequired { .. }))
+            .collect();
+        if !per_server_drifts.is_empty() {
             // Drift severity ladder: Medium by default, upgraded to High if any
             // newly-added tool is outside the allowed set for that server.
-            let severity = if any_added_tool_out_of_allowed(&drifts_after_trust, mcp_allowed_tools)
-            {
+            let severity = if any_added_tool_out_of_allowed(&per_server_drifts, mcp_allowed_tools) {
                 Severity::High
             } else {
                 Severity::Medium
             };
-            findings.push(finding_for_drift(&drifts_after_trust, severity));
+            findings.push(finding_for_drift(&per_server_drifts, severity));
         }
     }
 
@@ -308,7 +328,18 @@ fn drift_filter_trusted(
     }
     drifts
         .into_iter()
-        .filter(|d| !trusted.iter().any(|t| t == d.name()))
+        .filter(|d| match d.name() {
+            // Per-server drift: drop the entry if its server name is in
+            // the trusted list. An empty server name here would be a
+            // *real* empty-name server (parse_mcp_config accepts `""` as
+            // a JSON object key); it is matched against the trusted list
+            // like any other name.
+            Some(n) => !trusted.iter().any(|t| t == n),
+            // Schema-wide signals (e.g. SchemaUpgradeRequired) have no
+            // per-server identity and cannot be "trusted away" — they
+            // must reach the operator so they can re-lock.
+            None => true,
+        })
         .collect()
 }
 
@@ -533,7 +564,13 @@ fn finding_for_drift(drifts: &[mcp_lock::McpDrift], severity: Severity) -> Findi
             }
         }
         if names.len() < 5 {
-            names.push(d.name().to_string());
+            // Only per-server drifts contribute a server name to the
+            // summary. `SchemaUpgradeRequired` is already routed to its
+            // own finding above and `continue`d past in the match arm —
+            // so any drift that reaches here has a name.
+            if let Some(n) = d.name() {
+                names.push(n.to_string());
+            }
         }
     }
 
@@ -583,8 +620,9 @@ fn finding_for_drift(drifts: &[mcp_lock::McpDrift], severity: Severity) -> Findi
 /// unchanged.
 fn finding_for_schema_upgrade_required(from_version: u32, to_version: u32) -> Finding {
     let detail = format!(
-        "MCP lockfile schema upgrade required (format_version {from_version} → {to_version}); \
-         drift comparison skipped for this run."
+        "MCP lockfile is at schema v{from_version}; re-lock with `tirith mcp lock --force` \
+         to migrate to v{to_version} and enable `tools_declared` drift detection. Real \
+         drift (if any) is reported separately."
     );
     Finding {
         rule_id: RuleId::McpServerDrift,
@@ -594,11 +632,13 @@ fn finding_for_schema_upgrade_required(from_version: u32, to_version: u32) -> Fi
         description: format!(
             "The committed `.tirith/mcp.lock` was written with schema version {from_version}, \
              but this build of tirith writes version {to_version}. The on-disk shape is \
-             compatible, but {from_version}'s stored hashes were computed under different \
-             rules than {to_version}'s — so the normal per-server drift comparison would \
-             fire on every server even when the MCP inventory is unchanged. Re-run \
-             `tirith mcp lock --force` once to regenerate the lockfile under the current \
-             hashing rules; subsequent scans will use the normal drift path."
+             compatible, and per-server drift is computed under v{from_version}-compatible \
+             semantics during the migration window — so any real drift (URL changed, command \
+             changed, env added/removed, tools added/removed, server added/removed) is still \
+             reported as its own finding. Re-run `tirith mcp lock --force` once to regenerate \
+             the lockfile under v{to_version}'s hashing rules; subsequent scans will then also \
+             detect a `\"tools\": []` ↔ omitted flip on the `tools_declared` field that \
+             v{from_version} silently ignored."
         ),
         evidence: vec![Evidence::Text { detail }],
         human_view: None,

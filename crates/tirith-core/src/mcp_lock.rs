@@ -360,58 +360,7 @@ impl McpServerEntry {
     /// stream an unambiguous encoding of the structure.
     pub fn content_hash(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(b"mcp-server-v2\0");
-        hash_field(&mut hasher, self.name.as_bytes());
-        match &self.transport {
-            McpTransport::Url { url, userinfo_hash } => {
-                hasher.update(b"url\0");
-                hash_field(&mut hasher, url.as_bytes());
-                // Fold `userinfo_hash` in so a userinfo change registers as
-                // drift (just like an env-value change does for stdio). The
-                // presence/absence of the hash is itself framed: a leading
-                // 0/1 byte distinguishes `None` from `Some("")`, so a future
-                // empty-hash sentinel cannot collide with a no-userinfo URL.
-                // The hash itself is already deterministically derived from
-                // (server_name, raw userinfo), so any userinfo change flips
-                // the per-server content hash even though no raw value is
-                // stored or hashed at this layer.
-                match userinfo_hash {
-                    Some(h) => {
-                        hasher.update(b"\x01");
-                        hash_field(&mut hasher, h.as_bytes());
-                    }
-                    None => {
-                        hasher.update(b"\x00");
-                    }
-                }
-            }
-            McpTransport::Stdio { command, args, env } => {
-                hasher.update(b"stdio\0");
-                hash_field(&mut hasher, command.as_bytes());
-                hash_field(&mut hasher, &(args.len() as u64).to_le_bytes());
-                for arg in args {
-                    hash_field(&mut hasher, arg.as_bytes());
-                }
-                hash_field(&mut hasher, &(env.len() as u64).to_le_bytes());
-                for entry in env {
-                    // Each env entry feeds its name AND its value_hash into the
-                    // per-server hash. The `value_hash` already deterministically
-                    // depends on the raw value (via `name + ':' + value`), so any
-                    // value change still flips the per-server content hash —
-                    // drift detection is unchanged even though no raw value is
-                    // stored or hashed here.
-                    hash_field(&mut hasher, entry.name.as_bytes());
-                    hash_field(&mut hasher, entry.value_hash.as_bytes());
-                }
-            }
-            McpTransport::Unknown => {
-                hasher.update(b"unknown\0");
-            }
-        }
-        hash_field(&mut hasher, &(self.tools.len() as u64).to_le_bytes());
-        for tool in &self.tools {
-            hash_field(&mut hasher, tool.as_bytes());
-        }
+        self.feed_content_hash_common(&mut hasher);
         // `tools_declared` joined the per-server hash in `format_version: 5`.
         // Pre-v5, a server flipping `"tools": []` to omitted (or vice-versa)
         // collapsed to an identical canonical `tools: Vec<String>` and hashed
@@ -430,6 +379,94 @@ impl McpServerEntry {
             hasher.update(b"\x00");
         }
         hex_lower(&hasher.finalize())
+    }
+
+    /// v4-compatible per-server content hash — the same byte stream the
+    /// v4 release computed, before `tools_declared` was folded into the
+    /// hash. Used by [`compute_drift`] when the parsed lockfile is tagged
+    /// [`LockfileSchema::LegacyV4Migration`] so the drift comparison runs
+    /// under v4 semantics on BOTH sides (current inventory and stored
+    /// lockfile) — that way real drift in a v4 lockfile (URL changed,
+    /// command changed, env changed, tools added/removed, server
+    /// added/removed) is still surfaced alongside the
+    /// [`McpDrift::SchemaUpgradeRequired`] migration prompt. Without this
+    /// method, the v5 short-circuit would silently absorb any real drift
+    /// that happened during the v4→v5 migration window — exactly the
+    /// signal a malicious config change would exploit.
+    ///
+    /// Concretely: every component a v5 hash includes EXCEPT the trailing
+    /// `tools_declared` byte. The v4 `"tools": []` ↔ omitted flip remains
+    /// undetected here (that is precisely the v4 semantic — the
+    /// regression is intentional for this migration-window comparison;
+    /// once the operator re-locks under v5 the regular `content_hash`
+    /// path catches the flip).
+    pub fn content_hash_v4(&self) -> String {
+        let mut hasher = Sha256::new();
+        self.feed_content_hash_common(&mut hasher);
+        hex_lower(&hasher.finalize())
+    }
+
+    /// Feed every per-server hash component into `hasher` EXCEPT the
+    /// trailing `tools_declared` byte. Shared by [`Self::content_hash`]
+    /// (v5: appends the declaration byte after this returns) and
+    /// [`Self::content_hash_v4`] (v4: omits the declaration byte
+    /// entirely). Keeping the common body in one place guarantees the
+    /// two hash functions never diverge on the shared prefix —
+    /// transport, env, tools list — only on the v5-introduced trailing
+    /// byte.
+    fn feed_content_hash_common(&self, hasher: &mut Sha256) {
+        hasher.update(b"mcp-server-v2\0");
+        hash_field(hasher, self.name.as_bytes());
+        match &self.transport {
+            McpTransport::Url { url, userinfo_hash } => {
+                hasher.update(b"url\0");
+                hash_field(hasher, url.as_bytes());
+                // Fold `userinfo_hash` in so a userinfo change registers as
+                // drift (just like an env-value change does for stdio). The
+                // presence/absence of the hash is itself framed: a leading
+                // 0/1 byte distinguishes `None` from `Some("")`, so a future
+                // empty-hash sentinel cannot collide with a no-userinfo URL.
+                // The hash itself is already deterministically derived from
+                // (server_name, raw userinfo), so any userinfo change flips
+                // the per-server content hash even though no raw value is
+                // stored or hashed at this layer.
+                match userinfo_hash {
+                    Some(h) => {
+                        hasher.update(b"\x01");
+                        hash_field(hasher, h.as_bytes());
+                    }
+                    None => {
+                        hasher.update(b"\x00");
+                    }
+                }
+            }
+            McpTransport::Stdio { command, args, env } => {
+                hasher.update(b"stdio\0");
+                hash_field(hasher, command.as_bytes());
+                hash_field(hasher, &(args.len() as u64).to_le_bytes());
+                for arg in args {
+                    hash_field(hasher, arg.as_bytes());
+                }
+                hash_field(hasher, &(env.len() as u64).to_le_bytes());
+                for entry in env {
+                    // Each env entry feeds its name AND its value_hash into the
+                    // per-server hash. The `value_hash` already deterministically
+                    // depends on the raw value (via `name + ':' + value`), so any
+                    // value change still flips the per-server content hash —
+                    // drift detection is unchanged even though no raw value is
+                    // stored or hashed here.
+                    hash_field(hasher, entry.name.as_bytes());
+                    hash_field(hasher, entry.value_hash.as_bytes());
+                }
+            }
+            McpTransport::Unknown => {
+                hasher.update(b"unknown\0");
+            }
+        }
+        hash_field(hasher, &(self.tools.len() as u64).to_le_bytes());
+        for tool in &self.tools {
+            hash_field(hasher, tool.as_bytes());
+        }
     }
 }
 
@@ -1763,18 +1800,28 @@ impl McpDrift {
         }
     }
 
-    /// The server name this drift refers to. `SchemaUpgradeRequired`
-    /// has no server name; it returns an empty string. Callers that
-    /// filter drift by server (e.g. trust filtering, allowed-tools
-    /// matching) inspect this — the empty string is never a real MCP
-    /// server name, so an `mcp_allowed_tools` / `trusted_mcp_servers`
-    /// match against an empty key is structurally impossible.
-    pub fn name(&self) -> &str {
+    /// The server name this drift refers to, or `None` for the schema-
+    /// wide [`McpDrift::SchemaUpgradeRequired`] signal which has no
+    /// per-server identity.
+    ///
+    /// **Why `Option<&str>` rather than `&str` with an empty-string
+    /// sentinel.** [`parse_mcp_config`] does accept an empty JSON object
+    /// key as a (degenerate) server name — `{"": {...}}` parses to a
+    /// server with `name == ""`. If the schema-wide signal also returned
+    /// `""`, name-based filtering / grouping / de-duplication would
+    /// shadow that legitimate empty-name server with the schema sentinel.
+    /// Returning `None` for the schema-wide variant keeps the two
+    /// structurally distinct: callers explicitly handle the schema case
+    /// or skip it, instead of unwittingly matching `""` against a real
+    /// empty-name server. Per-server variants (`Added`, `Removed`,
+    /// `Changed`) return `Some(&name)` — the real server name, including
+    /// an empty string when the source config used `""` as a key.
+    pub fn name(&self) -> Option<&str> {
         match self {
-            McpDrift::Removed { name, .. } => name,
-            McpDrift::Added { name, .. } => name,
-            McpDrift::Changed(entry) => &entry.name,
-            McpDrift::SchemaUpgradeRequired { .. } => "",
+            McpDrift::Removed { name, .. } => Some(name),
+            McpDrift::Added { name, .. } => Some(name),
+            McpDrift::Changed(entry) => Some(&entry.name),
+            McpDrift::SchemaUpgradeRequired { .. } => None,
         }
     }
 }
@@ -1815,22 +1862,42 @@ impl McpDrift {
 /// observes that the *hash* changed, never the underlying secret. A drift
 /// report is therefore safe to print to a terminal and to serialize as JSON.
 pub fn compute_drift(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift> {
-    // Migration short-circuit. A lockfile parsed from a legacy
-    // `format_version: 4` carries `LockfileSchema::LegacyV4Migration`
+    // Legacy v4 migration path. A lockfile parsed from a legacy
+    // `format_version: 4` carries [`LockfileSchema::LegacyV4Migration`]
     // because its stored hashes were computed under the pre-v5 rules
-    // (tools_declared excluded). Every server's recomputed v5 hash
-    // would differ from the stored v4 hash even when nothing in the
-    // MCP inventory changed, so the normal drift walk would fire a
-    // phantom-drift storm. Surface a single migration entry instead;
-    // the operator runs `tirith mcp lock --force` once and subsequent
-    // runs use the normal drift path. The `current` inventory is
-    // intentionally NOT inspected here — there's no useful per-server
-    // comparison to do until the baseline is regenerated.
+    // (tools_declared excluded). The straightforward "compare v5 hashes
+    // directly" walk would phantom-drift on every existing server
+    // because every recomputed v5 hash differs from every v4 baseline
+    // when `tools_declared` happens to differ between the two sides.
+    //
+    // We resolve this by comparing under **v4-compatible semantics** on
+    // both sides — see [`McpServerEntry::content_hash_v4`]. That keeps
+    // real drift (URL changed, command changed, env added/removed,
+    // tools added/removed, server added/removed) visible across the
+    // schema boundary, while suppressing the `tools_declared`-only
+    // phantom drift. The lockfile-wide `SchemaUpgradeRequired` migration
+    // prompt rides on top so the operator knows to re-lock and pick up
+    // v5's `tools_declared` drift detection on the next run.
+    //
+    // Why both signals matter. A malicious config change made during the
+    // v4→v5 migration window would, under a "migration-only" short-
+    // circuit, slip silently into the operator's `tirith mcp lock
+    // --force` regeneration. Computing v4-compatible drift in parallel
+    // closes that window: real drift is reported alongside the
+    // migration prompt, so no signal is absorbed by the upgrade.
     if matches!(lock.schema_state, LockfileSchema::LegacyV4Migration) {
-        return vec![McpDrift::SchemaUpgradeRequired {
+        let mut drifts = compute_drift_v4(current, lock);
+        // Migration prompt always rides on top. Its sort key is `(0, "",
+        // "")` so the final sort_by_key call below places it first; emit
+        // it unconditionally — even when the v4 comparison is clean —
+        // since the schema-state itself is the signal that the operator
+        // needs to re-lock once.
+        drifts.push(McpDrift::SchemaUpgradeRequired {
             from_version: lock.format_version,
             to_version: MCP_LOCK_FORMAT_VERSION,
-        }];
+        });
+        drifts.sort_by_key(McpDrift::sort_key);
+        return drifts;
     }
 
     // Compute the current inventory's would-be inventory hash. If it equals
@@ -1913,6 +1980,132 @@ pub fn compute_drift(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift
 
     drifts.sort_by_key(McpDrift::sort_key);
     drifts
+}
+
+/// Compute per-server drift between `current` and `lock` under **v4
+/// hashing semantics** — every per-server hash on both sides is the
+/// v4-style hash (see [`McpServerEntry::content_hash_v4`]), which
+/// excludes `tools_declared` from the hash input.
+///
+/// Used exclusively by [`compute_drift`] when the parsed lockfile is
+/// tagged [`LockfileSchema::LegacyV4Migration`]. The returned drift
+/// vector is **unsorted** — the caller (`compute_drift`) appends the
+/// migration prompt and then calls [`McpDrift::sort_key`] once to
+/// deterministically order the combined output.
+///
+/// The walk logic is structurally identical to the v5 slow path in
+/// `compute_drift`: a merge walk over `(name, source_config)`-sorted
+/// sides emitting Added / Removed / Changed entries. The only
+/// difference is which hash function feeds the equality check.
+fn compute_drift_v4(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift> {
+    // Mirror the v5 fast path: build the would-be locked form of the
+    // current inventory, but use v4 hashes. The `from_inventory` call
+    // gives us a sorted `Vec<McpLockServer>`; we recompute hashes onto
+    // a side-table indexed by position so the merge walk below can
+    // compare v4 hashes without mutating the v5 hashes in
+    // `current_lock.servers` (those are still useful elsewhere).
+    let current_lock = McpLockfile::from_inventory(current);
+    let current_hashes_v4: Vec<String> = current_lock.servers.iter().map(server_v4_hash).collect();
+    let lock_hashes_v4: Vec<String> = lock.servers.iter().map(server_v4_hash).collect();
+
+    // Fast path: if every v4 hash on the current side matches every v4
+    // hash on the lock side (and the server lists align), no real drift
+    // exists under v4 semantics — return empty so only the migration
+    // prompt fires. Cheap to skip when populations differ in length.
+    if current_lock.servers.len() == lock.servers.len()
+        && current_hashes_v4 == lock_hashes_v4
+        && current_lock
+            .servers
+            .iter()
+            .zip(lock.servers.iter())
+            .all(|(a, b)| a.name == b.name && a.source_config == b.source_config)
+    {
+        return Vec::new();
+    }
+
+    let mut drifts: Vec<McpDrift> = Vec::new();
+    let mut i = 0usize;
+    let mut j = 0usize;
+
+    while i < current_lock.servers.len() && j < lock.servers.len() {
+        let cur = &current_lock.servers[i];
+        let prev = &lock.servers[j];
+
+        let key_cur = (&cur.name, &cur.source_config);
+        let key_prev = (&prev.name, &prev.source_config);
+
+        match key_cur.cmp(&key_prev) {
+            std::cmp::Ordering::Less => {
+                drifts.push(McpDrift::Added {
+                    name: cur.name.clone(),
+                    source_config: cur.source_config.clone(),
+                    tools: cur.tools.clone(),
+                });
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                drifts.push(McpDrift::Removed {
+                    name: prev.name.clone(),
+                    source_config: prev.source_config.clone(),
+                });
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                // Compare v4-style hashes only. `compute_changed_entry`
+                // diffs the per-field detail (transport changes, env
+                // changes, tools changes) directly from the structured
+                // fields, NOT from any hash — so the function works
+                // identically under v4 and v5 semantics. The only thing
+                // v4 hides is the `tools_declared` flip, which has no
+                // dedicated `McpServerDriftEntry` field to surface
+                // anyway.
+                if current_hashes_v4[i] != lock_hashes_v4[j] {
+                    if let Some(entry) = compute_changed_entry(cur, prev) {
+                        drifts.push(McpDrift::Changed(entry));
+                    }
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    while i < current_lock.servers.len() {
+        let cur = &current_lock.servers[i];
+        drifts.push(McpDrift::Added {
+            name: cur.name.clone(),
+            source_config: cur.source_config.clone(),
+            tools: cur.tools.clone(),
+        });
+        i += 1;
+    }
+    while j < lock.servers.len() {
+        let prev = &lock.servers[j];
+        drifts.push(McpDrift::Removed {
+            name: prev.name.clone(),
+            source_config: prev.source_config.clone(),
+        });
+        j += 1;
+    }
+
+    drifts
+}
+
+/// Re-derive a v4-compatible per-server hash from an [`McpLockServer`].
+/// [`McpServerEntry::content_hash_v4`] is the canonical implementation;
+/// this helper bridges the two record types (the structurally-identical
+/// fields are copied into a transient `McpServerEntry` and hashed). The
+/// allocation cost is one `clone()` per server per `compute_drift`
+/// call under the v4 migration path — negligible (lockfiles typically
+/// hold tens of servers at most).
+fn server_v4_hash(server: &McpLockServer) -> String {
+    McpServerEntry {
+        name: server.name.clone(),
+        transport: server.transport.clone(),
+        tools: server.tools.clone(),
+        tools_declared: server.tools_declared,
+        source_config: server.source_config.clone(),
+    }
+    .content_hash_v4()
 }
 
 /// Classify the field-level change between two servers that share a
@@ -5119,12 +5312,18 @@ mod tests {
     #[test]
     fn parse_lockfile_v4_triggers_migration_message() {
         // A `format_version: 4` lockfile parses cleanly — its on-disk
-        // shape is identical to v5 — and `compute_drift` returns a
-        // single `SchemaUpgradeRequired` entry pointing the operator at
-        // `tirith mcp lock --force`. No per-server drift entries are
-        // emitted; the v4 stored hashes would all differ from the v5
-        // recomputed hashes even when nothing about the MCP inventory
-        // changed, so phantom drift is short-circuited.
+        // shape is identical to v5 — and `compute_drift` emits a
+        // `SchemaUpgradeRequired` entry pointing the operator at
+        // `tirith mcp lock --force`. When the v4 baseline ALSO matches
+        // the current inventory under v4-compatible hashing (the case
+        // covered here), no per-server drift fires alongside the
+        // migration prompt — the operator just sees "re-lock to
+        // upgrade".
+        //
+        // This test pins the migration *message*. The cases where real
+        // drift exists alongside the migration prompt are covered by
+        // `v4_lockfile_with_real_drift_reports_both_upgrade_and_drift`
+        // and `v4_lockfile_clean_reports_only_upgrade` below.
         let body = r#"{
             "format_version": 4,
             "inventory_hash": "abc",
@@ -5143,32 +5342,216 @@ mod tests {
         assert_eq!(parsed.schema_state, LockfileSchema::LegacyV4Migration);
         assert_eq!(parsed.format_version, 4);
 
-        // Build a current inventory matching the locked server. Without
-        // the migration short-circuit, compute_drift would either find
-        // no drift (since the data is identical) OR (more realistically)
-        // find drift because v4's hash for the empty-tools-omitted case
-        // differs from v5's. The migration tag forces the short-circuit.
+        // Build a current inventory matching the locked server. Under
+        // v4-compatible hashing both sides match (tools_declared is
+        // excluded), so only the migration entry fires.
         let inv = mk_inventory(vec![stdio_server("s", "node")]);
         let drifts = compute_drift(&inv, &parsed);
-        assert_eq!(drifts.len(), 1, "expected exactly one migration entry");
-        match &drifts[0] {
-            McpDrift::SchemaUpgradeRequired {
-                from_version,
-                to_version,
-            } => {
-                assert_eq!(*from_version, 4);
-                assert_eq!(*to_version, MCP_LOCK_FORMAT_VERSION);
-            }
-            other => panic!("expected SchemaUpgradeRequired, got {other:?}"),
-        }
-        // No phantom Added/Removed/Changed drift entries surface alongside
-        // the migration entry.
+
+        // The migration prompt is present, with the right version pair.
+        let migration = drifts
+            .iter()
+            .find_map(|d| match d {
+                McpDrift::SchemaUpgradeRequired {
+                    from_version,
+                    to_version,
+                } => Some((*from_version, *to_version)),
+                _ => None,
+            })
+            .expect("v4 lockfile must surface SchemaUpgradeRequired");
+        assert_eq!(migration, (4, MCP_LOCK_FORMAT_VERSION));
+    }
+
+    #[test]
+    fn v4_lockfile_with_real_drift_reports_both_upgrade_and_drift() {
+        // Build a v4 lockfile that records server "s" with URL
+        // `https://example.com/old`. The current inventory has the
+        // same server but the URL has changed to `https://example.com/new`.
+        // Under the migration window, compute_drift must report BOTH:
+        //   1. SchemaUpgradeRequired (the v4→v5 migration prompt)
+        //   2. Changed (the real URL drift, surfaced via v4-compatible
+        //      comparison so it isn't absorbed by the migration short-
+        //      circuit).
+        let body = r#"{
+            "format_version": 4,
+            "inventory_hash": "abc",
+            "configs": [".mcp.json"],
+            "servers": [
+                {
+                    "name": "s",
+                    "transport": {"kind": "url", "url": "https://example.com/old"},
+                    "tools": [],
+                    "source_config": ".mcp.json",
+                    "hash": "deadbeef"
+                }
+            ]
+        }"#;
+        let parsed = parse_lockfile(body).expect("v4 lockfile must parse");
+        assert_eq!(parsed.schema_state, LockfileSchema::LegacyV4Migration);
+
+        // Current inventory: same server name + source, different URL.
+        let inv = mk_inventory(vec![McpServerEntry {
+            name: "s".into(),
+            transport: McpTransport::Url {
+                url: "https://example.com/new".into(),
+                userinfo_hash: None,
+            },
+            tools: vec![],
+            tools_declared: true,
+            source_config: ".mcp.json".into(),
+        }]);
+
+        let drifts = compute_drift(&inv, &parsed);
+
+        // Migration prompt fires.
         assert!(
-            !drifts.iter().any(|d| matches!(
-                d,
-                McpDrift::Added { .. } | McpDrift::Removed { .. } | McpDrift::Changed(_)
-            )),
-            "no per-server drift may fire under the legacy-v4 migration short-circuit: {drifts:?}",
+            drifts
+                .iter()
+                .any(|d| matches!(d, McpDrift::SchemaUpgradeRequired { .. })),
+            "expected SchemaUpgradeRequired alongside real drift: {drifts:?}",
+        );
+
+        // Real URL drift fires as a Changed entry — proving that real
+        // signal is NOT absorbed by the migration short-circuit.
+        let changed_entry = drifts.iter().find_map(|d| match d {
+            McpDrift::Changed(entry) if entry.name == "s" => Some(entry),
+            _ => None,
+        });
+        let entry = changed_entry.expect("real URL drift must surface alongside migration prompt");
+        assert!(
+            entry
+                .transport_changes
+                .iter()
+                .any(|c| matches!(c, McpTransportChange::UrlChanged)),
+            "expected UrlChanged in transport_changes: {:?}",
+            entry.transport_changes,
+        );
+    }
+
+    #[test]
+    fn v4_lockfile_clean_reports_only_upgrade() {
+        // A v4 lockfile that matches the current inventory exactly under
+        // v4-compatible hashing surfaces ONLY the migration prompt — no
+        // phantom Added / Removed / Changed entries.
+        //
+        // The `tools_declared: true` default on the parsed lockfile
+        // matches the default the current inventory's `stdio_server`
+        // helper uses, so both sides hash identically under
+        // `content_hash_v4` (which excludes `tools_declared` anyway,
+        // making this even more robust).
+        let body = r#"{
+            "format_version": 4,
+            "inventory_hash": "abc",
+            "configs": [".mcp.json"],
+            "servers": [
+                {
+                    "name": "s",
+                    "transport": {"kind": "stdio", "command": "node", "args": [], "env": []},
+                    "tools": [],
+                    "source_config": ".mcp.json",
+                    "hash": "deadbeef"
+                }
+            ]
+        }"#;
+        let parsed = parse_lockfile(body).expect("v4 lockfile must parse");
+        let inv = mk_inventory(vec![stdio_server("s", "node")]);
+        let drifts = compute_drift(&inv, &parsed);
+
+        // Exactly one entry, and it's the migration prompt.
+        assert_eq!(
+            drifts.len(),
+            1,
+            "clean v4 lockfile must produce only the migration entry: {drifts:?}",
+        );
+        assert!(
+            matches!(&drifts[0], McpDrift::SchemaUpgradeRequired { .. }),
+            "expected SchemaUpgradeRequired only, got {drifts:?}",
+        );
+    }
+
+    #[test]
+    fn v5_lockfile_normal_drift_unchanged() {
+        // Regression check: a v5 lockfile flows through the normal
+        // drift path. The v4 migration branch in compute_drift must not
+        // touch it — no SchemaUpgradeRequired entry, drift mirrors the
+        // pre-Item-2 v5 contract.
+        let inv_before = mk_inventory(vec![stdio_server("s", "node")]);
+        let lock = McpLockfile::from_inventory(&inv_before);
+        let body = lock.render();
+        let parsed = parse_lockfile(&body).expect("v5 lockfile must parse");
+        assert_eq!(parsed.schema_state, LockfileSchema::Current);
+
+        // Unchanged inventory → empty drift.
+        let drifts_same = compute_drift(&inv_before, &parsed);
+        assert!(
+            drifts_same.is_empty(),
+            "unchanged v5 inventory must produce no drift: {drifts_same:?}",
+        );
+
+        // Mutated inventory → real drift, no migration prompt.
+        let inv_after = mk_inventory(vec![stdio_server("s", "node"), stdio_server("t", "node")]);
+        let drifts_changed = compute_drift(&inv_after, &parsed);
+        assert!(
+            drifts_changed
+                .iter()
+                .any(|d| matches!(d, McpDrift::Added { name, .. } if name == "t")),
+            "expected an Added drift for server t: {drifts_changed:?}",
+        );
+        assert!(
+            !drifts_changed
+                .iter()
+                .any(|d| matches!(d, McpDrift::SchemaUpgradeRequired { .. })),
+            "v5 drift must NOT contain SchemaUpgradeRequired: {drifts_changed:?}",
+        );
+    }
+
+    #[test]
+    fn mcp_drift_name_distinguishes_empty_name_server_from_schema_signal() {
+        // Item 1: `McpDrift::name()` must distinguish a per-server
+        // signal with `name == ""` (a real, if degenerate, MCP server
+        // whose JSON object key is the empty string) from the schema-
+        // wide `SchemaUpgradeRequired` signal that has no per-server
+        // identity. Returning `Option<&str>` makes the two structurally
+        // distinct: a name-based dedupe / filter sees the empty-name
+        // server as `Some("")` and the schema signal as `None`, so they
+        // cannot collide.
+        let empty_name_server_drift = McpDrift::Added {
+            name: String::new(),
+            source_config: ".mcp.json".into(),
+            tools: vec![],
+        };
+        let schema_signal = McpDrift::SchemaUpgradeRequired {
+            from_version: 4,
+            to_version: MCP_LOCK_FORMAT_VERSION,
+        };
+
+        // The two are observably distinct via `name()`.
+        assert_eq!(empty_name_server_drift.name(), Some(""));
+        assert_eq!(schema_signal.name(), None);
+        assert_ne!(empty_name_server_drift.name(), schema_signal.name());
+
+        // Group / dedupe-by-name does not conflate them. A naive
+        // pre-Item-1 implementation that grouped by `&str` would have
+        // bucketed both under `""` and lost one. The `Option<&str>`
+        // signature forces the caller to handle the schema case
+        // explicitly.
+        let drifts = vec![empty_name_server_drift.clone(), schema_signal.clone()];
+        let mut per_server_names: Vec<&str> = Vec::new();
+        let mut schema_signal_seen = false;
+        for d in &drifts {
+            match d.name() {
+                Some(n) => per_server_names.push(n),
+                None => schema_signal_seen = true,
+            }
+        }
+        assert_eq!(
+            per_server_names,
+            vec![""],
+            "the per-server bucket must contain exactly the empty-name server",
+        );
+        assert!(
+            schema_signal_seen,
+            "the schema-wide signal must be observed via the `None` arm",
         );
     }
 

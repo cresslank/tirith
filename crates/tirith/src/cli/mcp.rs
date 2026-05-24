@@ -764,9 +764,10 @@ fn print_drift_body(drifts: &[McpDrift]) {
                 to_version,
             } => {
                 eprintln!(
-                    "  ! schema upgrade required: lockfile written with format_version={from_version}, \
-                     this tirith writes format_version={to_version}. Run `tirith mcp lock --force` to \
-                     regenerate; drift comparison is skipped for this run."
+                    "  ! schema upgrade required: lockfile is at schema v{from_version}; re-lock \
+                     with `tirith mcp lock --force` to migrate to v{to_version} (this enables \
+                     `tools_declared` drift detection). Real drift, if any, is reported \
+                     separately below."
                 );
             }
         }
