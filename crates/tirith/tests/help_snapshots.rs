@@ -51,6 +51,7 @@ help_example_tests! {
     help_scan       => (["scan", "--help"], "tirith scan");
     #[cfg(unix)]
     help_fetch      => (["fetch", "--help"], "tirith fetch");
+    help_fix        => (["fix", "--help"], "tirith fix --");
     help_setup      => (["setup", "--help"], "tirith setup claude-code");
     help_init       => (["init", "--help"], "tirith init --shell");
     help_doctor     => (["doctor", "--help"], "tirith doctor --fix");

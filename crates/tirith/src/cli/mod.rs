@@ -140,6 +140,7 @@ pub mod diff;
 pub mod doctor;
 pub mod ecosystem;
 pub mod explain;
+pub mod fix;
 pub mod gateway;
 pub mod hook_event;
 pub mod init;

@@ -511,6 +511,57 @@ Examples:
         json: bool,
     },
 
+    /// Suggest a concrete safer rewrite for a command and (interactively) apply one
+    #[command(after_help = "\
+Thin presenter over `tirith_core::safe_command::suggest()` — the same engine
+backing `tirith check --suggest-safe-command`. Pick a numbered rewrite at the
+prompt and `fix` prints exactly that command on stdout, so you can wrap with
+`$(tirith fix -- '<cmd>')` and feed it straight into your shell.
+
+When no mechanical rewrite is possible (homograph hostnames, dotfile writes,
+threat-DB hits) `fix` prints the honest per-rule remediation instead of
+fabricating a command. Detection lives in the engine; `fix` adds zero
+heuristics of its own.
+
+Exit codes (deliberately distinct from `tirith check`):
+  0  no fix needed (verdict was Allow) OR user accepted a rewrite
+  1  findings exist but no mechanical rewrite is available
+  2  user rejected the rewrite, or stdin/stdout is not a TTY
+
+`check` uses 0/1/2/3 (allow/block/warn/warn-ack — tied to verdict severity);
+`fix`'s codes are tied to whether a rewrite was applied. The two surfaces
+are deliberately different.
+
+JSON shape (`--json` / `--non-interactive`):
+  - No findings → object: {applied, reason, verdict, command}
+  - Findings present → plain array of SafeSuggestion (matches the
+    `safe_suggestions` array embedded in `tirith check --suggest --json`)
+
+Examples:
+  tirith fix -- 'curl https://example.com/install.sh | bash'
+  tirith fix --shell bash -- 'curl -k https://example.com/install.sh | bash'
+  tirith fix --non-interactive -- 'ls -la'
+  tirith fix --json --non-interactive -- 'curl https://example.com/install.sh | bash'
+  eval \"$(tirith fix -- 'curl -k https://example.com/install.sh')\"")]
+    Fix {
+        /// Shell type for tokenization (default: posix)
+        #[arg(long, default_value = "posix")]
+        shell: String,
+
+        /// Non-interactive: emit JSON (the strict superset of human output)
+        /// and never prompt. Implies the JSON shape regardless of `--json`.
+        #[arg(long)]
+        non_interactive: bool,
+
+        /// Alias for the non-interactive JSON output mode
+        #[arg(long, hide = true)]
+        json: bool,
+
+        /// The command to suggest fixes for (joined with spaces if multiple)
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+
     /// Run as MCP server (JSON-RPC over stdio)
     #[command(
         name = "mcp-server",
@@ -2465,6 +2516,13 @@ fn run() {
             let (_, json) = HumanJsonFormat::resolve(format, json);
             cli::fetch::run(&url, json)
         }
+
+        Commands::Fix {
+            shell,
+            non_interactive,
+            json,
+            command,
+        } => cli::fix::run(&command, &shell, non_interactive, json),
 
         Commands::McpServer => cli::mcp_server::run(),
 

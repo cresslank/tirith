@@ -6773,3 +6773,210 @@ fn explain_fix_without_rule_or_finding_is_rejected() {
         .expect("failed to run tirith");
     assert_ne!(out.status.code(), Some(0));
 }
+
+// ── tirith fix (M6 ch4) ────────────────────────────────────────────────────
+//
+// `tirith fix` is a thin presenter over `safe_command::suggest()`. The CLI
+// tests here pin the shape of the public surface — exit codes, the two JSON
+// shapes (envelope on no-findings, array on findings), and the discipline
+// that `fix` never invents a rewrite when the library returns
+// `safe_command: None`.
+//
+// Exit-code contract is deliberately different from `tirith check`:
+//   0 = no fix needed OR user accepted; 1 = guidance only; 2 = rejected /
+//   no-TTY / no suggestion applicable.
+
+#[test]
+fn fix_clean_command_exits_zero_with_no_findings_envelope() {
+    // Spec: `tirith fix -- "ls -la"` → exit 0 with "no fix needed".
+    // Under --non-interactive we get the JSON envelope shape instead.
+    let out = tirith()
+        .args(["fix", "--non-interactive", "--", "ls -la"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("fix --non-interactive -- 'ls -la' valid JSON");
+    assert_eq!(v["applied"], false);
+    assert_eq!(v["reason"], "no_findings");
+    assert_eq!(v["verdict"], "allow");
+    assert_eq!(v["command"], "ls -la");
+}
+
+#[test]
+fn fix_clean_command_human_prints_no_fix_needed() {
+    // The plan's spec text: "→ print 'no fix needed' (or {applied,...} under
+    // --json)". Pin the literal human string so a refactor that drops the
+    // line trips CI.
+    let out = tirith()
+        .args(["fix", "--", "ls -la"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no fix needed"),
+        "fix on clean command must print 'no fix needed', got: {stdout}"
+    );
+}
+
+#[test]
+fn fix_non_interactive_json_emits_array_for_pipe_to_shell() {
+    // Acceptance: `tirith fix --json --non-interactive -- "curl … | bash"`
+    // emits a valid JSON array of SafeSuggestion. Exit 2 because a rewrite
+    // exists but we have no way to accept it under --non-interactive.
+    let out = tirith()
+        .args([
+            "fix",
+            "--json",
+            "--non-interactive",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(2));
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("fix --json --non-interactive valid JSON");
+    let arr = v
+        .as_array()
+        .expect("findings-present shape is a JSON array");
+    assert!(!arr.is_empty(), "expected at least one suggestion");
+    // The pipe-to-shell rewrite must be present with the canonical
+    // /tmp/tirith-review.sh download-then-run shape.
+    let curl_pipe = arr
+        .iter()
+        .find(|s| s["rule_id"] == "curl_pipe_shell")
+        .expect("curl_pipe_shell suggestion present");
+    let sc = curl_pipe["safe_command"]
+        .as_str()
+        .expect("safe_command is a string for this transform");
+    assert!(
+        sc.contains("/tmp/tirith-review.sh"),
+        "rewrite must use the canonical review scratch path, got: {sc}"
+    );
+    assert!(
+        sc.contains("less /tmp/tirith-review.sh"),
+        "rewrite must include the review step, got: {sc}"
+    );
+    // Every suggestion must carry a non-empty `remediation` (honest guidance)
+    // — this is the discipline that prevents fabricated rewrites.
+    for s in arr {
+        assert!(
+            s["remediation"].as_str().is_some_and(|r| !r.is_empty()),
+            "every suggestion must have a non-empty remediation"
+        );
+        assert!(
+            s["rationale"].as_str().is_some_and(|r| !r.is_empty()),
+            "every suggestion must have a non-empty rationale"
+        );
+    }
+}
+
+#[test]
+fn fix_non_interactive_emits_array_without_json_flag() {
+    // Spec step 8: `--non-interactive` → JSON-emit all suggestions; `--json`
+    // is its strict superset. Both should produce the same shape.
+    let out = tirith()
+        .args([
+            "fix",
+            "--non-interactive",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(2));
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("fix --non-interactive (no --json) valid JSON");
+    assert!(
+        v.is_array(),
+        "non-interactive must emit a JSON array on findings (matches --json)"
+    );
+}
+
+#[test]
+fn fix_no_tty_with_rewrites_exits_two() {
+    // Spec acceptance: `tirith fix --non-interactive -- "echo nope" </dev/null`
+    // exits 2 IF no suggestion can be applied. We exercise the stronger
+    // variant: a command that DOES have a rewrite, run with stdin redirected
+    // and --non-interactive. The exit code is 2 because a rewrite exists but
+    // we can't get an accept signal.
+    use std::process::Stdio;
+    let out = tirith()
+        .args([
+            "fix",
+            "--non-interactive",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn fix_with_shell_flag_routes_through_powershell_tokenizer() {
+    // The `--shell` flag must reach the analyzer. Use a curl|bash pipeline
+    // that the engine flags under POSIX; verify that PowerShell tokenization
+    // path also recognises it (the base_command in safe_command.rs strips
+    // .exe under PowerShell).
+    let out = tirith()
+        .args([
+            "fix",
+            "--shell",
+            "powershell",
+            "--non-interactive",
+            "--",
+            "curl https://example.com/install.sh | bash.exe",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    // We expect findings + at least one suggestion (so exit 2 under
+    // --non-interactive).
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "powershell shell path must reach a finding: stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("fix --shell powershell valid JSON");
+    assert!(v.is_array(), "findings-present must be array shape");
+}
+
+#[test]
+fn fix_unknown_shell_falls_back_to_posix_with_warning() {
+    // `tirith check` warns and falls back to posix on an unknown --shell.
+    // `fix` mirrors that contract so users can't pass `--shell tcsh` and
+    // silently get analysis with the wrong tokenizer.
+    let out = tirith()
+        .args([
+            "fix",
+            "--shell",
+            "tcsh",
+            "--non-interactive",
+            "--",
+            "ls -la",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown shell"),
+        "expected stderr warning for unknown shell, got: {stderr}"
+    );
+}
+
+#[test]
+fn fix_empty_command_is_no_op_exit_zero() {
+    // `tirith fix --` with no command is a documented no-op (mirrors
+    // `tirith check` with an empty command). Exit 0.
+    let out = tirith()
+        .args(["fix", "--", ""])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+}
