@@ -637,6 +637,42 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes:
             "Non-ASCII bytes in pasted content (analysis trigger only, never sole reason to WARN)",
     },
+    PatternEntry {
+        id: "prompt_injection_seed",
+        // M7 ch5 — paste-only fast gate for the prompt-injection rule.
+        //
+        // The seeds (see `assets/data/prompt_injection_seeds.txt`) are
+        // case-insensitive English phrases. We only need a coarse tier-1
+        // probe that lets paste content with ANY of the high-signal seed
+        // keywords through to tier-3, where `rules::prompt_injection`
+        // does the precise regex match. Keeping these as `paste_only`
+        // (NOT `exec`) avoids tripping the exec hot path on commands
+        // like `git ignore-revs` or `# disregard this commit`.
+        //
+        // FileScan always proceeds to tier-3 (see `extract::tier1_scan`),
+        // so file-scan reachability does not require an entry here — but
+        // we keep the pattern explicit for the safeguard test that
+        // checks every rule category has a PATTERN_TABLE row.
+        //
+        // The output-direction pipeline (`engine::analyze_output`) does
+        // NOT consult PATTERN_TABLE at all, so output reachability is
+        // independent of this row.
+        tier1_exec_fragments: &[],
+        tier1_paste_only_fragments: &[
+            r"(?i)\bignore\b",
+            r"(?i)\bdisregard\b",
+            r"(?i)\bforget\b",
+            r"(?i)\boverride\b",
+            r"(?i)\bact\s+as\b",
+            r"(?i)\byou\s+are\s+now\b",
+            r"(?i)\bsystem\s*:",
+            r"(?i)\bDAN\s+mode\b",
+            r"(?i)\bdo\s+anything\s+now\b",
+            r"(?i)\bnew\s+instructions\s*:",
+        ],
+        notes: "Prompt-injection seed phrases — coarse tier-1 gate for the paste context. \
+                The precise multi-word regex lives in `rules::prompt_injection`.",
+    },
 ];
 
 fn generate_tier1_regex(out_dir: &str) {
@@ -945,6 +981,9 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ),
     ("output_title_manipulation", "OutputTitleManipulation"),
     ("output_clear_screen", "OutputClearScreen"),
+    // M7 ch5 — prompt-injection seed phrases.
+    ("prompt_injection_in_output", "PromptInjectionInOutput"),
+    ("ignore_previous_instructions", "IgnorePreviousInstructions"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[

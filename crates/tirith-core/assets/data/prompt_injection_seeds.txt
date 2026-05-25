@@ -1,0 +1,24 @@
+# Prompt-injection seed strings — M7 ch5.
+#
+# One regex per line, applied case-insensitively against agent output.
+# These are well-known instruction-override / jailbreak markers — the rule
+# catches the easy cases, NOT a complete defense. See the module docs at
+# `crates/tirith-core/src/rules/prompt_injection.rs` for the full disclaimer.
+#
+# Lines beginning with `#` are comments; blank lines are ignored.
+#
+# ── "ignore previous instructions" family → IgnorePreviousInstructions ──
+ignore (all )?previous instructions
+disregard (above|previous)
+ignore the above
+forget the above
+ignore your training
+override your instructions
+new instructions:
+#
+# ── role-override / jailbreak family → PromptInjectionInOutput ─────────
+act as <role>
+you are now
+system:
+do anything now
+DAN mode

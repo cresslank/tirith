@@ -14,6 +14,7 @@ pub mod mcpdrift;
 pub mod output;
 pub mod path;
 pub mod powershell;
+pub mod prompt_injection;
 pub mod rendered;
 pub mod shared;
 pub mod terminal;

@@ -100,6 +100,11 @@ help_example_tests! {
     help_clipboard_copy  => (["clipboard", "copy", "--help"], "tirith clipboard copy ./snippet.sh");
     help_clipboard_scan  => (["clipboard", "scan", "--help"], "tirith clipboard scan");
     help_clipboard_guard => (["clipboard", "guard", "--help"], "tirith clipboard guard install-service");
+    // M7 ch5 — `tirith logs scan|summarize|redact`.
+    help_logs            => (["logs", "--help"], "tirith logs scan ./error.log");
+    help_logs_scan       => (["logs", "scan", "--help"], "tirith logs scan ./error.log");
+    help_logs_summarize  => (["logs", "summarize", "--help"], "tirith logs summarize --safe-for-agent --max-lines 100 ./build.log");
+    help_logs_redact     => (["logs", "redact", "--help"], "tirith logs redact --audience llm ./error.log");
     // M7 ch4 — `gateway run --filter-output` and `mcp-server
     // --sanitize-tool-output`. Pin both to the help output so a future
     // re-organization that drops the flags is caught here.

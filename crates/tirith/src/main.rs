@@ -1217,6 +1217,140 @@ Examples:
         #[command(subcommand)]
         action: ClipboardAction,
     },
+
+    /// Scan / summarize / redact log files for agent-safety review (M7 ch5)
+    #[command(after_help = "\
+Subcommands:
+  tirith logs scan       — run the file-scan + credential engine over a log
+                           file. Flags prompt-injection seeds, secrets,
+                           ANSI/zero-width terminal-deception bytes. Exits 1
+                           on any finding.
+  tirith logs summarize  — produce a compressed view of a log file. With
+                           `--safe-for-agent`, also redacts secrets /
+                           internal hostnames / customer IDs and strips
+                           ANSI escape sequences. Truncates to
+                           `--max-lines` (default 200) keeping head+tail.
+  tirith logs redact     — share-engine wrapper for log content. Same
+                           audience-aware DLP shape as `tirith share`.
+
+Honesty on prompt injection:
+  `scan` uses the M7 ch5 prompt-injection seed catalog — well-known
+  phrases like \"ignore previous instructions\", \"act as <role>\",
+  \"system:\", \"DAN mode\". This catches the EASY cases and is NOT a
+  complete defense. Sophisticated injections (encoded payloads,
+  paraphrases, cross-language) will slip past. Treat every line of
+  agent output as untrusted regardless of whether the rule fired.
+
+Streaming:
+  `summarize` and `redact` stream line-by-line and have no input size
+  cap. `scan` reads up to 64 MiB (above that, use `summarize` first).
+
+Examples:
+  tirith logs scan ./error.log
+  tirith logs scan --json ./agent-trace.log
+  tirith logs summarize ./build.log
+  tirith logs summarize --safe-for-agent --max-lines 100 ./build.log
+  tirith logs redact --audience llm ./error.log
+  tirith logs redact --audience public-paste --json ./error.log")]
+    Logs {
+        #[command(subcommand)]
+        action: LogsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum LogsAction {
+    /// Scan a log file for prompt-injection seeds, secrets, and escape sequences
+    #[command(after_help = "\
+Runs `engine::analyze` with `ScanContext::FileScan` over the file content,
+plus an explicit credential pass (the file-scan path does not run credentials
+by default, but secrets in logs are a primary concern). Exits 1 on any
+finding.
+
+The prompt-injection rule catches well-known seed phrases only — it is NOT
+a complete defense. See `tirith logs --help` for the full disclaimer.
+
+Examples:
+  tirith logs scan ./error.log
+  tirith logs scan --json ./agent-trace.log")]
+    Scan {
+        /// Log file to scan.
+        path: std::path::PathBuf,
+
+        /// Output format (default: human).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Compress a log file: dedup lines, optionally redact and strip ANSI
+    #[command(after_help = "\
+Streams the file via `BufReader::lines()` so large logs (1 GiB+) do not
+balloon memory. Pipeline:
+
+  1. (when --safe-for-agent) redact secrets / internal hostnames /
+     customer IDs via `redact_for_audience(input, llm)`.
+  2. (when --safe-for-agent) strip ANSI / OSC / DCS escape sequences
+     and zero-width characters.
+  3. Collapse runs of identical consecutive lines into `line [×N]`.
+  4. Truncate to `--max-lines` (default 200), keeping head + tail
+     with a `[... N lines collapsed ...]` marker between.
+
+The stderr trailer reports per-action counts: secrets removed,
+duplicate lines collapsed, escape sequences stripped.
+
+Examples:
+  tirith logs summarize ./build.log
+  tirith logs summarize --safe-for-agent --max-lines 100 ./build.log
+  tirith logs summarize --safe-for-agent --json ./error.log")]
+    Summarize {
+        /// Log file to summarize.
+        path: std::path::PathBuf,
+
+        /// Redact secrets/internal IPs/customer IDs and strip ANSI escape
+        /// sequences before emitting.
+        #[arg(long)]
+        safe_for_agent: bool,
+
+        /// Maximum number of output lines (head+tail). Default 200.
+        #[arg(long, default_value_t = 200)]
+        max_lines: usize,
+
+        /// Output format (default: human).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Stream a log file through the audience-aware share-engine
+    #[command(after_help = "\
+Identical audience semantics to `tirith share --target`. Streams the file
+line-by-line, applies `redact_for_audience_with_custom`, and writes the
+sanitized content to stdout. Per-label counts go to stderr.
+
+Examples:
+  tirith logs redact --audience llm ./error.log
+  tirith logs redact --audience public-paste ./error.log
+  tirith logs redact --audience github-issue --json ./error.log")]
+    Redact {
+        /// Log file to redact.
+        path: std::path::PathBuf,
+
+        /// Audience preset: github-issue | slack | llm | public-paste | generic.
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(tirith_core::redact::ShareAudience::cli_values()))]
+        audience: String,
+
+        /// Output format (default: human).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3536,6 +3670,32 @@ fn run() {
                     std::process::exit(2);
                 }
                 cli::clipboard::daemon_foreground(json)
+            }
+        },
+
+        Commands::Logs { action } => match action {
+            LogsAction::Scan { path, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::logs::scan(&path, json)
+            }
+            LogsAction::Summarize {
+                path,
+                safe_for_agent,
+                max_lines,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::logs::summarize(&path, safe_for_agent, max_lines, json)
+            }
+            LogsAction::Redact {
+                path,
+                audience,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::logs::redact(&path, &audience, json)
             }
         },
     };

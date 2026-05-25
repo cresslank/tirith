@@ -286,6 +286,25 @@ pub enum RuleId {
     /// command, the program's output) off-screen so a fake banner can
     /// take its place.
     OutputClearScreen,
+
+    // Prompt-injection rules (M7 ch5) — fire from `rules::prompt_injection`
+    // when a well-known instruction-override / role-override seed phrase
+    // appears in the scanned text. Reached from:
+    //   * `engine::analyze_output` (the M7 ch1 output pipeline), and
+    //   * `engine::analyze` for `ScanContext::Paste` and `ScanContext::FileScan`,
+    //     gated by the `prompt_injection_seed` PATTERN_TABLE entry in build.rs.
+    // Honest scope: these catch well-known patterns and are NOT a complete
+    // defense — treat agent output as untrusted regardless. See the module
+    // doc at `rules/prompt_injection.rs` for the full disclaimer.
+    /// M7 ch5 — a prompt-injection seed phrase (e.g. "act as <role>",
+    /// "you are now", "system:", "DAN mode", "do anything now") appeared
+    /// in the scanned text. High severity.
+    PromptInjectionInOutput,
+    /// M7 ch5 — the highest-confidence subset: an explicit instruction-
+    /// override seed phrase ("ignore previous instructions", "disregard
+    /// above", "forget the above", "override your instructions", "new
+    /// instructions:", "ignore your training"). High severity.
+    IgnorePreviousInstructions,
 }
 
 impl fmt::Display for RuleId {

@@ -452,6 +452,10 @@ pub fn analyze_output_finalize(state: &OutputAnalyzerState) -> Verdict {
     let start = Instant::now();
     let mut findings = crate::rules::output::check(&state.scan_result);
     findings.extend(finalize_output_chunks(state));
+    // M7 ch5 — prompt-injection seed phrases scanned against the captured
+    // tail text. The output pipeline bypasses PATTERN_TABLE, so this rule
+    // is unconditionally reachable here.
+    findings.extend(crate::rules::prompt_injection::check(&state.tail_text));
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     Verdict::from_findings(
         findings,
@@ -770,6 +774,15 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
                 ));
             }
         }
+
+        // NOTE: prompt-injection scanning in the FileScan path is
+        // deliberately NOT wired here. The general `tirith scan` over a
+        // repo would false-flag legitimate documentation that quotes
+        // injection phrases (e.g. a security write-up under
+        // `docs/examples/.claude/skills/demo.md`). `tirith logs scan`
+        // calls `rules::prompt_injection::check` explicitly in
+        // `cli/logs.rs` — that's the audit-target where the rule is
+        // appropriate. The Paste / output pipelines remain wired in.
     } else {
         if ctx.scan_context == ScanContext::Paste {
             if let Some(ref bytes) = ctx.raw_bytes {
@@ -784,6 +797,10 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
                     crate::rules::terminal::check_clipboard_html(html, &ctx.input);
                 findings.extend(clipboard_findings);
             }
+
+            // M7 ch5 — prompt-injection seed phrases in pasted content
+            // (e.g. agent output the user copied into the terminal).
+            findings.extend(crate::rules::prompt_injection::check(&ctx.input));
         }
 
         if ctx.scan_context == ScanContext::Exec {

@@ -664,6 +664,9 @@ const ALL_RULE_IDS: &[&str] = &[
     "output_terminal_hyperlink_mismatch",
     "output_title_manipulation",
     "output_clear_screen",
+    // Prompt-injection rules (M7 ch5)
+    "prompt_injection_in_output",
+    "ignore_previous_instructions",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -756,6 +759,14 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "output_terminal_hyperlink_mismatch",
     "output_title_manipulation",
     "output_clear_screen",
+    // M7 ch5 — prompt-injection rules fire from both
+    // `engine::analyze_output` (covered by `output.toml` via
+    // `test_output_fixtures` below) and from `engine::analyze` for
+    // Paste/FileScan (no engine.toml fixture yet — the dedicated CLI
+    // smoke tests in `crates/tirith/tests/cli_integration.rs` cover the
+    // file-scan path through `tirith logs scan`).
+    "prompt_injection_in_output",
+    "ignore_previous_instructions",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -835,17 +846,22 @@ fn test_output_fixtures() {
 }
 
 /// Sibling of `test_all_rule_ids_have_fixture_coverage` that pins coverage
-/// for the 6 output-direction rules against the `output.toml` fixtures.
+/// for the 6 output-direction rules and the 2 prompt-injection rules
+/// against the `output.toml` fixtures.
 #[test]
 fn test_output_rule_ids_have_fixture_coverage() {
     let covered = collect_output_fixture_rules();
     let required = [
+        // M7 ch1
         "output_osc52_clipboard_write",
         "output_hidden_text",
         "output_fake_prompt",
         "output_terminal_hyperlink_mismatch",
         "output_title_manipulation",
         "output_clear_screen",
+        // M7 ch5
+        "prompt_injection_in_output",
+        "ignore_previous_instructions",
     ];
     let missing: Vec<&str> = required
         .iter()
@@ -1038,6 +1054,9 @@ fn test_rule_id_list_is_complete() {
         RuleId::OutputTerminalHyperlinkMismatch,
         RuleId::OutputTitleManipulation,
         RuleId::OutputClearScreen,
+        // Prompt-injection rules (M7 ch5)
+        RuleId::PromptInjectionInOutput,
+        RuleId::IgnorePreviousInstructions,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();
