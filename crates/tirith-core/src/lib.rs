@@ -5,6 +5,7 @@ pub mod audit_aggregator;
 pub mod audit_tune;
 pub mod audit_upload;
 pub mod checkpoint;
+pub mod clipboard;
 pub mod confusables;
 pub mod data;
 pub mod dep_confusion;

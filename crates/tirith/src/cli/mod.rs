@@ -134,6 +134,7 @@ pub mod audit;
 pub mod bash_capability;
 pub mod check;
 pub mod checkpoint;
+pub mod clipboard;
 pub mod completions;
 pub mod daemon;
 pub mod diff;

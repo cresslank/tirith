@@ -7154,3 +7154,161 @@ fn share_rejects_unknown_target() {
         "error must list valid values, got: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M7 ch3 — tirith clipboard {copy,scan,guard,daemon}
+// ---------------------------------------------------------------------------
+
+/// `tirith clipboard copy --help` exits 0 and surfaces the expected flags.
+/// Cheapest possible sanity check that the subcommand wiring landed.
+#[test]
+fn clipboard_copy_help_exits_zero() {
+    let out = tirith()
+        .args(["clipboard", "copy", "--help"])
+        .output()
+        .expect("failed to run tirith clipboard copy --help");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("--redact") && stdout.contains("--audience"),
+        "clipboard copy --help should mention --redact + --audience, got:\n{stdout}"
+    );
+}
+
+/// `tirith clipboard scan --json` returns a stable JSON envelope.
+///
+/// On headless CI (Linux without X/Wayland) arboard's `Clipboard::new()`
+/// errors out — we degrade to a documented `no_backend` envelope and
+/// exit 0 so this test passes everywhere. On macOS/Windows with a
+/// session we may also see `empty` or `ok`. The contract: `status` is
+/// always present and is one of a small known set.
+#[test]
+fn clipboard_scan_json_returns_documented_envelope() {
+    let out = tirith()
+        .args(["clipboard", "scan", "--json"])
+        .output()
+        .expect("failed to run tirith clipboard scan");
+    // Exit 0 on the soft-degrade paths (no backend / empty); 0/1/2 on a
+    // real verdict. The narrow ask: it must be JSON-parseable.
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        panic!("clipboard scan --json must emit valid JSON ({e}): {stdout}")
+    });
+    let status = v
+        .get("status")
+        .and_then(|s| s.as_str())
+        .expect("status field is required");
+    assert!(
+        matches!(status, "ok" | "no_backend" | "empty" | "error"),
+        "unexpected status value: {status}"
+    );
+}
+
+/// `tirith clipboard guard status --json` returns the documented envelope
+/// with the four required fields. The exit is 0 even when no service is
+/// installed — the command is informational.
+#[test]
+fn clipboard_guard_status_json_exits_zero_with_envelope() {
+    let out = tirith()
+        .args(["clipboard", "guard", "status", "--json"])
+        .output()
+        .expect("failed to run tirith clipboard guard status");
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("status --json must emit valid JSON");
+    assert!(v.get("platform").is_some(), "platform field required");
+    assert!(v.get("installed").is_some(), "installed field required");
+    assert!(v.get("loaded").is_some(), "loaded field required");
+}
+
+/// `tirith clipboard guard install-service` without `--apply` prints the
+/// platform-correct unit content to stdout. On Windows the command
+/// returns a "not supported" notice and exit 1; everywhere else exit 0.
+#[test]
+fn clipboard_guard_install_service_dry_run_prints_unit() {
+    let out = tirith()
+        .args(["clipboard", "guard", "install-service"])
+        .output()
+        .expect("failed to run tirith clipboard guard install-service");
+
+    #[cfg(target_os = "windows")]
+    {
+        assert_eq!(out.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("not supported"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(out.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("sh.tirith.clipboard"));
+        assert!(stdout.contains("ProgramArguments"));
+        assert!(stdout.contains("clipboard"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(out.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("[Unit]"));
+        assert!(stdout.contains("ExecStart="));
+        assert!(stdout.contains("clipboard daemon --foreground"));
+    }
+}
+
+/// `tirith clipboard copy` refuses to copy a file containing a
+/// High-severity finding (AWS key here) without `--redact`. The exit
+/// code is 1 and the stderr message points at `--redact`. Using
+/// `TIRITH=0` would bypass the engine — that's exactly what we DON'T
+/// want here, so the test inherits the default fail-mode and pins
+/// the refusal path.
+///
+/// Note: this test does NOT verify that the clipboard was untouched —
+/// arboard is unavailable on most CI runners, and we don't want to
+/// race against the host's clipboard state. The refusal itself is what
+/// the spec keys on.
+#[test]
+fn clipboard_copy_refuses_secret_without_redact() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("creds.env");
+    // Build the AWS key string without writing the literal in source
+    // so a future grep-for-secrets pass doesn't flag this test file.
+    let key = format!("AKIA{}", "IOSFODNN7EXAMPLE");
+    fs::write(&fixture, format!("AWS_ACCESS_KEY_ID={key}\n")).unwrap();
+
+    let out = tirith()
+        .args(["clipboard", "copy", fixture.to_str().unwrap()])
+        .output()
+        .expect("failed to run tirith clipboard copy");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "secret content must refuse with exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("secret-shaped content detected"),
+        "stderr must steer the user to --redact, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("--redact"),
+        "stderr must mention --redact, got: {stderr}"
+    );
+}
+
+/// `tirith clipboard daemon` without `--foreground` exits 2 with a
+/// clear message. This is the safety net against
+/// `tirith clipboard daemon &` silently no-op'ing or spawning an
+/// orphan polling loop.
+#[test]
+fn clipboard_daemon_requires_foreground_flag() {
+    let out = tirith()
+        .args(["clipboard", "daemon"])
+        .output()
+        .expect("failed to run tirith clipboard daemon");
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--foreground is required"),
+        "stderr must explain the --foreground requirement: {stderr}"
+    );
+}

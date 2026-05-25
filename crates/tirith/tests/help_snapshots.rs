@@ -96,6 +96,10 @@ help_example_tests! {
     help_output_wrap => (["output", "wrap", "--help"], "tirith output wrap on");
     help_share      => (["share", "--help"], "tirith share --target llm");
     help_redact     => (["redact", "--help"], "tirith redact --audience slack");
+    help_clipboard       => (["clipboard", "--help"], "tirith clipboard copy ./snippet.sh");
+    help_clipboard_copy  => (["clipboard", "copy", "--help"], "tirith clipboard copy ./snippet.sh");
+    help_clipboard_scan  => (["clipboard", "scan", "--help"], "tirith clipboard scan");
+    help_clipboard_guard => (["clipboard", "guard", "--help"], "tirith clipboard guard install-service");
 }
 
 #[test]

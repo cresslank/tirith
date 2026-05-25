@@ -1155,6 +1155,54 @@ Examples:
         #[arg(long)]
         json: bool,
     },
+
+    /// Read/write/scan the system clipboard with secret-shape gating (M7 ch3)
+    #[command(after_help = "\
+Subcommands:
+  tirith clipboard copy <file>                 — copy file contents to
+                                                  the clipboard; refuses when
+                                                  the file contains secret-
+                                                  shaped data. Use --redact
+                                                  --audience <a> to copy a
+                                                  sanitized version instead.
+  tirith clipboard scan                        — read the current clipboard
+                                                  and print a paste verdict.
+  tirith clipboard guard install-service       — print (and on --apply write)
+                                                  the OS-correct service
+                                                  unit that drives the
+                                                  background polling daemon.
+                                                  macOS: launchd plist.
+                                                  Linux: systemd --user unit.
+                                                  Windows: not supported in
+                                                  service mode.
+  tirith clipboard guard uninstall-service     — remove the unit.
+  tirith clipboard guard status                — report whether the service
+                                                  is installed + loaded.
+
+Why a service unit, not a shell-profile `&` background:
+  Spawning the daemon from ~/.zshrc via `&` orphans processes on
+  subshells, double-runs on window reload, and gives `uninstall` no
+  clean-shutdown handle. We ship the launchd / systemd path only.
+  Operators who still want the manual escape hatch can run
+  `tirith clipboard daemon --foreground &` themselves.
+
+Headless behavior:
+  Linux without X/Wayland (CI, SSH) → no clipboard backend → soft
+  degrade with a documented `no_backend` envelope. Exit code stays 0
+  under --json so CI hygiene runs don't trip.
+
+Examples:
+  tirith clipboard copy ./snippet.sh
+  tirith clipboard copy --redact --audience public-paste ./fixture.log
+  tirith clipboard scan --json
+  tirith clipboard guard install-service
+  tirith clipboard guard install-service --apply
+  tirith clipboard guard uninstall-service
+  tirith clipboard guard status")]
+    Clipboard {
+        #[command(subcommand)]
+        action: ClipboardAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1172,6 +1220,176 @@ Examples:
     Wrap {
         /// One of: on, off, status.
         action: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClipboardAction {
+    /// Copy a file's contents to the clipboard, refusing secret-shaped data
+    #[command(after_help = "\
+Reads the file, runs the paste-context analyzer over it, and:
+  - if a High-severity finding fires (e.g. an AWS key, GitHub token,
+    SSH private key) AND `--redact` is NOT set, refuses with exit 1.
+  - if `--redact --audience <a>` is set, applies the audience-aware
+    redactor (see `tirith share --help`) and copies the sanitized
+    content instead. Prints a per-label summary to stderr.
+  - otherwise copies the file unchanged.
+
+Examples:
+  tirith clipboard copy ./snippet.sh
+  tirith clipboard copy --redact --audience public-paste ./fixture.log
+  tirith clipboard copy --redact --audience llm ./snippet.sh --json")]
+    Copy {
+        /// File to read.
+        path: PathBuf,
+
+        /// Apply audience-aware redaction before copying.
+        #[arg(long)]
+        redact: bool,
+
+        /// Audience for `--redact`. Defaults to `generic` when --redact is
+        /// set without an explicit audience.
+        #[arg(long)]
+        audience: Option<String>,
+
+        /// Output format (default: human).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Scan the current clipboard contents and print a paste verdict
+    #[command(after_help = "\
+Reads the system clipboard, runs the paste pipeline over the
+contents, and reports a Verdict. Exit codes match `tirith paste`:
+0 = Allow, 1 = Block (High), 2 = Warn (Medium), 3 = WarnAck.
+
+Soft-degrades on headless machines (no X/Wayland, SSH, CI runner)
+to a `no_backend` envelope under `--json`; exit code 0.
+
+Examples:
+  tirith clipboard scan
+  tirith clipboard scan --json")]
+    Scan {
+        /// Output format (default: human).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Manage the background clipboard guard service (launchd / systemd)
+    #[command(after_help = "\
+`install-service`   — print (or write on --apply) the OS-correct
+                      service unit that runs the polling daemon.
+                      macOS: ~/Library/LaunchAgents/sh.tirith.clipboard.plist
+                      Linux: ~/.config/systemd/user/tirith-clipboard.service
+                      Windows: not supported in service mode.
+`uninstall-service` — remove the unit and unload the service.
+`status`            — report whether the service is installed +
+                      loaded.
+
+Examples:
+  tirith clipboard guard install-service
+  tirith clipboard guard install-service --apply
+  tirith clipboard guard uninstall-service
+  tirith clipboard guard status
+  tirith clipboard guard status --json")]
+    Guard {
+        #[command(subcommand)]
+        action: GuardAction,
+    },
+
+    /// Run the clipboard polling daemon in the foreground (used by service unit)
+    ///
+    /// Hidden from the top-level `--help` listing — this command exists
+    /// for the launchd / systemd service unit's `ExecStart`. Operators
+    /// who want to run it manually can still do so:
+    ///
+    ///     tirith clipboard daemon --foreground &
+    #[command(hide = true)]
+    Daemon {
+        /// Required flag — there is no background mode. The foreground
+        /// requirement is explicit so a typo (`tirith clipboard daemon`
+        /// with no flag) doesn't silently no-op or spin up an orphan.
+        #[arg(long)]
+        foreground: bool,
+
+        /// Output format (default: human).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum GuardAction {
+    /// Print (or write on --apply) the OS-correct service unit
+    #[command(
+        name = "install-service",
+        after_help = "\
+Prints the launchd plist (macOS) or systemd --user unit (Linux) that
+drives `tirith clipboard daemon --foreground`. Without --apply, the
+content is printed to stdout (suitable for review or piping into a
+config-management system). With --apply, the unit is written to the
+canonical path and the OS service manager is asked to load it.
+
+The write is idempotent: running --apply twice when the file already
+matches is a no-op.
+
+Examples:
+  tirith clipboard guard install-service
+  tirith clipboard guard install-service --apply
+  tirith clipboard guard install-service --apply --json"
+    )]
+    InstallService {
+        /// Actually write the unit file and load it. Without this flag
+        /// the content is printed to stdout for inspection.
+        #[arg(long)]
+        apply: bool,
+
+        /// Output format (default: human).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Remove the service unit and unload it
+    #[command(
+        name = "uninstall-service",
+        after_help = "\
+Examples:
+  tirith clipboard guard uninstall-service
+  tirith clipboard guard uninstall-service --json"
+    )]
+    UninstallService {
+        /// Output format (default: human).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Report whether the service is installed and loaded
+    #[command(after_help = "\
+Examples:
+  tirith clipboard guard status
+  tirith clipboard guard status --json")]
+    Status {
+        /// Output format (default: human).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
     },
 }
 
@@ -3234,6 +3452,55 @@ fn run() {
             };
             cli::share::redact_stdin(aud, json)
         }
+
+        Commands::Clipboard { action } => match action {
+            ClipboardAction::Copy {
+                path,
+                redact,
+                audience,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::clipboard::copy(&path, redact, audience.as_deref(), json)
+            }
+            ClipboardAction::Scan { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::clipboard::scan(json)
+            }
+            ClipboardAction::Guard { action } => match action {
+                GuardAction::InstallService {
+                    apply,
+                    format,
+                    json,
+                } => {
+                    let (_, json) = HumanJsonFormat::resolve(format, json);
+                    cli::clipboard::install_service(apply, json)
+                }
+                GuardAction::UninstallService { format, json } => {
+                    let (_, json) = HumanJsonFormat::resolve(format, json);
+                    cli::clipboard::uninstall_service(json)
+                }
+                GuardAction::Status { format, json } => {
+                    let (_, json) = HumanJsonFormat::resolve(format, json);
+                    cli::clipboard::status(json)
+                }
+            },
+            ClipboardAction::Daemon {
+                foreground,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                if !foreground {
+                    eprintln!(
+                        "tirith clipboard daemon: --foreground is required (this binary has no background mode; use `tirith clipboard guard install-service` to run under launchd/systemd)"
+                    );
+                    std::process::exit(2);
+                }
+                cli::clipboard::daemon_foreground(json)
+            }
+        },
     };
 
     std::process::exit(exit_code);
