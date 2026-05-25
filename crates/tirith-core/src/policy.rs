@@ -1406,10 +1406,17 @@ fn cache_remote_policy(yaml: &str) -> std::io::Result<()> {
 }
 
 /// Load a previously cached remote policy.
+///
+/// Runs the same forward-migration sequence as the direct remote-success
+/// path (via [`Policy::try_parse_yaml`]) so a cached policy written by an
+/// older tirith version is upgraded before deserialization. Without this,
+/// `policy_fetch_fail_mode: cached` would silently skip migrations and
+/// drop fields the schema relocated (e.g. legacy `internal_package_names`
+/// migrated into `package_policy` by the v1→v2 migration).
 fn load_cached_remote_policy() -> Option<Policy> {
     let path = remote_policy_cache_path()?;
     let content = std::fs::read_to_string(&path).ok()?;
-    match serde_yaml::from_str::<Policy>(&content) {
+    match Policy::try_parse_yaml(&content) {
         Ok(mut p) => {
             p.path = Some(format!("cached:{}", path.display()));
             Some(p)

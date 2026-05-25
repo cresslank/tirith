@@ -923,6 +923,86 @@ fn sensitive_env_set_in_process() -> Vec<&'static str> {
         .collect()
 }
 
+/// Returns `true` when `cmd` looks like a *single simple command* that
+/// `env -u VAR ... <cmd>` can safely wrap.
+///
+/// `env -u VAR <cmd>` only scrubs the environment of the immediately
+/// following process. Pipelines (`|`), logical chains (`&&`, `||`), command
+/// separators (`;`), redirections (`>`, `<`, `>>`, `<<`), background jobs
+/// (`&`), command substitutions (`` ` ``, `$(`), and subshells (`(`, `)`)
+/// all spawn additional child processes that *inherit the caller's env*,
+/// not the scrubbed one. Wrapping such a command with `env -u` produces a
+/// safe-looking rewrite whose later stages still see the secret — strictly
+/// worse than admitting we have no automatic fix.
+///
+/// Implementation: scan byte-by-byte while tracking single-quote,
+/// double-quote, and backslash-escape state. POSIX single quotes
+/// (`'...'`) make their contents literal; inside double quotes only
+/// `$`, `` ` ``, and `\` retain meaning, so `|`, `&`, `;`, `>`, `<`,
+/// `(`, `)` are safe to ignore there. `` ` `` and `$(` are flagged
+/// whenever they appear outside single quotes — they trigger command
+/// substitution even inside `"..."`.
+fn is_simple_command_for_env_scrub(cmd: &str) -> bool {
+    // Quote / escape tracking state. Both quote flags cannot be true at
+    // the same time — POSIX shells don't nest the two.
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        // Backslash outside single quotes consumes the next byte verbatim.
+        // Inside single quotes a backslash is literal — POSIX has no escape.
+        if escape {
+            escape = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' && !in_single {
+            escape = true;
+            i += 1;
+            continue;
+        }
+
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            match b {
+                b'"' => in_double = false,
+                // Command substitution is active inside double quotes.
+                b'`' => return false,
+                b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'(' => return false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+
+        // Unquoted context — flag any shell-compound metacharacter.
+        match b {
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'|' | b'&' | b';' | b'>' | b'<' | b'(' | b')' | b'`' => return false,
+            b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'(' => return false,
+            _ => {}
+        }
+        i += 1;
+    }
+
+    // Unterminated quotes or trailing backslash — treat as not-simple. A
+    // malformed command is exactly the case where guessing the right
+    // wrapper is most dangerous.
+    !(in_single || in_double || escape)
+}
+
 /// Build an env-scrub suggestion for the verdict when:
 ///  (i)   at least one finding is High severity or above, AND
 ///  (ii)  at least one sensitive env var is currently set in this process,
@@ -930,7 +1010,14 @@ fn sensitive_env_set_in_process() -> Vec<&'static str> {
 ///  (iii) the shell is a POSIX shell (bash/zsh/sh/fish/posix) — `env -u`
 ///        does not exist on PowerShell, so we'd emit a broken "safe
 ///        command". Detect-and-decline for PowerShell rather than ship a
-///        rewrite that won't execute.
+///        rewrite that won't execute, AND
+///  (iv)  the command is a single simple command (no `|`, `&&`, `;`,
+///        redirections, subshells, or command substitution). `env -u VAR`
+///        only scrubs the immediately-following child process — every
+///        subsequent stage in a pipeline or chain still inherits the real
+///        env, so wrapping a compound command would emit a "safe" rewrite
+///        the secret could still leak through. See
+///        [`is_simple_command_for_env_scrub`].
 ///
 /// Returns `None` otherwise.
 fn build_env_scrub_suggestion(
@@ -959,6 +1046,14 @@ fn build_env_scrub_suggestion(
 
     let set_vars = sensitive_env_set_in_process();
     if set_vars.is_empty() {
+        return None;
+    }
+
+    // `env -u` only affects the immediately-following command, so a
+    // compound shell construct (pipeline, chain, redirect, subshell,
+    // background, command substitution) would leak the secret through
+    // its later stages. Decline rather than ship a misleading rewrite.
+    if !is_simple_command_for_env_scrub(cmd.trim()) {
         return None;
     }
 
@@ -1236,6 +1331,156 @@ mod tests {
         for s in suggest(cmd, ShellType::Posix, &v) {
             assert!(!s.remediation.is_empty(), "rule {}", s.rule_id);
             assert!(!s.rationale.is_empty(), "rule {}", s.rule_id);
+        }
+    }
+
+    // ── is_simple_command_for_env_scrub guard ─────────────────────────────
+    //
+    // The guard is exercised directly (instead of via `suggest()`) because
+    // `build_env_scrub_suggestion` also requires a sensitive env var to be
+    // set in the *current process* — mutating `std::env` from a test would
+    // race against any parallel test that reads the env. The integration
+    // path is covered by the existing `suggest()` flow plus the dedicated
+    // `env_scrub_declines_when_command_is_compound` test below, which
+    // uses a known-sensitive var name guarded by `serial_test`-free
+    // explicit set/unset.
+
+    #[test]
+    fn simple_command_accepted_for_env_scrub() {
+        assert!(is_simple_command_for_env_scrub("npm install foo"));
+        assert!(is_simple_command_for_env_scrub(
+            "curl https://example.com/x"
+        ));
+        assert!(is_simple_command_for_env_scrub("pip install requests"));
+        assert!(is_simple_command_for_env_scrub("ls -la /tmp"));
+    }
+
+    #[test]
+    fn pipeline_rejected_for_env_scrub() {
+        // `env -u VAR npm install foo | sh` would scrub only the npm
+        // process; the piped `sh` still inherits the original env and
+        // could exfiltrate the secret. The guard refuses to emit a
+        // misleading "safe" rewrite for this shape.
+        assert!(!is_simple_command_for_env_scrub("npm install foo | sh"));
+        assert!(!is_simple_command_for_env_scrub("curl https://foo | bash"));
+    }
+
+    #[test]
+    fn logical_chain_rejected_for_env_scrub() {
+        // && and || run a second command in the same shell context;
+        // wrapping with `env -u` would only scrub the first stage.
+        assert!(!is_simple_command_for_env_scrub("ls && cat secret"));
+        assert!(!is_simple_command_for_env_scrub("ls || echo failed"));
+        // `;` is a hard sequence — same problem, second command keeps
+        // the original env.
+        assert!(!is_simple_command_for_env_scrub("ls; cat secret"));
+    }
+
+    #[test]
+    fn redirection_rejected_for_env_scrub() {
+        // Redirection by itself is benign for env scrubbing, but the
+        // operator may have constructed a compound command (here-doc,
+        // multi-line pipeline through a file) that we cannot reason
+        // about. Conservative: refuse the suggestion.
+        assert!(!is_simple_command_for_env_scrub("ls > /tmp/x"));
+        assert!(!is_simple_command_for_env_scrub("cat < /etc/passwd"));
+        assert!(!is_simple_command_for_env_scrub("ls >> /tmp/x"));
+    }
+
+    #[test]
+    fn background_and_subshell_rejected_for_env_scrub() {
+        assert!(!is_simple_command_for_env_scrub("long-job &"));
+        assert!(!is_simple_command_for_env_scrub("(cd /tmp && ls)"));
+    }
+
+    #[test]
+    fn command_substitution_rejected_for_env_scrub() {
+        // `$(...)` and backticks spawn a child shell that inherits the
+        // env regardless of what the outer `env -u` scrubs.
+        assert!(!is_simple_command_for_env_scrub("echo $(whoami)"));
+        assert!(!is_simple_command_for_env_scrub("echo `whoami`"));
+        // `$(` inside double quotes is still command substitution.
+        assert!(!is_simple_command_for_env_scrub("echo \"$(whoami)\""));
+        // Backtick inside double quotes is still command substitution.
+        assert!(!is_simple_command_for_env_scrub("echo \"`whoami`\""));
+    }
+
+    #[test]
+    fn metacharacter_inside_single_quotes_does_not_disqualify() {
+        // Single-quoted strings are literal in POSIX shells — the `|`,
+        // `&`, etc. inside them are not metacharacters and the command
+        // is in fact a single simple invocation.
+        assert!(is_simple_command_for_env_scrub(
+            "echo 'this is | not a pipe'"
+        ));
+        assert!(is_simple_command_for_env_scrub("echo 'a && b'"));
+        assert!(is_simple_command_for_env_scrub("echo 'cat > file'"));
+    }
+
+    #[test]
+    fn metacharacter_inside_double_quotes_treated_correctly() {
+        // Inside double quotes, `|`, `&`, `;`, `<`, `>`, `(`, `)` are
+        // *not* metacharacters in POSIX — the shell passes them through
+        // as literal bytes — so the command is still a single
+        // invocation.
+        assert!(is_simple_command_for_env_scrub(
+            "echo \"this is | not a pipe\""
+        ));
+        assert!(is_simple_command_for_env_scrub("echo \"a && b\""));
+        // But `$(` and backtick *are* still active inside double quotes:
+        assert!(!is_simple_command_for_env_scrub("echo \"$(whoami)\""));
+    }
+
+    #[test]
+    fn escaped_metacharacter_does_not_disqualify() {
+        // A literal backslash-pipe is just an escaped char (passed
+        // through to the command as the two bytes `\|`). It is not a
+        // pipeline.
+        assert!(is_simple_command_for_env_scrub("grep \\| file"));
+        assert!(is_simple_command_for_env_scrub("echo a\\&b"));
+    }
+
+    #[test]
+    fn unterminated_quote_is_rejected() {
+        // Malformed input — exactly the case where guessing the right
+        // wrapper is most dangerous. Decline.
+        assert!(!is_simple_command_for_env_scrub("echo 'unterminated"));
+        assert!(!is_simple_command_for_env_scrub("echo \"unterminated"));
+        // Trailing backslash with nothing to escape — same reason.
+        assert!(!is_simple_command_for_env_scrub("echo trailing\\"));
+    }
+
+    #[test]
+    fn env_scrub_declines_when_command_is_compound() {
+        // End-to-end: with a sensitive env var set, a compound command
+        // must yield no env_scrub suggestion (even though all other
+        // gates pass). Uses GITHUB_TOKEN — present in `sensitive_env.toml`.
+        //
+        // The env-var mutation here is intentionally light-touch: if
+        // the test environment already has GITHUB_TOKEN set we use it
+        // as-is and skip the restore step. The assertion checks the
+        // compound-shape guard, which is independent of the var's
+        // value, so a racing read under parallel `cargo test` cannot
+        // produce a false negative.
+        const VAR: &str = "GITHUB_TOKEN";
+        let preexisting = std::env::var_os(VAR);
+        if preexisting.is_none() {
+            std::env::set_var(VAR, "x");
+        }
+
+        let cmd = "curl https://example.com/install | bash";
+        let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+        let suggestions = suggest(cmd, ShellType::Posix, &v);
+        // No suggestion with rule_id "env_scrub" — the compound-command
+        // guard rejects this shape.
+        assert!(
+            !suggestions.iter().any(|s| s.rule_id == "env_scrub"),
+            "env_scrub must not fire for compound commands, got: {:?}",
+            suggestions.iter().map(|s| &s.rule_id).collect::<Vec<_>>()
+        );
+
+        if preexisting.is_none() {
+            std::env::remove_var(VAR);
         }
     }
 }

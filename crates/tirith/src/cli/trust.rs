@@ -1383,7 +1383,12 @@ pub fn audit(since: Option<&str>, json: bool) -> i32 {
 
     if !log_path.exists() {
         if json {
-            let _ = print_json(&serde_json::json!({"entries": []}));
+            // Emit the same envelope shape as the normal path so consumers
+            // never have to special-case "no log yet": `entries` is always
+            // an array and `skipped_lines` is always present (0 here, since
+            // there were no lines to skip). Matches the `result.skipped_lines`
+            // (`usize`) emission below — both serialize as a JSON integer.
+            let _ = print_json(&serde_json::json!({"entries": [], "skipped_lines": 0_usize}));
         } else {
             eprintln!(
                 "tirith: trust audit: no audit log yet at {}",
