@@ -1,6 +1,6 @@
 use etcetera::BaseStrategy;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::agent_origin::AgentOrigin;
@@ -38,6 +38,13 @@ fn find_policy_in_dir(dir: &Path) -> Option<PathBuf> {
 /// them as "older than any registered migration".
 fn default_schema_version() -> u32 {
     1
+}
+
+/// M8 ch1 — `context_guard_enabled` defaults to `true` so a fresh policy
+/// (or one that predates M8) opts in to context detection out of the box.
+/// Set to `false` to silence the rule while still reading the labels file.
+fn default_context_guard_enabled() -> bool {
+    true
 }
 
 /// Policy configuration loaded from YAML.
@@ -206,6 +213,42 @@ pub struct Policy {
     /// See [`ShareConfig`] for the field layout. Defaults are empty.
     #[serde(default)]
     pub share: ShareConfig,
+
+    /// **M8 ch1 — operational-context guard switch.**
+    ///
+    /// When `true` (the default), the `rules::context` module evaluates
+    /// the active provider context (kube / aws / gcp / azure) against the
+    /// labels file and emits a finding for destructive / write /
+    /// credential-change commands targeting labeled-production contexts.
+    /// Set to `false` to disable the guard while keeping the labels file
+    /// readable for `tirith context status` reporting.
+    #[serde(default = "default_context_guard_enabled")]
+    pub context_guard_enabled: bool,
+
+    /// **M8 ch1 — operator-supplied destructive verbs per provider.**
+    ///
+    /// Keys are provider strings (`kube`, `aws`, `gcp`, `azure`); values
+    /// are verb strings that, when seen as a positional arg in the first
+    /// three positions of the parsed command, escalate the match to
+    /// `ContextProdDestructiveCommand` (High). The shipped tables in
+    /// `rules::context` cover the common verbs; this hook lets an
+    /// operator widen the set without code changes.
+    #[serde(default)]
+    pub context_destructive_verbs: HashMap<String, Vec<String>>,
+
+    /// **M8 ch1 — `provider:context` → criticality map.**
+    ///
+    /// Populated by [`Policy::load_context_labels`] from
+    /// `~/.config/tirith/context-labels.yaml` (user scope) merged with
+    /// `<repo>/.tirith/context-labels.yaml` (repo scope). NOT serialized
+    /// to `policy.yaml` — labels live in their own dedicated file so a
+    /// hand-edited `policy.yaml` is never round-tripped through serde.
+    ///
+    /// Keys: `kube:prod-us-east`, `aws:prod`, `gcp:svc@my-prod-project`,
+    /// `azure:Prod Subscription`. Values: `critical` / `production` /
+    /// `prod` / `live` / `p0` / `p1` (case-insensitive).
+    #[serde(skip)]
+    pub context_labels: BTreeMap<String, String>,
 }
 
 /// **M7 ch2** — `tirith share` policy configuration.
@@ -682,6 +725,9 @@ impl Default for Policy {
             package_policy: PackagePolicy::default(),
             agent_rules: AgentRules::default(),
             share: ShareConfig::default(),
+            context_guard_enabled: default_context_guard_enabled(),
+            context_destructive_verbs: HashMap::new(),
+            context_labels: BTreeMap::new(),
         }
     }
 }
@@ -1092,6 +1138,26 @@ impl Policy {
         })
     }
 
+    /// **M8 ch1** — load context-label entries from the user-scope and
+    /// repo-scope label files and merge them into `context_labels`.
+    ///
+    /// Files (resolution order, both applied — repo wins on conflict):
+    ///   1. `~/.config/tirith/context-labels.yaml` (user scope)
+    ///   2. `<repo>/.tirith/context-labels.yaml` (repo scope)
+    ///
+    /// Format is a flat YAML map: `provider:context: criticality`. Empty
+    /// or missing files are not errors. Parse failures emit a diagnostic
+    /// and continue with the other file.
+    pub fn load_context_labels(&mut self, cwd: Option<&str>) {
+        if let Some(user_path) = user_context_labels_path() {
+            merge_context_labels(&user_path, &mut self.context_labels);
+        }
+        if let Some(repo_root) = find_repo_root(cwd) {
+            let repo_path = repo_root.join(".tirith").join("context-labels.yaml");
+            merge_context_labels(&repo_path, &mut self.context_labels);
+        }
+    }
+
     /// Load and merge user-level lists (allowlist/blocklist flat text files).
     pub fn load_user_lists(&mut self) {
         if let Some(config) = crate::policy::config_dir() {
@@ -1408,6 +1474,91 @@ pub fn state_dir() -> Option<PathBuf> {
         Ok(val) if !val.trim().is_empty() => Some(PathBuf::from(val.trim()).join("tirith")),
         _ => home::home_dir().map(|h| h.join(".local/state/tirith")),
     }
+}
+
+/// **M8 ch1** — user-scope context-labels file path.
+///
+/// `~/.config/tirith/context-labels.yaml` (XDG `${XDG_CONFIG_HOME}` honored
+/// via `etcetera`). Returns `None` if no config dir is resolvable.
+pub fn user_context_labels_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("context-labels.yaml"))
+}
+
+/// **M8 ch1** — repo-scope context-labels file path for a given cwd, if
+/// the cwd is inside a git repo. Returns `None` when no `.git` is found.
+pub fn repo_context_labels_path(cwd: Option<&str>) -> Option<PathBuf> {
+    find_repo_root(cwd).map(|r| r.join(".tirith").join("context-labels.yaml"))
+}
+
+/// Merge a single labels file's entries into `into`. The file is a flat
+/// YAML map (`String -> String`). Missing files are silently ignored;
+/// parse errors emit a stderr diagnostic and continue.
+fn merge_context_labels(path: &Path, into: &mut BTreeMap<String, String>) {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if content.trim().is_empty() {
+        return;
+    }
+    let value: serde_yaml::Value = match serde_yaml::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "tirith: warning: context-labels file at {} parse error: {e}",
+                path.display(),
+            );
+            return;
+        }
+    };
+    let map = match value {
+        serde_yaml::Value::Mapping(m) => m,
+        serde_yaml::Value::Null => return,
+        _ => {
+            eprintln!(
+                "tirith: warning: context-labels file at {} must be a YAML mapping",
+                path.display(),
+            );
+            return;
+        }
+    };
+    for (k, v) in map {
+        if let (Some(key), Some(val)) = (k.as_str(), v.as_str()) {
+            let key = key.trim();
+            let val = val.trim();
+            if !key.is_empty() && !val.is_empty() {
+                into.insert(key.to_string(), val.to_string());
+            }
+        }
+    }
+}
+
+/// Write a single label entry to a labels file (creates the file and
+/// parent directory if needed). Used by `tirith context label`. Preserves
+/// existing entries — only the target key is overwritten.
+pub fn write_context_label(path: &Path, label_key: &str, criticality: &str) -> std::io::Result<()> {
+    let mut existing: BTreeMap<String, String> = BTreeMap::new();
+    merge_context_labels(path, &mut existing);
+    existing.insert(label_key.to_string(), criticality.to_string());
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let yaml = serde_yaml::to_string(&existing).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("serialize: {e}"))
+    })?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    use std::io::Write as _;
+    f.write_all(yaml.as_bytes())?;
+    Ok(())
 }
 
 /// Get the path for caching remote policy: ~/.cache/tirith/remote-policy.yaml

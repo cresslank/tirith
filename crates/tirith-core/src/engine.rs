@@ -759,6 +759,9 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     policy.load_user_lists();
     policy.load_org_lists(ctx.cwd.as_deref());
     policy.load_trust_entries(ctx.cwd.as_deref());
+    // M8 ch1 — context-labels file (NOT policy.yaml). Reads the
+    // user-scope file and the repo-scope file and merges.
+    policy.load_context_labels(ctx.cwd.as_deref());
 
     // Fail-open: None when the DB is unavailable.
     let threat_db: Option<std::sync::Arc<crate::threatdb::ThreatDb>> =
@@ -990,6 +993,14 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         // rules, no network on the hot path.
         let install_findings = crate::rules::install::check(&ctx.input, ctx.shell);
         findings.extend(install_findings);
+
+        // M8 ch1 — operational-context rules. Cheap when labels are empty
+        // (early return); behind a `policy.context_guard_enabled` switch.
+        // Only runs in the exec / paste branch (FileScan returns above).
+        if ctx.scan_context == ScanContext::Exec {
+            let context_findings = crate::rules::context::check(&ctx.input, ctx.shell, &policy);
+            findings.extend(context_findings);
+        }
 
         let cred_findings =
             crate::rules::credential::check(&ctx.input, ctx.shell, ctx.scan_context);

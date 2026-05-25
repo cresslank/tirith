@@ -668,6 +668,10 @@ const ALL_RULE_IDS: &[&str] = &[
     // Prompt-injection rules (M7 ch5)
     "prompt_injection_in_output",
     "ignore_previous_instructions",
+    // Operational-context rules (M8 ch1)
+    "context_prod_destructive_command",
+    "context_prod_write_operation",
+    "context_prod_credential_change",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -773,6 +777,18 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // file-scan path through `tirith logs scan`).
     "prompt_injection_in_output",
     "ignore_previous_instructions",
+    // M8 ch1 — operational-context rules require BOTH an active
+    // provider context (detected by `crate::context_detect`) AND an
+    // operator-supplied labels file. Static fixtures can't simulate the
+    // detector's output across CI environments (kube/aws/gcp/az config
+    // varies per host). Covered by unit tests in `rules/context.rs`
+    // plus the `context_command_fixtures` integration test below, which
+    // injects fake detection via `TIRITH_CONTEXT_DETECT_DISABLE=1` for
+    // the no-detection short-circuit case and confirms the no-label
+    // / read-only allow paths through the engine directly.
+    "context_prod_destructive_command",
+    "context_prod_write_operation",
+    "context_prod_credential_change",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1064,6 +1080,10 @@ fn test_rule_id_list_is_complete() {
         // Prompt-injection rules (M7 ch5)
         RuleId::PromptInjectionInOutput,
         RuleId::IgnorePreviousInstructions,
+        // Operational-context rules (M8 ch1)
+        RuleId::ContextProdDestructiveCommand,
+        RuleId::ContextProdWriteOperation,
+        RuleId::ContextProdCredentialChange,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();
@@ -1552,4 +1572,176 @@ fn test_lab_corpus_reaches_tier3() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// M8 ch1 — context-rule integration tests.
+//
+// Static `command.toml` fixtures cover the "no labels → no fire" path. These
+// tests exercise the block path by seeding both a fake kube context (via
+// `KUBECONFIG`) AND a context-labels file under a temp repo (via
+// `TIRITH_POLICY_ROOT` + a fake `.git` boundary so `find_repo_root` resolves
+// to the temp dir).
+//
+// They serialize on a file-scope mutex (the crate's `TEST_ENV_LOCK` is
+// `cfg(test)`-private to the lib crate and not reachable from integration
+// tests) and clear the cache before/after each test.
+// ---------------------------------------------------------------------------
+
+static CONTEXT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
+    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Fake kubeconfig with current-context: prod-us-east.
+    let kube_path = dir.path().join("kubeconfig");
+    fs::write(
+        &kube_path,
+        "apiVersion: v1\nkind: Config\ncurrent-context: prod-us-east\n",
+    )
+    .unwrap();
+
+    // Fake .git boundary + .tirith/ dir with a policy.yaml AND a
+    // context-labels.yaml. The labels file makes `prod-us-east` critical.
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    let tirith_dir = dir.path().join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "context_guard_enabled: true\n",
+    )
+    .unwrap();
+    fs::write(
+        tirith_dir.join("context-labels.yaml"),
+        "kube:prod-us-east: critical\n",
+    )
+    .unwrap();
+
+    // SAFETY: serialized via TEST_ENV_LOCK. We set BOTH env vars before
+    // touching the engine so policy discovery + kube detection both pick
+    // up the temp paths. The disable env MUST be unset for this test.
+    unsafe {
+        std::env::set_var("KUBECONFIG", kube_path.display().to_string());
+        std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
+        std::env::remove_var("TIRITH_CONTEXT_DETECT_DISABLE");
+    }
+    tirith_core::context_detect::clear_cache_for_tests();
+
+    let ctx = AnalysisContext {
+        input: "kubectl delete namespace payments".to_string(),
+        shell: ShellType::Posix,
+        scan_context: ScanContext::Exec,
+        raw_bytes: None,
+        interactive: true,
+        cwd: Some(dir.path().display().to_string()),
+        file_path: None,
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
+    };
+
+    let verdict = engine::analyze(&ctx);
+
+    // Clean up env BEFORE asserting so a failing assertion doesn't leave a
+    // polluted environment behind.
+    unsafe {
+        std::env::remove_var("KUBECONFIG");
+        std::env::remove_var("TIRITH_POLICY_ROOT");
+    }
+    tirith_core::context_detect::clear_cache_for_tests();
+
+    let context_finding = verdict.findings.iter().find(|f| {
+        matches!(
+            f.rule_id,
+            tirith_core::verdict::RuleId::ContextProdDestructiveCommand
+        )
+    });
+    assert!(
+        context_finding.is_some(),
+        "expected ContextProdDestructiveCommand finding; got: {:?}",
+        verdict
+            .findings
+            .iter()
+            .map(|f| format!("{}: {}", f.rule_id, f.title))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(verdict.action, Action::Block);
+}
+
+#[test]
+fn context_rule_allows_kubectl_get_in_labeled_prod() {
+    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let dir = tempfile::tempdir().unwrap();
+    let kube_path = dir.path().join("kubeconfig");
+    fs::write(
+        &kube_path,
+        "apiVersion: v1\nkind: Config\ncurrent-context: prod-us-east\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    let tirith_dir = dir.path().join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "context_guard_enabled: true\n",
+    )
+    .unwrap();
+    fs::write(
+        tirith_dir.join("context-labels.yaml"),
+        "kube:prod-us-east: critical\n",
+    )
+    .unwrap();
+
+    unsafe {
+        std::env::set_var("KUBECONFIG", kube_path.display().to_string());
+        std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
+        std::env::remove_var("TIRITH_CONTEXT_DETECT_DISABLE");
+    }
+    tirith_core::context_detect::clear_cache_for_tests();
+
+    let ctx = AnalysisContext {
+        input: "kubectl get pods -n payments".to_string(),
+        shell: ShellType::Posix,
+        scan_context: ScanContext::Exec,
+        raw_bytes: None,
+        interactive: true,
+        cwd: Some(dir.path().display().to_string()),
+        file_path: None,
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
+    };
+
+    let verdict = engine::analyze(&ctx);
+
+    unsafe {
+        std::env::remove_var("KUBECONFIG");
+        std::env::remove_var("TIRITH_POLICY_ROOT");
+    }
+    tirith_core::context_detect::clear_cache_for_tests();
+
+    let context_findings: Vec<_> = verdict
+        .findings
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.rule_id,
+                tirith_core::verdict::RuleId::ContextProdDestructiveCommand
+                    | tirith_core::verdict::RuleId::ContextProdWriteOperation
+                    | tirith_core::verdict::RuleId::ContextProdCredentialChange
+            )
+        })
+        .collect();
+    assert!(
+        context_findings.is_empty(),
+        "read-only kubectl get must NOT fire any context rule; got: {:?}",
+        context_findings
+            .iter()
+            .map(|f| f.rule_id.to_string())
+            .collect::<Vec<_>>()
+    );
 }

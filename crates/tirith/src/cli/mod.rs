@@ -136,6 +136,7 @@ pub mod check;
 pub mod checkpoint;
 pub mod clipboard;
 pub mod completions;
+pub mod context;
 pub mod daemon;
 pub mod diff;
 pub mod doctor;

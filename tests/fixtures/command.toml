@@ -1725,3 +1725,62 @@ expected_rules = ["ps_inline_download_execute"]
 # to the `&&` fixture above. Catches the specific precedence bug class
 # where `||` is consumed as two single `|` pipes.
 forbidden_rules = ["pipe_to_interpreter"]
+
+# M8 ch1 — operational-context fixtures.
+#
+# The standard golden-fixture runner does NOT seed a labels file in the user
+# config dir, so `policy.context_labels` is empty and `rules::context::check`
+# short-circuits on every input. These fixtures pin that behavior — they MUST
+# NOT regress to a block when the labels file is absent. The block path is
+# covered by the dedicated integration test
+# `context_command_block_when_labeled` in `tests/golden_fixtures.rs`, which
+# injects a temp labels file and overrides detection via the disable env's
+# inverse path (a per-test labels-file seed).
+
+[[fixture]]
+name = "context_kubectl_get_pods_no_labels_allow"
+min_milestone = 8
+input = "kubectl get pods -n payments"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "context_aws_s3_ls_no_labels_allow"
+min_milestone = 8
+input = "aws s3 ls s3://prod-bucket/"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "context_kubectl_delete_no_labels_allow"
+min_milestone = 8
+input = "kubectl delete namespace payments"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "context_aws_s3_rm_no_labels_allow"
+min_milestone = 8
+input = "aws s3 rm s3://prod-bucket/old-dump.sql"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "context_helm_uninstall_no_labels_allow"
+min_milestone = 8
+input = "helm uninstall payments --namespace payments-prod"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "context_kubectl_apply_dev_no_labels_allow"
+min_milestone = 8
+input = "kubectl apply -f deploy.yaml -n dev"
+context = "exec"
+expected_action = "allow"
+expected_rules = []

@@ -311,6 +311,34 @@ pub enum RuleId {
     /// above", "forget the above", "override your instructions", "new
     /// instructions:", "ignore your training"). High severity.
     IgnorePreviousInstructions,
+
+    // Operational-context rules (M8 ch1) — fire from `rules::context` when
+    // the parsed command's leader is a cloud / k8s CLI
+    // (`kubectl`, `kustomize`, `helm`, `argocd`, `aws`, `aws-vault`,
+    // `gcloud`, `az`) and the operation is destructive while the active
+    // provider context is labeled production / critical. Context detection
+    // lives in `crate::context_detect`; labels live in
+    // `~/.config/tirith/context-labels.yaml` (user) or
+    // `<repo>/.tirith/context-labels.yaml` (repo).
+    /// M8 ch1 — destructive cloud / k8s command against a production-
+    /// labeled context. High severity. Examples:
+    /// `kubectl delete namespace payments`, `helm uninstall payments`,
+    /// `aws s3 rm s3://prod-bucket --recursive`,
+    /// `gcloud compute instances delete prod-frontend`.
+    ContextProdDestructiveCommand,
+    /// M8 ch1 — write-shaped (but not strictly destructive) cloud / k8s
+    /// command against a production-labeled context. Medium severity.
+    /// Covers state mutations that aren't full deletes — e.g.
+    /// `kubectl apply`, `kubectl patch`, `helm upgrade`, `helm install`,
+    /// `aws s3 cp ... s3://prod/...`, `gcloud compute instances start`.
+    ContextProdWriteOperation,
+    /// M8 ch1 — credential / IAM change against a production-labeled
+    /// context. High severity. Covers IAM and access-key mutations that
+    /// are routinely irreversible (or audit-noisy if undone):
+    /// `aws iam create-access-key`, `aws iam delete-user`,
+    /// `gcloud iam service-accounts keys create`, `az ad sp delete`,
+    /// `kubectl create clusterrolebinding`, etc.
+    ContextProdCredentialChange,
 }
 
 impl fmt::Display for RuleId {

@@ -217,7 +217,13 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         // M7 ch5 — prompt-injection seed phrases. Pattern-matching on
         // human-readable text; not threat-DB driven.
         | RuleId::PromptInjectionInOutput
-        | RuleId::IgnorePreviousInstructions => false,
+        | RuleId::IgnorePreviousInstructions
+        // M8 ch1 — operational-context rules. Heuristics on parsed
+        // command verbs vs. operator-supplied labels; not threat-DB
+        // driven.
+        | RuleId::ContextProdDestructiveCommand
+        | RuleId::ContextProdWriteOperation
+        | RuleId::ContextProdCredentialChange => false,
     }
 }
 

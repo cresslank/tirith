@@ -1256,6 +1256,111 @@ Examples:
         #[command(subcommand)]
         action: LogsAction,
     },
+
+    /// Inspect / guard / label your active cloud + k8s contexts (M8 ch1)
+    #[command(after_help = "\
+Subcommands:
+  tirith context status                         — list the currently-active
+                                                  kube / aws / gcp / azure
+                                                  contexts and their labels.
+  tirith context guard on | off | status        — flip the context-guard rule
+                                                  on or off in your local
+                                                  policy.yaml (single boolean
+                                                  key — never round-trips the
+                                                  whole policy file).
+  tirith context label <provider:context>       — label a provider:context
+        <criticality> [--scope user|repo]         entry (e.g.
+                                                  `kube:prod-us-east critical`).
+                                                  --scope user writes to
+                                                  ~/.config/tirith/context-labels.yaml,
+                                                  --scope repo writes to
+                                                  <repo>/.tirith/context-labels.yaml.
+
+Labels live in a DEDICATED labels file, NOT policy.yaml:
+  The labels file is a flat YAML map. We never modify policy.yaml when
+  writing labels — operators hand-edit that file with comments and a
+  specific key order; round-tripping it would lose those.
+
+Honest scope:
+  Labels are operator-trust, not adversary-resistant. The labels file is
+  user-writable; anyone with shell access can re-label a context. tirith
+  context is for catching operational footguns (`kubectl delete namespace
+  payments` on the wrong cluster), not for stopping someone who already
+  has root.
+
+Examples:
+  tirith context status
+  tirith context status --json
+  tirith context guard on
+  tirith context guard status
+  tirith context label kube:prod-us-east critical --scope user
+  tirith context label aws:prod production --scope repo")]
+    Context {
+        #[command(subcommand)]
+        action: ContextAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContextAction {
+    /// List the active kube / aws / gcp / azure contexts + their labels
+    #[command(after_help = "\
+Examples:
+  tirith context status
+  tirith context status --json")]
+    Status {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Turn the operational-context rule on or off (writes to policy.yaml)
+    #[command(after_help = "\
+Examples:
+  tirith context guard on
+  tirith context guard off
+  tirith context guard status")]
+    Guard {
+        /// One of: on, off, status.
+        action: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Label a `provider:context` entry with a criticality string
+    #[command(after_help = "\
+Provider is one of: kube, aws, gcp, azure.
+Criticality is one of: critical, production, prod, live, p0, p1, p2, staging, dev, test
+(case-insensitive; the first six are the values that fire the guard rule).
+
+Examples:
+  tirith context label kube:prod-us-east critical --scope user
+  tirith context label aws:prod production --scope user
+  tirith context label gcp:svc@my-prod-project critical --scope repo")]
+    Label {
+        /// `provider:context` key (e.g. `kube:prod-us-east`).
+        label_key: String,
+        /// Criticality string. `critical` / `production` / `prod` / `live`
+        /// / `p0` / `p1` trigger the guard rule; others (`staging`, `dev`,
+        /// `test`, `p2`) record the label without enforcement.
+        criticality: String,
+        /// Where to write the label file. `user` →
+        /// `~/.config/tirith/context-labels.yaml`. `repo` →
+        /// `<repo>/.tirith/context-labels.yaml`.
+        #[arg(long, default_value = "user")]
+        scope: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3696,6 +3801,40 @@ fn run() {
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::logs::redact(&path, &audience, json)
+            }
+        },
+
+        Commands::Context { action } => match action {
+            ContextAction::Status { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::context::status(json)
+            }
+            ContextAction::Guard {
+                action,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::context::guard(&action, json)
+            }
+            ContextAction::Label {
+                label_key,
+                criticality,
+                scope,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                let parsed_scope = match cli::context::LabelScope::parse(&scope) {
+                    Some(s) => s,
+                    None => {
+                        eprintln!(
+                            "tirith context label: --scope must be 'user' or 'repo' (got {scope})"
+                        );
+                        std::process::exit(2);
+                    }
+                };
+                cli::context::label(&label_key, &criticality, parsed_scope, json)
             }
         },
     };

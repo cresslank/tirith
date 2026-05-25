@@ -7,6 +7,7 @@ pub mod audit_upload;
 pub mod checkpoint;
 pub mod clipboard;
 pub mod confusables;
+pub mod context_detect;
 pub mod data;
 pub mod dep_confusion;
 pub mod ecosystem_scan;

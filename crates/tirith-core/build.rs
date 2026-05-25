@@ -638,6 +638,27 @@ const PATTERN_TABLE: &[PatternEntry] = &[
             "Non-ASCII bytes in pasted content (analysis trigger only, never sole reason to WARN)",
     },
     PatternEntry {
+        id: "cloud_cli",
+        // M8 ch1 — cloud / k8s CLIs whose destructive subcommands
+        // (`kubectl delete`, `helm uninstall`, `aws s3 rm`, `gcloud … delete`,
+        // `az … delete`, etc.) we gate against the active provider context.
+        // The PATTERN_TABLE entry is a coarse tier-1 probe; the precise
+        // destructive-verb match lives in `rules::context::check`.
+        //
+        // `aws-vault` is listed alongside `aws` because `aws-vault exec
+        // <profile> -- aws s3 rm …` is the same destructive shape with a
+        // credential wrapper. We catch the wrapper here so the rule body
+        // can step past it.
+        //
+        // Word boundaries (`\b`) keep `aws-` (a Cargo crate prefix) and
+        // `azimuth` etc. out of the tier-1 hit list.
+        tier1_exec_fragments: &[
+            r"\b(?:kubectl|kustomize|helm|argocd|aws|aws-vault|gcloud|az)\b",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Cloud / k8s CLIs for production-context destructive-command detection (M8 ch1)",
+    },
+    PatternEntry {
         id: "prompt_injection_seed",
         // M7 ch5 — paste-only fast gate for the prompt-injection rule.
         //
@@ -988,6 +1009,16 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     // M7 ch5 — prompt-injection seed phrases.
     ("prompt_injection_in_output", "PromptInjectionInOutput"),
     ("ignore_previous_instructions", "IgnorePreviousInstructions"),
+    // Operational-context rules (M8 ch1).
+    (
+        "context_prod_destructive_command",
+        "ContextProdDestructiveCommand",
+    ),
+    ("context_prod_write_operation", "ContextProdWriteOperation"),
+    (
+        "context_prod_credential_change",
+        "ContextProdCredentialChange",
+    ),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -1011,6 +1042,7 @@ const VALID_CATEGORIES: &[&str] = &[
     "license",
     "threatintel",
     "output",
+    "context",
 ];
 
 #[derive(Deserialize)]
