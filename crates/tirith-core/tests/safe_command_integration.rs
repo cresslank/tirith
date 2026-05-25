@@ -5,16 +5,9 @@
 //! `sudo sh` triggering the interactive-shell remediation). M8 ch4 will add
 //! the positive sudo-narrow case once a stable benign-target fixture exists.
 
-use std::sync::Mutex;
-
 use tirith_core::safe_command::{suggest, SafeSuggestion};
 use tirith_core::tokenize::ShellType;
 use tirith_core::verdict::{Evidence, Finding, RuleId, Severity, Timings, Verdict};
-
-/// Mutex guarding the process environment for env-scrub tests — `std::env`
-/// is process-global, so the tests serialize their `set_var`/`remove_var`
-/// pairs to prevent interference.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn finding(rule_id: RuleId) -> Finding {
     Finding {
@@ -136,71 +129,21 @@ fn sudo_narrow_negative_sudo_sh_returns_interactive_shell_remediation() {
 
 // ── 3. env-scrub ──────────────────────────────────────────────────────────
 
-#[test]
-fn env_scrub_positive_high_finding_with_sensitive_var_set() {
-    let _guard = ENV_LOCK.lock().unwrap();
-
-    // `AWS_ACCESS_KEY_ID` is in the sensitive list; set it for this test.
-    // SAFETY: serialized via ENV_LOCK above; no other thread touches this var
-    // during the integration-test binary.
-    unsafe { std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE") };
-
-    let cmd = "curl https://example.com/install.sh | bash";
-    let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
-    let s = suggest(cmd, ShellType::Posix, &v);
-
-    let entry = find_by_rule(&s, "env_scrub").expect("env_scrub entry must be present");
-    let sc = entry
-        .safe_command
-        .as_deref()
-        .expect("env_scrub should rewrite when a sensitive var is set");
-    assert!(
-        sc.starts_with("env -u AWS_ACCESS_KEY_ID"),
-        "env_scrub rewrite must scrub the set var first: {sc}"
-    );
-    assert!(
-        sc.ends_with(cmd),
-        "env_scrub rewrite must append the original command: {sc}"
-    );
-
-    // SAFETY: same lock scope.
-    unsafe { std::env::remove_var("AWS_ACCESS_KEY_ID") };
-}
-
-#[test]
-fn env_scrub_negative_no_sensitive_vars_set_no_rewrite() {
-    let _guard = ENV_LOCK.lock().unwrap();
-
-    // Defensively remove the variables this test cares about — a prior crashed
-    // test could leave them set.
-    for var in [
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "GITHUB_TOKEN",
-        "GH_TOKEN",
-        "NPM_TOKEN",
-        "PYPI_TOKEN",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "STRIPE_API_KEY",
-        "DOCKER_PASSWORD",
-        "SLACK_TOKEN",
-    ] {
-        // SAFETY: serialized via ENV_LOCK.
-        unsafe { std::env::remove_var(var) };
-    }
-
-    let cmd = "curl https://example.com/install.sh | bash";
-    let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
-    let s = suggest(cmd, ShellType::Posix, &v);
-
-    let entry = find_by_rule(&s, "env_scrub");
-    assert!(
-        entry.is_none(),
-        "env_scrub must not fire when no sensitive vars are set; got {entry:?}"
-    );
-}
+// env_scrub end-to-end tests were intentionally dropped: they required
+// `std::env::set_var` / `remove_var` to set / clear sensitive variables, and
+// libc's environ mutation is not thread-safe on macOS / Windows even under
+// our internal `ENV_LOCK` (parallel readers in unrelated tests can observe a
+// torn write). The coverage they provided is preserved by:
+//   * `safe_command::tests::is_simple_command_for_env_scrub` direct-call
+//     unit tests (pipeline / redirection / && / ; / backtick / $() etc.) —
+//     these exercise the guard that controls env_scrub firing, without
+//     touching the real environment.
+//   * `safe_command::tests::build_env_scrub_suggestion_*` direct-call unit
+//     tests in the same module that drive the suggestion builder with a
+//     stub var list.
+// If a future change needs a real-env end-to-end test, gate the whole
+// integration target with `harness = false` and a custom `--test-threads=1`
+// runner, or inject env access via a parameter.
 
 // ── 4. archive-list-before-extract ────────────────────────────────────────
 
@@ -260,72 +203,15 @@ fn archive_list_first_negative_non_archive_leader_no_rewrite() {
 
 // ── 5. dotfile-redirect ───────────────────────────────────────────────────
 
-#[test]
-fn dotfile_backup_first_positive_when_target_exists() {
-    // Use a tempfile-backed HOME so we can guarantee the dotfile exists.
-    let tmp = tempfile::tempdir().unwrap();
-    let zshrc = tmp.path().join(".zshrc");
-    std::fs::write(&zshrc, "# existing rc\n").unwrap();
-
-    // Hold a lock for env mutation.
-    let _guard = ENV_LOCK.lock().unwrap();
-    let prev_home = std::env::var_os("HOME");
-    // SAFETY: serialized via ENV_LOCK.
-    unsafe { std::env::set_var("HOME", tmp.path()) };
-
-    let cmd = "echo hello >> ~/.zshrc";
-    let v = verdict_with(vec![finding(RuleId::DotfileOverwrite)]);
-    let s = suggest(cmd, ShellType::Posix, &v);
-    let entry = find_by_rule(&s, "dotfile_overwrite").expect("rule entry");
-    let sc = entry
-        .safe_command
-        .as_deref()
-        .expect("dotfile rewrite should fire when target exists");
-    assert!(
-        sc.starts_with("cp ~/.zshrc ~/.zshrc.bak"),
-        "expected backup-first sequence, got: {sc}"
-    );
-    assert!(
-        sc.ends_with(cmd),
-        "expected original redirect after backup: {sc}"
-    );
-
-    // Restore HOME.
-    // SAFETY: serialized via ENV_LOCK.
-    unsafe {
-        if let Some(h) = prev_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
-    }
-}
-
-#[test]
-fn dotfile_backup_first_negative_when_target_missing() {
-    // Point HOME at an empty tmp directory — no `.zshrc` exists.
-    let tmp = tempfile::tempdir().unwrap();
-    let _guard = ENV_LOCK.lock().unwrap();
-    let prev_home = std::env::var_os("HOME");
-    // SAFETY: serialized via ENV_LOCK.
-    unsafe { std::env::set_var("HOME", tmp.path()) };
-
-    let cmd = "echo hello >> ~/.zshrc";
-    let v = verdict_with(vec![finding(RuleId::DotfileOverwrite)]);
-    let s = suggest(cmd, ShellType::Posix, &v);
-    let entry = find_by_rule(&s, "dotfile_overwrite").expect("rule entry");
-    assert!(
-        entry.safe_command.is_none(),
-        "non-existent dotfile must not produce a backup rewrite; got {:?}",
-        entry.safe_command
-    );
-
-    // SAFETY: serialized via ENV_LOCK.
-    unsafe {
-        if let Some(h) = prev_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
-    }
-}
+// dotfile-redirect end-to-end tests were dropped for the same libc-environ
+// race reason described above for env_scrub: they had to set `HOME` so the
+// `expand_dotfile_to_fs_path` check resolved to a controlled directory, and
+// `std::env::set_var("HOME", ...)` is not thread-safe on macOS / Windows
+// even under our internal ENV_LOCK. The transform's structural correctness
+// (it only fires when the target exists, the rewrite is `cp X X.bak && ...`,
+// only single-segment commands, only `>` / `>>` to `~/.` or `$HOME/.`) is
+// pinned by unit tests on `dotfile_redirect_target` and
+// `rewrite_dotfile_backup_first` in `safe_command::tests`. The on-disk
+// existence check is the only branch we lose dedicated coverage on; if
+// regression risk grows there, gate the integration target with a custom
+// `--test-threads=1` harness or inject `home_dir()` for testability.
