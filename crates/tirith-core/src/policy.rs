@@ -149,20 +149,21 @@ pub struct Policy {
     #[serde(default)]
     pub threat_intel: ThreatIntelConfig,
 
-    /// **M6 ch6 — temporary top-level field for the dependency-confusion
-    /// heuristic's operator-supplied internal-name list.**
+    /// **M6 ch7 — package-policy section.**
     ///
-    /// Each entry is a name pattern. A trailing `*` is a wildcard: `@org/*`
-    /// matches every `@org/<anything>` resolution on the public registry.
-    /// When the heuristic finds a public-registry resolution matching a
-    /// pattern, it emits `PackageDependencyConfusion`.
+    /// Thresholds and actions for the package-reputation signals shipped in
+    /// M6 ch6. Replaces the hard-coded `AGGREGATE_BLOCK_SCORE = 76` /
+    /// `AGGREGATE_WARN_SCORE = 51` constants and exposes per-signal
+    /// thresholds (CVSS, package age, low downloads, typosquat distance,
+    /// repo-mismatch cap, ...) plus the `internal_package_names` list the
+    /// dependency-confusion heuristic consumes.
     ///
-    /// **Ch7 will move this under `package_policy.internal_package_names`
-    /// alongside the rest of `PackagePolicy` and add a migration. For M6 ch6
-    /// it ships at the top level so the dep-confusion signal does not depend
-    /// on ch7.**
+    /// Every field has a sensible default — leaving `package_policy:` empty
+    /// keeps the M6 ch6 behavior. See [`PackagePolicy`] for the per-field
+    /// docs and effective defaults via [`PackagePolicy::*_effective`]
+    /// helpers.
     #[serde(default)]
-    pub internal_package_names: Vec<String>,
+    pub package_policy: PackagePolicy,
 
     /// Per-agent governance rules (M4 item 8).
     ///
@@ -644,8 +645,173 @@ impl Default for Policy {
             policy_fetch_fail_mode: None,
             enforce_fail_mode: None,
             threat_intel: ThreatIntelConfig::default(),
-            internal_package_names: Vec::new(),
+            package_policy: PackagePolicy::default(),
             agent_rules: AgentRules::default(),
+        }
+    }
+}
+
+/// M6 ch7 — operator-supplied internal-name pattern for the
+/// dependency-confusion heuristic.
+///
+/// `name` is a package-name pattern. A trailing `*` is the only supported
+/// wildcard: `@org/*` matches every `@org/<anything>` resolution on the
+/// public registry (the textbook 2021 dependency-confusion shape).
+///
+/// `ecosystem` is optional: when set (`"npm"`, `"pypi"`, `"crates.io"`,
+/// `"go"`, ...) the pattern matches only that ecosystem's lookups; when
+/// `None` the pattern matches every ecosystem (the previous M6 ch6
+/// behavior for the top-level string list).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InternalPackageSpec {
+    /// Optional ecosystem scope (npm / pypi / crates.io / ...). `None`
+    /// matches every ecosystem — the M6 ch6 behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ecosystem: Option<String>,
+    /// The pattern. A trailing `*` is wildcard.
+    pub name: String,
+}
+
+impl InternalPackageSpec {
+    /// Build a spec from a bare-string pattern (the M6 ch6 shape) — used by
+    /// the migration to lift the legacy top-level list.
+    pub fn from_pattern(name: impl Into<String>) -> Self {
+        Self {
+            ecosystem: None,
+            name: name.into(),
+        }
+    }
+}
+
+/// M6 ch7 — package-policy section.
+///
+/// Thresholds and actions for the package-reputation signals shipped in
+/// M6 ch6. Every field defaults to the M6 ch6 shipping behavior — the
+/// section can be omitted entirely without changing detection.
+///
+/// All threshold fields are read via `*_effective` helpers that fold in
+/// the M6 ch6 baseline so callers do not branch on `Option`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PackagePolicy {
+    /// Block when the registry positively reports the package does not
+    /// exist (`PackageExistence::NotFound`). Requires `--online`; offline
+    /// runs report `Unknown` and this rule never fires.
+    pub block_not_found: bool,
+    /// Block when the package was first published within this many days
+    /// (registry-API age). `None` disables the block path; `Some(N)`
+    /// blocks when `package_age_days <= N`.
+    pub block_newer_than_days: Option<u32>,
+    /// Warn when the package was first published within this many days.
+    /// `None` falls back to the M6 ch6 baseline (the
+    /// `VERY_NEW_PACKAGE_DAYS` constant in `package_risk`).
+    pub warn_newer_than_days: Option<u32>,
+    /// Warn when the registry-reported recent downloads fall at or below
+    /// this number. `None` disables the warn path.
+    pub warn_low_downloads_below: Option<u32>,
+    /// Block when `name_vs_popular == Unknown` AND the install-script
+    /// analysis flagged a network call or shell spawn. Requires the
+    /// install-script signal — paths where script text is available are
+    /// `--online` install (npm inline), `ecosystem scan --installed`, and
+    /// `package scan --lockfile --online`. Bare offline `install` cannot
+    /// fire it.
+    pub block_install_scripts_for_unknown_packages: bool,
+    /// Block when the package name is within this edit distance of a
+    /// known-popular package. `None` disables; `Some(1)` is the strictest
+    /// useful setting (one-character typosquats only). Read by
+    /// `install_txn`'s `PackagePolicyTyposquatDistance` rule.
+    pub block_typosquat_distance: Option<u32>,
+    /// Override the aggregate-score block threshold. `None` falls back to
+    /// the M6 ch6 baseline of 76 (`risk_level == "critical"`).
+    pub block_aggregate_score: Option<u32>,
+    /// Override the aggregate-score warn threshold. `None` falls back to
+    /// the M6 ch6 baseline of 51 (`risk_level == "high"`).
+    pub warn_aggregate_score: Option<u32>,
+    /// Block when any OSV advisory's CVSS is at or above this value.
+    /// `None` falls back to the M6 ch6 baseline of `7.0`.
+    pub block_osv_min_cvss: Option<f32>,
+    /// Elevate `PackageRepoMismatch` from its Medium baseline to Block.
+    /// Default `false` — the M6 ch6 behavior is "Medium finding only".
+    pub block_repo_mismatch: bool,
+    /// Whether `PackageInstallScriptNetworkCall` produces a Warn-baseline
+    /// finding. Default `true` — the M6 ch6 behavior. Set to `false` to
+    /// silence the signal entirely (paranoia-1 / noisy-CI environments).
+    pub warn_install_script_network_call: bool,
+    /// Whether a `PackageDependencyConfusion` finding blocks. Default
+    /// `true` — the rule's M6 ch6 severity is `High` so the Block is the
+    /// natural action mapping. Set to `false` to demote to Warn.
+    pub block_dependency_confusion: bool,
+    /// Operator-supplied internal-name patterns the dependency-confusion
+    /// heuristic consumes. Replaces the M6 ch6 top-level
+    /// `internal_package_names: Vec<String>` (migrated forward by
+    /// [`crate::policy_migrations`] v1→v2).
+    pub internal_package_names: Vec<InternalPackageSpec>,
+    /// Cap on how many packages the `--online` repo-mismatch check
+    /// verifies (ordered by score, highest first). `None` falls back to
+    /// the M6 ch6 baseline of 50. Set to `0` via `Some(0)` to disable.
+    pub repo_mismatch_check_max_packages: Option<u32>,
+}
+
+impl PackagePolicy {
+    /// The aggregate-score Block threshold — `block_aggregate_score` or
+    /// the M6 ch6 baseline of 76.
+    pub fn block_aggregate_score_effective(&self) -> u32 {
+        self.block_aggregate_score
+            .unwrap_or(DEFAULT_BLOCK_AGGREGATE_SCORE)
+    }
+    /// The aggregate-score Warn threshold — `warn_aggregate_score` or
+    /// the M6 ch6 baseline of 51.
+    pub fn warn_aggregate_score_effective(&self) -> u32 {
+        self.warn_aggregate_score
+            .unwrap_or(DEFAULT_WARN_AGGREGATE_SCORE)
+    }
+    /// The OSV CVSS threshold above which the OSV advisory should block —
+    /// `block_osv_min_cvss` or the M6 ch6 baseline of 7.0.
+    pub fn block_osv_min_cvss_effective(&self) -> f32 {
+        self.block_osv_min_cvss
+            .unwrap_or(DEFAULT_BLOCK_OSV_MIN_CVSS)
+    }
+    /// The repo-mismatch verification cap — `repo_mismatch_check_max_packages`
+    /// or the M6 ch6 baseline of 50.
+    pub fn repo_mismatch_check_max_packages_effective(&self) -> u32 {
+        self.repo_mismatch_check_max_packages
+            .unwrap_or(DEFAULT_REPO_MISMATCH_CHECK_MAX_PACKAGES)
+    }
+}
+
+/// M6 ch7 baseline thresholds — these match the constants the M6 ch6
+/// install/scan paths previously hard-coded. Centralised here so the
+/// `package_policy.*_effective` helpers and the `policy init` template
+/// agree on a single source of truth.
+pub const DEFAULT_BLOCK_AGGREGATE_SCORE: u32 = 76;
+pub const DEFAULT_WARN_AGGREGATE_SCORE: u32 = 51;
+pub const DEFAULT_BLOCK_OSV_MIN_CVSS: f32 = 7.0;
+pub const DEFAULT_REPO_MISMATCH_CHECK_MAX_PACKAGES: u32 = 50;
+
+impl Default for PackagePolicy {
+    fn default() -> Self {
+        Self {
+            block_not_found: false,
+            block_newer_than_days: None,
+            warn_newer_than_days: None,
+            warn_low_downloads_below: None,
+            block_install_scripts_for_unknown_packages: false,
+            block_typosquat_distance: None,
+            block_aggregate_score: None,
+            warn_aggregate_score: None,
+            block_osv_min_cvss: None,
+            block_repo_mismatch: false,
+            // The M6 ch6 install-script signal ships as Warn-baseline; the
+            // ch7 default keeps it on so existing operators do not lose the
+            // finding silently.
+            warn_install_script_network_call: true,
+            // The M6 ch6 dep-confusion finding is High → Block by the
+            // default severity → action mapping. Default `true` preserves
+            // that behavior.
+            block_dependency_confusion: true,
+            internal_package_names: Vec::new(),
+            repo_mismatch_check_max_packages: None,
         }
     }
 }
@@ -1243,11 +1409,16 @@ mod tests {
     #[test]
     fn shipping_policy_without_schema_version_loads_as_v1() {
         // Mirrors a pre-M5.5 `.tirith/policy.yaml`: no schema_version
-        // field at all. The loader must default to v1 and parse the
-        // shipping fields cleanly.
+        // field at all. The loader must default to v1 (via the migration
+        // chain), parse the shipping fields cleanly, and emerge at the
+        // current schema version.
         let yaml = "fail_mode: open\nparanoia: 2\n";
         let p = Policy::load_from_yaml(yaml, Some("test"));
-        assert_eq!(p.schema_version, 1);
+        assert_eq!(
+            p.schema_version,
+            crate::policy_migrations::CURRENT_SCHEMA_VERSION,
+            "loaded policy must be at the current schema version after migration"
+        );
         assert_eq!(p.paranoia, 2);
         assert_eq!(p.path.as_deref(), Some("test"));
     }
@@ -1256,7 +1427,12 @@ mod tests {
     fn explicit_schema_version_v1_loads() {
         let yaml = "schema_version: 1\nparanoia: 3\n";
         let p = Policy::load_from_yaml(yaml, None);
-        assert_eq!(p.schema_version, 1);
+        // After migration through the registered chain, the loaded policy
+        // emerges at CURRENT_SCHEMA_VERSION.
+        assert_eq!(
+            p.schema_version,
+            crate::policy_migrations::CURRENT_SCHEMA_VERSION
+        );
         assert_eq!(p.paranoia, 3);
     }
 
@@ -1264,8 +1440,9 @@ mod tests {
     fn future_schema_version_falls_back_to_default() {
         // A policy declaring a version newer than this binary supports
         // must NOT silently drop fields. The loader prints the migration
-        // error and returns `Policy::default()` (which itself is v1).
-        // This pins the no-silent-drop invariant from the F3 design.
+        // error and returns `Policy::default()` (which itself carries the
+        // serde default v1). This pins the no-silent-drop invariant from
+        // the F3 design.
         let yaml = "schema_version: 9999\nparanoia: 4\n";
         let p = Policy::load_from_yaml(yaml, Some("synthetic"));
         // Did NOT keep the file's paranoia=4 because deserialization
@@ -1274,10 +1451,11 @@ mod tests {
             p.paranoia, 4,
             "future-version policy must not be silently honored",
         );
-        assert_eq!(
-            p.schema_version,
-            crate::policy_migrations::CURRENT_SCHEMA_VERSION
-        );
+        // The fallback is `Policy::default()` which carries the serde
+        // default `schema_version = 1` — NOT the build's current schema.
+        // This is intentional: a future-version load shouldn't synthesize
+        // a "current schema" policy out of thin air, only the safe default.
+        assert_eq!(p.schema_version, 1);
     }
 
     #[test]

@@ -184,6 +184,38 @@ pub enum RuleId {
     /// does not mention the package name. High severity.
     PackageRepoMismatch,
 
+    // Package-policy gated rules (M6 ch7) — these fire from
+    // `install_txn` / `ecosystem_scan` when the `package_policy` section
+    // (chunk 7) crosses a configured threshold. Each has a clean default
+    // behavior at the M6 ch6 baseline and only fires when policy carries
+    // a stronger threshold.
+    /// M6 ch7 — the package is newer than the policy's
+    /// `block_newer_than_days` / `warn_newer_than_days`. Warn baseline;
+    /// elevated to Block when the Block threshold is configured AND the
+    /// package's age is at or below it.
+    PackagePolicyNewerThanDays,
+    /// M6 ch7 — the package's `recent_downloads` is at or below the
+    /// policy's `warn_low_downloads_below`. Warn severity. Requires
+    /// `--online` to gather the downloads count.
+    PackagePolicyLowDownloads,
+    /// M6 ch7 — the package name is within the policy's
+    /// `block_typosquat_distance` edit distance of a known-popular name.
+    /// Block severity. Distinct from `ThreatPackageTyposquat` (DB-confirmed)
+    /// and `ThreatPackageSimilarName` (advisory) — this fires from a
+    /// policy-supplied distance threshold rather than the threat-DB.
+    PackagePolicyTyposquatDistance,
+    /// M6 ch7 — the package is `NameVsPopular::Unknown` AND the
+    /// install-script analysis flagged a network call or shell spawn.
+    /// Block severity. Requires the install-script signal — `--online`
+    /// install (npm inline), `ecosystem scan --installed`, or
+    /// `package scan --lockfile --online`.
+    PackagePolicyUnknownPackageWithInstallScripts,
+    /// M6 ch7 — the registry positively reports the package does not
+    /// exist (`PackageExistence::NotFound`) AND the policy carries
+    /// `block_not_found: true`. Block severity. Requires `--online`;
+    /// offline runs report `Unknown` and this rule never fires.
+    PackagePolicyNotFound,
+
     // Rendered content rules
     HiddenCssContent,
     HiddenColorContent,

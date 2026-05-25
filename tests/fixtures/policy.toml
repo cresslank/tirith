@@ -119,3 +119,53 @@ input = "curl https://example.com/api"
 context = "paste"
 expected_action = "allow"
 expected_rules = []
+
+# ── M6 ch7 — package_policy section thresholds (negative-shape fixtures) ──
+#
+# The new policy-gated rules (`package_policy_*`) are emitted by
+# `install_txn` / `ecosystem_scan` from a `--online` registry signal AND
+# a configured policy threshold. The static engine path that these
+# fixtures exercise has neither signal, so the rules must NOT fire on
+# bare exec-context commands. The positive emission paths are unit-tested
+# in `install_txn.rs` and `ecosystem_scan.rs`. The rules are listed in
+# EXTERNALLY_TRIGGERED_RULES.
+
+[[fixture]]
+name = "m6_ch7_package_policy_newer_than_days_offline_does_not_fire"
+min_milestone = 6
+input = "npm install some-recent-package"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "m6_ch7_package_policy_low_downloads_offline_does_not_fire"
+min_milestone = 6
+input = "pip install rarely-downloaded-package"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "m6_ch7_package_policy_typosquat_distance_offline_does_not_fire"
+min_milestone = 6
+input = "cargo install some-distinct-crate-name"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "m6_ch7_package_policy_unknown_with_install_scripts_offline_does_not_fire"
+min_milestone = 6
+input = "npm install some-unknown-pkg"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "m6_ch7_package_policy_not_found_offline_does_not_fire"
+min_milestone = 6
+input = "npm install does-not-exist-anywhere"
+context = "exec"
+expected_action = "allow"
+expected_rules = []

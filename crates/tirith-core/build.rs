@@ -894,6 +894,21 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "PackageInstallScriptNetworkCall",
     ),
     ("package_repo_mismatch", "PackageRepoMismatch"),
+    // Package-policy gated rules (M6 ch7) — 5 new policy-driven rule IDs.
+    (
+        "package_policy_newer_than_days",
+        "PackagePolicyNewerThanDays",
+    ),
+    ("package_policy_low_downloads", "PackagePolicyLowDownloads"),
+    (
+        "package_policy_typosquat_distance",
+        "PackagePolicyTyposquatDistance",
+    ),
+    (
+        "package_policy_unknown_package_with_install_scripts",
+        "PackagePolicyUnknownPackageWithInstallScripts",
+    ),
+    ("package_policy_not_found", "PackagePolicyNotFound"),
     // Rendered content
     ("hidden_css_content", "HiddenCssContent"),
     ("hidden_color_content", "HiddenColorContent"),

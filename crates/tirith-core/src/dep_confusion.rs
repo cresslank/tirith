@@ -1,15 +1,14 @@
-//! M6 ch6 — dependency-confusion heuristic.
+//! M6 ch6/ch7 — dependency-confusion heuristic.
 //!
 //! Returns a [`DepConfusionVerdict`] for a given `(eco, name, policy)` triple.
 //! Two heuristics are layered:
 //!
 //!  1. **Operator-supplied internal-name patterns.** When the policy carries
-//!     `internal_package_names` and the public-registry resolution matches
-//!     one of those patterns, this is the textbook dep-confusion shape (the
-//!     2021 `@<org>/<util>` attack). For M6 ch6 the field is a temporary
-//!     top-level field on `Policy`; ch7 moves it under
-//!     `package_policy.internal_package_names`. Glob-style wildcard at the
-//!     end of an `@<org>/*` pattern is supported.
+//!     `package_policy.internal_package_names` (M6 ch7) and the public-registry
+//!     resolution matches one of those patterns, this is the textbook
+//!     dep-confusion shape (the 2021 `@<org>/<util>` attack). Each
+//!     [`InternalPackageSpec`] can optionally scope to a specific ecosystem.
+//!     Glob-style wildcard at the end of an `@<org>/*` pattern is supported.
 //!  2. **Registry-namespace shape.** Without the operator list, the heuristic
 //!     falls back to obvious `@<reserved-org>/<name>` patterns — npm scope
 //!     names whose `@<org>` portion is a known internal-org indicator
@@ -20,7 +19,7 @@
 //! Read-only; no I/O. The heuristic runs offline.
 
 use crate::package_risk::DepConfusionVerdict;
-use crate::policy::Policy;
+use crate::policy::{InternalPackageSpec, Policy};
 use crate::threatdb::Ecosystem;
 
 /// Evaluate the dependency-confusion heuristic for `(eco, name)`.
@@ -37,17 +36,23 @@ pub fn evaluate(eco: Ecosystem, name: &str, policy: &Policy) -> DepConfusionVerd
         };
     }
 
-    // (1) Operator-supplied internal-name patterns. The field lives at the
-    // top level of `Policy` for M6 ch6 (temporary; ch7 moves it under
-    // `package_policy`). Patterns support a single trailing `*` wildcard.
-    for pattern in &policy.internal_package_names {
-        if matches_pattern(pattern, name) {
+    // (1) Operator-supplied internal-name patterns (ch7 location:
+    // `package_policy.internal_package_names`). Each entry is an
+    // `InternalPackageSpec { ecosystem, name }`; `ecosystem == None` matches
+    // every ecosystem (the M6 ch6 behavior). Patterns support a single
+    // trailing `*` wildcard.
+    for spec in &policy.package_policy.internal_package_names {
+        if !ecosystem_matches(spec, eco) {
+            continue;
+        }
+        if matches_pattern(&spec.name, name) {
             return DepConfusionVerdict {
                 risk: true,
                 reason: format!(
                     "name '{name}' matches the operator-declared internal pattern \
                      '{pattern}'; resolving it on the public registry shadows the \
-                     internal package."
+                     internal package.",
+                    pattern = spec.name,
                 ),
             };
         }
@@ -94,8 +99,22 @@ fn npm_scope(name: &str) -> Option<&str> {
     Some(&name[..slash])
 }
 
+/// `true` when this spec is unscoped (matches every ecosystem) or its
+/// declared ecosystem string matches `eco`. Comparison is case-insensitive
+/// to match the spelling shipping `Ecosystem` serialization uses.
+fn ecosystem_matches(spec: &InternalPackageSpec, eco: Ecosystem) -> bool {
+    let Some(declared) = &spec.ecosystem else {
+        return true;
+    };
+    let declared = declared.trim();
+    if declared.is_empty() {
+        return true;
+    }
+    declared.eq_ignore_ascii_case(&eco.to_string())
+}
+
 /// Scopes whose name shape is a strong "this is private" signal. Conservative
-/// list; ch7's `internal_package_names` is the real surface for this.
+/// list; ch7's `package_policy.internal_package_names` is the real surface.
 const RESERVED_INTERNAL_SCOPES: &[&str] = &[
     "@internal",
     "@private",
@@ -116,10 +135,24 @@ mod tests {
     use super::*;
 
     fn policy_with(internal: &[&str]) -> Policy {
-        Policy {
-            internal_package_names: internal.iter().map(|s| (*s).to_string()).collect(),
-            ..Policy::default()
-        }
+        let mut policy = Policy::default();
+        policy.package_policy.internal_package_names = internal
+            .iter()
+            .map(|s| InternalPackageSpec::from_pattern(*s))
+            .collect();
+        policy
+    }
+
+    fn policy_with_scoped(specs: &[(Option<&str>, &str)]) -> Policy {
+        let mut policy = Policy::default();
+        policy.package_policy.internal_package_names = specs
+            .iter()
+            .map(|(eco, name)| InternalPackageSpec {
+                ecosystem: eco.map(|s| s.to_string()),
+                name: (*name).to_string(),
+            })
+            .collect();
+        policy
     }
 
     #[test]
@@ -177,6 +210,27 @@ mod tests {
         let p = Policy::default();
         let v = evaluate(Ecosystem::Npm, "   ", &p);
         assert!(!v.risk);
+    }
+
+    #[test]
+    fn scoped_spec_matches_only_declared_ecosystem() {
+        // npm-scoped pattern must not flag a matching name in pypi
+        let p = policy_with_scoped(&[(Some("npm"), "internal-tool")]);
+        let v_npm = evaluate(Ecosystem::Npm, "internal-tool", &p);
+        assert!(v_npm.risk);
+        let v_pypi = evaluate(Ecosystem::PyPI, "internal-tool", &p);
+        assert!(
+            !v_pypi.risk,
+            "spec scoped to npm must not match a pypi resolution"
+        );
+    }
+
+    #[test]
+    fn unscoped_spec_matches_all_ecosystems() {
+        // None (unscoped) must match every ecosystem
+        let p = policy_with_scoped(&[(None, "internal-tool")]);
+        assert!(evaluate(Ecosystem::Npm, "internal-tool", &p).risk);
+        assert!(evaluate(Ecosystem::PyPI, "internal-tool", &p).risk);
     }
 
     #[test]

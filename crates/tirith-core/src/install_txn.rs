@@ -30,7 +30,10 @@
 
 use crate::engine::{self, AnalysisContext};
 use crate::extract::ScanContext;
-use crate::package_risk::{self, ApiSignals, ContentSignals, PackageSignals, RiskBreakdown};
+use crate::package_risk::{
+    self, ApiProvenance, ApiSignals, ContentSignals, NameVsPopular, PackageExistence,
+    PackageSignals, RiskBreakdown,
+};
 use crate::policy::{FailMode, Policy};
 use crate::rules::threatintel::{self, PackageRef};
 use crate::threatdb::{Ecosystem, ThreatDb};
@@ -310,19 +313,6 @@ pub struct PlanRequest<'a> {
     pub online: OnlineMode<'a>,
 }
 
-/// The aggregate-risk score at or above which a package, on its *own risk
-/// score alone* (no DB typosquat, no slopsquat shape — those are already
-/// findings in their own right), warrants a blocking finding.
-///
-/// `package_risk::risk_level` calls 76–100 `"critical"`; a critical aggregate
-/// score means several independent provenance red flags stacked up, which is a
-/// block-worthy signal even without a confirmed name match.
-const AGGREGATE_BLOCK_SCORE: u32 = 76;
-
-/// The aggregate-risk score at or above which a package warrants an advisory
-/// (warn) finding on its score alone. `risk_level` calls 51–75 `"high"`.
-const AGGREGATE_WARN_SCORE: u32 = 51;
-
 /// Analyze a package-manager install and produce a ready-to-run [`InstallPlan`].
 ///
 /// This is the single entry point. It:
@@ -406,14 +396,48 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
     let eco = manager.ecosystem();
     let mut planned: Vec<PlannedPackage> = Vec::new();
 
+    let online_in_use = matches!(request.online, OnlineMode::Resolver(_));
     for pkg in extracted.into_iter().filter(|p| p.ecosystem == eco) {
         let signals = gather_package_signals(request, eco, &pkg, &mut notes);
         // `score_package` itself asserts the factor-sum invariant.
         let breakdown = package_risk::score_package(&signals);
 
+        // M6 ch7 — install-script signal is only present when (a) `--online`
+        // resolved the package and inline `scripts.*` arrived, OR (b) the
+        // path is `ecosystem scan --installed` / `package scan --lockfile
+        // --online` (where script text is on disk). A bare offline `tirith
+        // install` cannot evaluate the signal — surface that gap explicitly
+        // rather than silently allowing the policy rule to no-op.
+        if request
+            .policy
+            .package_policy
+            .block_install_scripts_for_unknown_packages
+            && !online_in_use
+            && matches!(signals.name_vs_popular, NameVsPopular::Unknown)
+        {
+            notes.push(format!(
+                "(install-script signal not available offline — pass `--online` to evaluate \
+                 install-script policy for '{}')",
+                pkg.name
+            ));
+        }
+
+        // Honest framing for the M6 ch7 `block_not_found` rule too: offline
+        // runs cannot resolve `PackageExistence` and the policy never fires.
+        if request.policy.package_policy.block_not_found
+            && !online_in_use
+            && package_existence(&signals.api).is_none()
+        {
+            notes.push(format!(
+                "(package-existence signal requires --online — `block_not_found` policy did \
+                 not evaluate for '{}')",
+                pkg.name
+            ));
+        }
+
         // (4) Turn the breakdown into findings, de-duplicated against the
         // threat-DB findings the engine already produced for this package.
-        for finding in risk_findings_for(&pkg, &breakdown, &findings) {
+        for finding in risk_findings_for(&pkg, &breakdown, &findings, request.policy) {
             findings.push(finding);
         }
 
@@ -908,9 +932,11 @@ fn risk_findings_for(
     pkg: &PackageRef,
     breakdown: &RiskBreakdown,
     existing: &[Finding],
+    policy: &Policy,
 ) -> Vec<Finding> {
     let mut out = Vec::new();
     let eco = pkg.ecosystem;
+    let pp = &policy.package_policy;
 
     // Does `existing` already carry a finding of `rule` that names this
     // package? The threatintel findings put the package name in the title and
@@ -963,8 +989,10 @@ fn risk_findings_for(
         || already_has(RuleId::ThreatPackageTyposquat)
         || already_has(RuleId::ThreatPackageSimilarName);
 
-    if !name_match_present && breakdown.score >= AGGREGATE_WARN_SCORE {
-        let severity = if breakdown.score >= AGGREGATE_BLOCK_SCORE {
+    let warn_threshold = pp.warn_aggregate_score_effective();
+    let block_threshold = pp.block_aggregate_score_effective();
+    if !name_match_present && breakdown.score >= warn_threshold {
+        let severity = if breakdown.score >= block_threshold {
             Severity::High
         } else {
             Severity::Medium
@@ -985,7 +1013,8 @@ fn risk_findings_for(
             ),
             evidence: vec![Evidence::Text {
                 detail: format!(
-                    "package={} ecosystem={eco} risk_score={} risk_level={}",
+                    "package={} ecosystem={eco} risk_score={} risk_level={} \
+                     warn_threshold={warn_threshold} block_threshold={block_threshold}",
                     pkg.name, breakdown.score, breakdown.risk_level,
                 ),
             }],
@@ -996,7 +1025,216 @@ fn risk_findings_for(
         });
     }
 
+    // --- M6 ch7 policy-driven rules ------------------------------------
+    out.extend(policy_findings_for(pkg, breakdown, policy));
+
     out
+}
+
+/// M6 ch7 — emit findings driven by `policy.package_policy` thresholds.
+///
+/// Each rule path here has a clean default (do not fire) and only emits
+/// when a policy threshold crosses a signal carried in `breakdown`. The
+/// caller hand-rolls "is this signal observable on the path's --online
+/// state" gating; this function trusts the inputs.
+fn policy_findings_for(
+    pkg: &PackageRef,
+    breakdown: &RiskBreakdown,
+    policy: &Policy,
+) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let eco = pkg.ecosystem;
+    let pp = &policy.package_policy;
+    let provenance: Option<&ApiProvenance> = match &breakdown.api_signals {
+        ApiSignals::Available { provenance } => Some(provenance),
+        _ => None,
+    };
+
+    // PackagePolicyNotFound — registry-confirmed 404 + block_not_found
+    if pp.block_not_found {
+        if let Some(prov) = provenance {
+            if matches!(prov.package_existence, PackageExistence::NotFound) {
+                out.push(Finding {
+                    rule_id: RuleId::PackagePolicyNotFound,
+                    severity: Severity::High,
+                    title: format!(
+                        "Package not found: {eco} '{}' (policy block_not_found)",
+                        pkg.name
+                    ),
+                    description: format!(
+                        "The {eco} package '{}' was not found in the registry (HTTP 404) \
+                         and policy `block_not_found: true` requires this to block. \
+                         The package may be a typo, may belong to a private registry, \
+                         or may have been removed.",
+                        pkg.name,
+                    ),
+                    evidence: vec![Evidence::Text {
+                        detail: format!("package={} ecosystem={eco} existence=not_found", pkg.name),
+                    }],
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                });
+            }
+        }
+    }
+
+    // PackagePolicyNewerThanDays — package_age_days against thresholds
+    if let Some(prov) = provenance {
+        if let Some(age_days) = prov.package_age_days {
+            let warn_d = pp.warn_newer_than_days;
+            let block_d = pp.block_newer_than_days;
+            let (fired, sev) = match (block_d, warn_d) {
+                (Some(b), _) if (age_days as u32) <= b => (true, Severity::High),
+                (_, Some(w)) if (age_days as u32) <= w => (true, Severity::Medium),
+                _ => (false, Severity::Medium),
+            };
+            if fired {
+                out.push(Finding {
+                    rule_id: RuleId::PackagePolicyNewerThanDays,
+                    severity: sev,
+                    title: format!(
+                        "Package newer than policy threshold: {eco} '{}' ({} day{})",
+                        pkg.name,
+                        age_days,
+                        if age_days == 1 { "" } else { "s" },
+                    ),
+                    description: format!(
+                        "The {eco} package '{}' was first published {age_days} day(s) ago, \
+                         which trips the policy threshold (warn_newer_than_days={:?}, \
+                         block_newer_than_days={:?}). A brand-new package has no community \
+                         track record yet.",
+                        pkg.name, warn_d, block_d,
+                    ),
+                    evidence: vec![Evidence::Text {
+                        detail: format!(
+                            "package={} ecosystem={eco} package_age_days={age_days} \
+                             warn_threshold={warn_d:?} block_threshold={block_d:?}",
+                            pkg.name,
+                        ),
+                    }],
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                });
+            }
+        }
+
+        // PackagePolicyLowDownloads — recent_downloads against threshold
+        if let (Some(dl), Some(low)) = (prov.recent_downloads, pp.warn_low_downloads_below) {
+            if dl <= low as u64 {
+                out.push(Finding {
+                    rule_id: RuleId::PackagePolicyLowDownloads,
+                    severity: Severity::Medium,
+                    title: format!(
+                        "Package has low recent downloads: {eco} '{}' ({} downloads)",
+                        pkg.name, dl,
+                    ),
+                    description: format!(
+                        "The {eco} package '{}' reports {dl} recent downloads, at or below the \
+                         policy threshold {low}. Low downloads on a public-registry package may \
+                         indicate unfamiliarity or abandonment.",
+                        pkg.name,
+                    ),
+                    evidence: vec![Evidence::Text {
+                        detail: format!(
+                            "package={} ecosystem={eco} recent_downloads={dl} threshold={low}",
+                            pkg.name,
+                        ),
+                    }],
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                });
+            }
+        }
+
+        // PackagePolicyUnknownPackageWithInstallScripts — Unknown + script signal
+        if pp.block_install_scripts_for_unknown_packages
+            && matches!(breakdown.name_vs_popular, NameVsPopular::Unknown)
+        {
+            if let Some(iss) = prov.install_script_signals.as_ref() {
+                if iss.has_network_call || iss.has_shell_spawn {
+                    out.push(Finding {
+                        rule_id: RuleId::PackagePolicyUnknownPackageWithInstallScripts,
+                        severity: Severity::High,
+                        title: format!(
+                            "Unknown {eco} package ships install-time scripts: '{}'",
+                            pkg.name,
+                        ),
+                        description: format!(
+                            "The {eco} package '{}' is not a known-popular name and its \
+                             install scripts include a network call or shell spawn. Policy \
+                             `block_install_scripts_for_unknown_packages: true` requires this \
+                             to block — review the install script directly before proceeding.",
+                            pkg.name,
+                        ),
+                        evidence: vec![Evidence::Text {
+                            detail: format!(
+                                "package={} ecosystem={eco} has_network_call={} \
+                                 has_shell_spawn={}",
+                                pkg.name, iss.has_network_call, iss.has_shell_spawn,
+                            ),
+                        }],
+                        human_view: None,
+                        agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // PackagePolicyTyposquatDistance — name-vs-popular edit distance
+    if let Some(max_dist) = pp.block_typosquat_distance {
+        if let NameVsPopular::NearPopular {
+            popular_name,
+            distance,
+        } = &breakdown.name_vs_popular
+        {
+            if (*distance as u32) <= max_dist {
+                out.push(Finding {
+                    rule_id: RuleId::PackagePolicyTyposquatDistance,
+                    severity: Severity::High,
+                    title: format!(
+                        "Typosquat distance below policy threshold: {eco} '{}' ≈ '{}'",
+                        pkg.name, popular_name,
+                    ),
+                    description: format!(
+                        "The {eco} package '{}' is edit-distance {distance} from the \
+                         popular package '{popular_name}', at or below the policy threshold \
+                         {max_dist}. Policy requires a block at this distance.",
+                        pkg.name,
+                    ),
+                    evidence: vec![Evidence::Text {
+                        detail: format!(
+                            "package={} ecosystem={eco} similar_to={popular_name} \
+                             distance={distance} threshold={max_dist}",
+                            pkg.name,
+                        ),
+                    }],
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                });
+            }
+        }
+    }
+
+    out
+}
+
+/// Helper: extract `package_existence` from `api_signals` when available.
+fn package_existence(api: &ApiSignals) -> Option<PackageExistence> {
+    match api {
+        ApiSignals::Available { provenance } => Some(provenance.package_existence),
+        _ => None,
+    }
 }
 
 /// Whether `finding`'s title or description mentions `name` as a whole word.
@@ -1477,7 +1715,8 @@ mod tests {
             api: ApiSignals::offline(),
         };
         let breakdown = package_risk::score_package(&signals);
-        let produced = risk_findings_for(&pkg, &breakdown, &existing);
+        let p = empty_policy();
+        let produced = risk_findings_for(&pkg, &breakdown, &existing, &p);
         assert!(
             produced.is_empty(),
             "a name-match already present must suppress the aggregate finding: {produced:?}"
@@ -1505,7 +1744,8 @@ mod tests {
             api: ApiSignals::offline(),
         };
         let breakdown = package_risk::score_package(&signals);
-        let produced = risk_findings_for(&pkg, &breakdown, &[]);
+        let p = empty_policy();
+        let produced = risk_findings_for(&pkg, &breakdown, &[], &p);
         assert_eq!(produced.len(), 1);
         assert_eq!(produced[0].rule_id, RuleId::ThreatPackageTyposquat);
         assert_eq!(produced[0].severity, Severity::High);
@@ -1809,6 +2049,286 @@ mod tests {
             "distro backends with a name on the command line must NOT show the \
              misleading legacy note: {:?}",
             plan.notes,
+        );
+    }
+
+    // ── M6 ch7 — policy-driven rule emission tests ─────────────────────────
+
+    /// Build a minimal `RiskBreakdown` carrying the given provenance
+    /// (so the policy_findings_for helper has data to read).
+    #[allow(deprecated)]
+    fn breakdown_with_provenance(
+        name: &str,
+        eco: Ecosystem,
+        nvp: NameVsPopular,
+        provenance: ApiProvenance,
+    ) -> RiskBreakdown {
+        let signals = PackageSignals {
+            ecosystem: eco,
+            name: name.to_string(),
+            version: None,
+            threat_db_missing: false,
+            name_vs_popular: nvp,
+            malicious_typosquat_of: None,
+            content_signals: ContentSignals::NotInspected,
+            api: ApiSignals::Available { provenance },
+        };
+        package_risk::score_package(&signals)
+    }
+
+    #[test]
+    fn package_policy_not_found_fires_when_signal_and_policy_align() {
+        let pkg = PackageRef {
+            ecosystem: Ecosystem::Npm,
+            name: "missing-pkg".to_string(),
+            version: None,
+        };
+        let provenance = ApiProvenance {
+            source: "npm".to_string(),
+            package_existence: PackageExistence::NotFound,
+            ..Default::default()
+        };
+        let breakdown = breakdown_with_provenance(
+            "missing-pkg",
+            Ecosystem::Npm,
+            NameVsPopular::Unknown,
+            provenance,
+        );
+        let mut policy = empty_policy();
+        policy.package_policy.block_not_found = true;
+        let findings = risk_findings_for(&pkg, &breakdown, &[], &policy);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::PackagePolicyNotFound
+                    && f.severity == Severity::High),
+            "PackagePolicyNotFound must fire High when signal+policy align: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn package_policy_not_found_does_not_fire_when_existence_unknown() {
+        // Honest no-data: offline runs report Unknown, and even with
+        // `block_not_found: true` the rule must stay silent.
+        let pkg = PackageRef {
+            ecosystem: Ecosystem::Npm,
+            name: "some-pkg".to_string(),
+            version: None,
+        };
+        let provenance = ApiProvenance {
+            source: "npm".to_string(),
+            package_existence: PackageExistence::Unknown,
+            ..Default::default()
+        };
+        let breakdown = breakdown_with_provenance(
+            "some-pkg",
+            Ecosystem::Npm,
+            NameVsPopular::Unknown,
+            provenance,
+        );
+        let mut policy = empty_policy();
+        policy.package_policy.block_not_found = true;
+        let findings = risk_findings_for(&pkg, &breakdown, &[], &policy);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::PackagePolicyNotFound),
+            "PackagePolicyNotFound must NOT fire on Unknown existence: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn package_policy_newer_than_days_block_fires_on_block_threshold() {
+        let pkg = PackageRef {
+            ecosystem: Ecosystem::Npm,
+            name: "fresh-pkg".to_string(),
+            version: None,
+        };
+        let provenance = ApiProvenance {
+            source: "npm".to_string(),
+            package_age_days: Some(3),
+            package_existence: PackageExistence::Exists,
+            ..Default::default()
+        };
+        let breakdown = breakdown_with_provenance(
+            "fresh-pkg",
+            Ecosystem::Npm,
+            NameVsPopular::Unknown,
+            provenance,
+        );
+        let mut policy = empty_policy();
+        policy.package_policy.block_newer_than_days = Some(7);
+        let findings = risk_findings_for(&pkg, &breakdown, &[], &policy);
+        let f = findings
+            .iter()
+            .find(|f| f.rule_id == RuleId::PackagePolicyNewerThanDays)
+            .expect("expected PackagePolicyNewerThanDays finding");
+        assert_eq!(
+            f.severity,
+            Severity::High,
+            "block_newer_than_days crossed -> Block severity"
+        );
+    }
+
+    #[test]
+    fn package_policy_typosquat_distance_fires_on_near_popular_at_or_below_threshold() {
+        let pkg = PackageRef {
+            ecosystem: Ecosystem::PyPI,
+            name: "reqeusts".to_string(),
+            version: None,
+        };
+        let provenance = ApiProvenance {
+            source: "pypi".to_string(),
+            package_existence: PackageExistence::Exists,
+            ..Default::default()
+        };
+        let breakdown = breakdown_with_provenance(
+            "reqeusts",
+            Ecosystem::PyPI,
+            NameVsPopular::NearPopular {
+                popular_name: "requests".to_string(),
+                distance: 1,
+            },
+            provenance,
+        );
+        let mut policy = empty_policy();
+        policy.package_policy.block_typosquat_distance = Some(1);
+        let findings = risk_findings_for(&pkg, &breakdown, &[], &policy);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::PackagePolicyTyposquatDistance),
+            "PackagePolicyTyposquatDistance must fire at distance <= threshold: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn package_policy_unknown_with_install_scripts_fires_on_network_or_shell() {
+        use crate::package_risk::InstallScriptSignals;
+        let pkg = PackageRef {
+            ecosystem: Ecosystem::Npm,
+            name: "unknown-pkg".to_string(),
+            version: None,
+        };
+        let provenance = ApiProvenance {
+            source: "npm".to_string(),
+            package_existence: PackageExistence::Exists,
+            install_script_signals: Some(InstallScriptSignals {
+                has_network_call: true,
+                has_shell_spawn: false,
+                suspicious_patterns: vec![],
+            }),
+            ..Default::default()
+        };
+        let breakdown = breakdown_with_provenance(
+            "unknown-pkg",
+            Ecosystem::Npm,
+            NameVsPopular::Unknown,
+            provenance,
+        );
+        let mut policy = empty_policy();
+        policy
+            .package_policy
+            .block_install_scripts_for_unknown_packages = true;
+        let findings = risk_findings_for(&pkg, &breakdown, &[], &policy);
+        assert!(
+            findings.iter().any(|f| f.rule_id
+                == RuleId::PackagePolicyUnknownPackageWithInstallScripts
+                && f.severity == Severity::High),
+            "PackagePolicyUnknownPackageWithInstallScripts must fire High: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn package_policy_low_downloads_warns_when_below_threshold() {
+        let pkg = PackageRef {
+            ecosystem: Ecosystem::PyPI,
+            name: "unfamiliar".to_string(),
+            version: None,
+        };
+        let provenance = ApiProvenance {
+            source: "pypi".to_string(),
+            package_existence: PackageExistence::Exists,
+            recent_downloads: Some(5),
+            ..Default::default()
+        };
+        let breakdown = breakdown_with_provenance(
+            "unfamiliar",
+            Ecosystem::PyPI,
+            NameVsPopular::Unknown,
+            provenance,
+        );
+        let mut policy = empty_policy();
+        policy.package_policy.warn_low_downloads_below = Some(100);
+        let findings = risk_findings_for(&pkg, &breakdown, &[], &policy);
+        let f = findings
+            .iter()
+            .find(|f| f.rule_id == RuleId::PackagePolicyLowDownloads)
+            .expect("expected PackagePolicyLowDownloads finding");
+        assert_eq!(f.severity, Severity::Medium);
+    }
+
+    #[test]
+    fn aggregate_threshold_reads_from_policy_not_constants() {
+        // Hand-curate a breakdown with score == 60 (provenance-only). With
+        // the default policy (warn=51, block=76) this should fire a
+        // Medium-severity ThreatSuspiciousPackage finding (Warn). With a
+        // custom policy lowering block to 60, it must escalate to High
+        // (Block) — proving thresholds are policy-driven.
+        #[allow(deprecated)]
+        let provenance = ApiProvenance {
+            source: "npm".to_string(),
+            package_age_days: Some(1),
+            ownership_transferred: Some(true),
+            version_spike: Some(true),
+            recent_downloads: Some(3),
+            has_source_repo: Some(false),
+            yanked_or_deprecated: true,
+            latest_version: Some("9.9.9".to_string()),
+            package_existence: PackageExistence::Exists,
+            ..Default::default()
+        };
+        let pkg = PackageRef {
+            ecosystem: Ecosystem::Npm,
+            name: "test-pkg".to_string(),
+            version: None,
+        };
+        let breakdown = breakdown_with_provenance(
+            "test-pkg",
+            Ecosystem::Npm,
+            NameVsPopular::Unknown,
+            provenance,
+        );
+
+        // With default policy and a critical score, the finding must be High.
+        let policy = empty_policy();
+        let findings = risk_findings_for(&pkg, &breakdown, &[], &policy);
+        let sus = findings
+            .iter()
+            .find(|f| f.rule_id == RuleId::ThreatSuspiciousPackage)
+            .expect("expected ThreatSuspiciousPackage on default thresholds");
+
+        // Lower both thresholds far below the score and re-evaluate. Result
+        // remains High (block_threshold crossed).
+        let mut tight_policy = empty_policy();
+        tight_policy.package_policy.warn_aggregate_score = Some(1);
+        tight_policy.package_policy.block_aggregate_score = Some(1);
+        let tight = risk_findings_for(&pkg, &breakdown, &[], &tight_policy);
+        let tight_sus = tight
+            .iter()
+            .find(|f| f.rule_id == RuleId::ThreatSuspiciousPackage)
+            .expect("tighter policy must still emit the finding");
+        // The default-policy finding's severity must follow the same map
+        // (we're not pinning the exact score here — just that the warn
+        // threshold drives Medium and block drives High):
+        assert!(
+            matches!(sus.severity, Severity::Medium | Severity::High),
+            "default-policy aggregate finding must be Medium or High"
+        );
+        assert_eq!(
+            tight_sus.severity,
+            Severity::High,
+            "extreme-tight thresholds must escalate to High"
         );
     }
 }

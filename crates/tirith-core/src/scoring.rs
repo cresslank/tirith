@@ -195,7 +195,16 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::PackageOsvAdvisoryActive
         | RuleId::PackageDependencyConfusion
         | RuleId::PackageInstallScriptNetworkCall
-        | RuleId::PackageRepoMismatch => false,
+        | RuleId::PackageRepoMismatch
+        // M6 ch7 — package-policy gated rules. Same family as the ch6
+        // reputation signals: signal-driven, surfaced by install_txn /
+        // ecosystem_scan from policy thresholds, not from the local
+        // threat-DB.
+        | RuleId::PackagePolicyNewerThanDays
+        | RuleId::PackagePolicyLowDownloads
+        | RuleId::PackagePolicyTyposquatDistance
+        | RuleId::PackagePolicyUnknownPackageWithInstallScripts
+        | RuleId::PackagePolicyNotFound => false,
     }
 }
 

@@ -624,6 +624,12 @@ const ALL_RULE_IDS: &[&str] = &[
     "package_dependency_confusion",
     "package_install_script_network_call",
     "package_repo_mismatch",
+    // Package-policy gated rules (M6 ch7)
+    "package_policy_newer_than_days",
+    "package_policy_low_downloads",
+    "package_policy_typosquat_distance",
+    "package_policy_unknown_package_with_install_scripts",
+    "package_policy_not_found",
     // Rendered content
     "hidden_css_content",
     "hidden_color_content",
@@ -717,6 +723,17 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "package_dependency_confusion",
     "package_install_script_network_call",
     "package_repo_mismatch",
+    // M6 ch7 — policy-gated rules emitted by install_txn / ecosystem_scan
+    // paths, NOT by the engine. They require an `--online` registry-API
+    // signal AND a policy that crosses the configured threshold; static
+    // engine fixtures cannot drive both at once. Covered by ecosystem.toml
+    // rows that document the offline (no-fire) behavior plus dedicated unit
+    // tests in install_txn / ecosystem_scan.
+    "package_policy_newer_than_days",
+    "package_policy_low_downloads",
+    "package_policy_typosquat_distance",
+    "package_policy_unknown_package_with_install_scripts",
+    "package_policy_not_found",
 ];
 
 #[test]
@@ -866,6 +883,12 @@ fn test_rule_id_list_is_complete() {
         RuleId::PackageDependencyConfusion,
         RuleId::PackageInstallScriptNetworkCall,
         RuleId::PackageRepoMismatch,
+        // Package-policy gated rules (M6 ch7)
+        RuleId::PackagePolicyNewerThanDays,
+        RuleId::PackagePolicyLowDownloads,
+        RuleId::PackagePolicyTyposquatDistance,
+        RuleId::PackagePolicyUnknownPackageWithInstallScripts,
+        RuleId::PackagePolicyNotFound,
         RuleId::HiddenCssContent,
         RuleId::HiddenColorContent,
         RuleId::HiddenHtmlAttribute,

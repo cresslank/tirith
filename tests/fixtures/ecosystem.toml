@@ -648,3 +648,54 @@ input = "cargo install some-crate-name"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# ── M6 ch7 — package-policy gated rules (5 fixtures, one per new rule) ──
+#
+# Same shape as the ch6 reputation-signal fixtures: each policy-gated rule
+# is emitted by `install_txn` / `ecosystem_scan` only when (a) the
+# registry-API signal is present (requires `--online` or a snapshot row)
+# AND (b) policy carries a threshold that crosses it. The static engine
+# pipeline has neither, so a bare exec-context command that names the
+# relevant package does NOT spuriously fire the new rule. The rules are
+# listed in EXTERNALLY_TRIGGERED_RULES; their emission paths are unit-
+# tested directly in install_txn / ecosystem_scan.
+
+[[fixture]]
+name = "m6_ch7_package_policy_newer_than_days_static_path_does_not_fire"
+min_milestone = 6
+input = "npm install brand-new-package"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "m6_ch7_package_policy_low_downloads_static_path_does_not_fire"
+min_milestone = 6
+input = "pip install unfamiliar-package"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "m6_ch7_package_policy_typosquat_distance_static_path_does_not_fire"
+min_milestone = 6
+input = "npm install some-unique-package-here"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "m6_ch7_package_policy_unknown_with_install_scripts_static_path_does_not_fire"
+min_milestone = 6
+input = "npm install some-unknown-package-with-scripts"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "m6_ch7_package_policy_not_found_static_path_does_not_fire"
+min_milestone = 6
+input = "npm install nonexistent-package-xyz123"
+context = "exec"
+expected_action = "allow"
+expected_rules = []

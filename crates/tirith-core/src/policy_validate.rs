@@ -58,6 +58,7 @@ pub fn validate(yaml: &str) -> Vec<PolicyIssue> {
     validate_action_overrides(&policy, &mut issues);
     validate_escalation_rules(&policy, &mut issues);
     validate_agent_rules(&policy, &mut issues);
+    validate_package_policy(&policy, &mut issues);
 
     // Typo guard: flag fields that aren't part of the Policy schema.
     validate_unknown_fields(yaml, &mut issues);
@@ -174,6 +175,137 @@ fn validate_approval_rules(policy: &crate::policy::Policy, issues: &mut Vec<Poli
                     rule.fallback
                 ),
                 field: Some(format!("approval_rules[{i}].fallback")),
+            });
+        }
+    }
+}
+
+/// M6 ch7 — range checks for the `package_policy` section.
+fn validate_package_policy(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {
+    let pp = &policy.package_policy;
+
+    // CVSS must be in [0, 10]
+    if let Some(cvss) = pp.block_osv_min_cvss {
+        if !cvss.is_finite() || !(0.0..=10.0).contains(&cvss) {
+            issues.push(PolicyIssue {
+                level: IssueLevel::Error,
+                message: format!(
+                    "package_policy.block_osv_min_cvss: must be in [0.0, 10.0], got {cvss}"
+                ),
+                field: Some("package_policy.block_osv_min_cvss".into()),
+            });
+        }
+    }
+
+    // Day-based thresholds: must be > 0 to be meaningful (0 disables the
+    // signal in the same way `None` does, but is silently misleading)
+    if let Some(d) = pp.block_newer_than_days {
+        if d == 0 {
+            issues.push(PolicyIssue {
+                level: IssueLevel::Warning,
+                message: "package_policy.block_newer_than_days: 0 disables the block path; \
+                          omit the field instead for clarity"
+                    .into(),
+                field: Some("package_policy.block_newer_than_days".into()),
+            });
+        }
+    }
+    if let Some(d) = pp.warn_newer_than_days {
+        if d == 0 {
+            issues.push(PolicyIssue {
+                level: IssueLevel::Warning,
+                message: "package_policy.warn_newer_than_days: 0 disables the warn path; \
+                          omit the field instead for clarity"
+                    .into(),
+                field: Some("package_policy.warn_newer_than_days".into()),
+            });
+        }
+    }
+
+    // Block must not be greater than Warn — if both are set, Block requires
+    // a stricter (smaller) age window than Warn.
+    if let (Some(b), Some(w)) = (pp.block_newer_than_days, pp.warn_newer_than_days) {
+        if b > w {
+            issues.push(PolicyIssue {
+                level: IssueLevel::Error,
+                message: format!(
+                    "package_policy: block_newer_than_days ({b}) must be <= warn_newer_than_days ({w}); \
+                     a Block age window cannot be wider than the Warn window"
+                ),
+                field: Some("package_policy.block_newer_than_days".into()),
+            });
+        }
+    }
+
+    // Aggregate-score thresholds: must be 0..=100
+    if let Some(b) = pp.block_aggregate_score {
+        if b > 100 {
+            issues.push(PolicyIssue {
+                level: IssueLevel::Error,
+                message: format!(
+                    "package_policy.block_aggregate_score: must be in 0..=100, got {b}"
+                ),
+                field: Some("package_policy.block_aggregate_score".into()),
+            });
+        }
+    }
+    if let Some(w) = pp.warn_aggregate_score {
+        if w > 100 {
+            issues.push(PolicyIssue {
+                level: IssueLevel::Error,
+                message: format!(
+                    "package_policy.warn_aggregate_score: must be in 0..=100, got {w}"
+                ),
+                field: Some("package_policy.warn_aggregate_score".into()),
+            });
+        }
+    }
+    if let (Some(b), Some(w)) = (pp.block_aggregate_score, pp.warn_aggregate_score) {
+        if w > b {
+            issues.push(PolicyIssue {
+                level: IssueLevel::Error,
+                message: format!(
+                    "package_policy: warn_aggregate_score ({w}) must be <= block_aggregate_score ({b})"
+                ),
+                field: Some("package_policy.warn_aggregate_score".into()),
+            });
+        }
+    }
+
+    // Typosquat distance: 1..=10 is the practical range; anything else is
+    // either useless (0) or matches every package (>10).
+    if let Some(d) = pp.block_typosquat_distance {
+        if d == 0 {
+            issues.push(PolicyIssue {
+                level: IssueLevel::Warning,
+                message: "package_policy.block_typosquat_distance: 0 matches only exact \
+                          known-popular names; this is almost never what you want — omit \
+                          the field instead"
+                    .into(),
+                field: Some("package_policy.block_typosquat_distance".into()),
+            });
+        }
+        if d > 10 {
+            issues.push(PolicyIssue {
+                level: IssueLevel::Warning,
+                message: format!(
+                    "package_policy.block_typosquat_distance: {d} is very wide; \
+                     typical values are 1..=3"
+                ),
+                field: Some("package_policy.block_typosquat_distance".into()),
+            });
+        }
+    }
+
+    // Internal-package-names entries: name must be non-empty.
+    for (i, spec) in pp.internal_package_names.iter().enumerate() {
+        if spec.name.trim().is_empty() {
+            issues.push(PolicyIssue {
+                level: IssueLevel::Error,
+                message: format!(
+                    "package_policy.internal_package_names[{i}]: name must not be empty"
+                ),
+                field: Some(format!("package_policy.internal_package_names[{i}].name")),
             });
         }
     }
@@ -438,6 +570,7 @@ fn validate_agent_rules(policy: &crate::policy::Policy, issues: &mut Vec<PolicyI
 
 fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
     let known_top_level = [
+        "schema_version",
         "fail_mode",
         "allow_bypass_env",
         "allow_bypass_env_noninteractive",
@@ -464,7 +597,30 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
         "enforce_fail_mode",
         "threat_intel",
         "agent_rules",
+        // M6 ch7 — package-policy section
+        "package_policy",
     ];
+
+    // Known fields under package_policy (M6 ch7). A typo at this level is
+    // load-bearing — a misspelled `block_newr_than_days` silently disables
+    // the operator's intent — so flag unknown keys.
+    let known_package_policy_fields = [
+        "block_not_found",
+        "block_newer_than_days",
+        "warn_newer_than_days",
+        "warn_low_downloads_below",
+        "block_install_scripts_for_unknown_packages",
+        "block_typosquat_distance",
+        "block_aggregate_score",
+        "warn_aggregate_score",
+        "block_osv_min_cvss",
+        "block_repo_mismatch",
+        "warn_install_script_network_call",
+        "block_dependency_confusion",
+        "internal_package_names",
+        "repo_mismatch_check_max_packages",
+    ];
+    let known_internal_package_spec_fields = ["ecosystem", "name"];
 
     // Known fields for nested objects
     let known_scan_fields = [
@@ -554,6 +710,54 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
                                         message: format!("unknown field 'checkpoints.{sk}'"),
                                         field: Some(format!("checkpoints.{sk}")),
                                     });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if k == "package_policy" {
+                    if let serde_yaml::Value::Mapping(sub_map) = value {
+                        for (sub_key, sub_val) in sub_map {
+                            let serde_yaml::Value::String(sk) = sub_key else {
+                                continue;
+                            };
+                            if !known_package_policy_fields.contains(&sk.as_str()) {
+                                issues.push(PolicyIssue {
+                                    level: IssueLevel::Warning,
+                                    message: format!("unknown field 'package_policy.{sk}'"),
+                                    field: Some(format!("package_policy.{sk}")),
+                                });
+                                continue;
+                            }
+                            // Recurse into internal_package_names entries —
+                            // each is an `InternalPackageSpec { ecosystem, name }`
+                            // map. A typo silently drops the entry, so flag.
+                            if sk == "internal_package_names" {
+                                if let serde_yaml::Value::Sequence(seq) = sub_val {
+                                    for (i, item) in seq.iter().enumerate() {
+                                        let serde_yaml::Value::Mapping(spec) = item else {
+                                            continue;
+                                        };
+                                        for skey in spec.keys() {
+                                            let serde_yaml::Value::String(sk2) = skey else {
+                                                continue;
+                                            };
+                                            if !known_internal_package_spec_fields
+                                                .contains(&sk2.as_str())
+                                            {
+                                                issues.push(PolicyIssue {
+                                                    level: IssueLevel::Warning,
+                                                    message: format!(
+                                                        "unknown field 'package_policy.internal_package_names[{i}].{sk2}'"
+                                                    ),
+                                                    field: Some(format!(
+                                                        "package_policy.internal_package_names[{i}].{sk2}"
+                                                    )),
+                                                });
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

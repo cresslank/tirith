@@ -1125,7 +1125,14 @@ pub struct DependencyAssessment {
 /// that is *also* slopsquat-shaped), but in practice the strongest signal
 /// usually stands alone. Findings reuse the existing package-supply-chain
 /// [`RuleId`]s. An allowlisted dependency produces no findings.
-pub fn findings_for(assessment: &DependencyAssessment) -> Vec<Finding> {
+///
+/// M6 ch7 — `policy` carries the `package_policy` thresholds that drive the
+/// `PackagePolicy*` rule paths (newer-than-days, low downloads, etc.). Tests
+/// can pass `&Policy::default()` to keep the M6 ch6 baseline.
+pub fn findings_for(
+    assessment: &DependencyAssessment,
+    policy: &crate::policy::Policy,
+) -> Vec<Finding> {
     if assessment.allowlisted {
         return Vec::new();
     }
@@ -1264,16 +1271,19 @@ pub fn findings_for(assessment: &DependencyAssessment) -> Vec<Finding> {
     // factor breakdown is the explainable evidence; we name the contributing
     // factors so the operator knows *why* the score is what it is.
     //
-    // Mirrors the same shape that `install_txn::risk_findings_for` already
-    // uses for the install-time aggregate-score finding (constants
-    // `AGGREGATE_WARN_SCORE = 51` / `AGGREGATE_BLOCK_SCORE = 76`) — the
-    // ecosystem scan now closes the parallel gap.
+    // M6 ch7 — thresholds now read from `policy.package_policy.*_effective()`
+    // rather than hard-coded constants. Severity mapping: score >=
+    // block_score → High (the action mapping sends High to Block), warn
+    // ≤ score < block → Medium (Warn).
+    let warn_score = policy.package_policy.warn_aggregate_score_effective();
+    let block_score = policy.package_policy.block_aggregate_score_effective();
+    let score = assessment.risk.score;
     let risk_level = assessment.risk.risk_level;
-    if matches!(risk_level, "high" | "critical") {
-        let severity = if risk_level == "critical" {
-            Severity::Critical
-        } else {
+    if score >= warn_score {
+        let severity = if score >= block_score {
             Severity::High
+        } else {
+            Severity::Medium
         };
         // Name the *named* contributing factors, in display order, so the
         // description points at evidence the reader can verify by hand —
@@ -1327,6 +1337,257 @@ pub fn findings_for(assessment: &DependencyAssessment) -> Vec<Finding> {
     }
 
     findings
+}
+
+/// M6 ch7 — emit `PackagePolicy*` findings for a single dependency
+/// assessment. The signals are read directly from the `ApiProvenance` on
+/// the breakdown so the scan path's evidence matches the `install_txn`
+/// path's evidence.
+fn policy_findings_for_assessment(
+    assessment: &DependencyAssessment,
+    policy: &crate::policy::Policy,
+) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let dep = &assessment.dependency;
+    let manifest = &assessment.manifest;
+    let pp = &policy.package_policy;
+    let provenance: Option<&package_risk::ApiProvenance> = match &assessment.risk.api_signals {
+        package_risk::ApiSignals::Available { provenance } => Some(provenance),
+        _ => None,
+    };
+    let Some(prov) = provenance else {
+        return out;
+    };
+
+    // PackagePolicyNotFound — registry-confirmed 404 + block_not_found
+    if pp.block_not_found
+        && matches!(
+            prov.package_existence,
+            package_risk::PackageExistence::NotFound
+        )
+    {
+        out.push(Finding {
+            rule_id: RuleId::PackagePolicyNotFound,
+            severity: Severity::High,
+            title: format!(
+                "Package not found: {} '{}' (policy block_not_found)",
+                dep.ecosystem, dep.name
+            ),
+            description: format!(
+                "Dependency '{}' declared in {manifest} was not found in the {} registry \
+                 (HTTP 404). Policy `block_not_found: true` requires this to block.",
+                dep.name, dep.ecosystem,
+            ),
+            evidence: vec![Evidence::Text {
+                detail: format!(
+                    "manifest={manifest} package={} ecosystem={} existence=not_found",
+                    dep.name, dep.ecosystem
+                ),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+    }
+
+    // PackagePolicyNewerThanDays — package_age_days vs thresholds
+    if let Some(age_days) = prov.package_age_days {
+        let warn_d = pp.warn_newer_than_days;
+        let block_d = pp.block_newer_than_days;
+        let (fired, sev) = match (block_d, warn_d) {
+            (Some(b), _) if (age_days as u32) <= b => (true, Severity::High),
+            (_, Some(w)) if (age_days as u32) <= w => (true, Severity::Medium),
+            _ => (false, Severity::Medium),
+        };
+        if fired {
+            out.push(Finding {
+                rule_id: RuleId::PackagePolicyNewerThanDays,
+                severity: sev,
+                title: format!(
+                    "Dependency newer than policy threshold: {} '{}' ({} day{})",
+                    dep.ecosystem,
+                    dep.name,
+                    age_days,
+                    if age_days == 1 { "" } else { "s" },
+                ),
+                description: format!(
+                    "Dependency '{}' declared in {manifest} was first published {age_days} day(s) \
+                     ago — trips warn_newer_than_days={:?} / block_newer_than_days={:?}.",
+                    dep.name, warn_d, block_d,
+                ),
+                evidence: vec![Evidence::Text {
+                    detail: format!(
+                        "manifest={manifest} package={} ecosystem={} package_age_days={age_days} \
+                         warn_threshold={warn_d:?} block_threshold={block_d:?}",
+                        dep.name, dep.ecosystem,
+                    ),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+        }
+    }
+
+    // PackagePolicyLowDownloads
+    if let (Some(dl), Some(low)) = (prov.recent_downloads, pp.warn_low_downloads_below) {
+        if dl <= low as u64 {
+            out.push(Finding {
+                rule_id: RuleId::PackagePolicyLowDownloads,
+                severity: Severity::Medium,
+                title: format!(
+                    "Dependency has low recent downloads: {} '{}' ({})",
+                    dep.ecosystem, dep.name, dl,
+                ),
+                description: format!(
+                    "Dependency '{}' declared in {manifest} reports {dl} recent downloads, at or \
+                     below the policy threshold {low}.",
+                    dep.name,
+                ),
+                evidence: vec![Evidence::Text {
+                    detail: format!(
+                        "manifest={manifest} package={} ecosystem={} recent_downloads={dl} threshold={low}",
+                        dep.name, dep.ecosystem,
+                    ),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+        }
+    }
+
+    // PackagePolicyUnknownPackageWithInstallScripts
+    if pp.block_install_scripts_for_unknown_packages
+        && matches!(
+            assessment.risk.name_vs_popular,
+            package_risk::NameVsPopular::Unknown
+        )
+    {
+        if let Some(iss) = prov.install_script_signals.as_ref() {
+            if iss.has_network_call || iss.has_shell_spawn {
+                out.push(Finding {
+                    rule_id: RuleId::PackagePolicyUnknownPackageWithInstallScripts,
+                    severity: Severity::High,
+                    title: format!(
+                        "Unknown {} dependency ships install-time scripts: '{}'",
+                        dep.ecosystem, dep.name,
+                    ),
+                    description: format!(
+                        "Dependency '{}' declared in {manifest} is not a known-popular {} name and \
+                         its install scripts include a network call or shell spawn.",
+                        dep.name, dep.ecosystem,
+                    ),
+                    evidence: vec![Evidence::Text {
+                        detail: format!(
+                            "manifest={manifest} package={} ecosystem={} has_network_call={} has_shell_spawn={}",
+                            dep.name, dep.ecosystem, iss.has_network_call, iss.has_shell_spawn,
+                        ),
+                    }],
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                });
+            }
+        }
+    }
+
+    // M6 ch7 — emit a `PackageOsvAdvisoryActive` finding when the
+    // registry-API path surfaced OSV advisories. Severity is driven by
+    // `block_osv_min_cvss`: any advisory whose CVSS meets/exceeds the
+    // threshold elevates to High (Block); otherwise Medium (Warn).
+    if let Some(advs) = prov.osv_advisories.as_ref() {
+        if !advs.is_empty() {
+            let min_block_cvss = pp.block_osv_min_cvss_effective();
+            let max_cvss = advs.iter().filter_map(|a| a.cvss).fold(0.0_f32, f32::max);
+            let severity = if max_cvss >= min_block_cvss {
+                Severity::High
+            } else {
+                Severity::Medium
+            };
+            let ids: Vec<&str> = advs.iter().take(3).map(|a| a.id.as_str()).collect();
+            out.push(Finding {
+                rule_id: RuleId::PackageOsvAdvisoryActive,
+                severity,
+                title: format!(
+                    "Active OSV advisory for {} dependency: {} ({} advisory)",
+                    dep.ecosystem,
+                    dep.name,
+                    advs.len(),
+                ),
+                description: format!(
+                    "Dependency '{}' declared in {manifest} matches {} OSV advisory record(s): \
+                     {}. Highest CVSS in the set: {max_cvss}. Policy `block_osv_min_cvss = \
+                     {min_block_cvss}` — severity is {} when the highest CVSS meets/exceeds the \
+                     threshold.",
+                    dep.name,
+                    advs.len(),
+                    ids.join(", "),
+                    if matches!(severity, Severity::High) {
+                        "High"
+                    } else {
+                        "Medium"
+                    },
+                ),
+                evidence: vec![Evidence::Text {
+                    detail: format!(
+                        "manifest={manifest} package={} ecosystem={} max_cvss={max_cvss} \
+                         threshold={min_block_cvss} advisories={}",
+                        dep.name,
+                        dep.ecosystem,
+                        ids.join(","),
+                    ),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+        }
+    }
+
+    // PackagePolicyTyposquatDistance
+    if let Some(max_dist) = pp.block_typosquat_distance {
+        if let package_risk::NameVsPopular::NearPopular {
+            popular_name,
+            distance,
+        } = &assessment.risk.name_vs_popular
+        {
+            if (*distance as u32) <= max_dist {
+                out.push(Finding {
+                    rule_id: RuleId::PackagePolicyTyposquatDistance,
+                    severity: Severity::High,
+                    title: format!(
+                        "Typosquat distance below policy threshold: {} '{}' ≈ '{}'",
+                        dep.ecosystem, dep.name, popular_name,
+                    ),
+                    description: format!(
+                        "Dependency '{}' declared in {manifest} is edit-distance {distance} from \
+                         the popular {} package '{popular_name}', at or below the policy \
+                         threshold {max_dist}.",
+                        dep.name, dep.ecosystem,
+                    ),
+                    evidence: vec![Evidence::Text {
+                        detail: format!(
+                            "manifest={manifest} package={} ecosystem={} similar_to={popular_name} \
+                             distance={distance} threshold={max_dist}",
+                            dep.name, dep.ecosystem,
+                        ),
+                    }],
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                });
+            }
+        }
+    }
+
+    out
 }
 
 // ===========================================================================
@@ -1446,6 +1707,12 @@ pub struct ScanRequest<'a> {
     /// [`ScanMode::Installed`]. `0` means unbounded (the CLI surfaces this
     /// behind a confirmation prompt). Ignored for the other modes.
     pub installed_max_entries: usize,
+    /// M6 ch7 — the active policy, plumbed through so the scan emits the
+    /// `PackagePolicy*` rule paths (newer-than-days, low downloads,
+    /// typosquat-distance, unknown-with-install-scripts, not-found) and
+    /// uses the configurable aggregate-score thresholds. `None` keeps the
+    /// shipping baseline (matches a `Policy::default()`).
+    pub policy: Option<&'a crate::policy::Policy>,
 }
 
 /// Run an `ecosystem scan` over `request.root` and return the full report.
@@ -1554,9 +1821,17 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
     }
 
     // Assemble the verdict: every finding from every assessment.
+    let default_policy = crate::policy::Policy::default();
+    let effective_policy = request.policy.unwrap_or(&default_policy);
     let mut findings: Vec<Finding> = Vec::new();
     for assessment in &assessments {
-        findings.extend(findings_for(assessment));
+        findings.extend(findings_for(assessment, effective_policy));
+        // M6 ch7 — policy-driven per-dependency rules (newer-than-days,
+        // low downloads, not-found, etc.). Allowlisted assessments
+        // suppress these too, matching `findings_for`'s behavior.
+        if !assessment.allowlisted {
+            findings.extend(policy_findings_for_assessment(assessment, effective_policy));
+        }
     }
     // tier_reached is 3 — `ecosystem scan` does the full analysis (it is not a
     // tier-gated hot-path command).
@@ -2767,8 +3042,9 @@ gem 'toplevelgem'
             SlopsquatAssessment::clear(),
             /* allowlisted = */ true,
         );
+        let policy = crate::policy::Policy::default();
         assert!(
-            findings_for(&a).is_empty(),
+            findings_for(&a, &policy).is_empty(),
             "an allowlisted dependency must yield no findings"
         );
     }
@@ -2785,7 +3061,8 @@ gem 'toplevelgem'
             SlopsquatAssessment::clear(),
             false,
         );
-        let findings = findings_for(&a);
+        let policy = crate::policy::Policy::default();
+        let findings = findings_for(&a, &policy);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, RuleId::ThreatPackageTyposquat);
         assert_eq!(findings[0].severity, Severity::High);
@@ -2804,7 +3081,8 @@ gem 'toplevelgem'
             slop,
             false,
         );
-        let findings = findings_for(&a);
+        let policy = crate::policy::Policy::default();
+        let findings = findings_for(&a, &policy);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, RuleId::ThreatSuspiciousPackage);
         assert_eq!(findings[0].severity, Severity::Medium);
@@ -2823,7 +3101,8 @@ gem 'toplevelgem'
             SlopsquatAssessment::clear(),
             false,
         );
-        let findings = findings_for(&a);
+        let policy = crate::policy::Policy::default();
+        let findings = findings_for(&a, &policy);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, RuleId::ThreatPackageSimilarName);
     }
@@ -2837,7 +3116,8 @@ gem 'toplevelgem'
             SlopsquatAssessment::clear(),
             false,
         );
-        assert!(findings_for(&a).is_empty());
+        let policy = crate::policy::Policy::default();
+        assert!(findings_for(&a, &policy).is_empty());
     }
 
     #[test]
@@ -2895,7 +3175,8 @@ gem 'toplevelgem'
             slopsquat: SlopsquatAssessment::clear(),
             allowlisted: false,
         };
-        let findings = findings_for(&assessment);
+        let policy = crate::policy::Policy::default();
+        let findings = findings_for(&assessment, &policy);
         assert!(
             !findings.is_empty(),
             "provenance-only High/Critical risk MUST emit a finding"
@@ -2907,11 +3188,15 @@ gem 'toplevelgem'
             "expected a ThreatSuspiciousPackage finding, got {:?}",
             findings.iter().map(|f| f.rule_id).collect::<Vec<_>>(),
         );
+        // M6 ch7: severity is High when score >= block_aggregate_score (76)
+        // and Medium when warn_aggregate_score <= score < block_aggregate_score
+        // (51..76). Both fire — the test only pins that *something* fires.
         assert!(
-            findings
-                .iter()
-                .any(|f| matches!(f.severity, Severity::High | Severity::Critical)),
-            "provenance-only finding must be High or Critical, got {:?}",
+            findings.iter().any(|f| matches!(
+                f.severity,
+                Severity::Medium | Severity::High | Severity::Critical
+            )),
+            "provenance-only finding must be Medium+, got {:?}",
             findings.iter().map(|f| f.severity).collect::<Vec<_>>(),
         );
     }
@@ -2952,8 +3237,9 @@ gem 'toplevelgem'
             slopsquat: SlopsquatAssessment::clear(),
             allowlisted: false,
         };
+        let policy = crate::policy::Policy::default();
         assert!(
-            findings_for(&assessment).is_empty(),
+            findings_for(&assessment, &policy).is_empty(),
             "Low/Medium provenance-only score with no name-shape signal must \
              not emit a finding"
         );
@@ -2983,6 +3269,7 @@ gem 'toplevelgem'
             is_allowlisted: &never_allowlisted,
             mode: ScanMode::Manifests,
             installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
         };
         let report = scan(&request);
         assert_eq!(report.manifests.len(), 2, "both manifests discovered");
@@ -3035,6 +3322,7 @@ gem 'toplevelgem'
             is_allowlisted: &never_allowlisted,
             mode: ScanMode::Manifests,
             installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
         };
         let report = scan(&request);
         assert_eq!(report.dependency_count, 0);
@@ -3064,6 +3352,7 @@ gem 'toplevelgem'
             is_allowlisted: &allow_all,
             mode: ScanMode::Manifests,
             installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
         };
         let report = scan(&request);
         assert_eq!(report.allowlisted_count(), 1);
@@ -3102,6 +3391,7 @@ gem 'toplevelgem'
             is_allowlisted: &never_allowlisted,
             mode: ScanMode::Manifests,
             installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
         };
         let report = scan(&request);
         assert!(report.online);
@@ -3156,6 +3446,7 @@ gem 'toplevelgem'
             is_allowlisted: &never_allow,
             mode: ScanMode::Installed,
             installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
         };
         let report = scan(&request);
         assert_eq!(report.mode, "installed");
@@ -3195,6 +3486,7 @@ gem 'toplevelgem'
             is_allowlisted: &never_allow,
             mode: ScanMode::Installed,
             installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
         };
         let report = scan(&request);
         assert_eq!(report.mode, "installed");
@@ -3234,6 +3526,7 @@ gem 'toplevelgem'
             is_allowlisted: &never_allow,
             mode: ScanMode::SpecificLockfile(lockfile.clone()),
             installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
         };
         let report = scan(&request);
         assert_eq!(report.mode, "specific_lockfile");
@@ -3267,6 +3560,7 @@ gem 'toplevelgem'
             is_allowlisted: &never_allow,
             mode: ScanMode::SpecificLockfile(lockfile.clone()),
             installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
         };
         let report = scan(&request);
         assert_eq!(report.mode, "specific_lockfile");
@@ -3303,6 +3597,7 @@ gem 'toplevelgem'
             // The MIN_INSTALLED_ENTRIES check lives at the CLI; the engine
             // accepts any non-zero cap.
             installed_max_entries: 2,
+            policy: None,
         };
         let report = scan(&request);
         assert_eq!(
@@ -3339,6 +3634,7 @@ gem 'toplevelgem'
             is_allowlisted: &never_allow,
             mode: ScanMode::Installed,
             installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
         };
         let report = scan(&request);
         assert_eq!(report.dependency_count, 1);
@@ -3372,6 +3668,7 @@ version = "1.0.61"
             is_allowlisted: &never_allow,
             mode: ScanMode::Installed,
             installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
         };
         let report = scan(&request);
         assert_eq!(
@@ -3400,6 +3697,7 @@ version = "1.0.61"
             is_allowlisted: &never_allow,
             mode: ScanMode::SpecificLockfile(bogus.clone()),
             installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
         };
         let report = scan(&request);
         assert_eq!(report.mode, "specific_lockfile");

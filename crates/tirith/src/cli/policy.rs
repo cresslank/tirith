@@ -187,6 +187,26 @@ scan:
 #   allow:
 #     - kind: agent
 #       name: claude-code
+
+# Package-policy section — M6 ch7. Thresholds and actions for the
+# package-reputation signals (newer-than-days, low downloads, OSV CVSS,
+# typosquat distance, repo-mismatch cap). Defaults preserve the M6 ch6
+# behavior; uncomment a knob to tighten one signal.
+# package_policy:
+#   block_not_found: false                    # block on registry HTTP 404 (--online only)
+#   block_newer_than_days:                    # block when first publication is <= N days
+#   warn_newer_than_days:                     # warn when first publication is <= N days
+#   warn_low_downloads_below:                 # warn when recent_downloads <= N
+#   block_install_scripts_for_unknown_packages: false   # block Unknown + script signal
+#   block_typosquat_distance:                 # block when edit-distance to popular <= N
+#   block_aggregate_score: 76                 # baseline; lower to tighten
+#   warn_aggregate_score: 51                  # baseline; lower to surface earlier
+#   block_osv_min_cvss: 7.0                   # any OSV >= this CVSS escalates to Block
+#   block_repo_mismatch: false                # elevate `package_repo_mismatch` to Block
+#   warn_install_script_network_call: true    # disable to silence install-script signal
+#   block_dependency_confusion: true          # disable to demote dep-confusion to Warn
+#   internal_package_names: []                # [{ ecosystem: npm, name: "@my-co/*" }]
+#   repo_mismatch_check_max_packages: 50      # cap on packages checked under --online
 "#;
 
 /// `ci-strict` — locked-down settings for an automated CI environment.
@@ -266,6 +286,25 @@ scan:
 #   allow:
 #     - kind: ci
 #       name: github-actions
+
+# Package-policy section — M6 ch7. CI baseline tightens several knobs:
+# strict environments typically want the block-on-not-found / install-script
+# / aggregate-score elevations on by default. Uncomment to opt in.
+# package_policy:
+#   block_not_found: true                     # block on registry HTTP 404 (--online only)
+#   block_newer_than_days: 3                  # CI rejects brand-new packages
+#   warn_newer_than_days: 14
+#   warn_low_downloads_below: 100
+#   block_install_scripts_for_unknown_packages: true
+#   block_typosquat_distance: 1
+#   block_aggregate_score: 76
+#   warn_aggregate_score: 51
+#   block_osv_min_cvss: 7.0
+#   block_repo_mismatch: true
+#   warn_install_script_network_call: true
+#   block_dependency_confusion: true
+#   internal_package_names: []
+#   repo_mismatch_check_max_packages: 50
 "#;
 
 /// `ai-agent-heavy` — tuned for environments where AI agents run many
@@ -371,6 +410,26 @@ scan:
 #   deny:
 #     - kind: agent
 #       name: untrusted-agent
+
+# Package-policy section — M6 ch7. AI-agent environments benefit from
+# tight package-reputation gates: agents are most likely to hallucinate
+# package names that don't exist, or to grab brand-new packages without
+# vetting. Recommended thresholds below.
+# package_policy:
+#   block_not_found: true
+#   block_newer_than_days: 7
+#   warn_newer_than_days: 30
+#   warn_low_downloads_below: 1000
+#   block_install_scripts_for_unknown_packages: true
+#   block_typosquat_distance: 2
+#   block_aggregate_score: 76
+#   warn_aggregate_score: 51
+#   block_osv_min_cvss: 7.0
+#   block_repo_mismatch: true
+#   warn_install_script_network_call: true
+#   block_dependency_confusion: true
+#   internal_package_names: []                # [{ ecosystem: npm, name: "@my-co/*" }]
+#   repo_mismatch_check_max_packages: 50
 "#;
 
 /// A curated starter policy selected via `tirith policy init --template`.

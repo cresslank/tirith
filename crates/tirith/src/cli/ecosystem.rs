@@ -207,6 +207,7 @@ pub fn scan(
         is_allowlisted: &is_allowlisted,
         mode: mode.clone(),
         installed_max_entries: max_installed_entries,
+        policy: Some(&policy),
     };
     let mut report = ecosystem_scan::scan(&request);
 
