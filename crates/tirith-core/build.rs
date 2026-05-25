@@ -659,6 +659,20 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Cloud / k8s CLIs for production-context destructive-command detection (M8 ch1)",
     },
     PatternEntry {
+        id: "ssh_cmd",
+        // M8 ch2 — `ssh` invocations whose target host is labeled
+        // production / critical. The PATTERN_TABLE entry is a coarse
+        // tier-1 probe; the precise destructive-verb + host-label match
+        // lives in `rules::ssh_context::check`.
+        //
+        // Word boundary (`\b`) keeps `sshd`, `sshpass`, and the suffix
+        // `_ssh` (e.g. `git_ssh`) out of the tier-1 hit list; only the
+        // standalone `ssh` token matches.
+        tier1_exec_fragments: &[r"\bssh\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "SSH invocations for remote-session destructive-command detection (M8 ch2)",
+    },
+    PatternEntry {
         id: "prompt_injection_seed",
         // M7 ch5 — paste-only fast gate for the prompt-injection rule.
         //
@@ -1018,6 +1032,15 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     (
         "context_prod_credential_change",
         "ContextProdCredentialChange",
+    ),
+    // SSH operational-context rules (M8 ch2).
+    (
+        "ssh_remote_destructive_on_labeled_host",
+        "SshRemoteDestructiveOnLabeledHost",
+    ),
+    (
+        "ssh_remote_shell_on_labeled_host",
+        "SshRemoteShellOnLabeledHost",
     ),
 ];
 

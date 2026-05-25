@@ -223,7 +223,12 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         // driven.
         | RuleId::ContextProdDestructiveCommand
         | RuleId::ContextProdWriteOperation
-        | RuleId::ContextProdCredentialChange => false,
+        | RuleId::ContextProdCredentialChange
+        // M8 ch2 — SSH operational-context rules. Same character as the
+        // M8 ch1 context rules — heuristic on parsed args + operator
+        // labels, no threat-DB involvement.
+        | RuleId::SshRemoteDestructiveOnLabeledHost
+        | RuleId::SshRemoteShellOnLabeledHost => false,
     }
 }
 

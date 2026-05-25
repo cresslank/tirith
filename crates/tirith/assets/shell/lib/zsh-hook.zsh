@@ -20,6 +20,18 @@ if [[ -z "${TIRITH_SESSION_ID:-}" ]]; then
   export TIRITH_SESSION_ID
 fi
 
+# M8 ch2 — surface "this shell is on the remote side of an SSH session" to
+# `tirith prompt-status` (planned for M8 ch6) and any other downstream
+# consumer. Set NOW so chunk 6 can read it without a follow-up hook patch.
+# Standard SSH env vars: SSH_CONNECTION, SSH_CLIENT, SSH_TTY. Setting at
+# every hook source is idempotent — if the parent already exported it
+# (e.g. a nested sub-shell on the remote side), we keep the parent value.
+if [[ -z "${TIRITH_SSH_REMOTE:-}" ]] \
+   && { [[ -n "${SSH_CONNECTION:-}" ]] || [[ -n "${SSH_CLIENT:-}" ]] || [[ -n "${SSH_TTY:-}" ]]; }; then
+  TIRITH_SSH_REMOTE=1
+  export TIRITH_SSH_REMOTE
+fi
+
 # Output helper: write to stderr by default.
 # Override via TIRITH_OUTPUT=tty to write to /dev/tty instead.
 _tirith_output() {

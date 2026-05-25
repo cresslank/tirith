@@ -762,6 +762,9 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     // M8 ch1 — context-labels file (NOT policy.yaml). Reads the
     // user-scope file and the repo-scope file and merges.
     policy.load_context_labels(ctx.cwd.as_deref());
+    // M8 ch2 — SSH host-labels file (NOT policy.yaml). Same dual-scope
+    // resolution as context-labels.
+    policy.load_ssh_host_labels(ctx.cwd.as_deref());
 
     // Fail-open: None when the DB is unavailable.
     let threat_db: Option<std::sync::Arc<crate::threatdb::ThreatDb>> =
@@ -1000,6 +1003,11 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         if ctx.scan_context == ScanContext::Exec {
             let context_findings = crate::rules::context::check(&ctx.input, ctx.shell, &policy);
             findings.extend(context_findings);
+
+            // M8 ch2 — SSH operational-context rules. Empty-labels fast
+            // path lives inside `ssh_context::check`; no extra gate here.
+            let ssh_findings = crate::rules::ssh_context::check(&ctx.input, ctx.shell, &policy);
+            findings.extend(ssh_findings);
         }
 
         let cred_findings =

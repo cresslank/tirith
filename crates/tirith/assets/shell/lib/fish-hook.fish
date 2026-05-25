@@ -17,6 +17,19 @@ if not set -q TIRITH_SESSION_ID
     set -gx TIRITH_SESSION_ID (printf '%x-%x' %self (date +%s))
 end
 
+# M8 ch2 — surface "this shell is on the remote side of an SSH session" to
+# `tirith prompt-status` (planned for M8 ch6) and any other downstream
+# consumer. Set NOW so chunk 6 can read it without a follow-up hook patch.
+# Standard SSH env vars: SSH_CONNECTION, SSH_CLIENT, SSH_TTY.
+if not set -q TIRITH_SSH_REMOTE
+    and begin
+        set -q SSH_CONNECTION
+        or set -q SSH_CLIENT
+        or set -q SSH_TTY
+    end
+    set -gx TIRITH_SSH_REMOTE 1
+end
+
 # Output helper: write to stderr by default.
 # Override via TIRITH_OUTPUT=tty to write to /dev/tty instead.
 function _tirith_output

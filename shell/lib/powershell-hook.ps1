@@ -20,6 +20,15 @@ if (-not $env:TIRITH_SESSION_ID) {
     $env:TIRITH_SESSION_ID = '{0:x}-{1:x}' -f $PID, [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 }
 
+# M8 ch2 — surface "this shell is on the remote side of an SSH session" to
+# `tirith prompt-status` (planned for M8 ch6) and any other downstream
+# consumer. Set NOW so chunk 6 can read it without a follow-up hook patch.
+# Standard SSH env vars: SSH_CONNECTION, SSH_CLIENT, SSH_TTY. PowerShell on
+# Windows rarely sees these but PowerShell 7+ via OpenSSH does.
+if ((-not $env:TIRITH_SSH_REMOTE) -and ($env:SSH_CONNECTION -or $env:SSH_CLIENT -or $env:SSH_TTY)) {
+    $env:TIRITH_SSH_REMOTE = '1'
+}
+
 # Interactivity gate: the hook only intercepts commands typed at a prompt and
 # pasted text, so it must be a complete no-op in a non-interactive PowerShell
 # (`pwsh -c …`, `pwsh -File …`, a CI step). `[Environment]::UserInteractive`

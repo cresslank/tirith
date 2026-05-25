@@ -154,7 +154,7 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VerbCategory {
+pub enum VerbCategory {
     Destructive,
     CredentialChange,
     Write,
@@ -163,7 +163,7 @@ enum VerbCategory {
 }
 
 impl VerbCategory {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Destructive => "destructive",
             Self::CredentialChange => "credential_change",
@@ -171,6 +171,101 @@ impl VerbCategory {
             Self::ReadOnly => "read_only",
             Self::Unknown => "unknown",
         }
+    }
+
+    /// `true` when the category should drive a finding (Destructive,
+    /// Write, or CredentialChange). Read-only / Unknown do not fire.
+    pub fn is_actionable(self) -> bool {
+        matches!(
+            self,
+            Self::Destructive | Self::CredentialChange | Self::Write
+        )
+    }
+}
+
+impl std::fmt::Display for VerbCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Classify an SSH inner-command string (the body of `ssh host '<body>'`).
+///
+/// This is the classifier the `rules::ssh_context` module uses to decide
+/// whether a destructive verb is being run on a labeled-prod remote host.
+/// It tokenizes `inner` via the supplied shell (POSIX is the default for
+/// remote shells), steps past one level of `sudo` / `doas`, and then maps
+/// the leader to a [`VerbCategory`] using the same heuristics as the
+/// cloud-CLI path (with a small extra surface for general-purpose
+/// destructive shell verbs like `systemctl stop`, `rm -rf`, `dd`).
+pub fn classify_inner_command_for_ssh(inner: &str, shell: ShellType) -> VerbCategory {
+    let segments = tokenize::tokenize(inner, shell);
+    let Some(seg) = segments.first() else {
+        return VerbCategory::Unknown;
+    };
+    let Some(cmd) = seg.command.as_deref() else {
+        return VerbCategory::Unknown;
+    };
+    let (leader, args) = resolve_leader_and_args(cmd, seg.args.as_slice(), shell);
+
+    let positional: Vec<&str> = args
+        .iter()
+        .map(|a| a.trim_matches(|c: char| c == '"' || c == '\''))
+        .filter(|a| !a.starts_with('-') && !a.contains('='))
+        .collect();
+    let first = positional.first().copied().unwrap_or("");
+
+    // Cloud-CLI path first (kubectl / aws / helm / etc.) — re-use the
+    // existing per-provider classifier so a remote `kubectl delete ns` is
+    // still recognized as Destructive.
+    if let Some(provider) = crate::context_detect::Provider::from_leader(&leader) {
+        return classify(provider, &args, &[]);
+    }
+
+    // General-purpose remote-shell verbs. SSH inner commands routinely
+    // wrap a `sudo systemctl …` or `rm -rf …`. We DON'T need a giant
+    // table — only the highest-signal verbs. Read-only commands explicitly
+    // map to ReadOnly so a `ssh prod-host 'ls'` does NOT fire.
+    let leader_lc = leader.to_lowercase();
+    match leader_lc.as_str() {
+        // Destructive — irreversible or service-level outage.
+        "rm" => {
+            // Bare `rm foo` is much lower-signal than `rm -rf`. We pick up
+            // BOTH (an `rm -rf` on prod is a paste-tear; `rm` alone is
+            // still "you didn't intend to do this on prod"), but flag
+            // `-rf` / `-fr` / `--recursive` / `--force` as Destructive.
+            VerbCategory::Destructive
+        }
+        "dd" | "mkfs" | "shred" | "wipefs" | "fdisk" | "parted" | "blkdiscard" => {
+            VerbCategory::Destructive
+        }
+        "systemctl" => match first {
+            "stop" | "restart" | "disable" | "mask" | "kill" | "reload-or-restart" => {
+                VerbCategory::Destructive
+            }
+            "start" | "enable" | "unmask" | "reload" => VerbCategory::Write,
+            "status" | "is-active" | "is-enabled" | "list-units" | "show" | "cat" => {
+                VerbCategory::ReadOnly
+            }
+            _ => VerbCategory::Unknown,
+        },
+        "service" => match first {
+            "stop" | "restart" | "force-reload" => VerbCategory::Destructive,
+            "start" | "reload" => VerbCategory::Write,
+            "status" => VerbCategory::ReadOnly,
+            _ => VerbCategory::Unknown,
+        },
+        "shutdown" | "poweroff" | "reboot" | "halt" | "init" => VerbCategory::Destructive,
+        "iptables" | "nft" | "nftables" => VerbCategory::Write,
+        // Credential-change shell verbs.
+        "passwd" | "chpasswd" | "useradd" | "userdel" | "usermod" | "groupadd" | "groupdel"
+        | "groupmod" | "visudo" => VerbCategory::CredentialChange,
+        // Read-only shell verbs.
+        "ls" | "cat" | "less" | "more" | "head" | "tail" | "stat" | "find" | "grep" | "ps"
+        | "top" | "df" | "du" | "uname" | "hostname" | "whoami" | "id" | "uptime" => {
+            VerbCategory::ReadOnly
+        }
+        _ => VerbCategory::Unknown,
     }
 }
 

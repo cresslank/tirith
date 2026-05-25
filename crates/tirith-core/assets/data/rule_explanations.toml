@@ -1691,3 +1691,28 @@ examples_good = ["aws iam list-access-keys", "gcloud iam service-accounts list",
 false_positive_guidance = "Read-only IAM commands (list/get/show) never fire. If your workflow requires interactive IAM mutations on a labeled-prod context, demote via `severity_overrides` for the specific rule on a CI runner, or re-label the context with `tirith context label`."
 remediation = "Route credential mutations through your change-management workflow (Terraform / Pulumi / a vetted runbook) rather than an interactive shell."
 mitre_id = "T1098"
+
+# M8 ch2 — SSH operational-context rules.
+
+[[rule]]
+id = "ssh_remote_destructive_on_labeled_host"
+title = "Destructive remote command against labeled SSH host"
+category = "context"
+severity_rationale = "High — `ssh prod-host '<destructive>'` slips past tirith's local enter / paste interception because the inner command runs on the remote shell. Operators sometimes wrap a destructive verb in an SSH call exactly to bypass local guards (knowingly or not). High severity matches the cloud-CLI destructive-command rule."
+description = "An `ssh host '<cmd>'` invocation targets a host listed in the SSH host-labels file with criticality `critical` / `production` / `prod` / `live` / `p0` / `p1`, and the inner command's verb is destructive (e.g. `sudo systemctl restart`, `rm -rf`, `dd`), a write mutation (`systemctl reload`, `iptables`), or a credential change (`passwd`, `useradd`)."
+examples_bad = ["ssh payments-prod-01 'sudo systemctl restart payments'", "ssh root@payments-prod-01 'sudo rm -rf /var/log/foo'", "ssh -t prod-host 'sudo useradd alice'"]
+examples_good = ["ssh payments-prod-01 'systemctl status payments'", "ssh payments-prod-01 'ls /var/log'", "ssh payments-prod-01 'cat /etc/hostname'"]
+false_positive_guidance = "If a labeled host is a routine deploy target, demote via `severity_overrides` or re-label the host with a non-critical criticality (`staging`, `dev`, `test`). Read-only commands (`ls`, `cat`, `systemctl status`) never fire."
+remediation = "Confirm the host's label with `tirith ssh label <host> <criticality>` before re-running. If the destruction is intentional, type the literal host name when the shell hook prompts to acknowledge the production-host risk."
+mitre_id = "T1485"
+
+[[rule]]
+id = "ssh_remote_shell_on_labeled_host"
+title = "Opening unprotected remote shell on labeled SSH host"
+category = "context"
+severity_rationale = "Info — connecting to a labeled-prod host with no inner command (`ssh prod-host`) is a benign operation. The Info finding surfaces the fact that tirith protects the LOCAL shell only — commands typed on the remote side after the SSH handshake are not intercepted unless the operator has run `tirith ssh bootstrap user@host` (planned for M8.1) to install the hook there."
+description = "A bare `ssh host` (no inner command) was issued against a host whose label is `critical` / `production` / `prod` / `live` / `p0` / `p1`. The finding is a reminder, not a block."
+examples_bad = []
+examples_good = ["ssh payments-prod-01"]
+false_positive_guidance = "If this Info finding is too noisy, set `severity_overrides: { ssh_remote_shell_on_labeled_host: info }` to keep the recording but silence the prompt-status indicator."
+remediation = "Plan a remote-side tirith install once `tirith ssh bootstrap` ships (M8.1). Until then, treat the post-handshake session as unprotected."

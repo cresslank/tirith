@@ -20,6 +20,18 @@
 if (($nu.is-interactive) and (not ('_TIRITH_NU_LOADED' in $env))) {
     $env._TIRITH_NU_LOADED = true
 
+    # M8 ch2 — surface "this shell is on the remote side of an SSH session"
+    # to `tirith prompt-status` (planned for M8 ch6) and any other
+    # downstream consumer. Set NOW so chunk 6 can read it without a
+    # follow-up hook patch. Nushell's `$env` is auto-exported to externals,
+    # which is exactly what we want here: a child `tirith` invocation
+    # should see TIRITH_SSH_REMOTE.
+    if (not ('TIRITH_SSH_REMOTE' in $env)) and (
+        ('SSH_CONNECTION' in $env) or ('SSH_CLIENT' in $env) or ('SSH_TTY' in $env)
+    ) {
+        $env.TIRITH_SSH_REMOTE = "1"
+    }
+
     # Defensively initialize pre_execution if absent/null (fresh configs may lack it)
     let existing = ($env.config.hooks.pre_execution? | default [])
 

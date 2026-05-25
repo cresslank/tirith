@@ -672,6 +672,9 @@ const ALL_RULE_IDS: &[&str] = &[
     "context_prod_destructive_command",
     "context_prod_write_operation",
     "context_prod_credential_change",
+    // SSH operational-context rules (M8 ch2)
+    "ssh_remote_destructive_on_labeled_host",
+    "ssh_remote_shell_on_labeled_host",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -789,6 +792,14 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "context_prod_destructive_command",
     "context_prod_write_operation",
     "context_prod_credential_change",
+    // M8 ch2 — SSH operational-context rules. Same shape as the M8 ch1
+    // context rules: they require an operator-supplied SSH host-labels
+    // file, which the static fixture runner does not seed. Block and
+    // Info paths are covered by per-rule unit tests in
+    // `rules/ssh_context.rs` plus integration tests below that inject a
+    // temp labels file via `TIRITH_POLICY_ROOT` + a fake `.git` boundary.
+    "ssh_remote_destructive_on_labeled_host",
+    "ssh_remote_shell_on_labeled_host",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1084,6 +1095,9 @@ fn test_rule_id_list_is_complete() {
         RuleId::ContextProdDestructiveCommand,
         RuleId::ContextProdWriteOperation,
         RuleId::ContextProdCredentialChange,
+        // SSH operational-context rules (M8 ch2)
+        RuleId::SshRemoteDestructiveOnLabeledHost,
+        RuleId::SshRemoteShellOnLabeledHost,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();
@@ -1740,6 +1754,187 @@ fn context_rule_allows_kubectl_get_in_labeled_prod() {
         context_findings.is_empty(),
         "read-only kubectl get must NOT fire any context rule; got: {:?}",
         context_findings
+            .iter()
+            .map(|f| f.rule_id.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M8 ch2 — SSH context-rule integration tests.
+//
+// Mirror of the M8 ch1 context-rule tests above: seed a temp
+// `.tirith/ssh-host-labels.yaml` under a fake `.git` boundary so the
+// engine's `policy.load_ssh_host_labels` picks it up; run the engine on
+// real `ssh …` commands; assert the rule fires (block) for destructive
+// inner commands and emits an Info finding (action stays Allow because
+// Info maps to Allow) for the bare-ssh case.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ssh_rule_blocks_destructive_on_labeled_host() {
+    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    let tirith_dir = dir.path().join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    // SSH host-labels file with payments-prod-01 = critical.
+    fs::write(
+        tirith_dir.join("ssh-host-labels.yaml"),
+        "payments-prod-01: critical\n",
+    )
+    .unwrap();
+
+    // SAFETY: serialized via CONTEXT_TEST_LOCK. We set the policy-root env
+    // var so the engine's discovery walks into our temp dir's `.tirith/`.
+    unsafe {
+        std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
+    }
+
+    let ctx = AnalysisContext {
+        input: "ssh payments-prod-01 'sudo systemctl restart payments'".to_string(),
+        shell: ShellType::Posix,
+        scan_context: ScanContext::Exec,
+        raw_bytes: None,
+        interactive: true,
+        cwd: Some(dir.path().display().to_string()),
+        file_path: None,
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
+    };
+    let verdict = engine::analyze(&ctx);
+
+    unsafe {
+        std::env::remove_var("TIRITH_POLICY_ROOT");
+    }
+
+    let ssh_finding = verdict.findings.iter().find(|f| {
+        matches!(
+            f.rule_id,
+            tirith_core::verdict::RuleId::SshRemoteDestructiveOnLabeledHost
+        )
+    });
+    assert!(
+        ssh_finding.is_some(),
+        "expected SshRemoteDestructiveOnLabeledHost; got: {:?}",
+        verdict
+            .findings
+            .iter()
+            .map(|f| format!("{}: {}", f.rule_id, f.title))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(verdict.action, Action::Block);
+}
+
+#[test]
+fn ssh_rule_emits_info_on_bare_labeled_host() {
+    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    let tirith_dir = dir.path().join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    fs::write(
+        tirith_dir.join("ssh-host-labels.yaml"),
+        "payments-prod-01: critical\n",
+    )
+    .unwrap();
+
+    unsafe {
+        std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
+    }
+
+    let ctx = AnalysisContext {
+        input: "ssh payments-prod-01".to_string(),
+        shell: ShellType::Posix,
+        scan_context: ScanContext::Exec,
+        raw_bytes: None,
+        interactive: true,
+        cwd: Some(dir.path().display().to_string()),
+        file_path: None,
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
+    };
+    let verdict = engine::analyze(&ctx);
+
+    unsafe {
+        std::env::remove_var("TIRITH_POLICY_ROOT");
+    }
+
+    let info_finding = verdict.findings.iter().find(|f| {
+        matches!(
+            f.rule_id,
+            tirith_core::verdict::RuleId::SshRemoteShellOnLabeledHost
+        )
+    });
+    assert!(
+        info_finding.is_some(),
+        "expected SshRemoteShellOnLabeledHost; got: {:?}",
+        verdict
+            .findings
+            .iter()
+            .map(|f| format!("{}: {}", f.rule_id, f.title))
+            .collect::<Vec<_>>(),
+    );
+    // Info severity maps to Allow.
+    assert_eq!(verdict.action, Action::Allow);
+}
+
+#[test]
+fn ssh_rule_allows_unlabeled_host_with_destructive_inner() {
+    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    let tirith_dir = dir.path().join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    fs::write(
+        tirith_dir.join("ssh-host-labels.yaml"),
+        "payments-prod-01: critical\n",
+    )
+    .unwrap();
+
+    unsafe {
+        std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
+    }
+
+    // Different host name — not in the labels file.
+    let ctx = AnalysisContext {
+        input: "ssh dev-host 'sudo systemctl restart x'".to_string(),
+        shell: ShellType::Posix,
+        scan_context: ScanContext::Exec,
+        raw_bytes: None,
+        interactive: true,
+        cwd: Some(dir.path().display().to_string()),
+        file_path: None,
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
+    };
+    let verdict = engine::analyze(&ctx);
+
+    unsafe {
+        std::env::remove_var("TIRITH_POLICY_ROOT");
+    }
+
+    let ssh_findings: Vec<_> = verdict
+        .findings
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.rule_id,
+                tirith_core::verdict::RuleId::SshRemoteDestructiveOnLabeledHost
+                    | tirith_core::verdict::RuleId::SshRemoteShellOnLabeledHost
+            )
+        })
+        .collect();
+    assert!(
+        ssh_findings.is_empty(),
+        "unlabeled host must NOT fire any SSH rule; got: {:?}",
+        ssh_findings
             .iter()
             .map(|f| f.rule_id.to_string())
             .collect::<Vec<_>>()

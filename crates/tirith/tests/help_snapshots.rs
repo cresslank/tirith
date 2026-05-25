@@ -117,6 +117,10 @@ help_example_tests! {
     help_context_status  => (["context", "status", "--help"], "tirith context status");
     help_context_guard   => (["context", "guard", "--help"], "tirith context guard on");
     help_context_label   => (["context", "label", "--help"], "tirith context label kube:prod-us-east critical --scope user");
+    // M8 ch2 — `tirith ssh guard|label`.
+    help_ssh             => (["ssh", "--help"], "tirith ssh guard on");
+    help_ssh_guard       => (["ssh", "guard", "--help"], "tirith ssh guard on");
+    help_ssh_label       => (["ssh", "label", "--help"], "tirith ssh label payments-prod-01 critical --scope user");
 }
 
 #[test]

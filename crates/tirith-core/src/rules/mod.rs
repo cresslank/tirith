@@ -18,6 +18,7 @@ pub mod powershell;
 pub mod prompt_injection;
 pub mod rendered;
 pub mod shared;
+pub mod ssh_context;
 pub mod terminal;
 pub mod threatintel;
 pub mod transport;

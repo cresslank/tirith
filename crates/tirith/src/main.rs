@@ -1299,6 +1299,50 @@ Examples:
         #[command(subcommand)]
         action: ContextAction,
     },
+
+    /// Inspect / guard / label SSH hosts for remote-session protection (M8 ch2)
+    #[command(after_help = "\
+Subcommands:
+  tirith ssh guard on | off | status        — flip the operational-context
+                                              rule (shared switch with
+                                              `tirith context guard`).
+  tirith ssh label <host> <criticality>     — label a host (or user@host)
+        [--scope user|repo]                   with a criticality string.
+                                              `~/.ssh/config` aliases are
+                                              resolved at label time via
+                                              `ssh -G <host>`; the labels
+                                              file always stores the final
+                                              hostname.
+
+Labels live in a DEDICATED labels file, NOT policy.yaml:
+  --scope user → ~/.config/tirith/ssh-host-labels.yaml
+  --scope repo → <repo>/.tirith/ssh-host-labels.yaml
+
+What it catches:
+  `ssh prod-host '<destructive>'` — when the target host is labeled
+  critical / production, destructive inner commands (sudo systemctl
+  stop, rm -rf, dd, useradd, kubectl delete, ...) fire a High finding.
+  Bare `ssh prod-host` emits an Info reminder that tirith protects the
+  LOCAL shell only — post-handshake commands are not intercepted.
+
+`tirith ssh bootstrap <user@host>` (auto-install hook on the remote
+side) is DEFERRED to M8.1 — running it today exits 2 with a pointer.
+
+Honest scope:
+  Labels are operator-trust, not adversary-resistant. The labels file
+  is user-writable; anyone with shell access can re-label a host.
+  tirith ssh is for catching operational footguns, not for stopping
+  someone who already has root.
+
+Examples:
+  tirith ssh guard on
+  tirith ssh guard status
+  tirith ssh label payments-prod-01 critical --scope user
+  tirith ssh label root@payments-prod-01 critical --scope repo")]
+    Ssh {
+        #[command(subcommand)]
+        action: SshAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1352,6 +1396,64 @@ Examples:
         /// Where to write the label file. `user` →
         /// `~/.config/tirith/context-labels.yaml`. `repo` →
         /// `<repo>/.tirith/context-labels.yaml`.
+        #[arg(long, default_value = "user")]
+        scope: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SshAction {
+    /// Turn the operational-context rule on or off (shared with `tirith context guard`)
+    #[command(after_help = "\
+Examples:
+  tirith ssh guard on
+  tirith ssh guard off
+  tirith ssh guard status
+
+Note: This flips the SAME `context_guard_enabled` policy field that
+`tirith context guard` operates on — there is one operator switch for
+both cloud-CLI and SSH operational-context rules.")]
+    Guard {
+        /// One of: on, off, status.
+        action: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Label an SSH host (or `user@host`) with a criticality string
+    #[command(after_help = "\
+Criticality is one of: critical, production, prod, live, p0, p1, p2,
+staging, dev, test (case-insensitive; the first six fire the guard rule).
+
+`~/.ssh/config` aliases are resolved at label time via `ssh -G <host>` so
+the labels file stores the final hostname; an operator who labels
+`prod-host` and later runs `ssh prod-host.example.com` still gets a match.
+
+Examples:
+  tirith ssh label payments-prod-01 critical --scope user
+  tirith ssh label root@payments-prod-01 critical --scope repo
+  tirith ssh label prod-shortname production --scope user")]
+    Label {
+        /// SSH host (bare host or `user@host`). May be an `~/.ssh/config`
+        /// alias — `ssh -G <host>` resolves the canonical hostname at
+        /// label time.
+        host: String,
+        /// Criticality string. `critical` / `production` / `prod` / `live`
+        /// / `p0` / `p1` trigger the guard rule; others (`staging`, `dev`,
+        /// `test`, `p2`) record the label without enforcement.
+        criticality: String,
+        /// Where to write the label file. `user` →
+        /// `~/.config/tirith/ssh-host-labels.yaml`. `repo` →
+        /// `<repo>/.tirith/ssh-host-labels.yaml`.
         #[arg(long, default_value = "user")]
         scope: String,
         /// Output format (default: human)
@@ -3835,6 +3937,36 @@ fn run() {
                     }
                 };
                 cli::context::label(&label_key, &criticality, parsed_scope, json)
+            }
+        },
+
+        Commands::Ssh { action } => match action {
+            SshAction::Guard {
+                action,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::ssh::guard(&action, json)
+            }
+            SshAction::Label {
+                host,
+                criticality,
+                scope,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                let parsed_scope = match cli::ssh::LabelScope::parse(&scope) {
+                    Some(s) => s,
+                    None => {
+                        eprintln!(
+                            "tirith ssh label: --scope must be 'user' or 'repo' (got {scope})"
+                        );
+                        std::process::exit(2);
+                    }
+                };
+                cli::ssh::label(&host, &criticality, parsed_scope, json)
             }
         },
     };

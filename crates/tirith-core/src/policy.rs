@@ -249,6 +249,26 @@ pub struct Policy {
     /// `prod` / `live` / `p0` / `p1` (case-insensitive).
     #[serde(skip)]
     pub context_labels: BTreeMap<String, String>,
+
+    /// **M8 ch2 — `host` (or `user@host`) → criticality map for SSH.**
+    ///
+    /// Populated by [`Policy::load_ssh_host_labels`] from
+    /// `~/.config/tirith/ssh-host-labels.yaml` (user scope) merged with
+    /// `<repo>/.tirith/ssh-host-labels.yaml` (repo scope). Repo wins on
+    /// conflict, mirroring the context-labels layout.
+    ///
+    /// Keys are SSH host strings. The matcher first looks for the exact
+    /// `user@host` form (e.g. `root@payments-prod-01`), then falls back
+    /// to the bare host (`payments-prod-01`). `~/.ssh/config` aliases
+    /// are resolved at label time via `ssh -G alias` — the labels file
+    /// always stores the FINAL hostname.
+    ///
+    /// Values: `critical` / `production` / `prod` / `live` / `p0` / `p1`
+    /// (case-insensitive). Other values (`staging`, `dev`, `test`,
+    /// `p2`) are recorded but do not fire the M8 ch2 rule — they
+    /// document the inventory without enforcing.
+    #[serde(skip)]
+    pub ssh_host_labels: BTreeMap<String, String>,
 }
 
 /// **M7 ch2** — `tirith share` policy configuration.
@@ -728,6 +748,7 @@ impl Default for Policy {
             context_guard_enabled: default_context_guard_enabled(),
             context_destructive_verbs: HashMap::new(),
             context_labels: BTreeMap::new(),
+            ssh_host_labels: BTreeMap::new(),
         }
     }
 }
@@ -1158,6 +1179,26 @@ impl Policy {
         }
     }
 
+    /// **M8 ch2** — load SSH host-label entries from the user-scope and
+    /// repo-scope label files and merge them into `ssh_host_labels`.
+    ///
+    /// Files (resolution order, both applied — repo wins on conflict):
+    ///   1. `~/.config/tirith/ssh-host-labels.yaml` (user scope)
+    ///   2. `<repo>/.tirith/ssh-host-labels.yaml` (repo scope)
+    ///
+    /// Format is a flat YAML map: `host: criticality`. The host string
+    /// may include a `user@` prefix; the lookup is exact-match with a
+    /// fall-back to the bare host (see `rules::ssh_context`).
+    pub fn load_ssh_host_labels(&mut self, cwd: Option<&str>) {
+        if let Some(user_path) = user_ssh_host_labels_path() {
+            merge_context_labels(&user_path, &mut self.ssh_host_labels);
+        }
+        if let Some(repo_root) = find_repo_root(cwd) {
+            let repo_path = repo_root.join(".tirith").join("ssh-host-labels.yaml");
+            merge_context_labels(&repo_path, &mut self.ssh_host_labels);
+        }
+    }
+
     /// Load and merge user-level lists (allowlist/blocklist flat text files).
     pub fn load_user_lists(&mut self) {
         if let Some(config) = crate::policy::config_dir() {
@@ -1488,6 +1529,20 @@ pub fn user_context_labels_path() -> Option<PathBuf> {
 /// the cwd is inside a git repo. Returns `None` when no `.git` is found.
 pub fn repo_context_labels_path(cwd: Option<&str>) -> Option<PathBuf> {
     find_repo_root(cwd).map(|r| r.join(".tirith").join("context-labels.yaml"))
+}
+
+/// **M8 ch2** — user-scope SSH host-labels file path.
+///
+/// `~/.config/tirith/ssh-host-labels.yaml`. Returns `None` if no config
+/// dir is resolvable.
+pub fn user_ssh_host_labels_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("ssh-host-labels.yaml"))
+}
+
+/// **M8 ch2** — repo-scope SSH host-labels file path for a given cwd, if
+/// the cwd is inside a git repo. Returns `None` when no `.git` is found.
+pub fn repo_ssh_host_labels_path(cwd: Option<&str>) -> Option<PathBuf> {
+    find_repo_root(cwd).map(|r| r.join(".tirith").join("ssh-host-labels.yaml"))
 }
 
 /// Merge a single labels file's entries into `into`. The file is a flat

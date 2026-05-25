@@ -339,6 +339,24 @@ pub enum RuleId {
     /// `gcloud iam service-accounts keys create`, `az ad sp delete`,
     /// `kubectl create clusterrolebinding`, etc.
     ContextProdCredentialChange,
+
+    // SSH operational-context rules (M8 ch2) — fire from
+    // `rules::ssh_context` when the parsed command's leader is `ssh` and
+    // the resolved target host is in `policy.ssh_host_labels` with a
+    // critical / production criticality.
+    /// M8 ch2 — destructive remote command against an SSH host labeled
+    /// production / critical. High severity. The inner command (after the
+    /// host) is re-classified through the same destructive-verb heuristic
+    /// `rules::context` uses for cloud CLIs, with extra coverage for
+    /// general-purpose shell verbs (`systemctl stop`, `rm -rf`, `dd`,
+    /// `useradd`, etc.).
+    SshRemoteDestructiveOnLabeledHost,
+    /// M8 ch2 — opening a bare interactive remote shell against a labeled
+    /// host. Info severity (does not block). Surfaces that tirith protects
+    /// the LOCAL shell only — commands typed after the SSH handshake are
+    /// not intercepted unless the operator runs `tirith ssh bootstrap`
+    /// (planned for M8.1) to install the hook on the remote side.
+    SshRemoteShellOnLabeledHost,
 }
 
 impl fmt::Display for RuleId {

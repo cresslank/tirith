@@ -1784,3 +1784,47 @@ input = "kubectl apply -f deploy.yaml -n dev"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# M8 ch2 — SSH operational-context fixtures.
+#
+# Like the M8 ch1 context fixtures, the static fixture runner does NOT seed
+# the SSH host-labels file, so `policy.ssh_host_labels` is empty and
+# `rules::ssh_context::check` short-circuits on every input. These fixtures
+# pin that behavior — they MUST NOT regress to a block when the labels file
+# is absent. The block/info paths are covered by
+# `ssh_rule_blocks_destructive_on_labeled_host` and
+# `ssh_rule_emits_info_on_bare_labeled_host` in `tests/golden_fixtures.rs`,
+# which seed a temp labels file under TIRITH_POLICY_ROOT + a fake .git
+# boundary.
+
+[[fixture]]
+name = "ssh_destructive_inner_no_labels_allow"
+min_milestone = 8
+input = "ssh prod-host 'sudo systemctl restart payments'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "ssh_readonly_inner_no_labels_allow"
+min_milestone = 8
+input = "ssh prod-host 'ls'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "ssh_dev_host_no_labels_allow"
+min_milestone = 8
+input = "ssh dev-host 'sudo systemctl restart x'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "ssh_bare_no_labels_allow"
+min_milestone = 8
+input = "ssh prod-host"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
