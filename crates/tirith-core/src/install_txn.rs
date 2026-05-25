@@ -797,8 +797,22 @@ fn extract_packages_manager_specific(
 fn parse_docker_specs(user_args: &[String]) -> Vec<PackageRef> {
     use crate::parse::{parse_docker_ref, UrlLike};
     let mut out = Vec::new();
-    for arg in user_args {
+    let mut i = 0;
+    while i < user_args.len() {
+        let arg = &user_args[i];
         if arg.starts_with('-') {
+            // Flags with separate value forms: skip BOTH the flag and its
+            // value so the value (e.g. `linux/amd64` after `--platform`)
+            // isn't misclassified as an image ref. Inline `--flag=value`
+            // doesn't consume the next token. The list below is the set of
+            // docker pull / run flags that take a separate value AND whose
+            // value can plausibly look like an image (contains `/`, `:`, or
+            // a digest-looking string). Boolean flags don't need to skip.
+            if !arg.contains('=') && is_docker_value_bearing_flag(arg) && i + 1 < user_args.len() {
+                i += 2;
+                continue;
+            }
+            i += 1;
             continue;
         }
         if let UrlLike::DockerRef {
@@ -823,8 +837,49 @@ fn parse_docker_specs(user_args: &[String]) -> Vec<PackageRef> {
                 version,
             });
         }
+        i += 1;
     }
     out
+}
+
+/// Docker CLI flags whose VALUE is a separate token (not inlined with `=`)
+/// AND whose value can plausibly match an image-ref shape (contains `/` or
+/// `:`) — so we must skip the value to avoid misclassifying it as a pull
+/// target. Conservative list: only the flags whose values look image-like.
+fn is_docker_value_bearing_flag(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--platform"
+            | "--user"
+            | "-u"
+            | "--volume"
+            | "-v"
+            | "--mount"
+            | "--publish"
+            | "-p"
+            | "--env"
+            | "-e"
+            | "--env-file"
+            | "--network"
+            | "--name"
+            | "--hostname"
+            | "-h"
+            | "--workdir"
+            | "-w"
+            | "--cidfile"
+            | "--entrypoint"
+            | "--label"
+            | "-l"
+            | "--add-host"
+            | "--device"
+            | "--dns"
+            | "--restart"
+            | "--memory"
+            | "-m"
+            | "--cpus"
+            | "--log-driver"
+            | "--log-opt"
+    )
 }
 
 /// Parse Go module-spec arguments into [`PackageRef`]s.
@@ -849,6 +904,19 @@ fn parse_go_specs(user_args: &[String]) -> Vec<PackageRef> {
             Some((n, v)) if !n.is_empty() && !v.is_empty() => (n, Some(v.to_string())),
             _ => (arg.as_str(), Some("latest".to_string())),
         };
+        // Reject local-path install targets. `go install ./cmd/foo`,
+        // `go install /abs/path/...`, `go install ~/repo/...` operate on
+        // local filesystem paths, not remote registry modules — turning them
+        // into `PackageRef`s would emit bogus risk findings for paths.
+        if name == "."
+            || name == ".."
+            || name.starts_with("./")
+            || name.starts_with("../")
+            || name.starts_with('/')
+            || name.starts_with('~')
+        {
+            continue;
+        }
         // Conservative shape check — a Go module path is dotted or has a
         // slash. `nginx` is rejected as a likely typo from a wrong source.
         if !name.contains('.') && !name.contains('/') {
@@ -1903,6 +1971,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_docker_specs_skips_value_after_value_bearing_flag() {
+        // Regression: `--platform linux/amd64` is a flag with a separate
+        // value token. The flag is skipped; the value `linux/amd64` MUST
+        // also be skipped — otherwise it parses as a `linux/amd64:latest`
+        // bogus image ref.
+        let pkgs = parse_docker_specs(&[
+            "--platform".to_string(),
+            "linux/amd64".to_string(),
+            "alpine".to_string(),
+        ]);
+        assert_eq!(pkgs.len(), 1, "only `alpine` should parse, not the value");
+        assert_eq!(pkgs[0].name, "library/alpine");
+
+        // Same for `-v /host:/container alpine` — the `/host:/container`
+        // value contains `/` and `:`, both of which would otherwise make it
+        // parse as an image ref.
+        let pkgs = parse_docker_specs(&[
+            "-v".to_string(),
+            "/host:/container".to_string(),
+            "alpine".to_string(),
+        ]);
+        assert_eq!(pkgs.len(), 1, "only `alpine` should parse, not the mount");
+        assert_eq!(pkgs[0].name, "library/alpine");
+
+        // Inline `--flag=value` form: only the flag token is skipped, the
+        // next positional argument IS parsed.
+        let pkgs = parse_docker_specs(&["-p=8080:80".to_string(), "alpine".to_string()]);
+        assert_eq!(pkgs.len(), 1, "inline `-p=8080:80` skips one token only");
+        assert_eq!(pkgs[0].name, "library/alpine");
+    }
+
+    #[test]
     fn parse_go_specs_defaults_version_to_latest() {
         // No `@version` → defaults to `latest`.
         let pkgs = parse_go_specs(&["github.com/spf13/cobra".to_string()]);
@@ -1931,6 +2031,39 @@ mod tests {
         // Flags are skipped.
         let pkgs = parse_go_specs(&["-v".to_string(), "github.com/x/y".to_string()]);
         assert_eq!(pkgs.len(), 1);
+    }
+
+    #[test]
+    fn parse_go_specs_rejects_local_path_targets() {
+        // Regression: `go install ./cmd/foo` was being treated as a remote
+        // registry module because `./cmd/foo` contains `/`. Local paths are
+        // NOT modules — they must be skipped entirely.
+        let cases = vec![
+            ".".to_string(),
+            "..".to_string(),
+            "./cmd/foo".to_string(),
+            "../cmd/foo".to_string(),
+            "./...".to_string(),
+            "../../package".to_string(),
+            "/abs/path/cmd/foo".to_string(),
+            "/usr/local/src/proj".to_string(),
+            "~/repo/cmd/foo".to_string(),
+            "~".to_string(),
+        ];
+        for tok in &cases {
+            let pkgs = parse_go_specs(std::slice::from_ref(tok));
+            assert!(
+                pkgs.is_empty(),
+                "local path {tok:?} must not parse as a Go module"
+            );
+        }
+        // Sanity: a real module still works alongside a local path.
+        let pkgs = parse_go_specs(&[
+            "./cmd/foo".to_string(),
+            "github.com/spf13/cobra@v1.8.0".to_string(),
+        ]);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "github.com/spf13/cobra");
     }
 
     #[test]

@@ -182,14 +182,76 @@ pub fn diff_two_snapshots(older: &SnapshotRow, newer: &SnapshotRow) -> Maintaine
     }
 }
 
-/// Synthesize an `OwnershipTransfer` record from a `MaintainerChangeHistory`.
-/// Pure; the diff already carries the data needed.
-pub fn synthesize_transfer(hist: &MaintainerChangeHistory) -> OwnershipTransfer {
+/// Synthesize an `OwnershipTransfer` record from two snapshot rows. Pure.
+///
+/// `OwnershipTransfer.previous` is the FULL older maintainer set and
+/// `OwnershipTransfer.current` is the FULL newer maintainer set — NOT the
+/// `added` / `removed` diff slices. The diff is already preserved in
+/// [`MaintainerChangeHistory`]; ownership-transfer-as-snapshot needs both
+/// full sets so the consumer can render "from {alice, bob} to {eve}".
+pub fn synthesize_transfer_from_snapshots(
+    older: &SnapshotRow,
+    newer: &SnapshotRow,
+) -> OwnershipTransfer {
+    let within_days = if newer.captured_at >= older.captured_at {
+        let secs = newer.captured_at - older.captured_at;
+        Some((secs / 86_400) as u32)
+    } else {
+        None
+    };
     OwnershipTransfer {
-        previous: hist.removed.clone(),
-        current: hist.added.clone(),
-        within_days: hist.transfer_within_days,
+        previous: older.maintainers.clone(),
+        current: newer.maintainers.clone(),
+        within_days,
     }
+}
+
+/// Diff and synthesize-transfer in one shot when both snapshots are needed.
+/// Returns `None` when fewer than two snapshots exist (mirrors `diff_recent`).
+///
+/// The history is the diff (`added` / `removed`); the optional transfer
+/// carries the FULL older/newer maintainer sets so the rule's evidence can
+/// render the snapshots, not just the diff.
+///
+/// The transfer is `Some` ONLY when no maintainer survives from older to
+/// newer (the older set is fully cleared) AND at least one new maintainer
+/// joined — the snapshot-aware definition of a *real* ownership transfer.
+/// This is the canonical predicate; the diff-only
+/// [`MaintainerChangeHistory::is_full_ownership_transfer`] cannot see a
+/// stable maintainer who appears in neither `added` nor `removed`, so it
+/// returns false positives on partial churn.
+pub fn diff_and_transfer_recent(
+    eco: Ecosystem,
+    name: &str,
+) -> Option<(MaintainerChangeHistory, Option<OwnershipTransfer>)> {
+    let rows = read_snapshots(eco, name);
+    if rows.len() < 2 {
+        return None;
+    }
+    let older = &rows[rows.len() - 2];
+    let newer = &rows[rows.len() - 1];
+    let hist = diff_two_snapshots(older, newer);
+    let transfer = if is_full_takeover_snapshots(older, newer) {
+        Some(synthesize_transfer_from_snapshots(older, newer))
+    } else {
+        None
+    };
+    Some((hist, transfer))
+}
+
+/// `true` when newer's maintainer set shares NO ids with older's, and newer
+/// is non-empty — a real ownership transfer between snapshots.
+fn is_full_takeover_snapshots(older: &SnapshotRow, newer: &SnapshotRow) -> bool {
+    if older.maintainers.is_empty() || newer.maintainers.is_empty() {
+        // No data, no claim — only flag when both snapshots carry maintainers.
+        return false;
+    }
+    let old_ids: std::collections::HashSet<&str> =
+        older.maintainers.iter().map(|m| m.id.as_str()).collect();
+    !newer
+        .maintainers
+        .iter()
+        .any(|m| old_ids.contains(m.id.as_str()))
 }
 
 /// Pull a maintainer list out of an [`ApiProvenance`]. The new
@@ -273,11 +335,99 @@ mod tests {
         let newer = row(86_400, &["eve"]);
         let h = diff_two_snapshots(&older, &newer);
         assert!(h.is_full_ownership_transfer());
-        let t = synthesize_transfer(&h);
+        let t = synthesize_transfer_from_snapshots(&older, &newer);
+        // The synthesized transfer carries the FULL older/newer maintainer
+        // sets — not just the diff. For the "alice → eve" full takeover both
+        // are singletons, so the sets carry one id each.
+        assert_eq!(
+            t.previous.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["alice"]
+        );
+        assert_eq!(
+            t.current.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["eve"]
+        );
+        // Disjoint by id — alice ∉ {eve}, eve ∉ {alice}.
         assert!(t
             .previous
             .iter()
             .all(|p| !t.current.iter().any(|c| c.id == p.id)));
+    }
+
+    #[test]
+    fn synthesize_transfer_carries_full_snapshot_sets_not_diff() {
+        // Partial churn: {alice, bob} → {alice, eve}. The diff is removed=[bob],
+        // added=[eve]; the FULL snapshot sets are {alice, bob} and {alice, eve}.
+        // The synthesized transfer must carry the FULL sets — alice is in
+        // BOTH `previous` and `current` because she sits in both snapshots.
+        let older = row(0, &["alice", "bob"]);
+        let newer = row(86_400, &["alice", "eve"]);
+        let t = synthesize_transfer_from_snapshots(&older, &newer);
+        assert_eq!(
+            t.previous.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["alice", "bob"]
+        );
+        assert_eq!(
+            t.current.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["alice", "eve"]
+        );
+    }
+
+    #[test]
+    fn is_full_takeover_snapshots_rejects_partial_churn() {
+        // {alice, bob, carol} → {alice, dave} — alice carries over, NOT a
+        // full takeover.
+        let older = row(0, &["alice", "bob", "carol"]);
+        let newer = row(86_400, &["alice", "dave"]);
+        assert!(!is_full_takeover_snapshots(&older, &newer));
+    }
+
+    #[test]
+    fn is_full_takeover_snapshots_accepts_clean_takeover() {
+        // {alice, bob} → {eve, mallory} — no overlap, real takeover.
+        let older = row(0, &["alice", "bob"]);
+        let newer = row(86_400, &["eve", "mallory"]);
+        assert!(is_full_takeover_snapshots(&older, &newer));
+    }
+
+    #[test]
+    fn is_full_takeover_snapshots_rejects_empty_snapshots() {
+        // Empty older → empty signal — don't claim a transfer with no data.
+        let older = row(0, &[]);
+        let newer = row(86_400, &["eve"]);
+        assert!(!is_full_takeover_snapshots(&older, &newer));
+        // Empty newer → "lost every owner" is the legacy
+        // `ownership_transferred=Some(true)` signal, not an OwnershipTransfer.
+        let older2 = row(0, &["alice"]);
+        let newer2 = row(86_400, &[]);
+        assert!(!is_full_takeover_snapshots(&older2, &newer2));
+    }
+
+    #[test]
+    fn partial_maintainer_churn_via_diff_and_transfer_recent_returns_no_transfer() {
+        // {alice, bob, carol} → {alice, dave}. Bob and Carol leave, Dave joins,
+        // but Alice carries over — this is NOT a full ownership transfer. The
+        // diff-only `is_full_ownership_transfer` cannot see Alice (she's in
+        // neither `added` nor `removed`), so it would incorrectly return true
+        // here. The snapshot-aware `diff_and_transfer_recent` MUST clear the
+        // transfer because Alice survives the change.
+        //
+        // The decisive predicate is: `previous.iter().any(|p|
+        // current.contains(p))` — and that's what the consumer in
+        // `package.rs` should check on the synthesized transfer, NOT the
+        // diff-only `is_full_ownership_transfer`. See the doc on
+        // `MaintainerChangeHistory::is_full_ownership_transfer`.
+        let older = row(0, &["alice", "bob", "carol"]);
+        let newer = row(86_400, &["alice", "dave"]);
+        let t = synthesize_transfer_from_snapshots(&older, &newer);
+        // The synthesized transfer carries the FULL sets — Alice is in both.
+        // The consumer can then reject this as a partial transfer by simply
+        // checking overlap.
+        let any_overlap = t
+            .previous
+            .iter()
+            .any(|p| t.current.iter().any(|c| c.id == p.id));
+        assert!(any_overlap, "alice carries over → not a full transfer");
     }
 
     #[test]

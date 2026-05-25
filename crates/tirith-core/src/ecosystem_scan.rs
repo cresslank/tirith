@@ -1355,6 +1355,50 @@ fn policy_findings_for_assessment(
         package_risk::ApiSignals::Available { provenance } => Some(provenance),
         _ => None,
     };
+
+    // `PackagePolicyTyposquatDistance` is an OFFLINE policy gate — it reads
+    // `assessment.risk.name_vs_popular`, which is computed from the local
+    // threat DB without any registry call. Emit it BEFORE the `Some(prov)`
+    // gate so an offline / degraded `--online` scan still surfaces typosquat
+    // findings. The API-backed gates below (NotFound / NewerThanDays /
+    // LowDownloads / UnknownPackageWithInstallScripts / OsvAdvisoryActive)
+    // each require provenance and are skipped without it.
+    if let Some(max_dist) = pp.block_typosquat_distance {
+        if let package_risk::NameVsPopular::NearPopular {
+            popular_name,
+            distance,
+        } = &assessment.risk.name_vs_popular
+        {
+            if (*distance as u32) <= max_dist {
+                out.push(Finding {
+                    rule_id: RuleId::PackagePolicyTyposquatDistance,
+                    severity: Severity::High,
+                    title: format!(
+                        "Typosquat distance below policy threshold: {} '{}' ≈ '{}'",
+                        dep.ecosystem, dep.name, popular_name,
+                    ),
+                    description: format!(
+                        "Dependency '{}' declared in {manifest} is edit-distance {distance} from \
+                         the popular {} package '{popular_name}', at or below the policy \
+                         threshold {max_dist}.",
+                        dep.name, dep.ecosystem,
+                    ),
+                    evidence: vec![Evidence::Text {
+                        detail: format!(
+                            "manifest={manifest} package={} ecosystem={} similar_to={popular_name} \
+                             distance={distance} threshold={max_dist}",
+                            dep.name, dep.ecosystem,
+                        ),
+                    }],
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                });
+            }
+        }
+    }
+
     let Some(prov) = provenance else {
         return out;
     };
@@ -1550,42 +1594,8 @@ fn policy_findings_for_assessment(
         }
     }
 
-    // PackagePolicyTyposquatDistance
-    if let Some(max_dist) = pp.block_typosquat_distance {
-        if let package_risk::NameVsPopular::NearPopular {
-            popular_name,
-            distance,
-        } = &assessment.risk.name_vs_popular
-        {
-            if (*distance as u32) <= max_dist {
-                out.push(Finding {
-                    rule_id: RuleId::PackagePolicyTyposquatDistance,
-                    severity: Severity::High,
-                    title: format!(
-                        "Typosquat distance below policy threshold: {} '{}' ≈ '{}'",
-                        dep.ecosystem, dep.name, popular_name,
-                    ),
-                    description: format!(
-                        "Dependency '{}' declared in {manifest} is edit-distance {distance} from \
-                         the popular {} package '{popular_name}', at or below the policy \
-                         threshold {max_dist}.",
-                        dep.name, dep.ecosystem,
-                    ),
-                    evidence: vec![Evidence::Text {
-                        detail: format!(
-                            "manifest={manifest} package={} ecosystem={} similar_to={popular_name} \
-                             distance={distance} threshold={max_dist}",
-                            dep.name, dep.ecosystem,
-                        ),
-                    }],
-                    human_view: None,
-                    agent_view: None,
-                    mitre_id: None,
-                    custom_rule_id: None,
-                });
-            }
-        }
-    }
+    // PackagePolicyTyposquatDistance is emitted at the top of this function
+    // BEFORE the `Some(prov)` gate — see the comment there for rationale.
 
     out
 }
@@ -3242,6 +3252,57 @@ gem 'toplevelgem'
             findings_for(&assessment, &policy).is_empty(),
             "Low/Medium provenance-only score with no name-shape signal must \
              not emit a finding"
+        );
+    }
+
+    #[test]
+    fn typosquat_policy_fires_when_api_signals_unavailable() {
+        // Regression: `policy_findings_for_assessment` used to early-return
+        // when `assessment.risk.api_signals` was not `Available`, which
+        // silently gated `PackagePolicyTyposquatDistance` (a purely-offline
+        // signal — computed from `name_vs_popular`, which is local) on
+        // network availability. An `--online` scan against a degraded
+        // registry would lose its typosquat findings. Pin that the
+        // typosquat gate fires regardless of API state.
+        let signals = PackageSignals {
+            ecosystem: Ecosystem::Npm,
+            name: "reaqt".to_string(),
+            version: None,
+            threat_db_missing: false,
+            name_vs_popular: NameVsPopular::NearPopular {
+                popular_name: "react".to_string(),
+                distance: 1,
+            },
+            malicious_typosquat_of: None,
+            content_signals: ContentSignals::NotInspected,
+            // Critically, the registry call FAILED — we have no provenance.
+            api: ApiSignals::unavailable("simulated network timeout"),
+        };
+        let breakdown = package_risk::score_package(&signals);
+        let assessment = DependencyAssessment {
+            dependency: DeclaredDependency {
+                name: "reaqt".to_string(),
+                ecosystem: Ecosystem::Npm,
+                version: None,
+                dev: false,
+            },
+            manifest: "package.json".to_string(),
+            risk: breakdown,
+            slopsquat: SlopsquatAssessment::clear(),
+            allowlisted: false,
+        };
+        // Configure a typosquat-distance policy threshold.
+        let mut policy = crate::policy::Policy::default();
+        policy.package_policy.block_typosquat_distance = Some(2);
+
+        let findings = policy_findings_for_assessment(&assessment, &policy);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::PackagePolicyTyposquatDistance),
+            "PackagePolicyTyposquatDistance must fire even when API is \
+             unavailable — got rule_ids: {:?}",
+            findings.iter().map(|f| f.rule_id).collect::<Vec<_>>(),
         );
     }
 

@@ -518,15 +518,16 @@ backing `tirith check --suggest-safe-command`. Pick a numbered rewrite at the
 prompt and `fix` prints exactly that command on stdout, so you can wrap with
 `$(tirith fix -- '<cmd>')` and feed it straight into your shell.
 
-When no mechanical rewrite is possible (homograph hostnames, dotfile writes,
-threat-DB hits) `fix` prints the honest per-rule remediation instead of
-fabricating a command. Detection lives in the engine; `fix` adds zero
-heuristics of its own.
+When no mechanical rewrite is possible (homograph hostnames, threat-DB hits)
+`fix` prints the honest per-rule remediation instead of fabricating a
+command. Detection lives in the engine; `fix` adds zero heuristics of its
+own. Dotfile-overwrite DOES have a mechanical rewrite (`cp <target>
+<target>.bak && <original>`) when the target file exists.
 
 Exit codes (deliberately distinct from `tirith check`):
   0  no fix needed (verdict was Allow) OR user accepted a rewrite
   1  findings exist but no mechanical rewrite is available
-  2  user rejected the rewrite, or stdin/stdout is not a TTY
+  2  user rejected the rewrite, JSON write failed, or stdin/stderr is not a TTY
 
 `check` uses 0/1/2/3 (allow/block/warn/warn-ack — tied to verdict severity);
 `fix`'s codes are tied to whether a rewrite was applied. The two surfaces

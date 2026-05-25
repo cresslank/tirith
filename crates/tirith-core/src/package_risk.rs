@@ -288,8 +288,30 @@ impl MaintainerChangeHistory {
 
     /// `true` when every previous maintainer is gone and the new set is
     /// non-empty — a true ownership transfer (not just a co-maintainer add).
+    ///
+    /// Because `MaintainerChangeHistory` only carries the diff (`added` /
+    /// `removed`), the only way to know "every previous maintainer is gone"
+    /// from the diff alone is for the diff sets to be fully disjoint by id:
+    /// any maintainer appearing in `added.id` ∩ `removed.id` would mean the
+    /// same person sits in both snapshots' maintainer sets, which the
+    /// snapshot diff would never have written. The stricter "all original
+    /// maintainers retired" check lives in
+    /// [`crate::registry_history::synthesize_transfer`], which has access to
+    /// the full older/newer snapshots and compares them directly.
     pub fn is_full_ownership_transfer(&self) -> bool {
-        !self.removed.is_empty() && !self.added.is_empty()
+        if self.removed.is_empty() || self.added.is_empty() {
+            return false;
+        }
+        // The added and removed sets must be fully disjoint — any shared id
+        // means the same maintainer appears in both snapshots, so the old
+        // set was not fully cleared.
+        self.added
+            .iter()
+            .all(|a| !self.removed.iter().any(|r| r.id == a.id))
+            && self
+                .removed
+                .iter()
+                .all(|r| !self.added.iter().any(|a| a.id == r.id))
     }
 }
 
@@ -456,6 +478,13 @@ pub struct ApiProvenance {
     /// `false_positive_guidance`.
     #[serde(default)]
     pub maintainer_change_history: Option<MaintainerChangeHistory>,
+    /// M6 ch6 — was the OSV lookup verified, unavailable, or not attempted?
+    /// Distinguishes a verified-empty result (`Verified` + empty
+    /// `osv_advisories`) from a failed-lookup empty result (`Unavailable` +
+    /// empty `osv_advisories`) — both look identical to the score otherwise.
+    /// Default `NotChecked` for non-`--online` runs.
+    #[serde(default)]
+    pub osv_state: crate::osv_correlation::OsvLookupState,
     /// M6 ch6 — OSV advisories matching `(eco, name, version)`. Sourced from
     /// the shipping `threatdb_api.rs` OSV cache; no new feed.
     #[serde(default)]
@@ -473,27 +502,28 @@ pub struct ApiProvenance {
     /// diff above. Supersedes the inferred `ownership_transferred` flag.
     #[serde(default)]
     pub ownership_transfer: Option<OwnershipTransfer>,
+    /// M6 ch6 — the registry-claimed repository URL, when one is present in
+    /// the underlying response and looks usable (an https/ssh git host URL).
+    /// Threaded through here so [`Self::repository_url_for_check`] can return
+    /// it without re-fetching, and so the `PackageRepoMismatch` rule actually
+    /// has data to consult through the `--online` package-risk path.
+    /// `None` when the registry API does not carry a repository field, or
+    /// the value present is empty / not a recognized URL shape.
+    #[serde(default)]
+    pub repository_url: Option<String>,
 }
 
 impl ApiProvenance {
     /// The registry-claimed repository URL when one is present in the
-    /// underlying response. This is exposed via [`crate::registry_history`]
-    /// and [`crate::repo_mismatch`]; `ApiProvenance` itself does NOT carry
-    /// the raw URL (that's a `RegistryMetadata` field) — instead, callers
-    /// that have it forward it through. Returns `None` here as a default for
-    /// older sites that haven't been retrofitted yet; see ch7 for full wiring.
+    /// underlying response. Carried on `ApiProvenance::repository_url`
+    /// (populated by `provenance_from_metadata`) so the `PackageRepoMismatch`
+    /// rule has data to consult through the `--online` package-risk path.
     ///
-    /// **Note:** the URL would naturally live on `ApiProvenance`, but the
-    /// shipping public surface intentionally exposes only *already-decided*
-    /// signals (booleans). We keep that contract — the URL is plumbed
-    /// separately by the registry-side seam.
+    /// Returns `None` when the registry API does not carry a repository
+    /// field, or when the value present is empty / not a recognized URL
+    /// shape (per [`crate::registry_api::is_usable_repo_url`]).
     pub fn repository_url_for_check(&self) -> Option<String> {
-        // For M6 ch6, repository_url is consumed at the registry-API site
-        // (where `RegistryMetadata` is still in scope). The provenance object
-        // does not preserve the raw URL today; this helper returns `None`
-        // here, and the CLI passes the URL directly into `repo_mismatch`. A
-        // future wave can promote the URL onto the provenance.
-        None
+        self.repository_url.clone()
     }
 }
 

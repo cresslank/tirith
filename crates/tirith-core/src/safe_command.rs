@@ -142,7 +142,7 @@ pub fn suggest(cmd: &str, shell: ShellType, verdict: &Verdict) -> Vec<SafeSugges
         if let Some(s) = build_sudo_narrow_suggestion(cmd, shell, &segments, verdict) {
             out.push(s);
         }
-        if let Some(s) = build_env_scrub_suggestion(cmd, verdict) {
+        if let Some(s) = build_env_scrub_suggestion(cmd, shell, verdict) {
             out.push(s);
         }
     }
@@ -609,8 +609,12 @@ fn rewrite_archive_list_first(segments: &[tokenize::Segment], shell: ShellType) 
         return None;
     }
     let raw = seg.raw.trim();
+    // `tar -tf` (NO compression flag) works for .tar / .tar.gz / .tar.bz2 /
+    // .tar.xz / .tar.zst on modern GNU & BSD tar — the binary auto-detects
+    // compression from the archive's magic bytes. Hard-coding `-tzf` (gzip)
+    // would break the preview step for every non-gzip tar variant.
     Some(match kind {
-        "tar" => format!("tar -tzf {archive} | head && {raw}"),
+        "tar" => format!("tar -tf {archive} | head && {raw}"),
         "unzip" => format!("unzip -l {archive} | head && {raw}"),
         "7z" => format!("7z l {archive} | head && {raw}"),
         _ => return None,
@@ -920,16 +924,36 @@ fn sensitive_env_set_in_process() -> Vec<&'static str> {
 }
 
 /// Build an env-scrub suggestion for the verdict when:
-///  (i)  at least one finding is High severity or above, AND
-///  (ii) at least one sensitive env var is currently set in this process.
+///  (i)   at least one finding is High severity or above, AND
+///  (ii)  at least one sensitive env var is currently set in this process,
+///        AND
+///  (iii) the shell is a POSIX shell (bash/zsh/sh/fish/posix) — `env -u`
+///        does not exist on PowerShell, so we'd emit a broken "safe
+///        command". Detect-and-decline for PowerShell rather than ship a
+///        rewrite that won't execute.
 ///
-/// Returns `None` otherwise — there is no env to scrub.
-fn build_env_scrub_suggestion(cmd: &str, verdict: &Verdict) -> Option<SafeSuggestion> {
+/// Returns `None` otherwise.
+fn build_env_scrub_suggestion(
+    cmd: &str,
+    shell: ShellType,
+    verdict: &Verdict,
+) -> Option<SafeSuggestion> {
     let any_high = verdict
         .findings
         .iter()
         .any(|f| f.severity >= Severity::High);
     if !any_high {
+        return None;
+    }
+
+    // `env -u VAR1 -u VAR2 ... <cmd>` is POSIX-only. On PowerShell the
+    // equivalent is per-var `$env:VAR = $null` lines, which can't be
+    // expressed as a single inline command without changing semantics
+    // (the lines would mutate the *caller's* session env, not just the
+    // child's). Decline rather than ship a broken rewrite. The user's
+    // remediation field in the per-rule guidance covers the PowerShell
+    // manual unset path.
+    if shell == ShellType::PowerShell {
         return None;
     }
 

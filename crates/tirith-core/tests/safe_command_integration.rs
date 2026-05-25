@@ -214,13 +214,32 @@ fn archive_list_first_positive_tar_xzf() {
         .safe_command
         .as_deref()
         .expect("archive-list-first should rewrite a known tar invocation");
+    // The preview uses `tar -tf` (no compression flag) so it works for
+    // .tar / .tar.gz / .tar.bz2 / .tar.xz / .tar.zst — modern GNU/BSD tar
+    // auto-detects compression from the archive's magic bytes. Hard-coding
+    // `-tzf` would have broken the preview step for every non-gzip variant.
     assert!(
-        sc.starts_with("tar -tzf foo.tar.gz | head"),
-        "expected preview-first sequence, got: {sc}"
+        sc.starts_with("tar -tf foo.tar.gz | head"),
+        "expected preview-first sequence with `tar -tf`, got: {sc}"
     );
     assert!(
         sc.contains(" && tar -xzf foo.tar.gz"),
         "expected the original extract on the && tail: {sc}"
+    );
+}
+
+#[test]
+fn archive_list_first_positive_tar_bz2_uses_universal_tf() {
+    // .tar.bz2 must NOT use `-tjf` either — the universal `tar -tf` form
+    // covers it via tar's magic-byte auto-detection.
+    let cmd = "tar -xjf foo.tar.bz2";
+    let v = verdict_with(vec![finding(RuleId::ArchiveExtract)]);
+    let s = suggest(cmd, ShellType::Posix, &v);
+    let entry = find_by_rule(&s, "archive_extract").expect("rule entry");
+    let sc = entry.safe_command.as_deref().expect("rewrite expected");
+    assert!(
+        sc.starts_with("tar -tf foo.tar.bz2 | head"),
+        "expected universal `tar -tf` preview for bz2, got: {sc}"
     );
 }
 

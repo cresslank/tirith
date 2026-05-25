@@ -9,8 +9,10 @@
 //! discards fields the struct does not know about, so a migration that runs
 //! after deserialization cannot see (let alone rename) those fields.
 //!
-//! At M5.5 the registry is empty — every shipping policy is `v1` and
-//! `CURRENT_SCHEMA_VERSION` equals `1`. Each later wave that changes the
+//! As of M6 ch7 the registry has one entry: `v1 → v2` moves the legacy
+//! top-level `internal_package_names: [String]` list under
+//! `package_policy.internal_package_names: [{name}]`.
+//! [`CURRENT_SCHEMA_VERSION`] is now `2`. Each later wave that changes the
 //! policy shape bumps the version and registers a forward migration here.
 //!
 //! Loaders accept any version ≤ `CURRENT_SCHEMA_VERSION`; a policy file
@@ -68,8 +70,20 @@ fn migrate_v1_to_v2(value: &mut Value) {
         return;
     };
     let mut new_entries: Vec<Value> = Vec::new();
-    for entry in seq {
-        let Some(s) = entry.as_str() else { continue };
+    for (idx, entry) in seq.iter().enumerate() {
+        let Some(s) = entry.as_str() else {
+            // The v1 shape is `internal_package_names: [String]`. Anything
+            // else here (a v2-shape map someone hand-pasted, a number, null)
+            // is a forward-migration error the operator should know about —
+            // their intent is unrecoverable here, but silent drop hides
+            // configuration drift. Print one stderr line per malformed
+            // entry, then continue so the rest of the list migrates.
+            eprintln!(
+                "tirith: migration warning: v1→v2 internal_package_names[{idx}] is not a \
+                 string ({entry:?}); dropped — the v1 shape is `[\"name1\", \"name2\", ...]`",
+            );
+            continue;
+        };
         let mut entry_map = serde_yaml::Mapping::new();
         entry_map.insert(
             Value::String("name".to_string()),

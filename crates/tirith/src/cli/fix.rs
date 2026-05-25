@@ -8,11 +8,12 @@
 //!
 //! ## Exit codes (deliberately distinct from `tirith check`)
 //!
-//! | code | meaning                                                            |
-//! |------|--------------------------------------------------------------------|
-//! | 0    | no fix needed (verdict was Allow) OR user accepted a rewrite       |
-//! | 1    | findings exist but no mechanical rewrite is available              |
-//! | 2    | user rejected the rewrite, or stdin/stdout is not a TTY            |
+//! | code | meaning                                                                                  |
+//! |------|------------------------------------------------------------------------------------------|
+//! | 0    | no fix needed (verdict was Allow) OR user accepted a rewrite                             |
+//! | 1    | findings exist but no mechanical rewrite is available                                    |
+//! | 2    | user rejected, JSON write failed, stdin/stderr is not a TTY, OR --non-interactive run    |
+//! |      | with rewrites present (the JSON IS the deliverable, but it can't be auto-applied)        |
 //!
 //! `check` uses 0/1/2/3 (allow/block/warn/warn-ack) — those codes are tied to
 //! *verdict severity*. `fix`'s codes are tied to *whether a rewrite was
@@ -21,10 +22,12 @@
 //!
 //! ## TTY gating
 //!
-//! Interactive mode requires BOTH `stdin` and `stdout` to be a TTY. Reading
-//! from a redirected stdin or writing a prompt into a pipe is a footgun — see
-//! the `cli::lab::run` precedent (`main.rs:2386-2389`). A `--non-interactive`
-//! flag or a non-TTY surface forces JSON-emit-and-exit behavior.
+//! Interactive mode requires BOTH `stdin` and `stderr` to be a TTY. Reading
+//! from a redirected stdin or writing a prompt into a pipe is a footgun.
+//! Stdout is intentionally reserved for the chosen `safe_command` so users
+//! can wrap the call with `$(tirith fix …)` / `eval "$(tirith fix …)"` and
+//! capture the rewrite. A `--non-interactive` flag or a non-TTY stdin/stderr
+//! pair forces JSON-emit-and-exit behavior.
 //!
 //! ## JSON shape (`--json` / `--non-interactive`)
 //!
@@ -73,12 +76,17 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
     let cmd = command_parts.join(" ");
     if cmd.trim().is_empty() {
         if json || non_interactive {
-            emit_no_findings_envelope(&FixEnvelope {
+            // Surface JSON write failures (broken pipe, truncated output)
+            // via exit code 2 — a piped consumer must not treat truncated
+            // JSON as the documented `applied:false / no_findings` envelope.
+            if !emit_no_findings_envelope(&FixEnvelope {
                 applied: false,
                 reason: "no_findings",
                 verdict: "allow",
                 command: "",
-            });
+            }) {
+                return 2;
+            }
         } else {
             println!("no fix needed");
         }
@@ -116,12 +124,14 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
     // Allow path: nothing to fix. Emit shape per output mode.
     if verdict.action == Action::Allow {
         if json || non_interactive {
-            emit_no_findings_envelope(&FixEnvelope {
+            if !emit_no_findings_envelope(&FixEnvelope {
                 applied: false,
                 reason: "no_findings",
                 verdict: action_str(verdict.action),
                 command: &cmd,
-            });
+            }) {
+                return 2;
+            }
         } else {
             println!("no fix needed");
         }
@@ -139,7 +149,9 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
     // the latter for the common `--non-interactive` flow.
     if json || non_interactive {
         let has_rewrite = suggestions.iter().any(|s| s.safe_command.is_some());
-        emit_suggestions_array(&suggestions);
+        if !emit_suggestions_array(&suggestions) {
+            return 2;
+        }
         return if has_rewrite { 2 } else { 1 };
     }
 
@@ -162,9 +174,10 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
         return 1;
     }
 
-    // Interactive mode requires BOTH stdin and stdout to be TTYs. Without
-    // that, we can't honestly prompt. The lab.rs dispatcher gates the same
-    // way (`main.rs:2386-2389`).
+    // Interactive mode requires BOTH stdin and stderr to be TTYs. Without
+    // that, we can't honestly prompt — see `is_tty_pair` below for why
+    // we gate on stderr (not stdout, which is the `$(tirith fix …)` capture
+    // surface).
     if !is_tty_pair() {
         // Surface what the user would have seen, then refuse to apply. Exit 2
         // signals "rewrite was available but I couldn't get an accept signal"
@@ -272,10 +285,14 @@ fn action_str(a: Action) -> &'static str {
 
 /// Helper kept local (the spec explicitly says to mirror lab.rs's pattern).
 ///
-/// Interactive mode requires BOTH stdin and stdout to be a TTY. Either being
-/// piped/redirected disqualifies — we never prompt into a non-TTY.
+/// Interactive mode requires BOTH stdin and STDERR to be a TTY. The prompt
+/// goes to stderr (so stdout stays clean for the `$(tirith fix …)` capture
+/// contract — accepting a rewrite prints exactly the chosen `safe_command`
+/// to stdout on its own line), so gating on stdout being a TTY would reject
+/// the documented `eval "$(tirith fix ...)"` interactive flow. We check
+/// stderr instead — that's the surface we actually need a TTY for.
 fn is_tty_pair() -> bool {
-    is_terminal::is_terminal(std::io::stdin()) && is_terminal::is_terminal(std::io::stdout())
+    is_terminal::is_terminal(std::io::stdin()) && is_terminal::is_terminal(std::io::stderr())
 }
 
 /// Stable JSON envelope used ONLY for the no-findings case (verdict was

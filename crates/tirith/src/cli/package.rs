@@ -88,8 +88,25 @@ pub fn scan(
         }
     };
 
+    // Fail fast on non-UTF-8 paths rather than silently falling back to the
+    // cwd. `ecosystem::scan` takes `Option<&str>` (None = use cwd), so a
+    // `to_str()` that returns `None` would otherwise mean a non-UTF-8 path
+    // is dropped entirely and the scan target silently changes. Erroring
+    // explicitly preserves the operator's intent.
+    let effective_path_str = match effective_path.to_str() {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "tirith package scan: path {:?} is not valid UTF-8; \
+                 tirith can scan UTF-8 paths only.",
+                effective_path.display()
+            );
+            return 2;
+        }
+    };
+
     super::ecosystem::scan(
-        effective_path.to_str(),
+        Some(effective_path_str),
         online,
         offline,
         effective_installed,
@@ -277,20 +294,32 @@ fn gather_api(
         provenance.package_existence = existence;
         // Snapshot-store write — reuses the fetched response, no extra call.
         let _ = tirith_core::registry_history::record_snapshot(eco, name, provenance);
-        // Diff against the previous snapshot, when one exists.
-        if let Some(history) = tirith_core::registry_history::diff_recent(eco, name) {
-            provenance.maintainer_change_history = Some(history.clone());
-            if history.is_full_ownership_transfer() {
-                provenance.ownership_transfer =
-                    Some(tirith_core::registry_history::synthesize_transfer(&history));
+        // Diff against the previous snapshot, when one exists. We need BOTH
+        // the diff (for the `MaintainerChangeHistory`) and the full older /
+        // newer snapshot sets (for the `OwnershipTransfer`) — the diff-only
+        // view cannot distinguish "alice + bob + carol → alice + dave"
+        // (partial, alice stays) from "alice + bob + carol → dave + eve"
+        // (full takeover). `diff_and_transfer_recent` returns the transfer
+        // ONLY when no original maintainer survives, which is the honest
+        // signal `provenance.ownership_transfer` is documented to carry.
+        if let Some((history, transfer)) =
+            tirith_core::registry_history::diff_and_transfer_recent(eco, name)
+        {
+            provenance.maintainer_change_history = Some(history);
+            if let Some(t) = transfer {
+                provenance.ownership_transfer = Some(t);
             }
         }
         // OSV correlation through the shipping `threatdb_api.rs` cache.
-        // Requires a version to do anything useful.
+        // Requires a version to do anything useful. We capture the
+        // `OsvLookupState` so the explainer can render "(no advisories
+        // verified)" vs "(OSV check unavailable: reason)" rather than have
+        // an empty `osv_advisories` ambiguously mean either.
         if let Some(v) = version {
-            let advs = tirith_core::osv_correlation::for_package(eco, name, v);
-            if !advs.is_empty() {
-                provenance.osv_advisories = Some(advs);
+            let result = tirith_core::osv_correlation::for_package_with_state(eco, name, v);
+            provenance.osv_state = result.state;
+            if !result.advisories.is_empty() {
+                provenance.osv_advisories = Some(result.advisories);
             }
         }
         // Dep-confusion (offline-safe heuristic).

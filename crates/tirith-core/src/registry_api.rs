@@ -291,6 +291,15 @@ pub fn provenance_from_metadata(meta: &RegistryMetadata) -> ApiProvenance {
     // `Some(false)` (the field exists but holds no usable URL).
     let has_source_repo = meta.repository_url.as_deref().map(is_usable_repo_url);
 
+    // Carry the repository URL on the provenance ONLY when it parses as a
+    // usable URL — `PackageRepoMismatch` and the snapshot store both want a
+    // URL that can plausibly be fetched, not the raw, possibly-empty field.
+    let repository_url = meta
+        .repository_url
+        .as_deref()
+        .filter(|u| is_usable_repo_url(u))
+        .map(|s| s.to_string());
+
     #[allow(deprecated)] // M6 ch6 grace period — the field is still emitted
     ApiProvenance {
         source: meta.source.clone(),
@@ -302,6 +311,7 @@ pub fn provenance_from_metadata(meta: &RegistryMetadata) -> ApiProvenance {
         has_source_repo,
         yanked_or_deprecated: meta.yanked_or_deprecated,
         latest_version: meta.latest_version.clone(),
+        repository_url,
         ..Default::default()
     }
 }

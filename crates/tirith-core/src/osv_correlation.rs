@@ -33,6 +33,51 @@ use crate::package_risk::OsvAdvisorySummary;
 use crate::policy;
 use crate::threatdb::Ecosystem;
 
+/// Outcome of an OSV lookup. Distinguishes "we asked OSV and got no
+/// advisories" from "we couldn't ask" — they look identical to the score
+/// model when the result is just `Vec<…>` (both produce empty).
+///
+/// Surfaced through [`ApiProvenance::osv_state`] so the explainer can render
+/// `"(no advisories)"` honestly when verified, vs `"(OSV check
+/// unavailable: timeout)"` when the lookup failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case", tag = "state", content = "reason")]
+pub enum OsvLookupState {
+    /// The lookup was not attempted (offline run, unsupported ecosystem, or
+    /// no version was supplied). The default.
+    #[default]
+    NotChecked,
+    /// The lookup completed; the (possibly empty) advisory set is verified.
+    Verified,
+    /// The lookup was attempted but failed (network error, parse error,
+    /// timeout). The advisory set should be treated as unknown, not empty.
+    Unavailable(String),
+}
+
+/// Result of an OSV lookup. Pairs the advisory list with the state so the
+/// caller can record `osv_state: Unavailable(reason)` for failed lookups
+/// rather than treat an empty `Vec` as "clean".
+#[derive(Debug, Clone)]
+pub struct OsvLookupResult {
+    pub advisories: Vec<OsvAdvisorySummary>,
+    pub state: OsvLookupState,
+}
+
+impl OsvLookupResult {
+    pub fn verified(advisories: Vec<OsvAdvisorySummary>) -> Self {
+        Self {
+            advisories,
+            state: OsvLookupState::Verified,
+        }
+    }
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            advisories: Vec::new(),
+            state: OsvLookupState::Unavailable(reason.into()),
+        }
+    }
+}
+
 /// Reuse the shipping `threatdb_api.rs` TTL — 1 hour. Documented there as the
 /// freshness window for OSV; matching it keeps the two paths consistent.
 const CACHE_TTL_SECS: u64 = 3600;
@@ -40,33 +85,44 @@ const CACHE_TTL_SECS: u64 = 3600;
 /// beats a long hang.
 const REQUEST_TIMEOUT_SECS: u64 = 10;
 
-/// Resolve OSV advisories for `(eco, name, version)` via the shared cache.
-///
-/// Returns an empty vector when the ecosystem has no OSV mapping (e.g. the
-/// distro/docker/go backends with no public OSV equivalent), when offline
-/// mode is active, or on any network / parse failure — honest no-data.
-pub fn for_package(eco: Ecosystem, name: &str, version: &str) -> Vec<OsvAdvisorySummary> {
+/// Resolve OSV advisories for `(eco, name, version)`, returning the
+/// advisory list AND the lookup state. This is the canonical entry point —
+/// it lets a caller distinguish "OSV says no advisories" (Verified, []) from
+/// "we couldn't reach OSV" (Unavailable, []), which the legacy
+/// [`for_package`] (returns `Vec` only) cannot.
+pub fn for_package_with_state(eco: Ecosystem, name: &str, version: &str) -> OsvLookupResult {
     let Some(eco_name) = osv_ecosystem_name(eco) else {
-        return Vec::new();
+        // No OSV mapping for distro/docker — this is a deterministic skip,
+        // not a failure. Render as Unavailable with an honest reason; the
+        // caller can suppress display when the ecosystem is known-unmapped.
+        return OsvLookupResult::unavailable(format!(
+            "{eco:?} has no OSV mapping; lookup deliberately skipped",
+        ));
     };
     let cache_key = format!("{}:{name}:{version}", eco_label(eco));
 
     // Cache hit?
     if let Some(cached) = load_cache::<Vec<OsvAdvisorySummary>>(&cache_key) {
-        return cached;
+        return OsvLookupResult::verified(cached);
     }
 
     // Cache miss — issue the same POST the shipping `threatdb_api.rs` path
-    // makes. (We could call into that module directly, but its types are
-    // private to the module by design; reproducing the request keeps the
-    // adapter thin and self-contained.)
+    // makes. A `None` here means the network/parse step failed; we cannot
+    // claim "verified empty" from a failed lookup.
     let advs = match query_osv_sync(eco_name, name, version) {
         Some(v) => v,
-        None => return Vec::new(),
+        None => return OsvLookupResult::unavailable("osv.dev query failed (network/parse error)"),
     };
 
     store_cache(&cache_key, &advs);
-    advs
+    OsvLookupResult::verified(advs)
+}
+
+/// Legacy shape — returns just the advisory list. Empty here can mean any
+/// of: ecosystem not mapped, offline, lookup failed, OR genuinely no
+/// advisories. New code should prefer [`for_package_with_state`].
+pub fn for_package(eco: Ecosystem, name: &str, version: &str) -> Vec<OsvAdvisorySummary> {
+    for_package_with_state(eco, name, version).advisories
 }
 
 // ---------------------------------------------------------------------------
@@ -207,26 +263,155 @@ fn query_osv_sync(
     Some(summaries)
 }
 
-/// Parse the CVSS v3 base score out of an OSV `severity` array. OSV records a
-/// CVSS string like `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H` with the
-/// base score not embedded; we accept either the full vector or a bare
-/// numeric (some advisories emit `"score": "9.8"`). We pull a numeric if
-/// present, otherwise return `None` and let the rule fire at its default
-/// Medium severity.
+/// Parse the CVSS v3 base score out of an OSV `severity` array.
+///
+/// OSV's `severity[].score` carries one of two shapes:
+///  * a bare numeric (`"7.5"`) — some advisory feeds emit this directly;
+///  * the standard CVSS v3 vector
+///    (`CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`) — overwhelmingly more
+///    common in real `/v1/query` responses.
+///
+/// We compute the base score from the vector when present so a real OSV
+/// response (vector-form) actually produces a usable score for the
+/// `block_osv_min_cvss` gate. Otherwise we fall back to parsing a bare
+/// numeric. Returns `None` only when the field is entirely unparseable —
+/// the rule then fires at its default Medium severity.
+///
+/// The implementation follows the CVSS v3.1 specification's base-score
+/// equations directly (FIRST.org's published formulas).
 fn parse_cvss3_base(severity: &[OsvSeverity]) -> Option<f32> {
     severity
         .iter()
         .find(|s| s.sev_type.starts_with("CVSS_V3"))
         .and_then(|s| {
-            // Bare numeric form ("7.5")
-            if let Ok(v) = s.score.trim().parse::<f32>() {
+            let trimmed = s.score.trim();
+            // Bare numeric form ("7.5") — some advisories emit just a score.
+            if let Ok(v) = trimmed.parse::<f32>() {
                 return Some(v);
             }
-            // Vector form — no base score embedded; we don't ship a vector
-            // calculator. Return None; the consumer treats this as "unknown
-            // CVSS, fall back to source-claimed severity".
-            None
+            // Vector form — `CVSS:3.x/AV:N/AC:L/.../A:H`. Compute from the
+            // base metrics per the v3.1 spec.
+            compute_cvss3_base_from_vector(trimmed)
         })
+}
+
+/// Compute the CVSS v3 base score from a vector string per the v3.1
+/// specification. Returns `None` if any required base metric is missing or
+/// the metric value is not in the spec's allowed enum.
+///
+/// Only base metrics (AV/AC/PR/UI/S/C/I/A) are read — temporal and
+/// environmental metrics, if present, are ignored. Scoped (S:C) PR scoring
+/// uses the changed-scope PR weights per the spec.
+fn compute_cvss3_base_from_vector(vector: &str) -> Option<f32> {
+    // Strip the `CVSS:3.x/` prefix and collect the metric pairs.
+    let body = vector
+        .strip_prefix("CVSS:3.1/")
+        .or_else(|| vector.strip_prefix("CVSS:3.0/"))?;
+
+    let mut av: Option<&str> = None;
+    let mut ac: Option<&str> = None;
+    let mut pr: Option<&str> = None;
+    let mut ui: Option<&str> = None;
+    let mut scope: Option<&str> = None;
+    let mut c: Option<&str> = None;
+    let mut i: Option<&str> = None;
+    let mut a: Option<&str> = None;
+
+    for pair in body.split('/') {
+        let (k, v) = pair.split_once(':')?;
+        match k {
+            "AV" => av = Some(v),
+            "AC" => ac = Some(v),
+            "PR" => pr = Some(v),
+            "UI" => ui = Some(v),
+            "S" => scope = Some(v),
+            "C" => c = Some(v),
+            "I" => i = Some(v),
+            "A" => a = Some(v),
+            _ => {}
+        }
+    }
+
+    let av_w = match av? {
+        "N" => 0.85_f32,
+        "A" => 0.62,
+        "L" => 0.55,
+        "P" => 0.20,
+        _ => return None,
+    };
+    let ac_w = match ac? {
+        "L" => 0.77_f32,
+        "H" => 0.44,
+        _ => return None,
+    };
+    let s_changed = match scope? {
+        "U" => false,
+        "C" => true,
+        _ => return None,
+    };
+    let pr_w = match (pr?, s_changed) {
+        ("N", _) => 0.85_f32,
+        ("L", false) => 0.62,
+        ("L", true) => 0.68,
+        ("H", false) => 0.27,
+        ("H", true) => 0.50,
+        _ => return None,
+    };
+    let ui_w = match ui? {
+        "N" => 0.85_f32,
+        "R" => 0.62,
+        _ => return None,
+    };
+    let cia = |s: &str| -> Option<f32> {
+        Some(match s {
+            "N" => 0.0,
+            "L" => 0.22,
+            "H" => 0.56,
+            _ => return None,
+        })
+    };
+    let c_w = cia(c?)?;
+    let i_w = cia(i?)?;
+    let a_w = cia(a?)?;
+
+    // ISS = 1 - ((1 - C) * (1 - I) * (1 - A))
+    let iss = 1.0 - ((1.0 - c_w) * (1.0 - i_w) * (1.0 - a_w));
+    // Impact = 6.42 * ISS                 if S:U
+    // Impact = 7.52 * (ISS - 0.029) - 3.25 * (ISS - 0.02)^15  if S:C
+    let impact = if s_changed {
+        7.52 * (iss - 0.029) - 3.25 * (iss - 0.02).powi(15)
+    } else {
+        6.42 * iss
+    };
+    if impact <= 0.0 {
+        return Some(0.0);
+    }
+    // Exploitability = 8.22 * AV * AC * PR * UI
+    let exploitability = 8.22 * av_w * ac_w * pr_w * ui_w;
+    // BaseScore =
+    //   if S:U → roundup(min(Impact + Exploitability, 10))
+    //   if S:C → roundup(min(1.08 * (Impact + Exploitability), 10))
+    let raw = if s_changed {
+        (1.08 * (impact + exploitability)).min(10.0)
+    } else {
+        (impact + exploitability).min(10.0)
+    };
+    Some(cvss_roundup(raw))
+}
+
+/// CVSS v3.1 roundup — round to the nearest one decimal place, away from
+/// zero. The spec specifies this exact operation (Section 7.1, Appendix A).
+fn cvss_roundup(input: f32) -> f32 {
+    // Multiply by 100,000 and use integer arithmetic to avoid floating-point
+    // surprises. Per the spec: if the value is already at one decimal
+    // (mantissa is a multiple of 10,000), return as-is; otherwise round
+    // *up* to the next 0.1.
+    let int_input = (input * 100_000.0).round() as i64;
+    if int_input % 10_000 == 0 {
+        int_input as f32 / 100_000.0
+    } else {
+        ((int_input / 10_000) + 1) as f32 / 10.0
+    }
 }
 
 fn eco_label(eco: Ecosystem) -> &'static str {
@@ -291,12 +476,51 @@ mod tests {
     }
 
     #[test]
-    fn cvss_vector_form_returns_none() {
+    fn cvss_vector_form_incomplete_returns_none() {
+        // Missing required base metrics — vector parser must decline rather
+        // than fabricate a score.
         let sev = vec![OsvSeverity {
             sev_type: "CVSS_V3".to_string(),
             score: "CVSS:3.1/AV:N/AC:L".to_string(),
         }];
         assert_eq!(parse_cvss3_base(&sev), None);
+    }
+
+    #[test]
+    fn cvss_vector_critical_full_impact_unchanged_scope() {
+        // CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H — the canonical "10.0
+        // critical" vector. Verifies the FIRST.org spec equations end-to-end.
+        let sev = vec![OsvSeverity {
+            sev_type: "CVSS_V3".to_string(),
+            score: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".to_string(),
+        }];
+        let v = parse_cvss3_base(&sev).expect("vector should parse");
+        assert!((9.7..=10.0).contains(&v), "expected ≈10.0, got {v}");
+    }
+
+    #[test]
+    fn cvss_vector_high_partial_impact() {
+        // CVSS:3.1/AV:N/AC:H/PR:H/UI:R/S:U/C:H/I:L/A:N — a real-world high.
+        let sev = vec![OsvSeverity {
+            sev_type: "CVSS_V3".to_string(),
+            score: "CVSS:3.1/AV:N/AC:H/PR:H/UI:R/S:U/C:H/I:L/A:N".to_string(),
+        }];
+        let v = parse_cvss3_base(&sev).expect("vector should parse");
+        // CVSS calculator: ≈ 4.7. Verifies it's in a sensible Medium range
+        // (above 0, below 7).
+        assert!((4.0..=5.5).contains(&v), "expected ≈4.7, got {v}");
+    }
+
+    #[test]
+    fn cvss_vector_changed_scope_uses_pr_changed_weights() {
+        // S:C with PR:L → the changed-scope PR weight (0.68 not 0.62).
+        let sev = vec![OsvSeverity {
+            sev_type: "CVSS_V3".to_string(),
+            score: "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H".to_string(),
+        }];
+        let v = parse_cvss3_base(&sev).expect("vector should parse");
+        // Per CVSS calculator: 10.0.
+        assert!(v >= 9.5, "expected ≈10.0, got {v}");
     }
 
     #[test]

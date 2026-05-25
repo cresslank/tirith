@@ -860,8 +860,9 @@ impl Policy {
             Ok(yaml) => {
                 let _ = cache_remote_policy(&yaml);
                 // Run schema migrations on the raw YAML before deserialization
-                // (M5.5 chunk F3). Registry is empty at M5.5 so this is a
-                // no-op for shipping policies; later waves rely on it.
+                // (M5.5 chunk F3). The v1→v2 migration registered by M6 ch7
+                // (legacy top-level `internal_package_names` → `package_policy`)
+                // runs on remote-fetched policies the same as local ones.
                 match Self::try_parse_yaml(&yaml) {
                     Ok(mut p) => {
                         p.path = Some(format!("remote:{server_url}"));
@@ -960,10 +961,30 @@ impl Policy {
                     "tirith: warning: cannot read policy at {}: {e}",
                     path.display()
                 );
-                return Policy::default();
+                // Read failure on a NAMED policy file is a misconfiguration,
+                // not "no policy" — fail closed so an operator who shipped a
+                // `fail_mode: closed` policy isn't silently downgraded to
+                // open. The default open-policy branch is reserved for the
+                // "no policy file found anywhere" case (handled by the
+                // discovery walk, not this loader).
+                return Self::fail_closed_policy();
             }
         };
-        Self::load_from_yaml(&content, Some(&path.display().to_string()))
+        let source = path.display().to_string();
+        match Self::try_parse_yaml(&content) {
+            Ok(mut p) => {
+                p.path = Some(source);
+                p
+            }
+            Err(e) => {
+                eprintln!("tirith: warning: policy load failed at {source}: {e}");
+                // Same logic: a parse failure on a named policy file
+                // (typo, schema-future-version, etc.) hides the operator's
+                // configuration — fail closed rather than silently revert
+                // to the open default.
+                Self::fail_closed_policy()
+            }
+        }
     }
 
     /// Parse YAML text into a `Policy`, running schema migrations first.

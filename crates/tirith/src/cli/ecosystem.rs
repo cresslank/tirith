@@ -104,7 +104,7 @@ pub fn scan(
         return 2;
     }
 
-    let installed_effective = installed || env_force_installed();
+    let installed_effective = installed || force_installed_for_tests();
 
     // Pick the engine mode from the CLI surface. `installed` wins over a
     // manifest-only walk. When `path` points at a single file and that file
@@ -453,8 +453,8 @@ fn highest_risk_dependency(report: &EcosystemScanReport) -> Option<&DependencyAs
 /// Resolve the effective [`ScanMode`] from the CLI surface.
 ///
 /// Precedence:
-///  1. `--installed` (or the test-only `TIRITH_FORCE_INSTALLED` env var) →
-///     [`ScanMode::Installed`].
+///  1. `--installed` (or the debug-only `TIRITH_FORCE_INSTALLED` env var
+///     in test builds) → [`ScanMode::Installed`].
 ///  2. `path` points at a single file recognized as a manifest →
 ///     [`ScanMode::SpecificLockfile`] (the path-arg form of `--lockfile`).
 ///  3. Otherwise → [`ScanMode::Manifests`] (the shipping default).
@@ -473,8 +473,15 @@ pub(crate) fn pick_mode(scan_root: &Path, installed: bool) -> ScanMode {
 }
 
 /// `true` when the `TIRITH_FORCE_INSTALLED` env var is set — used only by
-/// tests to drive the installed-tree mode without re-shimming `Args`.
-fn env_force_installed() -> bool {
+/// tests to drive the installed-tree mode without re-shimming `Args`. The
+/// env override is GATED to debug builds (`cfg!(debug_assertions)`) so a
+/// release binary never honors `TIRITH_FORCE_INSTALLED` from an inherited
+/// environment — production behavior depends only on `--installed`, never
+/// on undocumented env vars.
+fn force_installed_for_tests() -> bool {
+    if !cfg!(debug_assertions) {
+        return false;
+    }
     std::env::var("TIRITH_FORCE_INSTALLED")
         .ok()
         .map(|v| !v.trim().is_empty())

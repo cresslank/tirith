@@ -47,14 +47,14 @@ pub fn run(
 /// log on a busy host doesn't burn unbounded CPU answering an `explain
 /// --finding` lookup. When the cap is hit without a match, the error
 /// names the cap and tells the operator to narrow the lookup via
-/// `tirith audit query` first.
+/// `tirith audit export --since` first.
 const AUDIT_SCAN_LIMIT: usize = 10_000;
 
 fn resolve_finding_id(id: &str) -> Result<RuleId, String> {
     let (event_id, index) = audit::parse_finding_id(id).ok_or_else(|| {
         format!(
             "malformed finding ID {id:?} — expected the form `<event_id>:<index>` \
-             (try `tirith audit query` to discover one)"
+             (try `tirith audit export --format json` to discover one)"
         )
     })?;
 
@@ -88,7 +88,7 @@ fn resolve_finding_id(id: &str) -> Result<RuleId, String> {
         if read.records.len() > AUDIT_SCAN_LIMIT {
             return Err(format!(
                 "finding ID {id:?} not found in the {scanned} most-recent audit entries (cap is {AUDIT_SCAN_LIMIT}); \
-                 narrow via `tirith audit query --since <duration>` and re-run"
+                 narrow via `tirith audit export --since <duration>` and re-run"
             ));
         }
         return Err(format!(

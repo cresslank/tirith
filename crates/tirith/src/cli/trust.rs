@@ -1406,6 +1406,18 @@ pub fn audit(since: Option<&str>, json: bool) -> i32 {
         }
     };
 
+    // Surface malformed-line skips: a partial write or a corrupted log
+    // silently dropped rows would otherwise be invisible to an operator
+    // running `trust audit` to chase a missing entry. Human shape prints
+    // to stderr; JSON shape includes it in the envelope below.
+    if result.skipped_lines > 0 && !json {
+        eprintln!(
+            "tirith: trust audit: skipped {} malformed audit log line(s) at {}",
+            result.skipped_lines,
+            log_path.display(),
+        );
+    }
+
     #[derive(Serialize)]
     struct TrustAuditRow {
         timestamp: String,
@@ -1441,7 +1453,12 @@ pub fn audit(since: Option<&str>, json: bool) -> i32 {
     }
 
     if json {
-        return print_json(&serde_json::json!({"entries": rows}));
+        // Include the skipped-line count so a JSON consumer can detect a
+        // partial / corrupted audit log without having to parse stderr.
+        return print_json(&serde_json::json!({
+            "entries": rows,
+            "skipped_lines": result.skipped_lines,
+        }));
     }
 
     if rows.is_empty() {
