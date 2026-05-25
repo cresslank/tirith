@@ -6980,3 +6980,177 @@ fn fix_empty_command_is_no_op_exit_zero() {
         .expect("failed to run tirith");
     assert_eq!(out.status.code(), Some(0));
 }
+
+// ─── M7 ch2 — `tirith share` / `tirith redact` ───────────────────
+
+/// `tirith share --target github-issue` must redact AWS keys but
+/// preserve Python stack traces — file paths and line numbers help
+/// the issue reader debug.
+#[test]
+fn share_github_issue_redacts_aws_key_preserves_stack_trace() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("crash.log");
+    let body = "\
+Traceback (most recent call last):
+  File \"/srv/app/handler.py\", line 42, in handle
+    raise RuntimeError(boom)
+RuntimeError: boom
+secret=AKIAIOSFODNN7EXAMPLE
+";
+    fs::write(&fixture, body).unwrap();
+
+    let out = tirith()
+        .args([
+            "share",
+            "--target",
+            "github-issue",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run tirith share");
+    assert_eq!(out.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("AKIAIOSFODNN7EXAMPLE"),
+        "AWS key must be redacted, got stdout: {stdout}"
+    );
+    // The stack trace pieces must survive.
+    assert!(
+        stdout.contains("Traceback"),
+        "stack trace marker must survive, got stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("File \"/srv/app/handler.py\", line 42"),
+        "file:line context must survive, got stdout: {stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("target=github-issue"),
+        "summary must name the target, got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("aws_access_key"),
+        "summary must mention the aws_access_key label, got stderr: {stderr}"
+    );
+}
+
+/// `tirith share --target public-paste` is stricter: also redacts
+/// private IPs in hostname context.
+#[test]
+fn share_public_paste_redacts_private_ip_in_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("net.log");
+    fs::write(&fixture, "server 10.0.0.5 timed out\n").unwrap();
+
+    let out = tirith()
+        .args([
+            "share",
+            "--target",
+            "public-paste",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run tirith share");
+    assert_eq!(out.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("10.0.0.5"),
+        "private IP in hostname context must be redacted on public-paste, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("[REDACTED:private_ipv4]"),
+        "private IP must be replaced with the labeled marker, got: {stdout}"
+    );
+    // The keyword "server" must be preserved so the line remains
+    // human-readable.
+    assert!(
+        stdout.contains("server "),
+        "keyword 'server' must survive, got: {stdout}"
+    );
+}
+
+/// `tirith share --json` emits a `{ redacted_content, redactions }`
+/// envelope. We don't assert the full content here — only that the
+/// shape is valid JSON with the documented top-level keys.
+#[test]
+fn share_json_emits_documented_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("data.log");
+    fs::write(&fixture, "key=AKIAIOSFODNN7EXAMPLE\n").unwrap();
+
+    let out = tirith()
+        .args([
+            "share",
+            "--target",
+            "llm",
+            "--json",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run tirith share");
+    assert_eq!(out.status.code(), Some(0));
+
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("share --json must emit valid JSON");
+    assert!(v.get("redacted_content").is_some());
+    assert!(v.get("redactions").is_some());
+    let redactions = v["redactions"].as_array().expect("redactions is array");
+    assert!(!redactions.is_empty(), "expected at least one redaction");
+    let row = &redactions[0];
+    assert!(row.get("label").is_some());
+    assert!(row.get("count").is_some());
+}
+
+/// `tirith redact --audience slack` reads stdin and writes redacted
+/// content to stdout. Same engine as `share`, no file argument.
+#[test]
+fn redact_stdin_with_audience_writes_to_stdout() {
+    let mut child = tirith()
+        .args(["redact", "--audience", "slack"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn tirith redact");
+
+    {
+        let stdin = child.stdin.as_mut().expect("stdin pipe");
+        use std::io::Write as _;
+        stdin
+            .write_all(b"server srv1.eng.corp key=AKIAIOSFODNN7EXAMPLE\n")
+            .unwrap();
+    }
+    let out = child.wait_with_output().expect("wait");
+    assert_eq!(out.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("AKIAIOSFODNN7EXAMPLE"));
+    // Internal hostname class is stripped on slack.
+    assert!(
+        !stdout.contains("srv1.eng.corp"),
+        "internal hostname must be redacted on slack: {stdout}"
+    );
+}
+
+/// Unknown `--target` produces a clap error and a non-zero exit. This
+/// pins the value_parser contract — silently accepting a typo would
+/// quietly downgrade the redaction strength.
+#[test]
+fn share_rejects_unknown_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("x.log");
+    fs::write(&fixture, "hello\n").unwrap();
+    let out = tirith()
+        .args(["share", "--target", "zoom-chat", fixture.to_str().unwrap()])
+        .output()
+        .expect("failed to run tirith");
+    assert_ne!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("github-issue") || stderr.contains("possible values"),
+        "error must list valid values, got: {stderr}"
+    );
+}

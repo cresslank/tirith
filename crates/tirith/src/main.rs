@@ -1085,6 +1085,76 @@ Examples:
         #[command(subcommand)]
         action: OutputAction,
     },
+
+    /// Redact a file before sharing it externally (M7 ch2)
+    #[command(after_help = "\
+Audience presets control what gets stripped IN ADDITION to credentials
+(which are always stripped):
+
+  github-issue  — strips credentials + internal hostnames
+                  (`*.corp`, `*.internal`, `*.local`, `*.lan`).
+                  Preserves repo paths, stack traces, line numbers.
+  slack         — same as github-issue.
+  llm           — strips credentials only. Preserves stack traces, line
+                  numbers, repo paths, /home/<user>. An LLM benefits
+                  from this context for debugging.
+  public-paste  — MOST aggressive: also strips /home/<user>,
+                  /Users/<user>, and RFC1918 private IPs that appear in
+                  hostname context (e.g. `server 10.0.0.5`). Public DNS
+                  like 1.1.1.1 is left alone.
+  generic       — same as llm. Safe default when no audience is known.
+
+The redacted content goes to stdout (or --out <path> if given). A
+per-label summary of how many items were removed prints to stderr. With
+--json, the envelope is `{ redacted_content, redactions: [...] }`.
+
+Customer / tenant / case IDs are repo-specific and NOT shipped as
+built-ins; configure them via `policy.share.customer_id_patterns`.
+
+Examples:
+  tirith share --target llm ./fixture.log
+  tirith share --target public-paste --out /tmp/safe.log ./fixture.log
+  tirith share --target github-issue --json ./fixture.log")]
+    Share {
+        /// File to redact. Use `-` (or omit) to read stdin.
+        path: Option<String>,
+
+        /// Audience preset: github-issue | slack | llm | public-paste | generic.
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(tirith_core::redact::ShareAudience::cli_values()))]
+        target: String,
+
+        /// Write redacted content to this file instead of stdout. Use `-`
+        /// for stdout (the default).
+        #[arg(long)]
+        out: Option<String>,
+
+        /// Output a `{ redacted_content, redactions: [...] }` JSON envelope.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Read stdin, write redacted content to stdout (M7 ch2)
+    #[command(after_help = "\
+Streams stdin → stdout, applying the same audience-aware redaction engine
+as `tirith share`. Useful for pipelines:
+
+  cat error.log | tirith redact --audience slack | pbcopy
+  kubectl logs my-pod | tirith redact --audience public-paste > safe.log
+
+See `tirith share --help` for what each audience strips.
+
+Examples:
+  cat ./fixture.log | tirith redact --audience slack
+  cat ./fixture.log | tirith redact --audience public-paste --json")]
+    Redact {
+        /// Audience preset: github-issue | slack | llm | public-paste | generic.
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(tirith_core::redact::ShareAudience::cli_values()))]
+        audience: String,
+
+        /// Output a `{ redacted_content, redactions: [...] }` JSON envelope.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3129,6 +3199,41 @@ fn run() {
         Commands::Output { action } => match action {
             OutputAction::Wrap { action } => cli::output_guard::run(&action),
         },
+
+        Commands::Share {
+            path,
+            target,
+            out,
+            json,
+        } => {
+            // The value_parser already constrained `target` to the
+            // accepted set; parse_audience is infallible here but we
+            // surface a clear error if something slips through.
+            let audience = match cli::share::parse_audience(&target) {
+                Ok(a) => a,
+                Err(msg) => {
+                    eprintln!("tirith share: {msg}");
+                    std::process::exit(2);
+                }
+            };
+            let path_arg = match path.as_deref() {
+                None | Some("-") => None,
+                Some(p) => Some(std::path::PathBuf::from(p)),
+            };
+            let out_arg = cli::share::resolve_out_path(out.as_deref());
+            cli::share::share(path_arg.as_deref(), out_arg.as_deref(), audience, json)
+        }
+
+        Commands::Redact { audience, json } => {
+            let aud = match cli::share::parse_audience(&audience) {
+                Ok(a) => a,
+                Err(msg) => {
+                    eprintln!("tirith redact: {msg}");
+                    std::process::exit(2);
+                }
+            };
+            cli::share::redact_stdin(aud, json)
+        }
     };
 
     std::process::exit(exit_code);

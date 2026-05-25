@@ -4,9 +4,140 @@ use regex::Regex;
 /// Credential redaction entry: (label, regex, prefix_len).
 /// prefix_len chars are kept visible, the rest is replaced with [REDACTED].
 struct CredRedactEntry {
+    label: String,
     regex: Regex,
     prefix_len: usize,
 }
+
+/// Target audience for [`redact_for_audience`]. The audience controls
+/// **what** gets redacted in addition to credentials, not how aggressively
+/// credentials themselves are scrubbed (credentials are ALWAYS redacted).
+///
+/// The contract:
+/// - [`ShareAudience::PublicPaste`] is the most aggressive: internal
+///   hostnames, `/home/<user>` / `/Users/<user>` paths, RFC1918 private
+///   IPs in hostname context, plus all credentials and customer IDs.
+/// - [`ShareAudience::Llm`] strips secrets but **preserves** stack traces,
+///   line numbers, and repo paths — an LLM needs that context to help
+///   debug. Treated identically to [`ShareAudience::Generic`].
+/// - [`ShareAudience::Slack`] and [`ShareAudience::GithubIssue`] strip
+///   secrets and internal hostnames, but preserve repo-relative paths so
+///   collaborators can find the referenced file.
+/// - [`ShareAudience::Generic`] is the safe default — same as
+///   [`ShareAudience::Llm`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareAudience {
+    GithubIssue,
+    Slack,
+    Llm,
+    PublicPaste,
+    Generic,
+}
+
+impl ShareAudience {
+    /// The string token used in [`share_patterns.toml`][crate::redact]'s
+    /// `audiences` array. Matching is case-sensitive; the CLI parses
+    /// `value_parser` strings into this enum via [`Self::parse_cli`].
+    fn toml_token(self) -> &'static str {
+        match self {
+            ShareAudience::GithubIssue => "github-issue",
+            ShareAudience::Slack => "slack",
+            ShareAudience::Llm => "llm",
+            ShareAudience::PublicPaste => "public-paste",
+            ShareAudience::Generic => "generic",
+        }
+    }
+
+    /// Parse a `--target` / `--audience` CLI string. Returns `None` on
+    /// unknown values so callers can produce a clap-style error message
+    /// listing the supported names.
+    pub fn parse_cli(s: &str) -> Option<ShareAudience> {
+        match s.trim() {
+            "github-issue" | "githubissue" | "github" => Some(ShareAudience::GithubIssue),
+            "slack" => Some(ShareAudience::Slack),
+            "llm" => Some(ShareAudience::Llm),
+            "public-paste" | "publicpaste" | "public" => Some(ShareAudience::PublicPaste),
+            "generic" => Some(ShareAudience::Generic),
+            _ => None,
+        }
+    }
+
+    /// Human-readable list of accepted CLI values (for error messages).
+    pub fn cli_values() -> &'static [&'static str] {
+        &["github-issue", "slack", "llm", "public-paste", "generic"]
+    }
+}
+
+/// One labeled redaction count emitted from [`redact_for_audience`].
+///
+/// `label` is the stable identifier (e.g. `"aws_access_key"`,
+/// `"internal_hostname"`), `count` is the number of distinct matches
+/// replaced in the input.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RedactionCount {
+    pub label: String,
+    pub count: usize,
+}
+
+/// Output of [`redact_for_audience`] — the redacted content alongside
+/// per-label counts. The CLI surface (`tirith share` / `tirith redact`)
+/// uses `redacted_content` for stdout and `redactions` for the stderr
+/// summary plus the `--json` envelope.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RedactReport {
+    pub redacted_content: String,
+    pub redactions: Vec<RedactionCount>,
+}
+
+impl RedactReport {
+    /// Sum of all per-label counts. Useful for "removed N items" summaries.
+    pub fn total(&self) -> usize {
+        self.redactions.iter().map(|r| r.count).sum()
+    }
+}
+
+/// A share-pattern entry loaded from `share_patterns.toml`.
+struct SharePatternEntry {
+    label: String,
+    regex: Regex,
+    /// `ShareAudience` tokens this pattern applies to. We store strings
+    /// (not the enum) so the loader can ignore unknown tokens forward-
+    /// compatibly.
+    audiences: Vec<String>,
+}
+
+static SHARE_PATTERNS: Lazy<Vec<SharePatternEntry>> = Lazy::new(|| {
+    #[derive(serde::Deserialize)]
+    struct File {
+        pattern: Option<Vec<Pat>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Pat {
+        id: String,
+        regex: String,
+        audiences: Vec<String>,
+    }
+
+    let toml_str = include_str!("../assets/data/share_patterns.toml");
+    let file: File = toml::from_str(toml_str).expect("invalid share_patterns.toml");
+
+    let mut entries = Vec::new();
+    if let Some(patterns) = file.pattern {
+        for p in patterns {
+            match Regex::new(&p.regex) {
+                Ok(re) => entries.push(SharePatternEntry {
+                    label: p.id,
+                    regex: re,
+                    audiences: p.audiences,
+                }),
+                Err(e) => {
+                    eprintln!("tirith: warning: invalid share pattern '{}': {e}", p.id);
+                }
+            }
+        }
+    }
+    entries
+});
 
 /// Credential patterns loaded from credential_patterns.toml at compile time.
 static CREDENTIAL_REDACT_PATTERNS: Lazy<Vec<CredRedactEntry>> = Lazy::new(|| {
@@ -17,11 +148,13 @@ static CREDENTIAL_REDACT_PATTERNS: Lazy<Vec<CredRedactEntry>> = Lazy::new(|| {
     }
     #[derive(serde::Deserialize)]
     struct CredPat {
+        id: String,
         regex: String,
         redact_prefix_len: Option<usize>,
     }
     #[derive(serde::Deserialize)]
     struct PkPat {
+        id: String,
         #[allow(dead_code)]
         regex: String,
         redact_regex: Option<String>,
@@ -35,6 +168,7 @@ static CREDENTIAL_REDACT_PATTERNS: Lazy<Vec<CredRedactEntry>> = Lazy::new(|| {
         for p in patterns {
             if let Ok(re) = Regex::new(&p.regex) {
                 entries.push(CredRedactEntry {
+                    label: p.id,
                     regex: re,
                     prefix_len: p.redact_prefix_len.unwrap_or(4),
                 });
@@ -48,6 +182,7 @@ static CREDENTIAL_REDACT_PATTERNS: Lazy<Vec<CredRedactEntry>> = Lazy::new(|| {
             let redact_pattern = pk.redact_regex.as_deref().unwrap_or(&pk.regex);
             if let Ok(re) = Regex::new(redact_pattern) {
                 entries.push(CredRedactEntry {
+                    label: pk.id,
                     regex: re,
                     prefix_len: 0,
                 });
@@ -160,6 +295,269 @@ pub fn redact_with_compiled(input: &str, compiled: &CompiledCustomPatterns) -> S
         result = re.replace_all(&result, "[REDACTED:custom]").into_owned();
     }
     result
+}
+
+/// Stable label for one of the built-in regex patterns.
+///
+/// The labels are snake_case (NOT the prose name in
+/// `[REDACTED:{label}]`) because they're consumed by `--json` and the
+/// stderr summary, where collaborator-style identifiers are more useful
+/// than "OpenAI API Key".
+fn builtin_label_for(idx: usize) -> &'static str {
+    match idx {
+        0 => "openai_api_key",
+        1 => "aws_access_key_builtin",
+        2 => "github_pat_builtin",
+        3 => "github_server_token",
+        4 => "anthropic_api_key_builtin",
+        5 => "slack_token_builtin",
+        6 => "email_address",
+        _ => "builtin_secret",
+    }
+}
+
+/// Audience-aware redaction. Strips credentials always, plus the subset
+/// of `share_patterns.toml` patterns whose `audiences` list includes the
+/// caller's audience.
+///
+/// **`PublicPaste` extras**: internal hostnames, `/home/<u>` / `/Users/<u>`
+/// paths, and RFC1918 private IPv4 addresses in hostname context (preceded
+/// by `server`/`host`/`connect`/`at` within 20 chars OR on their own
+/// line). Public-info IPs like `1.1.1.1` are deliberately NOT touched.
+///
+/// **`Llm` / `Generic` defaults**: secrets only. Stack traces, repo
+/// paths, and line numbers are preserved because an LLM needs that
+/// context to help debug. This is intentional — see `risks` in the M7
+/// chunk-2 plan: over-redaction starves the LLM of useful context.
+///
+/// Per-label counts are returned in [`RedactReport::redactions`] so the
+/// CLI summary can show "removed 3 secrets, 2 internal hostnames".
+pub fn redact_for_audience(input: &str, audience: ShareAudience) -> RedactReport {
+    redact_for_audience_with_custom(input, audience, &[])
+}
+
+/// Same as [`redact_for_audience`] but also redacts repo-specific
+/// customer-ID patterns supplied via `policy.share.customer_id_patterns`.
+/// Each pattern is labeled `customer_id` in the report (per-pattern
+/// counts are aggregated under the same label).
+pub fn redact_for_audience_with_custom(
+    input: &str,
+    audience: ShareAudience,
+    customer_id_patterns: &[String],
+) -> RedactReport {
+    use std::collections::HashMap;
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    let bump =
+        |label: &str, n: usize, counts: &mut HashMap<String, usize>, order: &mut Vec<String>| {
+            if n == 0 {
+                return;
+            }
+            if !counts.contains_key(label) {
+                order.push(label.to_string());
+            }
+            *counts.entry(label.to_string()).or_insert(0) += n;
+        };
+
+    let mut result = input.to_string();
+
+    // 1. Credential patterns first (always-on; preserve short prefix,
+    //    emit stable snake_case labels like `aws_access_key`).
+    //    Reordered ahead of built-ins so the labeled `[REDACTED:Name]`
+    //    output from a built-in doesn't shadow a credential match.
+    for entry in CREDENTIAL_REDACT_PATTERNS.iter() {
+        let matches = entry.regex.find_iter(&result).count();
+        if matches > 0 {
+            let prefix_len = entry.prefix_len;
+            result = entry
+                .regex
+                .replace_all(&result, |caps: &regex::Captures| {
+                    let matched = &caps[0];
+                    let prefix: String = matched.chars().take(prefix_len).collect();
+                    format!("{prefix}[REDACTED]")
+                })
+                .into_owned();
+            bump(&entry.label, matches, &mut counts, &mut order);
+        }
+    }
+
+    // 2. Built-in patterns (always-on for every audience). These cover
+    //    long-tail providers (OpenAI, Slack legacy `xox`, Email, etc.)
+    //    not in credential_patterns.toml.
+    for (idx, (label, regex)) in BUILTIN_PATTERNS.iter().enumerate() {
+        let matches = regex.find_iter(&result).count();
+        if matches > 0 {
+            result = regex
+                .replace_all(&result, format!("[REDACTED:{label}]"))
+                .into_owned();
+            bump(builtin_label_for(idx), matches, &mut counts, &mut order);
+        }
+    }
+
+    // 3. Customer-ID patterns from policy (always-on, labeled
+    //    `customer_id`; aggregated across all patterns).
+    for pat_str in customer_id_patterns {
+        if pat_str.len() > 1024 {
+            eprintln!(
+                "tirith: customer_id pattern too long ({} chars), skipping",
+                pat_str.len()
+            );
+            continue;
+        }
+        match Regex::new(pat_str) {
+            Ok(re) => {
+                let matches = re.find_iter(&result).count();
+                if matches > 0 {
+                    result = re
+                        .replace_all(&result, "[REDACTED:customer_id]")
+                        .into_owned();
+                    bump("customer_id", matches, &mut counts, &mut order);
+                }
+            }
+            Err(e) => {
+                eprintln!("tirith: warning: invalid customer_id pattern '{pat_str}': {e}");
+            }
+        }
+    }
+
+    // 4. Share patterns (audience-filtered).
+    let token = audience.toml_token();
+    for entry in SHARE_PATTERNS.iter() {
+        if !entry.audiences.iter().any(|a| a == token) {
+            continue;
+        }
+        let matches = entry.regex.find_iter(&result).count();
+        if matches > 0 {
+            let label = entry.label.clone();
+            result = entry
+                .regex
+                .replace_all(&result, format!("[REDACTED:{label}]").as_str())
+                .into_owned();
+            bump(&entry.label, matches, &mut counts, &mut order);
+        }
+    }
+
+    // 5. Private-IPv4 redaction (public-paste only, context-sensitive).
+    //    See `apply_private_ipv4` for the keyword-window / own-line
+    //    detection rules.
+    if matches!(audience, ShareAudience::PublicPaste) {
+        let (new_result, n) = apply_private_ipv4(&result);
+        result = new_result;
+        bump("private_ipv4", n, &mut counts, &mut order);
+    }
+
+    let redactions = order
+        .into_iter()
+        .map(|label| RedactionCount {
+            count: counts[&label],
+            label,
+        })
+        .collect();
+
+    RedactReport {
+        redacted_content: result,
+        redactions,
+    }
+}
+
+/// Redact RFC1918 private IPv4 addresses (10/8, 172.16/12, 192.168/16)
+/// that appear in hostname context. Returns `(new_string, n_replacements)`.
+///
+/// Detection contract (kept narrow on purpose to avoid false positives):
+///   - The IP literal must match one of the RFC1918 ranges.
+///   - AND one of:
+///       1. The IP is preceded by `server` / `host` / `hostname` /
+///          `connect` / `at` within the previous 20 characters
+///          (case-insensitive, word-bounded), OR
+///       2. The IP appears on its own line — i.e. only whitespace before
+///          it on its line and only whitespace/EOL after it.
+///
+/// `1.1.1.1` (Cloudflare) and `8.8.8.8` (Google) are deliberately NOT
+/// touched because they're public DNS infrastructure, not private LAN
+/// leakage. Even `10.0.0.5` is left alone unless one of the two context
+/// signals fires — many readmes/diagrams reference private CIDRs as
+/// examples and we don't want to over-redact.
+fn apply_private_ipv4(input: &str) -> (String, usize) {
+    static IP_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(concat!(
+            r"\b(",
+            r"10\.(?:[0-9]{1,3}\.){2}[0-9]{1,3}",
+            r"|172\.(?:1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}",
+            r"|192\.168\.[0-9]{1,3}\.[0-9]{1,3}",
+            r")\b",
+        ))
+        .unwrap()
+    });
+
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+    let mut count = 0usize;
+
+    for cap in IP_RE.find_iter(input) {
+        let start = cap.start();
+        let end = cap.end();
+
+        // Window of up to 20 bytes preceding the match for the
+        // keyword-context check.
+        let window_start = start.saturating_sub(20);
+        let preceding = &input[window_start..start];
+
+        // Two trigger predicates (either suffices).
+        let keyword_context = has_trailing_context_keyword(preceding);
+        let own_line = is_on_own_line(bytes, start, end);
+
+        if !(keyword_context || own_line) {
+            continue;
+        }
+
+        out.push_str(&input[cursor..start]);
+        out.push_str("[REDACTED:private_ipv4]");
+        cursor = end;
+        count += 1;
+    }
+    out.push_str(&input[cursor..]);
+
+    (out, count)
+}
+
+/// True when `preceding` ends with a hostname-context keyword followed
+/// by whitespace (within the window the caller provided). Case-insensitive.
+fn has_trailing_context_keyword(preceding: &str) -> bool {
+    static KW_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?i)\b(server|host|hostname|connect|at)\s+$").unwrap());
+    KW_RE.is_match(preceding)
+}
+
+/// True when the byte range `[start..end)` is the only non-whitespace
+/// content on its line (modulo a trailing newline).
+fn is_on_own_line(bytes: &[u8], start: usize, end: usize) -> bool {
+    // Walk back to start of line; require only whitespace.
+    let mut i = start;
+    while i > 0 {
+        let b = bytes[i - 1];
+        if b == b'\n' {
+            break;
+        }
+        if !(b == b' ' || b == b'\t') {
+            return false;
+        }
+        i -= 1;
+    }
+    // Walk forward from end; require only whitespace until EOL/EOF.
+    let mut j = end;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if b == b'\n' {
+            return true;
+        }
+        if !(b == b' ' || b == b'\t' || b == b'\r') {
+            return false;
+        }
+        j += 1;
+    }
+    true
 }
 
 /// Redact shell-style assignment values such as `KEY=value` before user content
@@ -515,5 +913,154 @@ mod tests {
         );
         assert!(redacted.contains("$env:OPENAI_API_KEY = [REDACTED]"));
         assert!(!redacted.contains("sk-secret"));
+    }
+
+    // ───────────── M7 ch2: audience-aware redaction ──────────────
+
+    #[test]
+    fn audience_llm_strips_aws_key_but_preserves_stack_trace() {
+        let aws_key = "AKIAIOSFODNN7EXAMPLE";
+        let input = format!(
+            "Traceback (most recent call last):\n  File \"foo.py\", line 42, in handler\n    raise RuntimeError(\"boom\")\nkey={aws_key}\n"
+        );
+        let report = redact_for_audience(&input, ShareAudience::Llm);
+        // Stack trace must survive — line numbers, file paths, "Traceback".
+        assert!(
+            report.redacted_content.contains("Traceback"),
+            "LLM target must preserve stack trace marker: {}",
+            report.redacted_content
+        );
+        assert!(report.redacted_content.contains("File \"foo.py\", line 42"));
+        // AWS key must be redacted.
+        assert!(!report.redacted_content.contains(aws_key));
+        assert!(report.redactions.iter().any(|r| r.count > 0));
+    }
+
+    #[test]
+    fn audience_github_issue_strips_internal_hostname_but_keeps_paths() {
+        let input = "deploy to srv1.eng.corp ran from /repo/path/main.rs line 12\n";
+        let report = redact_for_audience(input, ShareAudience::GithubIssue);
+        assert!(!report.redacted_content.contains("srv1.eng.corp"));
+        assert!(report.redacted_content.contains("/repo/path/main.rs"));
+        assert!(report
+            .redactions
+            .iter()
+            .any(|r| r.label == "internal_hostname" && r.count == 1));
+    }
+
+    #[test]
+    fn audience_public_paste_strips_home_path_and_private_ip_in_context() {
+        let aws_key = "AKIAIOSFODNN7EXAMPLE";
+        let input = format!(
+            "config at /home/alice/.aws/credentials key={aws_key}\nserver 10.0.0.5 responded ok\n"
+        );
+        let report = redact_for_audience(&input, ShareAudience::PublicPaste);
+        assert!(!report.redacted_content.contains("/home/alice"));
+        assert!(!report.redacted_content.contains("10.0.0.5"));
+        assert!(!report.redacted_content.contains(aws_key));
+        assert!(report.redactions.iter().any(|r| r.label == "home_path"));
+        assert!(report.redactions.iter().any(|r| r.label == "private_ipv4"));
+    }
+
+    #[test]
+    fn private_ipv4_keyword_window_preserves_keyword_text() {
+        let input = "server 10.0.0.5 ok";
+        let report = redact_for_audience(input, ShareAudience::PublicPaste);
+        // The keyword "server" must survive — we only replace the IP literal.
+        assert!(
+            report.redacted_content.starts_with("server "),
+            "keyword must be preserved, got: {}",
+            report.redacted_content
+        );
+        assert!(report.redacted_content.contains("[REDACTED:private_ipv4]"));
+    }
+
+    #[test]
+    fn private_ipv4_public_ip_is_not_redacted() {
+        // 1.1.1.1 is Cloudflare's public DNS — must NOT be touched even on
+        // public-paste, and the `server` keyword must not trigger us.
+        let input = "server 1.1.1.1 responded\n";
+        let report = redact_for_audience(input, ShareAudience::PublicPaste);
+        assert!(report.redacted_content.contains("1.1.1.1"));
+        assert!(!report.redacted_content.contains("[REDACTED:private_ipv4]"));
+    }
+
+    #[test]
+    fn private_ipv4_without_context_or_own_line_is_not_redacted() {
+        // The IP appears inline without any keyword context AND not on its
+        // own line. We must NOT redact — README diagrams reference
+        // `192.168.0.1` as an example all the time.
+        let input = "use 192.168.0.1 as your gateway and 10.0.0.1 for DNS\n";
+        let report = redact_for_audience(input, ShareAudience::PublicPaste);
+        assert!(report.redacted_content.contains("192.168.0.1"));
+        assert!(report.redacted_content.contains("10.0.0.1"));
+    }
+
+    #[test]
+    fn private_ipv4_on_own_line_is_redacted() {
+        let input = "the host is below:\n  10.0.0.5\nand it responds quickly.\n";
+        let report = redact_for_audience(input, ShareAudience::PublicPaste);
+        assert!(!report.redacted_content.contains("10.0.0.5"));
+        assert!(report.redactions.iter().any(|r| r.label == "private_ipv4"));
+    }
+
+    #[test]
+    fn audience_llm_does_not_redact_private_ip_or_hostname() {
+        // LLM audience preserves everything EXCEPT credentials. The
+        // operator may need that context to help the LLM diagnose.
+        let input = "server 10.0.0.5 timed out at /home/alice/repo/foo.rs line 12\n";
+        let report = redact_for_audience(input, ShareAudience::Llm);
+        assert!(report.redacted_content.contains("10.0.0.5"));
+        assert!(report.redacted_content.contains("/home/alice"));
+        assert!(report.redactions.is_empty(), "no secrets, no redactions");
+    }
+
+    #[test]
+    fn customer_id_patterns_are_redacted_and_counted_under_one_label() {
+        // Two patterns from different repos collapse to a single
+        // `customer_id` label in the report (count aggregates).
+        let input = "customer CUST-12345 escalated; ref ACME-99887.";
+        let patterns = vec![r"CUST-\d+".to_string(), r"ACME-\d+".to_string()];
+        let report = redact_for_audience_with_custom(input, ShareAudience::Slack, &patterns);
+        assert!(!report.redacted_content.contains("CUST-12345"));
+        assert!(!report.redacted_content.contains("ACME-99887"));
+        let cust = report
+            .redactions
+            .iter()
+            .find(|r| r.label == "customer_id")
+            .expect("expected customer_id row");
+        assert_eq!(cust.count, 2);
+    }
+
+    #[test]
+    fn share_audience_parse_cli_round_trips() {
+        for tok in ShareAudience::cli_values() {
+            assert!(
+                ShareAudience::parse_cli(tok).is_some(),
+                "advertised CLI value {tok:?} must parse"
+            );
+        }
+        assert!(ShareAudience::parse_cli("not-a-real-audience").is_none());
+    }
+
+    #[test]
+    fn redact_report_total_sums_counts() {
+        let aws_key = "AKIAIOSFODNN7EXAMPLE";
+        let input = format!("k1={aws_key}\nk2={aws_key}\n");
+        let report = redact_for_audience(&input, ShareAudience::Slack);
+        // Sum across all labels.
+        assert!(report.total() >= 2);
+    }
+
+    #[test]
+    fn audience_redaction_emits_stable_label_for_aws_in_json() {
+        // The `--json` consumer relies on stable snake_case labels, not
+        // the prose `[REDACTED:...]` token. This test pins them.
+        let input = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n";
+        let report = redact_for_audience(input, ShareAudience::Llm);
+        assert!(report
+            .redactions
+            .iter()
+            .any(|r| r.label == "aws_access_key"));
     }
 }

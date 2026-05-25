@@ -94,6 +94,8 @@ help_example_tests! {
     help_view       => (["view", "--help"], "tirith view /var/log/system.log");
     help_output     => (["output", "--help"], "tirith output wrap on | off | status");
     help_output_wrap => (["output", "wrap", "--help"], "tirith output wrap on");
+    help_share      => (["share", "--help"], "tirith share --target llm");
+    help_redact     => (["redact", "--help"], "tirith redact --audience slack");
 }
 
 #[test]

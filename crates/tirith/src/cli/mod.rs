@@ -159,6 +159,7 @@ pub mod receipt;
 pub mod scan;
 pub mod score;
 pub mod selfupdate;
+pub mod share;
 pub mod threatdb_cmd;
 pub mod trust;
 pub mod view;

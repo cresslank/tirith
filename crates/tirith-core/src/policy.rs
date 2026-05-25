@@ -194,6 +194,40 @@ pub struct Policy {
     /// for security policy alone.
     #[serde(default)]
     pub agent_rules: AgentRules,
+
+    /// **M7 ch2 — `tirith share` / `tirith redact` config.**
+    ///
+    /// Repo-specific patterns for `tirith share` to scrub before sending
+    /// content to teammates, LLMs, or public pastes. The shipped pattern
+    /// set in `share_patterns.toml` covers cross-org signals (private IPs,
+    /// internal-DNS hostnames, `/home/<user>` paths); customer / tenant /
+    /// case IDs are necessarily repo-specific so they're supplied here.
+    ///
+    /// See [`ShareConfig`] for the field layout. Defaults are empty.
+    #[serde(default)]
+    pub share: ShareConfig,
+}
+
+/// **M7 ch2** — `tirith share` policy configuration.
+///
+/// Only `customer_id_patterns` is shipped on day one. Future M7 chunks
+/// may add audience-default overrides here; the empty-default contract is
+/// the supported forward-compat surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShareConfig {
+    /// Repo-specific regex patterns matched against the content fed to
+    /// `tirith share` / `tirith redact`. Every match is replaced with
+    /// `[REDACTED:customer_id]` and tallied under the `customer_id`
+    /// label in the report. Patterns longer than 1024 chars are skipped
+    /// with a warning.
+    ///
+    /// Examples (a real repo will configure these to its own ID
+    /// shapes — there is no shipped default):
+    ///   - `CUST-\d{4,6}`
+    ///   - `acct_[a-z0-9]{16}`
+    ///   - `case#\d+`
+    pub customer_id_patterns: Vec<String>,
 }
 
 /// Per-agent governance rules — the policy surface for Milestone 4 item 8.
@@ -647,6 +681,7 @@ impl Default for Policy {
             threat_intel: ThreatIntelConfig::default(),
             package_policy: PackagePolicy::default(),
             agent_rules: AgentRules::default(),
+            share: ShareConfig::default(),
         }
     }
 }
