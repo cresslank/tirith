@@ -673,6 +673,20 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "SSH invocations for remote-session destructive-command detection (M8 ch2)",
     },
     PatternEntry {
+        id: "iac_cmd",
+        // M8 ch3 — IaC CLIs (`terraform`, `pulumi`, `tofu` / OpenTofu).
+        // The PATTERN_TABLE entry is a coarse tier-1 probe; precise
+        // `apply` / `destroy` / `-auto-approve` matching lives in
+        // `rules::iac::check`.
+        //
+        // Word boundaries (`\b`) keep `terraformer` (third-party tool),
+        // `pulumictl`, and `tofu-config` out of the tier-1 hit list —
+        // only the standalone IaC CLI leader tokens match.
+        tier1_exec_fragments: &[r"\b(?:terraform|pulumi|tofu)\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "IaC CLIs for apply-gate / destroy detection (M8 ch3)",
+    },
+    PatternEntry {
         id: "prompt_injection_seed",
         // M7 ch5 — paste-only fast gate for the prompt-injection rule.
         //
@@ -1042,6 +1056,13 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "ssh_remote_shell_on_labeled_host",
         "SshRemoteShellOnLabeledHost",
     ),
+    // IaC operational-context rules (M8 ch3).
+    ("iac_apply_without_plan", "IacApplyWithoutPlan"),
+    ("iac_apply_auto_approve", "IacApplyAutoApprove"),
+    ("iac_apply_auto_approve_prod", "IacApplyAutoApproveProd"),
+    ("iac_destroy_prod", "IacDestroyProd"),
+    ("iac_plan_high_risk_changes", "IacPlanHighRiskChanges"),
+    ("iac_plan_hash_mismatch", "IacPlanHashMismatch"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[

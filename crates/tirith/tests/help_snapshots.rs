@@ -121,6 +121,11 @@ help_example_tests! {
     help_ssh             => (["ssh", "--help"], "tirith ssh guard on");
     help_ssh_guard       => (["ssh", "guard", "--help"], "tirith ssh guard on");
     help_ssh_label       => (["ssh", "label", "--help"], "tirith ssh label payments-prod-01 critical --scope user");
+    // M8 ch3 — `tirith iac guard|check-plan|require-plan-before-apply`.
+    help_iac             => (["iac", "--help"], "tirith iac guard on");
+    help_iac_guard       => (["iac", "guard", "--help"], "tirith iac guard on");
+    help_iac_check_plan  => (["iac", "check-plan", "--help"], "tirith iac check-plan tfplan");
+    help_iac_require_plan_before_apply => (["iac", "require-plan-before-apply", "--help"], "tirith iac require-plan-before-apply on");
 }
 
 #[test]

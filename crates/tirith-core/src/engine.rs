@@ -1008,6 +1008,12 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             // path lives inside `ssh_context::check`; no extra gate here.
             let ssh_findings = crate::rules::ssh_context::check(&ctx.input, ctx.shell, &policy);
             findings.extend(ssh_findings);
+
+            // M8 ch3 — IaC operational-context rules. Non-IaC leader
+            // short-circuits inside `iac::check`; tier-1 gate is the
+            // `iac_cmd` PATTERN_TABLE entry.
+            let iac_findings = crate::rules::iac::check(&ctx.input, ctx.shell, &policy);
+            findings.extend(iac_findings);
         }
 
         let cred_findings =

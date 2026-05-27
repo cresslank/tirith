@@ -357,6 +357,44 @@ pub enum RuleId {
     /// not intercepted unless the operator runs `tirith ssh bootstrap`
     /// (planned for M8.1) to install the hook on the remote side.
     SshRemoteShellOnLabeledHost,
+
+    // IaC operational-context rules (M8 ch3) — fire from `rules::iac` when
+    // the parsed command's leader is an IaC CLI (`terraform`, `pulumi`,
+    // `tofu`). Detection short-circuits when the leader is not an IaC CLI.
+    // `apply <tfplan>` paths can additionally consult the plan-hash store
+    // under `state_dir()/iac_plans/<sha256>` to detect plan tampering when
+    // `policy.iac_require_plan_before_apply` is on.
+    /// M8 ch3 — `terraform apply` (or `pulumi up`, `tofu apply`) issued
+    /// without a saved plan, where the policy requires one
+    /// (`policy.iac_require_plan_before_apply: true`). High severity.
+    /// The "apply with no plan" shape combined with the policy switch
+    /// is treated as a deliberate gate violation.
+    IacApplyWithoutPlan,
+    /// M8 ch3 — `terraform apply -auto-approve` (or `pulumi up --yes`,
+    /// `tofu apply -auto-approve`) outside of a production-labeled
+    /// context. Medium severity — auto-approve is a footgun even in dev,
+    /// but does not warrant a Block default.
+    IacApplyAutoApprove,
+    /// M8 ch3 — `terraform apply -auto-approve` (or equivalents) inside
+    /// a production-labeled context (resolved through the M8 ch1 active
+    /// context + labels file). High severity — auto-approve in prod is
+    /// the documented anti-pattern.
+    IacApplyAutoApproveProd,
+    /// M8 ch3 — `terraform destroy` / `pulumi destroy` / `tofu destroy`
+    /// inside a production-labeled context. High severity — destroys
+    /// resources that take hours to days to recreate.
+    IacDestroyProd,
+    /// M8 ch3 — `tirith iac check-plan` parsed a saved plan and found
+    /// high-risk changes (IAM mutations, security-group changes,
+    /// public-bucket grants, DB deletes, load-balancer changes).
+    /// Medium severity — heuristic, but worth surfacing.
+    IacPlanHighRiskChanges,
+    /// M8 ch3 — `terraform apply <tfplan>` where the supplied plan file
+    /// does not match any hash in the `iac_plans` store. Either the plan
+    /// was tampered with after `iac check-plan` recorded it, or the plan
+    /// was never checked. High severity when
+    /// `policy.iac_require_plan_before_apply: true` is set.
+    IacPlanHashMismatch,
 }
 
 impl fmt::Display for RuleId {

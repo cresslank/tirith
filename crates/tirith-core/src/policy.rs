@@ -269,6 +269,24 @@ pub struct Policy {
     /// document the inventory without enforcing.
     #[serde(skip)]
     pub ssh_host_labels: BTreeMap<String, String>,
+
+    /// **M8 ch3 — gate `apply` invocations behind a recorded plan hash.**
+    ///
+    /// When `true`, the IaC rules in `rules::iac` enforce a stricter
+    /// apply gate:
+    ///   * `terraform apply` (no plan file) → `IacApplyWithoutPlan` (High).
+    ///   * `terraform apply tfplan` where the file's SHA-256 is NOT in
+    ///     `state_dir()/iac_plans/<sha256>` → `IacPlanHashMismatch` (High).
+    ///
+    /// When `false` (the default), neither rule fires; `iac` is purely
+    /// advisory (auto-approve and destroy-in-prod still flag, but the
+    /// hash store is consulted only by `tirith iac check-plan`).
+    ///
+    /// Toggled by `tirith iac require-plan-before-apply on|off`. Persisted
+    /// to `policy.yaml` via the same single-line append-or-rewrite the M8
+    /// ch1 `context_guard_enabled` flag uses.
+    #[serde(default)]
+    pub iac_require_plan_before_apply: bool,
 }
 
 /// **M7 ch2** — `tirith share` policy configuration.
@@ -749,6 +767,7 @@ impl Default for Policy {
             context_destructive_verbs: HashMap::new(),
             context_labels: BTreeMap::new(),
             ssh_host_labels: BTreeMap::new(),
+            iac_require_plan_before_apply: false,
         }
     }
 }
@@ -1543,6 +1562,16 @@ pub fn user_ssh_host_labels_path() -> Option<PathBuf> {
 /// the cwd is inside a git repo. Returns `None` when no `.git` is found.
 pub fn repo_ssh_host_labels_path(cwd: Option<&str>) -> Option<PathBuf> {
     find_repo_root(cwd).map(|r| r.join(".tirith").join("ssh-host-labels.yaml"))
+}
+
+/// **M8 ch3** — directory where `tirith iac check-plan` records the
+/// SHA-256 hash of each plan it has reviewed.
+///
+/// Path: `state_dir()/iac_plans/`. Files inside are named after the plan's
+/// hex SHA-256 (`<hash>.json`) with the recorded metadata. Returns `None`
+/// when `state_dir()` itself is unresolvable.
+pub fn iac_plans_dir() -> Option<PathBuf> {
+    state_dir().map(|s| s.join("iac_plans"))
 }
 
 /// Merge a single labels file's entries into `into`. The file is a flat

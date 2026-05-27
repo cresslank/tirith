@@ -1828,3 +1828,50 @@ input = "ssh prod-host"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# M8 ch3 — IaC operational-context rules.
+#
+# The fixture runner uses the default Policy (no labels, no
+# `iac_require_plan_before_apply`), so the prod / plan-hash paths cannot
+# fire here — those are covered by dedicated unit tests in `rules/iac.rs`.
+# The fixtures below pin the tool-only paths the runner CAN reach.
+
+[[fixture]]
+name = "terraform_apply_auto_approve_warns"
+min_milestone = 8
+input = "terraform apply -auto-approve"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["iac_apply_auto_approve"]
+
+[[fixture]]
+name = "tofu_apply_auto_approve_warns"
+min_milestone = 8
+input = "tofu apply -auto-approve"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["iac_apply_auto_approve"]
+
+[[fixture]]
+name = "pulumi_up_yes_warns"
+min_milestone = 8
+input = "pulumi up --yes"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["iac_apply_auto_approve"]
+
+[[fixture]]
+name = "terraform_apply_clean_allow"
+min_milestone = 8
+input = "terraform apply tfplan"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "terraform_destroy_no_label_allow"
+min_milestone = 8
+input = "terraform destroy"
+context = "exec"
+expected_action = "allow"
+expected_rules = []

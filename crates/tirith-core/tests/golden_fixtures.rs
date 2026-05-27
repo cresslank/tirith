@@ -675,6 +675,13 @@ const ALL_RULE_IDS: &[&str] = &[
     // SSH operational-context rules (M8 ch2)
     "ssh_remote_destructive_on_labeled_host",
     "ssh_remote_shell_on_labeled_host",
+    // IaC operational-context rules (M8 ch3)
+    "iac_apply_without_plan",
+    "iac_apply_auto_approve",
+    "iac_apply_auto_approve_prod",
+    "iac_destroy_prod",
+    "iac_plan_high_risk_changes",
+    "iac_plan_hash_mismatch",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -800,6 +807,20 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // temp labels file via `TIRITH_POLICY_ROOT` + a fake `.git` boundary.
     "ssh_remote_destructive_on_labeled_host",
     "ssh_remote_shell_on_labeled_host",
+    // M8 ch3 — IaC operational-context rules. The Medium auto-approve
+    // path fires from the engine with default policy (covered by
+    // `command.toml`). The High prod / hash-mismatch / apply-without-plan
+    // paths require either context detection OR
+    // `iac_require_plan_before_apply: true` — neither of which the static
+    // fixture runner injects. Covered by unit tests in `rules/iac.rs` and
+    // the dedicated `iac_rule_*` integration tests at the end of this
+    // file. `iac_plan_high_risk_changes` is emitted by
+    // `tirith iac check-plan`, not the engine.
+    "iac_apply_without_plan",
+    "iac_apply_auto_approve_prod",
+    "iac_destroy_prod",
+    "iac_plan_high_risk_changes",
+    "iac_plan_hash_mismatch",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1098,6 +1119,13 @@ fn test_rule_id_list_is_complete() {
         // SSH operational-context rules (M8 ch2)
         RuleId::SshRemoteDestructiveOnLabeledHost,
         RuleId::SshRemoteShellOnLabeledHost,
+        // IaC operational-context rules (M8 ch3)
+        RuleId::IacApplyWithoutPlan,
+        RuleId::IacApplyAutoApprove,
+        RuleId::IacApplyAutoApproveProd,
+        RuleId::IacDestroyProd,
+        RuleId::IacPlanHighRiskChanges,
+        RuleId::IacPlanHashMismatch,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();
@@ -1938,5 +1966,134 @@ fn ssh_rule_allows_unlabeled_host_with_destructive_inner() {
             .iter()
             .map(|f| f.rule_id.to_string())
             .collect::<Vec<_>>()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M8 ch3 — IaC apply-gate integration tests.
+//
+// These tests inject a temp `state_dir()` via `XDG_STATE_HOME` so the
+// plan-hash store lives in the test scope, then exercise the
+// `IacApplyWithoutPlan` / `IacPlanHashMismatch` rules via the engine.
+// They share the `CONTEXT_TEST_LOCK` mutex because they mutate
+// `XDG_STATE_HOME` and `TIRITH_POLICY_ROOT` env vars.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn iac_rule_blocks_apply_without_plan_when_policy_on() {
+    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    let tirith_dir = dir.path().join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "iac_require_plan_before_apply: true\n",
+    )
+    .unwrap();
+
+    unsafe {
+        std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
+    }
+
+    let ctx = AnalysisContext {
+        input: "terraform apply".to_string(),
+        shell: ShellType::Posix,
+        scan_context: ScanContext::Exec,
+        raw_bytes: None,
+        interactive: true,
+        cwd: Some(dir.path().display().to_string()),
+        file_path: None,
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
+    };
+    let verdict = engine::analyze(&ctx);
+
+    unsafe {
+        std::env::remove_var("TIRITH_POLICY_ROOT");
+    }
+
+    let iac_finding = verdict
+        .findings
+        .iter()
+        .find(|f| matches!(f.rule_id, tirith_core::verdict::RuleId::IacApplyWithoutPlan));
+    assert!(
+        iac_finding.is_some(),
+        "expected IacApplyWithoutPlan finding; got: {:?}",
+        verdict
+            .findings
+            .iter()
+            .map(|f| format!("{}: {}", f.rule_id, f.title))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(verdict.action, Action::Block);
+}
+
+#[test]
+fn iac_rule_blocks_plan_hash_mismatch_when_policy_on() {
+    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    let tirith_dir = dir.path().join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "iac_require_plan_before_apply: true\n",
+    )
+    .unwrap();
+
+    // Write a plan file with content that won't match any recorded hash —
+    // we never call `iac_plan::record_plan_hash` in this test.
+    let plan_path = dir.path().join("tfplan");
+    fs::write(&plan_path, b"NOT A REAL TF PLAN BUT NOT EMPTY").unwrap();
+
+    // Steer the iac_plans_dir under a temp XDG_STATE_HOME so this test
+    // cannot match a real recorded hash from the developer's machine.
+    let state_dir = dir.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    let prev_xdg = std::env::var_os("XDG_STATE_HOME");
+
+    unsafe {
+        std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
+        std::env::set_var("XDG_STATE_HOME", state_dir.display().to_string());
+    }
+
+    let ctx = AnalysisContext {
+        input: format!("terraform apply {}", plan_path.display()),
+        shell: ShellType::Posix,
+        scan_context: ScanContext::Exec,
+        raw_bytes: None,
+        interactive: true,
+        cwd: Some(dir.path().display().to_string()),
+        file_path: None,
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
+    };
+    let verdict = engine::analyze(&ctx);
+
+    unsafe {
+        std::env::remove_var("TIRITH_POLICY_ROOT");
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+    }
+
+    let mismatch_finding = verdict
+        .findings
+        .iter()
+        .find(|f| matches!(f.rule_id, tirith_core::verdict::RuleId::IacPlanHashMismatch));
+    assert!(
+        mismatch_finding.is_some(),
+        "expected IacPlanHashMismatch finding; got: {:?}",
+        verdict
+            .findings
+            .iter()
+            .map(|f| format!("{}: {}", f.rule_id, f.title))
+            .collect::<Vec<_>>(),
     );
 }

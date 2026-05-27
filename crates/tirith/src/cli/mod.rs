@@ -145,6 +145,7 @@ pub mod explain;
 pub mod fix;
 pub mod gateway;
 pub mod hook_event;
+pub mod iac;
 pub mod init;
 pub mod install;
 pub mod lab;

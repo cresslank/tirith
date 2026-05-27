@@ -228,7 +228,16 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         // M8 ch1 context rules — heuristic on parsed args + operator
         // labels, no threat-DB involvement.
         | RuleId::SshRemoteDestructiveOnLabeledHost
-        | RuleId::SshRemoteShellOnLabeledHost => false,
+        | RuleId::SshRemoteShellOnLabeledHost
+        // M8 ch3 — IaC operational-context rules. Heuristics on parsed
+        // IaC CLI args + (for prod rules) operator-supplied context
+        // labels. No threat-DB involvement.
+        | RuleId::IacApplyWithoutPlan
+        | RuleId::IacApplyAutoApprove
+        | RuleId::IacApplyAutoApproveProd
+        | RuleId::IacDestroyProd
+        | RuleId::IacPlanHighRiskChanges
+        | RuleId::IacPlanHashMismatch => false,
     }
 }
 

@@ -1716,3 +1716,77 @@ examples_bad = []
 examples_good = ["ssh payments-prod-01"]
 false_positive_guidance = "If this Info finding is too noisy, set `severity_overrides: { ssh_remote_shell_on_labeled_host: info }` to keep the recording but silence the prompt-status indicator."
 remediation = "Plan a remote-side tirith install once `tirith ssh bootstrap` ships (M8.1). Until then, treat the post-handshake session as unprotected."
+
+# M8 ch3 — IaC operational-context rules.
+
+[[rule]]
+id = "iac_apply_without_plan"
+title = "Terraform / Pulumi / OpenTofu apply without a saved plan"
+category = "context"
+severity_rationale = "High — applying without a plan file means the operator has not reviewed the precise resource changes the run will execute. `policy.iac_require_plan_before_apply: true` is the operator's explicit opt-in for the plan-before-apply gate; firing High under that switch matches the operator's stated risk model."
+description = "A `terraform apply` / `pulumi up` / `tofu apply` invocation has no positional plan-file argument, and `policy.iac_require_plan_before_apply` is on. Run `terraform plan -out tfplan && tirith iac check-plan tfplan && terraform apply tfplan` instead."
+examples_bad = ["terraform apply", "pulumi up", "tofu apply"]
+examples_good = ["terraform apply tfplan", "terraform plan -out tfplan && tirith iac check-plan tfplan"]
+false_positive_guidance = "If your workflow legitimately runs `apply` without a saved plan (e.g. CI that runs plan + apply in one step), demote with `severity_overrides` or leave `iac_require_plan_before_apply: false`."
+remediation = "Run `terraform plan -out tfplan` first, then `tirith iac check-plan tfplan`, then `terraform apply tfplan`. The hash store under `state_dir()/iac_plans/` records the plan you reviewed."
+mitre_id = "T1098"
+
+[[rule]]
+id = "iac_apply_auto_approve"
+title = "Terraform / Pulumi / OpenTofu apply with auto-approve outside production"
+category = "context"
+severity_rationale = "Medium — `-auto-approve` / `--yes` skips the interactive confirmation step that exists specifically to catch typos in resource targeting. Outside of production this is a footgun rather than a critical risk; the Medium baseline surfaces the signal without blocking."
+description = "A `terraform apply -auto-approve`, `pulumi up --yes`, or `tofu apply -auto-approve` invocation was issued and the active provider context is not labeled `critical` / `production`. CI workflows commonly run with these flags — see `false_positive_guidance`."
+examples_bad = ["terraform apply -auto-approve", "pulumi up --yes", "tofu apply -auto-approve"]
+examples_good = ["terraform apply tfplan", "pulumi up", "tofu apply"]
+false_positive_guidance = "CI runners apply with `-auto-approve` by design. Suppress per-runner via `severity_overrides: { iac_apply_auto_approve: info }`. Interactive operators should consider removing the flag — the confirmation step is two seconds and catches the wrong-workspace footgun."
+remediation = "For interactive use, drop `-auto-approve` and confirm the change set. For CI, route through a service account with limited blast radius."
+mitre_id = "T1485"
+
+[[rule]]
+id = "iac_apply_auto_approve_prod"
+title = "Terraform / Pulumi / OpenTofu apply with auto-approve in production"
+category = "context"
+severity_rationale = "High — `-auto-approve` against a production-labeled cloud / k8s context skips the only interactive checkpoint between the operator and an irreversible change. The combination is a documented anti-pattern (the IaC tools themselves print warnings against it in their docs)."
+description = "A `terraform apply -auto-approve` (or `pulumi up --yes`, `tofu apply -auto-approve`) invocation was issued and the active provider context is labeled `critical` / `production` / `prod` / `live` / `p0` / `p1`. Requires both the M8 ch1 context detection and an operator-labeled context."
+examples_bad = ["terraform apply -auto-approve  # with AWS_PROFILE=prod", "pulumi up --yes  # with stack=prod-us-east"]
+examples_good = ["terraform apply tfplan  # plan reviewed via tirith iac check-plan"]
+false_positive_guidance = "Routine prod CI pipelines that use `-auto-approve` should run through a service account with `tirith` exempted, OR demote via `severity_overrides`. The default High is intentional for interactive shells."
+remediation = "Remove `-auto-approve`, run `terraform plan -out tfplan`, review with `tirith iac check-plan`, then `terraform apply tfplan`."
+mitre_id = "T1485"
+
+[[rule]]
+id = "iac_destroy_prod"
+title = "Terraform / Pulumi / OpenTofu destroy in production"
+category = "context"
+severity_rationale = "High — `terraform destroy` removes every resource the workspace owns. Against a production-labeled context this is a one-command production outage. Even with the IaC tool's built-in confirmation, the rate of `Ctrl-Tab` errors makes a hard block worthwhile."
+description = "A `terraform destroy` / `pulumi destroy` / `tofu destroy` invocation was issued and the active provider context is labeled `critical` / `production`. The rule requires both the M8 ch1 context detection and an operator-labeled context."
+examples_bad = ["terraform destroy  # with AWS_PROFILE=prod", "pulumi destroy --stack prod-us-east", "tofu destroy"]
+examples_good = ["terraform destroy  # with AWS_PROFILE=dev"]
+false_positive_guidance = "Destroying a prod environment is rare and should be deliberate. If your workflow legitimately tears down ephemeral prod-like environments, label them as `staging` rather than `production`."
+remediation = "Confirm the active context with `tirith context status`. If the destruction is intentional, type the literal context name when prompted to acknowledge the production-context risk."
+mitre_id = "T1485"
+
+[[rule]]
+id = "iac_plan_high_risk_changes"
+title = "Saved IaC plan contains high-risk changes"
+category = "context"
+severity_rationale = "Medium — `tirith iac check-plan` parsed the saved plan and found resource changes in high-risk categories (IAM mutations, security-group rules, public-bucket grants, DB / cluster deletes, load-balancer changes). Medium signals that the plan deserves a closer review without blocking the apply path."
+description = "The `tirith iac check-plan <tfplan>` command parsed the saved plan's JSON (via `terraform show -json` or `pulumi preview --json`) and found at least one resource change that matches the high-risk categories: `aws_iam_*`, `*_security_group*`, `aws_s3_bucket_public_access_block`, `*_db_instance` deletes, `*_load_balancer*`. Surfaces the signal so the operator can review before applying."
+examples_bad = ["A plan that deletes an RDS instance.", "A plan that adds 0.0.0.0/0 ingress to a security group."]
+examples_good = ["A plan that only touches CloudWatch alarms."]
+false_positive_guidance = "Some workflows legitimately mutate IAM as part of a deploy. The Medium baseline is intentional — surface the signal, do not block by default."
+remediation = "Inspect the flagged resources via `terraform show tfplan` (or `pulumi preview` output). If the changes are intentional, proceed with `terraform apply tfplan`."
+mitre_id = "T1098"
+
+[[rule]]
+id = "iac_plan_hash_mismatch"
+title = "Terraform / OpenTofu apply against a plan file that does not match a recorded hash"
+category = "context"
+severity_rationale = "High — when `policy.iac_require_plan_before_apply: true` is set, the operator has opted into a plan-before-apply gate. A plan-file the user passes to `apply` that does not match any hash in the `iac_plans` store means either the plan was tampered with after `iac check-plan` recorded it, or the plan was never checked. Either way, the apply must be blocked."
+description = "A `terraform apply <tfplan>` (or `tofu apply <tfplan>`) invocation was issued, `policy.iac_require_plan_before_apply` is on, and the SHA-256 hash of `<tfplan>` does not match any plan recorded in `state_dir()/iac_plans/`."
+examples_bad = ["terraform apply tfplan  # tfplan was modified after `tirith iac check-plan tfplan`"]
+examples_good = ["terraform apply tfplan  # tfplan hash is recorded"]
+false_positive_guidance = "If the plan was legitimately re-generated, re-run `tirith iac check-plan tfplan` to record the new hash."
+remediation = "Run `tirith iac check-plan <tfplan>` to record the plan's hash, then re-run `terraform apply <tfplan>`. If you don't recognize the modification, investigate before re-running."
+mitre_id = "T1565"

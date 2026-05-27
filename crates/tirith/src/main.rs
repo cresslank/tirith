@@ -1300,6 +1300,64 @@ Examples:
         action: ContextAction,
     },
 
+    /// Guard / inspect IaC apply gates for Terraform / Pulumi / OpenTofu (M8 ch3)
+    #[command(after_help = "\
+Subcommands:
+  tirith iac guard on | off | status                  — flip the shared
+                                                        operational-context
+                                                        switch (same flag
+                                                        as `tirith context
+                                                        guard`).
+  tirith iac check-plan <tfplan>                      — parse the saved plan,
+        [--tool terraform|pulumi|tofu]                  record its SHA-256 in
+                                                        the per-process plan
+                                                        store, and report
+                                                        create / update /
+                                                        destroy counts +
+                                                        IAM / SG / public-bucket
+                                                        flags.
+  tirith iac require-plan-before-apply                — toggle the
+        on | off | status                               plan-before-apply gate.
+                                                        When ON,
+                                                        `terraform apply`
+                                                        without a saved plan
+                                                        is High; mismatched
+                                                        plan hashes block too.
+
+What it catches:
+  `terraform apply -auto-approve` (or `pulumi up --yes`, `tofu apply
+  -auto-approve`) — Medium outside production, High inside production
+  (resolved through `tirith context status`).
+
+  `terraform destroy` against a labeled-prod context — High.
+
+  `terraform apply tfplan` where the file hash does NOT match a
+  `tirith iac check-plan`-recorded entry, when
+  `iac_require_plan_before_apply` is on — High.
+
+Plan source:
+  `tirith iac check-plan` shells out to `terraform show -json <plan>` /
+  `tofu show -json <plan>` with a 5s timeout (plans can be large).
+  Pulumi plans are read directly because `pulumi preview --json` is
+  already JSON. The shell-out NEVER happens on the engine hot path;
+  only `tirith iac check-plan` invokes it.
+
+Plan cache:
+  Records go under `state_dir()/iac_plans/<sha256>.json`. Plans older
+  than 7 days are dropped on each `check-plan` invocation.
+
+Examples:
+  tirith iac guard on
+  tirith iac guard status
+  tirith iac require-plan-before-apply on
+  tirith iac require-plan-before-apply status
+  tirith iac check-plan tfplan
+  tirith iac check-plan --tool pulumi ./plan.json")]
+    Iac {
+        #[command(subcommand)]
+        action: IacAction,
+    },
+
     /// Inspect / guard / label SSH hosts for remote-session protection (M8 ch2)
     #[command(after_help = "\
 Subcommands:
@@ -1456,6 +1514,82 @@ Examples:
         /// `<repo>/.tirith/ssh-host-labels.yaml`.
         #[arg(long, default_value = "user")]
         scope: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum IacAction {
+    /// Turn the shared operational-context rule on or off
+    #[command(after_help = "\
+Examples:
+  tirith iac guard on
+  tirith iac guard off
+  tirith iac guard status
+
+Note: This flips the SAME `context_guard_enabled` policy field that
+`tirith context guard` and `tirith ssh guard` operate on — one operator
+switch silences ALL operational-context findings (cloud CLI, SSH, IaC).")]
+    Guard {
+        /// One of: on, off, status.
+        action: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Parse a saved IaC plan, record its SHA-256, and report the change summary
+    #[command(after_help = "\
+Examples:
+  tirith iac check-plan tfplan
+  tirith iac check-plan --tool pulumi ./plan.json
+  tirith iac check-plan --json tfplan
+
+Tool detection:
+  Auto-detected from sibling files in the plan's parent directory
+  (`Pulumi.yaml` → pulumi, `tofu.lock.hcl` → tofu, otherwise terraform).
+  Pass `--tool` to override.")]
+    CheckPlan {
+        /// Path to the saved plan file. Terraform binary plans are
+        /// passed to `terraform show -json` for parsing; Pulumi JSON
+        /// plans are read directly.
+        plan: std::path::PathBuf,
+
+        /// Force a specific tool (terraform | pulumi | tofu). When
+        /// unset, the tool is detected from sibling files.
+        #[arg(long)]
+        tool: Option<String>,
+
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Toggle the plan-before-apply gate (engine refuses bare `apply`)
+    #[command(after_help = "\
+When ON, `terraform apply` (no plan file) fires `iac_apply_without_plan`
+at High severity; `terraform apply tfplan` where the file's SHA-256
+does NOT match a `tirith iac check-plan`-recorded hash fires
+`iac_plan_hash_mismatch` at High severity.
+
+Examples:
+  tirith iac require-plan-before-apply on
+  tirith iac require-plan-before-apply off
+  tirith iac require-plan-before-apply status")]
+    RequirePlanBeforeApply {
+        /// One of: on, off, status.
+        action: String,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -3967,6 +4101,34 @@ fn run() {
                     }
                 };
                 cli::ssh::label(&host, &criticality, parsed_scope, json)
+            }
+        },
+
+        Commands::Iac { action } => match action {
+            IacAction::Guard {
+                action,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::iac::guard(&action, json)
+            }
+            IacAction::CheckPlan {
+                plan,
+                tool,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::iac::check_plan(&plan, tool.as_deref(), json)
+            }
+            IacAction::RequirePlanBeforeApply {
+                action,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::iac::require_plan_before_apply(&action, json)
             }
         },
     };
