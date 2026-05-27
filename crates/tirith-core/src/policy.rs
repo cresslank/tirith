@@ -287,6 +287,33 @@ pub struct Policy {
     /// ch1 `context_guard_enabled` flag uses.
     #[serde(default)]
     pub iac_require_plan_before_apply: bool,
+
+    /// **M8 ch4 — require a tagged sudo-session for the sudo rules to
+    /// downgrade.**
+    ///
+    /// When `true`, an active session file under
+    /// `state_dir()/sudo-session.json` (created via
+    /// `tirith sudo session start --reason "…"`) downgrades the five
+    /// M8 ch4 sudo rules from High to Medium. When `false` (the
+    /// default), the session file is consulted purely for status
+    /// reporting and never affects rule severity — every sudo rule
+    /// fires at its baseline High.
+    ///
+    /// Toggled by `tirith sudo require-reason on|off`. Persisted via
+    /// the same single-line append-or-rewrite the M8 ch1
+    /// `context_guard_enabled` flag uses.
+    #[serde(default)]
+    pub sudo_require_reason: bool,
+
+    /// **M8 ch4 — default session lifetime for `tirith sudo session start`.**
+    ///
+    /// When set, `tirith sudo session start` (with no `--ttl` flag)
+    /// uses this value as the session TTL in seconds. When `None`, the
+    /// CLI falls back to [`crate::sudo_session::DEFAULT_SESSION_TTL_SECS`]
+    /// (30 minutes). The rule module never reads this field directly —
+    /// it only affects the CLI default.
+    #[serde(default)]
+    pub sudo_session_ttl: Option<u64>,
 }
 
 /// **M7 ch2** — `tirith share` policy configuration.
@@ -768,6 +795,8 @@ impl Default for Policy {
             context_labels: BTreeMap::new(),
             ssh_host_labels: BTreeMap::new(),
             iac_require_plan_before_apply: false,
+            sudo_require_reason: false,
+            sudo_session_ttl: None,
         }
     }
 }

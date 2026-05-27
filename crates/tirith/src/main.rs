@@ -1401,6 +1401,54 @@ Examples:
         #[command(subcommand)]
         action: SshAction,
     },
+
+    /// Guard / inspect sudo-escalation gates (M8 ch4)
+    #[command(after_help = "\
+Subcommands:
+  tirith sudo guard on | off | status              — flip the shared
+                                                     operational-context
+                                                     switch (same flag
+                                                     as `tirith context
+                                                     guard`).
+  tirith sudo session start [--ttl 30m]            — open a tagged sudo
+        [--reason \"…\"]                            session window. When
+                                                     `sudo_require_reason`
+                                                     is on, an active
+                                                     session downgrades
+                                                     the M8 ch4 sudo rules
+                                                     from High to Medium.
+  tirith sudo session end                          — clear the session.
+  tirith sudo session status                       — report active or
+                                                     inactive + remaining
+                                                     TTL.
+  tirith sudo require-reason on | off | status     — toggle the
+                                                     `sudo_require_reason`
+                                                     gate.
+
+What it catches:
+  `sudo sh | bash | zsh | fish` — interactive root shell, High.
+  `sudo -E …` with sensitive env (AWS_*, GITHUB_TOKEN, …) set — High.
+  `… | sudo tee /etc/cron.d/x` (or /usr/local/bin/, /lib/systemd/) — High.
+  `sudo curl -o /usr/local/bin/<tool> <url>` — High.
+  `sudo chmod -R 777 /home` (or /, /usr, /etc) — High.
+
+Session file:
+  Stored under `state_dir()/sudo-session.json` with `{started_at, ttl_secs,
+  reason}`. The TTL check tolerates ±60s clock skew (NTP drift, container
+  time-warp). The file is user-writable — labels are operator-trust, not
+  adversary-resistant.
+
+Examples:
+  tirith sudo guard on
+  tirith sudo guard status
+  tirith sudo session start --ttl 30m --reason \"rotating cert\"
+  tirith sudo session status
+  tirith sudo session end
+  tirith sudo require-reason on")]
+    Sudo {
+        #[command(subcommand)]
+        action: SudoAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1590,6 +1638,123 @@ Examples:
     RequirePlanBeforeApply {
         /// One of: on, off, status.
         action: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SudoAction {
+    /// Turn the shared operational-context rule on or off
+    #[command(after_help = "\
+Examples:
+  tirith sudo guard on
+  tirith sudo guard off
+  tirith sudo guard status
+
+Note: This flips the SAME `context_guard_enabled` policy field that
+`tirith context guard`, `tirith ssh guard`, and `tirith iac guard` operate
+on — one operator switch silences ALL operational-context findings
+(cloud CLI, SSH, IaC, sudo).")]
+    Guard {
+        /// One of: on, off, status.
+        action: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Open / close / report a tagged sudo-session window
+    #[command(after_help = "\
+Session windows record `{started_at, ttl, reason}` under
+`state_dir()/sudo-session.json`. When `policy.sudo_require_reason` is ON,
+an active session downgrades the five M8 ch4 sudo rules from High to
+Medium so the audit trail records intent without blocking.
+
+The TTL check tolerates ±60s clock skew (NTP drift, container time-warp).
+The file is user-writable — labels are operator-trust, not adversary-
+resistant.
+
+Examples:
+  tirith sudo session start --ttl 30m --reason \"rotating cert\"
+  tirith sudo session start --ttl 1h
+  tirith sudo session status
+  tirith sudo session status --json
+  tirith sudo session end")]
+    Session {
+        #[command(subcommand)]
+        action: SudoSessionAction,
+    },
+
+    /// Toggle the `sudo_require_reason` policy gate
+    #[command(after_help = "\
+When ON, an active sudo-session downgrades the five M8 ch4 sudo rules
+from High to Medium. `tirith sudo session start` requires a `--reason`
+flag when this is ON. When OFF (the default), the session file is
+consulted purely for status reporting — every sudo rule fires at its
+baseline High severity.
+
+Examples:
+  tirith sudo require-reason on
+  tirith sudo require-reason off
+  tirith sudo require-reason status")]
+    RequireReason {
+        /// One of: on, off, status.
+        action: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SudoSessionAction {
+    /// Open a sudo-session window
+    #[command(after_help = "\
+TTL accepts `90s`, `5m`, `2h`, `1d`, or bare seconds. Default is 30m
+unless `policy.sudo_session_ttl` is set.
+
+Examples:
+  tirith sudo session start --ttl 30m --reason \"rotating cert\"
+  tirith sudo session start --reason \"deploying\"")]
+    Start {
+        /// Session lifetime (e.g. `30m`, `2h`, `90s`). When omitted,
+        /// falls back to `policy.sudo_session_ttl` then the 30-minute
+        /// built-in default.
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Operator-supplied reason string (free-form). Required when
+        /// `policy.sudo_require_reason` is on.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Clear the active sudo-session window
+    End {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Report whether a sudo session is active + how much TTL remains
+    Status {
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -4129,6 +4294,44 @@ fn run() {
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::iac::require_plan_before_apply(&action, json)
+            }
+        },
+
+        Commands::Sudo { action } => match action {
+            SudoAction::Guard {
+                action,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::sudo::guard(&action, json)
+            }
+            SudoAction::Session { action } => match action {
+                SudoSessionAction::Start {
+                    ttl,
+                    reason,
+                    format,
+                    json,
+                } => {
+                    let (_, json) = HumanJsonFormat::resolve(format, json);
+                    cli::sudo::session_start(ttl.as_deref(), reason.as_deref(), json)
+                }
+                SudoSessionAction::End { format, json } => {
+                    let (_, json) = HumanJsonFormat::resolve(format, json);
+                    cli::sudo::session_end(json)
+                }
+                SudoSessionAction::Status { format, json } => {
+                    let (_, json) = HumanJsonFormat::resolve(format, json);
+                    cli::sudo::session_status(json)
+                }
+            },
+            SudoAction::RequireReason {
+                action,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::sudo::require_reason(&action, json)
             }
         },
     };

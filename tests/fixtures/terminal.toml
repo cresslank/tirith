@@ -180,8 +180,13 @@ name = "hidden_multiline_sudo"
 min_milestone = 1
 input = "ls\nsudo rm -rf /"
 context = "paste"
-expected_action = "allow"
-expected_rules = []
+# Pre-M8 ch4 this paste was silently dropped at the tier-1 gate (no
+# exec-only pattern matched, paste fragments lacked a sudo trigger).
+# M8 ch4 added `\bsudo\b` to both exec AND paste tier-1 fragments so
+# the multiline `sudo rm -rf /` smuggling shape now correctly reaches
+# `hidden_multiline` in tier-3 — exactly the rule's intended scope.
+expected_action = "block"
+expected_rules = ["hidden_multiline"]
 
 [[fixture]]
 name = "multiline_safe"

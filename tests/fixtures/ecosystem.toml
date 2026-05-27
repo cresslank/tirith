@@ -247,14 +247,21 @@ context = "exec"
 expected_action = "block"
 expected_rules = ["repo_add_from_pipe"]
 
-# repo_add_from_pipe BENIGN — local file into tee is not a network-fetch attack
+# repo_add_from_pipe BENIGN — local file into tee is not a network-fetch
+# attack, so `repo_add_from_pipe` must NOT fire. M8 ch4 introduced
+# `sudo_tee_system_file`, which catches `… | sudo tee /etc/…` regardless
+# of source (even local files become attacker-controllable if their
+# content came from somewhere untrusted). The `forbidden_rules` entry
+# pins that we still do NOT trip `repo_add_from_pipe` here — the rule
+# being demonstrated has not regressed.
 [[fixture]]
-name = "repo_add_local_cat_into_tee_allow"
+name = "repo_add_local_cat_into_tee_no_repo_add_rule"
 min_milestone = 3
 input = "cat ./vendor.list | sudo tee /etc/apt/sources.list.d/vendor.list"
 context = "exec"
-expected_action = "allow"
-expected_rules = []
+expected_action = "block"
+expected_rules = ["sudo_tee_system_file"]
+forbidden_rules = ["repo_add_from_pipe"]
 
 # repo_add_from_pipe BENIGN — curl piped to tee into a normal file
 [[fixture]]

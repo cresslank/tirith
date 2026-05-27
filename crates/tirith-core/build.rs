@@ -687,6 +687,26 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "IaC CLIs for apply-gate / destroy detection (M8 ch3)",
     },
     PatternEntry {
+        id: "sudo_cmd",
+        // M8 ch4 — `sudo` invocations. The PATTERN_TABLE entry is a
+        // coarse tier-1 probe; the precise interactive-shell /
+        // env-preserve / tee-system / download-install /
+        // recursive-perms matching lives in `rules::sudo::check`.
+        //
+        // Word boundary (`\b`) keeps `sudoers` (file name) and
+        // `pseudo-` (prefix) out of the tier-1 hit list — only the
+        // standalone `sudo` token matches.
+        //
+        // The pipe-to-interpreter pattern already matches `| sudo
+        // bash` because the alternation has a `sudo` literal inside;
+        // this entry catches direct `sudo …` invocations that the
+        // pipe regex does not cover (e.g. `sudo sh` alone, `sudo tee
+        // /etc/foo`).
+        tier1_exec_fragments: &[r"\bsudo\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "Sudo invocations for escalation-gate detection (M8 ch4)",
+    },
+    PatternEntry {
         id: "prompt_injection_seed",
         // M7 ch5 — paste-only fast gate for the prompt-injection rule.
         //
@@ -1063,6 +1083,15 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("iac_destroy_prod", "IacDestroyProd"),
     ("iac_plan_high_risk_changes", "IacPlanHighRiskChanges"),
     ("iac_plan_hash_mismatch", "IacPlanHashMismatch"),
+    // Sudo-escalation rules (M8 ch4).
+    ("sudo_shell_spawn", "SudoShellSpawn"),
+    ("sudo_env_preserve_sensitive", "SudoEnvPreserveSensitive"),
+    ("sudo_tee_system_file", "SudoTeeSystemFile"),
+    ("sudo_download_install", "SudoDownloadInstall"),
+    (
+        "sudo_recursive_perms_broad_path",
+        "SudoRecursivePermsBroadPath",
+    ),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[

@@ -682,6 +682,12 @@ const ALL_RULE_IDS: &[&str] = &[
     "iac_destroy_prod",
     "iac_plan_high_risk_changes",
     "iac_plan_hash_mismatch",
+    // Sudo-escalation rules (M8 ch4)
+    "sudo_shell_spawn",
+    "sudo_env_preserve_sensitive",
+    "sudo_tee_system_file",
+    "sudo_download_install",
+    "sudo_recursive_perms_broad_path",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -1126,6 +1132,12 @@ fn test_rule_id_list_is_complete() {
         RuleId::IacDestroyProd,
         RuleId::IacPlanHighRiskChanges,
         RuleId::IacPlanHashMismatch,
+        // Sudo-escalation rules (M8 ch4)
+        RuleId::SudoShellSpawn,
+        RuleId::SudoEnvPreserveSensitive,
+        RuleId::SudoTeeSystemFile,
+        RuleId::SudoDownloadInstall,
+        RuleId::SudoRecursivePermsBroadPath,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();

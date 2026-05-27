@@ -1875,3 +1875,79 @@ input = "terraform destroy"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# M8 ch4 — sudo-escalation rules.
+#
+# Each fixture below pins one of the five M8 ch4 rules at its default
+# High severity. The `sudo_env_preserve_sensitive` row uses the
+# explicit `--preserve-env=AWS_SECRET_ACCESS_KEY` form so the rule
+# fires from a presence-only name check (no env mutation needed —
+# avoids the libc-environ race documented in safe_command's env
+# integration tests).
+
+[[fixture]]
+name = "sudo_sh_blocks"
+min_milestone = 8
+input = "sudo sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["sudo_shell_spawn"]
+
+[[fixture]]
+name = "sudo_preserve_env_aws_secret_blocks"
+min_milestone = 8
+input = "sudo --preserve-env=AWS_SECRET_ACCESS_KEY pip install foo"
+context = "exec"
+expected_action = "block"
+expected_rules = ["sudo_env_preserve_sensitive"]
+
+[[fixture]]
+name = "sudo_tee_etc_cron_blocks"
+min_milestone = 8
+input = "echo evil | sudo tee /etc/cron.d/x"
+context = "exec"
+expected_action = "block"
+expected_rules = ["sudo_tee_system_file"]
+
+[[fixture]]
+name = "sudo_curl_usr_local_bin_blocks"
+min_milestone = 8
+input = "sudo curl -o /usr/local/bin/foo https://example.com/foo"
+context = "exec"
+expected_action = "block"
+expected_rules = ["sudo_download_install"]
+
+[[fixture]]
+name = "sudo_chmod_recursive_home_blocks"
+min_milestone = 8
+input = "sudo chmod -R 777 /home"
+context = "exec"
+expected_action = "block"
+expected_rules = ["sudo_recursive_perms_broad_path"]
+
+# Clean-allow fixtures pin the narrow-path / safe-target shapes that
+# the rule MUST NOT flag.
+
+[[fixture]]
+name = "sudo_apt_update_allows"
+min_milestone = 8
+input = "sudo apt update"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "sudo_tee_tmp_allows"
+min_milestone = 8
+input = "echo cfg | sudo tee /tmp/foo"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "sudo_chmod_narrow_allows"
+min_milestone = 8
+input = "sudo chmod -R 755 /home/me/proj"
+context = "exec"
+expected_action = "allow"
+expected_rules = []

@@ -237,7 +237,16 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::IacApplyAutoApproveProd
         | RuleId::IacDestroyProd
         | RuleId::IacPlanHighRiskChanges
-        | RuleId::IacPlanHashMismatch => false,
+        | RuleId::IacPlanHashMismatch
+        // M8 ch4 — sudo-escalation rules. Heuristics on the parsed
+        // sudo invocation + (for env-preserve) presence-only check
+        // against the sensitive-env asset list. No threat-DB
+        // involvement.
+        | RuleId::SudoShellSpawn
+        | RuleId::SudoEnvPreserveSensitive
+        | RuleId::SudoTeeSystemFile
+        | RuleId::SudoDownloadInstall
+        | RuleId::SudoRecursivePermsBroadPath => false,
     }
 }
 

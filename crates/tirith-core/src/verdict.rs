@@ -395,6 +395,41 @@ pub enum RuleId {
     /// was never checked. High severity when
     /// `policy.iac_require_plan_before_apply: true` is set.
     IacPlanHashMismatch,
+
+    // Sudo-escalation rules (M8 ch4) — fire from `rules::sudo` when the
+    // parsed command's leader resolves to `sudo` (direct or behind an
+    // `env`-style wrapper). The PATTERN_TABLE entry `sudo_cmd` is the
+    // tier-1 gate. All five default to High severity; the M8 ch4
+    // `policy.sudo_require_reason` + sudo-session file together can
+    // downgrade them to Medium when the operator has tagged an active
+    // session.
+    /// M8 ch4 — `sudo sh|bash|zsh|fish|dash|ksh|tcsh|pwsh|powershell|nu`
+    /// opens an interactive root shell. Subsequent commands typed into
+    /// the spawned shell run as root with zero tirith visibility — we
+    /// intercept the local shell only, not nested shells. High severity.
+    SudoShellSpawn,
+    /// M8 ch4 — `sudo -E` / `--preserve-env` with at least one sensitive
+    /// env var from `assets/data/sensitive_env.toml` currently set in
+    /// the parent shell's environment (OR `--preserve-env=VAR_LIST`
+    /// where the list intersects the sensitive set). The credentials
+    /// become readable via `/proc/<pid>/environ` to anything that can
+    /// enumerate processes. High severity.
+    SudoEnvPreserveSensitive,
+    /// M8 ch4 — `… | sudo tee <system-path>` writing attacker-
+    /// controllable input to a privileged system file (`/etc/…`,
+    /// `/usr/local/bin/…`, `/lib/systemd/…`, `/etc/cron*`). The
+    /// `/tmp`, `~`, and repo-relative shapes never fire. High severity.
+    SudoTeeSystemFile,
+    /// M8 ch4 — `sudo curl|wget|fetch -o <system-path>` (or
+    /// `--output=…` / `-O …` equivalents) downloading remote content
+    /// directly to a privileged system path as root. Bypasses package
+    /// signing entirely. High severity.
+    SudoDownloadInstall,
+    /// M8 ch4 — `sudo chmod|chown -R …` against a broad system tree
+    /// (`/`, `/home`, `/usr`, `/etc`). Routinely strips setuid bits,
+    /// locks operators out of their homedirs, or breaks distro
+    /// packages. High severity.
+    SudoRecursivePermsBroadPath,
 }
 
 impl fmt::Display for RuleId {

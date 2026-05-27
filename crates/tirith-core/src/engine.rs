@@ -1014,6 +1014,13 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             // `iac_cmd` PATTERN_TABLE entry.
             let iac_findings = crate::rules::iac::check(&ctx.input, ctx.shell, &policy);
             findings.extend(iac_findings);
+
+            // M8 ch4 — sudo-escalation rules. Non-sudo leader
+            // short-circuits inside `sudo::check`; tier-1 gate is the
+            // `sudo_cmd` PATTERN_TABLE entry. Session-file lookup is
+            // lazy (only when a finding fires).
+            let sudo_findings = crate::rules::sudo::check(&ctx.input, ctx.shell, &policy);
+            findings.extend(sudo_findings);
         }
 
         let cred_findings =

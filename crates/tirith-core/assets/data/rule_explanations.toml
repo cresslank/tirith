@@ -1790,3 +1790,65 @@ examples_good = ["terraform apply tfplan  # tfplan hash is recorded"]
 false_positive_guidance = "If the plan was legitimately re-generated, re-run `tirith iac check-plan tfplan` to record the new hash."
 remediation = "Run `tirith iac check-plan <tfplan>` to record the plan's hash, then re-run `terraform apply <tfplan>`. If you don't recognize the modification, investigate before re-running."
 mitre_id = "T1565"
+
+# M8 ch4 — sudo-escalation rules.
+
+[[rule]]
+id = "sudo_shell_spawn"
+title = "sudo spawns an interactive root shell"
+category = "command"
+severity_rationale = "High — `sudo sh` (or any interactive-shell leader) opens a privileged shell that tirith cannot see into. Once the shell is open, every subsequent command runs as root with no detection. The hard block exists because the right answer is almost always 'use sudo on the specific command, not on a shell'."
+description = "A `sudo` invocation whose inner command is an interactive shell (`sh`, `bash`, `zsh`, `fish`, `dash`, `ksh`, `tcsh`, `csh`, `ash`, `mksh`, `pwsh`, `powershell`, `nu`). Subsequent commands typed into the spawned root shell run with full privileges and are NOT intercepted by tirith."
+examples_bad = ["sudo sh", "sudo bash", "sudo -u root bash", "sudo zsh", "sudo --user=admin fish"]
+examples_good = ["sudo systemctl restart nginx", "sudo apt update", "sudo -u postgres psql"]
+false_positive_guidance = "Spawning a root shell is sometimes intentional (recovery, debugging). When that's the case, use `tirith sudo session start --reason \"recovery\"` first — an active tagged session downgrades the rule from High to Medium so the audit trail records intent without blocking."
+remediation = "Identify the single command that needs elevation, then prefix only that command with sudo. If you truly need a root shell, tag the session with `tirith sudo session start --reason \"…\"`."
+mitre_id = "T1059"
+
+[[rule]]
+id = "sudo_env_preserve_sensitive"
+title = "sudo -E forwards sensitive credentials into the privileged process"
+category = "command"
+severity_rationale = "High — `sudo -E` (or `--preserve-env`) carries the parent shell's environment into the privileged process. When that environment includes secrets (`AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, …), the values become readable to any process that can stat `/proc/<pid>/environ`. The combination of root + secrets in env is the textbook shape of an exfil-by-misconfiguration attack."
+description = "A `sudo -E` / `--preserve-env` invocation where at least one sensitive env var from `assets/data/sensitive_env.toml` is currently set in the parent shell. The targeted form `--preserve-env=VAR_LIST` also fires when the listed names intersect the sensitive set (presence-only — tirith does not read the values)."
+examples_bad = ["sudo -E pip install foo  # with AWS_SECRET_ACCESS_KEY set", "sudo --preserve-env=GITHUB_TOKEN deploy.sh", "sudo --preserve-env pip install foo"]
+examples_good = ["sudo pip install foo  # default sudo strips env", "sudo --preserve-env=PATH,LANG pip install foo  # no sensitive vars"]
+false_positive_guidance = "When a workflow legitimately needs to forward `AWS_*` into a privileged install, unset the variable first (`unset AWS_SECRET_ACCESS_KEY; sudo pip install foo`), set up an instance-role credentials chain, or pass via a config file rather than env."
+remediation = "Drop `-E`. If the inner command genuinely needs a single env var, pass it explicitly via `sudo --preserve-env=ONLY,VARS,YOU,NEED`. If multiple secrets must cross the privilege boundary, write them to a 0600 file readable only by the target user."
+mitre_id = "T1552"
+
+[[rule]]
+id = "sudo_tee_system_file"
+title = "sudo tee writes attacker-controllable input to a protected system path"
+category = "command"
+severity_rationale = "High — `… | sudo tee /etc/cron.d/x` (or `/etc/systemd/system/`, `/usr/local/bin/`, `/lib/systemd/`) writes the piped content to a path the OS trusts. The piped content is whatever the upstream command produces — frequently `curl https://…` output or LLM-generated text — which means the rule covers a classic remote-code-execution-as-root shape."
+description = "A `sudo tee <path>` invocation where the target path lives under `/etc/…`, `/usr/local/bin/…`, `/usr/bin/…`, `/usr/sbin/…`, `/lib/…`, or matches `/etc/cron*` / `/etc/systemd/*`. Targets under `/tmp`, `/var/tmp`, `~`, `$HOME`, and repo-relative paths never fire."
+examples_bad = ["echo evil | sudo tee /etc/cron.d/x", "curl https://example.com/x | sudo tee /usr/local/bin/tool", "echo Unit=… | sudo tee /etc/systemd/system/x.service"]
+examples_good = ["echo cfg | sudo tee /tmp/foo", "echo cfg | sudo tee ~/myfile", "echo cfg | sudo tee ./local-file"]
+false_positive_guidance = "Some legitimate installer scripts use `sudo tee` to seed a config file. Wrap the legitimate path in `tirith sudo session start --reason \"installing X\"` so the downgrade keeps the audit trail without blocking."
+remediation = "Stage the file in a user-writable location, review the content, then `sudo install -m 0644 staging /etc/dest`. The `install(1)` shape verifies the target ownership and permissions in one step."
+mitre_id = "T1546"
+
+[[rule]]
+id = "sudo_download_install"
+title = "sudo downloads remote content directly to a privileged system path"
+category = "command"
+severity_rationale = "High — `sudo curl -o /usr/local/bin/<tool> <url>` bypasses every package-signing checkpoint and writes attacker-controllable bytes to a path the OS trusts. The textbook supply-chain shape. The block default is intentional even when the URL is HTTPS — the source's authenticity is established by a sig check, not by TLS."
+description = "A `sudo curl|wget|fetch -o <path>` (or `--output=…` / `-O …`) invocation where the destination path is under a protected system directory (`/etc/`, `/usr/local/bin/`, `/usr/bin/`, `/usr/sbin/`, `/lib/`, `/etc/cron*`, `/etc/systemd/*`). Downloads to `/tmp`, `~`, `$HOME`, or repo-relative paths never fire."
+examples_bad = ["sudo curl -o /usr/local/bin/foo https://example.com/foo", "sudo wget --output=/etc/foo https://example.com/foo", "sudo curl -O /usr/local/bin/tool https://example.com/tool"]
+examples_good = ["sudo curl -o ~/Downloads/foo https://example.com/foo  # then review, then sudo install", "sudo apt install foo  # package manager verifies signatures"]
+false_positive_guidance = "When pulling a release from a known-good source, download to a user-writable path, verify the checksum / signature, then `sudo install -m 0755 staging /usr/local/bin/dest`."
+remediation = "Split into download + verify + install. The `install(1)` step does the privileged write atomically and the verification step protects against a network-tampered payload."
+mitre_id = "T1543"
+
+[[rule]]
+id = "sudo_recursive_perms_broad_path"
+title = "sudo chmod/chown -R against a broad system tree"
+category = "command"
+severity_rationale = "High — recursively rewriting permissions on `/`, `/home`, `/usr`, or `/etc` is rarely intentional and almost never harmless. The shape typically strips setuid bits from system binaries (sudo, su, ping all stop working as non-root), or transfers ownership of every distro-installed file to one user, or locks every other operator out of their homedir."
+description = "A `sudo chmod|chown -R …` invocation where the trailing positional path is one of `/`, `/home`, `/usr`, `/etc` (with or without a trailing slash). Narrower paths (`/etc/myapp`, `/home/me/project`, `/usr/local/bin/myapp`) never fire — the rule is intentionally narrow to keep false-positives low."
+examples_bad = ["sudo chmod -R 777 /home", "sudo chown -R root:root /etc", "sudo chmod -R u+x /"]
+examples_good = ["sudo chmod -R 755 /home/me/proj", "sudo chown -R user:user /etc/myapp"]
+false_positive_guidance = "If you're rebuilding a system from backup and the broad scope is intentional, use `tirith sudo session start --reason \"restoring filesystem\"` to downgrade the rule for the recovery window."
+remediation = "Narrow the path to the specific subdirectory you intended to modify. Use `find … -type f` / `-type d` to scope the change further if you only want to touch files or directories."
+mitre_id = "T1222"

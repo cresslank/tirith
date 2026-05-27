@@ -165,6 +165,7 @@ pub mod score;
 pub mod selfupdate;
 pub mod share;
 pub mod ssh;
+pub mod sudo;
 pub mod threatdb_cmd;
 pub mod trust;
 pub mod view;

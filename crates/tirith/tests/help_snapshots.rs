@@ -126,6 +126,11 @@ help_example_tests! {
     help_iac_guard       => (["iac", "guard", "--help"], "tirith iac guard on");
     help_iac_check_plan  => (["iac", "check-plan", "--help"], "tirith iac check-plan tfplan");
     help_iac_require_plan_before_apply => (["iac", "require-plan-before-apply", "--help"], "tirith iac require-plan-before-apply on");
+    // M8 ch4 — `tirith sudo guard|session|require-reason`.
+    help_sudo                  => (["sudo", "--help"], "tirith sudo guard on");
+    help_sudo_guard            => (["sudo", "guard", "--help"], "tirith sudo guard on");
+    help_sudo_session          => (["sudo", "session", "--help"], "tirith sudo session start --ttl 30m --reason");
+    help_sudo_require_reason   => (["sudo", "require-reason", "--help"], "tirith sudo require-reason on");
 }
 
 #[test]

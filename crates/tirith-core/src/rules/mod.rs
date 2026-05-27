@@ -20,6 +20,7 @@ pub mod prompt_injection;
 pub mod rendered;
 pub mod shared;
 pub mod ssh_context;
+pub mod sudo;
 pub mod terminal;
 pub mod threatintel;
 pub mod transport;

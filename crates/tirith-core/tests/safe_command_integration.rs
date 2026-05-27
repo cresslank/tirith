@@ -1,9 +1,14 @@
 //! End-to-end coverage for the M6 ch5 safe-command transforms.
 //!
-//! Each transform ships one positive and one negative test, except
-//! `sudo-narrow` which ships two negatives (`sudo rm -rf /` still flagging,
-//! `sudo sh` triggering the interactive-shell remediation). M8 ch4 will add
-//! the positive sudo-narrow case once a stable benign-target fixture exists.
+//! Each transform ships one positive and one negative test. The
+//! `sudo-narrow` family now ships four: two negatives carried forward
+//! from M6 (`sudo rm -rf /` still flagging, `sudo sh` triggering the
+//! interactive-shell remediation) plus two M8 ch4 cases — the deferred
+//! positive (`sudo apt update`, where the stripped leader is benign)
+//! and a new negative that pins the M6 ch5 invariant that an
+//! interactive-shell leader NEVER yields a mechanical rewrite, even
+//! when the sudo-only rules added in M8 ch4 are what made the verdict
+//! fire.
 
 use tirith_core::safe_command::{suggest, SafeSuggestion};
 use tirith_core::tokenize::ShellType;
@@ -123,6 +128,85 @@ fn sudo_narrow_negative_sudo_sh_returns_interactive_shell_remediation() {
     assert!(
         entry.rationale.contains("avoid interactive root shells"),
         "rationale should warn about interactive root shells: {}",
+        entry.rationale
+    );
+}
+
+// ── 2a. sudo-narrow (M8 ch4 deferred POSITIVE) ───────────────────────────
+//
+// M6 ch5 had a sudo-narrow positive case marked DEFERRED to M8 ch4
+// because no stable benign-target fixture existed. M8 ch4 ships the
+// sudo rule family — including `SudoShellSpawn`, which finally gives
+// us a clean way to construct the positive: a sudo command that
+// fires a sudo-ONLY rule (no inner-command finding), so stripping
+// sudo leaves an Allow path.
+//
+// `sudo apt update` is the textbook positive — `apt update` alone
+// is Allow under the default engine. We DON'T drive this through
+// `tirith_core::engine::analyze` because the verdict-construction
+// in this test runs the suggester directly with a synthetic verdict;
+// the engine call inside `build_sudo_narrow_suggestion` re-analyzes
+// the stripped inner command and is what produces the rewrite.
+
+#[test]
+fn sudo_narrow_positive_sudo_apt_update_strips_sudo() {
+    // `sudo apt update` — the inner command `apt update` is Allow,
+    // and the leader (`apt`) is NOT an interactive shell. sudo-narrow
+    // must emit a rewrite to the bare inner command.
+    let cmd = "sudo apt update";
+    // Synthetic finding to keep the call path uniform with the other
+    // sudo-narrow tests — any finding triggers the command-shape
+    // transforms.
+    let v = verdict_with(vec![finding(RuleId::CommandNetworkDeny)]);
+    let s = suggest(cmd, ShellType::Posix, &v);
+    let entry = find_by_rule(&s, "sudo_narrow")
+        .expect("sudo_narrow entry must be present for sudo apt update");
+    let sc = entry
+        .safe_command
+        .as_deref()
+        .expect("sudo apt update: stripped leader is benign, rewrite should fire");
+    assert_eq!(
+        sc, "apt update",
+        "sudo-narrow should emit the bare inner command, got: {sc}"
+    );
+    assert!(
+        entry.rationale.contains("safe to run without sudo"),
+        "rationale should explain the strip: {}",
+        entry.rationale
+    );
+}
+
+// ── 2b. sudo-narrow (M8 ch4 NEGATIVE — interactive shell invariant) ──────
+//
+// Pins the M6 ch5 invariant: an interactive-shell leader NEVER
+// yields a mechanical rewrite, even when the M8 ch4 sudo rules are
+// what made the verdict fire. The simpler `sudo sh` case above
+// drives this via a synthetic PipeToInterpreter; this version drives
+// it with the M8 ch4 `SudoShellSpawn` finding to confirm that
+// adding the sudo rules has NOT loosened the invariant.
+
+#[test]
+fn sudo_narrow_negative_sudo_shell_spawn_keeps_no_rewrite() {
+    let cmd = "sudo sh";
+    let v = verdict_with(vec![finding(RuleId::SudoShellSpawn)]);
+    let s = suggest(cmd, ShellType::Posix, &v);
+    let entry = find_by_rule(&s, "sudo_narrow")
+        .expect("sudo_narrow entry must be present for sudo sh + SudoShellSpawn");
+    assert!(
+        entry.safe_command.is_none(),
+        "sudo sh + SudoShellSpawn must NOT mechanically rewrite — got {:?}",
+        entry.safe_command
+    );
+    assert!(
+        entry
+            .rationale
+            .contains("no safe mechanical rewrite available"),
+        "rationale should advertise no rewrite: {}",
+        entry.rationale
+    );
+    assert!(
+        entry.rationale.contains("avoid interactive root shells"),
+        "rationale should mention interactive root shells: {}",
         entry.rationale
     );
 }
