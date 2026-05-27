@@ -1609,7 +1609,16 @@ pub fn iac_plans_dir() -> Option<PathBuf> {
 fn merge_context_labels(path: &Path, into: &mut BTreeMap<String, String>) {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(_) => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            // Permission / UTF-8 / other I/O — surface the failure so the
+            // operator knows labels were skipped (PR-127 review #13).
+            eprintln!(
+                "tirith: warning: context-labels file at {} read error: {e}",
+                path.display(),
+            );
+            return;
+        }
     };
     if content.trim().is_empty() {
         return;

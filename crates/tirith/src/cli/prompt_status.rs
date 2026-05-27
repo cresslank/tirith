@@ -106,10 +106,11 @@ struct Status {
     sudo_active: bool,
 }
 
-/// Entry point. `short` and `json` are mutually exclusive in CLI surface
-/// — the `--short` flag takes priority for the bracketed PS1 line, the
-/// `--json` flag emits the JSON envelope, and falling through with
-/// neither produces the long human form.
+/// Entry point. Precedence when multiple format flags are passed:
+/// `--json` always wins (JSON envelope), then `--short` (bracketed PS1
+/// line), and the long human form is the default. `--short` and `--json`
+/// are NOT enforced as mutually exclusive in clap — passing both is
+/// legal and produces JSON (PR-127 review #23, comment-analyzer #4).
 pub fn run(short: bool, json: bool) -> i32 {
     let status = match load_or_refresh() {
         Ok(s) => s,
@@ -367,7 +368,13 @@ fn ensure_dir_0700(dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Write the cache file with `0600` perms on Unix.
+/// Write the cache file with `0600` perms on Unix. Atomic via
+/// write-tempfile-then-rename, so a concurrent reader (split-pane terminal,
+/// another shell instance) never observes a half-written envelope.
+///
+/// If the tempfile path can't be created (e.g. read-only directory) we
+/// fall back to a direct write — the worst case there is the documented
+/// "parse failure → refresh" path, which is operationally fine.
 fn write_cache(path: &std::path::Path, status: &Status) -> std::io::Result<()> {
     let envelope = CacheEnvelope {
         schema_version: 1,
@@ -379,9 +386,47 @@ fn write_cache(path: &std::path::Path, status: &Status) -> std::io::Result<()> {
     };
     let body = serde_json::to_vec(&envelope).map_err(std::io::Error::other)?;
 
-    // Write to a tempfile in the same dir and rename — atomic vs another
-    // prompt invocation racing the write. Best-effort: if the temp path
-    // can't be created we fall back to a direct write.
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => return write_direct(path, &body),
+    };
+    let file_name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => return write_direct(path, &body),
+    };
+    let tmp_name = format!(".{file_name}.{}.tmp", std::process::id());
+    let tmp_path = parent.join(tmp_name);
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = match opts.open(&tmp_path) {
+        Ok(f) => f,
+        Err(_) => {
+            // Tempfile creation failed — fall back to the direct write.
+            return write_direct(path, &body);
+        }
+    };
+    use std::io::Write as _;
+    if let Err(e) = f.write_all(&body) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    drop(f);
+    match fs::rename(&tmp_path, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
+}
+
+fn write_direct(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -391,7 +436,7 @@ fn write_cache(path: &std::path::Path, status: &Status) -> std::io::Result<()> {
     }
     let mut f = opts.open(path)?;
     use std::io::Write as _;
-    f.write_all(&body)
+    f.write_all(body)
 }
 
 fn unix_now() -> u64 {

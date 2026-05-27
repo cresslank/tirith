@@ -36,6 +36,7 @@
 
 use crate::context_detect::{self, Provider};
 use crate::policy::Policy;
+use crate::rules::shared::is_critical_label;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
@@ -68,6 +69,20 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
     };
 
     let detection = context_detect::detect_all();
+
+    // If the provider we'd have to consult had a detection failure
+    // (timeout, exec error, parse error), surface it on stderr so the
+    // operator knows the verdict can't safely fall back to "allow". Prior
+    // versions stored `detection.failures` but never surfaced it — see
+    // PR-127 review finding #5.
+    if let Some(failure) = detection.failures.get(&provider) {
+        eprintln!(
+            "tirith: warning: {} context detection failed ({}); rule may not fire correctly for this command",
+            provider.as_str(),
+            failure,
+        );
+    }
+
     let active = match detection.contexts.get(&provider) {
         Some(ctx) => ctx,
         None => return Vec::new(),
@@ -449,14 +464,6 @@ fn args_mention_rbac(args: &[String]) -> bool {
                 | "secret"
         )
     })
-}
-
-fn is_critical_label(label: &str) -> bool {
-    let lower = label.trim().to_lowercase();
-    matches!(
-        lower.as_str(),
-        "critical" | "production" | "prod" | "live" | "p0" | "p1"
-    )
 }
 
 fn resolve_leader_and_args(cmd: &str, args: &[String], shell: ShellType) -> (String, Vec<String>) {

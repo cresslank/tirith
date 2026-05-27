@@ -8,9 +8,8 @@
 //!
 //! ## Clock-skew tolerance
 //!
-//! TTL freshness checks compare against `SystemTime::now()` and ALSO
-//! against the file's `mtime`. The `mtime` fallback exists for two
-//! reasons:
+//! TTL freshness checks compare against `SystemTime::now()` and the
+//! recorded `started_at`. Two cases are tolerated:
 //!
 //! 1. Operator clock-skew (NTP drift, container time-warp) — if
 //!    `now()` and the recorded `started_at` differ by ≤ 60 seconds we
@@ -18,6 +17,10 @@
 //! 2. Stale-fail safety — when the system clock is wrong by hours, the
 //!    `started_at` field can read as wildly in the future. We reject
 //!    expired sessions but never panic on an unparseable timestamp.
+//!
+//! The on-disk `mtime` is **never** used to rewrite `started_at` —
+//! `touch(1)`, `cp -p`, or a backup tool refreshing the timestamp must
+//! not silently reactivate an expired session.
 //!
 //! ## Lifecycle
 //!
@@ -117,32 +120,15 @@ impl SudoSession {
 /// missing OR the parsed session has expired. Caller never needs to
 /// re-check the TTL.
 ///
-/// File mtime check: if the JSON `started_at` field looks impossibly
-/// old (>1y) but the file's mtime is fresh, we trust the mtime —
-/// catches the rare "tirith was upgraded and the schema shifted" case
-/// without dropping the session silently.
+/// We *never* overwrite a parsed `started_at` from disk mtime. A prior
+/// implementation did so when the JSON timestamp drifted >1y from mtime,
+/// intending to recover from on-disk schema changes; in practice
+/// `touch(1)` or backup tools could refresh mtime on a long-expired
+/// session and silently reactivate it for another TTL window.
 pub fn read_active_session() -> Option<SudoSession> {
     let path = sudo_session_path()?;
     let bytes = std::fs::read(&path).ok()?;
-    let mut session: SudoSession = serde_json::from_slice(&bytes).ok()?;
-
-    // mtime fallback. If `started_at` is unparseable-old but the file
-    // looks fresh on disk, trust the disk timestamp. This is a last-
-    // resort path; we never WIDEN the TTL beyond what's recorded.
-    let mtime_secs = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs());
-    if let Some(mtime) = mtime_secs {
-        // If JSON timestamp drifted >1 year from mtime, treat mtime as
-        // canonical. This is rare — only happens when the JSON shape
-        // changed under the operator.
-        let one_year = 365 * 24 * 60 * 60;
-        if session.started_at + one_year < mtime || mtime + one_year < session.started_at {
-            session.started_at = mtime;
-        }
-    }
+    let session: SudoSession = serde_json::from_slice(&bytes).ok()?;
 
     if session.is_active() {
         Some(session)
@@ -200,6 +186,10 @@ fn unix_now() -> u64 {
 
 /// Parse a `--ttl` string like `30m` / `2h` / `90s` / bare seconds.
 /// Returns the duration in seconds. Empty string → `None`.
+///
+/// The trailing suffix must be a single ASCII character. Multi-byte
+/// suffixes (e.g. `5m€`) are rejected; previously the implementation
+/// called `s.split_at(s.len() - 1)` which can panic mid-codepoint.
 pub fn parse_ttl(s: &str) -> Option<u64> {
     let s = s.trim();
     if s.is_empty() {
@@ -209,7 +199,17 @@ pub fn parse_ttl(s: &str) -> Option<u64> {
     if let Ok(n) = s.parse::<u64>() {
         return Some(n);
     }
+    // The unit suffix must be a single ASCII byte. Reject anything else
+    // (including multi-byte unicode) up-front so the boundary split below
+    // is always safe.
+    let last_byte = s.as_bytes().last().copied()?;
+    if !last_byte.is_ascii() {
+        return None;
+    }
     let (num_part, suffix) = s.split_at(s.len() - 1);
+    if num_part.is_empty() {
+        return None;
+    }
     let n: u64 = num_part.parse().ok()?;
     match suffix {
         "s" | "S" => Some(n),
@@ -252,6 +252,18 @@ mod tests {
         assert_eq!(parse_ttl(""), None);
         assert_eq!(parse_ttl("xyz"), None);
         assert_eq!(parse_ttl("3w"), None);
+    }
+
+    #[test]
+    fn parse_ttl_does_not_panic_on_multibyte_suffix() {
+        // Regression: parse_ttl previously called s.split_at(s.len() - 1)
+        // which panics mid-codepoint when the last char is multi-byte
+        // (e.g. €, 中, 😀). The CLI passes this string straight from the
+        // operator's --ttl arg.
+        assert_eq!(parse_ttl("5m€"), None);
+        assert_eq!(parse_ttl("30s😀"), None);
+        assert_eq!(parse_ttl("€"), None);
+        assert_eq!(parse_ttl("m"), None); // unit only, no number
     }
 
     #[test]

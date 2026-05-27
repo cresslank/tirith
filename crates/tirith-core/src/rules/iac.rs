@@ -42,6 +42,7 @@ use std::path::PathBuf;
 use crate::context_detect::{self, Provider};
 use crate::iac_plan;
 use crate::policy::Policy;
+use crate::rules::shared::is_critical_label;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
@@ -206,12 +207,21 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
                 match std::fs::read(&pb) {
                     Ok(bytes) => {
                         let sha = iac_plan::sha256_hex(&bytes);
-                        if !iac_plan::plan_hash_recorded(&sha) {
-                            findings.push(make_finding(
-                                RuleId::IacPlanHashMismatch,
-                                Severity::High,
-                                format!("{} apply against an unrecorded plan file", tool.as_str()),
-                                format!(
+                        let status = iac_plan::plan_hash_status(&sha);
+                        // We treat both "NotRecorded" and
+                        // "StateDirUnresolved" as evidence the apply must
+                        // pause — fail closed (PR-127 review #14). The
+                        // evidence text differentiates so the operator
+                        // can fix the right thing.
+                        if !matches!(status, iac_plan::PlanHashStatus::Recorded) {
+                            let detail = match status {
+                                iac_plan::PlanHashStatus::StateDirUnresolved => format!(
+                                    "tirith could not resolve its state directory; plan-hash \
+                                     verification cannot proceed. Set `XDG_STATE_HOME` or \
+                                     ensure `$HOME` is writable, then run \
+                                     `tirith iac check-plan {path}` to record this plan."
+                                ),
+                                _ => format!(
                                     "`{}` was invoked with plan file `{}` but the file's \
                                      SHA-256 (`{}`) does not match any plan recorded in \
                                      `{}`. Run `tirith iac check-plan {}` first.",
@@ -221,6 +231,12 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
                                     iac_plan::iac_plans_dir_display(),
                                     path,
                                 ),
+                            };
+                            findings.push(make_finding(
+                                RuleId::IacPlanHashMismatch,
+                                Severity::High,
+                                format!("{} apply against an unrecorded plan file", tool.as_str()),
+                                detail,
                                 tool,
                                 input,
                                 prod_context.as_deref(),
@@ -277,14 +293,6 @@ fn find_prod_context(policy: &Policy) -> Option<String> {
         }
     }
     None
-}
-
-fn is_critical_label(label: &str) -> bool {
-    let lower = label.trim().to_lowercase();
-    matches!(
-        lower.as_str(),
-        "critical" | "production" | "prod" | "live" | "p0" | "p1"
-    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

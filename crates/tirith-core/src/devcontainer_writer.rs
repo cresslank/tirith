@@ -16,12 +16,16 @@
 //! string-aware so a `//` or `/*` inside a JSON string literal is
 //! preserved verbatim.
 //!
-//! The strip-then-parse approach loses original formatting on rewrite,
-//! but that is acceptable here — the writer reconstructs a minimal
-//! pretty-printed file with the tirith additions. The injection is
-//! idempotent (a re-run with the tirith hook already present is a
-//! no-op), so operators do not lose hand-edits to fields tirith does
-//! not touch (`name`, `image`, `features`, `customizations`, etc.).
+//! **Honest scope.** The JSONC support here is **best-effort, not a
+//! complete JSONC implementation**: single-quoted string literals,
+//! unquoted object keys, and Unicode escape edge cases are NOT handled.
+//! Comments INSIDE the file are dropped on the rewrite path — the writer
+//! re-emits via `serde_json::to_string_pretty`, so operator-added
+//! comments do not survive injection. The injection is idempotent (a
+//! re-run with the tirith hook already present is a no-op), so the only
+//! real loss is the formatting in fields tirith does not touch — values
+//! like `name`, `image`, `features`, and `customizations` survive but
+//! lose their original whitespace and comments.
 
 use std::path::{Path, PathBuf};
 

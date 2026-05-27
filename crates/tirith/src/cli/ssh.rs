@@ -211,11 +211,12 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
 
 /// `tirith ssh label <host> <criticality> [--scope user|repo]`.
 ///
-/// Resolves `~/.ssh/config` aliases via `ssh -G <host>` before writing the
-/// label, so an operator who labels `prod-host` (their local alias) and
-/// later runs `ssh prod-host.example.com` (the real DNS name) gets a
-/// match. The labels file stores the FINAL hostname; the host string the
-/// user typed is recorded next to it in the diagnostic output.
+/// Resolves `~/.ssh/config` aliases via `ssh -G <host>` so an operator who
+/// labels `prod-host` (their local alias) and later runs
+/// `ssh prod-host.example.com` (the real DNS name) gets a match. The
+/// labels file stores BOTH the raw input AND the resolved hostname
+/// whenever they differ — the rule at runtime only sees what the user
+/// typed at the shell, so the raw key has to round-trip.
 pub fn label(host: &str, criticality: &str, scope: LabelScope, json: bool) -> i32 {
     if host.trim().is_empty() {
         eprintln!("tirith ssh label: host is empty");
@@ -231,7 +232,16 @@ pub fn label(host: &str, criticality: &str, scope: LabelScope, json: bool) -> i3
         return 2;
     }
 
-    let resolved_host = resolve_ssh_alias(host).unwrap_or_else(|| host.to_string());
+    let resolved_host = resolve_ssh_alias(host).unwrap_or_else(|| {
+        // Surface that the alias resolution failed so the operator knows
+        // labels may not catch DNS-name occurrences if `~/.ssh/config` is
+        // in play. We still proceed — labelling by the raw string is
+        // strictly more conservative than nothing.
+        eprintln!(
+            "tirith ssh label: warning: `ssh -G {host}` failed (binary missing, timeout, or no hostname line); labeling raw input only — if {host} is an alias, runs against the resolved name will not match"
+        );
+        host.to_string()
+    });
 
     let target_path = match scope {
         LabelScope::User => match policy_mod::user_ssh_host_labels_path() {
@@ -251,14 +261,28 @@ pub fn label(host: &str, criticality: &str, scope: LabelScope, json: bool) -> i3
     };
 
     // Re-use `write_context_label` for the actual file write — the format
-    // is identical (flat YAML map of `key: value`). The function is
-    // host-agnostic; it just persists one key/value pair.
-    if let Err(e) = policy_mod::write_context_label(&target_path, &resolved_host, criticality) {
+    // is identical (flat YAML map of `key: value`).
+    //
+    // We write the RAW host input as the key first because the runtime
+    // rule looks up by the literal string the user typed at the shell. If
+    // the resolved hostname differs (alias → DNS name) we additionally
+    // write the resolved form so an operator who labels `prod-host`
+    // (alias) is also matched when they type `prod.example.com` directly.
+    if let Err(e) = policy_mod::write_context_label(&target_path, host, criticality) {
         eprintln!(
             "tirith ssh label: failed to write {}: {e}",
             target_path.display()
         );
         return 1;
+    }
+    if resolved_host != host {
+        if let Err(e) = policy_mod::write_context_label(&target_path, &resolved_host, criticality) {
+            eprintln!(
+                "tirith ssh label: failed to write resolved-host entry to {}: {e}",
+                target_path.display()
+            );
+            return 1;
+        }
     }
 
     if json {
@@ -298,7 +322,6 @@ pub fn label(host: &str, criticality: &str, scope: LabelScope, json: bool) -> i3
 /// (PATH differences, libc mismatches, sudoers footguns) that deserve a
 /// dedicated PR with real field validation. M8 ch2 ships inspection +
 /// labeling only; this stub exits 2 with a pointer at the follow-up.
-#[allow(dead_code)]
 pub fn bootstrap_stub(_target: &str, json: bool) -> i32 {
     let msg = "tirith ssh bootstrap: DEFERRED to M8.1 follow-up PR. \
                Run `tirith ssh label <host> <criticality>` for now; \

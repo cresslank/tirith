@@ -186,6 +186,23 @@ pub fn check_plan(plan_path: &Path, forced_tool: Option<&str>, json: bool) -> i3
     // Purge old plans best-effort. Failures are silent.
     let purged = iac_plan::purge_old_plans();
 
+    // Cap the read at `MAX_PLAN_SIZE_BYTES` (32 MiB). A plan file
+    // symlinked to /dev/zero or a maliciously oversized JSON would
+    // otherwise OOM the CLI before the parse step's own timeout fires
+    // (PR-127 review #10).
+    match std::fs::metadata(plan_path) {
+        Ok(md) if md.len() > iac_plan::MAX_PLAN_SIZE_BYTES => {
+            eprintln!(
+                "tirith iac check-plan: {} is {} bytes; cap is {} bytes ({} MiB). Refusing to read.",
+                plan_path.display(),
+                md.len(),
+                iac_plan::MAX_PLAN_SIZE_BYTES,
+                iac_plan::MAX_PLAN_SIZE_BYTES / (1024 * 1024),
+            );
+            return 1;
+        }
+        _ => {}
+    }
     let bytes = match std::fs::read(plan_path) {
         Ok(b) => b,
         Err(e) => {
@@ -196,6 +213,18 @@ pub fn check_plan(plan_path: &Path, forced_tool: Option<&str>, json: bool) -> i3
             return 1;
         }
     };
+    if bytes.len() as u64 > iac_plan::MAX_PLAN_SIZE_BYTES {
+        // metadata() may have lied (symlink, /dev/zero, fifo) — double
+        // check after the read and refuse to parse.
+        eprintln!(
+            "tirith iac check-plan: read {} bytes from {}; cap is {} bytes ({} MiB). Refusing to parse.",
+            bytes.len(),
+            plan_path.display(),
+            iac_plan::MAX_PLAN_SIZE_BYTES,
+            iac_plan::MAX_PLAN_SIZE_BYTES / (1024 * 1024),
+        );
+        return 1;
+    }
 
     let tool = if let Some(name) = forced_tool {
         match name {

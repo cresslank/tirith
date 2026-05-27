@@ -26,6 +26,7 @@ use std::collections::HashSet;
 use once_cell::sync::Lazy;
 
 use crate::policy::Policy;
+use crate::rules::shared::is_critical_label;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
@@ -153,14 +154,6 @@ fn check_exec(
         input,
         seg,
     ));
-}
-
-fn is_critical_label(label: &str) -> bool {
-    let lower = label.trim().to_lowercase();
-    matches!(
-        lower.as_str(),
-        "critical" | "production" | "prod" | "live" | "p0" | "p1"
-    )
 }
 
 /// Walk `args` and find the first non-flag positional — that's the

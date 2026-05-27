@@ -19,10 +19,12 @@
 //!    timeout. Extracts the active subscription `name` (operator-facing
 //!    string that matches `az account list -o table`).
 //!
-//! Every external command goes through [`run_with_timeout`] which wraps
-//! `std::process::Command` in a watchdog thread. On timeout we `kill()` the
-//! child and return [`ContextDetectFailure::Timeout`]; on non-zero exit we
-//! return [`ContextDetectFailure::Exited`]. The hot path NEVER blocks on a
+//! Every external command goes through [`run_with_timeout`] which spawns
+//! `std::process::Command` and polls `try_wait()` against a deadline on
+//! the main thread; stdout is drained in a helper thread to avoid
+//! pipe-buffer deadlock. On timeout we `kill()` the child and return
+//! [`ContextDetectFailure::Timeout`]; on non-zero exit we return
+//! [`ContextDetectFailure::Exited`]. The hot path NEVER blocks on a
 //! shell-out — callers gate detection on the parsed leader being a cloud
 //! CLI (see `engine.rs`) and a 5-second per-process cache keeps repeat
 //! invocations cheap.
@@ -48,7 +50,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -456,74 +458,31 @@ struct ShellOutOutput {
 /// - `Err(ContextDetectFailure::Exited(code))` on non-zero exit.
 /// - `Err(ContextDetectFailure::Io(reason))` on other spawn / read errors.
 fn run_with_timeout(program: &str, args: &[&str]) -> Result<ShellOutOutput, ContextDetectFailure> {
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ContextDetectFailure::NotConfigured);
-        }
-        Err(e) => {
-            return Err(ContextDetectFailure::Io(format!("spawn {program}: {e}")));
-        }
-    };
-
-    // Stream stdout in a helper thread so the OS pipe buffer doesn't fill
-    // up while we poll for exit. We collect into a Vec<u8> on the thread.
-    let stdout_handle = child.stdout.take().map(|mut s| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            use std::io::Read as _;
-            let _ = s.read_to_end(&mut buf);
-            buf
-        })
-    });
-
-    let deadline = Instant::now() + SHELL_OUT_TIMEOUT;
-    let poll = Duration::from_millis(25);
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = stdout_handle
-                    .and_then(|h| h.join().ok())
-                    .unwrap_or_default();
-                return if status.success() {
-                    Ok(ShellOutOutput {
-                        status: status.code(),
-                        stdout,
-                    })
-                } else {
-                    Err(ContextDetectFailure::Exited(status.code().unwrap_or(-1)))
-                };
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    // Best-effort kill; reap the corpse and return Timeout.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    // Drop the stdout reader by joining it (it'll exit
-                    // when the pipe closes due to the kill).
-                    if let Some(h) = stdout_handle {
-                        let _ = h.join();
-                    }
-                    return Err(ContextDetectFailure::Timeout);
-                }
-                std::thread::sleep(poll);
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                if let Some(h) = stdout_handle {
-                    let _ = h.join();
-                }
-                return Err(ContextDetectFailure::Io(format!("try_wait {program}: {e}")));
+    // Delegate to the shared shell-timeout helper in `crate::util`; map
+    // its outcome onto our typed failure enum.
+    use crate::util::{run_shell_with_timeout, ShellTimeoutOutcome};
+    let outcome = run_shell_with_timeout(
+        program,
+        args,
+        SHELL_OUT_TIMEOUT,
+        Duration::from_millis(25),
+        Stdio::null(),
+    );
+    match outcome {
+        ShellTimeoutOutcome::Completed { status, stdout } => {
+            if status.success() {
+                Ok(ShellOutOutput {
+                    status: status.code(),
+                    stdout,
+                })
+            } else {
+                Err(ContextDetectFailure::Exited(status.code().unwrap_or(-1)))
             }
         }
+        ShellTimeoutOutcome::NotFound => Err(ContextDetectFailure::NotConfigured),
+        ShellTimeoutOutcome::SpawnError(reason) => Err(ContextDetectFailure::Io(reason)),
+        ShellTimeoutOutcome::WaitError(reason) => Err(ContextDetectFailure::Io(reason)),
+        ShellTimeoutOutcome::Timeout => Err(ContextDetectFailure::Timeout),
     }
 }
 

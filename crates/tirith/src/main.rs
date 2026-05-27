@@ -426,7 +426,9 @@ Examples:
     ///
     /// Designed to be invoked from `$PS1` / `$PROMPT` / `fish_prompt` on every
     /// redraw. Reads pre-cached protection / context / sudo / SSH state so
-    /// the per-prompt overhead stays under 5 ms on a warm cache.
+    /// the per-prompt overhead is ~10 ms total including binary startup
+    /// (see `docs/prompt-integration.md`); the application work on a warm
+    /// cache is well under 5 ms but the process spawn dominates.
     #[command(after_help = "\
 Output forms:
   tirith prompt-status --short                # [tirith:guarded][aws:prod][kube:payments-prod]
@@ -1672,6 +1674,22 @@ Examples:
         /// `<repo>/.tirith/ssh-host-labels.yaml`.
         #[arg(long, default_value = "user")]
         scope: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Cross-host binary bootstrap — deferred to M8.1
+    #[command(after_help = "\
+DEFERRED to the M8.1 follow-up PR. Cross-host binary deploy needs PATH /
+libc / sudoers field validation that hasn't shipped yet. For now use
+`tirith ssh label <host> <criticality>` to label the host and run
+`tirith ssh guard on` to enable the rule.")]
+    Bootstrap {
+        /// Target host (bare host or `user@host`).
+        target: String,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -4508,6 +4526,14 @@ fn run() {
                     }
                 };
                 cli::ssh::label(&host, &criticality, parsed_scope, json)
+            }
+            SshAction::Bootstrap {
+                target,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::ssh::bootstrap_stub(&target, json)
             }
         },
 

@@ -1,15 +1,25 @@
 //! IaC plan parsing and hashing — M8 ch3.
 //!
+//! ## Supported tools
+//!
+//! Terraform, OpenTofu, and Pulumi only. CDK, CloudFormation, Ansible,
+//! and Crossplane are **out of scope** for M8 — their plan shapes don't
+//! resemble the `terraform show -json` envelope and would need their own
+//! dispatch arms. Operators piping `cdk synth` JSON into `tirith iac
+//! check-plan` will see `unrecognized plan JSON shape` and should treat
+//! that as "not supported yet" rather than "broken".
+//!
 //! Two responsibilities, deliberately separated from the hot path:
 //!
 //! 1. **Plan parsing.** `parse_plan_json` accepts a byte buffer holding the
 //!    output of `terraform show -json tfplan` (also produced by
-//!    `pulumi preview --json`, which uses the same `resource_changes`
-//!    shape for the per-resource list, and by `tofu show -json`). Counts
-//!    create / update / destroy and flags IAM / SG / public-bucket /
-//!    DB / LB changes against a curated heuristic table. The heuristic
-//!    is intentionally narrow — false positives here drive operator
-//!    noise but missing categories are easy to add.
+//!    `tofu show -json`), OR the output of `pulumi preview --json` which
+//!    uses a different `steps`-keyed shape that `parse_plan_json`
+//!    dispatches to separately. Counts create / update / destroy and
+//!    flags IAM / SG / public-bucket / DB / LB changes against a
+//!    curated heuristic table. The heuristic is intentionally narrow —
+//!    false positives here drive operator noise but missing categories
+//!    are easy to add.
 //!
 //! 2. **Plan hashing + cache.** `record_plan_hash` writes
 //!    `state_dir()/iac_plans/<sha256>.json` with a short metadata blob,
@@ -25,8 +35,8 @@
 //! can be large; the 1.5s context-detect cap is too tight here).
 
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::process::Stdio;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -344,14 +354,43 @@ pub fn record_plan_hash(
     Ok(sha)
 }
 
-/// `true` when a plan with the supplied hash has been recorded.
-pub fn plan_hash_recorded(sha256: &str) -> bool {
+/// Status of a plan-hash lookup. PR-127 review #14: previously a bare
+/// `bool` conflated "no state dir resolvable" (operator environment is
+/// broken — `XDG_STATE_HOME` unset on a system that doesn't have one) with
+/// "this hash hasn't been recorded" (mismatch detected). Distinguish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanHashStatus {
+    /// A plan file with the supplied hash exists in the recorded store.
+    Recorded,
+    /// The store exists but the hash isn't in it. This is a real mismatch.
+    NotRecorded,
+    /// The state directory itself couldn't be resolved (no `$HOME`, no
+    /// `XDG_STATE_HOME`, etc.). The caller should treat this as a
+    /// configuration problem, not a mismatch.
+    StateDirUnresolved,
+}
+
+/// Check whether a plan with the supplied hash has been recorded.
+pub fn plan_hash_status(sha256: &str) -> PlanHashStatus {
     let dir = match crate::policy::iac_plans_dir() {
         Some(d) => d,
-        None => return false,
+        None => return PlanHashStatus::StateDirUnresolved,
     };
     let path = dir.join(format!("{sha256}.json"));
-    path.is_file()
+    if path.is_file() {
+        PlanHashStatus::Recorded
+    } else {
+        PlanHashStatus::NotRecorded
+    }
+}
+
+/// `true` when a plan with the supplied hash has been recorded.
+///
+/// Use [`plan_hash_status`] when you need to distinguish "not recorded"
+/// from "state directory unresolvable". This helper folds both into
+/// `false` for legacy callers.
+pub fn plan_hash_recorded(sha256: &str) -> bool {
+    matches!(plan_hash_status(sha256), PlanHashStatus::Recorded)
 }
 
 /// Human-readable form of the iac plan store path (for evidence
@@ -374,6 +413,13 @@ pub fn load_recorded_plan(sha256: &str) -> Option<RecordedPlan> {
 
 /// Purge plans older than [`PLAN_CACHE_TTL`]. Returns the count of
 /// removed files. Errors are swallowed silently — purge is best-effort.
+///
+/// We prefer the `recorded_at_unix` field from the JSON body over the
+/// filesystem mtime (the latter is rewritten by `cp -p`, `rsync
+/// --archive`, backup tools, cloud-sync) and only fall back to mtime when
+/// the JSON can't be read. Forward clock skew (`modified > now`) never
+/// purges — `duration_since` returns `Err` there and we leave the file
+/// alone (PR-127 review #15 + greptile P2 fix).
 pub fn purge_old_plans() -> usize {
     let dir = match crate::policy::iac_plans_dir() {
         Some(d) => d,
@@ -390,15 +436,21 @@ pub fn purge_old_plans() -> usize {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
+        // Prefer JSON `recorded_at_unix` over mtime — file copy /
+        // backup tools rewrite mtime and would otherwise purge freshly-
+        // synced plans on the next invocation.
+        let recorded_at = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<RecordedPlan>(&b).ok())
+            .map(|p| SystemTime::UNIX_EPOCH + Duration::from_secs(p.recorded_at_unix))
+            .or_else(|| entry.metadata().ok().and_then(|m| m.modified().ok()));
+        let Some(recorded_at) = recorded_at else {
+            continue;
         };
-        let modified = match metadata.modified() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        if let Ok(age) = now.duration_since(modified) {
+        // `duration_since` returns `Err` when recorded_at is in the
+        // future (forward clock skew). In that case we leave the file
+        // alone — never delete on `now < recorded_at`.
+        if let Ok(age) = now.duration_since(recorded_at) {
             if age > PLAN_CACHE_TTL && std::fs::remove_file(&path).is_ok() {
                 removed += 1;
             }
@@ -435,6 +487,8 @@ fn unix_now() -> u64 {
 /// The only legitimate caller is `tirith iac check-plan`, where the
 /// operator is interactively requesting plan inspection.
 pub fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u8>, String> {
+    use crate::util::{run_shell_with_timeout, ShellTimeoutOutcome};
+
     let program = match tool {
         PlanTool::Terraform => "terraform",
         PlanTool::Tofu => "tofu",
@@ -447,64 +501,43 @@ pub fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u
     };
 
     let plan_path_string = plan_path.to_string_lossy().into_owned();
-    let mut cmd = Command::new(program);
-    cmd.args(["show", "-json", plan_path_string.as_str()])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null());
-
-    let mut child = cmd.spawn().map_err(|e| format!("spawn {program}: {e}"))?;
-
-    let stdout_handle = child.stdout.take().map(|mut s| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            use std::io::Read as _;
-            let _ = s.read_to_end(&mut buf);
-            buf
-        })
-    });
-
-    let deadline = Instant::now() + TERRAFORM_SHOW_TIMEOUT;
-    let poll = Duration::from_millis(50);
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = stdout_handle
-                    .and_then(|h| h.join().ok())
-                    .unwrap_or_default();
-                if status.success() {
-                    return Ok(stdout);
-                } else {
+    // Stderr is discarded — previous implementation piped it and never
+    // drained, which could deadlock the child if `terraform show -json`
+    // emitted ≥64KiB of stderr (PR-127 CodeRabbit "Drain stderr or don't
+    // pipe it").
+    let outcome = run_shell_with_timeout(
+        program,
+        &["show", "-json", plan_path_string.as_str()],
+        TERRAFORM_SHOW_TIMEOUT,
+        Duration::from_millis(50),
+        Stdio::null(),
+    );
+    match outcome {
+        ShellTimeoutOutcome::Completed { status, stdout } => {
+            if status.success() {
+                if stdout.len() as u64 > MAX_PLAN_SIZE_BYTES {
                     return Err(format!(
-                        "{program} show -json exited with status {}",
-                        status.code().unwrap_or(-1)
+                        "{program} show -json produced {} bytes; cap is {} bytes ({} MiB)",
+                        stdout.len(),
+                        MAX_PLAN_SIZE_BYTES,
+                        MAX_PLAN_SIZE_BYTES / (1024 * 1024),
                     ));
                 }
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    if let Some(h) = stdout_handle {
-                        let _ = h.join();
-                    }
-                    return Err(format!(
-                        "{program} show -json exceeded {}s timeout",
-                        TERRAFORM_SHOW_TIMEOUT.as_secs()
-                    ));
-                }
-                std::thread::sleep(poll);
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                if let Some(h) = stdout_handle {
-                    let _ = h.join();
-                }
-                return Err(format!("try_wait {program}: {e}"));
+                Ok(stdout)
+            } else {
+                Err(format!(
+                    "{program} show -json exited with status {}",
+                    status.code().unwrap_or(-1)
+                ))
             }
         }
+        ShellTimeoutOutcome::NotFound => Err(format!("{program}: binary not found on PATH")),
+        ShellTimeoutOutcome::SpawnError(reason) => Err(reason),
+        ShellTimeoutOutcome::WaitError(reason) => Err(reason),
+        ShellTimeoutOutcome::Timeout => Err(format!(
+            "{program} show -json exceeded {}s timeout",
+            TERRAFORM_SHOW_TIMEOUT.as_secs()
+        )),
     }
 }
 

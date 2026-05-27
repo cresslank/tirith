@@ -2127,3 +2127,107 @@ fn iac_rule_blocks_plan_hash_mismatch_when_policy_on() {
             .collect::<Vec<_>>(),
     );
 }
+
+/// Regression test for PR-127 review #4 — the prior plan-hash test only
+/// proved "no recorded → mismatch". This pins the full lifecycle:
+/// (a) record the original plan's hash, (b) confirm no mismatch fires
+/// against the unchanged file, (c) modify the file, (d) confirm the
+/// mismatch fires after modification.
+#[test]
+fn iac_rule_detects_plan_modification_after_record() {
+    use tirith_core::iac_plan::{self, PlanSummary};
+
+    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    let tirith_dir = dir.path().join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "iac_require_plan_before_apply: true\n",
+    )
+    .unwrap();
+
+    let plan_path = dir.path().join("tfplan");
+    let original_bytes = b"ORIGINAL PLAN CONTENT";
+    fs::write(&plan_path, original_bytes).unwrap();
+
+    let state_dir = dir.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    let prev_xdg = std::env::var_os("XDG_STATE_HOME");
+    let prev_policy_root = std::env::var_os("TIRITH_POLICY_ROOT");
+
+    unsafe {
+        std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
+        std::env::set_var("XDG_STATE_HOME", state_dir.display().to_string());
+    }
+
+    // (a) Record the hash of the ORIGINAL file content.
+    let summary = PlanSummary::default();
+    iac_plan::record_plan_hash(original_bytes, &plan_path, &summary)
+        .expect("record_plan_hash should succeed");
+
+    let analyze = |input: &str| {
+        let ctx = AnalysisContext {
+            input: input.to_string(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive: true,
+            cwd: Some(dir.path().display().to_string()),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+        };
+        engine::analyze(&ctx)
+    };
+
+    // (b) Unchanged file → no mismatch.
+    let v_unchanged = analyze(&format!("terraform apply {}", plan_path.display()));
+    let unchanged_mismatch = v_unchanged
+        .findings
+        .iter()
+        .any(|f| matches!(f.rule_id, tirith_core::verdict::RuleId::IacPlanHashMismatch));
+    assert!(
+        !unchanged_mismatch,
+        "unchanged plan file must NOT fire IacPlanHashMismatch; got: {:?}",
+        v_unchanged
+            .findings
+            .iter()
+            .map(|f| format!("{}: {}", f.rule_id, f.title))
+            .collect::<Vec<_>>(),
+    );
+
+    // (c) Modify the file.
+    fs::write(&plan_path, b"MODIFIED PLAN CONTENT").unwrap();
+
+    // (d) Modified file → mismatch.
+    let v_modified = analyze(&format!("terraform apply {}", plan_path.display()));
+
+    unsafe {
+        match prev_policy_root {
+            Some(v) => std::env::set_var("TIRITH_POLICY_ROOT", v),
+            None => std::env::remove_var("TIRITH_POLICY_ROOT"),
+        }
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+    }
+
+    let modified_mismatch = v_modified
+        .findings
+        .iter()
+        .any(|f| matches!(f.rule_id, tirith_core::verdict::RuleId::IacPlanHashMismatch));
+    assert!(
+        modified_mismatch,
+        "modified plan file MUST fire IacPlanHashMismatch; got: {:?}",
+        v_modified
+            .findings
+            .iter()
+            .map(|f| format!("{}: {}", f.rule_id, f.title))
+            .collect::<Vec<_>>(),
+    );
+}

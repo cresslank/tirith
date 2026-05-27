@@ -495,9 +495,15 @@ fn first_broad_path_arg(args: &[String], _shell: ShellType) -> Option<String> {
 /// subdirectory. We deliberately keep this narrow — false-positives on
 /// `/etc/myapp/config.d` are noisy.
 fn is_broad_path(p: &str) -> bool {
-    matches!(p, "/" | "/home" | "/usr" | "/etc")
+    matches!(
+        p,
+        "/" | "/home" | "/usr" | "/etc" | "/var" | "/opt" | "/srv" | "/lib" | "/bin"
+    )
         // Trailing slash variants.
-        || matches!(p, "/home/" | "/usr/" | "/etc/")
+        || matches!(
+            p,
+            "/home/" | "/usr/" | "/etc/" | "/var/" | "/opt/" | "/srv/" | "/lib/" | "/bin/"
+        )
 }
 
 fn is_chmod_mode_or_owner(a: &str) -> bool {
@@ -562,18 +568,40 @@ fn first_download_output_path(args: &[String]) -> Option<String> {
 }
 
 /// Returns `true` when the target file path is under a protected system
-/// directory. Deliberately narrow to keep false-positives low — the
-/// `tee /tmp/foo` / `tee ~/something` / `tee ./relative` shapes never
-/// fire.
+/// directory or a well-known shell-init dotfile in the user's home.
+/// Deliberately narrow to keep false-positives low — the
+/// `tee /tmp/foo` / `tee ~/notes.md` / `tee ./relative` shapes never fire.
+///
+/// Home-dotfile protection covers `~/.bashrc` / `~/.zshrc` / `~/.profile`
+/// / `~/.bash_profile` / `~/.zshenv` / `~/.bash_login` / `~/.zprofile` —
+/// the textbook persistence-vector files. The dotfile-overwrite rule
+/// (`check_dotfile_overwrite` in `rules/command.rs`) catches the redirect
+/// shape but not the pipe-into-`sudo tee` shape, so the carveout here
+/// must close that gap.
 fn is_protected_system_path(p: &str) -> bool {
-    // Allow ~/ and $HOME/ explicitly — those are user-writable scopes.
+    // Repo-relative / current-dir — never protected.
+    if !p.starts_with('/')
+        && !p.starts_with('~')
+        && !p.starts_with("$HOME")
+        && !p.starts_with("${HOME")
+    {
+        return false;
+    }
+
+    // Shell-init dotfiles in the user's home are protected. We match the
+    // bare dotfile name; subdirectories like `~/.config/zsh/...` are not
+    // covered here because the user almost always owns them and they're
+    // not the textbook persistence vector.
+    if is_home_shell_init_dotfile(p) {
+        return true;
+    }
+
+    // Other paths under ~/ and $HOME/ are user-writable and not
+    // protected.
     if p.starts_with('~') || p.starts_with("$HOME") || p.starts_with("${HOME") {
         return false;
     }
-    // Repo-relative / current-dir.
-    if !p.starts_with('/') {
-        return false;
-    }
+
     // /tmp is shared but not OS-system.
     if p == "/tmp" || p.starts_with("/tmp/") {
         return false;
@@ -596,6 +624,42 @@ fn is_protected_system_path(p: &str) -> bool {
         || p.starts_with("/usr/lib/systemd/")
         || p.starts_with("/etc/cron")
         || p.starts_with("/etc/systemd/")
+        // Webroot / persistent system dirs added per PR-127 review.
+        || p == "/var/www"
+        || p.starts_with("/var/www/")
+        || p == "/srv"
+        || p.starts_with("/srv/")
+        || p == "/root"
+        || p.starts_with("/root/")
+        || p == "/boot"
+        || p.starts_with("/boot/")
+        || p == "/var/lib"
+        || p.starts_with("/var/lib/")
+}
+
+/// Returns `true` when the path points at a well-known shell-init
+/// dotfile in the user's home directory. Matches `~/.bashrc`,
+/// `~/.zshrc`, `~/.profile`, `~/.bash_profile`, `~/.zshenv`,
+/// `~/.bash_login`, `~/.zprofile`. Both `~/` and `$HOME/` prefixes are
+/// recognised. Suffixes like `~/.bashrc.bak` are NOT matched — only the
+/// exact basenames listed.
+fn is_home_shell_init_dotfile(p: &str) -> bool {
+    const PREFIXES: &[&str] = &["~/", "$HOME/", "${HOME}/", "${HOME:-/root}/"];
+    const FILES: &[&str] = &[
+        ".bashrc",
+        ".zshrc",
+        ".profile",
+        ".bash_profile",
+        ".zshenv",
+        ".bash_login",
+        ".zprofile",
+    ];
+    for prefix in PREFIXES {
+        if let Some(tail) = p.strip_prefix(prefix) {
+            return FILES.contains(&tail);
+        }
+    }
+    false
 }
 
 /// Return the list of sensitive env-var names that are currently set in
@@ -755,6 +819,56 @@ mod tests {
     }
 
     #[test]
+    fn sudo_tee_home_dotfile_fires() {
+        // Regression: PR-127 review #3. `sudo tee ~/.bashrc` is a
+        // textbook persistence vector that previously bypassed every
+        // sudo rule (carveout) AND the dotfile_overwrite rule (which
+        // only matches the redirect shape, not pipe-into-`sudo tee`).
+        let policy = Policy::default();
+        for path in [
+            "~/.bashrc",
+            "~/.zshrc",
+            "~/.profile",
+            "~/.bash_profile",
+            "~/.zshenv",
+            "$HOME/.bashrc",
+            "${HOME}/.zshrc",
+        ] {
+            let cmd = format!("sudo tee {path}");
+            let findings = check(&cmd, ShellType::Posix, &policy);
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| matches!(f.rule_id, RuleId::SudoTeeSystemFile)),
+                "expected SudoTeeSystemFile for `{cmd}`; got: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sudo_tee_webroot_and_persistent_dirs_fire() {
+        // Regression: PR-127 review #16. /var/www, /srv, /root, /boot,
+        // /var/lib were missing from the protected-paths list.
+        let policy = Policy::default();
+        for path in [
+            "/var/www/html/x.php",
+            "/srv/http/index.html",
+            "/root/.ssh/authorized_keys",
+            "/boot/grub.cfg",
+            "/var/lib/dpkg/status",
+        ] {
+            let cmd = format!("sudo tee {path}");
+            let findings = check(&cmd, ShellType::Posix, &policy);
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| matches!(f.rule_id, RuleId::SudoTeeSystemFile)),
+                "expected SudoTeeSystemFile for `{cmd}`; got: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
     fn sudo_curl_o_usr_local_bin_fires() {
         let policy = Policy::default();
         let findings = check(
@@ -891,7 +1005,40 @@ mod tests {
         assert!(!is_protected_system_path("/tmp/foo"));
         assert!(!is_protected_system_path("/home/me/foo"));
         assert!(!is_protected_system_path("relative/path"));
+        // ~/foo (non-dotfile, non-shell-init) is still allowed.
         assert!(!is_protected_system_path("~/foo"));
+    }
+
+    #[test]
+    fn is_protected_system_path_covers_home_shell_init_dotfiles() {
+        // Regression: PR-127 review #3 — `sudo tee ~/.bashrc` was a
+        // textbook persistence vector silently allowed.
+        assert!(is_protected_system_path("~/.bashrc"));
+        assert!(is_protected_system_path("~/.zshrc"));
+        assert!(is_protected_system_path("~/.profile"));
+        assert!(is_protected_system_path("~/.bash_profile"));
+        assert!(is_protected_system_path("~/.zshenv"));
+        assert!(is_protected_system_path("~/.bash_login"));
+        assert!(is_protected_system_path("~/.zprofile"));
+        assert!(is_protected_system_path("$HOME/.bashrc"));
+        assert!(is_protected_system_path("${HOME}/.zshrc"));
+        // Suffixes / non-shell-init dotfiles remain allowed.
+        assert!(!is_protected_system_path("~/.bashrc.bak"));
+        assert!(!is_protected_system_path("~/.config/some.toml"));
+        assert!(!is_protected_system_path("~/.vimrc"));
+    }
+
+    #[test]
+    fn is_protected_system_path_covers_webroot_and_persistent_dirs() {
+        // Regression: PR-127 review #16 — /var/www, /srv, /root, /boot,
+        // /var/lib were missing.
+        assert!(is_protected_system_path("/var/www"));
+        assert!(is_protected_system_path("/var/www/html/x.php"));
+        assert!(is_protected_system_path("/srv/http/index.html"));
+        assert!(is_protected_system_path("/root"));
+        assert!(is_protected_system_path("/root/.ssh/authorized_keys"));
+        assert!(is_protected_system_path("/boot/grub.cfg"));
+        assert!(is_protected_system_path("/var/lib/dpkg/status"));
     }
 
     #[test]
@@ -900,6 +1047,12 @@ mod tests {
         assert!(is_broad_path("/home"));
         assert!(is_broad_path("/etc"));
         assert!(is_broad_path("/usr"));
+        // PR-127 review #13 expansion.
+        assert!(is_broad_path("/var"));
+        assert!(is_broad_path("/opt"));
+        assert!(is_broad_path("/srv"));
+        assert!(is_broad_path("/lib"));
+        assert!(is_broad_path("/bin"));
         assert!(!is_broad_path("/etc/cron.d"));
         assert!(!is_broad_path("/home/me"));
     }

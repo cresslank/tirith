@@ -40,6 +40,7 @@
 
 use crate::policy::Policy;
 use crate::rules::context::classify_inner_command_for_ssh;
+use crate::rules::shared::is_critical_label;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
@@ -284,14 +285,6 @@ fn command_basename(cmd: &str, shell: ShellType) -> String {
         .strip_suffix(".exe")
         .map(str::to_string)
         .unwrap_or(lower)
-}
-
-fn is_critical_label(label: &str) -> bool {
-    let lower = label.trim().to_lowercase();
-    matches!(
-        lower.as_str(),
-        "critical" | "production" | "prod" | "live" | "p0" | "p1"
-    )
 }
 
 #[cfg(test)]
