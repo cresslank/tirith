@@ -9700,7 +9700,14 @@ fn commands_run_audit_applies_operator_dlp_patterns() {
     )
     .unwrap();
 
+    // Run FROM the repo root (as a real user would), so policy discovery finds
+    // `<root>/.tirith/policy.yaml` via the cwd walk-up — not solely via
+    // TIRITH_POLICY_ROOT. The foreign-cwd + TIRITH_POLICY_ROOT-only path is
+    // Windows-fragile for policy discovery (the manifest is found either way,
+    // but the DLP patterns live in the policy); pinning cwd makes the operator
+    // DLP patterns load deterministically on every platform.
     let out = commands_tirith(root.path())
+        .current_dir(root.path())
         .args(["commands", "run", "emit"])
         .output()
         .expect("commands run emit");
