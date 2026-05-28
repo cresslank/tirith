@@ -9598,6 +9598,70 @@ fn commands_run_still_refuses_and_renders_on_block() {
     );
 }
 
+#[test]
+fn commands_run_interactive_warn_ack_gates_execution() {
+    // Fix-verification gap: the interactive Warn-ack branch (TIRITH_INTERACTIVE=1)
+    // gates an execute-or-not decision. Declining ("n") must NOT run the command
+    // (exit 1, "aborted by user"); accepting ("y") must proceed. Driven via piped
+    // stdin — no real TTY, deterministic, not flaky. (Findings render to stderr,
+    // the echoed URL only reaches stdout if the command actually executed, so
+    // stdout is the execution proof.)
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    write_root_manifest(
+        root.path(),
+        "allowed:\n  - name: greet\n    command: \"echo https://bit.ly/x\"\n",
+    );
+
+    // A `commands_tirith` that ENABLES the prompt instead of auto-proceeding.
+    let interactive = |root: &std::path::Path| {
+        let mut cmd = commands_tirith(root);
+        cmd.env("TIRITH_INTERACTIVE", "1");
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd
+    };
+
+    // Decline: "n" → abort, exit 1, command does NOT execute (no echo on stdout).
+    let mut child = interactive(root.path())
+        .args(["commands", "run", "greet"])
+        .spawn()
+        .expect("spawn (decline)");
+    child.stdin.take().unwrap().write_all(b"n\n").unwrap();
+    let declined = child.wait_with_output().expect("wait (decline)");
+    let dstdout = String::from_utf8_lossy(&declined.stdout);
+    let dstderr = String::from_utf8_lossy(&declined.stderr);
+    assert_eq!(
+        declined.status.code(),
+        Some(1),
+        "declining the Warn ack must exit 1, got stdout:\n{dstdout}\nstderr:\n{dstderr}"
+    );
+    assert!(
+        dstderr.contains("aborted by user"),
+        "decline must report 'aborted by user', got stderr:\n{dstderr}"
+    );
+    assert!(
+        !dstdout.contains("https://bit.ly/x"),
+        "a DECLINED command must NOT execute (no echo on stdout), got stdout:\n{dstdout}"
+    );
+
+    // Accept: "y" → proceeds and executes (the echo reaches stdout).
+    let mut child = interactive(root.path())
+        .args(["commands", "run", "greet"])
+        .spawn()
+        .expect("spawn (accept)");
+    child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+    let accepted = child.wait_with_output().expect("wait (accept)");
+    let astdout = String::from_utf8_lossy(&accepted.stdout);
+    assert!(
+        astdout.contains("https://bit.ly/x"),
+        "ACCEPTING the Warn ack must execute the command, got stdout:\n{astdout}"
+    );
+}
+
 /// Recursively locate the first `log.jsonl` (the audit log) under `root`.
 fn find_audit_log(root: &std::path::Path) -> Option<PathBuf> {
     for entry in fs::read_dir(root).ok()?.flatten() {
