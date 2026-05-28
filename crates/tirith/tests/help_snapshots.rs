@@ -294,9 +294,16 @@ fn help_incident_states_no_new_rules_and_lockout_safety() {
         let out = tirith().args(args).output().expect("failed to run tirith");
         let stdout = String::from_utf8_lossy(&out.stdout);
         let lower = stdout.to_ascii_lowercase();
+        // F13: require the SPECIFIC lockout/recoverability wording. The bare
+        // word "always" is too generic (it appears in unrelated help text like
+        // "always exits 0") and could let the real safety note go missing while
+        // the test still passed. Demand the "lockout" marker AND an explicit
+        // recoverability promise ("recoverable" or "always succeeds").
         assert!(
-            lower.contains("lockout") || lower.contains("recoverable") || lower.contains("always"),
-            "{args:?} --help must carry the lockout-safety note, got:\n{stdout}"
+            lower.contains("lockout safety")
+                && (lower.contains("recoverable") || lower.contains("always succeeds")),
+            "{args:?} --help must carry the explicit lockout-safety + recoverability note, \
+             got:\n{stdout}"
         );
     }
 }

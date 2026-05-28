@@ -171,8 +171,9 @@ Examples:
         /// Info `command_card_verified` finding but does NOT change the verdict
         /// (other findings still apply); a command that differs from the card
         /// emits a High `command_card_mismatch`. To use a maintainer's card
-        /// hosted at a URL, run `tirith command-card fetch <url>` first, then
-        /// pass the cached path here.
+        /// hosted at a URL, download it to a local file first, then pass that
+        /// path here (`tirith check` never fetches a card itself). On Unix,
+        /// `tirith command-card fetch <url>` does this download for you.
         #[arg(long)]
         card: Option<String>,
 
@@ -2169,8 +2170,14 @@ Examples:
         action: BaselineAction,
     },
 
-    /// Create, sign, verify, and fetch signed command cards (M11 ch1)
-    #[command(after_help = "\
+    /// Create, sign, and verify signed command cards (M11 ch1)
+    // The help text is platform-split: `command-card fetch` is `#[cfg(unix)]`
+    // (it reuses the unix-only hardened downloader), so the Windows help must
+    // NOT advertise a `fetch` subcommand that does not exist there — it instead
+    // tells the user to download the card to a local file manually.
+    #[cfg_attr(
+        unix,
+        command(after_help = "\
 A command card is an ed25519-signed attestation of what a command DOES: the
 exact command string, the domains it should contact, the SHA-256 of any script
 it pipes, the paths it writes, whether it needs sudo, and an expiry date. A
@@ -2209,7 +2216,46 @@ Examples:
     --expected-domain example.com --writes /usr/local/bin/example > install-card.json
   tirith command-card sign --key ed25519-priv.bin install-card.json
   tirith command-card verify install-card.json
-  tirith command-card fetch https://example.com/install-card.json")]
+  tirith command-card fetch https://example.com/install-card.json")
+    )]
+    #[cfg_attr(
+        not(unix),
+        command(after_help = "\
+A command card is an ed25519-signed attestation of what a command DOES: the
+exact command string, the domains it should contact, the SHA-256 of any script
+it pipes, the paths it writes, whether it needs sudo, and an expiry date. A
+maintainer publishes a card next to their install one-liner; a user verifies
+the card against the command they are about to run.
+
+v1 is ATTESTATION-ONLY. A verified card emits an Info `command_card_verified`
+finding that improves audit confidence but does NOT change the verdict — a
+`curl … | sh` with a valid card still warns/blocks exactly as it would without
+one. A command that differs from its trusted card emits a High
+`command_card_mismatch` (a tampering signal). There is no card-driven
+suppression in v1.
+
+TRUST (manual in v1): card signatures verify against ed25519 public keys you
+have explicitly trusted by dropping `<key_id>.pub` into
+`~/.config/tirith/trusted-card-keys/`. A card signed by a key not in that
+directory is treated as unverified.
+
+NO HOT-PATH NETWORK: `tirith check` NEVER fetches a card. A `# tirith-card:`
+comment value or `--card` argument must be a LOCAL path. To use a card hosted
+at a URL, download it to a local file first (e.g. with your browser or a
+download tool), then pass that path to `tirith check --card`. The automated
+`command-card fetch` downloader is not available on this platform.
+
+Subcommands:
+  create  build an unsigned card from flags (or prompts) and print JSON
+  sign    sign a card in place with an ed25519 private key
+  verify  verify a card against your trusted-keys directory
+
+Examples:
+  tirith command-card create --command 'curl -fsSL https://example.com/install.sh | sh' \\
+    --expected-domain example.com --writes /usr/local/bin/example > install-card.json
+  tirith command-card sign --key ed25519-priv.bin install-card.json
+  tirith command-card verify install-card.json")
+    )]
     CommandCard {
         #[command(subcommand)]
         action: CommandCardAction,

@@ -236,7 +236,12 @@ pub static PROVIDERS: &[Provider] = &[
             "Roll the new credential out to every workload before deleting the old.",
             "Review Cloud Audit Logs for use of the leaked credential.",
         ],
-        key_prefix_shapes: &["AIza", "\"type\": \"service_account\"", "-----BEGIN PRIVATE KEY-----"],
+        // NOTE: the generic `-----BEGIN PRIVATE KEY-----` PEM header is
+        // deliberately NOT listed here. It is not GCP-specific (any RSA/EC
+        // service key, SSH key, or unrelated PEM uses it) and would misroute
+        // every bare private key to GCP. We keep only GCP-distinctive shapes:
+        // the `AIza` API-key prefix and the service-account JSON `type` field.
+        key_prefix_shapes: &["AIza", "\"type\": \"service_account\""],
         last_verified: LAST_VERIFIED,
     },
     Provider {
@@ -284,12 +289,18 @@ pub fn provider_names() -> Vec<&'static str> {
 /// text often keeps a credential's leading prefix (`AKIA…`, `ghp_…`) even after
 /// the body is masked, which is enough to route the user to the right provider.
 pub fn match_provider(finding_text: &str) -> Option<&'static Provider> {
+    // Case-insensitive: redacted audit text may upper/lower-case an env-var name
+    // (`AWS_SECRET_ACCESS_KEY=` vs the table's `aws_secret_access_key`), so we
+    // lowercase BOTH the haystack and each shape before comparing. The
+    // longest-match (then table-order) tie-break is preserved — lengths are
+    // unchanged by ASCII-lowercasing, so `sk-ant-api` still beats `sk-`.
+    let haystack = finding_text.to_ascii_lowercase();
     PROVIDERS
         .iter()
         .filter_map(|p| {
             p.key_prefix_shapes
                 .iter()
-                .filter(|shape| finding_text.contains(*shape))
+                .filter(|shape| haystack.contains(&shape.to_ascii_lowercase()))
                 .map(|shape| shape.len())
                 .max()
                 .map(|best| (p, best))
@@ -495,6 +506,54 @@ mod tests {
             Some("anthropic")
         );
         assert!(match_provider("nothing credential-shaped here").is_none());
+    }
+
+    #[test]
+    fn bare_pem_header_does_not_attribute_to_gcp() {
+        // F4 (Minor): the generic `-----BEGIN PRIVATE KEY-----` PEM header is not
+        // GCP-specific and must NOT misroute an unrelated private key to gcp.
+        assert!(
+            match_provider("-----BEGIN PRIVATE KEY-----").is_none(),
+            "a bare PEM private-key header must not attribute to gcp"
+        );
+        assert!(
+            match_provider("cat key.pem\n-----BEGIN PRIVATE KEY-----\nMIIE...").map(|p| p.provider)
+                != Some("gcp"),
+            "a generic PEM block must not route to gcp"
+        );
+        // GCP-distinctive shapes still attribute correctly.
+        assert_eq!(
+            match_provider("export KEY=AIzaSyExampleExampleExample").map(|p| p.provider),
+            Some("gcp")
+        );
+        assert_eq!(
+            match_provider("{\"type\": \"service_account\", \"project_id\": \"x\"}")
+                .map(|p| p.provider),
+            Some("gcp")
+        );
+    }
+
+    #[test]
+    fn match_provider_is_case_insensitive() {
+        // F5 (Minor): redacted audit text may upper-case an env-var name. An
+        // UPPERCASE `AWS_SECRET_ACCESS_KEY=` must still attribute to aws.
+        assert_eq!(
+            match_provider("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIexample").map(|p| p.provider),
+            Some("aws"),
+            "uppercase AWS_SECRET_ACCESS_KEY must route to aws"
+        );
+        // Mixed case of a shorter shape also matches.
+        assert_eq!(
+            match_provider("NPM_TOKEN env: npm_AbCdEf").map(|p| p.provider),
+            Some("npm")
+        );
+        // Case-insensitivity must NOT broaden the longest-match tie-break: an
+        // uppercase Anthropic key still beats OpenAI's `sk-`.
+        assert_eq!(
+            match_provider("ANTHROPIC_API_KEY=SK-ANT-API03-REDACTED").map(|p| p.provider),
+            Some("anthropic"),
+            "uppercased sk-ant-api must still win over sk-"
+        );
     }
 
     #[test]

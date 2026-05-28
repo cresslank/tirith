@@ -331,13 +331,28 @@ pub fn fetch(url: &str, json: bool) -> i32 {
     let sha = command_card::sha256_hex(&bytes);
     let dest = cache_dir.join(format!("{sha}.json"));
     // Persist atomically: NamedTempFile::persist renames within the same dir.
+    // The cache is content-addressed (`<sha256>.json`), so refetching the same
+    // card is IDEMPOTENT. `persist` (overwrite=true) already replaces an
+    // existing same-named file on the common platforms, so a refetch normally
+    // just succeeds. As belt-and-suspenders for any backend that surfaces an
+    // `AlreadyExists` on the rename (or a future switch to a no-clobber
+    // persist), explicitly treat "destination already holds these exact bytes"
+    // as a cache hit rather than an error.
     if let Err(e) = tmp.persist(&dest) {
-        emit_error(
-            json,
-            "tirith command-card fetch",
-            &format!("persist {}: {}", dest.display(), e.error),
-        );
-        return 1;
+        let already_cached = e.error.kind() == std::io::ErrorKind::AlreadyExists
+            && std::fs::read(&dest)
+                .map(|existing| existing == bytes)
+                .unwrap_or(false);
+        if !already_cached {
+            emit_error(
+                json,
+                "tirith command-card fetch",
+                &format!("persist {}: {}", dest.display(), e.error),
+            );
+            return 1;
+        }
+        // Cache hit: identical bytes already at `dest`. Fall through to report
+        // the cached path as success.
     }
 
     if json {

@@ -871,7 +871,14 @@ fn check_command_manifest_hot(
         Err(_) => return (Vec::new(), None),
     };
 
-    let outcome = manifest.evaluate(&ctx.input, engine_findings);
+    // Strip any leading `# tirith-card:` prelude before manifest matching, the
+    // same way the card-comparison path does (see `check_command_card_hot` /
+    // `command_card::strip_card_comment_lines`). Otherwise the card-comment
+    // wrapper skews matching: `allowed[]` EXACT matches would miss (the analyzed
+    // input still carries the marker line) and `dangerous[]` globs would match
+    // against the wrapper rather than the real command.
+    let command = crate::command_card::strip_card_comment_lines(&ctx.input);
+    let outcome = manifest.evaluate(&command, engine_findings);
     (outcome.findings, outcome.matched_allowed_name)
 }
 
@@ -917,12 +924,12 @@ fn check_command_card_hot(ctx: &AnalysisContext) -> Vec<Finding> {
                 title: "Command card reference is a remote URL".to_string(),
                 description: format!(
                     "The command-card reference '{url}' is a remote URL. tirith does not \
-                     fetch cards during `tirith check`; remote URLs require \
-                     `tirith command-card fetch` first, then pass the cached path via \
-                     `--card`."
+                     fetch cards during `tirith check`; download the card to a local file \
+                     first, then pass that path via `--card`. On Unix, \
+                     `tirith command-card fetch <url>` performs this download for you."
                 ),
                 evidence: vec![crate::verdict::Evidence::Text {
-                    detail: "remote URLs require `tirith command-card fetch` first".to_string(),
+                    detail: "remote URLs must be downloaded to a local file first, then passed via `--card`".to_string(),
                 }],
                 human_view: None,
                 agent_view: None,

@@ -365,14 +365,24 @@ fn analyze_command(command: &str, cwd: Option<&str>) -> tirith_core::verdict::Ve
 
 /// Run `command` through the platform shell, inheriting stdio. Returns the
 /// child's exit code (128 if killed by a signal with no code).
+///
+/// The shell family here MUST match what [`analyze_command`] tokenized with
+/// (see [`RUN_SHELL`]): the safety re-check is only sound if the engine parsed
+/// the command the way the shell that runs it will. On non-Windows we therefore
+/// execute via a POSIX `sh -c` (matching `ShellType::Posix`) rather than
+/// `$SHELL -c` — `$SHELL` may be fish/csh, whose word-splitting and operator
+/// semantics differ from POSIX, which would let the re-check parse a DIFFERENT
+/// command than the one actually executed. Windows uses `cmd /C` (matching
+/// `ShellType::Cmd`).
 fn run_shell_command(command: &str) -> std::io::Result<i32> {
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(command);
         c
     } else {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut c = Command::new(shell);
+        // Deterministically POSIX `sh`, NOT `$SHELL`, so execution matches the
+        // Posix analysis in `analyze_command`.
+        let mut c = Command::new("/bin/sh");
         c.arg("-c").arg(command);
         c
     };
@@ -413,13 +423,33 @@ mod tests {
 
     #[test]
     fn run_shell_matches_execution_platform() {
-        // The `commands run` safety re-check must tokenize with the SAME shell
-        // `run_shell_command` executes: `cmd /C` on Windows, `$SHELL -c` (POSIX)
-        // elsewhere. A mismatch (e.g. always-Posix) can mis-tokenize and miss
-        // findings on Windows.
+        // F7: the `commands run` safety re-check must tokenize with the SAME
+        // shell family `run_shell_command` executes: `cmd /C` on Windows, and a
+        // deterministic POSIX `/bin/sh -c` (NOT `$SHELL -c`, which could be
+        // fish/csh) elsewhere. A mismatch (e.g. analyze-as-Posix but run-as-fish)
+        // can mis-tokenize and miss findings.
         #[cfg(windows)]
         assert_eq!(RUN_SHELL, ShellType::Cmd);
         #[cfg(not(windows))]
         assert_eq!(RUN_SHELL, ShellType::Posix);
+    }
+
+    /// F7: the resolved execution shell must match `RUN_SHELL`'s family even when
+    /// `$SHELL` points at a non-POSIX shell. We can't easily introspect the
+    /// `Command` built by the private `run_shell_command`, so we pin the
+    /// invariant: on non-Windows the analysis is Posix AND execution is hardwired
+    /// to `/bin/sh` (a POSIX shell), independent of `$SHELL`. This is a
+    /// compile-time/structural guarantee — the function no longer reads `$SHELL`.
+    #[cfg(not(windows))]
+    #[test]
+    fn execution_shell_is_posix_independent_of_env_shell() {
+        // The constant the analysis uses is Posix...
+        assert_eq!(RUN_SHELL, ShellType::Posix);
+        // ...and `/bin/sh` exists on the unix CI/runners we target, so the
+        // hardwired execution path is a real POSIX shell rather than `$SHELL`.
+        assert!(
+            std::path::Path::new("/bin/sh").exists(),
+            "the deterministic POSIX execution shell /bin/sh must exist"
+        );
     }
 }

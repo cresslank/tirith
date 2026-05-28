@@ -29,17 +29,24 @@ marker. That serves three goals:
 | `env-line`           | `TIRITH_CANARY_TOKEN=canary_` + 24 hex                    | `TIRITH_CANARY_TOKEN=canary_3f9a…`                      |
 | `private-key-shaped` | PEM block whose body is `TIRITHCANARY` + 52 base64 chars  | `-----BEGIN TIRITH CANARY PRIVATE KEY----- …`           |
 
-### Why `AKIA00CANARY` can never be a real AWS key
+### The `00CANARY` marker keeps the token clearly synthetic
 
-A real AWS access-key ID is `AKIA` followed by 16 characters drawn from the RFC
-4648 **base32** alphabet (`A`–`Z` and `2`–`7`). The digits `0` and `1` are NOT
-in that alphabet. The canary's `00CANARY` infix therefore guarantees the token
-can never collide with a genuine AWS key, while keeping the recognizable `AKIA`
-prefix so it reads as an AWS credential. The random suffix uses the base32
-alphabet so the overall length and character set otherwise resemble a real key.
+The `aws-like` token keeps the recognizable `AKIA` prefix so it reads as an AWS
+credential at a glance, then embeds a literal, obviously-fake `00CANARY` infix.
+That marker is the point: it makes the token visibly a tirith canary rather than
+a live secret, so anyone who inspects a flagged value — or a provider's abuse
+team, if one ever sees it — can tell it is bait and not a real leaked key. This
+sharply reduces the chance of a canary being mistaken for a genuine credential
+and triggering an unwanted takedown or rotation.
+
+This is a "clearly-labelled synthetic" property, not a mathematical guarantee:
+tirith does not claim the string is impossible to confuse with every real key,
+only that the explicit marker makes accidental confusion unlikely. The random
+suffix keeps the overall length and shape close to a real key so the token still
+looks credible as a planted decoy.
 
 The `ghp_canary_`, `AIzaCANARY`, `canary_`, and `TIRITHCANARY` markers play the
-same role for the other kinds.
+same clearly-synthetic role for the other kinds.
 
 ## Randomness
 

@@ -120,13 +120,18 @@ pub fn stop(yes: bool, json: bool) -> i32 {
     let existing = incident::read_state();
     if existing.is_none() {
         if json {
-            let _ = write_json_stdout(
+            // A failed JSON write must surface non-zero so a piped consumer never
+            // pairs truncated/absent JSON with a success exit (mirrors
+            // command-card sign/verify and `incident report`).
+            if !write_json_stdout(
                 &StoppedOut {
                     stopped: false,
                     was_active: false,
                 },
                 "tirith incident stop: failed to write JSON output",
-            );
+            ) {
+                return 2;
+            }
         } else {
             println!("No incident is active — nothing to stop.");
         }
@@ -168,13 +173,18 @@ pub fn stop(yes: bool, json: bool) -> i32 {
             );
 
             if json {
-                let _ = write_json_stdout(
+                // Surface a failed JSON write as non-zero (see the no-incident
+                // branch above): the incident WAS stopped on disk, but a piped
+                // consumer must not read success with truncated/absent JSON.
+                if !write_json_stdout(
                     &StoppedOut {
                         stopped: removed,
                         was_active: true,
                     },
                     "tirith incident stop: failed to write JSON output",
-                );
+                ) {
+                    return 2;
+                }
                 return 0;
             }
             println!("Incident ended — normal policy restored.");
@@ -309,8 +319,29 @@ pub fn report(out: Option<PathBuf>, json: bool) -> i32 {
             }
         },
         None => {
-            // No --out: print to stdout so it can be piped/redirected.
-            print!("{body}");
+            // No --out. In `--json` mode emit a structured, machine-readable
+            // object (the markdown carried as a string field) so a JSON consumer
+            // never receives raw Markdown on a surface it asked to be JSON —
+            // consistent with the `--out` JSON branch above. Otherwise print the
+            // raw markdown for piping/redirection.
+            if json {
+                #[derive(serde::Serialize)]
+                struct ReportStdoutOut {
+                    report_markdown: String,
+                    bytes: usize,
+                }
+                if !write_json_stdout(
+                    &ReportStdoutOut {
+                        report_markdown: body.clone(),
+                        bytes: body.len(),
+                    },
+                    "tirith incident report: failed to write JSON output",
+                ) {
+                    return 2;
+                }
+            } else {
+                print!("{body}");
+            }
             0
         }
     }

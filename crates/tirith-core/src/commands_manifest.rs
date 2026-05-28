@@ -51,6 +51,7 @@ use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 /// One entry under `allowed:` — a named, catalogued command.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AllowedEntry {
     /// Short human label (`test`, `build`, …). Used by `tirith commands run
     /// <name>` and surfaced in audit context.
@@ -92,6 +93,7 @@ impl DangerousAction {
 /// One entry under `dangerous:` — a glob pattern that, when matched, elevates
 /// the verdict.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DangerousEntry {
     /// Glob pattern (`*` wildcard only in v1).
     pub pattern: String,
@@ -101,7 +103,14 @@ pub struct DangerousEntry {
 }
 
 /// Parsed `.tirith/commands.yaml`.
+///
+/// `deny_unknown_fields` is load-bearing: with `#[serde(default)]` on both
+/// lists, a typo'd top-level key (`dangerouss:` / `allowedd:`) would otherwise
+/// be silently ignored and the manifest would load with EMPTY lists — quietly
+/// disabling the operator's `dangerous[]` elevations. Rejecting unknown keys
+/// turns that typo into a loud parse error instead.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CommandsManifest {
     #[serde(default)]
     pub allowed: Vec<AllowedEntry>,
@@ -537,6 +546,38 @@ mod tests {
         assert_eq!(m.dangerous.len(), 1);
         assert_eq!(m.dangerous[0].pattern, "curl * | bash");
         assert_eq!(m.dangerous[0].action, DangerousAction::Block);
+    }
+
+    #[test]
+    fn unknown_top_level_key_is_rejected() {
+        // F2 (Major): a typo'd top-level key must FAIL the load rather than be
+        // silently ignored (which would load empty lists and disable the
+        // operator's elevations). `deny_unknown_fields` enforces this.
+        let typo = "dangerouss:\n  - pattern: \"curl * | bash\"\n";
+        let err = CommandsManifest::from_yaml(typo)
+            .expect_err("a misspelled top-level key must be a parse error");
+        assert!(matches!(err, ManifestError::Parse(_)), "got {err:?}");
+
+        // A correctly-spelled manifest still parses (no false positive).
+        let ok = "dangerous:\n  - pattern: \"curl * | bash\"\n";
+        let m = CommandsManifest::from_yaml(ok).expect("valid manifest parses");
+        assert_eq!(m.dangerous.len(), 1);
+    }
+
+    #[test]
+    fn unknown_entry_field_is_rejected() {
+        // F2 (Major): unknown fields inside `allowed[]` / `dangerous[]` entries
+        // are also rejected, so a typo'd entry key cannot be silently dropped.
+        let bad_allowed = "allowed:\n  - name: test\n    commandd: npm test\n";
+        assert!(matches!(
+            CommandsManifest::from_yaml(bad_allowed),
+            Err(ManifestError::Parse(_))
+        ));
+        let bad_dangerous = "dangerous:\n  - pattern: \"x\"\n    actionn: warn\n";
+        assert!(matches!(
+            CommandsManifest::from_yaml(bad_dangerous),
+            Err(ManifestError::Parse(_))
+        ));
     }
 
     #[test]

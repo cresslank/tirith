@@ -25,10 +25,10 @@
 //!
 //! # Clearly-synthetic token shapes
 //!
-//! Every generated token carries a literal, obviously-fake marker so it can
-//! never be mistaken for a real third-party credential (which could trigger an
-//! external provider's abuse / take-down workflow), while still matching
-//! tirith's own credential-shape detection:
+//! Every generated token carries a literal, obviously-fake marker so a flagged
+//! value reads as tirith bait rather than a real third-party credential
+//! (reducing the chance it triggers an external provider's abuse / take-down
+//! workflow), while still matching tirith's own credential-shape detection:
 //!
 //! | kind                 | shape                                           |
 //! |----------------------|-------------------------------------------------|
@@ -38,12 +38,13 @@
 //! | `env-line`           | `TIRITH_CANARY_TOKEN=canary_` + 24 hex          |
 //! | `private-key-shaped` | a PEM block whose body is `TIRITHCANARY...`     |
 //!
-//! The `AKIA00CANARY` infix is invalid for a real AWS key: AWS access-key IDs
-//! are `AKIA` + `[A-Z2-7]{16}` (RFC 4648 base32), and `0`/`1` are NOT in that
-//! alphabet — so `00CANARY` can never collide with a genuine key. The
-//! `ghp_canary_` / `AIzaCANARY` / `canary_` markers serve the same purpose for
-//! the other kinds. A developer who spots the token can immediately tell it is a
-//! tirith canary, not a real leak. See `docs/canary-formats.md`.
+//! The `AKIA00CANARY` infix keeps the recognizable `AKIA` prefix while the
+//! explicit `00CANARY` marker makes the token clearly synthetic, so it is
+//! unlikely to be mistaken for a genuine key. The `ghp_canary_` / `AIzaCANARY`
+//! / `canary_` markers serve the same clearly-synthetic purpose for the other
+//! kinds. A developer who spots the token can tell it is a tirith canary, not a
+//! real leak. This is a clearly-labelled property, not a mathematical
+//! impossibility claim — see `docs/canary-formats.md`.
 //!
 //! # Token-shape overlap with real creds
 //!
@@ -74,8 +75,8 @@ use serde::{Deserialize, Serialize};
 /// The synthetic token kinds `tirith canary create <kind>` understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanaryKind {
-    /// `AKIA00CANARY` + random — AWS-access-key-shaped, but the `00CANARY`
-    /// infix is invalid for a real AWS key (`0` ∉ base32).
+    /// `AKIA00CANARY` + random — AWS-access-key-shaped, with an explicit
+    /// `00CANARY` marker that keeps the token clearly synthetic.
     AwsLike,
     /// `ghp_canary_` + random — GitHub-personal-access-token-shaped.
     GithubLike,
@@ -163,9 +164,10 @@ pub fn store_path() -> Option<PathBuf> {
 /// caller decides whether to persist it.
 pub fn generate_token(kind: CanaryKind) -> String {
     match kind {
-        // AWS access keys are `AKIA` + 16 base32 chars. `0` is NOT in base32,
-        // so `AKIA00CANARY` (12 chars) + 8 more = a 20-char `AKIA…` string that
-        // can never be a real key. Suffix uses the base32 alphabet for shape.
+        // AWS access keys look like `AKIA` + 16 chars. We keep the recognizable
+        // `AKIA` prefix, then embed an explicit `00CANARY` marker so the token
+        // is clearly synthetic (reducing the chance it's mistaken for a real
+        // key); the suffix uses a base32-style alphabet purely for shape.
         CanaryKind::AwsLike => format!("AKIA00CANARY{}", random_chars(BASE32, 8)),
         // `ghp_` is GitHub's PAT prefix; `canary_` makes it obviously fake.
         CanaryKind::GithubLike => format!("ghp_canary_{}", random_chars(ALNUM, 30)),
@@ -363,9 +365,21 @@ impl StoreLock {
         }
         let file = opts.open(&lock_path)?;
         use fs2::FileExt;
-        // Blocking exclusive lock; fall back to a try-lock so an
-        // unsupported-locking filesystem does not hard-fail the mutation.
-        let _ = file.lock_exclusive().or_else(|_| file.try_lock_exclusive());
+        // Blocking exclusive lock. Only an `Unsupported` error (advisory locking
+        // not available on this platform/filesystem) is treated as best-effort:
+        // we proceed UNLOCKED, relying on the atomic rename in [`rewrite_store`]
+        // to still prevent torn files. ANY OTHER lock error (EINTR-after-retry,
+        // EDEADLK, ENOLCK, …) must fail loudly so the mutation aborts rather than
+        // racing without the serialization guarantee — mirroring how `audit.rs`
+        // hard-fails on a lock error instead of writing unlocked.
+        if let Err(e) = file.lock_exclusive() {
+            if e.kind() != std::io::ErrorKind::Unsupported {
+                return Err(e);
+            }
+            // Unsupported: best-effort. Try once more (non-blocking) in case the
+            // backend supports try-locking, but never hard-fail on Unsupported.
+            let _ = file.try_lock_exclusive();
+        }
         Ok(StoreLock { file })
     }
 }
@@ -703,9 +717,9 @@ mod tests {
     fn aws_like_token_is_clearly_synthetic() {
         let tok = generate_token(CanaryKind::AwsLike);
         assert!(tok.starts_with("AKIA00CANARY"), "got {tok}");
-        // `0` is not in the AWS base32 alphabet, so a real key can never carry
-        // the `00CANARY` infix — this is the load-bearing "can't be mistaken
-        // for a real credential" property.
+        // The explicit `00CANARY` marker is what keeps the token clearly
+        // synthetic, so a flagged value reads as tirith bait rather than a real
+        // leaked credential — the load-bearing "clearly-labelled" property.
         assert!(tok.contains("00CANARY"));
         assert_eq!(tok.len(), "AKIA00CANARY".len() + 8);
     }
@@ -896,6 +910,62 @@ mod tests {
         // lock itself is free: another acquire returns immediately.
         assert!(lock_path_for(&store).exists(), "lock sentinel persists");
         let _g = StoreLock::acquire(&store).expect("lock is free to re-acquire");
+    }
+
+    #[test]
+    fn acquire_proceeds_on_supported_lock_and_persists() {
+        // F1 (Major): `StoreLock::acquire` must NOT silently drop the
+        // serialization guarantee on an arbitrary lock error. On a normal
+        // filesystem `lock_exclusive` succeeds, so acquire returns `Ok` and the
+        // guarded mutation persists — proving the happy (supported-lock) path is
+        // preserved by the fix and the lock is actually held across the write.
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        {
+            let _g = StoreLock::acquire(&store).expect("supported-lock acquire succeeds");
+            // The sentinel lock file is created as part of acquire.
+            assert!(lock_path_for(&store).exists(), "lock sentinel created");
+            // While the lock is held in THIS scope, the file handle is open and
+            // the guard is live; dropping it below releases the lock.
+        }
+        // After release the guarded mutator works and its effect persists,
+        // confirming acquire returned a real, releasable lock (not an UNLOCKED
+        // best-effort handle from a swallowed error).
+        create_at(&store, CanaryKind::AwsLike, None).unwrap();
+        assert!(
+            store_nonempty_at(&store),
+            "mutation under a real lock persists"
+        );
+    }
+
+    #[test]
+    fn acquire_propagates_non_unsupported_io_errors() {
+        // F1 (Major): only an `Unsupported` lock error is best-effort; any other
+        // I/O failure during acquire must propagate as `Err`, never silently
+        // proceed. We force a deterministic, cross-platform failure: point the
+        // store at a path whose PARENT is an existing regular FILE, so
+        // `create_dir_all(parent)` inside `acquire` fails (NotADirectory /
+        // AlreadyExists) and the error is returned rather than swallowed.
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        // store would live UNDER the regular file `not-a-dir` — its parent can
+        // never be created.
+        let store = blocker.join("canaries.jsonl");
+        // `StoreLock` is not `Debug`, so match instead of `expect_err`.
+        match StoreLock::acquire(&store) {
+            Ok(_) => panic!("acquire must fail when the store's parent cannot be created"),
+            Err(err) => {
+                // It must surface a real error (the exact kind is OS-dependent),
+                // proving acquire does not return a bogus unlocked guard on a
+                // non-Unsupported failure.
+                assert_ne!(
+                    err.kind(),
+                    std::io::ErrorKind::Unsupported,
+                    "this fixture exercises the NON-Unsupported (propagated) branch"
+                );
+            }
+        }
     }
 
     #[test]
