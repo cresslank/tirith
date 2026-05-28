@@ -2087,6 +2087,9 @@ mod tests {
         .unwrap();
     }
 
+    // Unix-only: the `/tmp` leader shape is the ExecInTmp trigger; on Windows
+    // the tmp root is `%TEMP%` and `/tmp/...` is not a tmp path.
+    #[cfg(unix)]
     #[test]
     fn exec_guard_on_fires_exec_in_tmp_off_fast_exits() {
         // A TIRITH_POLICY_ROOT in the environment would override the cwd-based

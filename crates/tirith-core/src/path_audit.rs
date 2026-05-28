@@ -802,12 +802,21 @@ mod tests {
         assert!(hits.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn is_system_path_recognizes_usr_bin() {
         assert!(is_system_path(Path::new("/usr/bin/git")));
         assert!(is_system_path(Path::new("/bin/sh")));
         assert!(!is_system_path(Path::new("/opt/homebrew/bin/git")));
         assert!(!is_system_path(Path::new("/tmp/git")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_system_path_recognizes_system32() {
+        // SYSTEM_PATH_DIRS on Windows holds the System32 / Windows dirs.
+        assert!(is_system_path(Path::new(r"C:\Windows\System32\cmd.exe")));
+        assert!(!is_system_path(Path::new(r"C:\Users\me\bin\git.exe")));
     }
 
     // `split_path` uses the platform separator (`:` on Unix, `;` on Windows),
