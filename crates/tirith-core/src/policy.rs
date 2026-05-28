@@ -1072,8 +1072,16 @@ impl Policy {
     /// Used in Tier 2 for fast bypass resolution.
     /// Uses the same resolution order as full discovery (TIRITH_POLICY_ROOT,
     /// walk-up, user-level) so bypass settings are consistent.
+    ///
+    /// **M11 ch5** — incident-mode runtime overrides are applied here too, so
+    /// the engine's tier-2 `TIRITH=0` bypass branch (which reads this partial
+    /// policy's `allow_bypass_env*` flags) honors an active incident and
+    /// refuses the bypass. Without this, a fast-exiting or bypass-requested
+    /// command would skip the override that full [`Self::discover`] applies.
     pub fn discover_partial(cwd: Option<&str>) -> Self {
-        Self::discover_local(cwd)
+        let mut p = Self::discover_local(cwd);
+        p.apply_runtime_overrides();
+        p
     }
 
     /// Discover and load full policy.
@@ -1088,7 +1096,22 @@ impl Policy {
     ///    - `"closed"`: return a fail-closed default (all actions = Block)
     ///    - `"cached"`: try cached remote policy, else fall back to local
     /// 4. Auth errors (401/403) always fail closed regardless of mode.
+    ///
+    /// **M11 ch5** — after the local/remote policy is resolved, incident-mode
+    /// runtime overrides are merged in via [`Self::apply_runtime_overrides`].
+    /// This is the single hot-path hook that flips the engine fail-closed and
+    /// disables the `TIRITH=0` bypass while an incident is active.
     pub fn discover(cwd: Option<&str>) -> Self {
+        let mut p = Self::discover_resolved(cwd);
+        p.apply_runtime_overrides();
+        p
+    }
+
+    /// The local/remote resolution body for [`Self::discover`], WITHOUT the
+    /// incident-override merge. Split out so the override is applied exactly
+    /// once on the final resolved policy regardless of which remote-fetch
+    /// branch produced it.
+    fn discover_resolved(cwd: Option<&str>) -> Self {
         let local = Self::discover_local(cwd);
 
         let server_url = std::env::var("TIRITH_SERVER_URL")
@@ -1279,6 +1302,60 @@ impl Policy {
             .ok()
             .and_then(|v| v.as_str().map(String::from))?;
         self.severity_overrides.get(&key).copied()
+    }
+
+    /// **M11 ch5** — merge incident-mode runtime overrides on top of this
+    /// loaded policy, in place.
+    ///
+    /// When [`crate::incident::active_cached`] reports an active incident,
+    /// the following overrides are applied:
+    ///
+    /// * `fail_mode` → [`FailMode::Closed`]
+    /// * `allow_bypass_env` → `false`
+    /// * `allow_bypass_env_noninteractive` → `false`
+    /// * a `severity_overrides` entry for each rule in
+    ///   [`crate::incident::INCIDENT_ELEVATED_RULES`], applied ONLY when it
+    ///   would *raise* the rule's effective severity above what the operator
+    ///   already pinned (we never downgrade an explicit override).
+    ///
+    /// This runs on EVERY analyze (it is called from [`Self::discover`] and
+    /// [`Self::discover_partial`], which back all hot paths). To keep the
+    /// common no-incident case cheap, the active-check is behind a 5-second
+    /// per-process stat cache in [`crate::incident::active_cached`]; when no
+    /// flag file exists the cost is a single `metadata()` stat (and nothing
+    /// within the TTL window), and this method is a near-noop early return.
+    pub fn apply_runtime_overrides(&mut self) {
+        // Near-noop fast path: no active incident → leave the policy untouched.
+        if crate::incident::active_cached().is_none() {
+            return;
+        }
+
+        // Incident active: force fail-closed and disable the env bypass in both
+        // interactivity modes. The bypass disable is what makes `tirith check`
+        // ignore `TIRITH=0` while an incident is active (see the engine's
+        // `bypass_requested` branch, which reads these two flags).
+        self.fail_mode = FailMode::Closed;
+        self.allow_bypass_env = false;
+        self.allow_bypass_env_noninteractive = false;
+
+        // Elevate the curated rule set — only ever raising severity.
+        for (rule, elevated) in crate::incident::INCIDENT_ELEVATED_RULES {
+            let Some(key) = serde_json::to_value(rule)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+            else {
+                continue;
+            };
+            match self.severity_overrides.get(&key).copied() {
+                // Operator already pinned this rule at or above the incident
+                // level — respect it, don't lower it.
+                Some(existing) if existing >= *elevated => {}
+                // No override, or a lower one: raise to the incident level.
+                _ => {
+                    self.severity_overrides.insert(key, *elevated);
+                }
+            }
+        }
     }
 
     /// Check if a URL is in the blocklist.

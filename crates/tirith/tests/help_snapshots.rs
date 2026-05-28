@@ -217,6 +217,13 @@ help_example_tests! {
     help_secret_triage         => (["secret", "triage", "--help"], "tirith secret triage --json");
     help_secret_rotate         => (["secret", "rotate", "--help"], "tirith secret rotate github");
     help_secret_revoke         => (["secret", "revoke", "--help"], "tirith secret revoke --provider aws");
+
+    // M11 ch5 — incident mode.
+    help_incident              => (["incident", "--help"], "tirith incident start --reason");
+    help_incident_start        => (["incident", "start", "--help"], "tirith incident start --reason");
+    help_incident_stop         => (["incident", "stop", "--help"], "tirith incident stop --yes");
+    help_incident_status       => (["incident", "status", "--help"], "tirith incident status");
+    help_incident_report       => (["incident", "report", "--help"], "tirith incident report --out");
 }
 
 /// The dominant requirement for `tirith secret` is HONESTY: every surface must
@@ -251,6 +258,42 @@ fn help_secret_states_assistant_only_and_no_network() {
         assert!(
             lower.contains("network"),
             "{args:?} --help must state it makes zero network calls, got:\n{stdout}"
+        );
+    }
+}
+
+/// The two load-bearing guarantees of `tirith incident` must be stated plainly
+/// in help so a future edit can't quietly drop them: (1) it adds NO new rule
+/// IDs (it only re-weights existing detection), and (2) `stop` is ALWAYS
+/// recoverable (lockout safety). Match single unsplittable tokens so the
+/// assertion is robust to clap's line-wrapping.
+#[test]
+fn help_incident_states_no_new_rules_and_lockout_safety() {
+    // The top-level help carries the "no new rule IDs" promise.
+    let top = tirith()
+        .args(["incident", "--help"])
+        .output()
+        .expect("failed to run tirith");
+    let top_out = String::from_utf8_lossy(&top.stdout);
+    assert!(
+        top_out.contains("NO new rule IDs") || top_out.to_ascii_lowercase().contains("no new rule"),
+        "incident --help must state it adds no new rule IDs, got:\n{top_out}"
+    );
+    assert!(
+        top_out.contains("FAIL-CLOSED") || top_out.to_ascii_lowercase().contains("fail-closed"),
+        "incident --help must state it forces fail-closed, got:\n{top_out}"
+    );
+    // Both the top-level and the `stop` help carry the lockout-safety note.
+    for args in [
+        &["incident", "--help"][..],
+        &["incident", "stop", "--help"][..],
+    ] {
+        let out = tirith().args(args).output().expect("failed to run tirith");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let lower = stdout.to_ascii_lowercase();
+        assert!(
+            lower.contains("lockout") || lower.contains("recoverable") || lower.contains("always"),
+            "{args:?} --help must carry the lockout-safety note, got:\n{stdout}"
         );
     }
 }

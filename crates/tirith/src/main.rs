@@ -2339,6 +2339,130 @@ Examples:
         #[command(subcommand)]
         action: SecretAction,
     },
+
+    /// Incident mode: fail-closed + elevate rules until you stop it (M11 ch5)
+    #[command(after_help = "\
+Incident mode is a manually-declared 'we may be under attack' posture. While it
+is active tirith stops being advisory and turns the screws:
+
+  * the runtime policy is forced FAIL-CLOSED;
+  * the TIRITH=0 env bypass is DISABLED (interactive AND non-interactive);
+  * a curated set of ALREADY-SHIPPING rules is elevated (credential_file_sweep,
+    base64_decode_execute, exec_recently_modified, exec_world_writable).
+
+It adds NO new rule IDs — it only re-weights existing detection.
+
+Subcommands:
+  start [--reason \"…\"]   declare an incident (errors if one is already active)
+  stop                    end the incident (prompts unless --yes); ALWAYS works
+  status                  show active/inactive + reason + started_at
+  report [--out <path>]   write a markdown incident report
+
+LOCKOUT SAFETY: `incident stop` is a direct state-file deletion — it is NOT
+gated by the incident's own fail-closed policy, so a stuck incident is always
+recoverable even with the bypass disabled.
+
+Report privacy: the report embeds only the audit log's already-REDACTED command
+text; full commands are never reconstructed.
+
+Examples:
+  tirith incident start --reason \"suspicious paste\"
+  tirith incident status
+  tirith incident report --out incident-2026-05-28.md
+  tirith incident stop --yes")]
+    Incident {
+        #[command(subcommand)]
+        action: IncidentAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum IncidentAction {
+    /// Declare an incident: flip fail-closed and disable the TIRITH=0 bypass
+    #[command(after_help = "\
+Declares an incident by writing a flag file at state_dir()/incident_active.json.
+While active, the runtime policy is forced fail-closed, the TIRITH=0 bypass is
+disabled (both interactivity modes), and a curated set of existing rules is
+elevated. A second `start` while one is already active fails (exit 1) with
+'already active since X' — it never overwrites the original reason/start time.
+
+Examples:
+  tirith incident start
+  tirith incident start --reason \"suspicious paste from teammate\"
+  tirith incident start --json")]
+    Start {
+        /// Free-text reason recorded in the flag file (stored verbatim).
+        #[arg(long)]
+        reason: Option<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// End the active incident and restore the normal policy (ALWAYS works)
+    #[command(after_help = "\
+Ends the incident by deleting the flag file and restoring the normal policy.
+Prompts for confirmation unless --yes is passed. Logs the stop to the audit log.
+
+LOCKOUT SAFETY: this is a plain filesystem deletion with NO `check` and NO
+policy gating, so it always succeeds even when the incident has the policy
+fail-closed and the bypass disabled.
+
+Examples:
+  tirith incident stop
+  tirith incident stop --yes")]
+    Stop {
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Show whether an incident is active, plus its reason + start time
+    #[command(after_help = "\
+Examples:
+  tirith incident status
+  tirith incident status --json")]
+    Status {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Write a markdown incident report (timeline, state, top findings)
+    #[command(after_help = "\
+Writes a markdown report covering: the audit timeline since the incident
+started, the top recent findings, the current persistence / env / PATH / hook /
+canary state, and an 'Actions taken' checklist for you to fill in. Embedded
+command text comes only from the audit log's already-REDACTED field — full
+commands are never reconstructed. With no --out the report prints to stdout.
+
+Examples:
+  tirith incident report
+  tirith incident report --out incident-2026-05-28.md")]
+    Report {
+        /// Write the report to this path instead of stdout (0600 on Unix).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Output format for the status line (default: human; report body is
+        /// always markdown).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -6887,6 +7011,30 @@ fn run() {
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::secret::revoke(&provider, json, verbose)
+            }
+        },
+
+        // M11 ch5 — incident mode (fail-closed + rule elevation + report).
+        Commands::Incident { action } => match action {
+            IncidentAction::Start {
+                reason,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::incident::start(reason, json)
+            }
+            IncidentAction::Stop { yes, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::incident::stop(yes, json)
+            }
+            IncidentAction::Status { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::incident::status(json)
+            }
+            IncidentAction::Report { out, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::incident::report(out, json)
             }
         },
 

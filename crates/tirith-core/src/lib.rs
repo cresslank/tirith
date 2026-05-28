@@ -26,6 +26,7 @@ pub mod extract;
 pub mod homoglyph;
 pub mod hygiene;
 pub mod iac_plan;
+pub mod incident;
 pub mod install_script_analysis;
 pub mod install_txn;
 pub mod intent;

@@ -157,6 +157,7 @@ pub mod hook_event;
 pub mod hooks;
 pub mod hygiene;
 pub mod iac;
+pub mod incident;
 pub mod init;
 pub mod install;
 pub mod intent;

