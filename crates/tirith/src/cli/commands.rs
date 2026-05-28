@@ -18,7 +18,7 @@
 
 use std::process::Command;
 
-use tirith_core::commands_manifest::{CommandsManifest, ManifestError};
+use tirith_core::commands_manifest::{CommandsManifest, DangerousAction, ManifestError};
 
 /// `tirith commands init` — write the starter `.tirith/commands.yaml`.
 ///
@@ -120,7 +120,7 @@ pub fn list(json: bool) -> i32 {
         let dangerous: Vec<_> = manifest
             .dangerous
             .iter()
-            .map(|e| serde_json::json!({ "pattern": e.pattern, "action": "block" }))
+            .map(|e| serde_json::json!({ "pattern": e.pattern, "action": dangerous_action_label(e.action) }))
             .collect();
         let v = serde_json::json!({ "allowed": allowed, "dangerous": dangerous });
         super::write_json_stdout(&v, "tirith commands list: failed to write JSON output");
@@ -138,7 +138,7 @@ pub fn list(json: bool) -> i32 {
         } else {
             println!("dangerous:");
             for e in &manifest.dangerous {
-                println!("  block   {}", e.pattern);
+                println!("  {:<7} {}", dangerous_action_label(e.action), e.pattern);
             }
         }
     }
@@ -196,13 +196,26 @@ pub fn run(name: &str, json: bool) -> i32 {
     };
     let command = entry.command.clone();
 
+    // Discover the repo policy once so the audit log redacts the command text
+    // with the operator's custom DLP patterns (same as `tirith check`), and the
+    // findings render below sees the same policy-derived view.
+    let policy = tirith_core::policy::Policy::discover(cwd.as_deref());
+
     // Re-check the resolved command through the engine. The manifest CANNOT
     // bypass detection: if the engine blocks (dangerous match, High/Critical
     // finding), we refuse to run it.
     let verdict = analyze_command(&command, cwd.as_deref());
     if verdict.action == tirith_core::verdict::Action::Block {
         // Audit the refusal so the blocked attempt is traceable.
-        let _ = tirith_core::audit::log_verdict(&verdict, &command, None, None, &[]);
+        let _ = tirith_core::audit::log_verdict(
+            &verdict,
+            &command,
+            None,
+            None,
+            &policy.dlp_custom_patterns,
+        );
+        // Surface WHY it was blocked, mirroring `tirith check`, before refusing.
+        render_findings(&verdict, &policy.dlp_custom_patterns, json);
         emit_error(
             json,
             "tirith commands run",
@@ -215,7 +228,40 @@ pub fn run(name: &str, json: bool) -> i32 {
     }
 
     // Audit the (allowed, non-blocked) run before executing it.
-    let _ = tirith_core::audit::log_verdict(&verdict, &command, None, None, &[]);
+    let _ = tirith_core::audit::log_verdict(
+        &verdict,
+        &command,
+        None,
+        None,
+        &policy.dlp_custom_patterns,
+    );
+
+    // A Warn/WarnAck verdict on an allowed command must NEVER be silently
+    // swallowed: render its findings just like `tirith check` does. In an
+    // interactive TTY, require explicit acknowledgement before running (mirrors
+    // check.rs's strict-warn prompt); non-interactive callers see the findings
+    // and proceed. (Block already returned above.)
+    if verdict.action != tirith_core::verdict::Action::Allow {
+        render_findings(&verdict, &policy.dlp_custom_patterns, json);
+
+        let interactive = if let Ok(val) = std::env::var("TIRITH_INTERACTIVE") {
+            val == "1"
+        } else {
+            is_terminal::is_terminal(std::io::stderr())
+        };
+        if interactive {
+            eprint!(
+                "tirith: proceed with {} warning(s) and run '{name}'? [y/N] ",
+                verdict.findings.len()
+            );
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input).ok();
+            if !matches!(input.trim(), "y" | "Y" | "yes" | "Yes") {
+                eprintln!("tirith commands run: aborted by user.");
+                return 1;
+            }
+        }
+    }
 
     if json {
         let v = serde_json::json!({
@@ -237,6 +283,37 @@ pub fn run(name: &str, json: bool) -> i32 {
             );
             1
         }
+    }
+}
+
+/// Render a non-Allow verdict's findings the SAME way `tirith check` does so a
+/// `commands run` Warn/Block surfaces its rules instead of being swallowed.
+/// JSON goes to stdout (machine-readable), human output to stderr (so it does
+/// not corrupt the executed command's stdout). No-op for an empty finding list.
+fn render_findings(
+    verdict: &tirith_core::verdict::Verdict,
+    dlp_custom_patterns: &[String],
+    json: bool,
+) {
+    if json {
+        if tirith_core::output::write_json_with_suggestions(
+            verdict,
+            dlp_custom_patterns,
+            None,
+            std::io::stdout().lock(),
+        )
+        .is_err()
+        {
+            eprintln!("tirith commands run: failed to write JSON output");
+        }
+    } else if tirith_core::output::write_human(
+        verdict,
+        /* warn_only */ false,
+        std::io::stderr().lock(),
+    )
+    .is_err()
+    {
+        eprintln!("tirith commands run: failed to write output");
     }
 }
 
@@ -301,6 +378,17 @@ fn run_shell_command(command: &str) -> std::io::Result<i32> {
     };
     let status = cmd.status()?;
     Ok(status.code().unwrap_or(128))
+}
+
+/// Stable label for a `dangerous[]` entry's action, shared by the JSON and
+/// human `list` renderers. The action is per-entry (`block` → Block, `warn` →
+/// Warn); hardcoding "block" here would misreport a `DangerousAction::Warn`
+/// entry.
+fn dangerous_action_label(action: DangerousAction) -> &'static str {
+    match action {
+        DangerousAction::Block => "block",
+        DangerousAction::Warn => "warn",
+    }
 }
 
 /// Human-readable rendering of a manifest load error.

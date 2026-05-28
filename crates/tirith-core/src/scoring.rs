@@ -332,6 +332,8 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::CommandCardVerified
         | RuleId::CommandCardUnverified
         | RuleId::CommandCardMismatch
+        // M11 ch2 — repo command-manifest rules. Local `.tirith/commands.yaml`
+        // allowlist/dangerous-glob match; no threat-DB involvement.
         | RuleId::RepoCommandUnknown
         | RuleId::RepoCommandDangerousPattern
         // M11 ch3 — honeytoken / canary. A local store lookup against the

@@ -753,6 +753,13 @@ const ALL_RULE_IDS: &[&str] = &[
     // Anomaly-detection rules (M10 ch5, D2)
     "anomaly_first_time_in_this_repo",
     "anomaly_rare_in_baseline",
+    // Command-card attestation rules (M11 ch1)
+    "command_card_verified",
+    "command_card_unverified",
+    "command_card_mismatch",
+    // Repo command-manifest rules (M11 ch2)
+    "repo_command_unknown",
+    "repo_command_dangerous_pattern",
     // Honeytoken / canary rule (M11 ch3, D3)
     "canary_token_touched",
 ];
@@ -1228,251 +1235,146 @@ fn test_all_rule_ids_have_fixture_coverage() {
     );
 }
 
+/// Generate the canonical list of every [`RuleId`] variant AND a compile-time
+/// exhaustiveness guard from a SINGLE source.
+///
+/// `all_rule_id_variants()` returns the listed variants; `_rule_id_exhaustive`
+/// is an exhaustive `match` (NO `_` arm) over the SAME list. Because the match
+/// is exhaustive, adding a new variant to the `RuleId` enum without adding it to
+/// THIS macro invocation fails to compile here — so the returned list (and its
+/// `.len()`) is genuinely enum-derived, not a hand-maintained `vec!` that can
+/// silently drift (the bug this replaced: the old `vec!` literal let 5 M11
+/// variants fall out of the completeness lists without any compile error).
+macro_rules! rule_id_variant_registry {
+    ($($variant:ident),+ $(,)?) => {
+        /// Every `RuleId` variant, in declaration order. Compiler-guaranteed
+        /// complete via `_rule_id_exhaustive` below.
+        fn all_rule_id_variants() -> Vec<tirith_core::verdict::RuleId> {
+            use tirith_core::verdict::RuleId;
+            vec![ $(RuleId::$variant),+ ]
+        }
+
+        /// Compile-time completeness guard: the exhaustive match (no `_` arm)
+        /// forces every enum variant to appear in the macro invocation above.
+        #[allow(dead_code)]
+        fn _rule_id_exhaustive(r: tirith_core::verdict::RuleId) {
+            use tirith_core::verdict::RuleId;
+            match r { $(RuleId::$variant => {}),+ }
+        }
+    };
+}
+
+rule_id_variant_registry! {
+    NonAsciiHostname, PunycodeDomain, MixedScriptInLabel, UserinfoTrick,
+    ConfusableDomain, RawIpUrl, NonStandardPort, InvalidHostChars,
+    TrailingDotWhitespace, LookalikeTld, NonAsciiPath, HomoglyphInPath,
+    DoubleEncoding, PlainHttpToSink, SchemelessToSink, InsecureTlsFlags,
+    ShortenedUrl, AnsiEscapes, ControlChars, BidiControls,
+    ZeroWidthChars, HiddenMultiline, UnicodeTags, InvisibleMathOperator,
+    VariationSelector, InvisibleWhitespace, HangulFiller, ConfusableText,
+    PipeToInterpreter, CurlPipeShell, WgetPipeShell, HttpiePipeShell,
+    XhPipeShell, DotfileOverwrite, ArchiveExtract, ProcMemAccess,
+    DockerRemotePrivEsc, CredentialFileSweep, Base64DecodeExecute, DataExfiltration,
+    PsSetExecutionPolicyBypass, PsDefenderExclusion, PsInlineDownloadExecute, DynamicCodeExecution,
+    ObfuscatedPayload, SuspiciousCodeExfiltration, ProxyEnvSet, SensitiveEnvExport,
+    CodeInjectionEnv, InterpreterHijackEnv, ShellInjectionEnv, MetadataEndpoint,
+    PrivateNetworkAccess, CommandNetworkDeny, ConfigInjection, ConfigSuspiciousIndicator,
+    ConfigMalformed, ConfigNonAscii, ConfigInvisibleUnicode, McpInsecureServer,
+    McpUntrustedServer, McpDuplicateServerName, McpOverlyPermissive, McpSuspiciousArgs,
+    McpServerDrift, GitTyposquat, DockerUntrustedRegistry, PipUrlInstall,
+    NpmUrlInstall, Web3RpcEndpoint, Web3AddressInUrl, VetNotConfigured,
+    // Install-command rules
+    RepoAddFromPipe, UnsignedRepoTrust, GpgCheckDisabled, KubectlApplyRemote,
+    HelmUntrustedRepo, TerraformRemoteModule, BrewUntrustedTap,
+    // CI / repo supply-chain scan rules
+    WorkflowUnpinnedAction, WorkflowDangerousTrigger, WorkflowCurlPipeShell, WorkflowUntrustedInput,
+    DockerfileUnpinnedImage, PackageScriptDangerous,
+    // AI-relevant file hidden-content scan rules
+    NotebookHiddenContent, NotebookSuspiciousOutput, AgentInstructionHidden, SvgScriptEmbedded,
+    SvgExternalReference,
+    // Threat intelligence — local DB
+    ThreatMaliciousPackage, ThreatMaliciousIp, ThreatPackageTyposquat, ThreatPackageSimilarName,
+    // Threat intelligence — supplemental feeds
+    ThreatMaliciousUrl, ThreatPhishingUrl, ThreatTorExitNode, ThreatThreatFoxIoc,
+    // Threat intelligence — real-time lookups
+    ThreatOsvVulnerable, ThreatCisaKev, ThreatSuspiciousPackage, ThreatSafeBrowsing,
+    // Package reputation rules (M6 ch6)
+    PackageNotFoundInRegistry, PackageMaintainerChangeRecent, PackageOwnershipTransferred,
+    PackageOsvAdvisoryActive, PackageDependencyConfusion, PackageInstallScriptNetworkCall,
+    PackageRepoMismatch,
+    // Package-policy gated rules (M6 ch7)
+    PackagePolicyNewerThanDays, PackagePolicyLowDownloads, PackagePolicyTyposquatDistance,
+    PackagePolicyUnknownPackageWithInstallScripts, PackagePolicyNotFound,
+    // Rendered content
+    HiddenCssContent, HiddenColorContent, HiddenHtmlAttribute, MarkdownComment, HtmlComment,
+    // Credential
+    CredentialInText, HighEntropySecret, PrivateKeyExposed,
+    // Cloaking / clipboard / pdf / policy / custom / license
+    ServerCloaking, ClipboardHidden, PdfHiddenText, CustomRuleMatch, PolicyBlocklisted,
+    AgentDeniedByPolicy, LicenseRequired,
+    // Output-direction rules (M7 ch1)
+    OutputOsc52ClipboardWrite, OutputHiddenText, OutputFakePrompt, OutputTerminalHyperlinkMismatch,
+    OutputTitleManipulation, OutputClearScreen, OutputTruncatedEscapeSequence,
+    // Prompt-injection rules (M7 ch5)
+    PromptInjectionInOutput, IgnorePreviousInstructions,
+    // Operational-context rules (M8 ch1)
+    ContextProdDestructiveCommand, ContextProdWriteOperation, ContextProdCredentialChange,
+    // SSH operational-context rules (M8 ch2)
+    SshRemoteDestructiveOnLabeledHost, SshRemoteShellOnLabeledHost,
+    // IaC operational-context rules (M8 ch3)
+    IacApplyWithoutPlan, IacApplyAutoApprove, IacApplyAutoApproveProd, IacDestroyProd,
+    IacPlanHighRiskChanges, IacPlanHashMismatch,
+    // Sudo-escalation rules (M8 ch4)
+    SudoShellSpawn, SudoEnvPreserveSensitive, SudoTeeSystemFile, SudoDownloadInstall,
+    SudoRecursivePermsBroadPath,
+    // Container-runtime rules (M8 ch5)
+    DockerRunPrivileged, DockerRunSensitiveBindMount, DockerExecProdContainer,
+    // Workstation hygiene rules (M9 ch1)
+    HygienePrivateKeyLoosePerms, HygieneEnvWorldReadable, HygieneKubeconfigGroupReadable,
+    HygieneNpmrcPlaintextToken, HygienePypircPlaintextToken, HygieneSshConfigUnsafeInclude,
+    HygieneGitCredentialHelperStore, HygieneShellHistorySecretLike, HygieneCloudCredsBadPerms,
+    HygieneDbDumpInRepo,
+    // Persistence-mechanism state-change rules (M9 ch2)
+    PersistenceShellRcModified, PersistenceAuthorizedKeysNewEntry, PersistenceCrontabModified,
+    PersistenceLaunchAgentAdded, PersistenceSshConfigInclude, PersistenceDirenvNewEnvrc,
+    // Shell-alias / function risk rules (M9 ch3)
+    AliasOverridesCriticalCommand, AliasContainsNetworkCall, AliasContainsCredentialRead,
+    AliasRecentlyAdded,
+    // Environment-variable lifecycle rules (M9 ch4)
+    EnvSensitiveExposedToUnknownScript, EnvSensitivePersistedInShellRc, EnvPrintenvToNetworkSink,
+    // Executable-provenance + PATH-shadowing rules (M9 ch5)
+    ExecInTmp, ExecRecentlyModified, ExecWorldWritable, ExecShadowsSystemCommand,
+    ExecUnsigned, ExecInRepoBin, PathWritableDirBeforeSystem, PathDuplicateCommandName,
+    PathDirInRepo, PathDirInTmp,
+    // Repo-hook / automation guard rules (M9 ch6)
+    RepoHookNetworkCall, RepoHookCredentialRead, RepoHookSudo, RepoHookSuspiciousShellPattern,
+    RepoHookExternalFetch,
+    // Blast-radius rules (M10 ch1)
+    BlastDeletesOutsideRepo, BlastWritesSystemPath, BlastSymlinkTraversal, BlastEmptyVarGlob,
+    BlastFindDelete, BlastRsyncDelete, BlastLargeFileCount,
+    // Post-run diff rule (M10 ch2)
+    PostRunShellRcModified,
+    // Tainted-content tracking rules (M10 ch3)
+    ExecOfTaintedFile, CommandSourcedFromTaintedFile,
+    // Anomaly-detection rules (M10 ch5, D2)
+    AnomalyFirstTimeInThisRepo, AnomalyRareInBaseline,
+    // Command-card attestation rules (M11 ch1)
+    CommandCardVerified, CommandCardUnverified, CommandCardMismatch,
+    // Repo command-manifest rules (M11 ch2)
+    RepoCommandUnknown, RepoCommandDangerousPattern,
+    // Honeytoken / canary rule (M11 ch3, D3)
+    CanaryTokenTouched,
+}
+
 /// Verify ALL_RULE_IDS stays in sync with the actual RuleId enum.
-/// Serializes every known variant and checks it appears in the list.
+///
+/// The variant list comes from [`all_rule_id_variants`], whose completeness is
+/// COMPILE-TIME enforced by the `_rule_id_exhaustive` match generated alongside
+/// it (no `_` arm) — so adding a `RuleId` variant without registering it fails
+/// to compile, and the count below is genuinely enum-derived.
 #[test]
 fn test_rule_id_list_is_complete() {
-    use tirith_core::verdict::RuleId;
-
-    // Exhaustive list — if a new variant is added to the enum, this
-    // match will fail to compile, forcing the developer to add it here.
-    let all_variants: Vec<RuleId> = vec![
-        RuleId::NonAsciiHostname,
-        RuleId::PunycodeDomain,
-        RuleId::MixedScriptInLabel,
-        RuleId::UserinfoTrick,
-        RuleId::ConfusableDomain,
-        RuleId::RawIpUrl,
-        RuleId::NonStandardPort,
-        RuleId::InvalidHostChars,
-        RuleId::TrailingDotWhitespace,
-        RuleId::LookalikeTld,
-        RuleId::NonAsciiPath,
-        RuleId::HomoglyphInPath,
-        RuleId::DoubleEncoding,
-        RuleId::PlainHttpToSink,
-        RuleId::SchemelessToSink,
-        RuleId::InsecureTlsFlags,
-        RuleId::ShortenedUrl,
-        RuleId::AnsiEscapes,
-        RuleId::ControlChars,
-        RuleId::BidiControls,
-        RuleId::ZeroWidthChars,
-        RuleId::HiddenMultiline,
-        RuleId::UnicodeTags,
-        RuleId::InvisibleMathOperator,
-        RuleId::VariationSelector,
-        RuleId::InvisibleWhitespace,
-        RuleId::HangulFiller,
-        RuleId::ConfusableText,
-        RuleId::PipeToInterpreter,
-        RuleId::CurlPipeShell,
-        RuleId::WgetPipeShell,
-        RuleId::HttpiePipeShell,
-        RuleId::XhPipeShell,
-        RuleId::DotfileOverwrite,
-        RuleId::ArchiveExtract,
-        RuleId::ProcMemAccess,
-        RuleId::DockerRemotePrivEsc,
-        RuleId::CredentialFileSweep,
-        RuleId::Base64DecodeExecute,
-        RuleId::DataExfiltration,
-        RuleId::PsSetExecutionPolicyBypass,
-        RuleId::PsDefenderExclusion,
-        RuleId::PsInlineDownloadExecute,
-        RuleId::DynamicCodeExecution,
-        RuleId::ObfuscatedPayload,
-        RuleId::SuspiciousCodeExfiltration,
-        RuleId::ProxyEnvSet,
-        RuleId::SensitiveEnvExport,
-        RuleId::CodeInjectionEnv,
-        RuleId::InterpreterHijackEnv,
-        RuleId::ShellInjectionEnv,
-        RuleId::MetadataEndpoint,
-        RuleId::PrivateNetworkAccess,
-        RuleId::CommandNetworkDeny,
-        RuleId::ConfigInjection,
-        RuleId::ConfigSuspiciousIndicator,
-        RuleId::ConfigMalformed,
-        RuleId::ConfigNonAscii,
-        RuleId::ConfigInvisibleUnicode,
-        RuleId::McpInsecureServer,
-        RuleId::McpUntrustedServer,
-        RuleId::McpDuplicateServerName,
-        RuleId::McpOverlyPermissive,
-        RuleId::McpSuspiciousArgs,
-        RuleId::McpServerDrift,
-        RuleId::GitTyposquat,
-        RuleId::DockerUntrustedRegistry,
-        RuleId::PipUrlInstall,
-        RuleId::NpmUrlInstall,
-        RuleId::Web3RpcEndpoint,
-        RuleId::Web3AddressInUrl,
-        RuleId::VetNotConfigured,
-        // Install-command rules
-        RuleId::RepoAddFromPipe,
-        RuleId::UnsignedRepoTrust,
-        RuleId::GpgCheckDisabled,
-        RuleId::KubectlApplyRemote,
-        RuleId::HelmUntrustedRepo,
-        RuleId::TerraformRemoteModule,
-        RuleId::BrewUntrustedTap,
-        // CI / repo supply-chain scan rules
-        RuleId::WorkflowUnpinnedAction,
-        RuleId::WorkflowDangerousTrigger,
-        RuleId::WorkflowCurlPipeShell,
-        RuleId::WorkflowUntrustedInput,
-        RuleId::DockerfileUnpinnedImage,
-        RuleId::PackageScriptDangerous,
-        // AI-relevant file hidden-content scan rules
-        RuleId::NotebookHiddenContent,
-        RuleId::NotebookSuspiciousOutput,
-        RuleId::AgentInstructionHidden,
-        RuleId::SvgScriptEmbedded,
-        RuleId::SvgExternalReference,
-        // Threat intelligence — local DB
-        RuleId::ThreatMaliciousPackage,
-        RuleId::ThreatMaliciousIp,
-        RuleId::ThreatPackageTyposquat,
-        RuleId::ThreatPackageSimilarName,
-        // Threat intelligence — supplemental feeds
-        RuleId::ThreatMaliciousUrl,
-        RuleId::ThreatPhishingUrl,
-        RuleId::ThreatTorExitNode,
-        RuleId::ThreatThreatFoxIoc,
-        // Threat intelligence — real-time lookups
-        RuleId::ThreatOsvVulnerable,
-        RuleId::ThreatCisaKev,
-        RuleId::ThreatSuspiciousPackage,
-        RuleId::ThreatSafeBrowsing,
-        // Package reputation rules (M6 ch6)
-        RuleId::PackageNotFoundInRegistry,
-        RuleId::PackageMaintainerChangeRecent,
-        RuleId::PackageOwnershipTransferred,
-        RuleId::PackageOsvAdvisoryActive,
-        RuleId::PackageDependencyConfusion,
-        RuleId::PackageInstallScriptNetworkCall,
-        RuleId::PackageRepoMismatch,
-        // Package-policy gated rules (M6 ch7)
-        RuleId::PackagePolicyNewerThanDays,
-        RuleId::PackagePolicyLowDownloads,
-        RuleId::PackagePolicyTyposquatDistance,
-        RuleId::PackagePolicyUnknownPackageWithInstallScripts,
-        RuleId::PackagePolicyNotFound,
-        RuleId::HiddenCssContent,
-        RuleId::HiddenColorContent,
-        RuleId::HiddenHtmlAttribute,
-        RuleId::MarkdownComment,
-        RuleId::HtmlComment,
-        RuleId::CredentialInText,
-        RuleId::HighEntropySecret,
-        RuleId::PrivateKeyExposed,
-        RuleId::ServerCloaking,
-        RuleId::ClipboardHidden,
-        RuleId::PdfHiddenText,
-        RuleId::CustomRuleMatch,
-        RuleId::PolicyBlocklisted,
-        RuleId::AgentDeniedByPolicy,
-        RuleId::LicenseRequired,
-        // Output-direction rules (M7 ch1)
-        RuleId::OutputOsc52ClipboardWrite,
-        RuleId::OutputHiddenText,
-        RuleId::OutputFakePrompt,
-        RuleId::OutputTerminalHyperlinkMismatch,
-        RuleId::OutputTitleManipulation,
-        RuleId::OutputClearScreen,
-        RuleId::OutputTruncatedEscapeSequence,
-        // Prompt-injection rules (M7 ch5)
-        RuleId::PromptInjectionInOutput,
-        RuleId::IgnorePreviousInstructions,
-        // Operational-context rules (M8 ch1)
-        RuleId::ContextProdDestructiveCommand,
-        RuleId::ContextProdWriteOperation,
-        RuleId::ContextProdCredentialChange,
-        // SSH operational-context rules (M8 ch2)
-        RuleId::SshRemoteDestructiveOnLabeledHost,
-        RuleId::SshRemoteShellOnLabeledHost,
-        // IaC operational-context rules (M8 ch3)
-        RuleId::IacApplyWithoutPlan,
-        RuleId::IacApplyAutoApprove,
-        RuleId::IacApplyAutoApproveProd,
-        RuleId::IacDestroyProd,
-        RuleId::IacPlanHighRiskChanges,
-        RuleId::IacPlanHashMismatch,
-        // Sudo-escalation rules (M8 ch4)
-        RuleId::SudoShellSpawn,
-        RuleId::SudoEnvPreserveSensitive,
-        RuleId::SudoTeeSystemFile,
-        RuleId::SudoDownloadInstall,
-        RuleId::SudoRecursivePermsBroadPath,
-        // Container-runtime rules (M8 ch5)
-        RuleId::DockerRunPrivileged,
-        RuleId::DockerRunSensitiveBindMount,
-        RuleId::DockerExecProdContainer,
-        // Workstation hygiene rules (M9 ch1)
-        RuleId::HygienePrivateKeyLoosePerms,
-        RuleId::HygieneEnvWorldReadable,
-        RuleId::HygieneKubeconfigGroupReadable,
-        RuleId::HygieneNpmrcPlaintextToken,
-        RuleId::HygienePypircPlaintextToken,
-        RuleId::HygieneSshConfigUnsafeInclude,
-        RuleId::HygieneGitCredentialHelperStore,
-        RuleId::HygieneShellHistorySecretLike,
-        RuleId::HygieneCloudCredsBadPerms,
-        RuleId::HygieneDbDumpInRepo,
-        // Persistence-mechanism state-change rules (M9 ch2)
-        RuleId::PersistenceShellRcModified,
-        RuleId::PersistenceAuthorizedKeysNewEntry,
-        RuleId::PersistenceCrontabModified,
-        RuleId::PersistenceLaunchAgentAdded,
-        RuleId::PersistenceSshConfigInclude,
-        RuleId::PersistenceDirenvNewEnvrc,
-        // Shell-alias / function risk rules (M9 ch3)
-        RuleId::AliasOverridesCriticalCommand,
-        RuleId::AliasContainsNetworkCall,
-        RuleId::AliasContainsCredentialRead,
-        RuleId::AliasRecentlyAdded,
-        // Environment-variable lifecycle rules (M9 ch4)
-        RuleId::EnvSensitiveExposedToUnknownScript,
-        RuleId::EnvSensitivePersistedInShellRc,
-        RuleId::EnvPrintenvToNetworkSink,
-        // Executable-provenance + PATH-shadowing rules (M9 ch5)
-        RuleId::ExecInTmp,
-        RuleId::ExecRecentlyModified,
-        RuleId::ExecWorldWritable,
-        RuleId::ExecShadowsSystemCommand,
-        RuleId::ExecUnsigned,
-        RuleId::ExecInRepoBin,
-        RuleId::PathWritableDirBeforeSystem,
-        RuleId::PathDuplicateCommandName,
-        RuleId::PathDirInRepo,
-        RuleId::PathDirInTmp,
-        // Repo-hook / automation guard rules (M9 ch6)
-        RuleId::RepoHookNetworkCall,
-        RuleId::RepoHookCredentialRead,
-        RuleId::RepoHookSudo,
-        RuleId::RepoHookSuspiciousShellPattern,
-        RuleId::RepoHookExternalFetch,
-        // Blast-radius rules (M10 ch1)
-        RuleId::BlastDeletesOutsideRepo,
-        RuleId::BlastWritesSystemPath,
-        RuleId::BlastSymlinkTraversal,
-        RuleId::BlastEmptyVarGlob,
-        RuleId::BlastFindDelete,
-        RuleId::BlastRsyncDelete,
-        RuleId::BlastLargeFileCount,
-        // Post-run diff rule (M10 ch2)
-        RuleId::PostRunShellRcModified,
-        // Tainted-content tracking rules (M10 ch3)
-        RuleId::ExecOfTaintedFile,
-        RuleId::CommandSourcedFromTaintedFile,
-        // Anomaly-detection rules (M10 ch5, D2)
-        RuleId::AnomalyFirstTimeInThisRepo,
-        RuleId::AnomalyRareInBaseline,
-        // Honeytoken / canary rule (M11 ch3, D3)
-        RuleId::CanaryTokenTouched,
-    ];
-
+    let all_variants = all_rule_id_variants();
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();
 
     for variant in &all_variants {
@@ -1483,11 +1385,12 @@ fn test_rule_id_list_is_complete() {
         );
     }
 
-    // Also check counts match (catches stale entries in ALL_RULE_IDS)
+    // The enum-derived variant count (compile-time-complete via the exhaustive
+    // guard) must equal ALL_RULE_IDS — catches a stale/extra entry in the const.
     assert_eq!(
-        all_variants.len(),
         ALL_RULE_IDS.len(),
-        "ALL_RULE_IDS has {} entries but RuleId enum has {} variants",
+        all_variants.len(),
+        "ALL_RULE_IDS has {} entries but the RuleId enum has {} variants",
         ALL_RULE_IDS.len(),
         all_variants.len()
     );

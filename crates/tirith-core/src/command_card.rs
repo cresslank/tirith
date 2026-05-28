@@ -479,11 +479,15 @@ pub enum CardRef {
 /// with `http://` or `https://` is classified as [`CardRef::RemoteUrl`] (never
 /// fetched on the hot path); anything else is a [`CardRef::LocalPath`].
 /// Returns the first such reference found.
+///
+/// Whitespace between the `#` and `tirith-card:` is flexible to stay in sync
+/// with the tier-1 marker regex (`#\s*tirith-card:`): `#tirith-card:` (no space)
+/// and `#  tirith-card:` (multiple) parse identically to the canonical
+/// `# tirith-card:`. If they didn't, such a line would force past the tier-1
+/// fast-exit yet be silently dropped here.
 pub fn find_card_comment(input: &str) -> Option<CardRef> {
-    const MARKER: &str = "# tirith-card:";
     for line in input.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix(MARKER) {
+        if let Some(rest) = card_comment_value(line) {
             let value = rest.trim();
             if value.is_empty() {
                 continue;
@@ -492,6 +496,17 @@ pub fn find_card_comment(input: &str) -> Option<CardRef> {
         }
     }
     None
+}
+
+/// If `line` is a `# tirith-card: <ref>` marker (with flexible whitespace after
+/// the `#`, matching the tier-1 `#\s*tirith-card:` regex), return the trailing
+/// reference text (un-trimmed). `None` for any non-marker line. Shared by
+/// [`find_card_comment`] and [`strip_card_comment_lines`] so the resolver and
+/// the strip-before-compare step treat exactly the same lines as card markers.
+fn card_comment_value(line: &str) -> Option<&str> {
+    let after_hash = line.trim_start().strip_prefix('#')?;
+    // `#\s*tirith-card:` — zero-or-more spaces between `#` and the keyword.
+    after_hash.trim_start().strip_prefix("tirith-card:")
 }
 
 /// Classify a card reference value as a local path or a remote URL.
@@ -511,15 +526,17 @@ pub fn classify_card_ref(value: &str) -> CardRef {
 /// carried via a `# tirith-card:` comment would always falsely mismatch its own
 /// (correctly-signed) card, since the analyzed input still contains the marker.
 ///
-/// Matches the same `trim_start().starts_with("# tirith-card:")` shape as
-/// [`find_card_comment`], so exactly the line(s) the resolver treats as the card
-/// reference are removed. Surviving lines are rejoined with `\n`; surrounding
-/// whitespace is left to [`Card::command_matches`]'s own trim.
+/// Matches the same flexible-whitespace marker shape as [`find_card_comment`]
+/// (via [`card_comment_value`]), so exactly the line(s) the resolver treats as
+/// the card reference are removed — including `#tirith-card:` / `#  tirith-card:`
+/// variants. If this diverged from the resolver, a `#tirith-card:` line picked
+/// up as the card ref would survive the strip and make the command falsely
+/// mismatch its own signed card. Surviving lines are rejoined with `\n`;
+/// surrounding whitespace is left to [`Card::command_matches`]'s own trim.
 pub fn strip_card_comment_lines(input: &str) -> String {
-    const MARKER: &str = "# tirith-card:";
     input
         .lines()
-        .filter(|line| !line.trim_start().starts_with(MARKER))
+        .filter(|line| card_comment_value(line).is_none())
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -851,6 +868,41 @@ mod tests {
         assert_eq!(
             find_card_comment("curl https://example.com/x.sh | sh"),
             None
+        );
+    }
+
+    #[test]
+    fn find_card_comment_flexible_whitespace_matches_tier1() {
+        // The tier-1 marker regex is `#\s*tirith-card:` (zero-or-more spaces),
+        // so `#tirith-card:` and `#  tirith-card:` force past the fast-exit.
+        // The parser MUST accept the same shapes or the card is silently
+        // dropped after being pulled past tier-1.
+        let expected = Some(CardRef::LocalPath("./c.json".to_string()));
+        // No space after `#`.
+        assert_eq!(
+            find_card_comment("#tirith-card: ./c.json\necho hi"),
+            expected
+        );
+        // Two spaces after `#`.
+        assert_eq!(
+            find_card_comment("#  tirith-card: ./c.json\necho hi"),
+            expected
+        );
+        // Canonical single space (sanity — same result).
+        assert_eq!(
+            find_card_comment("# tirith-card: ./c.json\necho hi"),
+            expected
+        );
+        // The strip step must treat the same flexible shapes as markers, so a
+        // `#tirith-card:` line is removed before command_matches (otherwise the
+        // surviving marker would falsely mismatch the signed command).
+        assert_eq!(
+            strip_card_comment_lines("#tirith-card: ./c.json\necho hi"),
+            "echo hi"
+        );
+        assert_eq!(
+            strip_card_comment_lines("#  tirith-card: ./c.json\necho hi"),
+            "echo hi"
         );
     }
 

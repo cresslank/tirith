@@ -447,6 +447,21 @@ pub fn analyze_output_chunk(
     chunk: &str,
     state: &mut OutputAnalyzerState,
 ) -> Vec<crate::verdict::Finding> {
+    // Production path: scan canaries against the DEFAULT store.
+    analyze_output_chunk_at(chunk, state, None)
+}
+
+/// Store-parameterized variant of [`analyze_output_chunk`]. When
+/// `canary_store` is `Some(path)`, the canary scan runs against that store via
+/// [`crate::canary::detect_at`] instead of the default store — the test seam
+/// for the output-path canary detection (the exec path has the analogous
+/// [`canary_findings_from_hits`] + [`crate::canary::detect_at`] seam). `None`
+/// reproduces the production default-store behavior exactly.
+pub(crate) fn analyze_output_chunk_at(
+    chunk: &str,
+    state: &mut OutputAnalyzerState,
+    canary_store: Option<&std::path::Path>,
+) -> Vec<crate::verdict::Finding> {
     // Snapshot lengths so we only translate freshly-discovered hits to findings.
     let before = ScanSnapshot::take(&state.scan_result);
 
@@ -485,14 +500,21 @@ pub fn analyze_output_chunk(
     // token straddling a chunk boundary is still caught; dedupe by canary id so
     // a token spanning chunks fires once. The opt-in callback fires with
     // context "output" (never the token value; non-blocking).
-    if crate::canary::store_nonempty() {
-        for hit in crate::redact::detect_canaries(&state.tail_text) {
-            if state.canary_seen.insert(hit.id.clone()) {
-                crate::canary::fire_callback(&hit, "output");
-                let f = canary_finding(&hit);
-                state.accumulated_chunk_findings.push(f.clone());
-                findings.push(f);
-            }
+    let canary_hits = match canary_store {
+        // Test seam: scan an explicit (tempdir) store. The caller has already
+        // ensured it is non-empty, so we skip the `store_nonempty()` fast-gate.
+        Some(store) => crate::canary::detect_at(store, &state.tail_text),
+        // Production: near-noop when the default store is empty/absent (a single
+        // `metadata()` stat short-circuits before any parse).
+        None if crate::canary::store_nonempty() => crate::redact::detect_canaries(&state.tail_text),
+        None => Vec::new(),
+    };
+    for hit in canary_hits {
+        if state.canary_seen.insert(hit.id.clone()) {
+            crate::canary::fire_callback(&hit, "output");
+            let f = canary_finding(&hit);
+            state.accumulated_chunk_findings.push(f.clone());
+            findings.push(f);
         }
     }
 
@@ -2235,12 +2257,20 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         // `allowed[]`. It CANNOT weaken any engine finding: this helper is
         // handed `&findings` read-only and returns findings to APPEND plus an
         // audit-only matched-name. There is no path by which a repo-controlled
-        // manifest reduces severity - the load-bearing invariant. Runs in Exec
-        // context only; a no-op (no file read past discovery) when no manifest
-        // exists on disk.
-        let (manifest_findings, manifest_match) = check_command_manifest_hot(ctx, &findings);
-        findings.extend(manifest_findings);
-        manifest_allowed_match = manifest_match;
+        // manifest reduces severity - the load-bearing invariant.
+        //
+        // Exec context ONLY (mirrors the command-card check above): the manifest
+        // models what the operator *typed to run*. Without this guard, any paste
+        // pulled past tier-1 by some OTHER signal would be matched against the
+        // repo's `dangerous:` globs, letting a repo-controlled `action: block`
+        // glob BLOCK a paste — contradicting both the in-source "Exec context
+        // only" contract and the tier-1 gate comment. A no-op (no file read past
+        // discovery) when no manifest exists on disk.
+        if ctx.scan_context == ScanContext::Exec {
+            let (manifest_findings, manifest_match) = check_command_manifest_hot(ctx, &findings);
+            findings.extend(manifest_findings);
+            manifest_allowed_match = manifest_match;
+        }
     }
 
     if !policy.custom_rules.is_empty() {
@@ -2982,6 +3012,24 @@ mod tests {
         }
     }
 
+    /// Build a Paste context whose cwd is `dir` (for policy + repo-root
+    /// discovery). Mirrors [`exec_ctx_in`] but in `ScanContext::Paste`.
+    fn paste_ctx_in(input: &str, dir: &std::path::Path) -> AnalysisContext {
+        AnalysisContext {
+            input: input.to_string(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::Paste,
+            raw_bytes: None,
+            interactive: true,
+            cwd: Some(dir.display().to_string()),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+        }
+    }
+
     /// Write a `.tirith/policy.yaml` under `dir` (a `.git` marker too, so it is
     /// a discovery boundary) carrying a single `exec_guard_enabled:` line.
     fn write_exec_guard_policy(dir: &std::path::Path, enabled: bool) {
@@ -3216,6 +3264,80 @@ mod tests {
             "no manifest on disk → neither manifest rule fires"
         );
         assert_eq!(verdict.manifest_allowed_match, None);
+    }
+
+    /// The repo command-manifest is EXEC-ONLY (it models what the operator typed
+    /// to run). A PASTE pulled past tier-1 by some OTHER signal must NOT be
+    /// matched against the repo's `dangerous:` globs — otherwise a repo-
+    /// controlled `action: block` glob could BLOCK arbitrary pasted text. This
+    /// pins the Exec-guard around the manifest call site: same input + manifest,
+    /// blocked in Exec but untouched in Paste.
+    #[test]
+    fn manifest_does_not_run_in_paste_context() {
+        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
+            return;
+        }
+        use crate::verdict::{Action, RuleId};
+
+        let dir = tempfile::tempdir().unwrap();
+        // A dangerous glob that matches our text, requesting a BLOCK. `*` is
+        // the only wildcard (v1); `.` is a literal, so `*bit.ly*` matches any
+        // command containing the substring `bit.ly`.
+        write_commands_manifest(
+            dir.path(),
+            "dangerous:\n  - pattern: \"*bit.ly*\"\n    action: block\n",
+        );
+
+        // The text is pulled past tier-1 by a NON-blocking signal: a shortened
+        // URL (`ShortenedUrl`, Medium → Warn). The manifest glob `* bit.ly *`
+        // matches the whole command, so in Exec it would elevate to Block.
+        let input = "echo see https://bit.ly/abc now";
+
+        // EXEC: the manifest fires and blocks (the contrast case).
+        let exec_verdict = analyze(&exec_ctx_in(input, dir.path()));
+        assert!(
+            exec_verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::RepoCommandDangerousPattern),
+            "sanity: in Exec the dangerous glob must fire"
+        );
+        assert_eq!(
+            exec_verdict.action,
+            Action::Block,
+            "sanity: in Exec the manifest elevates to Block"
+        );
+
+        // PASTE: the manifest must NOT run — no manifest rule, and the verdict is
+        // NOT blocked by it (only the Medium ShortenedUrl warning remains).
+        let paste_verdict = analyze(&paste_ctx_in(input, dir.path()));
+        assert!(
+            !paste_verdict.findings.iter().any(|f| matches!(
+                f.rule_id,
+                RuleId::RepoCommandUnknown | RuleId::RepoCommandDangerousPattern
+            )),
+            "manifest rules MUST NOT fire in Paste context; got {:?}",
+            paste_verdict
+                .findings
+                .iter()
+                .map(|f| f.rule_id)
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(
+            paste_verdict.action,
+            Action::Block,
+            "a repo dangerous-glob MUST NOT block a paste"
+        );
+        // The pull-past signal itself is present (proves we DID reach tier-3,
+        // i.e. the no-manifest-rule result is real, not a tier-1 fast-exit).
+        assert!(
+            paste_verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::ShortenedUrl),
+            "the paste should have reached tier-3 (ShortenedUrl present)"
+        );
+        assert_eq!(paste_verdict.manifest_allowed_match, None);
     }
 
     #[test]
@@ -3769,6 +3891,94 @@ mod tests {
         assert!(!crate::canary::store_nonempty_at(&store));
         let hits = crate::canary::detect_at(&store, "anything at all");
         assert!(canary_findings_from_hits(&hits, "exec").is_empty());
+    }
+
+    #[test]
+    fn analyze_output_chunk_detects_canary_across_chunk_boundary() {
+        // Output-path canary wiring (the exec/paste path is covered above). A
+        // canary token a tool echoes back can arrive SPLIT across two streamed
+        // chunks; the retained `tail_text` window must reassemble it so the
+        // token still fires, and `canary_seen` must dedup so a token spanning
+        // chunks (or repeated later) fires EXACTLY ONCE.
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("canaries.jsonl");
+        let entry =
+            crate::canary::create_at(&store, crate::canary::CanaryKind::AwsLike, None).unwrap();
+
+        // Split the token so its first half ends chunk 1 and its second half
+        // begins chunk 2 — neither chunk alone contains the whole token, so a
+        // raw-per-chunk scan would miss it; only the reassembled tail matches.
+        let token = &entry.token;
+        assert!(token.len() >= 4, "token long enough to split mid-token");
+        let mid = token.len() / 2;
+        let (first_half, second_half) = token.split_at(mid);
+
+        let mut state = OutputAnalyzerState::default();
+        // Chunk 1: some preamble + the first half of the token, no full match yet.
+        let chunk1 = format!("reading decoy file...\nAKIA-PREFIX-DECOY {first_half}");
+        let f1 = analyze_output_chunk_at(&chunk1, &mut state, Some(&store));
+        assert!(
+            !f1.iter()
+                .any(|f| f.rule_id == crate::verdict::RuleId::CanaryTokenTouched),
+            "half a token must NOT fire on chunk 1"
+        );
+
+        // Chunk 2: the second half completes the token at the chunk boundary,
+        // plus trailing bytes after it.
+        let chunk2 = format!("{second_half} ...rest of the tool output\n");
+        let f2 = analyze_output_chunk_at(&chunk2, &mut state, Some(&store));
+        let n2 = f2
+            .iter()
+            .filter(|f| f.rule_id == crate::verdict::RuleId::CanaryTokenTouched)
+            .count();
+        assert_eq!(n2, 1, "boundary-straddling token must fire once on chunk 2");
+
+        // Chunk 3: the FULL token again — `canary_seen` must suppress a re-fire.
+        let chunk3 = format!("echoed once more: {token}\n");
+        let f3 = analyze_output_chunk_at(&chunk3, &mut state, Some(&store));
+        assert!(
+            !f3.iter()
+                .any(|f| f.rule_id == crate::verdict::RuleId::CanaryTokenTouched),
+            "a repeated token must be deduped by canary_seen"
+        );
+
+        // Across the whole stream (chunk findings + finalize), EXACTLY ONE
+        // CanaryTokenTouched, and it must not leak the token value.
+        let verdict = analyze_output_finalize(&state);
+        let canary_findings: Vec<_> = verdict
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == crate::verdict::RuleId::CanaryTokenTouched)
+            .collect();
+        assert_eq!(
+            canary_findings.len(),
+            1,
+            "exactly one canary finding across the whole stream"
+        );
+        assert_eq!(canary_findings[0].severity, crate::verdict::Severity::High);
+        assert!(
+            !canary_findings[0].description.contains(token),
+            "finding must not echo the canary token value"
+        );
+        assert!(canary_findings[0].description.contains(&entry.id));
+    }
+
+    #[test]
+    fn analyze_output_chunk_at_empty_store_is_noop() {
+        // The default-store production path stays a no-op when no canary is
+        // registered: an explicit empty store yields no canary findings.
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("canaries.jsonl");
+        assert!(!crate::canary::store_nonempty_at(&store));
+        let mut state = OutputAnalyzerState::default();
+        let findings =
+            analyze_output_chunk_at("AKIA00CANARYAAAAAAAA echoed\n", &mut state, Some(&store));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == crate::verdict::RuleId::CanaryTokenTouched),
+            "empty store must produce no canary finding"
+        );
     }
 
     // ---- M10 ch5 — anomaly-baseline wiring tests ---------------------------

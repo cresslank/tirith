@@ -2563,4 +2563,101 @@ mod tests {
         );
         assert_eq!(agent_decision(&base, &origin), AgentDecision::Unspecified);
     }
+
+    /// Serialize a RuleId to its severity_overrides map key (snake_case),
+    /// matching what `apply_runtime_overrides` / `severity_override` use.
+    fn rule_key(rule: &RuleId) -> String {
+        serde_json::to_value(rule)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .expect("RuleId serializes to a string")
+    }
+
+    #[test]
+    fn apply_runtime_overrides_preserves_higher_operator_pin_raises_lower() {
+        // M11 ch5 regression: `apply_runtime_overrides` must NEVER downgrade an
+        // operator's explicit severity_override below the incident level, but
+        // MUST raise an override that sits below it. We pin one
+        // INCIDENT_ELEVATED_RULES entry ABOVE its incident level and another
+        // BELOW, activate an incident, and assert the merge respects both.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Point state_dir() (hence incident::flag_path()) at a tempdir so the
+        // active-incident check reads our flag, never the real machine state.
+        // state_dir() reads XDG_STATE_HOME on every platform (Windows included).
+        let state = tempfile::tempdir().unwrap();
+        let _xdg = EnvVarGuard::set("XDG_STATE_HOME", state.path());
+
+        // ExecRecentlyModified's incident level is High; pin it at Critical
+        // (ABOVE) — must be preserved. CredentialFileSweep's incident level is
+        // Critical; pin it at Low (BELOW) — must be raised to Critical.
+        let above_rule = RuleId::ExecRecentlyModified;
+        let below_rule = RuleId::CredentialFileSweep;
+        // Sanity-pin the incident levels this test assumes against the table.
+        let incident_level = |r: &RuleId| {
+            crate::incident::INCIDENT_ELEVATED_RULES
+                .iter()
+                .find(|(rule, _)| rule == r)
+                .map(|(_, sev)| *sev)
+                .expect("rule is in INCIDENT_ELEVATED_RULES")
+        };
+        assert_eq!(incident_level(&above_rule), Severity::High);
+        assert_eq!(incident_level(&below_rule), Severity::Critical);
+        assert!(
+            Severity::Critical > Severity::High,
+            "Critical must outrank High for the 'above' pin to be meaningful"
+        );
+
+        let mut policy = Policy::default();
+        policy
+            .severity_overrides
+            .insert(rule_key(&above_rule), Severity::Critical); // above incident High
+        policy
+            .severity_overrides
+            .insert(rule_key(&below_rule), Severity::Low); // below incident Critical
+
+        // No incident yet → overrides untouched (fast-path early return).
+        crate::incident::invalidate_cache();
+        let flag = crate::incident::flag_path().expect("flag path resolves under XDG_STATE_HOME");
+        // Defensive: ensure no stale flag from a prior run in this tempdir.
+        let _ = crate::incident::stop_at(&flag);
+        crate::incident::invalidate_cache();
+        let mut no_incident = policy.clone();
+        no_incident.apply_runtime_overrides();
+        assert_eq!(
+            no_incident.fail_mode, policy.fail_mode,
+            "no active incident must not change fail_mode"
+        );
+
+        // Activate the incident (writes the flag + invalidates the cache).
+        crate::incident::start_at(&flag, "downgrade-guard test").unwrap();
+
+        policy.apply_runtime_overrides();
+
+        // The higher operator pin is preserved; the lower one is raised exactly
+        // to the incident level (not above).
+        assert_eq!(
+            policy.severity_override(&above_rule),
+            Some(Severity::Critical),
+            "operator pin ABOVE the incident level must be preserved, not downgraded"
+        );
+        assert_eq!(
+            policy.severity_override(&below_rule),
+            Some(Severity::Critical),
+            "operator pin BELOW the incident level must be raised to it"
+        );
+
+        // The fail-closed posture + both bypass disables must also be applied.
+        assert_eq!(policy.fail_mode, FailMode::Closed);
+        assert!(!policy.allow_bypass_env);
+        assert!(!policy.allow_bypass_env_noninteractive);
+
+        // Clean up the process-global incident cache + flag so sibling tests
+        // (which may run after the lock is released) never see a stale active
+        // incident pointing at this now-deleted tempdir.
+        let _ = crate::incident::stop_at(&flag);
+        crate::incident::invalidate_cache();
+    }
 }

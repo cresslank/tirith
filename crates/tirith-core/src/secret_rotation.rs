@@ -498,6 +498,40 @@ mod tests {
     }
 
     #[test]
+    fn match_provider_equal_length_tie_breaks_to_earlier_table_entry() {
+        // The longest-match rule documents that an EQUAL-byte-length shape tie
+        // resolves to the FIRST provider in PROVIDERS order. Pin an actual tie:
+        // aws's `AKIA` and github's `ghp_` are BOTH 4 bytes, and aws precedes
+        // github in the table, so an input matching both must route to aws.
+        assert_eq!("AKIA".len(), "ghp_".len(), "shapes must be equal length");
+        let aws_idx = PROVIDERS.iter().position(|p| p.provider == "aws").unwrap();
+        let github_idx = PROVIDERS
+            .iter()
+            .position(|p| p.provider == "github")
+            .unwrap();
+        assert!(
+            aws_idx < github_idx,
+            "test assumes aws precedes github in PROVIDERS"
+        );
+
+        // Input contains both 4-byte shapes; neither provider has a LONGER shape
+        // matching here, so the best length is 4 for both — a genuine tie.
+        let both = "AKIA0000example ghp_0000example";
+        assert_eq!(
+            match_provider(both).map(|p| p.provider),
+            Some("aws"),
+            "equal-length tie must resolve to the earlier table entry (aws)"
+        );
+        // Order in the INPUT text must not change the outcome — only table order.
+        let reversed = "ghp_0000example AKIA0000example";
+        assert_eq!(
+            match_provider(reversed).map(|p| p.provider),
+            Some("aws"),
+            "tie-break is by table order, not input order"
+        );
+    }
+
+    #[test]
     fn cargo_cio_substring_does_not_false_match() {
         // Regression (code-reviewer #1): the dropped 3-char "cio" shape matched
         // inside common words. A benign command containing "suspicious" /

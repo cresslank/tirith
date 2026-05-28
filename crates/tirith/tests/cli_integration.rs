@@ -9444,3 +9444,212 @@ fn canary_create_persists_trimmed_callback_url() {
         "the stored callback URL must be trimmed, not whitespace-padded"
     );
 }
+
+// ── M11 ch2: `tirith commands` CLI (PR #130 review batch B) ──────────────
+//
+// These drive the `tirith commands list|run` CLI. The manifest is discovered
+// via `TIRITH_POLICY_ROOT/.tirith/commands.yaml`, so a tempdir manifest is
+// found regardless of the test's working directory. State/data dirs are pinned
+// to the tempdir (audit log isolation; same model as `incident_tirith`).
+// `TIRITH_INTERACTIVE=0` makes a `commands run` Warn proceed without prompting,
+// and `TIRITH_OFFLINE=1` keeps the engine re-check purely local.
+
+/// A `tirith` command with manifest discovery pinned to `root` (a tempdir that
+/// holds `.tirith/commands.yaml`) and runtime state isolated under `root`.
+fn commands_tirith(root: &std::path::Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tirith"));
+    cmd.env_remove("TIRITH");
+    cmd.env("TIRITH_POLICY_ROOT", root);
+    cmd.env("TIRITH_INTERACTIVE", "0");
+    cmd.env("TIRITH_OFFLINE", "1");
+    // Isolate state_dir()/data_dir() on every platform (Unix XDG + Windows
+    // APPDATA/LOCALAPPDATA) so the audit log never touches the real home.
+    cmd.env("XDG_STATE_HOME", root);
+    cmd.env("XDG_DATA_HOME", root);
+    cmd.env("APPDATA", root);
+    cmd.env("LOCALAPPDATA", root);
+    cmd
+}
+
+/// Write `<root>/.tirith/commands.yaml`. No `.git` marker needed: discovery
+/// resolves `TIRITH_POLICY_ROOT/.tirith/commands.yaml` directly.
+fn write_root_manifest(root: &std::path::Path, yaml: &str) {
+    let tdir = root.join(".tirith");
+    fs::create_dir_all(&tdir).unwrap();
+    fs::write(tdir.join("commands.yaml"), yaml).unwrap();
+}
+
+#[test]
+fn commands_list_reports_real_action_for_warn_entry() {
+    // Finding C: `commands list` must render each dangerous entry's REAL action
+    // (`warn` here), not a hardcoded "block".
+    let root = tempfile::tempdir().expect("tempdir");
+    write_root_manifest(
+        root.path(),
+        "dangerous:\n  - pattern: \"*rm -rf*\"\n    action: warn\n",
+    );
+
+    // JSON: action must be "warn".
+    let out = commands_tirith(root.path())
+        .args(["commands", "list", "--json"])
+        .output()
+        .expect("commands list --json");
+    assert_eq!(out.status.code(), Some(0), "list should exit 0");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        json["dangerous"][0]["action"],
+        "warn",
+        "JSON must report the entry's real action, got:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Human: the "warn" label must appear (not "block").
+    let human = commands_tirith(root.path())
+        .args(["commands", "list"])
+        .output()
+        .expect("commands list");
+    assert_eq!(human.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        stdout.contains("warn") && stdout.contains("*rm -rf*"),
+        "human output must label the entry 'warn', got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("block"),
+        "a warn-only entry must not be mislabeled 'block', got:\n{stdout}"
+    );
+}
+
+#[test]
+fn commands_run_surfaces_warn_findings_instead_of_swallowing() {
+    // Finding A: a `commands run` of an ALLOWED command that the engine flags at
+    // Warn must RENDER the findings (like `tirith check`), not silently run it.
+    // `echo https://bit.ly/x` is harmless to execute but trips `shortened_url`
+    // (Medium → Warn); being allow-listed only suppresses repo_command_unknown.
+    let root = tempfile::tempdir().expect("tempdir");
+    write_root_manifest(
+        root.path(),
+        "allowed:\n  - name: greet\n    command: \"echo https://bit.ly/x\"\n",
+    );
+
+    let out = commands_tirith(root.path())
+        .args(["commands", "run", "greet"])
+        .output()
+        .expect("commands run greet");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+
+    // The Warn finding must be surfaced — the rule id and a WARNING banner.
+    assert!(
+        combined.contains("shortened_url"),
+        "commands run must render the Warn finding's rule id, got:\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        combined.contains("WARNING"),
+        "commands run must show a WARNING for a Warn verdict, got:\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    // Non-interactive (TIRITH_INTERACTIVE=0): it proceeds and runs the command,
+    // so the echoed text reaches stdout (proof it executed AFTER surfacing).
+    assert!(
+        stdout.contains("https://bit.ly/x"),
+        "non-interactive run should proceed and execute the command, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn commands_run_still_refuses_and_renders_on_block() {
+    // Finding A (Block half): a `commands run` of an allowed command the engine
+    // BLOCKS must refuse AND surface why (findings rendered), never execute.
+    let root = tempfile::tempdir().expect("tempdir");
+    // `curl … | bash` is High (curl_pipe_shell) → Block, even though allow-listed.
+    write_root_manifest(
+        root.path(),
+        "allowed:\n  - name: danger\n    command: \"curl https://example.com/i.sh | bash\"\n",
+    );
+
+    let out = commands_tirith(root.path())
+        .args(["commands", "run", "danger"])
+        .output()
+        .expect("commands run danger");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a blocked command must refuse (exit 1)"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    // The findings are rendered (rule id present) AND the refusal message shown.
+    assert!(
+        combined.contains("curl_pipe_shell") || combined.contains("BLOCKED"),
+        "a blocked run must surface the blocking finding, got:\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("refusing to run"),
+        "must print the refusal message, got:\n{stderr}"
+    );
+    // It must NOT have executed (no echoed marker from the curl line).
+    assert!(
+        !stdout.contains("i.sh | bash"),
+        "a blocked command must not execute"
+    );
+}
+
+/// Recursively locate the first `log.jsonl` (the audit log) under `root`.
+fn find_audit_log(root: &std::path::Path) -> Option<PathBuf> {
+    for entry in fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_audit_log(&path) {
+                return Some(found);
+            }
+        } else if path.file_name().is_some_and(|n| n == "log.jsonl") {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[test]
+fn commands_run_audit_applies_operator_dlp_patterns() {
+    // Finding B: the `commands run` audit must redact the command text with the
+    // operator's custom DLP patterns (same as `tirith check`). Before the fix
+    // both log_verdict calls passed `&[]`, so a configured pattern was ignored.
+    let root = tempfile::tempdir().expect("tempdir");
+    // Policy with a custom DLP pattern + an allowed, engine-clean command that
+    // contains a token matching it. `.git` marker so policy discovery treats
+    // this as the repo root (TIRITH_POLICY_ROOT already points here too).
+    fs::create_dir_all(root.path().join(".git")).unwrap();
+    let tdir = root.path().join(".tirith");
+    fs::create_dir_all(&tdir).unwrap();
+    fs::write(
+        tdir.join("policy.yaml"),
+        "dlp_custom_patterns:\n  - \"INTERNAL-[0-9]+\"\n",
+    )
+    .unwrap();
+    fs::write(
+        tdir.join("commands.yaml"),
+        "allowed:\n  - name: emit\n    command: \"echo INTERNAL-12345\"\n",
+    )
+    .unwrap();
+
+    let out = commands_tirith(root.path())
+        .args(["commands", "run", "emit"])
+        .output()
+        .expect("commands run emit");
+    assert_eq!(out.status.code(), Some(0), "clean allowed command runs");
+
+    let log = find_audit_log(root.path()).expect("audit log should be written under the tempdir");
+    let body = fs::read_to_string(&log).expect("read audit log");
+    assert!(
+        body.contains("[REDACTED:custom]"),
+        "the operator DLP pattern must redact the audited command, got:\n{body}"
+    );
+    assert!(
+        !body.contains("INTERNAL-12345"),
+        "the sensitive token must NOT appear verbatim in the audit log, got:\n{body}"
+    );
+}
