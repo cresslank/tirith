@@ -417,6 +417,14 @@ fn append_entry(store: &Path, entry: &CanaryEntry) -> std::io::Result<()> {
     let mut file = opts.open(store)?;
     let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
     writeln!(file, "{line}")?;
+    // Durability: a buffered append that returns Ok before the bytes reach
+    // stable storage can be lost on a crash/power-loss, leaving a registered
+    // canary that never fires. Flush our user-space writer, then fsync the file
+    // so the appended line survives. `flush()` is a no-op for `std::fs::File`
+    // (it has no user-space buffer) but is correct and cheap if the writer type
+    // ever changes; `sync_all()` is the load-bearing barrier.
+    file.flush()?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -439,6 +447,14 @@ fn rewrite_store(store: &Path, entries: &[CanaryEntry]) -> std::io::Result<()> {
         let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
         writeln!(tmp, "{line}")?;
     }
+    // Durability: fsync the temp file's contents to stable storage BEFORE the
+    // atomic rename. Without this, a crash between `persist` (the rename) and
+    // the kernel flushing the temp file's data can leave the store renamed into
+    // place but holding zero/garbage bytes — worse than the pre-rename state.
+    // Flush the user-space writer first (a no-op for the inner `File` today, but
+    // correct regardless), then `sync_all()` the underlying file.
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
     tmp.persist(store).map_err(|e| e.error)?;
     Ok(())
 }
@@ -799,6 +815,49 @@ mod tests {
         assert_eq!(hits.len(), 1, "registered token must fire exactly one hit");
         assert_eq!(hits[0].id, entry.id);
         assert_eq!(hits[0].kind, "aws-like");
+    }
+
+    /// Durability regression (CodeRabbit/Greptile R4 #1): every store mutator
+    /// must flush + `sync_all()` before returning Ok, so a registered/pruned/
+    /// rotated canary survives a crash. A unit test cannot OBSERVE the fsync
+    /// barrier directly (the kernel would have to crash between the write and
+    /// the flush), so this asserts the necessary precondition: after each
+    /// mutator returns Ok the written content is durably present and readable
+    /// straight from the file on disk (via `parse_store`, NOT the in-process
+    /// cache). If a mutator regressed to dropping the synced write, the bytes
+    /// would not be on disk for `parse_store` to read back. The actual fsync
+    /// calls live in `append_entry` (create) and `rewrite_store` (prune/rotate).
+    #[test]
+    fn mutators_persist_durably_to_disk() {
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+
+        // create → the appended line is on disk and round-trips.
+        let a = create_at(&store, CanaryKind::AwsLike, None).unwrap();
+        let b = create_at(&store, CanaryKind::GithubLike, None).unwrap();
+        let on_disk = parse_store(&store);
+        assert_eq!(on_disk.len(), 2, "both created entries must be on disk");
+        assert!(on_disk.iter().any(|e| e.id == a.id && e.token == a.token));
+        assert!(on_disk.iter().any(|e| e.id == b.id && e.token == b.token));
+
+        // prune → the rewritten (synced) store is on disk with exactly the kept
+        // entry; the pruned id is gone.
+        assert_eq!(prune_at(&store, &a.id).unwrap(), 1);
+        let on_disk = parse_store(&store);
+        assert_eq!(on_disk.len(), 1, "prune must durably rewrite the store");
+        assert_eq!(on_disk[0].id, b.id);
+
+        // rotate → the rewritten (synced) store carries the fresh token for the
+        // same id; the old token is gone from disk.
+        let rotated = rotate_at(&store, &b.id).unwrap().expect("known id");
+        assert_ne!(rotated.token, b.token, "rotate must regenerate the token");
+        let on_disk = parse_store(&store);
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].id, b.id);
+        assert_eq!(
+            on_disk[0].token, rotated.token,
+            "rotated token must be the one durably written to disk"
+        );
     }
 
     #[test]

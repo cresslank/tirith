@@ -585,6 +585,45 @@ pub fn strip_card_comment_lines(input: &str) -> String {
     out.join("\n")
 }
 
+/// `true` when `input`'s LEADING prelude contains at least one
+/// `# tirith-card:` marker line — i.e. when [`strip_card_comment_lines`] would
+/// actually remove something. Mirrors the prelude scope of [`find_card_comment`]
+/// / [`strip_card_comment_lines`]: scanning stops at the first non-empty
+/// non-marker line (a marker inside a heredoc body is command content, not a
+/// prelude marker). Cheap: returns on the first marker or the first real line.
+pub fn has_card_comment_prelude(input: &str) -> bool {
+    for line in input.lines() {
+        if card_comment_value(line).is_some() {
+            return true;
+        }
+        if line.trim().is_empty() {
+            // Blank line stays inside the leading prelude.
+            continue;
+        }
+        // First non-empty non-marker line: the command starts here, no prelude
+        // marker preceded it.
+        return false;
+    }
+    false
+}
+
+/// Like [`strip_card_comment_lines`] but ZERO-allocation on the common path:
+/// when `input` carries no leading `# tirith-card:` prelude marker, the original
+/// is borrowed UNCHANGED (no line re-join, so trailing newlines / `\r\n` endings
+/// are preserved exactly as today). Only when a prelude marker is present do we
+/// allocate the stripped, prelude-free command.
+///
+/// This is the form the engine's EXEC analysis path uses to feed prelude-free
+/// command text into URL extraction and the exec-scoped rule set without paying
+/// an allocation on every command that carries no card.
+pub fn strip_card_comment_lines_cow(input: &str) -> std::borrow::Cow<'_, str> {
+    if has_card_comment_prelude(input) {
+        std::borrow::Cow::Owned(strip_card_comment_lines(input))
+    } else {
+        std::borrow::Cow::Borrowed(input)
+    }
+}
+
 /// Evaluate an already-loaded card against the analyzed command, given the
 /// trusted-keys directory and today's date. Pure: callers do the disk read for
 /// the card and key files (or, in tests, supply a tempdir).
@@ -617,10 +656,14 @@ pub fn evaluate_card(
 /// * [`CardOutcome::Verified`] → one Info `CommandCardVerified` (the ONLY rule
 ///   that ever claims verification).
 /// * [`CardOutcome::Mismatch`] → one High `CommandCardMismatch`.
-/// * [`CardOutcome::Unverified`] → at most one Info `CommandCardUnverified`
+/// * [`CardOutcome::Unverified`] → exactly one Info `CommandCardUnverified`
 ///   note (NEVER `CommandCardVerified` — a failed verify must not be tagged as
-///   a verified one); `Unsigned` produces nothing (a card-less command should
-///   be silent on this axis).
+///   a verified one). This INCLUDES the `Unsigned` failure: this helper runs
+///   only after a card REFERENCE was resolved and read, so an `Unsigned` outcome
+///   means a card was SUPPLIED but unsigned — it must stay visible in audit/JSON,
+///   not be silently dropped. (The genuinely card-LESS command stays silent via
+///   an early return in the engine's `check_command_card_hot`, BEFORE this
+///   helper is ever reached.)
 ///
 /// Crucially, none of these change any OTHER finding's action — the engine's
 /// action derivation runs over the full findings list unchanged.
@@ -659,10 +702,14 @@ pub fn findings_for_outcome(outcome: &CardOutcome) -> Vec<Finding> {
             custom_rule_id: None,
         }],
         CardOutcome::Unverified(failure) => {
-            // Unsigned is silent — a command with no card should not nag here.
-            if matches!(failure, VerifyFailure::Unsigned) {
-                return Vec::new();
-            }
+            // Every Unverified case — INCLUDING `Unsigned` — emits the Info note.
+            // This helper runs ONLY after a card REFERENCE was resolved and the
+            // card was read+parsed (the engine's `check_command_card_hot` returns
+            // early, before reaching here, when no `--card` flag and no
+            // `# tirith-card:` comment were found). So "Unsigned" here means a
+            // card WAS supplied but carries no signature — that must be VISIBLE in
+            // audit/JSON, not hidden. The "no card → stay silent" case is handled
+            // upstream by that early return, not by suppressing the finding here.
             vec![Finding {
                 rule_id: RuleId::CommandCardUnverified,
                 severity: Severity::Info,
@@ -871,10 +918,17 @@ mod tests {
         assert!(findings[0].description.contains("expired"));
     }
 
+    /// CodeRabbit/Greptile R4 #3: a SUPPLIED-but-unsigned card must be VISIBLE.
+    /// `findings_for_outcome` only runs after a card ref was resolved + read, so
+    /// an `Unsigned` outcome means "a card was supplied but carries no signature"
+    /// — that belongs in audit/JSON as an Info `CommandCardUnverified`, NOT
+    /// dropped. (The genuinely card-LESS command stays silent via an early return
+    /// in `engine::check_command_card_hot`, never reaching this helper — covered
+    /// by `engine::tests::no_card_stays_silent_even_when_trust_store_unresolvable`.)
     #[test]
-    fn unsigned_card_is_silent() {
+    fn unsigned_supplied_card_is_visible() {
         let dir = tempfile::tempdir().unwrap();
-        let card = sample_card(); // never signed
+        let card = sample_card(); // supplied, but never signed
         let outcome = evaluate_card(
             &card,
             "curl -fsSL https://example.com/install.sh | sh",
@@ -882,8 +936,27 @@ mod tests {
             today(),
         );
         assert_eq!(outcome, CardOutcome::Unverified(VerifyFailure::Unsigned));
-        // Unsigned must produce NO finding — a command with no card is silent.
-        assert!(findings_for_outcome(&outcome).is_empty());
+        // A supplied unsigned card emits exactly one Info CommandCardUnverified —
+        // visible, but NEVER tagged as verified (which would corrupt audit counts).
+        let findings = findings_for_outcome(&outcome);
+        assert_eq!(
+            findings.len(),
+            1,
+            "a supplied unsigned card must emit exactly one finding"
+        );
+        assert_eq!(findings[0].rule_id, RuleId::CommandCardUnverified);
+        assert_eq!(findings[0].severity, Severity::Info);
+        assert_ne!(
+            findings[0].rule_id,
+            RuleId::CommandCardVerified,
+            "an unsigned card must never be reported as verified"
+        );
+        assert!(
+            findings[0].description.contains("not signed")
+                || findings[0].description.contains("could not be verified"),
+            "note must explain the card was unsigned/unverified; got: {}",
+            findings[0].description
+        );
     }
 
     #[test]

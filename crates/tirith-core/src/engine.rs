@@ -1695,8 +1695,20 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     // FileScan has no notion of a typed prefix, so a `TIRITH=0` token in those
     // contexts must not grant bypass. Process-level TIRITH=0 env still applies
     // in every context.
-    let bypass_inline =
-        ctx.scan_context == ScanContext::Exec && find_inline_bypass(&ctx.input, ctx.shell);
+    // Parse the inline bypass off the prelude-STRIPPED command: a leading
+    // `# tirith-card:` marker is transport metadata, not part of the command. A
+    // command carried as `# tirith-card: …\nTIRITH=0 cmd | sh` must honor the
+    // bypass exactly as the un-prefixed `TIRITH=0 cmd | sh` does (otherwise the
+    // newline-separated prelude makes the pipeline look non-pipe-separated and
+    // the bypass silently fails to apply). `strip_card_comment_lines_cow`
+    // borrows unchanged when there is no marker, so the no-card path is
+    // zero-allocation and byte-identical to today. Exec-only (paste/file scan
+    // never grant an inline bypass anyway).
+    let bypass_inline = ctx.scan_context == ScanContext::Exec
+        && find_inline_bypass(
+            &crate::command_card::strip_card_comment_lines_cow(&ctx.input),
+            ctx.shell,
+        );
     let bypass_requested = bypass_env || bypass_inline;
     let tier0_ms = tier0_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1916,6 +1928,31 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     // boundary.
     let mut manifest_allowed_match: Option<String> = None;
 
+    // M11 R4 #2 — in EXEC context, strip any leading `# tirith-card:` prelude
+    // before tier-2 extraction and the exec-scoped tier-3 rules. The marker line
+    // is transport metadata, NOT part of the command the operator ran. Left in
+    // `ctx.input`, a URL-shaped or secret-shaped card REFERENCE in the prelude
+    // would be scanned as if it were command content — e.g. a
+    // `# tirith-card: https://evil.example/x.json` ref would emit a suspicious-
+    // URL / plain-HTTP / shortener finding, and a secret-shaped ref would emit a
+    // credential finding — neither of which describes the actual command. Card
+    // DETECTION/EVALUATION still runs off the ORIGINAL `ctx.input`
+    // (`check_command_card_hot` needs the marker, and strips internally for its
+    // own byte-for-byte command comparison).
+    //
+    // Paste / FileScan are deliberately UNAFFECTED: a `# tirith-card:` line only
+    // carries meaning in a typed/run command, and the byte-identical
+    // `Cow::Borrowed` fallback (no marker present) keeps the common exec path
+    // zero-allocation and behaviorally unchanged. The exec invisible-char byte
+    // scan below still runs against the ORIGINAL `ctx.input` (its offsets and
+    // `inert_range` are keyed to that buffer, and a hidden control char smuggled
+    // into a prelude line is still worth catching).
+    let analyzed_input: std::borrow::Cow<'_, str> = if ctx.scan_context == ScanContext::Exec {
+        crate::command_card::strip_card_comment_lines_cow(&ctx.input)
+    } else {
+        std::borrow::Cow::Borrowed(ctx.input.as_str())
+    };
+
     if ctx.scan_context == ScanContext::FileScan {
         // FileScan runs byte-scan + configfile/codefile/rendered rules only.
         // It does NOT run command/env/URL-extraction rules — the input isn't a
@@ -2077,7 +2114,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             }
         }
 
-        extracted = extract::extract_urls(&ctx.input, ctx.shell);
+        extracted = extract::extract_urls(&analyzed_input, ctx.shell);
 
         for url_info in &extracted {
             // url::Url percent-encodes non-ASCII on parse, so non-ASCII path
@@ -2105,7 +2142,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
 
         // Threat intel rules are a local DB lookup — no network I/O on the hot path.
         let threat_findings = crate::rules::threatintel::check(
-            &ctx.input,
+            &analyzed_input,
             ctx.shell,
             &extracted,
             threat_db.as_deref(),
@@ -2113,7 +2150,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         findings.extend(threat_findings);
 
         let command_findings = crate::rules::command::check(
-            &ctx.input,
+            &analyzed_input,
             ctx.shell,
             ctx.cwd.as_deref(),
             ctx.scan_context,
@@ -2125,7 +2162,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         // `rules::powershell` module docstring for scope and boundary
         // with `pipe_to_interpreter`.
         if ctx.shell == ShellType::PowerShell {
-            let ps_findings = crate::rules::powershell::check(&ctx.input, ctx.shell);
+            let ps_findings = crate::rules::powershell::check(&analyzed_input, ctx.shell);
             findings.extend(ps_findings);
         }
 
@@ -2133,39 +2170,42 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         // patterns (unsigned repos, disabled GPG checks, remote manifests).
         // Pure pattern detection — same exec/paste applicability as command
         // rules, no network on the hot path.
-        let install_findings = crate::rules::install::check(&ctx.input, ctx.shell);
+        let install_findings = crate::rules::install::check(&analyzed_input, ctx.shell);
         findings.extend(install_findings);
 
         // M8 ch1 — operational-context rules. Cheap when labels are empty
         // (early return); behind a `policy.context_guard_enabled` switch.
         // Only runs in the exec / paste branch (FileScan returns above).
         if ctx.scan_context == ScanContext::Exec {
-            let context_findings = crate::rules::context::check(&ctx.input, ctx.shell, &policy);
+            let context_findings =
+                crate::rules::context::check(&analyzed_input, ctx.shell, &policy);
             findings.extend(context_findings);
 
             // M8 ch2 — SSH operational-context rules. Empty-labels fast
             // path lives inside `ssh_context::check`; no extra gate here.
-            let ssh_findings = crate::rules::ssh_context::check(&ctx.input, ctx.shell, &policy);
+            let ssh_findings =
+                crate::rules::ssh_context::check(&analyzed_input, ctx.shell, &policy);
             findings.extend(ssh_findings);
 
             // M8 ch3 — IaC operational-context rules. Non-IaC leader
             // short-circuits inside `iac::check`; tier-1 gate is the
             // `iac_cmd` PATTERN_TABLE entry.
-            let iac_findings = crate::rules::iac::check(&ctx.input, ctx.shell, &policy);
+            let iac_findings = crate::rules::iac::check(&analyzed_input, ctx.shell, &policy);
             findings.extend(iac_findings);
 
             // M8 ch4 — sudo-escalation rules. Non-sudo leader
             // short-circuits inside `sudo::check`; tier-1 gate is the
             // `sudo_cmd` PATTERN_TABLE entry. Session-file lookup is
             // lazy (only when a finding fires).
-            let sudo_findings = crate::rules::sudo::check(&ctx.input, ctx.shell, &policy);
+            let sudo_findings = crate::rules::sudo::check(&analyzed_input, ctx.shell, &policy);
             findings.extend(sudo_findings);
 
             // M8 ch5 — container-runtime rules. Non-docker leader
             // short-circuits inside `container::check`; tier-1 gates
             // are the `docker_command` (run / create) and
             // `docker_exec` PATTERN_TABLE entries.
-            let container_findings = crate::rules::container::check(&ctx.input, ctx.shell, &policy);
+            let container_findings =
+                crate::rules::container::check(&analyzed_input, ctx.shell, &policy);
             findings.extend(container_findings);
 
             // M9 ch4 — environment-variable lifecycle guard. Behind the
@@ -2183,14 +2223,14 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
                     crate::env_guard::effective_sensitive_vars(&policy.env_guard_sensitive_vars);
                 let set_sensitive = crate::env_guard::sensitive_env_set_in_process(&sensitive);
                 if let Some(f) = crate::env_guard::check_sensitive_exposed_to_unknown_script(
-                    &ctx.input,
+                    &analyzed_input,
                     ctx.shell,
                     &set_sensitive,
                 ) {
                     findings.push(f);
                 }
                 if let Some(f) =
-                    crate::env_guard::check_printenv_to_network_sink(&ctx.input, ctx.shell)
+                    crate::env_guard::check_printenv_to_network_sink(&analyzed_input, ctx.shell)
                 {
                     findings.push(f);
                 }
@@ -2238,7 +2278,9 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             // `analyze` doc-comment for the hot/cold split.
             let blast_env = crate::blast_radius::env_snapshot();
             findings.extend(crate::blast_radius::cheap_check(
-                &ctx.input, ctx.shell, &blast_env,
+                &analyzed_input,
+                ctx.shell,
+                &blast_env,
             ));
 
             // M10 ch3 — tainted-content check. Always-on (no policy flag), but
@@ -2268,7 +2310,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         }
 
         let cred_findings =
-            crate::rules::credential::check(&ctx.input, ctx.shell, ctx.scan_context);
+            crate::rules::credential::check(&analyzed_input, ctx.shell, ctx.scan_context);
         findings.extend(cred_findings);
 
         // M11 ch3 — honeytoken / canary check. Always-on (no policy flag), but
@@ -2285,14 +2327,19 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             ScanContext::Paste => "paste",
             _ => "exec",
         };
-        findings.extend(check_canary_hot(&ctx.input, canary_context));
+        // Exec scans the prelude-stripped command (`analyzed_input`); paste scans
+        // the original (the `Cow` is borrowed unchanged there). A registered
+        // canary token sitting in a `# tirith-card:` transport line is metadata,
+        // not the command the operator ran — consistent with the other
+        // exec-scoped rules above.
+        findings.extend(check_canary_hot(&analyzed_input, canary_context));
 
         let env_findings = crate::rules::environment::check(&crate::rules::environment::RealEnv);
         findings.extend(env_findings);
 
         if !policy.network_deny.is_empty() {
             let net_findings = crate::rules::command::check_network_policy(
-                &ctx.input,
+                &analyzed_input,
                 ctx.shell,
                 &policy.network_deny,
                 &policy.network_allow,
@@ -2326,7 +2373,12 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
 
     if !policy.custom_rules.is_empty() {
         let compiled = crate::rules::custom::compile_rules(&policy.custom_rules);
-        let custom_findings = crate::rules::custom::check(&ctx.input, ctx.scan_context, &compiled);
+        // `analyzed_input` is the prelude-stripped command in Exec and the
+        // original input verbatim in Paste / FileScan (the `Cow` borrows
+        // unchanged there), so custom regex rules match the command an operator
+        // actually ran, not its `# tirith-card:` transport wrapper.
+        let custom_findings =
+            crate::rules::custom::check(&analyzed_input, ctx.scan_context, &compiled);
         findings.extend(custom_findings);
     }
 
@@ -3141,6 +3193,52 @@ mod tests {
         assert!(
             findings.is_empty(),
             "a command with no card must emit nothing, got: {findings:?}"
+        );
+    }
+
+    /// CodeRabbit/Greptile R4 #3: a SUPPLIED but UNSIGNED card (resolved via
+    /// `--card`, trust store available, but the card carries no signature) must
+    /// be VISIBLE — exactly one Info `CommandCardUnverified` — not hidden. The
+    /// card-LESS counterpart stays silent (covered above): the distinction is
+    /// that this path resolved a real card ref, so the unsigned outcome belongs
+    /// in audit/JSON.
+    #[test]
+    fn supplied_unsigned_card_emits_unverified_note() {
+        let dir = tempfile::tempdir().unwrap();
+        // An UNSIGNED card on disk (Card::new never signs).
+        let card_path = dir.path().join("card.json");
+        let card = crate::command_card::Card::new(
+            "echo hi".to_string(),
+            vec!["example.com".to_string()],
+            None,
+            vec![],
+            false,
+            "2099-01-01".to_string(),
+        );
+        std::fs::write(&card_path, card.to_json_pretty().unwrap()).unwrap();
+        // A resolvable (empty) trusted-keys dir: trust store IS available, the
+        // card is simply unsigned.
+        let trusted = dir.path().join("trusted");
+        std::fs::create_dir_all(&trusted).unwrap();
+
+        let mut ctx = exec_ctx("echo hi");
+        ctx.card_ref = Some(card_path.display().to_string());
+
+        let findings = check_command_card_hot_with_trusted_dir(&ctx, Some(trusted));
+        assert_eq!(
+            findings.len(),
+            1,
+            "a supplied unsigned card must surface exactly one note, got: {findings:?}"
+        );
+        assert_eq!(
+            findings[0].rule_id,
+            crate::verdict::RuleId::CommandCardUnverified
+        );
+        assert_eq!(findings[0].severity, crate::verdict::Severity::Info);
+        assert_ne!(
+            findings[0].rule_id,
+            crate::verdict::RuleId::CommandCardVerified,
+            "an unsigned card must never be reported as verified"
         );
     }
 

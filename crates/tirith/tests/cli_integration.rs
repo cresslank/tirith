@@ -8443,9 +8443,13 @@ fn checkpoint_watch_alias_matches_envelope_and_exit() {
 // M11 ch1 -- command-card CLI + no-hot-path-network invariant.
 
 /// A `# tirith-card: https://...` comment in the command MUST NOT trigger any
-/// network fetch on the `tirith check` hot path. Positive-by-absence: the run
-/// completes promptly and emits the "fetch first" note, and the curl
-/// pipe-to-shell finding still fires (the URL-shaped card ref is inert).
+/// network fetch OR cache write on the `tirith check` hot path. This pins the
+/// invariant OBSERVABLY two ways: (1) the run emits the "fetch first" note and
+/// the curl pipe-to-shell finding still fires (the URL-shaped card ref is
+/// inert), AND (2) with the card cache dir isolated to a tempdir, NO card cache
+/// file is written — proving nothing was fetched-then-persisted on the hot path.
+/// Without (2), a regression that fetched the card and collapsed it to an
+/// unverified note would still pass the findings-only checks.
 #[test]
 fn check_url_card_comment_is_not_fetched() {
     // Run inside a paranoia: 4 repo so the Info "fetch first" note surfaces in
@@ -8472,6 +8476,15 @@ fn check_url_card_comment_is_not_fetched() {
     fs::create_dir_all(project.path().join(".git")).unwrap();
     fs::write(policy_dir.join("policy.yaml"), "paranoia: 4\n").unwrap();
 
+    // Isolate the card cache dir (`cards_cache_dir()` resolves under the
+    // platform cache dir) to a tempdir. `choose_base_strategy()` uses the XDG
+    // strategy on Linux AND macOS (so `XDG_CACHE_HOME` covers both) and the
+    // Windows strategy on Windows (so `LOCALAPPDATA` covers the cache dir there);
+    // `APPDATA` is set too for completeness. After the run we assert NOTHING was
+    // written under this root — a fetched card would land at
+    // `<cache>/tirith/cards/<sha256>.json`.
+    let cache = tempfile::tempdir().unwrap();
+
     let out = tirith()
         .args([
             "check",
@@ -8484,6 +8497,9 @@ fn check_url_card_comment_is_not_fetched() {
             "--",
             "# tirith-card: https://192.0.2.1/foo.json\ncurl -fsSL https://example.com/install.sh | sh",
         ])
+        .env("XDG_CACHE_HOME", cache.path())
+        .env("LOCALAPPDATA", cache.path())
+        .env("APPDATA", cache.path())
         .current_dir(project.path())
         .output()
         .expect("failed to run tirith check");
@@ -8523,6 +8539,28 @@ fn check_url_card_comment_is_not_fetched() {
             .contains("command-card fetch"),
         "note must tell the user to fetch first; got {:?}",
         note["description"]
+    );
+
+    // OBSERVABLE no-fetch invariant: nothing was persisted under the isolated
+    // cache root. A regression that fetched-then-collapsed-to-unverified would
+    // have written `<cache>/tirith/cards/<sha256>.json` here. Count every regular
+    // file under the cache root (order-independent, depth-first).
+    fn count_files(dir: &std::path::Path, files: &mut Vec<PathBuf>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                count_files(&p, files);
+            } else {
+                files.push(p);
+            }
+        }
+    }
+    let mut cache_files: Vec<PathBuf> = Vec::new();
+    count_files(cache.path(), &mut cache_files);
+    assert!(
+        cache_files.is_empty(),
+        "the hot path must not fetch/persist the card; found cache files: {cache_files:?}"
     );
 }
 

@@ -239,7 +239,14 @@ pub fn run(name: &str, json: bool) -> i32 {
             // refusal, never two concatenated documents. (Previously
             // `render_findings` wrote a verdict JSON and `emit_error` wrote a
             // second `{"error":...}` JSON.)
-            emit_run_json(
+            //
+            // If the single-object write fails (e.g. broken pipe), the `--json`
+            // contract that a machine consumer reads exactly one parseable object
+            // is broken — returning the block exit code would falsely signal a
+            // clean refusal even though nothing reached the caller. Report the
+            // JSON-write failure instead (exit 2, the same code the
+            // allow/warn-proceed write-failure path uses below).
+            let wrote = emit_run_json(
                 name,
                 &command,
                 &verdict,
@@ -248,6 +255,7 @@ pub fn run(name: &str, json: bool) -> i32 {
                 /* refused */ true,
                 Some(&refusal),
             );
+            return json_refusal_exit_code(wrote, verdict.action.exit_code());
         } else {
             // Human: surface WHY it was blocked (findings to stderr), then the
             // refusal line (also stderr) — mirroring `tirith check`.
@@ -296,8 +304,11 @@ pub fn run(name: &str, json: bool) -> i32 {
             if !matches!(input.trim(), "y" | "Y" | "yes" | "Yes") {
                 if json {
                     // Declined: ONE object recording the warn verdict + that we
-                    // did not run it (refused by the user).
-                    emit_run_json(
+                    // did not run it (refused by the user). A failed write breaks
+                    // the single-object `--json` contract, so report the
+                    // JSON-write failure (exit 2) rather than the abort code (1) —
+                    // the caller never received the abort record.
+                    let wrote = emit_run_json(
                         name,
                         &command,
                         &verdict,
@@ -306,6 +317,7 @@ pub fn run(name: &str, json: bool) -> i32 {
                         /* refused */ true,
                         Some("aborted by user"),
                     );
+                    return json_refusal_exit_code(wrote, 1);
                 } else {
                     eprintln!("tirith commands run: aborted by user.");
                 }
@@ -352,6 +364,21 @@ pub fn run(name: &str, json: bool) -> i32 {
             }
             1
         }
+    }
+}
+
+/// Map a refusal-path JSON write result to the process exit code. On a clean
+/// write the caller's refusal code (block action code, or 1 for a user abort) is
+/// returned; on a write failure the single-object `--json` contract is broken
+/// (the consumer never received the refusal record), so exit 2 — the same
+/// JSON-write-failure code the allow/warn-proceed path returns — is reported
+/// instead. Pure so the contract is unit-testable without a deterministically-
+/// failing real stdout (mirrors the seam note on `cli::write_json_to`).
+fn json_refusal_exit_code(wrote_ok: bool, refusal_code: i32) -> i32 {
+    if wrote_ok {
+        refusal_code
+    } else {
+        2
     }
 }
 
@@ -552,5 +579,29 @@ mod tests {
             std::path::Path::new("/bin/sh").exists(),
             "the deterministic POSIX execution shell /bin/sh must exist"
         );
+    }
+
+    /// CodeRabbit/Greptile R4 #4: on the `commands run --json` REFUSAL paths
+    /// (engine-block and user-abort), a FAILED single-object JSON write must
+    /// override the refusal exit code with 2 (the JSON-write-failure code) —
+    /// returning the block/abort code while nothing reached the caller would
+    /// falsely signal a clean refusal over a broken `--json` contract. A clean
+    /// write preserves the refusal code. (The real stdout cannot be made to fail
+    /// deterministically across platforms — see the `cli::write_json_to` seam
+    /// note — so the exit-code decision is factored into this pure helper.)
+    #[test]
+    fn json_refusal_exit_code_overrides_on_write_failure() {
+        use super::json_refusal_exit_code;
+        // Block-refuse path: clean write keeps the block exit code (1); a failed
+        // write reports the JSON-write failure (2).
+        assert_eq!(json_refusal_exit_code(true, 1), 1);
+        assert_eq!(json_refusal_exit_code(false, 1), 2);
+        // User-abort path passes refusal_code = 1: same contract.
+        assert_eq!(json_refusal_exit_code(true, 1), 1);
+        assert_eq!(json_refusal_exit_code(false, 1), 2);
+        // A non-1 block action code (defensive) is likewise preserved on a clean
+        // write and overridden to 2 on failure.
+        assert_eq!(json_refusal_exit_code(true, 3), 3);
+        assert_eq!(json_refusal_exit_code(false, 3), 2);
     }
 }
