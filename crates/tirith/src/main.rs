@@ -48,6 +48,49 @@ Examples:
   tirith watch --with-net-hints -- pip install requests
   tirith watch --json -- cargo build";
 
+/// Shared help text for `tirith temp-run` (and its hidden `sandbox-dir`
+/// alias). The honesty banner here is the SAME wording carried by the human
+/// output banner, the JSON `disclaimer` field, and `docs/threat-model.md` —
+/// pinned together by `help_snapshots.rs::help_temp_run`.
+const TEMP_RUN_AFTER_HELP: &str = "\
+FILE ISOLATION ONLY; NOT A SANDBOX.
+  The command runs with full user privileges and can read your keychain, ssh
+  keys, AWS creds, and the network. Use this for filesystem-impact preview
+  ONLY. The ONLY thing temp-run changes is the working directory: the command
+  starts in a fresh mkdtemp dir, so files it WRITES land there instead of your
+  tree, and you get a diff of what it touched. Runtime sandboxing is an explicit
+  tirith non-goal (see docs/threat-model.md) — temp-run is a file-isolation
+  workflow, not a containment boundary.
+
+What this does:
+  mkdtemp → (optionally seed) → run the command there → diff the temp dir for
+  new / modified files → prompt to delete or keep (default keep + print the
+  path when non-interactive).
+
+  --copy-repo   Seed the temp dir with a copy of the current repo, EXCLUDING
+                .git/. Off by default (copying a large tree is slow); the
+                default is an empty temp dir. Pure walkdir + fs::copy — no
+                `cp --exclude` (GNU-only) dependency.
+  --strip-env   Clear the child's environment and re-add only an allowlist
+                (HOME, PATH, USER, LANG, TERM). A convenience knob, NOT secret
+                scrubbing — a stripped env is still not a security boundary.
+                Pure Command::env_clear() — no `env -i` (non-portable) shell-out.
+
+Exit code:
+  The watched command's own exit code (so `temp-run -- false` exits 1), except
+  a usage error (2) or a setup/spawn failure (2). The filesystem diff is
+  reported but never overrides the child's exit code.
+
+JSON:
+  Every --json envelope carries `\"isolation_kind\": \"file_only_not_a_sandbox\"`
+  so a downstream consumer can never mistake this for a security boundary.
+
+Examples:
+  tirith temp-run -- ./script.sh
+  tirith temp-run --copy-repo -- make build
+  tirith temp-run --strip-env -- ./untrusted-installer.sh
+  tirith temp-run --json -- npm install left-pad";
+
 #[derive(Subcommand)]
 enum Commands {
     /// Manage the tirith background daemon
@@ -1933,6 +1976,57 @@ Examples:
         json: bool,
 
         /// The command to run and watch (everything after `--`)
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+
+    /// Run a command in a throwaway temp dir and diff its file impact (M10 ch6)
+    ///
+    /// FILE ISOLATION ONLY — NOT a sandbox. The command runs with your full
+    /// privileges (keychain, ssh keys, cloud creds, network). The only thing
+    /// changed is the working directory. See `tirith temp-run --help`.
+    #[command(after_help = TEMP_RUN_AFTER_HELP)]
+    TempRun {
+        /// Seed the temp dir with a copy of the current repo, EXCLUDING .git/.
+        /// Off by default (the default is an empty temp dir) — copying a large
+        /// tree is slow. Pure walkdir + fs::copy; no `cp --exclude`.
+        #[arg(long)]
+        copy_repo: bool,
+
+        /// Clear the child's environment and re-add only an allowlist (HOME,
+        /// PATH, USER, LANG, TERM). A convenience knob, NOT secret scrubbing.
+        /// Pure Command::env_clear(); no non-portable `env -i` shell-out.
+        #[arg(long)]
+        strip_env: bool,
+
+        /// Output the run + file diff as JSON. The envelope always carries
+        /// `"isolation_kind": "file_only_not_a_sandbox"`.
+        #[arg(long)]
+        json: bool,
+
+        /// The command to run in the temp dir (everything after `--`)
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+
+    /// Hidden alias for `temp-run` (the spec's `sandbox-dir` word). The
+    /// canonical name is `temp-run` to avoid "sandbox" implying a boundary it
+    /// does not have; this exists only for discoverability and is identical.
+    #[command(name = "sandbox-dir", hide = true, after_help = TEMP_RUN_AFTER_HELP)]
+    SandboxDir {
+        /// Seed the temp dir with a .git-excluded copy of the repo (off by default).
+        #[arg(long)]
+        copy_repo: bool,
+
+        /// Clear the child env and re-add only HOME, PATH, USER, LANG, TERM.
+        #[arg(long)]
+        strip_env: bool,
+
+        /// Output JSON (carries `"isolation_kind": "file_only_not_a_sandbox"`).
+        #[arg(long)]
+        json: bool,
+
+        /// The command to run in the temp dir (everything after `--`)
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         command: Vec<String>,
     },
@@ -6054,6 +6148,19 @@ fn run() {
                 cli::baseline::reset(yes, json)
             }
         },
+        // `temp-run` and its hidden `sandbox-dir` alias share one impl.
+        Commands::TempRun {
+            copy_repo,
+            strip_env,
+            json,
+            command,
+        }
+        | Commands::SandboxDir {
+            copy_repo,
+            strip_env,
+            json,
+            command,
+        } => cli::temp_run::run(&command, copy_repo, strip_env, json),
     };
 
     std::process::exit(exit_code);

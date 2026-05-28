@@ -8262,3 +8262,91 @@ fn intend_empty_command_is_usage_error() {
         "an empty command should be a usage error (exit 2)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M10 ch6 — `tirith temp-run` (file isolation only; NOT a sandbox).
+// ---------------------------------------------------------------------------
+
+/// Positive: a command that creates a file lands that file in the temp dir
+/// (reported as a `new_files` diff entry), NOT in the caller's cwd. Runs
+/// non-interactively (no TTY) so the temp dir is kept and its path is printed
+/// in the JSON envelope; the test deletes it afterward.
+#[cfg(unix)]
+#[test]
+fn temp_run_creates_file_in_temp_dir_not_cwd() {
+    let tmpdir = tempfile::tempdir().expect("tmpdir");
+    let workdir = tmpdir.path().join("project");
+    fs::create_dir_all(&workdir).unwrap();
+
+    let out = tirith()
+        .args(["temp-run", "--json", "--", "touch foo.txt"])
+        .current_dir(&workdir)
+        .output()
+        .expect("failed to run tirith");
+
+    assert_eq!(out.status.code(), Some(0), "touch should exit 0");
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("temp-run --json should be valid JSON");
+
+    // The honesty marker is the load-bearing assertion.
+    assert_eq!(
+        json["isolation_kind"], "file_only_not_a_sandbox",
+        "JSON must carry the not-a-sandbox isolation_kind marker"
+    );
+    assert_eq!(json["not_a_sandbox"], true);
+
+    // foo.txt was created INSIDE the temp dir → reported as a new file.
+    let new_files = json["new_files"].as_array().expect("new_files array");
+    assert!(
+        new_files.iter().any(|v| v == "foo.txt"),
+        "foo.txt should be reported as a new file in the temp dir, got: {new_files:?}"
+    );
+
+    // ...and NOT in the caller's working directory.
+    assert!(
+        !workdir.join("foo.txt").exists(),
+        "temp-run must not touch the caller's cwd"
+    );
+
+    // Non-interactive → the temp dir is kept; clean it up.
+    assert_eq!(json["temp_dir_kept"], true);
+    if let Some(p) = json["temp_dir"].as_str() {
+        let kept = PathBuf::from(p);
+        assert!(
+            kept.join("foo.txt").is_file(),
+            "the created file should live in the kept temp dir"
+        );
+        let _ = fs::remove_dir_all(&kept);
+    }
+}
+
+/// Smoke: a trivial safe command (`true`) exits 0 and emits the not-a-sandbox
+/// markers. We never run untrusted code in CI — this only exercises the
+/// envelope and honesty fields.
+#[cfg(unix)]
+#[test]
+fn temp_run_smoke_true_emits_isolation_kind() {
+    let out = tirith()
+        .args(["temp-run", "--json", "--", "true"])
+        .output()
+        .expect("failed to run tirith");
+
+    assert_eq!(out.status.code(), Some(0), "`true` should exit 0");
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("temp-run --json should be valid JSON");
+    assert_eq!(json["isolation_kind"], "file_only_not_a_sandbox");
+    assert_eq!(json["not_a_sandbox"], true);
+    assert!(
+        json["disclaimer"]
+            .as_str()
+            .is_some_and(|d| d.contains("not a sandbox")),
+        "JSON disclaimer must say it is not a sandbox"
+    );
+
+    // Clean up the kept temp dir (non-interactive keeps it).
+    if let Some(p) = json["temp_dir"].as_str() {
+        let _ = fs::remove_dir_all(PathBuf::from(p));
+    }
+}

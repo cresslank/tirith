@@ -180,6 +180,7 @@ pub mod share;
 pub mod ssh;
 pub mod sudo;
 pub mod taint;
+pub mod temp_run;
 pub mod threatdb_cmd;
 pub mod trust;
 pub mod view;

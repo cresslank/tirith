@@ -191,6 +191,32 @@ help_example_tests! {
     help_baseline_learn        => (["baseline", "learn", "--help"], "tirith baseline learn --json");
     help_baseline_status       => (["baseline", "status", "--help"], "tirith baseline status --json");
     help_baseline_reset        => (["baseline", "reset", "--help"], "tirith baseline reset --yes");
+    // M10 ch6 — `tirith temp-run` file-isolation workflow (D1, NOT a sandbox).
+    help_temp_run              => (["temp-run", "--help"], "tirith temp-run -- ./script.sh");
+}
+
+/// The dominant requirement for `temp-run` is honesty-of-claim: the help text
+/// must state plainly that it is NOT a sandbox and the command runs with full
+/// privileges. Pin the exact wording so a future edit can't soften it.
+#[test]
+fn help_temp_run_states_not_a_sandbox() {
+    let out = tirith()
+        .args(["temp-run", "--help"])
+        .output()
+        .expect("failed to run tirith");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.to_lowercase().contains("not a sandbox"),
+        "temp-run --help must say it is NOT a sandbox, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("full user privileges"),
+        "temp-run --help must say the command runs with full user privileges, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("keychain"),
+        "temp-run --help must warn the command can read the keychain, got:\n{stdout}"
+    );
 }
 
 #[test]
