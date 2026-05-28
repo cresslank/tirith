@@ -1297,6 +1297,8 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "repo_command_dangerous_pattern",
         "RepoCommandDangerousPattern",
     ),
+    // Honeytoken / canary rule (M11 ch3, D3).
+    ("canary_token_touched", "CanaryTokenTouched"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -1331,6 +1333,7 @@ const VALID_CATEGORIES: &[&str] = &[
     "anomaly",
     "command_card",
     "commands_manifest",
+    "canary",
 ];
 
 #[derive(Deserialize)]

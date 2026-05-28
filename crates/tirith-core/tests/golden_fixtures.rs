@@ -753,6 +753,8 @@ const ALL_RULE_IDS: &[&str] = &[
     // Anomaly-detection rules (M10 ch5, D2)
     "anomaly_first_time_in_this_repo",
     "anomaly_rare_in_baseline",
+    // Honeytoken / canary rule (M11 ch3, D3)
+    "canary_token_touched",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -1079,6 +1081,18 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // documenting the default (no-manifest) behavior.
     "repo_command_unknown",
     "repo_command_dangerous_pattern",
+    // M11 ch3 — the honeytoken / canary rule fires from `engine::analyze`
+    // (paste + exec) AND `engine::analyze_output` ONLY when a token registered
+    // in the local canary store at `state_dir()/canaries.jsonl` appears in the
+    // scanned text. The static golden-fixture runner writes no canary store
+    // (and never touches the real `state_dir()`), so a text fixture cannot drive
+    // the rule — the trigger is runtime store state plus a substring match, not
+    // input content. Covered by unit tests in `crates/tirith-core/src/canary.rs`
+    // (create/detect/prune/rotate round-trips against a `tempfile::tempdir()`
+    // store) plus the `engine::tests::canary_*` wiring tests that point the
+    // lookup at a temp store, following the M10 taint/anomaly runtime-state
+    // pattern.
+    "canary_token_touched",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1454,6 +1468,8 @@ fn test_rule_id_list_is_complete() {
         // Anomaly-detection rules (M10 ch5, D2)
         RuleId::AnomalyFirstTimeInThisRepo,
         RuleId::AnomalyRareInBaseline,
+        // Honeytoken / canary rule (M11 ch3, D3)
+        RuleId::CanaryTokenTouched,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();

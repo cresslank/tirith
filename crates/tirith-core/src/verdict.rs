@@ -882,6 +882,27 @@ pub enum RuleId {
     /// elevate via this rule but can NEVER weaken an engine finding of severity
     /// ≥ High.
     RepoCommandDangerousPattern,
+
+    // Honeytoken / canary rule (M11 ch3, design-decision D3). A canary is a
+    // deliberately-synthetic, clearly-fake secret-shaped token the user planted
+    // as bait (`tirith canary create`), recorded in a local-first store at
+    // `state_dir()/canaries.jsonl` (`crate::canary`). This fires from
+    // `engine::analyze` (paste + exec) AND `engine::analyze_output` when a
+    // REGISTERED canary token appears in the scanned text — detection is a STORE
+    // lookup, not a shape match, so an unrelated real credential fires the
+    // existing `CredentialInText` / `HighEntropySecret` rules, NEVER this one.
+    // It carries no PATTERN_TABLE entry (the trigger is runtime store STATE plus
+    // a substring match, not a regex on arbitrary input) and lives in
+    // `EXTERNALLY_TRIGGERED_RULES`, covered by unit tests in
+    // `crates/tirith-core/src/canary.rs` against a `tempfile::tempdir()` store
+    // plus engine hot-path tests that point the lookup at a temp store.
+    /// M11 ch3 — a synthetic canary token the user registered with
+    /// `tirith canary create` was found in the scanned input (a command, paste,
+    /// or inspected tool output). High severity: a canary is bait planted where
+    /// it should never be read, so a match is a strong "someone touched the
+    /// decoy" signal. ONLY the user's own registered tokens fire this — the
+    /// store scopes detection, so a genuine third-party credential does not.
+    CanaryTokenTouched,
 }
 
 impl fmt::Display for RuleId {

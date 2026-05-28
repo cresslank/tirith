@@ -134,6 +134,7 @@ pub mod audit;
 pub mod baseline;
 #[cfg(unix)]
 pub mod bash_capability;
+pub mod canary;
 pub mod check;
 pub mod checkpoint;
 pub mod clipboard;

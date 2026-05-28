@@ -243,6 +243,29 @@ pub fn redact(input: &str) -> String {
     result
 }
 
+/// M11 ch3 — the canary-detection scan that drives
+/// [`crate::verdict::RuleId::CanaryTokenTouched`].
+///
+/// Returns one [`crate::canary::CanaryHit`] per REGISTERED canary token found
+/// in `input` (deduped by id). This is the single detection entry point the
+/// engine uses on BOTH the `engine::analyze` (paste + exec) path and the
+/// `engine::analyze_output` path — anchoring "any string matching a registered
+/// canary triggers `CanaryTokenTouched`" in one place alongside the other
+/// content-scanning helpers in this module.
+///
+/// Detection is a STORE lookup, not a shape match (see [`crate::canary`]): only
+/// the user's own registered tokens match, so an unrelated real credential is
+/// NOT reported here (it fires `CredentialInText` / `HighEntropySecret`
+/// instead). The lookup is a near-noop when the canary store is empty/absent
+/// (a single `metadata()` stat short-circuits it), and the engine additionally
+/// only forces past its tier-1 fast-exit when the store is non-empty.
+///
+/// The token value itself is NEVER returned in a hit — only the canary's id,
+/// kind, and (opt-in) callback URL — so this cannot leak a planted secret.
+pub fn detect_canaries(input: &str) -> Vec<crate::canary::CanaryHit> {
+    crate::canary::detect(input)
+}
+
 /// Pre-compiled set of custom DLP patterns.
 pub struct CompiledCustomPatterns {
     patterns: Vec<Regex>,

@@ -413,6 +413,10 @@ pub struct OutputAnalyzerState {
     /// `analyze_output_finalize_mut` folds these into the final verdict so
     /// streaming callers (`tirith view`) don't have to thread them by hand.
     accumulated_chunk_findings: Vec<crate::verdict::Finding>,
+    /// M11 ch3 — canary ids already fired in this stream, so a token spanning
+    /// multiple chunks (or repeated) fires at most once per stream. Bounded to
+    /// the handful of canaries a user registers; memory cost is trivial.
+    canary_seen: std::collections::HashSet<String>,
 }
 
 const OUTPUT_TAIL_KEEP: usize = 16 * 1024;
@@ -469,6 +473,26 @@ pub fn analyze_output_chunk(
         if state.prompt_injection_seen.insert(key) {
             state.accumulated_chunk_findings.push(f.clone());
             findings.push(f);
+        }
+    }
+
+    // M11 ch3 — honeytoken / canary scan on the output path. A canary token a
+    // tool echoes back (e.g. an MCP tool result that read a decoy file) must
+    // fire CanaryTokenTouched just like on the exec/paste path. Near-noop when
+    // the store is empty (a single `metadata()` stat short-circuits), so a
+    // no-canary machine pays nothing. We scan the retained tail (`tail_text`,
+    // already updated by `append_tail` above) rather than the raw chunk so a
+    // token straddling a chunk boundary is still caught; dedupe by canary id so
+    // a token spanning chunks fires once. The opt-in callback fires with
+    // context "output" (never the token value; non-blocking).
+    if crate::canary::store_nonempty() {
+        for hit in crate::redact::detect_canaries(&state.tail_text) {
+            if state.canary_seen.insert(hit.id.clone()) {
+                crate::canary::fire_callback(&hit, "output");
+                let f = canary_finding(&hit);
+                state.accumulated_chunk_findings.push(f.clone());
+                findings.push(f);
+            }
         }
     }
 
@@ -1099,6 +1123,70 @@ fn taint_finding(
     }
 }
 
+/// M11 ch3 — the honeytoken / canary hot check. Scans `text` against the
+/// registered canary store; for each registered canary token found, emits one
+/// [`crate::verdict::RuleId::CanaryTokenTouched`] (High) finding and, when that
+/// canary carries an opt-in self-hosted callback URL, fires a best-effort POST
+/// (`{kind, detected_at, context}` only — NEVER the token value; non-blocking).
+///
+/// Caller gates this behind a non-empty canary store (the `canary_triggered`
+/// tier-1 force-past). The lookup itself is a cached substring scan
+/// ([`crate::canary::detect`]). `context` is a short label (`"exec"`,
+/// `"paste"`, `"output"`) recorded only in the callback body / finding text —
+/// never any token value.
+fn check_canary_hot(text: &str, context: &str) -> Vec<Finding> {
+    // Detection is anchored in `redact::detect_canaries` (the content-scanning
+    // module) so the analyze + analyze_output paths share one entry point; it
+    // delegates to `canary::detect` (a cached store lookup).
+    let hits = crate::redact::detect_canaries(text);
+    canary_findings_from_hits(&hits, context)
+}
+
+/// Build findings from canary hits and fire each hit's opt-in callback. Split
+/// from [`check_canary_hot`] so the store-parameterized engine test can drive
+/// it with [`crate::canary::detect_at`] against a `tempfile::tempdir()` store
+/// (the production path uses the default store via [`crate::canary::detect`]).
+fn canary_findings_from_hits(hits: &[crate::canary::CanaryHit], context: &str) -> Vec<Finding> {
+    let mut findings = Vec::with_capacity(hits.len());
+    for hit in hits {
+        // Best-effort, opt-in, non-blocking. A canary created WITHOUT a
+        // `--callback-url` has `callback_url: None` and this is a no-op (no
+        // network). The POST never carries the token value.
+        crate::canary::fire_callback(hit, context);
+        findings.push(canary_finding(hit));
+    }
+    findings
+}
+
+/// Build a [`crate::verdict::RuleId::CanaryTokenTouched`] finding for a canary
+/// hit. Deliberately does NOT echo the token value into the finding (the value
+/// is a planted secret; surfacing its id + kind is enough to triage).
+fn canary_finding(hit: &crate::canary::CanaryHit) -> Finding {
+    use crate::verdict::{Evidence, RuleId, Severity};
+    Finding {
+        rule_id: RuleId::CanaryTokenTouched,
+        severity: Severity::High,
+        title: "Canary token touched".to_string(),
+        description: format!(
+            "A synthetic canary token you registered with `tirith canary create` \
+             (id {}, kind {}) appeared in the scanned input. A canary is bait \
+             planted where it should never be read, so this is a strong signal \
+             that the decoy was touched. Investigate what read it, rotate any real \
+             credentials co-located with the bait, then `tirith canary rotate {}` \
+             or `tirith canary prune {}`.",
+            hit.id, hit.kind, hit.id, hit.id
+        ),
+        // Record the id + kind only — NOT the token value (a planted secret).
+        evidence: vec![Evidence::Text {
+            detail: format!("canary id: {} (kind: {})", hit.id, hit.kind),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: Some("T1552".to_string()),
+        custom_rule_id: None,
+    }
+}
+
 /// M10 ch5 — leaders that classify the command's ecosystem for the anomaly
 /// baseline tuple. A pure leader → ecosystem-label map; `None` for leaders that
 /// are not package/ecosystem commands. Low-cardinality, non-identifying.
@@ -1575,6 +1663,18 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     // / file scan never pay even the stat. Mirrors `exec_guard_triggered`.
     let taint_triggered = ctx.scan_context == ScanContext::Exec && crate::taint::store_nonempty();
 
+    // M11 ch3 — the canary check is a runtime-state lookup (does the input
+    // contain a token registered in the local canary store?), not a regex/byte
+    // signal. A pasted or run blob carrying a registered canary would otherwise
+    // fast-exit at tier-1 before the canary scan ran (the tier-1 gating bug
+    // class — see CLAUDE.md). Force past the fast-exit ONLY when the canary
+    // store is non-empty: a single `metadata()` stat, so a machine that has
+    // never run `tirith canary create` pays nothing. Unlike taint (exec-only),
+    // this applies to BOTH paste and exec — a canary can be pasted OR run.
+    // Mirrors `taint_triggered`.
+    let canary_triggered = matches!(ctx.scan_context, ScanContext::Exec | ScanContext::Paste)
+        && crate::canary::store_nonempty();
+
     // M11 ch1 — a `--card <path>` sidecar flag is not a regex/byte signal, so a
     // clean-looking command (`curl … | sh` already trips tier-1, but a bare
     // `./install.sh --card …` may not) would fast-exit before the card check
@@ -1603,6 +1703,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         && !exec_guard_triggered
         && !hooks_guard_triggered
         && !taint_triggered
+        && !canary_triggered
         && !card_triggered
         && !manifest_triggered
     {
@@ -2050,6 +2151,22 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         let cred_findings =
             crate::rules::credential::check(&ctx.input, ctx.shell, ctx.scan_context);
         findings.extend(cred_findings);
+
+        // M11 ch3 — honeytoken / canary check. Always-on (no policy flag), but
+        // the per-input scan short-circuits to a near-noop when the canary store
+        // is empty/absent (and the tier-1 force-past `canary_triggered` only
+        // fires when the store is non-empty, so a no-canary machine never even
+        // reaches here unless some OTHER signal already pulled us past the
+        // fast-exit). When the scanned command/paste contains a token the user
+        // registered with `tirith canary create`, this fires CanaryTokenTouched
+        // (High) and, for any matched canary with an opt-in self-hosted callback
+        // URL, sends a best-effort POST (never the token value; non-blocking).
+        // The store is cached per-process (5s TTL) — see `crate::canary`.
+        let canary_context = match ctx.scan_context {
+            ScanContext::Paste => "paste",
+            _ => "exec",
+        };
+        findings.extend(check_canary_hot(&ctx.input, canary_context));
 
         let env_findings = crate::rules::environment::check(&crate::rules::environment::RealEnv);
         findings.extend(env_findings);
@@ -3547,6 +3664,65 @@ mod tests {
         // No marks written.
         let ctx = exec_ctx_in("bash ./install.sh", dir.path());
         assert!(check_taint_hot_with_store(&ctx, &store).is_empty());
+    }
+
+    // ---- M11 ch3 — canary / honeytoken wiring tests ------------------------
+    //
+    // The store-level create/detect/prune/rotate logic is covered exhaustively
+    // by `crate::canary`'s own unit tests (against a tempdir). These tests cover
+    // the ENGINE wiring: a registered canary token in scanned text produces a
+    // High `CanaryTokenTouched` finding via the same `canary_findings_from_hits`
+    // path the hot check uses. We drive `crate::canary::detect_at` against a
+    // tempdir store (no env mutation, no real `state_dir()`), then build the
+    // findings exactly as `check_canary_hot` would. Local-only canaries
+    // (callback_url == None) make `fire_callback` a no-op, so no network is hit.
+
+    #[test]
+    fn canary_finding_fires_high_for_registered_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("canaries.jsonl");
+        let entry =
+            crate::canary::create_at(&store, crate::canary::CanaryKind::AwsLike, None).unwrap();
+
+        // A paste that embeds the registered token (e.g. dumping a decoy creds
+        // file) produces exactly one High CanaryTokenTouched finding.
+        let blob = format!("aws_access_key_id = {}", entry.token);
+        let hits = crate::canary::detect_at(&store, &blob);
+        let findings = canary_findings_from_hits(&hits, "paste");
+        assert_eq!(findings.len(), 1, "registered token fires one finding");
+        assert_eq!(
+            findings[0].rule_id,
+            crate::verdict::RuleId::CanaryTokenTouched
+        );
+        assert_eq!(findings[0].severity, crate::verdict::Severity::High);
+        // The finding must NOT leak the token value — only id + kind.
+        assert!(
+            !findings[0].description.contains(&entry.token),
+            "finding must not echo the canary token value"
+        );
+        assert!(findings[0].description.contains(&entry.id));
+    }
+
+    #[test]
+    fn canary_no_fire_for_unregistered_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("canaries.jsonl");
+        crate::canary::create_at(&store, crate::canary::CanaryKind::GithubLike, None).unwrap();
+        // A genuine-looking AWS key that is NOT registered must produce nothing
+        // on the canary axis (it fires CredentialInText elsewhere, not here).
+        let hits = crate::canary::detect_at(&store, "AKIAIOSFODNN7EXAMPLE in a paste");
+        let findings = canary_findings_from_hits(&hits, "paste");
+        assert!(findings.is_empty(), "unregistered token must not fire");
+    }
+
+    #[test]
+    fn canary_empty_store_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("canaries.jsonl");
+        // No canary created → empty store → no hits → no findings.
+        assert!(!crate::canary::store_nonempty_at(&store));
+        let hits = crate::canary::detect_at(&store, "anything at all");
+        assert!(canary_findings_from_hits(&hits, "exec").is_empty());
     }
 
     // ---- M10 ch5 — anomaly-baseline wiring tests ---------------------------

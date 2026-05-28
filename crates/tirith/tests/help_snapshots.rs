@@ -205,6 +205,13 @@ help_example_tests! {
     help_commands_list         => (["commands", "list", "--help"], "tirith commands list");
     help_commands_run          => (["commands", "run", "--help"], "tirith commands run test");
     help_commands_check        => (["commands", "check", "--help"], "tirith commands check -- \"npm run build\"");
+    // M11 ch3 — honeytoken / canary (`tirith canary ...`), design-decision D3.
+    help_canary                => (["canary", "--help"], "tirith canary create aws-like");
+    help_canary_create         => (["canary", "create", "--help"], "tirith canary create github-like --callback-url https://my-host.example/hit");
+    help_canary_status         => (["canary", "status", "--help"], "tirith canary status");
+    help_canary_list           => (["canary", "list", "--help"], "tirith canary list");
+    help_canary_prune          => (["canary", "prune", "--help"], "tirith canary prune a1b2c3d4e5f6 --yes");
+    help_canary_rotate         => (["canary", "rotate", "--help"], "tirith canary rotate a1b2c3d4e5f6");
 }
 
 /// The dominant requirement for `temp-run` is honesty-of-claim: the help text

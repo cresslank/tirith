@@ -2251,6 +2251,171 @@ Examples:
         #[command(subcommand)]
         action: RepoCommandsAction,
     },
+
+    /// Plant honeytoken / canary tokens (local-first, opt-in callback) (M11 ch3)
+    #[command(after_help = "\
+A canary is a deliberately-synthetic, clearly-fake secret-shaped token you plant
+as BAIT where it should never be read — a decoy ~/.aws/credentials, a fake .env,
+a bait line in a private repo. tirith records it in a local-first store at
+<state-dir>/canaries.jsonl. When that EXACT token later shows up in a command
+you run, a paste, or a tool output tirith inspects, the engine fires
+CanaryTokenTouched (High) — a strong 'someone touched the decoy' signal.
+
+Detection is a STORE lookup, NOT a shape match: ONLY tokens you registered fire.
+An unrelated, genuine AWS key in a paste fires the existing credential rules, not
+the canary rule.
+
+Clearly-synthetic shapes (see docs/canary-formats.md):
+  aws-like            AKIA00CANARY... (the 00CANARY infix is invalid for a real
+                      AWS key — 0 is not in the base32 alphabet)
+  github-like         ghp_canary_...
+  gcp-like            AIzaCANARY...
+  env-line            TIRITH_CANARY_TOKEN=canary_...
+  private-key-shaped  a PEM block with a TIRITHCANARY marker
+These can never be mistaken for a real third-party credential, so they cannot
+trigger an external provider's abuse / take-down workflow.
+
+D3 — local-first, no phone-home:
+  By DEFAULT a canary is local-only: detection raises a finding and writes to
+  the local audit log; nothing leaves the machine. `create --callback-url <url>`
+  opts into a best-effort POST of {kind, detected_at, context} (NEVER the token
+  value) to a URL YOU self-host. There is no tirith-operated endpoint. A callback
+  failure is logged to the audit log and never blocks the verdict — it is the
+  single exception to tirith's no-network rule, gated entirely behind your URL.
+
+Subcommands:
+  create <kind> [--callback-url <url>]  generate + store a fresh canary token
+  status                                summary (count, callbacks, store path)
+  list                                  every registered canary (with token)
+  prune <id>                            remove one canary (prompts unless --yes)
+  rotate <id>                           fresh token, same id + callback
+
+Examples:
+  tirith canary create aws-like
+  tirith canary create github-like --callback-url https://my-host.example/hit
+  tirith canary status
+  tirith canary list --json
+  tirith canary rotate a1b2c3d4e5f6
+  tirith canary prune a1b2c3d4e5f6 --yes")]
+    Canary {
+        #[command(subcommand)]
+        action: CanaryAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CanaryAction {
+    /// Generate and store a fresh synthetic canary token
+    #[command(after_help = "\
+Generates a clearly-synthetic token of the chosen kind, stores it in the local
+canary store, and prints the token so you can plant it. The token can never be
+mistaken for a real credential (see docs/canary-formats.md).
+
+<kind> is one of: aws-like, github-like, gcp-like, env-line, private-key-shaped.
+
+--callback-url is OPT-IN and must be a URL YOU self-host (http/https). On
+detection, a best-effort POST of {kind, detected_at, context} (NEVER the token
+value) is sent to it; failures are logged and never block. Omit it for the
+local-only default (no network ever).
+
+Examples:
+  tirith canary create aws-like
+  tirith canary create github-like --callback-url https://my-host.example/hit
+  tirith canary create env-line --json")]
+    Create {
+        /// The token kind: aws-like, github-like, gcp-like, env-line, or
+        /// private-key-shaped.
+        kind: String,
+        /// OPT-IN, user-self-hosted callback URL (http/https). On detection a
+        /// best-effort POST of {kind, detected_at, context} — never the token
+        /// value — is sent here. Omit for local-only (the default).
+        #[arg(long = "callback-url")]
+        callback_url: Option<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Show a compact canary summary (count, callbacks, store path)
+    #[command(after_help = "\
+Prints how many canaries are registered, how many use an opt-in callback, and
+where the store lives. Does NOT print token values (use `tirith canary list`).
+
+Examples:
+  tirith canary status
+  tirith canary status --json")]
+    Status {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// List every registered canary (id, kind, token, callback)
+    #[command(after_help = "\
+Examples:
+  tirith canary list
+  tirith canary list --json")]
+    List {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Remove one canary by id (prompts for confirmation)
+    #[command(after_help = "\
+Prompts before removing unless --yes is passed. In a non-interactive shell
+without --yes the removal is refused (no silent prune). In --json mode, --yes is
+required to confirm. A pruned canary's token stops firing.
+
+Examples:
+  tirith canary prune a1b2c3d4e5f6
+  tirith canary prune a1b2c3d4e5f6 --yes")]
+    Prune {
+        /// The canary id to remove (from `tirith canary list`).
+        id: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Regenerate a canary's token, keeping its id and callback URL
+    #[command(after_help = "\
+Generates a fresh token of the SAME kind for an existing canary, preserving the
+id and any callback URL. The OLD token stops firing; the NEW one fires going
+forward. Use after a canary hit to re-arm the bait.
+
+Exit codes:
+  0  rotated (fresh token generated)
+  1  no canary with that id
+
+Examples:
+  tirith canary rotate a1b2c3d4e5f6
+  tirith canary rotate a1b2c3d4e5f6 --json")]
+    Rotate {
+        /// The canary id to rotate (from `tirith canary list`).
+        id: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -6532,6 +6697,41 @@ fn run() {
                 cli::commands::check(&cmd.join(" "), &shell, json)
             }
         },
+
+        // M11 ch3 — honeytoken / canary (`tirith canary ...`).
+        Commands::Canary { action } => match action {
+            CanaryAction::Create {
+                kind,
+                callback_url,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::canary::create(&kind, callback_url, json)
+            }
+            CanaryAction::Status { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::canary::status(json)
+            }
+            CanaryAction::List { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::canary::list(json)
+            }
+            CanaryAction::Prune {
+                id,
+                yes,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::canary::prune(&id, yes, json)
+            }
+            CanaryAction::Rotate { id, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::canary::rotate(&id, json)
+            }
+        },
+
         // `temp-run` and its hidden `sandbox-dir` alias share one impl.
         Commands::TempRun {
             copy_repo,

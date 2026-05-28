@@ -332,7 +332,10 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::CommandCardVerified
         | RuleId::CommandCardMismatch
         | RuleId::RepoCommandUnknown
-        | RuleId::RepoCommandDangerousPattern => false,
+        | RuleId::RepoCommandDangerousPattern
+        // M11 ch3 — honeytoken / canary. A local store lookup against the
+        // user's own planted tokens; not a threat-DB indicator match.
+        | RuleId::CanaryTokenTouched => false,
     }
 }
 
