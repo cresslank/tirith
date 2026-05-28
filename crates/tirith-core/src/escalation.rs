@@ -923,6 +923,7 @@ mod tests {
             approval_description: None,
             escalation_reason: None,
             agent_origin: None,
+            manifest_allowed_match: None,
         };
         let policy = crate::policy::Policy::default();
         let result = post_process_verdict(
@@ -957,6 +958,7 @@ mod tests {
             approval_description: None,
             escalation_reason: None,
             agent_origin: None,
+            manifest_allowed_match: None,
         };
 
         let mut policy = crate::policy::Policy::default();
@@ -997,6 +999,7 @@ mod tests {
             approval_description: None,
             escalation_reason: None,
             agent_origin: None,
+            manifest_allowed_match: None,
         };
 
         let mut policy = crate::policy::Policy::default();
@@ -1090,6 +1093,7 @@ mod tests {
             approval_description: None,
             escalation_reason: None,
             agent_origin: None,
+            manifest_allowed_match: None,
         };
 
         // Default Policy has paranoia=1, which keeps Medium+ and removes Low.
@@ -1151,6 +1155,7 @@ mod tests {
             approval_description: None,
             escalation_reason: None,
             agent_origin,
+            manifest_allowed_match: None,
         }
     }
 

@@ -81,6 +81,18 @@ pub struct AuditEntry {
     /// this field still parse (serde-default on read).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_origin: Option<crate::agent_origin::AgentOrigin>,
+
+    /// M11 ch2 — the repo command manifest's `allowed[*].name` that matched
+    /// this command, if any. AUDIT-CONTEXT ONLY: copied verbatim from
+    /// [`crate::verdict::Verdict::manifest_allowed_match`] so an operator can
+    /// see *why* an otherwise-clean command was not annotated
+    /// `repo_command_unknown` (it was catalogued). This field is NEVER read by
+    /// any action-derivation path — the manifest is suppression-bounded and
+    /// cannot weaken a verdict. `None` for `hook_telemetry` / `trust_change`
+    /// entries and when no `allowed[]` entry matched. Old logs without this
+    /// field still parse (serde-default on read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_allowed_match: Option<String>,
 }
 
 /// Outcome of an audit-log append.
@@ -284,6 +296,9 @@ pub fn log_verdict_with_raw(
         // `escalation::apply_agent_rules`); the audit record preserves it
         // so downstream tooling can attribute verdicts after the fact.
         agent_origin: verdict.agent_origin.clone(),
+        // M11 ch2: audit-context only — record the repo-command-manifest
+        // `allowed[]` match for traceability. Never consulted for action.
+        manifest_allowed_match: verdict.manifest_allowed_match.clone(),
     };
 
     let line = match append_to_audit_log(&entry, log_path) {
@@ -351,6 +366,8 @@ pub fn log_hook_event(
         // shell hook. Chunk 2+ may revisit and emit a synthetic origin for
         // hook events that originated from a known agent integration.
         agent_origin: None,
+        // M11 ch2: not applicable to telemetry / trust-change entries.
+        manifest_allowed_match: None,
     };
 
     // Telemetry / trust-change entries are best-effort; a write failure here is
@@ -400,6 +417,8 @@ pub fn log_trust_change(
         // to an agent. Leaving `agent_origin` as `None` keeps the entry
         // type's semantics clear.
         agent_origin: None,
+        // M11 ch2: not applicable to telemetry / trust-change entries.
+        manifest_allowed_match: None,
     };
 
     // Telemetry / trust-change entries are best-effort; a write failure here is
@@ -513,6 +532,7 @@ mod tests {
             approval_description: None,
             escalation_reason: None,
             agent_origin: None,
+            manifest_allowed_match: None,
         };
 
         // TIRITH_LOG=0 is an intentional skip, not a failure → Ok(()).
@@ -617,6 +637,7 @@ mod tests {
             approval_description: None,
             escalation_reason: None,
             agent_origin: None,
+            manifest_allowed_match: None,
         };
 
         let _ = log_verdict(&verdict, "echo hello", Some(log_path), None, &[]);
@@ -680,6 +701,7 @@ mod tests {
             approval_description: None,
             escalation_reason: None,
             agent_origin: None,
+            manifest_allowed_match: None,
         };
 
         // Refusing the symlink is a real write failure → Err, so the caller
@@ -750,6 +772,7 @@ mod tests {
             approval_description: None,
             escalation_reason: None,
             agent_origin: None,
+            manifest_allowed_match: None,
         };
 
         let result = log_verdict(&verdict, "test cmd", Some(log_path), None, &[]);
@@ -805,6 +828,7 @@ mod tests {
             approval_description: None,
             escalation_reason: None,
             agent_origin: None,
+            manifest_allowed_match: None,
         };
         verdict.agent_origin = AgentOrigin::agent("claude-code", Some("1.2.3"));
 
@@ -894,6 +918,7 @@ mod tests {
             approval_description: None,
             escalation_reason: None,
             agent_origin: None,
+            manifest_allowed_match: None,
         };
         log_verdict(&verdict, "echo hi", Some(log_path.clone()), None, &[])
             .expect("audit write should succeed");

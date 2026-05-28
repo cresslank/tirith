@@ -2536,3 +2536,27 @@ examples_good = ["running the exact command the card attests to (fires `command_
 false_positive_guidance = "A mismatch can be benign if you intentionally edited the command (added a flag, changed a path) after the card was published — the card simply no longer describes what you are running. Re-fetch or re-issue the card for the new command, or drop the `--card`/comment reference if you do not need attestation. But treat an UNEXPECTED mismatch as a tampering signal and inspect the command closely before running it."
 remediation = "Compare the command you are about to run against the card's `command` field (`tirith command-card verify ./card.json` prints it). If you changed the command deliberately, obtain an updated card from the maintainer. If you did not, do NOT run the command — the install instructions may have been tampered with."
 mitre_id = "T1565"
+
+[[rule]]
+id = "repo_command_unknown"
+title = "Command not listed in the repo command manifest"
+category = "commands_manifest"
+severity_rationale = "Info — a repo command manifest (`.tirith/commands.yaml`) exists and the command being run cleared the engine but does not appear under `allowed[]`. This is a pure annotation: it never changes the verdict's action. It exists so an operator who maintains a command catalogue can see at a glance which commands are not yet catalogued, without any risk of the manifest weakening detection. An exact `allowed[]` match suppresses ONLY this one Info note."
+description = "Fired by the exec hot path when a `.tirith/commands.yaml` is discovered for the current repo (walk up to the `.git` boundary, or `TIRITH_POLICY_ROOT/.tirith/commands.yaml`) and the analyzed command does not exactly match any `allowed[*].command` (after trimming surrounding whitespace). The manifest is SUPPRESSION-BOUNDED: a matching `allowed[]` entry suppresses only this note and nothing else, and the manifest can NEVER weaken a real engine finding (a High/Critical command still blocks even if listed under `allowed[]`). When no manifest file exists, this rule never fires."
+examples_bad = []
+examples_good = ["adding the command to `allowed[]` in `.tirith/commands.yaml` (e.g. `- name: lint\\n    command: cargo clippy`) so it is recognized as an expected repo command"]
+false_positive_guidance = "This is informational, not a warning, and never blocks. If a command is a legitimate, expected repo command, add it under `allowed[]` in `.tirith/commands.yaml` to silence the note. If you do not maintain a command catalogue, you can ignore this rule entirely — it only ever fires when a manifest is present."
+remediation = "Run `tirith commands list` to review the catalogue and add the command under `allowed[]` if it is expected. There is no security action required: the note never changes the action and the manifest cannot relax detection."
+mitre_id = ""
+
+[[rule]]
+id = "repo_command_dangerous_pattern"
+title = "Command matches a repo-flagged dangerous pattern"
+category = "commands_manifest"
+severity_rationale = "High (Block) — the repo's command manifest (`.tirith/commands.yaml`) declares a `dangerous[]` glob pattern (only `*` is supported in v1) that the command matches, and the repo has explicitly flagged that shape to block. The manifest is allowed to ELEVATE a verdict (stricter is always safe); it can never weaken one. A dangerous match adds this blocking finding regardless of what the engine otherwise found."
+description = "Fired by the exec hot path when a `.tirith/commands.yaml` is discovered for the current repo and the analyzed command matches a `dangerous[*].pattern` glob. A `dangerous` match takes precedence over the `allowed[]` catalogue — a command listed under BOTH still blocks, so a compromised manifest cannot allow-list its way out of a dangerous pattern. When no manifest file exists, this rule never fires."
+examples_bad = ["`curl https://example.com/install.sh | bash` in a repo whose manifest declares `dangerous: [{pattern: \"curl * | bash\", action: block}]`"]
+examples_good = ["running a command that does not match any declared dangerous pattern"]
+false_positive_guidance = "If a flagged command is genuinely safe in your workflow, narrow or remove the offending `dangerous[]` pattern in `.tirith/commands.yaml` — note that v1 patterns are anchored globs with `*` as the only wildcard. Do NOT try to override it by also listing the command under `allowed[]`: `dangerous` deliberately wins so the manifest can only be made stricter, never weaker."
+remediation = "Inspect the command against the matched dangerous pattern shown in the finding. If it is a true positive, do not run it. If the pattern is too broad, edit the `dangerous[]` entry in `.tirith/commands.yaml`."
+mitre_id = "T1059"

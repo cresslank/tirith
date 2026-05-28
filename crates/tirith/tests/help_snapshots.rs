@@ -199,6 +199,12 @@ help_example_tests! {
     help_command_card_sign     => (["command-card", "sign", "--help"], "tirith command-card sign --key ed25519-priv.bin install-card.json");
     help_command_card_verify   => (["command-card", "verify", "--help"], "tirith command-card verify install-card.json");
     help_command_card_fetch    => (["command-card", "fetch", "--help"], "tirith command-card fetch https://example.com/install-card.json");
+    // M11 ch2 — repo command manifest (`tirith commands ...`).
+    help_commands              => (["commands", "--help"], "tirith commands run test");
+    help_commands_init         => (["commands", "init", "--help"], "tirith commands init");
+    help_commands_list         => (["commands", "list", "--help"], "tirith commands list");
+    help_commands_run          => (["commands", "run", "--help"], "tirith commands run test");
+    help_commands_check        => (["commands", "check", "--help"], "tirith commands check -- \"npm run build\"");
 }
 
 /// The dominant requirement for `temp-run` is honesty-of-claim: the help text

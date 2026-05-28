@@ -1291,6 +1291,12 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     // Command-card rules (M11 ch1).
     ("command_card_verified", "CommandCardVerified"),
     ("command_card_mismatch", "CommandCardMismatch"),
+    // Repo command-manifest rules (M11 ch2).
+    ("repo_command_unknown", "RepoCommandUnknown"),
+    (
+        "repo_command_dangerous_pattern",
+        "RepoCommandDangerousPattern",
+    ),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -1324,6 +1330,7 @@ const VALID_CATEGORIES: &[&str] = &[
     "taint",
     "anomaly",
     "command_card",
+    "commands_manifest",
 ];
 
 #[derive(Deserialize)]

@@ -2462,6 +2462,7 @@ policy:
             approval_description: None,
             escalation_reason: None,
             agent_origin: None,
+            manifest_allowed_match: None,
         };
 
         let resp = build_deny_response(Value::from(1), &verdict, 5.0);

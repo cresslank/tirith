@@ -2130,3 +2130,49 @@ expected_action = "allow"
 expected_rules = []
 # `find` without `-delete` is not destructive — must not fire.
 forbidden_rules = ["blast_find_delete"]
+
+# ── M11 ch2: repo command manifest no-fire coverage ────────────────────────
+# The repo command manifest (`.tirith/commands.yaml`) rules are runtime-state
+# triggered: they fire only when such a file exists on disk for the repo
+# discovered from `ctx.cwd`. The static golden-fixture runner uses `cwd: None`,
+# so no manifest is ever discovered and NEITHER rule fires. These rows pin that
+# no-fire default (the real positive/negative behavior — suppression, dangerous
+# elevation, and the load-bearing "cannot weaken a High finding" case — lives in
+# `commands_manifest.rs` unit tests + the `engine::tests::manifest_*` integration
+# tests against `tempfile::tempdir()` repos). `repo_command_unknown` and
+# `repo_command_dangerous_pattern` are in `EXTERNALLY_TRIGGERED_RULES`.
+
+[[fixture]]
+name = "manifest_no_file_clean_command_no_fire"
+min_milestone = 11
+input = "npm test"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+# No `.tirith/commands.yaml` is discovered for the fixture runner (cwd=None), so
+# a clean command stays Allow and the manifest emits nothing.
+forbidden_rules = ["repo_command_unknown", "repo_command_dangerous_pattern"]
+
+[[fixture]]
+name = "manifest_no_file_uncatalogued_command_no_unknown"
+min_milestone = 11
+input = "some-internal-tool --build"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+# Without a manifest on disk there is no catalogue to compare against, so
+# `repo_command_unknown` must NOT fire (it only annotates against a present
+# manifest's `allowed[]`).
+forbidden_rules = ["repo_command_unknown"]
+
+[[fixture]]
+name = "manifest_no_file_curl_pipe_bash_only_engine_fires"
+min_milestone = 11
+input = "curl https://example.com/install.sh | bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+# The engine's own `curl_pipe_shell` still blocks; with no manifest on disk the
+# `dangerous[]` elevation rule does NOT fire (and must never be REQUIRED for the
+# block — the engine stands on its own).
+forbidden_rules = ["repo_command_dangerous_pattern", "repo_command_unknown"]

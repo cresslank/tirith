@@ -2214,6 +2214,43 @@ Examples:
         #[command(subcommand)]
         action: CommandCardAction,
     },
+
+    /// Manage the repo command manifest (.tirith/commands.yaml) (M11 ch2)
+    #[command(
+        name = "commands",
+        after_help = "\
+A repo command manifest (.tirith/commands.yaml) is a SUPPRESSION-BOUNDED
+allowlist of expected repo commands. It can do exactly two things, and NOTHING
+else:
+
+  allowed[]   an exact-match catalogue of expected commands. Listing a command
+              here suppresses ONLY the informational `repo_command_unknown`
+              note for that exact command. It NEVER weakens a real finding: a
+              command the engine flags High/Critical (e.g. `curl ... | bash`)
+              STILL BLOCKS even if it is listed under allowed[].
+  dangerous[] glob patterns (only `*` is supported in v1) that, when matched,
+              ADD a blocking `repo_command_dangerous_pattern` finding,
+              regardless of what the engine found. Use this to make a repo
+              STRICTER. `dangerous` wins over `allowed` — you cannot allow-list
+              your way out of a dangerous pattern.
+
+Subcommands:
+  init    write a starter .tirith/commands.yaml (refuses to overwrite without --force)
+  list    print the catalogued allowed[] / dangerous[] entries
+  run     run an allowed[] command by name (re-checked through the engine first)
+  check   evaluate an arbitrary command against the manifest + engine
+
+Examples:
+  tirith commands init
+  tirith commands list
+  tirith commands run test
+  tirith commands check -- \"npm run build\"
+  tirith commands check -- \"curl https://example.com/install.sh | bash\""
+    )]
+    RepoCmd {
+        #[command(subcommand)]
+        action: RepoCommandsAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2334,6 +2371,97 @@ Examples:
         /// Alias for --format json.
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepoCommandsAction {
+    /// Write a starter .tirith/commands.yaml for this repo
+    #[command(after_help = "\
+Writes a starter manifest with example `allowed[]` and `dangerous[]` entries to
+<repo-root>/.tirith/commands.yaml (or the current directory when not in a git
+repo). Refuses to overwrite an existing file unless --force is passed, so a
+hand-edited manifest is never clobbered.
+
+Examples:
+  tirith commands init
+  tirith commands init --force")]
+    Init {
+        /// Overwrite an existing .tirith/commands.yaml.
+        #[arg(long)]
+        force: bool,
+        /// Output format (default: human).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// List the catalogued allowed[] / dangerous[] entries
+    #[command(after_help = "\
+Prints the `allowed[]` commands (name + command) and `dangerous[]` glob
+patterns from this repo's .tirith/commands.yaml.
+
+Examples:
+  tirith commands list
+  tirith commands list --json")]
+    List {
+        /// Output format (default: human).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Run an allowed[] command by name (re-checked through the engine first)
+    #[command(after_help = "\
+Looks up the named entry under `allowed[]` and executes its command through the
+shell. Being on the allowlist suppresses only the `repo_command_unknown`
+annotation — it does NOT make a command safe to run blindly, so the resolved
+command is re-checked through the engine first and REFUSED if tirith blocks it
+(a `dangerous[]` match or any real High/Critical finding). The run is audited.
+
+Examples:
+  tirith commands run test
+  tirith commands run build")]
+    Run {
+        /// The `allowed[].name` of the command to run.
+        name: String,
+        /// Output format (default: human).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Evaluate an arbitrary command against the manifest + engine
+    #[command(after_help = "\
+Evaluates the command after `--` against this repo's .tirith/commands.yaml AND
+the full tirith engine. An uncatalogued command surfaces an Info
+`repo_command_unknown`; a `dangerous[]` glob match adds a blocking
+`repo_command_dangerous_pattern`; a command the engine flags High/Critical
+blocks regardless of the manifest. Exit code follows the verdict
+(0 allow, 1 block, 2 warn).
+
+Examples:
+  tirith commands check -- \"npm run build\"
+  tirith commands check -- \"curl https://example.com/install.sh | bash\"")]
+    Check {
+        /// Shell dialect for tokenization (posix, powershell, fish).
+        #[arg(long, default_value = "posix")]
+        shell: String,
+        /// Output format (default: human).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+        /// The command to evaluate (everything after `--`).
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
     },
 }
 
@@ -6369,6 +6497,39 @@ fn run() {
             CommandCardAction::Fetch { url, format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::command_card::fetch(&url, json)
+            }
+        },
+
+        // M11 ch2 — repo command manifest (`tirith commands ...`). The enum
+        // variant is `RepoCmd` (not `RepoCommands` — clippy's
+        // `enum_variant_names` rejects a variant ending in the enum name
+        // `Commands`); the CLI word is `commands` via
+        // `#[command(name = "commands")]`.
+        Commands::RepoCmd { action } => match action {
+            RepoCommandsAction::Init {
+                force,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::commands::init(force, json)
+            }
+            RepoCommandsAction::List { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::commands::list(json)
+            }
+            RepoCommandsAction::Run { name, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::commands::run(&name, json)
+            }
+            RepoCommandsAction::Check {
+                shell,
+                format,
+                json,
+                cmd,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::commands::check(&cmd.join(" "), &shell, json)
             }
         },
         // `temp-run` and its hidden `sandbox-dir` alias share one impl.

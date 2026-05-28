@@ -122,6 +122,10 @@ pub fn run(
                         approval_description: None,
                         escalation_reason: None,
                         agent_origin: None,
+                        // M11 ch2 — daemon responses don't carry the
+                        // repo-command-manifest match; the local fast path
+                        // would (this branch is a pre-upgrade-daemon fallback).
+                        manifest_allowed_match: None,
                     },
                     None,
                 )

@@ -451,6 +451,7 @@ mod tests {
             approval_description: None,
             escalation_reason: None,
             agent_origin: None,
+            manifest_allowed_match: None,
         };
 
         let wh = WebhookConfig {
@@ -499,6 +500,7 @@ mod tests {
             approval_description: None,
             escalation_reason: None,
             agent_origin: None,
+            manifest_allowed_match: None,
         };
 
         let wh = WebhookConfig {

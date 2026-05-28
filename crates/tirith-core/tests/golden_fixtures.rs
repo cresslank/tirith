@@ -1066,6 +1066,19 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // no-hot-path-network URL-comment case).
     "command_card_verified",
     "command_card_mismatch",
+    // M11 ch2 — repo-command-manifest rules fire from `engine::analyze` (Exec)
+    // only when a `.tirith/commands.yaml` exists on disk for the repo discovered
+    // from `ctx.cwd` (walk up to the `.git` boundary, or
+    // `TIRITH_POLICY_ROOT/.tirith/commands.yaml`). The static golden-fixture
+    // runner uses `cwd: None`, so no manifest is discovered and neither rule
+    // fires — a runtime-state trigger a text fixture cannot reproduce. Covered
+    // by unit tests in `crates/tirith-core/src/commands_manifest.rs` plus the
+    // `engine::tests::manifest_*` integration tests (including the load-bearing
+    // "manifest cannot weaken a High finding" regression) against
+    // `tempfile::tempdir()` repos. `command.toml` carries no-fire rows
+    // documenting the default (no-manifest) behavior.
+    "repo_command_unknown",
+    "repo_command_dangerous_pattern",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
