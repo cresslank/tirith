@@ -168,6 +168,7 @@ pub mod paste;
 pub mod path;
 pub mod persistence;
 pub mod policy;
+pub mod preview;
 pub mod prompt_status;
 pub mod receipt;
 pub mod scan;

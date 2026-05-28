@@ -2366,3 +2366,87 @@ examples_good = ["A hook that runs locally-installed tooling with no remote fetc
 false_positive_guidance = "Running a pinned remote tool can be legitimate. Prefer pinned versions + integrity hashes; review unfamiliar URLs / packages."
 remediation = "Review the hook (`tirith hooks explain <name>`). Pin remote packages to a version + integrity hash, or vendor them locally. Investigate URLs you do not recognize."
 mitre_id = "T1195.002"
+
+[[rule]]
+id = "blast_deletes_outside_repo"
+title = "Destructive command reaches outside the repository"
+category = "blast"
+severity_rationale = "High — `tirith preview` resolved a destructive target (rm/mv/chmod -R/find -delete/rsync --delete) to a path outside the current repository (or above the current directory). Operating destructively outside the repo boundary is how an intended `rm -rf ./build` becomes a wipe of a sibling project or a home directory."
+description = "Surfaced ONLY by `tirith preview -- \"<cmd>\"`, which walks the filesystem to resolve the command's targets. At least one target canonicalizes outside the repo root. The `tirith check` hot path never walks the filesystem and never emits this rule — it is a simulator-only signal."
+examples_bad = ["`tirith preview -- \"rm -rf ../other-project\"` from inside a repo", "`rm -rf $HOME/work` while the intended target was a repo-relative dir"]
+examples_good = ["`tirith preview -- \"rm -rf ./dist\"` showing `outside repo: no`"]
+false_positive_guidance = "Deleting outside the repo is sometimes intended (cleaning a shared cache). Confirm the resolved paths in the preview output match what you mean to remove."
+remediation = "Re-run with repo-relative paths, or double-check the absolute/`..` target in the preview output before executing. Prefer deleting from inside the directory you mean to clean."
+mitre_id = "T1485"
+
+[[rule]]
+id = "blast_writes_system_path"
+title = "Destructive command targets a system path"
+category = "blast"
+severity_rationale = "High — a destructive command (rm/mv/chmod -R/find -delete/rsync --delete) targets a broad system path (`/`, `/home`, `/usr`, `/etc`, `~`, …) by string shape alone. Even when intentional this routinely breaks the OS, removes other users' data, or strips permissions across a system tree."
+description = "Fired on the `engine::analyze` hot path by the CHEAP, filesystem-free `blast_radius::cheap_check`: the parsed target is a well-known system path. No filesystem walk is involved — this is a pure string-shape check. Run `tirith preview` for the full impact count."
+examples_bad = ["`rm -rf /`", "`rm -rf /home`", "`chmod -R 0777 /etc`", "`mv important /`"]
+examples_good = ["`rm -rf ./dist`", "`rm -rf node_modules`", "`chmod -R u+x ./scripts`"]
+false_positive_guidance = "A deliberate system-wide change (rare, usually under a package manager or with sudo) will trip this. If you truly mean a system path, you already know the risk; otherwise re-check the target."
+remediation = "Target a specific repo-relative or project path instead of a broad system directory. Run `tirith preview -- \"<cmd>\"` to see exactly what would be affected before executing."
+mitre_id = "T1485"
+
+[[rule]]
+id = "blast_symlink_traversal"
+title = "Destructive command's target tree contains symlinks"
+category = "blast"
+severity_rationale = "Medium — `tirith preview` found symbolic links inside the destructive target tree. Depending on the tool and flags, a destructive operation can traverse a link and affect files outside the visible tree. Reported at Medium because not every traversal is harmful, but it is worth reviewing."
+description = "Surfaced ONLY by `tirith preview -- \"<cmd>\"`, which walks the target tree (links are counted, never followed). The presence of symlinks is reported so you can confirm none of them point somewhere you do not intend to touch. The hot path never walks the filesystem and never emits this rule."
+examples_bad = ["A `dist/` tree containing a symlink to `/etc/hosts`, about to be `rm -rf`'d"]
+examples_good = ["A target tree with no symlinks (`symlinks: 0` in the preview output)"]
+false_positive_guidance = "Symlinks in a build tree are common and often safe to delete (the link, not its target, is removed by most tools). Review where each link points if you are unsure."
+remediation = "Inspect the symlinks listed by the preview and confirm their targets. Use tool flags that do not follow symlinks where available."
+mitre_id = "T1485"
+
+[[rule]]
+id = "blast_empty_var_glob"
+title = "Destructive command targets an empty-variable path"
+category = "blast"
+severity_rationale = "High — an argument of the shape `\"$VAR/\"` where `VAR` is unset/empty expands to `\"/\"`, so the command operates on the filesystem root. This is the classic `rm -rf \"$EMPTY/\"` footgun that wipes a machine when a build variable is never set."
+description = "Fired on the `engine::analyze` hot path by the CHEAP `blast_radius::cheap_check`: a `\"$VAR/\"`-shaped target whose variable resolves to empty in the snapshotted environment. The detector takes the environment as an injected map, so the empty-variable case is unit-tested without mutating the process environment."
+examples_bad = ["`rm -rf \"$BUILD_DIR/\"` when `BUILD_DIR` was never exported", "`rm -rf \"${PREFIX}/\"` with `PREFIX` empty"]
+examples_good = ["`rm -rf \"${BUILD_DIR:?must be set}/\"` (fails loudly if unset)", "`rm -rf \"$BUILD_DIR/\"` with `BUILD_DIR=dist` set"]
+false_positive_guidance = "If the variable is set elsewhere (a parent process, a sourced file) the static check cannot see it and may over-report. Confirm the variable is actually populated at run time."
+remediation = "Guard the variable: `\"${VAR:?VAR must be set}/\"` aborts when it is empty. Set and export the variable before the destructive command, and quote it."
+mitre_id = "T1485"
+
+[[rule]]
+id = "blast_find_delete"
+title = "find with -delete recursively removes files"
+category = "blast"
+severity_rationale = "Medium — `find … -delete` traverses the directory tree and unlinks every matching entry. A broad or mistaken predicate can remove far more than intended. Reported at Medium so it warns without blocking everyday cleanups."
+description = "Fired on the `engine::analyze` hot path by the CHEAP `blast_radius::cheap_check` when a `find` invocation carries a `-delete` action. Run `tirith preview` to see how many files the predicate would actually remove before executing."
+examples_bad = ["`find . -type f -delete`", "`find / -name '*.tmp' -delete`"]
+examples_good = ["`find . -type f -name '*.rs'` (no `-delete` — just lists)", "`find ./cache -mtime +30 -delete` after previewing the count"]
+false_positive_guidance = "Periodic cache/temp cleanups legitimately use `find -delete`. Preview the match set to confirm the predicate is scoped the way you expect."
+remediation = "Run the `find` without `-delete` first (or `tirith preview -- \"<cmd>\"`) to see what matches, then add `-delete` once the match set is confirmed."
+mitre_id = "T1485"
+
+[[rule]]
+id = "blast_rsync_delete"
+title = "rsync --delete prunes the destination"
+category = "blast"
+severity_rationale = "Medium — `rsync --delete` removes anything in the destination that is not present in the source. A swapped source/destination, a trailing-slash mistake, or an empty source can wipe the destination tree. Reported at Medium so it warns without blocking routine mirrors."
+description = "Fired on the `engine::analyze` hot path by the CHEAP `blast_radius::cheap_check` when an `rsync` invocation carries `--delete` / `--delete-*` / `--del`. The destination operand is the side that loses files. Run `tirith preview` to understand the impact."
+examples_bad = ["`rsync -a --delete /empty/ /important/` (empties the destination)", "`rsync -a --delete` with source and destination swapped"]
+examples_good = ["`rsync -a src/ dst/` (no `--delete`)", "`rsync -a --delete ./build/ ./public/` after confirming the source is correct"]
+false_positive_guidance = "Mirroring with `--delete` is a normal deploy/backup pattern. Double-check the source/destination order and trailing slashes before running."
+remediation = "Run with `--dry-run` (or `tirith preview -- \"<cmd>\"`) first to see what would be deleted on the destination, then drop `--dry-run` once confirmed."
+mitre_id = "T1485"
+
+[[rule]]
+id = "blast_large_file_count"
+title = "Destructive command affects a large number of files"
+category = "blast"
+severity_rationale = "Info — a `tirith preview` simulation counted more than 1000 files in the destructive target tree. This is not necessarily wrong, but a four-figure file count is large enough to be worth a second look before executing. Info severity never blocks."
+description = "Surfaced ONLY by `tirith preview -- \"<cmd>\"`, which walks the target tree (depth ≤ 5, capped at 100k files) and counts files. The hot path never walks the filesystem and never emits this rule — it is a simulator-only signal."
+examples_bad = ["`tirith preview -- \"rm -rf ./node_modules\"` reporting tens of thousands of files"]
+examples_good = ["`tirith preview -- \"rm -rf ./dist\"` reporting a handful of files"]
+false_positive_guidance = "Deleting a large generated tree (node_modules, target/, a cache) legitimately touches many files. The count is informational — confirm it matches the directory you mean to remove."
+remediation = "Confirm the large count corresponds to the directory you intend to delete (a generated/cache tree is expected). If the count is surprising, re-check the target path."
+mitre_id = "T1485"

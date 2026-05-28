@@ -173,6 +173,8 @@ help_example_tests! {
     help_hooks_scan            => (["hooks", "scan", "--help"], "tirith hooks scan --json");
     help_hooks_guard           => (["hooks", "guard", "--help"], "tirith hooks guard on");
     help_hooks_explain         => (["hooks", "explain", "--help"], "tirith hooks explain pre-commit");
+    // M10 ch1 — `tirith preview` blast-radius simulator.
+    help_preview               => (["preview", "--help"], "tirith preview -- \"rm -rf ./dist\"");
 }
 
 #[test]

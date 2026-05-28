@@ -738,6 +738,28 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "printenv/env piped to a network sink (M9 ch4)",
     },
     PatternEntry {
+        id: "destructive_fs_op",
+        // M10 ch1 — destructive filesystem ops (`rm`, `mv`, `chmod`, `find`,
+        // `rsync`). The PATTERN_TABLE entry is a coarse tier-1 probe; the
+        // precise "target is a system path / empty-`$VAR/` glob /
+        // `find -delete` / `rsync --delete`" matching lives in the CHEAP,
+        // filesystem-free `blast_radius::cheap_check` (hot path).
+        //
+        // The full filesystem-walking simulator (`blast_radius::simulate`)
+        // runs ONLY under explicit `tirith preview` and is NEVER reached from
+        // the hot path — see the `engine::analyze` doc-comment for the split.
+        //
+        // Word boundaries (`\b`) keep `rmdir`-style longer tokens that share a
+        // prefix out where it matters; `\brm\b` matches the `rm` leader and not
+        // `charm`/`firmware`. `find`/`rsync`/`chmod`/`mv` are likewise bounded.
+        // The cheap check re-verifies the leader token anyway, so a coarse
+        // tier-1 hit on (e.g.) `mv` in prose is harmless — it just proceeds to
+        // tier-3 where `cheap_check` finds no destructive segment.
+        tier1_exec_fragments: &[r"\b(?:rm|mv|chmod|find|rsync)\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "Destructive filesystem ops for blast-radius cheap check (M10 ch1)",
+    },
+    PatternEntry {
         id: "prompt_injection_seed",
         // M7 ch5 — paste-only fast gate for the prompt-injection rule.
         //
@@ -1225,6 +1247,14 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "RepoHookSuspiciousShellPattern",
     ),
     ("repo_hook_external_fetch", "RepoHookExternalFetch"),
+    // Blast-radius rules (M10 ch1).
+    ("blast_deletes_outside_repo", "BlastDeletesOutsideRepo"),
+    ("blast_writes_system_path", "BlastWritesSystemPath"),
+    ("blast_symlink_traversal", "BlastSymlinkTraversal"),
+    ("blast_empty_var_glob", "BlastEmptyVarGlob"),
+    ("blast_find_delete", "BlastFindDelete"),
+    ("blast_rsync_delete", "BlastRsyncDelete"),
+    ("blast_large_file_count", "BlastLargeFileCount"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -1254,6 +1284,7 @@ const VALID_CATEGORIES: &[&str] = &[
     "aliases",
     "exec",
     "hooks",
+    "blast",
 ];
 
 #[derive(Deserialize)]

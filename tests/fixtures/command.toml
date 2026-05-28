@@ -2025,3 +2025,96 @@ forbidden_rules = [
     "exec_in_repo_bin",
     "path_writable_dir_before_system",
 ]
+
+# M10 ch1 — blast-radius CHEAP hot-path subset (4 rules:
+# blast_writes_system_path, blast_empty_var_glob, blast_find_delete,
+# blast_rsync_delete).
+#
+# These fire from `engine::analyze` (Exec) via the filesystem-FREE
+# `blast_radius::cheap_check`, gated at tier-1 by the `destructive_fs_op`
+# PATTERN_TABLE entry. They are pure string-shape checks (plus an env-map
+# lookup for the empty-`$VAR/` case) — NO filesystem walk, NO glob expansion,
+# NO file counting. The 3 SIMULATOR-ONLY rules (blast_deletes_outside_repo,
+# blast_symlink_traversal, blast_large_file_count) require the filesystem walk
+# that runs ONLY under `tirith preview`, so they have NO static fixture (they
+# live in EXTERNALLY_TRIGGERED_RULES, covered by blast_radius.rs unit tests).
+#
+# IMPORTANT: the golden-fixture runner uses `cwd = None`, so cheap_check
+# snapshots the real process env. The empty-`$VAR/` fixture uses a variable
+# name that is never set in CI (`TIRITH_FIXTURE_UNSET_DIR`) so it resolves to
+# empty and the rule fires deterministically.
+
+[[fixture]]
+name = "blast_rm_rf_home_system_path"
+min_milestone = 10
+input = "rm -rf /home"
+context = "exec"
+expected_action = "block"
+expected_rules = ["blast_writes_system_path"]
+
+[[fixture]]
+name = "blast_rm_rf_root_slash_system_path"
+min_milestone = 10
+input = "rm -rf /"
+context = "exec"
+expected_action = "block"
+expected_rules = ["blast_writes_system_path"]
+
+[[fixture]]
+name = "blast_chmod_recursive_etc_system_path"
+min_milestone = 10
+input = "chmod -R 0777 /etc"
+context = "exec"
+expected_action = "block"
+expected_rules = ["blast_writes_system_path"]
+
+[[fixture]]
+name = "blast_empty_var_glob_collapses_to_root"
+min_milestone = 10
+input = 'rm -rf "$TIRITH_FIXTURE_UNSET_DIR/"'
+context = "exec"
+expected_action = "block"
+expected_rules = ["blast_empty_var_glob"]
+
+[[fixture]]
+name = "blast_find_delete_recursive_sweep"
+min_milestone = 10
+input = "find . -type f -delete"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["blast_find_delete"]
+
+[[fixture]]
+name = "blast_rsync_delete_prunes_destination"
+min_milestone = 10
+input = "rsync -a --delete src/ dst/"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["blast_rsync_delete"]
+
+[[fixture]]
+name = "blast_rm_rf_relative_dist_no_fire"
+min_milestone = 10
+input = "rm -rf ./dist"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+# The whole point of the hot/cold split: a repo-relative target is NOT a system
+# path, so the CHEAP hot-path check stays silent. Counting `./dist`'s impact is
+# `tirith preview`'s job (off the hot path), never `tirith check`'s.
+forbidden_rules = [
+    "blast_writes_system_path",
+    "blast_deletes_outside_repo",
+    "blast_large_file_count",
+    "blast_symlink_traversal",
+]
+
+[[fixture]]
+name = "blast_find_without_delete_no_fire"
+min_milestone = 10
+input = "find . -type f -name '*.rs'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+# `find` without `-delete` is not destructive — must not fire.
+forbidden_rules = ["blast_find_delete"]

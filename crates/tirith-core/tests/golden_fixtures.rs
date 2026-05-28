@@ -736,6 +736,14 @@ const ALL_RULE_IDS: &[&str] = &[
     "repo_hook_sudo",
     "repo_hook_suspicious_shell_pattern",
     "repo_hook_external_fetch",
+    // Blast-radius rules (M10 ch1)
+    "blast_deletes_outside_repo",
+    "blast_writes_system_path",
+    "blast_symlink_traversal",
+    "blast_empty_var_glob",
+    "blast_find_delete",
+    "blast_rsync_delete",
+    "blast_large_file_count",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -991,6 +999,21 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "repo_hook_sudo",
     "repo_hook_suspicious_shell_pattern",
     "repo_hook_external_fetch",
+    // M10 ch1 — blast-radius SIMULATOR-ONLY rules. These fire ONLY from
+    // `tirith preview -- "<cmd>"` via `blast_radius::simulate` +
+    // `report_findings`, which WALK THE FILESYSTEM (depth ≤ 5, ≤ 100k files),
+    // expand globs against cwd, and count files/dirs/symlinks. The
+    // `engine::analyze` golden-fixture runner never walks the filesystem (that
+    // is `preview`'s job, off the hot path), so a static text fixture cannot
+    // reproduce them — they need a real on-disk target tree. Covered by unit
+    // tests in `crates/tirith-core/src/blast_radius.rs` against
+    // `tempfile::tempdir()` trees. The FOUR CHEAP hot-path rules
+    // (`blast_writes_system_path`, `blast_empty_var_glob`, `blast_find_delete`,
+    // `blast_rsync_delete`) DO have static `command.toml` fixtures because they
+    // fire by string shape with no filesystem access.
+    "blast_deletes_outside_repo",
+    "blast_symlink_traversal",
+    "blast_large_file_count",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1350,6 +1373,14 @@ fn test_rule_id_list_is_complete() {
         RuleId::RepoHookSudo,
         RuleId::RepoHookSuspiciousShellPattern,
         RuleId::RepoHookExternalFetch,
+        // Blast-radius rules (M10 ch1)
+        RuleId::BlastDeletesOutsideRepo,
+        RuleId::BlastWritesSystemPath,
+        RuleId::BlastSymlinkTraversal,
+        RuleId::BlastEmptyVarGlob,
+        RuleId::BlastFindDelete,
+        RuleId::BlastRsyncDelete,
+        RuleId::BlastLargeFileCount,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();

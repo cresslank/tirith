@@ -1815,6 +1815,48 @@ Examples:
         #[command(subcommand)]
         action: HooksAction,
     },
+
+    /// Preview the blast radius of a destructive command (M10 ch1)
+    #[command(after_help = "\
+What this does:
+  Simulates the filesystem impact of a destructive command (rm / mv / chmod -R /
+  find … -delete / rsync --delete) WITHOUT running it. Walks the target tree
+  (depth <= 5, <= 100k files), expands globs against the current directory, and
+  reports file / dir / symlink counts, the largest file, whether any target
+  escapes the repo, and whether it writes a system path.
+
+What this is NOT:
+  - It does NOT execute the command. It only counts impact.
+  - It is NOT a sandbox or a security boundary. It reads the disk to count
+    impact and then exits.
+  - It is the ONLY tirith surface that walks the filesystem. `tirith check`
+    NEVER walks the disk — it runs only the cheap string-shape blast-radius
+    checks on the hot path.
+
+Globs expand against the current working directory, so the reported counts
+reflect the cwd at the time you run the preview.
+
+Exit codes:
+  0  no concerns
+  1  HIGH impact (system path / outside repo / empty-variable glob)
+  2  review recommended (find -delete / rsync --delete / symlinks)
+
+Examples:
+  tirith preview -- \"rm -rf ./dist\"
+  tirith preview --json -- \"find . -type f -delete\"
+  tirith preview -- \"rsync -a --delete src/ dst/\"")]
+    Preview {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+
+        /// The destructive command to simulate
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -5578,6 +5620,14 @@ fn run() {
                 cli::hooks::explain(&name, json)
             }
         },
+        Commands::Preview {
+            format,
+            json,
+            command,
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::preview::run(&command.join(" "), json)
+        }
     };
 
     std::process::exit(exit_code);

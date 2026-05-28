@@ -709,6 +709,61 @@ pub enum RuleId {
     /// reaching out to the network during a hook is worth surfacing even when it
     /// is not a raw `curl | sh`.
     RepoHookExternalFetch,
+
+    // Blast-radius rules (M10 ch1). Split into a CHEAP hot-path subset and a
+    // SIMULATOR-ONLY subset.
+    //
+    // HOT PATH (4 rules) — fire from `engine::analyze` (Exec context) via the
+    // CHEAP, filesystem-free `blast_radius::cheap_check` when the parsed leader
+    // is `rm|mv|chmod|find … -delete|rsync --delete` and a target is dangerous
+    // by STRING SHAPE alone. They are pure string compares + an injected env-map
+    // lookup (no `stat`, no walk, no glob expansion). Tier-1 gate is the
+    // `destructive_fs_op` PATTERN_TABLE entry. These four have `command.toml`
+    // fixtures: `BlastWritesSystemPath`, `BlastEmptyVarGlob`, `BlastFindDelete`,
+    // `BlastRsyncDelete`.
+    //
+    // SIMULATOR-ONLY (3 rules) — fire ONLY from explicit
+    // `tirith preview -- "<cmd>"` via `blast_radius::simulate` +
+    // `report_findings`, which WALK THE FILESYSTEM (depth ≤ 5, ≤ 100k files),
+    // expand globs against cwd, and count files/dirs/symlinks. They are NEVER
+    // reachable from the `tirith check` hot path, so they carry no static
+    // fixture and live in `EXTERNALLY_TRIGGERED_RULES`, covered by unit tests in
+    // `blast_radius.rs` against `tempfile::tempdir()` trees:
+    // `BlastDeletesOutsideRepo`, `BlastSymlinkTraversal`, `BlastLargeFileCount`.
+    /// M10 ch1 (SIMULATOR-ONLY) — a `tirith preview` simulation resolved at
+    /// least one destructive target outside the repository root (or above the
+    /// cwd when no repo root is known). High severity. Never fires on the hot
+    /// path — the filesystem walk that resolves the target tree runs only under
+    /// `tirith preview`.
+    BlastDeletesOutsideRepo,
+    /// M10 ch1 (HOT) — a destructive command (`rm`/`mv`/`chmod -R`/`find
+    /// -delete`/`rsync --delete`) targets a broad system path (`/`, `/home`,
+    /// `/usr`, `/etc`, `~`, …) by string shape alone. High severity. Cheap,
+    /// filesystem-free string compare on the hot path.
+    BlastWritesSystemPath,
+    /// M10 ch1 (SIMULATOR-ONLY) — a `tirith preview` simulation found symlinks
+    /// in the destructive target tree (counted, never followed). Medium
+    /// severity — a tool may traverse a link and reach files outside the visible
+    /// tree. Requires the filesystem walk, so it never fires on the hot path.
+    BlastSymlinkTraversal,
+    /// M10 ch1 (HOT) — a destructive command targets a `"$VAR/"`-shaped path
+    /// where `VAR` resolves to empty (`rm -rf "$EMPTY/"` with `EMPTY` unset →
+    /// `rm -rf "/"`). High severity. Detected against an injected env-map (the
+    /// hot path snapshots `std::env` once and passes it in), so the detector is
+    /// pure and the empty-var case is unit-testable without an env mutation.
+    BlastEmptyVarGlob,
+    /// M10 ch1 (HOT) — `find … -delete` recursively unlinks every matching
+    /// entry. Medium severity. Surfaced by string shape on the hot path; run
+    /// `tirith preview` for the file count.
+    BlastFindDelete,
+    /// M10 ch1 (HOT) — `rsync --delete` prunes destination files not present in
+    /// the source. Medium severity. A wrong source/dest pair wipes the
+    /// destination. Surfaced by string shape on the hot path.
+    BlastRsyncDelete,
+    /// M10 ch1 (SIMULATOR-ONLY) — a `tirith preview` simulation counted more
+    /// than 1000 files in the destructive target tree. Info severity (never
+    /// blocks). Requires the filesystem walk, so it never fires on the hot path.
+    BlastLargeFileCount,
 }
 
 impl fmt::Display for RuleId {

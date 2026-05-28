@@ -834,6 +834,38 @@ fn tmp_roots() -> Vec<std::path::PathBuf> {
 /// `git commit` is not a regex/byte signal, so the tier-1 fast-exit is forced
 /// past (only for a hook-triggering leader) when the flag is set — see the
 /// `hooks_guard_triggered` gate below.
+///
+/// # M10 ch1 — blast-radius hot/cold split (load-bearing)
+///
+/// The exec/paste hot path runs ONLY the CHEAP, filesystem-free blast-radius
+/// subset via [`crate::blast_radius::cheap_check`] (always-on, no policy flag,
+/// gated at tier-1 by the `destructive_fs_op` PATTERN_TABLE entry). When the
+/// parsed leader is a destructive op (`rm` / `mv` / `chmod` / `find … -delete` /
+/// `rsync --delete`), the cheap check emits a finding ONLY when a target is
+/// dangerous by STRING SHAPE alone:
+///
+///   * [`crate::verdict::RuleId::BlastWritesSystemPath`] (High) — target is `/`,
+///     `/home`, `/usr`, `/etc`, `~`, … by literal shape.
+///   * [`crate::verdict::RuleId::BlastEmptyVarGlob`] (High) — a `"$VAR/"`-shaped
+///     target where `VAR` resolves to empty in the env snapshot taken here and
+///     passed into the (otherwise pure) detector.
+///   * [`crate::verdict::RuleId::BlastFindDelete`] (Medium) — `find … -delete`.
+///   * [`crate::verdict::RuleId::BlastRsyncDelete`] (Medium) — `rsync --delete`.
+///
+/// The cheap check does NOT stat, walk the filesystem, expand globs, or count
+/// anything — `rm -rf ./dist` (a repo-relative target) produces no hot-path
+/// finding by design.
+///
+/// The full filesystem-walking simulator
+/// ([`crate::blast_radius::simulate`] + [`crate::blast_radius::report_findings`])
+/// runs ONLY under explicit `tirith preview -- "<cmd>"`. It walks the target
+/// tree (depth ≤ 5, ≤ 100k files), expands globs against the cwd, counts
+/// files/dirs/symlinks, and emits the SIMULATOR-ONLY rules
+/// ([`BlastDeletesOutsideRepo`](crate::verdict::RuleId::BlastDeletesOutsideRepo),
+/// [`BlastSymlinkTraversal`](crate::verdict::RuleId::BlastSymlinkTraversal),
+/// [`BlastLargeFileCount`](crate::verdict::RuleId::BlastLargeFileCount)). It is
+/// NEVER reachable from this `analyze` path — the `tirith check` hot path never
+/// walks the filesystem; that is `preview`'s job.
 pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     analyze_inner(ctx).0
 }
@@ -1329,6 +1361,25 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             if policy.hooks_guard_enabled {
                 findings.extend(check_repo_hooks_hot(ctx));
             }
+
+            // M10 ch1 — blast-radius CHEAP subset. Always-on (no policy flag),
+            // gated at tier-1 by the `destructive_fs_op` PATTERN_TABLE entry.
+            // This runs ONLY the filesystem-free string-shape check
+            // (`blast_radius::cheap_check`): a destructive leader
+            // (rm/mv/chmod/find -delete/rsync --delete) whose target is
+            // obviously dangerous by shape (`/`, `/home`, `/usr`, `~`, or a
+            // `"$VAR/"` glob with an empty VAR). The env snapshot is taken ONCE
+            // here and passed in so the detector stays pure (no std::env read
+            // inside the rule — the libc setenv race, PR #125).
+            //
+            // The full filesystem-walking simulator
+            // (`blast_radius::simulate` + `report_findings`) is NEVER called
+            // here — it runs ONLY under explicit `tirith preview`. See the
+            // `analyze` doc-comment for the hot/cold split.
+            let blast_env = crate::blast_radius::env_snapshot();
+            findings.extend(crate::blast_radius::cheap_check(
+                &ctx.input, ctx.shell, &blast_env,
+            ));
         }
 
         let cred_findings =

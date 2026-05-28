@@ -306,7 +306,16 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::RepoHookCredentialRead
         | RuleId::RepoHookSudo
         | RuleId::RepoHookSuspiciousShellPattern
-        | RuleId::RepoHookExternalFetch => false,
+        | RuleId::RepoHookExternalFetch
+        // M10 ch1 — blast-radius rules. Structural/simulation heuristics on a
+        // destructive command's targets; no threat-DB involvement.
+        | RuleId::BlastDeletesOutsideRepo
+        | RuleId::BlastWritesSystemPath
+        | RuleId::BlastSymlinkTraversal
+        | RuleId::BlastEmptyVarGlob
+        | RuleId::BlastFindDelete
+        | RuleId::BlastRsyncDelete
+        | RuleId::BlastLargeFileCount => false,
     }
 }
 
