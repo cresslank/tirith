@@ -1890,3 +1890,126 @@ examples_good = ["docker exec my-dev-container /bin/sh  # no label", "docker log
 false_positive_guidance = "Unlabel the container if it's no longer production (`tirith context label container:<name> dev --scope user` — labels file overwrite). Or accept the audit-trail entry and continue."
 remediation = "Use `docker logs <container>` for read-only inspection. For mutations, prefer the upstream deploy pipeline rather than `docker exec` into a live container — the latter leaves no audit trail outside tirith's local log."
 mitre_id = "T1059"
+
+# M9 ch1 — workstation file-permission / credential-file hygiene rules.
+# These fire only from `tirith hygiene scan|fix`, never the engine hot path.
+
+[[rule]]
+id = "hygiene_private_key_loose_perms"
+title = "SSH private key is group- or other-accessible"
+category = "hygiene"
+severity_rationale = "High — an SSH private key readable by any account other than the owner can be copied and used to impersonate you. ssh itself refuses to use keys with loose permissions for this reason."
+description = "A `~/.ssh/id_*` private key (a file named `id_*` without a `.pub` suffix) has permission bits granting group or other any access (`mode & 0o077 != 0`). The comparison is mask-based, so a key at 0600 passes regardless of file-type / sticky bits across macOS and Linux."
+examples_bad = ["~/.ssh/id_ed25519 with mode 0644", "~/.ssh/id_rsa with mode 0640"]
+examples_good = ["~/.ssh/id_ed25519 with mode 0600", "~/.ssh/id_rsa.pub with mode 0644  # public key, fine"]
+false_positive_guidance = "Public keys (`*.pub`) are never flagged. If a key is intentionally shared via a group, that is still unsafe for a private key — move shared material out of ~/.ssh."
+remediation = "Run `chmod 0600 ~/.ssh/id_*`. `tirith hygiene fix` can apply this for you (chmod-only)."
+mitre_id = "T1552.004"
+
+[[rule]]
+id = "hygiene_env_world_readable"
+title = "Repo .env file is world-readable"
+category = "hygiene"
+severity_rationale = "High — `.env` files routinely hold API keys, database passwords, and tokens. World-readable permissions expose those secrets to every local account."
+description = "A `.env` / `.env.*` / `*.env` file in the repo tree has the other-read bit set (`mode & 0o004 != 0`). The repo walk skips `.git`, `node_modules`, `target`, and `vendor`."
+examples_bad = [".env with mode 0644", ".env.production with mode 0644"]
+examples_good = [".env with mode 0600", ".env.local with mode 0640  # group-only, not world-readable"]
+false_positive_guidance = "A `.env.example` with placeholder values is harmless even if world-readable; tirith still flags it on permissions alone — chmod it or rename it if it carries no secrets."
+remediation = "Run `chmod 0600 <file>`. `tirith hygiene fix` can apply this for you (chmod-only). Also ensure `.env` is in .gitignore."
+mitre_id = "T1552.001"
+
+[[rule]]
+id = "hygiene_kubeconfig_group_readable"
+title = "kubeconfig is group- or other-accessible"
+category = "hygiene"
+severity_rationale = "Medium — `~/.kube/config` embeds cluster credentials (client certs, bearer tokens). Group/other access leaks them to co-tenants on a shared host. Medium (not High) because the common distro default is 0644 and the threat is local-multiuser."
+description = "`~/.kube/config` has permission bits granting group or other any access (`mode & 0o077 != 0`)."
+examples_bad = ["~/.kube/config with mode 0644"]
+examples_good = ["~/.kube/config with mode 0600"]
+false_positive_guidance = "On a single-user workstation the practical risk is low, but locking the file down costs nothing. Accept-and-continue is reasonable on a machine only you can log into."
+remediation = "Run `chmod 0600 ~/.kube/config`. `tirith hygiene fix` can apply this for you (chmod-only)."
+mitre_id = "T1552.001"
+
+[[rule]]
+id = "hygiene_npmrc_plaintext_token"
+title = ".npmrc carries a plaintext registry token"
+category = "hygiene"
+severity_rationale = "High — a literal `_authToken` in `~/.npmrc` is a long-lived publish/install credential sitting in cleartext on disk and is trivially exfiltrated by any process running as you."
+description = "`~/.npmrc` contains an `_authToken` / `_password` / `_auth` assignment whose value is a literal (not an `${ENV}` reference)."
+examples_bad = ["//registry.npmjs.org/:_authToken=npm_abcdef0123456789..."]
+examples_good = ["//registry.npmjs.org/:_authToken=${NPM_TOKEN}"]
+false_positive_guidance = "Env-reference forms (`${NPM_TOKEN}`) are the recommended pattern and are never flagged."
+remediation = "Replace the literal token with `${NPM_TOKEN}` (resolved from your environment / a secret manager) and rotate the exposed token. tirith does NOT edit the file — this is a manual fix."
+mitre_id = "T1552.001"
+
+[[rule]]
+id = "hygiene_pypirc_plaintext_token"
+title = ".pypirc carries a plaintext password or API token"
+category = "hygiene"
+severity_rationale = "High — a literal `password` or `pypi-…` upload token in `~/.pypirc` is a PyPI publish credential in cleartext."
+description = "`~/.pypirc` contains a `password` assignment with a literal value, or a literal `pypi-…` API token in a value position."
+examples_bad = ["password = pypi-AgEIcHlwaS5vcmc..."]
+examples_good = ["username = __token__  # with the token supplied via keyring or ${TWINE_PASSWORD}"]
+false_positive_guidance = "A bare `username = __token__` with no literal password is the keyring/env-indirection pattern and is not flagged."
+remediation = "Use a keyring-backed credential or a `${TWINE_PASSWORD}` env reference and rotate the exposed token. tirith does NOT edit the file — this is a manual fix."
+mitre_id = "T1552.001"
+
+[[rule]]
+id = "hygiene_ssh_config_unsafe_include"
+title = "SSH config Include resolves outside ~/.ssh"
+category = "hygiene"
+severity_rationale = "Medium — an `Include` directive pointing outside `~/.ssh` (especially a world-writable location like /tmp) lets another process inject `ProxyCommand` / `LocalCommand` / identity directives that ssh will execute on your behalf."
+description = "`~/.ssh/config` contains an `Include` directive whose target is an absolute path outside `~/.ssh`, a `~/…` path outside `.ssh`, or a relative path that climbs out with `../`."
+examples_bad = ["Include /tmp/evil_ssh_config", "Include ~/Downloads/extra_config", "Include ../../etc/ssh_overrides"]
+examples_good = ["Include config.d/*", "Include ~/.ssh/work_config"]
+false_positive_guidance = "Relative includes resolve under ~/.ssh by ssh's own rules and are fine. If you intentionally include a managed file elsewhere, verify it is owned by you and not group/world-writable."
+remediation = "Confine SSH includes to ~/.ssh, or verify the external target is owned by you with 0600 perms. tirith does NOT edit the file — this is a manual fix."
+mitre_id = "T1098.004"
+
+[[rule]]
+id = "hygiene_git_credential_helper_store"
+title = "git credential.helper = store writes plaintext credentials"
+category = "hygiene"
+severity_rationale = "Medium — the `store` helper persists every git credential (including HTTPS tokens) as cleartext in ~/.git-credentials with no expiry. An encrypted OS keychain helper is the safe alternative."
+description = "`~/.gitconfig` sets `credential.helper = store`, either as a one-line `credential.helper = store` or as `helper = store` inside a `[credential]` section."
+examples_bad = ["[credential]\\n\\thelper = store"]
+examples_good = ["[credential]\\n\\thelper = osxkeychain", "[credential]\\n\\thelper = libsecret"]
+false_positive_guidance = "If you genuinely need a file-backed helper (e.g. a headless CI box with no keychain), `cache` (in-memory, expiring) is safer than `store`. Accept the finding only if you understand the tradeoff."
+remediation = "Switch to an OS keychain helper: `git config --global credential.helper osxkeychain` (macOS) or `libsecret` (Linux), then delete ~/.git-credentials. tirith does NOT edit the file — this is a manual fix."
+mitre_id = "T1552.001"
+
+[[rule]]
+id = "hygiene_shell_history_secret_like"
+title = "Shell history contains credential-shaped text"
+category = "hygiene"
+severity_rationale = "Medium — secrets typed on the command line are recorded verbatim in shell history files, which are world-readable on some systems and routinely synced to dotfile repos. Medium because the detection is heuristic and the history file is owner-readable by default."
+description = "A shell history (`~/.bash_history`, `~/.zsh_history`, `~/.history`, fish history) contains text matching tirith's SHIPPING high-confidence credential detector (`rules::credential`, the same provider-pattern + entropy gate the paste interceptor uses). No new regex is introduced for history scanning to keep false positives low."
+examples_bad = ["aws configure set aws_access_key_id AKIAIOSFODNN7EXAMPLE  # in ~/.bash_history"]
+examples_good = ["git status\\ncargo build  # ordinary commands"]
+false_positive_guidance = "The detector reuses the paste-interceptor's high-confidence patterns, but any heuristic can over-match. Inspect the flagged history file before acting; a base64 blob or a long hash can look secret-shaped."
+remediation = "Scrub the offending lines from the history file and rotate any exposed credential. Set `HISTIGNORE`/`HISTCONTROL` (bash) or `HIST_IGNORE_SPACE` (zsh) to avoid recording secret-bearing commands. tirith does NOT edit the file — this is a manual fix."
+mitre_id = "T1552.003"
+
+[[rule]]
+id = "hygiene_cloud_creds_bad_perms"
+title = "AWS credentials file is group- or other-accessible"
+category = "hygiene"
+severity_rationale = "High — `~/.aws/credentials` holds long-lived access keys. Group/other read access lets any co-tenant copy them and assume your AWS identity."
+description = "`~/.aws/credentials` (or `~/.aws/config`) has permission bits granting group or other any access (`mode & 0o077 != 0`)."
+examples_bad = ["~/.aws/credentials with mode 0644"]
+examples_good = ["~/.aws/credentials with mode 0600"]
+false_positive_guidance = "Prefer short-lived credentials (SSO / `aws sts`) over long-lived keys entirely. If the file must exist, lock it to 0600."
+remediation = "Run `chmod 0600 ~/.aws/credentials`. `tirith hygiene fix` can apply this for you (chmod-only). Consider migrating to AWS SSO for short-lived credentials."
+mitre_id = "T1552.001"
+
+[[rule]]
+id = "hygiene_db_dump_in_repo"
+title = "Database dump present in the repository"
+category = "hygiene"
+severity_rationale = "Medium — `*.dump` / `*.sql` files committed (or sitting) in a repo frequently contain production PII, password hashes, or embedded credentials, and are easy to leak via a push or an archive."
+description = "A `*.dump` or `*.sql` file exists in the repo tree (the walk skips `.git`, `node_modules`, `target`, `vendor`, and dot-directories)."
+examples_bad = ["backup.sql in the repo root", "snapshot.dump committed to the repo"]
+examples_good = ["schema migration .sql files under db/migrations/  # structure only, no data — review and allowlist if intended"]
+false_positive_guidance = "Schema-only migration `.sql` files are legitimate. tirith flags on extension alone — review the file; if it carries no data, this is a false positive you can ignore."
+remediation = "Move the dump out of the repo and add the pattern to .gitignore. If it was committed, scrub it from history (`git filter-repo`). tirith NEVER moves or deletes files — this is a manual fix."
+mitre_id = "T1552.001"

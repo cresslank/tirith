@@ -142,6 +142,10 @@ help_example_tests! {
     help_codespaces            => (["codespaces", "--help"], "tirith codespaces setup");
     help_codespaces_setup      => (["codespaces", "setup", "--help"], "tirith codespaces setup");
     help_codespaces_inject     => (["codespaces", "inject", "--help"], "tirith codespaces inject");
+    // M9 ch1 — `tirith hygiene scan|fix`.
+    help_hygiene               => (["hygiene", "--help"], "tirith hygiene scan");
+    help_hygiene_scan          => (["hygiene", "scan", "--help"], "tirith hygiene scan --json");
+    help_hygiene_fix           => (["hygiene", "fix", "--help"], "tirith hygiene fix --dry-run");
 }
 
 #[test]

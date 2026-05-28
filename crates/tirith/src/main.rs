@@ -1561,6 +1561,47 @@ Examples:
         #[command(subcommand)]
         action: CodespacesAction,
     },
+
+    /// Audit local credential-file / permission hygiene (M9 ch1)
+    #[command(after_help = "\
+Subcommands:
+  tirith hygiene scan                             — walk ~/.ssh, ~/.aws,
+        [--json]                                    ~/.kube/config, ~/.npmrc,
+                                                    ~/.pypirc, ~/.gitconfig,
+                                                    shell histories, and the
+                                                    repo root; report
+                                                    hygiene issues. Exit 1 if
+                                                    any High/Critical finding.
+  tirith hygiene fix                              — apply chmod-only fixes.
+        [--dry-run] [--yes] [--json]                Per-finding confirmation
+                                                    unless --yes. NEVER moves,
+                                                    edits, or deletes files.
+
+What it catches:
+  ~/.ssh/id_* not 0600                            — High (auto-fix: chmod).
+  ~/.aws/credentials loose perms                  — High (auto-fix: chmod).
+  repo .env world-readable                        — High (auto-fix: chmod).
+  ~/.kube/config group-readable                   — Medium (auto-fix: chmod).
+  ~/.npmrc / ~/.pypirc plaintext token            — High (manual fix).
+  ~/.ssh/config unsafe Include                    — Medium (manual fix).
+  ~/.gitconfig credential.helper = store          — Medium (manual fix).
+  shell history with credential-shaped text       — Medium (manual fix).
+  *.dump / *.sql in the repo                       — Medium (manual fix).
+
+`fix` is chmod-only by design: the only automated remediation is
+`chmod 0600` on a loose-permission file. Token / location / config
+problems are reported with guidance but never auto-applied — tirith
+never moves, edits, or deletes your files.
+
+Examples:
+  tirith hygiene scan
+  tirith hygiene scan --json
+  tirith hygiene fix --dry-run
+  tirith hygiene fix --yes")]
+    Hygiene {
+        #[command(subcommand)]
+        action: HygieneAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2003,6 +2044,71 @@ Examples:
         /// Create a minimal devcontainer.json if one does not exist.
         #[arg(long)]
         create: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum HygieneAction {
+    /// Walk sensitive paths + the repo root and report hygiene issues
+    #[command(after_help = "\
+What it walks:
+  ~/.ssh (private-key perms, config Include directives), ~/.aws
+  (credentials perms), ~/.kube/config (perms), ~/.npmrc + ~/.pypirc
+  (plaintext tokens), ~/.gitconfig (credential.helper = store), shell
+  histories (credential-shaped text via the shipping credential
+  detector — no new regex), and the current repo root for stray
+  *.dump / *.sql / world-readable *.env* files.
+
+Exit codes:
+  0  no High/Critical finding (clean, or only Medium/Low).
+  1  at least one High/Critical finding.
+
+Examples:
+  tirith hygiene scan
+  tirith hygiene scan --json")]
+    Scan {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Apply chmod-only fixes (never moves / edits / deletes files)
+    #[command(after_help = "\
+What it fixes:
+  ONLY loose file permissions, via `chmod 0600`. Token / location /
+  config problems are reported with guidance but NEVER auto-applied.
+  tirith never moves, edits, or deletes your files.
+
+Confirmation:
+  By default each chmod is confirmed interactively. `--yes` applies
+  every chmod fix without prompting. `--dry-run` previews and applies
+  nothing. In a non-TTY context without `--yes`, every fix is skipped.
+
+Exit codes:
+  0  nothing to fix, all fixes applied, or dry-run completed.
+  1  at least one chmod fix failed to apply.
+
+Examples:
+  tirith hygiene fix --dry-run
+  tirith hygiene fix
+  tirith hygiene fix --yes
+  tirith hygiene fix --yes --json")]
+    Fix {
+        /// Show what would change without applying anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply every chmod fix without per-finding confirmation.
+        #[arg(long)]
+        yes: bool,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -4636,6 +4742,22 @@ fn run() {
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::codespaces::inject(path.as_deref(), create, json)
+            }
+        },
+
+        Commands::Hygiene { action } => match action {
+            HygieneAction::Scan { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::hygiene::scan(json)
+            }
+            HygieneAction::Fix {
+                dry_run,
+                yes,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::hygiene::fix(dry_run, yes, json)
             }
         },
     };

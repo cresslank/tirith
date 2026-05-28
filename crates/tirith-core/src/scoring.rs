@@ -252,7 +252,19 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         // labels keyed by `container:<name>`. No threat-DB involvement.
         | RuleId::DockerRunPrivileged
         | RuleId::DockerRunSensitiveBindMount
-        | RuleId::DockerExecProdContainer => false,
+        | RuleId::DockerExecProdContainer
+        // M9 ch1 — workstation hygiene rules. Filesystem perm/contents/
+        // location checks from `tirith hygiene`; no threat-DB involvement.
+        | RuleId::HygienePrivateKeyLoosePerms
+        | RuleId::HygieneEnvWorldReadable
+        | RuleId::HygieneKubeconfigGroupReadable
+        | RuleId::HygieneNpmrcPlaintextToken
+        | RuleId::HygienePypircPlaintextToken
+        | RuleId::HygieneSshConfigUnsafeInclude
+        | RuleId::HygieneGitCredentialHelperStore
+        | RuleId::HygieneShellHistorySecretLike
+        | RuleId::HygieneCloudCredsBadPerms
+        | RuleId::HygieneDbDumpInRepo => false,
     }
 }
 

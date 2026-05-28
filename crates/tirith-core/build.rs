@@ -1114,6 +1114,38 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "DockerRunSensitiveBindMount",
     ),
     ("docker_exec_prod_container", "DockerExecProdContainer"),
+    // Workstation hygiene rules (M9 ch1).
+    (
+        "hygiene_private_key_loose_perms",
+        "HygienePrivateKeyLoosePerms",
+    ),
+    ("hygiene_env_world_readable", "HygieneEnvWorldReadable"),
+    (
+        "hygiene_kubeconfig_group_readable",
+        "HygieneKubeconfigGroupReadable",
+    ),
+    (
+        "hygiene_npmrc_plaintext_token",
+        "HygieneNpmrcPlaintextToken",
+    ),
+    (
+        "hygiene_pypirc_plaintext_token",
+        "HygienePypircPlaintextToken",
+    ),
+    (
+        "hygiene_ssh_config_unsafe_include",
+        "HygieneSshConfigUnsafeInclude",
+    ),
+    (
+        "hygiene_git_credential_helper_store",
+        "HygieneGitCredentialHelperStore",
+    ),
+    (
+        "hygiene_shell_history_secret_like",
+        "HygieneShellHistorySecretLike",
+    ),
+    ("hygiene_cloud_creds_bad_perms", "HygieneCloudCredsBadPerms"),
+    ("hygiene_db_dump_in_repo", "HygieneDbDumpInRepo"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -1138,6 +1170,7 @@ const VALID_CATEGORIES: &[&str] = &[
     "threatintel",
     "output",
     "context",
+    "hygiene",
 ];
 
 #[derive(Deserialize)]

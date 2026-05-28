@@ -458,6 +458,54 @@ pub enum RuleId {
     /// because reading logs is often legitimate even on a prod
     /// container.
     DockerExecProdContainer,
+
+    // Workstation file-permission / credential-file hygiene rules (M9 ch1).
+    // These fire ONLY from the `tirith hygiene scan|fix` filesystem walk
+    // (`crate::hygiene`), never from the `engine::analyze` exec/paste hot
+    // path or `analyze_output`. They are perm-/contents-/location-based
+    // checks against well-known sensitive paths under `~` and the repo root,
+    // so they carry no PATTERN_TABLE entry and live in
+    // `EXTERNALLY_TRIGGERED_RULES`. Covered by unit tests in `hygiene.rs`.
+    /// M9 ch1 — a `~/.ssh/id_*` private key is group- or other-accessible
+    /// (`mode & 0o077 != 0`). High severity. Auto-fixable via `chmod 0600`.
+    HygienePrivateKeyLoosePerms,
+    /// M9 ch1 — a repo `.env` / `.env.*` file is world-readable
+    /// (`mode & 0o004 != 0`). High severity — env files routinely hold
+    /// API keys and DB passwords. Auto-fixable via `chmod 0600`.
+    HygieneEnvWorldReadable,
+    /// M9 ch1 — `~/.kube/config` is group- or other-accessible. Medium
+    /// severity (common distro default is 0644; the threat is local-
+    /// multiuser). Auto-fixable via `chmod 0600`.
+    HygieneKubeconfigGroupReadable,
+    /// M9 ch1 — `~/.npmrc` carries a literal `_authToken` / `_password`
+    /// (not an `${ENV}` reference). High severity — a publish/install
+    /// credential on disk. Manual fix (rotate + env-indirect).
+    HygieneNpmrcPlaintextToken,
+    /// M9 ch1 — `~/.pypirc` carries a literal `password` / `pypi-…` token.
+    /// High severity. Manual fix (keyring / env reference + rotate).
+    HygienePypircPlaintextToken,
+    /// M9 ch1 — `~/.ssh/config` contains an `Include` directive that
+    /// resolves outside `~/.ssh` (absolute path elsewhere, `~/…` outside
+    /// `.ssh`, or a `../` escape). Medium severity. Manual fix (review).
+    HygieneSshConfigUnsafeInclude,
+    /// M9 ch1 — `~/.gitconfig` sets `credential.helper = store`, which
+    /// persists every git credential as cleartext in `~/.git-credentials`.
+    /// Medium severity. Manual fix (switch to an OS keychain helper).
+    HygieneGitCredentialHelperStore,
+    /// M9 ch1 — a shell history (`~/.bash_history`, `~/.zsh_history`, …)
+    /// contains credential-shaped text, detected with the SHIPPING
+    /// high-confidence credential detector (`rules::credential`), not a new
+    /// regex. Medium severity. Manual fix (scrub + rotate).
+    HygieneShellHistorySecretLike,
+    /// M9 ch1 — `~/.aws/credentials` (or `~/.aws/config`) is group- or
+    /// other-accessible. High severity — long-lived cloud access keys.
+    /// Auto-fixable via `chmod 0600`.
+    HygieneCloudCredsBadPerms,
+    /// M9 ch1 — a `*.dump` / `*.sql` database dump is present in the repo
+    /// tree (outside `.git` / `node_modules` / `target` / `vendor`).
+    /// Medium severity — dumps frequently carry PII / credentials. Manual
+    /// fix (move out of repo + .gitignore; tirith never deletes files).
+    HygieneDbDumpInRepo,
 }
 
 impl fmt::Display for RuleId {

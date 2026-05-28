@@ -16,6 +16,7 @@ pub mod engine;
 pub mod escalation;
 pub mod extract;
 pub mod homoglyph;
+pub mod hygiene;
 pub mod iac_plan;
 pub mod install_script_analysis;
 pub mod install_txn;

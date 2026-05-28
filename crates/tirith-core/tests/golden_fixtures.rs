@@ -692,6 +692,17 @@ const ALL_RULE_IDS: &[&str] = &[
     "docker_run_privileged",
     "docker_run_sensitive_bind_mount",
     "docker_exec_prod_container",
+    // Workstation hygiene rules (M9 ch1)
+    "hygiene_private_key_loose_perms",
+    "hygiene_env_world_readable",
+    "hygiene_kubeconfig_group_readable",
+    "hygiene_npmrc_plaintext_token",
+    "hygiene_pypirc_plaintext_token",
+    "hygiene_ssh_config_unsafe_include",
+    "hygiene_git_credential_helper_store",
+    "hygiene_shell_history_secret_like",
+    "hygiene_cloud_creds_bad_perms",
+    "hygiene_db_dump_in_repo",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -838,6 +849,27 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // `docker_run_sensitive_bind_mount` rules DO have static fixtures
     // (see `command.toml`).
     "docker_exec_prod_container",
+    // M9 ch1 — workstation hygiene rules fire ONLY from the
+    // `tirith hygiene scan|fix` filesystem walk (`crate::hygiene`), never
+    // from `engine::analyze` (the golden-fixture runner) or
+    // `analyze_output`. They are perm-/contents-/location-based checks
+    // against well-known sensitive paths under `~` + the repo root, which
+    // static text fixtures cannot reproduce (they need real files with
+    // real mode bits, not an input string). Covered by unit tests in
+    // `crates/tirith-core/src/hygiene.rs` (one positive + one negative per
+    // rule, using `tempfile::tempdir()`), following the M8 runtime-state
+    // pattern. The `configfile.toml` fixtures document the no-fire engine
+    // behavior for the file-content shapes.
+    "hygiene_private_key_loose_perms",
+    "hygiene_env_world_readable",
+    "hygiene_kubeconfig_group_readable",
+    "hygiene_npmrc_plaintext_token",
+    "hygiene_pypirc_plaintext_token",
+    "hygiene_ssh_config_unsafe_include",
+    "hygiene_git_credential_helper_store",
+    "hygiene_shell_history_secret_like",
+    "hygiene_cloud_creds_bad_perms",
+    "hygiene_db_dump_in_repo",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1153,6 +1185,17 @@ fn test_rule_id_list_is_complete() {
         RuleId::DockerRunPrivileged,
         RuleId::DockerRunSensitiveBindMount,
         RuleId::DockerExecProdContainer,
+        // Workstation hygiene rules (M9 ch1)
+        RuleId::HygienePrivateKeyLoosePerms,
+        RuleId::HygieneEnvWorldReadable,
+        RuleId::HygieneKubeconfigGroupReadable,
+        RuleId::HygieneNpmrcPlaintextToken,
+        RuleId::HygienePypircPlaintextToken,
+        RuleId::HygieneSshConfigUnsafeInclude,
+        RuleId::HygieneGitCredentialHelperStore,
+        RuleId::HygieneShellHistorySecretLike,
+        RuleId::HygieneCloudCredsBadPerms,
+        RuleId::HygieneDbDumpInRepo,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();
