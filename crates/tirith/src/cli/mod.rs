@@ -178,6 +178,7 @@ pub mod prompt_status;
 pub mod receipt;
 pub mod scan;
 pub mod score;
+pub mod secret;
 pub mod selfupdate;
 pub mod share;
 pub mod ssh;

@@ -212,6 +212,77 @@ help_example_tests! {
     help_canary_list           => (["canary", "list", "--help"], "tirith canary list");
     help_canary_prune          => (["canary", "prune", "--help"], "tirith canary prune a1b2c3d4e5f6 --yes");
     help_canary_rotate         => (["canary", "rotate", "--help"], "tirith canary rotate a1b2c3d4e5f6");
+    // M11 ch4 — `tirith secret triage|rotate|revoke` (guidance-only assistant).
+    help_secret                => (["secret", "--help"], "tirith secret rotate github");
+    help_secret_triage         => (["secret", "triage", "--help"], "tirith secret triage --json");
+    help_secret_rotate         => (["secret", "rotate", "--help"], "tirith secret rotate github");
+    help_secret_revoke         => (["secret", "revoke", "--help"], "tirith secret revoke --provider aws");
+}
+
+/// The dominant requirement for `tirith secret` is HONESTY: every surface must
+/// state plainly that tirith does NOT rotate/revoke (the user does) and that it
+/// makes zero network calls. Pin both so a future edit can't soften them.
+///
+/// Assertions match single, unsplittable tokens (`rotation`, `revocation`,
+/// `NOT`, `network`) rather than multi-word phrases: clap line-wraps
+/// `after_help` at a terminal-width-dependent column, so a phrase like "does
+/// NOT perform rotation" can land split across a line break in CI. Tokens
+/// can't be split mid-word, so the contract stays pinned without being
+/// brittle to wrap width.
+#[test]
+fn help_secret_states_assistant_only_and_no_network() {
+    for args in [
+        &["secret", "--help"][..],
+        &["secret", "triage", "--help"][..],
+        &["secret", "rotate", "--help"][..],
+        &["secret", "revoke", "--help"][..],
+    ] {
+        let out = tirith().args(args).output().expect("failed to run tirith");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let lower = stdout.to_ascii_lowercase();
+        // Honesty: tirith does NOT perform rotation / revocation.
+        assert!(
+            stdout.contains("NOT")
+                && (lower.contains("rotation") || lower.contains("rotate"))
+                && (lower.contains("revocation") || lower.contains("revoke")),
+            "{args:?} --help must carry the 'tirith does NOT rotate/revoke' honesty banner, got:\n{stdout}"
+        );
+        // Zero network calls.
+        assert!(
+            lower.contains("network"),
+            "{args:?} --help must state it makes zero network calls, got:\n{stdout}"
+        );
+    }
+}
+
+/// The unknown-provider error must list all 11 valid providers so the user can
+/// self-correct without reading docs.
+#[test]
+fn secret_rotate_unknown_provider_lists_all_eleven() {
+    let out = tirith()
+        .args(["secret", "rotate", "definitely-not-a-provider"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(2), "unknown provider must exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for p in [
+        "aws",
+        "github",
+        "npm",
+        "pypi",
+        "cargo",
+        "stripe",
+        "slack",
+        "openai",
+        "anthropic",
+        "gcp",
+        "azure",
+    ] {
+        assert!(
+            stderr.contains(p),
+            "unknown-provider error must list '{p}', got:\n{stderr}"
+        );
+    }
 }
 
 /// The dominant requirement for `temp-run` is honesty-of-claim: the help text

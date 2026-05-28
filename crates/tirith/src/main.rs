@@ -2301,6 +2301,133 @@ Examples:
         #[command(subcommand)]
         action: CanaryAction,
     },
+
+    /// Secret-rotation ASSISTANT: where + how to rotate a leak (M11 ch4)
+    #[command(after_help = "\
+tirith does NOT perform rotation or revocation; it shows you where and how.
+YOU do the rotation. This is a guidance-only assistant.
+
+It makes ZERO network calls — the revocation and doc URLs it prints are inert
+strings for you to open yourself. No HTTP client is ever constructed.
+
+Subcommands:
+  triage                  scan RECENT credential findings in the local audit
+                          log and print a one-line rotation next-step for each
+  rotate <provider>       show a provider's revocation URL, docs, and the
+                          manual checklist you perform
+  revoke --provider <p>   same data, leading with the revocation URL
+
+Providers (11): aws, github, npm, pypi, cargo, stripe, slack, openai,
+anthropic, gcp, azure.
+
+triage reads credential-type findings already recorded by the engine
+(credential_in_text, high_entropy_secret, private_key_exposed,
+canary_token_touched, and the threat-DB package rules) — it adds no new
+detection and no new rule IDs. It only ever sees the engine's REDACTED command
+text, never raw secret values.
+
+Guidance staleness: each provider entry carries a last_verified date, shown
+under --verbose, so a stale entry is visible rather than silently trusted.
+
+Examples:
+  tirith secret triage
+  tirith secret triage --json
+  tirith secret rotate github
+  tirith secret rotate github --verbose
+  tirith secret revoke --provider aws")]
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretAction {
+    /// Scan recent audit findings and print a rotation next-step per leak
+    #[command(after_help = "\
+Reads RECENT credential-type findings from the local audit log and prints a
+one-line rotation next-step for each, attributing the leak to a provider where
+the shape is recognizable. ZERO network calls. tirith does NOT perform rotation
+or revocation — it points you at the right revocation page; YOU rotate.
+
+Only the engine's already-REDACTED command text is read; raw secret values are
+never seen. Exit code 0 whether or not findings exist (1 only if the audit log
+cannot be read).
+
+Examples:
+  tirith secret triage
+  tirith secret triage --verbose
+  tirith secret triage --json")]
+    Triage {
+        /// Show extra detail per finding (redacted text, docs URL, verified date).
+        #[arg(long)]
+        verbose: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Show a provider's revocation URL, docs, and manual rotation checklist
+    #[command(after_help = "\
+Prints where to revoke/regenerate the credential, the provider's docs, and the
+step-by-step checklist YOU perform. ZERO network calls — the URLs are inert
+strings. tirith does NOT perform rotation or revocation; YOU do.
+
+<provider> is one of: aws, github, npm, pypi, cargo, stripe, slack, openai,
+anthropic, gcp, azure. An unknown provider errors with the valid list.
+
+--verbose additionally shows the guidance's last_verified date and the
+triage shapes used to attribute leaks to this provider.
+
+Examples:
+  tirith secret rotate github
+  tirith secret rotate aws --verbose
+  tirith secret rotate stripe --json")]
+    Rotate {
+        /// The provider to rotate (aws, github, npm, pypi, cargo, stripe,
+        /// slack, openai, anthropic, gcp, azure).
+        provider: String,
+        /// Show the guidance's last_verified date and triage shapes.
+        #[arg(long)]
+        verbose: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Lead with a provider's revocation URL, then the checklist
+    #[command(after_help = "\
+Like `rotate`, but leads with the revocation URL prominently. ZERO network
+calls. tirith does NOT perform rotation or revocation — it shows you the page;
+YOU revoke.
+
+--provider is one of: aws, github, npm, pypi, cargo, stripe, slack, openai,
+anthropic, gcp, azure. An unknown provider errors with the valid list.
+
+Examples:
+  tirith secret revoke --provider aws
+  tirith secret revoke --provider github --json")]
+    Revoke {
+        /// The provider to revoke (aws, github, npm, pypi, cargo, stripe,
+        /// slack, openai, anthropic, gcp, azure).
+        #[arg(long)]
+        provider: String,
+        /// Show the guidance's last_verified date.
+        #[arg(long)]
+        verbose: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -6729,6 +6856,37 @@ fn run() {
             CanaryAction::Rotate { id, format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::canary::rotate(&id, json)
+            }
+        },
+
+        // M11 ch4 — secret-rotation ASSISTANT (`tirith secret ...`). Guidance
+        // only: 0 network calls, no new RuleIds. tirith does NOT rotate.
+        Commands::Secret { action } => match action {
+            SecretAction::Triage {
+                verbose,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::secret::triage(json, verbose)
+            }
+            SecretAction::Rotate {
+                provider,
+                verbose,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::secret::rotate(&provider, json, verbose)
+            }
+            SecretAction::Revoke {
+                provider,
+                verbose,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::secret::revoke(&provider, json, verbose)
             }
         },
 

@@ -57,6 +57,7 @@ pub mod safe_command;
 pub mod sarif;
 pub mod scan;
 pub mod scoring;
+pub mod secret_rotation;
 pub mod selfupdate;
 pub mod session;
 pub mod session_warnings;

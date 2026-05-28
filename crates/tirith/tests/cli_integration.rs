@@ -8733,3 +8733,199 @@ fn command_card_fetch_rejects_unreachable_url() {
         .expect("fetch");
     assert_ne!(out.status.code(), Some(0), "unreachable fetch must fail");
 }
+
+// ---------------------------------------------------------------------------
+// M11 ch4 — `tirith secret triage|rotate|revoke` (guidance-only assistant).
+// 0 network calls, no new RuleIds; presents over existing audit data + a
+// static provider table.
+// ---------------------------------------------------------------------------
+
+/// Write a synthetic audit log under a temp data dir and return the dir so the
+/// caller can set XDG_DATA_HOME + APPDATA (etcetera honors XDG on Unix, APPDATA
+/// on Windows). Mirrors the `policy_tune_*` audit-log test helper.
+fn write_secret_audit_log(lines: &str) -> tempfile::TempDir {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let tirith_data = data_dir.path().join("tirith");
+    fs::create_dir_all(&tirith_data).expect("create data dir");
+    fs::write(tirith_data.join("log.jsonl"), lines).expect("write audit log");
+    data_dir
+}
+
+/// `tirith secret triage` reads recent credential findings and prints a
+/// per-finding next-step that routes a recognizable AWS leak to the AWS
+/// revocation page. The honesty banner must be present.
+#[test]
+fn secret_triage_routes_aws_finding_to_revocation_url() {
+    // A credential_in_text finding whose redacted text retains the AKIA prefix.
+    let log = concat!(
+        r#"{"timestamp":"2026-05-28T10:00:00Z","session_id":"s1","action":"Warn","rule_ids":["credential_in_text"],"command_redacted":"export AWS_ACCESS_KEY_ID=AKIAEXAMPLE0000ABCD","bypass_requested":false,"bypass_honored":false,"interactive":true,"tier_reached":3,"entry_type":"verdict"}"#,
+        "\n",
+    );
+    let data_dir = write_secret_audit_log(log);
+
+    let out = tirith()
+        .env("XDG_DATA_HOME", data_dir.path())
+        .env("APPDATA", data_dir.path())
+        .env("TIRITH_OFFLINE", "1")
+        .args(["secret", "triage"])
+        .output()
+        .expect("failed to run tirith secret triage");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "triage exits 0 on a readable log"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("does NOT perform rotation"),
+        "triage must print the honesty banner, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("credential_in_text"),
+        "triage must surface the finding's rule_id, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("console.aws.amazon.com"),
+        "an AKIA leak must route to the AWS revocation URL, got:\n{stdout}"
+    );
+}
+
+/// `tirith secret triage --json` emits a machine-readable envelope carrying the
+/// assistant-only flag and the attributed provider.
+#[test]
+fn secret_triage_json_envelope_is_stable() {
+    let log = concat!(
+        r#"{"timestamp":"2026-05-28T10:00:00Z","session_id":"s1","action":"Warn","rule_ids":["high_entropy_secret"],"command_redacted":"TOKEN=ghp_redactedredactedredacted","bypass_requested":false,"bypass_honored":false,"interactive":true,"tier_reached":3,"entry_type":"verdict"}"#,
+        "\n",
+    );
+    let data_dir = write_secret_audit_log(log);
+
+    let out = tirith()
+        .env("XDG_DATA_HOME", data_dir.path())
+        .env("APPDATA", data_dir.path())
+        .args(["secret", "triage", "--json"])
+        .output()
+        .expect("failed to run tirith secret triage --json");
+    assert_eq!(out.status.code(), Some(0));
+
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(json["assistant_only"], true);
+    assert_eq!(json["count"], 1);
+    let finding = &json["findings"][0];
+    assert_eq!(finding["rule_id"], "high_entropy_secret");
+    assert_eq!(finding["provider"], "github");
+    assert!(finding["revocation_url"]
+        .as_str()
+        .unwrap()
+        .contains("github.com/settings/tokens"));
+}
+
+/// With no audit log at all, triage reports "nothing to triage" and exits 0 —
+/// not an error.
+#[test]
+fn secret_triage_no_audit_log_is_clean() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let out = tirith()
+        .env("XDG_DATA_HOME", data_dir.path())
+        .env("APPDATA", data_dir.path())
+        .args(["secret", "triage"])
+        .output()
+        .expect("failed to run tirith secret triage");
+    assert_eq!(out.status.code(), Some(0), "missing log is not an error");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("No audit log yet") || stdout.contains("No recent credential findings"),
+        "triage with no log must say so plainly, got:\n{stdout}"
+    );
+}
+
+/// `tirith secret rotate github` shows the revocation URL and the manual
+/// checklist, exits 0, and carries the honesty banner.
+#[test]
+fn secret_rotate_github_shows_url_and_checklist() {
+    let out = tirith()
+        .args(["secret", "rotate", "github"])
+        .output()
+        .expect("failed to run tirith secret rotate github");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("https://github.com/settings/tokens"),
+        "rotate github must show the revocation URL, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Manual checklist"),
+        "rotate github must show the checklist, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("does NOT perform rotation"),
+        "rotate must print the honesty banner, got:\n{stdout}"
+    );
+}
+
+/// `--verbose` surfaces the guidance staleness date.
+#[test]
+fn secret_rotate_verbose_shows_last_verified() {
+    let out = tirith()
+        .args(["secret", "rotate", "aws", "--verbose"])
+        .output()
+        .expect("failed to run tirith secret rotate aws --verbose");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("last verified: 2026-05-28"),
+        "--verbose must show the last_verified date, got:\n{stdout}"
+    );
+}
+
+/// `tirith secret rotate bogus-provider` errors (exit 2) with the list of all
+/// 11 valid providers.
+#[test]
+fn secret_rotate_bogus_provider_lists_valid_providers() {
+    let out = tirith()
+        .args(["secret", "rotate", "bogus-provider"])
+        .output()
+        .expect("failed to run tirith secret rotate bogus-provider");
+    assert_eq!(out.status.code(), Some(2), "unknown provider must exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown provider 'bogus-provider'"));
+    // All 11 providers must appear in the corrective list.
+    for p in [
+        "aws",
+        "github",
+        "npm",
+        "pypi",
+        "cargo",
+        "stripe",
+        "slack",
+        "openai",
+        "anthropic",
+        "gcp",
+        "azure",
+    ] {
+        assert!(
+            stderr.contains(p),
+            "valid-provider list must include '{p}': {stderr}"
+        );
+    }
+}
+
+/// `tirith secret revoke --provider aws` leads with the revocation URL.
+#[test]
+fn secret_revoke_leads_with_revocation_url() {
+    let out = tirith()
+        .args(["secret", "revoke", "--provider", "aws"])
+        .output()
+        .expect("failed to run tirith secret revoke");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("REVOKE your aws credential here"),
+        "revoke must lead with the revocation call-to-action, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("console.aws.amazon.com"),
+        "revoke must show the AWS revocation URL, got:\n{stdout}"
+    );
+}
