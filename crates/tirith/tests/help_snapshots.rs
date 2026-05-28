@@ -155,6 +155,11 @@ help_example_tests! {
     help_aliases               => (["aliases", "--help"], "tirith aliases scan");
     help_aliases_scan          => (["aliases", "scan", "--help"], "tirith aliases scan --include-runtime");
     help_aliases_explain       => (["aliases", "explain", "--help"], "tirith aliases explain git");
+    // M9 ch4 — `tirith env guard|diff|explain`.
+    help_env                   => (["env", "--help"], "tirith env guard on");
+    help_env_guard             => (["env", "guard", "--help"], "tirith env guard status --json");
+    help_env_diff              => (["env", "diff", "--help"], "tirith env diff --reset");
+    help_env_explain           => (["env", "explain", "--help"], "tirith env explain AWS_SECRET_ACCESS_KEY");
 }
 
 #[test]

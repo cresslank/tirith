@@ -14,6 +14,7 @@ pub mod dep_confusion;
 pub mod devcontainer_writer;
 pub mod ecosystem_scan;
 pub mod engine;
+pub mod env_guard;
 pub mod escalation;
 pub mod extract;
 pub mod homoglyph;

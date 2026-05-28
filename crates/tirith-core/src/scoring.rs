@@ -280,7 +280,13 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::AliasOverridesCriticalCommand
         | RuleId::AliasContainsNetworkCall
         | RuleId::AliasContainsCredentialRead
-        | RuleId::AliasRecentlyAdded => false,
+        | RuleId::AliasRecentlyAdded
+        // M9 ch4 — environment-variable lifecycle rules. Heuristics on the
+        // exec command shape + sensitive-env presence + rc-file scan from
+        // `tirith env`; no threat-DB involvement.
+        | RuleId::EnvSensitiveExposedToUnknownScript
+        | RuleId::EnvSensitivePersistedInShellRc
+        | RuleId::EnvPrintenvToNetworkSink => false,
     }
 }
 

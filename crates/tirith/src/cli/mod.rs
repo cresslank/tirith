@@ -144,6 +144,7 @@ pub mod devcontainer;
 pub mod diff;
 pub mod doctor;
 pub mod ecosystem;
+pub mod env_guard;
 pub mod explain;
 pub mod fix;
 pub mod gateway;

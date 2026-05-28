@@ -314,6 +314,34 @@ pub struct Policy {
     /// it only affects the CLI default.
     #[serde(default)]
     pub sudo_session_ttl: Option<u64>,
+
+    /// **M9 ch4 — environment-variable lifecycle guard switch.**
+    ///
+    /// When `true`, the two exec-path env-guard rules in
+    /// [`crate::env_guard`] fire from `engine::analyze`:
+    ///   * [`crate::verdict::RuleId::EnvSensitiveExposedToUnknownScript`]
+    ///     (High) — a sensitive env var is set AND the command pipes remote
+    ///     content into a shell interpreter.
+    ///   * [`crate::verdict::RuleId::EnvPrintenvToNetworkSink`] (Medium) —
+    ///     `printenv`/`env` piped into a network sink.
+    ///
+    /// When `false` (the default), neither exec-path rule fires; the
+    /// `tirith env diff|explain` observability surfaces still work (they read
+    /// the snapshot + rc files directly and do not consult this flag).
+    ///
+    /// Toggled by `tirith env guard on|off`. Persisted to `policy.yaml` via
+    /// the same single-line append-or-rewrite the M8 flags use.
+    #[serde(default)]
+    pub env_guard_enabled: bool,
+
+    /// **M9 ch4 — user extension of the sensitive env-var name list.**
+    ///
+    /// Merged with the built-in `assets/data/sensitive_env.toml` list (see
+    /// [`crate::env_guard::effective_sensitive_vars`]). Lets an operator add
+    /// org-specific secret variable names (`MY_CORP_API_KEY`, …) without a
+    /// code change. The built-in list is always included; these are appended.
+    #[serde(default)]
+    pub env_guard_sensitive_vars: Vec<String>,
 }
 
 /// **M7 ch2** — `tirith share` policy configuration.
@@ -797,6 +825,8 @@ impl Default for Policy {
             iac_require_plan_before_apply: false,
             sudo_require_reason: false,
             sudo_session_ttl: None,
+            env_guard_enabled: false,
+            env_guard_sensitive_vars: Vec::new(),
         }
     }
 }

@@ -20,6 +20,18 @@ if [[ -z "${TIRITH_SESSION_ID:-}" ]]; then
   export TIRITH_SESSION_ID
 fi
 
+# M9 ch4 — record a shell-start environment snapshot for `tirith env diff`.
+# We exec a hidden tirith subcommand that reads ITS OWN inherited environment
+# and writes ONLY variable names + an 8-char value-hash prefix (never raw
+# values, never a recoverable hash) to <state-dir>/env_snapshot.json. The child
+# inherits this shell's exported env, so no value ever crosses an argv boundary
+# or a temp file. Interactive-only and backgrounded (&) so it never blocks the
+# prompt. The hook is sourced once per session (guarded above), so this runs
+# once per shell start.
+if [[ -o interactive ]]; then
+  command tirith env snapshot >/dev/null 2>&1 &!
+fi
+
 # M8 ch2 — surface "this shell is on the remote side of an SSH session" to
 # `tirith prompt-status` (planned for M8 ch6) and any other downstream
 # consumer. Set NOW so chunk 6 can read it without a follow-up hook patch.

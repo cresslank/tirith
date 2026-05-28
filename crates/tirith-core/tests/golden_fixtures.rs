@@ -715,6 +715,10 @@ const ALL_RULE_IDS: &[&str] = &[
     "alias_contains_network_call",
     "alias_contains_credential_read",
     "alias_recently_added",
+    // Environment-variable lifecycle rules (M9 ch4)
+    "env_sensitive_exposed_to_unknown_script",
+    "env_sensitive_persisted_in_shell_rc",
+    "env_printenv_to_network_sink",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -912,6 +916,20 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "alias_contains_network_call",
     "alias_contains_credential_read",
     "alias_recently_added",
+    // M9 ch4 — environment-variable lifecycle rules. Two fire from the
+    // `engine::analyze` exec hot path ONLY when `policy.env_guard_enabled` is
+    // set (opt-in, default false) — the static golden-fixture runner uses the
+    // default policy, so they never fire there. The third
+    // (`env_sensitive_persisted_in_shell_rc`) fires only from the
+    // `tirith env guard` rc-file scan (`crate::env_guard`), never the engine.
+    // The two exec rules additionally read `std::env` for the set-sensitive
+    // list, which a static text fixture cannot drive without an env mutation
+    // (the libc setenv race, PR #125). All three are covered by unit tests in
+    // `crates/tirith-core/src/env_guard.rs` that inject a synthetic
+    // sensitive-set / rc-file root, following the M8 context-rule pattern.
+    "env_sensitive_exposed_to_unknown_script",
+    "env_sensitive_persisted_in_shell_rc",
+    "env_printenv_to_network_sink",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1250,6 +1268,10 @@ fn test_rule_id_list_is_complete() {
         RuleId::AliasContainsNetworkCall,
         RuleId::AliasContainsCredentialRead,
         RuleId::AliasRecentlyAdded,
+        // Environment-variable lifecycle rules (M9 ch4)
+        RuleId::EnvSensitiveExposedToUnknownScript,
+        RuleId::EnvSensitivePersistedInShellRc,
+        RuleId::EnvPrintenvToNetworkSink,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();

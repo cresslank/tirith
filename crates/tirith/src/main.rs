@@ -1686,6 +1686,39 @@ Examples:
         #[command(subcommand)]
         action: AliasesAction,
     },
+
+    /// Monitor sensitive environment-variable lifecycle (M9 ch4)
+    #[command(after_help = "\
+Subcommands:
+  tirith env guard on|off|status                  — flip the exec-path env-guard
+        [--json]                                    rules (off by default).
+  tirith env diff [--reset]                       — show sensitive vars set /
+        [--json]                                    changed since shell start.
+                                                    Exit 1 if any newly appeared.
+  tirith env explain <VAR>                        — show where a var is set
+        [--json]                                    (file:line, value MASKED).
+
+What it protects:
+  When `guard` is ON, the exec hot path flags (i) a sensitive env var set while
+  a command pipes remote content into a shell (curl|bash), and (ii) printenv/env
+  piped into a network sink (curl/nc). The sensitive list is the same one the
+  `--suggest-safe-command` env-scrub rewrite uses; extend it via
+  policy.env_guard_sensitive_vars.
+
+Value safety (load-bearing):
+  tirith NEVER prints, stores, or hashes-recoverably an env value. `explain`
+  masks values as ****; the shell-start snapshot stores variable NAMES plus an
+  8-char SHA-256 prefix for change-detection only — useless for value recovery.
+
+Examples:
+  tirith env guard on
+  tirith env diff
+  tirith env diff --reset
+  tirith env explain AWS_SECRET_ACCESS_KEY")]
+    Env {
+        #[command(subcommand)]
+        action: EnvAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2346,6 +2379,97 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum EnvAction {
+    /// Flip the exec-path env-guard rules on/off (or report status)
+    #[command(after_help = "\
+What it does:
+  Sets policy.env_guard_enabled in your local policy.yaml (append-or-rewrite a
+  single line — other lines untouched). When ON, `engine::analyze` flags a
+  sensitive env var exposed to an unknown piped-to-shell command (High) and
+  printenv/env piped to a network sink (Medium). Default is OFF.
+
+Exit codes:
+  0  on/off succeeded, or status found no persisted secret.
+  1  status found a sensitive var exported in an rc/profile file.
+  2  unknown action (expected on|off|status).
+
+Examples:
+  tirith env guard on
+  tirith env guard off
+  tirith env guard status --json")]
+    Guard {
+        /// on | off | status
+        action: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Show sensitive vars set / changed since shell start (values masked)
+    #[command(after_help = "\
+What it shows:
+  Compares the sensitive vars set in this process against the shell-start
+  snapshot (state-dir/env_snapshot.json, written by the shell hook). Reports
+  which sensitive vars are newly-set or value-changed. VALUES ARE NEVER SHOWN —
+  change-detection uses an 8-char SHA-256 prefix only.
+
+--reset:
+  Re-baseline the snapshot from the current environment (names + 8-char hashes).
+
+Exit codes:
+  0  no sensitive var newly appeared (or --reset).
+  1  at least one sensitive var is newly set since shell start.
+
+Examples:
+  tirith env diff
+  tirith env diff --json
+  tirith env diff --reset")]
+    Diff {
+        /// Re-baseline the snapshot from the current environment.
+        #[arg(long)]
+        reset: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Show where a variable is set (file:line; value masked as ****)
+    #[command(after_help = "\
+What it shows:
+  Every rc/profile file that exports <VAR> (file + line number) with the value
+  MASKED to ****, plus whether the variable is currently set in this process.
+  tirith NEVER reads or prints the value.
+
+Exit codes:
+  0  found in the process or an rc file.
+  2  not configured anywhere tirith scanned.
+
+Examples:
+  tirith env explain AWS_SECRET_ACCESS_KEY
+  tirith env explain GITHUB_TOKEN --json")]
+    Explain {
+        /// The environment variable name to locate.
+        var: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Internal: write the shell-start env snapshot (used by the shell hook)
+    #[command(hide = true)]
+    Snapshot,
 }
 
 #[derive(Subcommand)]
@@ -5026,6 +5150,29 @@ fn run() {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::aliases::explain(&name, include_runtime, json)
             }
+        },
+        Commands::Env { action } => match action {
+            EnvAction::Guard {
+                action,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::env_guard::guard(&action, json)
+            }
+            EnvAction::Diff {
+                reset,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::env_guard::diff(reset, json)
+            }
+            EnvAction::Explain { var, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::env_guard::explain(&var, json)
+            }
+            EnvAction::Snapshot => cli::env_guard::snapshot_write(),
         },
     };
 

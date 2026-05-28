@@ -37,6 +37,20 @@ if (-not [Environment]::UserInteractive) {
     return
 }
 
+# M9 ch4 — record a shell-start environment snapshot for `tirith env diff`.
+# Start a background job that execs a hidden tirith subcommand; the child reads
+# ITS OWN inherited environment and writes ONLY variable names + an 8-char
+# value-hash prefix (never raw values, never a recoverable hash) to
+# <state-dir>/env_snapshot.json. No value crosses an argv boundary or a temp
+# file. Backgrounded via Start-Job so it never blocks the prompt; errors are
+# swallowed so a missing binary never disrupts the shell. Runs once per session
+# (this hook is sourced once per shell start).
+try {
+    Start-Job -ScriptBlock { & tirith env snapshot 2>$null 1>$null } | Out-Null
+} catch {
+    # Ignore — the snapshot is best-effort and must never break the shell.
+}
+
 # Check for PSReadLine
 $psrlModule = Get-Module PSReadLine -ErrorAction SilentlyContinue
 if (-not $psrlModule) {

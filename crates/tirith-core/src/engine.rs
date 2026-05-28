@@ -1028,6 +1028,34 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             // `docker_exec` PATTERN_TABLE entries.
             let container_findings = crate::rules::container::check(&ctx.input, ctx.shell, &policy);
             findings.extend(container_findings);
+
+            // M9 ch4 — environment-variable lifecycle guard. Behind the
+            // opt-in `policy.env_guard_enabled` switch. Two rules:
+            //   * EnvSensitiveExposedToUnknownScript (High) — a sensitive env
+            //     var is currently set AND the command pipes remote content
+            //     into a shell. The set of currently-set sensitive var NAMES
+            //     is computed once here and passed into the (otherwise pure)
+            //     rule, so the rule stays unit-testable without an env
+            //     mutation (the libc setenv race, PR #125).
+            //   * EnvPrintenvToNetworkSink (Medium) — `printenv`/`env` piped
+            //     into a network sink. Tier-1 gate is `env_to_network_sink`.
+            if policy.env_guard_enabled {
+                let sensitive =
+                    crate::env_guard::effective_sensitive_vars(&policy.env_guard_sensitive_vars);
+                let set_sensitive = crate::env_guard::sensitive_env_set_in_process(&sensitive);
+                if let Some(f) = crate::env_guard::check_sensitive_exposed_to_unknown_script(
+                    &ctx.input,
+                    ctx.shell,
+                    &set_sensitive,
+                ) {
+                    findings.push(f);
+                }
+                if let Some(f) =
+                    crate::env_guard::check_printenv_to_network_sink(&ctx.input, ctx.shell)
+                {
+                    findings.push(f);
+                }
+            }
         }
 
         let cred_findings =

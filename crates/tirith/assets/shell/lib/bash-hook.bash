@@ -40,6 +40,18 @@ if [[ -z "${TIRITH_SSH_REMOTE:-}" ]] \
   export TIRITH_SSH_REMOTE
 fi
 
+# M9 ch4 — record a shell-start environment snapshot for `tirith env diff`.
+# Exec a hidden tirith subcommand that reads ITS OWN inherited environment and
+# writes ONLY variable names + an 8-char value-hash prefix (never raw values,
+# never a recoverable hash) to <state-dir>/env_snapshot.json. The child
+# inherits this shell's exported env, so no value crosses an argv boundary or a
+# temp file. Interactive-only and backgrounded so it never blocks the prompt.
+# Sourced once per session (guarded above), so this runs once per shell start.
+if [[ $- == *i* ]]; then
+  command tirith env snapshot >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+fi
+
 # Output helper: write to stderr by default.
 # Override via TIRITH_OUTPUT=tty to write to /dev/tty instead.
 _tirith_output() {

@@ -32,6 +32,18 @@ if (($nu.is-interactive) and (not ('_TIRITH_NU_LOADED' in $env))) {
         $env.TIRITH_SSH_REMOTE = "1"
     }
 
+    # M9 ch4 — record a shell-start environment snapshot for `tirith env diff`.
+    # Exec a hidden tirith subcommand that reads ITS OWN inherited environment
+    # (nushell's `$env` is auto-exported to externals) and writes ONLY variable
+    # names + an 8-char value-hash prefix (never raw values, never a recoverable
+    # hash) to <state-dir>/env_snapshot.json. No value crosses an argv boundary
+    # or a temp file. The write is a sub-millisecond single env read; it runs
+    # once per session (guarded above). Errors are swallowed so a missing binary
+    # never disrupts the shell.
+    try {
+        ^tirith env snapshot | complete | ignore
+    }
+
     # Defensively initialize pre_execution if absent/null (fresh configs may lack it)
     let existing = ($env.config.hooks.pre_execution? | default [])
 

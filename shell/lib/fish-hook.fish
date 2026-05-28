@@ -30,6 +30,17 @@ if not set -q TIRITH_SSH_REMOTE
     set -gx TIRITH_SSH_REMOTE 1
 end
 
+# M9 ch4 — record a shell-start environment snapshot for `tirith env diff`.
+# Exec a hidden tirith subcommand that reads ITS OWN inherited environment and
+# writes ONLY variable names + an 8-char value-hash prefix (never raw values,
+# never a recoverable hash) to <state-dir>/env_snapshot.json. The child
+# inherits this shell's exported env, so no value crosses an argv boundary or a
+# temp file. Interactive-only and backgrounded so it never blocks the prompt.
+if status is-interactive
+    command tirith env snapshot >/dev/null 2>&1 &
+    disown 2>/dev/null
+end
+
 # Output helper: write to stderr by default.
 # Override via TIRITH_OUTPUT=tty to write to /dev/tty instead.
 function _tirith_output

@@ -571,6 +571,35 @@ pub enum RuleId {
     /// *recently-added* alias for review (a freshly-planted malicious alias),
     /// without claiming the alias itself is malicious.
     AliasRecentlyAdded,
+
+    // Environment-variable lifecycle rules (M9 ch4). Two fire from the
+    // `engine::analyze` exec hot path (gated behind `policy.env_guard_enabled`);
+    // one fires only from `tirith env guard` over the rc-file scan. The
+    // sensitive-variable list is the SAME `assets/data/sensitive_env.toml`
+    // list the M6 ch5 env-scrub transform uses. See `crate::env_guard`.
+    /// M9 ch4 — a sensitive env var (`AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`,
+    /// …) is currently set AND the command pipes remote content into a shell
+    /// interpreter (`curl … | bash`, `wget … | sh`). A malicious script
+    /// inherits and can exfiltrate the secret. High severity. **This is the
+    /// dedicated rule the M6 ch5 env-scrub `safe_command` transform attaches
+    /// to** — when this finding is present, the env-scrub rewrite fires under
+    /// this rule_id (the generic "any High finding" heuristic is retained for
+    /// backward compat). Tier-1 rides the existing pipe-to-interpreter
+    /// patterns; the std::env check is wired in `engine.rs`. Unit-tested via a
+    /// `&[String]` of currently-set sensitive names (no std::env mutation).
+    EnvSensitiveExposedToUnknownScript,
+    /// M9 ch4 — a sensitive env var is `export`ed in a shell rc/profile
+    /// (`~/.bashrc`, `~/.zshrc`, …). High severity — a credential persisted in
+    /// shell config leaks into every shell and is a common exfiltration target.
+    /// Fires only from the `tirith env guard` rc-file scan
+    /// (`crate::env_guard`), never the exec hot path → `EXTERNALLY_TRIGGERED`.
+    EnvSensitivePersistedInShellRc,
+    /// M9 ch4 — `printenv` / `env` (with no command argument) piped into a
+    /// network sink (`curl`, `wget`, `nc`). Medium severity — dumps every
+    /// environment variable, including any secrets, off the machine. Fires
+    /// from the exec hot path under `policy.env_guard_enabled`; tier-1 gate is
+    /// the `env_to_network_sink` PATTERN_TABLE entry.
+    EnvPrintenvToNetworkSink,
 }
 
 impl fmt::Display for RuleId {

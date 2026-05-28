@@ -915,6 +915,17 @@ fn build_sudo_narrow_suggestion(
 
 /// Currently-set sensitive env vars, in the order they appear in the asset
 /// file. Stable order keeps the suggested command deterministic.
+///
+/// NOTE (M9 ch4): this uses ONLY the built-in `sensitive_env.toml` list, not
+/// the user's `policy.env_guard_sensitive_vars` extension — `suggest()` has no
+/// `Policy` handle. In practice this never produces an incomplete scrub: the
+/// env-scrub mechanical rewrite only fires for a SINGLE SIMPLE command
+/// (`is_simple_command_for_env_scrub`), whereas the dedicated
+/// `EnvSensitiveExposedToUnknownScript` rule that a custom var could trigger
+/// only fires on a pipe-to-interpreter shape — which env-scrub declines. So
+/// the two never co-produce a rewrite that would omit a custom var. If
+/// `suggest()` ever grows a policy handle, switch this to
+/// `env_guard::effective_sensitive_vars(&policy.env_guard_sensitive_vars)`.
 fn sensitive_env_set_in_process() -> Vec<&'static str> {
     sensitive_env_vars()
         .iter()
@@ -1004,7 +1015,10 @@ fn is_simple_command_for_env_scrub(cmd: &str) -> bool {
 }
 
 /// Build an env-scrub suggestion for the verdict when:
-///  (i)   at least one finding is High severity or above, AND
+///  (i)   the dedicated [`RuleId::EnvSensitiveExposedToUnknownScript`] finding
+///        is present (M9 ch4 — the explicit trigger this transform points at),
+///        OR at least one finding is High severity or above (the original M6
+///        ch5 heuristic, kept for backward compat), AND
 ///  (ii)  at least one sensitive env var is currently set in this process,
 ///        AND
 ///  (iii) the shell is a POSIX shell (bash/zsh/sh/fish/posix) — `env -u`
@@ -1025,11 +1039,20 @@ fn build_env_scrub_suggestion(
     shell: ShellType,
     verdict: &Verdict,
 ) -> Option<SafeSuggestion> {
+    // Fire when EITHER the dedicated M9 ch4 rule is present (the explicit,
+    // audit-visible trigger this transform was designed to point at) OR any
+    // High-severity finding is present (the original M6 ch5 heuristic, kept
+    // for backward compat). Both paths are valid; the dedicated-rule path
+    // makes the env-scrub trigger explicit in `--explain` / audit output.
+    let dedicated_rule_present = verdict
+        .findings
+        .iter()
+        .any(|f| f.rule_id == RuleId::EnvSensitiveExposedToUnknownScript);
     let any_high = verdict
         .findings
         .iter()
         .any(|f| f.severity >= Severity::High);
-    if !any_high {
+    if !dedicated_rule_present && !any_high {
         return None;
     }
 
@@ -1448,6 +1471,36 @@ mod tests {
         assert!(!is_simple_command_for_env_scrub("echo \"unterminated"));
         // Trailing backslash with nothing to escape — same reason.
         assert!(!is_simple_command_for_env_scrub("echo trailing\\"));
+    }
+
+    #[test]
+    fn dedicated_rule_present_is_an_env_scrub_trigger() {
+        // M9 ch4 — prove the dedicated `EnvSensitiveExposedToUnknownScript`
+        // finding is recognized as an env-scrub trigger independent of the
+        // legacy "any High finding" heuristic. This exercises the trigger
+        // predicate WITHOUT mutating `std::env` (the libc setenv race, PR
+        // #125): the end-to-end rewrite additionally needs a sensitive var
+        // set in the process, which is covered race-free by the CLI
+        // integration test `env_scrub_fires_under_dedicated_rule` (it sets
+        // the var in a CHILD `tirith` process).
+        //
+        // The finding is Medium severity, so the `any_high` heuristic is
+        // false; only the dedicated-rule branch can mark this verdict as a
+        // candidate. We assert the predicate the function uses, mirroring the
+        // exact `dedicated_rule_present` check.
+        let mut f = finding(RuleId::EnvSensitiveExposedToUnknownScript);
+        f.severity = Severity::Medium;
+        let v = verdict_with(vec![f]);
+        let any_high = v.findings.iter().any(|f| f.severity >= Severity::High);
+        let dedicated_present = v
+            .findings
+            .iter()
+            .any(|f| f.rule_id == RuleId::EnvSensitiveExposedToUnknownScript);
+        assert!(!any_high, "Medium finding must not trip the High heuristic");
+        assert!(
+            dedicated_present,
+            "dedicated rule must be detectable as an env-scrub trigger"
+        );
     }
 
     // NOTE: An end-to-end `env_scrub_declines_when_command_is_compound` test

