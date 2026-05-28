@@ -798,6 +798,16 @@ fn tmp_roots() -> Vec<std::path::PathBuf> {
 /// file's mtime/mode/ownership, do NOT shell out to `file`/`codesign`, and do
 /// NOT enumerate the whole PATH.
 ///
+/// NOTE (hot/cold is CONVENTION-enforced, not type-enforced): the split between
+/// the three cheap "hot" rules and the seven expensive "cold" rules is held by
+/// which producer fn the engine calls ([`check_exec_provenance_hot`] vs the
+/// `tirith exec`/`tirith path` CLI), the `(HOT)`/`(COLD)` tags in
+/// `verdict.rs`, and the distinct `LeaderLocation` vs `PathDirRisk` enums —
+/// the compiler does not stop a future edit from emitting a cold rule from the
+/// hot producer. A follow-up refactor may add a `RuleId::is_hot_path_eligible()`
+/// predicate + a test that the `*_hot` fns only emit hot-eligible ids; until
+/// then, keep `check_exec_provenance_hot` limited to the three rules above.
+///
 /// The OTHER SEVEN exec-provenance rules NEVER fire here. They run only under
 /// explicit `tirith exec check|provenance` / `tirith path audit|which`:
 /// `ExecRecentlyModified`, `ExecWorldWritable`, `ExecUnsigned`,
@@ -805,6 +815,25 @@ fn tmp_roots() -> Vec<std::path::PathBuf> {
 /// child-process), and `PathDuplicateCommandName`, `PathDirInRepo`,
 /// `PathDirInTmp` (off-hot-path; full-PATH enumeration). See
 /// `crate::exec_provenance` and `crate::path_audit` module docs.
+///
+/// # M9 ch6 — repo-hook leader-targeted hot scan
+///
+/// A SECOND hot subset runs in `ScanContext::Exec` behind
+/// `policy.hooks_guard_enabled`: when the command leader is a hook-triggering
+/// command (`git commit|pull|checkout|merge|rebase|push`,
+/// `npm|yarn|pnpm install`, `direnv allow|reload`), the engine scans ONLY the
+/// hook surfaces that leader actually triggers
+/// ([`check_repo_hooks_hot`] → [`crate::repo_hooks::scan_triggered_by_leader`])
+/// and surfaces the three hot-eligible rules ([`crate::verdict::RuleId::RepoHookNetworkCall`],
+/// [`RepoHookCredentialRead`](crate::verdict::RuleId::RepoHookCredentialRead),
+/// [`RepoHookSudo`](crate::verdict::RuleId::RepoHookSudo)) **DOWNGRADED to
+/// `Severity::Medium`** (a WARN for an everyday command, not a block). The two
+/// Medium-only repo-hook rules (`RepoHookSuspiciousShellPattern`,
+/// `RepoHookExternalFetch`) are NOT surfaced on the hot path — `tirith hooks
+/// scan` reports the true `High`. Like the ch5 subset, a clean-looking
+/// `git commit` is not a regex/byte signal, so the tier-1 fast-exit is forced
+/// past (only for a hook-triggering leader) when the flag is set — see the
+/// `hooks_guard_triggered` gate below.
 pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     analyze_inner(ctx).0
 }
@@ -2027,6 +2056,71 @@ mod tests {
             is_config_override: false,
             clipboard_html: None,
         }
+    }
+
+    /// Build an Exec context whose cwd is `dir` (for policy + repo-root
+    /// discovery). Used by the exec-guard ON/OFF tests.
+    fn exec_ctx_in(input: &str, dir: &std::path::Path) -> AnalysisContext {
+        AnalysisContext {
+            input: input.to_string(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive: true,
+            cwd: Some(dir.display().to_string()),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+        }
+    }
+
+    /// Write a `.tirith/policy.yaml` under `dir` (a `.git` marker too, so it is
+    /// a discovery boundary) carrying a single `exec_guard_enabled:` line.
+    fn write_exec_guard_policy(dir: &std::path::Path, enabled: bool) {
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join(".tirith")).unwrap();
+        std::fs::write(
+            dir.join(".tirith").join("policy.yaml"),
+            format!("exec_guard_enabled: {enabled}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn exec_guard_on_fires_exec_in_tmp_off_fast_exits() {
+        // A TIRITH_POLICY_ROOT in the environment would override the cwd-based
+        // discovery this test relies on; skip rather than assert falsely.
+        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
+            return;
+        }
+        use crate::verdict::RuleId;
+
+        // A leader resolving under /tmp. An absolute path is used as-is by
+        // `resolve_leader` (it need not exist), and /tmp is always a tmp root.
+        let input = "/tmp/payload-xyz-9999 --do-thing";
+
+        // OFF: the leader is not a regex/byte signal, so with the guard off the
+        // analysis fast-exits at tier-1 and ExecInTmp never fires.
+        let off_dir = tempfile::tempdir().unwrap();
+        write_exec_guard_policy(off_dir.path(), false);
+        let off = analyze(&exec_ctx_in(input, off_dir.path()));
+        assert!(
+            !off.findings.iter().any(|f| f.rule_id == RuleId::ExecInTmp),
+            "with exec_guard_enabled=false the /tmp leader must fast-exit, got {:?}",
+            off.findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
+        );
+
+        // ON: the force-past gate keeps the analysis alive to tier-3 and the
+        // hot exec subset fires ExecInTmp.
+        let on_dir = tempfile::tempdir().unwrap();
+        write_exec_guard_policy(on_dir.path(), true);
+        let on = analyze(&exec_ctx_in(input, on_dir.path()));
+        assert!(
+            on.findings.iter().any(|f| f.rule_id == RuleId::ExecInTmp),
+            "with exec_guard_enabled=true a /tmp leader must fire ExecInTmp, got {:?}",
+            on.findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
+        );
     }
 
     #[test]

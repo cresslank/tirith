@@ -152,19 +152,28 @@ pub fn watch(interval: u64, json: bool) -> i32 {
         let current = persistence::scan();
         let findings = persistence::diff_entries(&current, &snapshot);
 
+        // Track whether this poll's change event was successfully delivered. A
+        // change must NOT be silently dropped: if the (--json) stdout write
+        // fails (e.g. a closed pipe), we skip the re-baseline below so the same
+        // change re-surfaces on the next poll instead of being lost forever.
+        let mut emitted = true;
         if !findings.is_empty() {
             if json {
                 let body = watch_poll_json_body(polls, &findings);
-                // A failed write must not silently drop a change event.
-                let _ = write_json_stdout(&body, "tirith persistence watch: failed to write JSON");
+                emitted =
+                    write_json_stdout(&body, "tirith persistence watch: failed to write JSON");
             } else {
                 print_human_watch_poll(polls, &findings);
             }
         }
 
-        // Re-baseline so the next poll reports only NEW changes.
-        snapshot = PersistenceSnapshot::from_entries(&current);
-        let _ = persistence::save_snapshot(&path, &snapshot);
+        // Re-baseline so the next poll reports only NEW changes — but only when
+        // any change event was actually emitted. On a delivery failure, leave
+        // the prior baseline in place so the change is reported again.
+        if emitted {
+            snapshot = PersistenceSnapshot::from_entries(&current);
+            let _ = persistence::save_snapshot(&path, &snapshot);
+        }
     }
 
     if !json {

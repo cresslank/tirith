@@ -45,12 +45,15 @@ pub fn audit(json: bool) -> i32 {
     let report = path_audit::audit_path_str(&path_value, repo_root.as_deref(), &tmp_roots());
 
     if json {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "schema_version": 1,
             "path_dirs": report.path_dirs,
             "findings": report.findings,
             "has_high": report.has_high(),
         });
+        if let Some(note) = platform_note() {
+            body["platform_note"] = serde_json::Value::String(note.to_string());
+        }
         if !write_json_stdout(&body, "tirith path audit: failed to write JSON output") {
             return 1;
         }
@@ -188,12 +191,34 @@ fn risk_label(risk: PathDirRisk) -> &'static str {
 
 // ─── human output ────────────────────────────────────────────────────────────
 
+/// On Windows the user-writability probe behind the writable-before-system
+/// rule is not implemented (it relies on the Unix `access(2)` W_OK check), so
+/// that one rule cannot fire. We say so explicitly rather than let a clean
+/// report imply full coverage. `None` on Unix (full coverage).
+fn platform_note() -> Option<&'static str> {
+    #[cfg(windows)]
+    {
+        Some(
+            "PATH audit on Windows covers repo-local / temp / duplicate-command risks; the \
+             user-writable-before-system rule is not yet implemented on this platform (it \
+             relies on a Unix writability probe), so a 'clean' result does not rule that out.",
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 fn print_human_audit(report: &PathAuditReport) {
     eprintln!(
         "tirith path audit: {} PATH dir(s), {} finding(s).",
         report.path_dirs.len(),
         report.findings.len()
     );
+    if let Some(note) = platform_note() {
+        eprintln!("  note: {note}");
+    }
     if report.findings.is_empty() {
         eprintln!("  $PATH is clean (no repo-local / /tmp / writable-before-system dirs, no duplicate commands).");
         return;

@@ -1730,18 +1730,22 @@ Subcommands:
                                    finding, 2 if not on $PATH.
   tirith exec provenance <PATH>  — same provenance for a specific file path.
         [--json]                   Exit 1 on a HIGH finding, 2 if not a file.
+  tirith exec guard on|off|status  — flip the exec hot-path provenance guard
+        [--json]                     (off by default). When ON, the three cheap
+                                     leader rules below run on the exec hot path.
 
 What it checks (COLD — never on the exec hot path):
   stat (mtime / mode / owner), `file --brief`, `codesign --verify` (macOS, 2s
   timeout), and package-manager ownership (Homebrew / nix / cargo / rustup /
   user-local). The exec hot path runs only three cheap string-compare rules
   (in /tmp, in repo, writable-PATH-dir-before-system) under
-  `tirith path guard on`.
+  `tirith exec guard on`.
 
 Examples:
   tirith exec check kubectl
   tirith exec check git --json
-  tirith exec provenance /tmp/installer")]
+  tirith exec provenance /tmp/installer
+  tirith exec guard on")]
     Exec {
         #[command(subcommand)]
         action: ExecAction,
@@ -1759,10 +1763,10 @@ Subcommands:
         [--secure] [--json]        With --secure, exit 1 if the resolved copy
                                    is NOT a system binary.
 
-Canonical longer spelling:
-  `tirith path which` is the canonical form of the shorter `tirith which`
-  spelling. The `which` action lives under the `path` namespace so all
-  shadowing tooling shares one command group.
+Why under `path`:
+  The `which` action lives under the `path` namespace (there is no top-level
+  `tirith which`) so all $PATH-shadowing tooling — audit, watch, which — shares
+  one command group.
 
 Examples:
   tirith path audit
@@ -2618,6 +2622,36 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+
+    /// Flip the exec hot-path provenance guard on/off (or report status)
+    #[command(after_help = "\
+What it does:
+  Sets policy.exec_guard_enabled in your local policy.yaml (append-or-rewrite a
+  single line — other lines untouched). When ON, the exec hot path runs three
+  cheap, stat-free rules on the resolved command leader: it WARNS when the leader
+  resolves under /tmp (ExecInTmp), inside the current repo (ExecInRepoBin), or
+  from a user-writable PATH dir ahead of the system path
+  (PathWritableDirBeforeSystem). The expensive provenance checks
+  (`tirith exec check`) NEVER run on the hot path. Default is OFF.
+
+Exit codes:
+  0  on/off succeeded, or status reported.
+  2  unknown action (expected on|off|status).
+
+Examples:
+  tirith exec guard on
+  tirith exec guard off
+  tirith exec guard status --json")]
+    Guard {
+        /// on | off | status
+        action: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2666,7 +2700,7 @@ Examples:
         json: bool,
     },
 
-    /// Resolve a command across $PATH (canonical form of `tirith which`)
+    /// Resolve a command across $PATH (lives under `path`; no top-level alias)
     #[command(after_help = "\
 What it shows:
   Every $PATH directory that resolves <CMD> to an executable, in order. The
@@ -5493,6 +5527,14 @@ fn run() {
             ExecAction::Provenance { path, format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::exec::provenance(&path, json)
+            }
+            ExecAction::Guard {
+                action,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::exec::guard(&action, json)
             }
         },
         Commands::Path { action } => match action {

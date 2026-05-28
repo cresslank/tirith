@@ -7,13 +7,149 @@
 //! `file --brief`, `codesign`) that NEVER run on the engine hot path — see
 //! [`tirith_core::exec_provenance`] and the `engine::analyze` doc-comment.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use tirith_core::exec_provenance::{self, Provenance};
 use tirith_core::path_audit;
+use tirith_core::policy::{self as policy_mod, Policy};
 use tirith_core::verdict::{Finding, Severity};
 
 use super::write_json_stdout;
+
+// ─── guard on|off|status ─────────────────────────────────────────────────────
+
+/// `tirith exec guard on|off|status` — flip / report `policy.exec_guard_enabled`.
+///
+/// When ON, the engine's exec hot path runs the THREE cheap leader-provenance
+/// rules (`ExecInTmp`, `ExecInRepoBin`, `PathWritableDirBeforeSystem`). Off by
+/// default. Mirrors `tirith hooks guard` / `tirith env guard` (append-or-rewrite
+/// a single line in the local `policy.yaml`, 0600, other lines untouched).
+pub fn guard(action: &str, json: bool) -> i32 {
+    let enable = match action {
+        "on" | "enable" | "true" => true,
+        "off" | "disable" | "false" => false,
+        "status" => return guard_status(json),
+        other => {
+            eprintln!("tirith exec guard: unknown action '{other}' (expected on|off|status)");
+            return 2;
+        }
+    };
+
+    let target_path = match resolve_policy_path_for_guard() {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+
+    if let Err(e) = update_policy_guard_key(&target_path, enable) {
+        eprintln!(
+            "tirith exec guard: failed to update {}: {e}",
+            target_path.display()
+        );
+        return 1;
+    }
+
+    if json {
+        let out = serde_json::json!({
+            "schema_version": 1,
+            "exec_guard_enabled": enable,
+            "policy_path": target_path.display().to_string(),
+        });
+        if !write_json_stdout(&out, "tirith exec guard: failed to write JSON output") {
+            return 1;
+        }
+    } else {
+        eprintln!(
+            "tirith exec guard: {} (written to {})",
+            if enable { "ON" } else { "OFF" },
+            target_path.display(),
+        );
+    }
+    0
+}
+
+fn guard_status(json: bool) -> i32 {
+    let policy = Policy::discover_partial(None);
+    if json {
+        let out = serde_json::json!({
+            "schema_version": 1,
+            "exec_guard_enabled": policy.exec_guard_enabled,
+            "policy_path": policy.path,
+        });
+        if !write_json_stdout(&out, "tirith exec guard: failed to write JSON output") {
+            return 1;
+        }
+    } else {
+        eprintln!(
+            "tirith exec guard: {}",
+            if policy.exec_guard_enabled {
+                "ON"
+            } else {
+                "OFF"
+            }
+        );
+        if !policy.exec_guard_enabled {
+            eprintln!(
+                "  (when ON, a command whose leader resolves under /tmp, inside the repo, or \
+                 from a user-writable PATH dir ahead of the system path will WARN on the exec \
+                 hot path. Run `tirith exec check <bin>` for the full cold provenance.)"
+            );
+        }
+    }
+    0
+}
+
+fn resolve_policy_path_for_guard() -> Result<PathBuf, i32> {
+    if let Some(existing) = policy_mod::discover_local_policy_path(None) {
+        return Ok(existing);
+    }
+    let user = policy_mod::config_dir().ok_or_else(|| {
+        eprintln!("tirith exec guard: could not resolve user config dir");
+        1
+    })?;
+    Ok(user.join("policy.yaml"))
+}
+
+/// Idempotently set / update the `exec_guard_enabled` line in a policy YAML
+/// file. Append-or-rewrite — never touches other lines (mirrors
+/// `cli::hooks::update_policy_guard_key`).
+fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let new_line = format!("exec_guard_enabled: {enable}");
+
+    let mut out = String::new();
+    let mut replaced = false;
+    for line in existing.lines() {
+        if line.trim_start().starts_with("exec_guard_enabled:") {
+            out.push_str(&new_line);
+            out.push('\n');
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !replaced {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&new_line);
+        out.push('\n');
+    }
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(out.as_bytes())
+}
 
 /// `tirith exec check <bin>` — resolve `bin` on `$PATH`, report provenance +
 /// shadowing. Exit 1 if any High-severity finding fires (recently-modified,
@@ -237,5 +373,42 @@ mod tests {
     fn check_nonexistent_command_exits_2() {
         // A command guaranteed not on PATH → exit 2 (not resolved).
         assert_eq!(check("tirith-no-such-bin-xyz-9999", true), 2);
+    }
+
+    #[test]
+    fn guard_unknown_action_returns_2() {
+        assert_eq!(guard("bogus", false), 2);
+    }
+
+    #[test]
+    fn update_policy_guard_key_appends_and_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.yaml");
+        std::fs::write(&path, "paranoia: 2\nfail_mode: open\n").unwrap();
+
+        update_policy_guard_key(&path, true).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("exec_guard_enabled: true"), "{content}");
+        assert!(content.contains("paranoia: 2"), "other lines preserved");
+
+        // Flip off — must REPLACE the existing line, not duplicate it.
+        update_policy_guard_key(&path, false).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("exec_guard_enabled: false"), "{content}");
+        assert_eq!(
+            content.matches("exec_guard_enabled:").count(),
+            1,
+            "must not duplicate the key"
+        );
+
+        // The written YAML must deserialize back into the field the engine
+        // reads at its tier-1 force-past gate (`policy.exec_guard_enabled`).
+        update_policy_guard_key(&path, true).unwrap();
+        let yaml = std::fs::read_to_string(&path).unwrap();
+        let parsed = Policy::try_parse_yaml(&yaml).expect("policy YAML must parse");
+        assert!(
+            parsed.exec_guard_enabled,
+            "exec_guard_enabled must round-trip to the engine-readable Policy"
+        );
     }
 }

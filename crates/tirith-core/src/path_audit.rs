@@ -48,7 +48,24 @@ use crate::verdict::{Evidence, Finding, RuleId, Severity};
 /// System directories whose precedence the writable-before-system rule cares
 /// about. A user-writable, repo-local/`/tmp` dir that appears BEFORE any of
 /// these in `$PATH` can shadow the system command of the same name.
+///
+/// Unix uses the FHS bin dirs; Windows uses the well-known `System32` /
+/// `Windows` roots so a writable dir ahead of them on `%PATH%` is still flagged
+/// rather than the audit silently treating every Windows PATH as clean (the
+/// writability probe is still Unix-only, so on Windows this only powers
+/// `is_system_path` / `--secure`, not the writable-before-system rule).
+#[cfg(not(windows))]
 pub const SYSTEM_PATH_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+
+/// Windows system directories (see [`SYSTEM_PATH_DIRS`] doc). Backslash form
+/// matches how `%PATH%` entries are written; `split_path` keeps them verbatim.
+#[cfg(windows)]
+pub const SYSTEM_PATH_DIRS: &[&str] = &[
+    r"C:\Windows\System32",
+    r"C:\Windows",
+    r"C:\Windows\System32\Wbem",
+    r"C:\Windows\System32\WindowsPowerShell\v1.0",
+];
 
 /// One cheap classification of the resolved leader's path (hot path). A leader
 /// can match more than one (e.g. a repo dir that is also on `$PATH` ahead of a
@@ -793,10 +810,25 @@ mod tests {
         assert!(!is_system_path(Path::new("/tmp/git")));
     }
 
+    // `split_path` uses the platform separator (`:` on Unix, `;` on Windows),
+    // so each separator case is gated to the platform whose separator it uses.
+    #[cfg(not(windows))]
     #[test]
     fn split_path_maps_empty_to_dot() {
         let dirs = split_path("/usr/bin::/bin");
         assert_eq!(dirs, vec![pb("/usr/bin"), pb("."), pb("/bin")]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn split_path_maps_empty_to_dot_windows() {
+        // On Windows the separator is `;`; an empty entry (a literal `;;` or a
+        // trailing `;`) still maps to `.` so it is audited, not dropped.
+        let dirs = split_path(r"C:\bin;;C:\sys");
+        assert_eq!(dirs, vec![pb(r"C:\bin"), pb("."), pb(r"C:\sys")]);
+        // A colon inside a drive-letter path must NOT be treated as a separator.
+        let drive = split_path(r"C:\Windows\System32");
+        assert_eq!(drive, vec![pb(r"C:\Windows\System32")]);
     }
 
     // ── resolve_leader ────────────────────────────────────────────────────
@@ -816,10 +848,33 @@ mod tests {
         assert_eq!(r.path, home.path().join("bin/x"));
     }
 
+    // `/usr/local/bin/foo` is only `is_absolute()` on Unix (no drive letter on
+    // Windows), so the Unix and Windows absolute-path cases are gated apart.
+    #[cfg(not(windows))]
     #[test]
     fn resolve_leader_absolute_path_used_directly() {
         let r = resolve_leader("/usr/local/bin/foo", None, None, "").unwrap();
         assert_eq!(r.path, pb("/usr/local/bin/foo"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_leader_absolute_path_used_directly_windows() {
+        // A drive-rooted Windows path with backslashes is absolute and used
+        // as-is (no cwd needed) — and a `\`-bearing leader counts as having a
+        // path component on Windows.
+        let r = resolve_leader(r"C:\tools\foo.exe", None, None, "").unwrap();
+        assert_eq!(r.path, pb(r"C:\tools\foo.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_leader_relative_no_cwd_is_none_not_panic() {
+        // A relative leader with no cwd must return None gracefully, never
+        // panic (the bug the Windows CI surfaced: a non-drive path is relative
+        // on Windows, so `cwd?` short-circuits to None instead of unwrapping).
+        assert!(resolve_leader(r"build\tool", None, None, "").is_none());
+        assert!(resolve_leader("/usr/local/bin/foo", None, None, "").is_none());
     }
 
     #[cfg(unix)]

@@ -913,23 +913,23 @@ fn build_sudo_narrow_suggestion(
 
 // ── Env scrub (command-shape based) ────────────────────────────────────────
 
-/// Currently-set sensitive env vars, in the order they appear in the asset
-/// file. Stable order keeps the suggested command deterministic.
+/// Currently-set sensitive env vars, in stable order (built-ins first, then any
+/// user `policy.env_guard_sensitive_vars` extension). Stable order keeps the
+/// suggested command deterministic.
 ///
-/// NOTE (M9 ch4): this uses ONLY the built-in `sensitive_env.toml` list, not
-/// the user's `policy.env_guard_sensitive_vars` extension — `suggest()` has no
-/// `Policy` handle. In practice this never produces an incomplete scrub: the
-/// env-scrub mechanical rewrite only fires for a SINGLE SIMPLE command
-/// (`is_simple_command_for_env_scrub`), whereas the dedicated
-/// `EnvSensitiveExposedToUnknownScript` rule that a custom var could trigger
-/// only fires on a pipe-to-interpreter shape — which env-scrub declines. So
-/// the two never co-produce a rewrite that would omit a custom var. If
-/// `suggest()` ever grows a policy handle, switch this to
-/// `env_guard::effective_sensitive_vars(&policy.env_guard_sensitive_vars)`.
-fn sensitive_env_set_in_process() -> Vec<&'static str> {
-    sensitive_env_vars()
-        .iter()
-        .copied()
+/// M9 ch4 fix: the effective list MERGES the built-in `sensitive_env.toml`
+/// names with the user's `policy.env_guard_sensitive_vars` extension (via
+/// [`crate::env_guard::effective_sensitive_vars`]) so an `env -u …` rewrite
+/// never silently omits a user-declared secret. The previous reasoning that the
+/// two paths could never co-fire was load-bearing and undocumented to the user;
+/// merging the list removes that fragility outright. A partial-policy discover
+/// (local files only) is cheap and only runs when the env-scrub transform is
+/// actually being built.
+fn sensitive_env_set_in_process() -> Vec<String> {
+    let policy = crate::policy::Policy::discover_partial(None);
+    let effective = crate::env_guard::effective_sensitive_vars(&policy.env_guard_sensitive_vars);
+    effective
+        .into_iter()
         .filter(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
         .collect()
 }

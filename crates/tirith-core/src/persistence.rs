@@ -40,6 +40,18 @@
 //! line through the shipping credential redactor ([`crate::redact::redact`])
 //! before it is surfaced — a new `authorized_keys` entry or a sourced token
 //! must never leak verbatim into a finding.
+//!
+//! ## Snapshot stores NO cleartext at rest (only hashes)
+//!
+//! The on-disk snapshot ([`PersistenceSnapshot`] at
+//! `state_dir()/persistence_snapshot.json`) is written `0600` AND stores only a
+//! per-file `sha256` + `size` + a SET of per-line hashes ([`SnapshotEntry`]) —
+//! never the raw bytes of `.bashrc` / `.envrc` / `authorized_keys` / `crontab`.
+//! Added lines are recomputed at `diff` time by re-reading the CURRENT file
+//! (cleartext is legitimately available then), keeping any line whose hash is
+//! absent from the prior snapshot's line-hash set, and redacting it. So a
+//! secret exported in an rc file never lands unredacted in a sibling state file
+//! that another local account could read.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -127,10 +139,13 @@ pub struct PersistenceEntry {
     pub sha256: String,
     /// Byte length of `content`.
     pub size: usize,
-    /// Raw content (UTF-8 lossy) used for added-line diffing. Not serialized
-    /// into the `scan` JSON output (only the fingerprint is), but IS persisted
-    /// in the on-disk snapshot so `diff` can show added lines.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Raw content (UTF-8 lossy), held IN MEMORY only for the current scan so
+    /// the diff can recompute added lines against the prior snapshot's line
+    /// hashes. NEVER serialized — neither into the `scan` JSON output nor into
+    /// the on-disk snapshot (which stores only `sha256` + `size` + per-line
+    /// hashes). Keeping cleartext out of the snapshot is the secret-at-rest
+    /// fix; see the module doc.
+    #[serde(skip)]
     pub content: String,
 }
 
@@ -151,7 +166,14 @@ fn default_schema_version() -> u32 {
     1
 }
 
-/// The persisted per-surface record: fingerprint + content.
+/// The persisted per-surface record: fingerprint + per-line hashes.
+///
+/// **No cleartext is stored.** Beyond the whole-file `sha256` + `size` (which
+/// detect *that* a surface changed), `line_hashes` holds the 16-char SHA-256
+/// prefix of every non-empty line, so `diff` can compute *added lines* by
+/// re-reading the current file and keeping lines whose hash is absent here —
+/// without ever persisting the raw rc/`.envrc`/`authorized_keys`/crontab bytes
+/// (which can carry secrets) to a world-readable sibling state file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotEntry {
     pub kind: PersistenceKind,
@@ -159,12 +181,16 @@ pub struct SnapshotEntry {
     pub present: bool,
     pub sha256: String,
     pub size: usize,
-    #[serde(default)]
-    pub content: String,
+    /// 16-char SHA-256 prefix of each non-empty content line (order-preserving,
+    /// as it appeared). Used by the diff to detect *added* lines without storing
+    /// cleartext. Empty for surfaces with no line content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub line_hashes: Vec<String>,
 }
 
 impl PersistenceSnapshot {
-    /// Build a snapshot from a freshly-collected inventory.
+    /// Build a snapshot from a freshly-collected inventory. Stores per-line
+    /// hashes (never cleartext) so a later diff can detect added lines.
     pub fn from_entries(entries: &[PersistenceEntry]) -> Self {
         let mut map = BTreeMap::new();
         for e in entries {
@@ -176,7 +202,7 @@ impl PersistenceSnapshot {
                     present: e.present,
                     sha256: e.sha256.clone(),
                     size: e.size,
-                    content: e.content.clone(),
+                    line_hashes: line_hashes(&e.content),
                 },
             );
         }
@@ -570,14 +596,20 @@ pub fn diff_entries(
     for entry in current {
         let prev = snapshot.entries.get(&entry.key);
 
-        // Determine whether this surface changed.
-        let (changed, prev_content, prev_present) = match prev {
-            Some(p) => (p.sha256 != entry.sha256, p.content.as_str(), p.present),
+        // Determine whether this surface changed. The prior content is gone
+        // (the snapshot stores only hashes), so we diff against the prior set
+        // of per-line hashes rather than the prior text.
+        let (changed, prev_line_hashes, prev_present): (bool, &[String], bool) = match prev {
+            Some(p) => (
+                p.sha256 != entry.sha256,
+                p.line_hashes.as_slice(),
+                p.present,
+            ),
             // No snapshot record for this key. A NEWLY-APPEARING surface that
             // is present now is a change worth reporting (a brand-new
             // LaunchAgent / .envrc). An absent surface with no prior record is
             // not a change (first-ever scan of an empty surface).
-            None => (entry.present, "", false),
+            None => (entry.present, &[], false),
         };
 
         if !changed {
@@ -596,7 +628,7 @@ pub fn diff_entries(
             PersistenceKind::SshConfig => {
                 // Only fire when the change ADDS an `Include` directive — a
                 // benign `Host` edit should not trip the persistence rule.
-                if !added_includes(prev_content, &entry.content) {
+                if !added_includes(prev_line_hashes, &entry.content) {
                     continue;
                 }
                 (RuleId::PersistenceSshConfigInclude, Severity::Medium)
@@ -605,7 +637,7 @@ pub fn diff_entries(
             PersistenceKind::Other => continue,
         };
 
-        let added = added_lines_redacted(prev_content, &entry.content);
+        let added = added_lines_redacted(prev_line_hashes, &entry.content);
         let change = describe_change(entry.kind, prev_present, entry.present);
 
         findings.push(PersistenceFinding {
@@ -637,17 +669,21 @@ fn describe_change(kind: PersistenceKind, prev_present: bool, now_present: bool)
     }
 }
 
-/// Lines present in `new` but not in `old`, run through the shipping credential
-/// redactor. Order-preserving, deduplicated against the set of old lines.
-fn added_lines_redacted(old: &str, new: &str) -> Vec<String> {
+/// Lines present in `new_content` whose per-line hash is NOT in the prior
+/// snapshot's `prev_line_hashes` set, run through the shipping credential
+/// redactor. Order-preserving. The prior text is never available (the snapshot
+/// stores hashes only), so membership is decided by hash — which is exactly the
+/// secret-at-rest contract: we recompute added lines from the CURRENT cleartext
+/// (legitimately in hand at diff time) against the PRIOR hashes.
+fn added_lines_redacted(prev_line_hashes: &[String], new_content: &str) -> Vec<String> {
     use std::collections::HashSet;
-    let old_set: HashSet<&str> = old.lines().collect();
+    let prev: HashSet<&str> = prev_line_hashes.iter().map(String::as_str).collect();
     let mut out = Vec::new();
-    for line in new.lines() {
-        if old_set.contains(line) {
+    for line in new_content.lines() {
+        if line.trim().is_empty() {
             continue;
         }
-        if line.trim().is_empty() {
+        if prev.contains(line_hash(line).as_str()) {
             continue;
         }
         out.push(crate::redact::redact(line));
@@ -655,29 +691,49 @@ fn added_lines_redacted(old: &str, new: &str) -> Vec<String> {
     out
 }
 
-/// `true` when `new` contains an `Include` directive line that `old` did not.
-/// Used to gate the SSH-config rule on an *added* include specifically.
-fn added_includes(old: &str, new: &str) -> bool {
+/// `true` when `new_content` contains an `Include` directive RAW line whose
+/// hash is absent from the prior snapshot's `prev_line_hashes`. Used to gate the
+/// SSH-config rule on an *added* include specifically.
+///
+/// The hash MUST be computed over the same raw (untrimmed, non-empty) line that
+/// [`line_hashes`] persists, so an indented `  Include …` line that is unchanged
+/// still matches its prior hash and does not look "added".
+fn added_includes(prev_line_hashes: &[String], new_content: &str) -> bool {
     use std::collections::HashSet;
-    let old_includes: HashSet<String> = include_lines(old).collect();
-    include_lines(new).any(|l| !old_includes.contains(&l))
+    let prev: HashSet<&str> = prev_line_hashes.iter().map(String::as_str).collect();
+    new_content
+        .lines()
+        .filter(|raw| line_is_include(raw))
+        .any(|raw| !prev.contains(line_hash(raw).as_str()))
 }
 
-/// Iterator over normalized `Include`/`IncludeIf`-style directive lines in an
-/// SSH config body (case-insensitive keyword match, trimmed).
-fn include_lines(contents: &str) -> impl Iterator<Item = String> + '_ {
-    contents.lines().filter_map(|raw| {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            return None;
-        }
-        let keyword = line.split(char::is_whitespace).next().unwrap_or("");
-        if keyword.eq_ignore_ascii_case("include") {
-            Some(line.to_string())
-        } else {
-            None
-        }
-    })
+/// `true` when a RAW config line is an `Include`/`IncludeIf` directive
+/// (case-insensitive keyword on the trimmed line; comments / blanks excluded).
+fn line_is_include(raw: &str) -> bool {
+    let line = raw.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return false;
+    }
+    let keyword = line.split(char::is_whitespace).next().unwrap_or("");
+    keyword.eq_ignore_ascii_case("include")
+}
+
+/// 16-char SHA-256 prefix of one content line. 64 bits is ample to distinguish
+/// "line already present" from "line added" for the small line counts these
+/// surfaces carry, while storing nothing recoverable.
+fn line_hash(line: &str) -> String {
+    sha256_hex(line.as_bytes()).chars().take(16).collect()
+}
+
+/// Per-line hashes for every NON-EMPTY line of `content`, order-preserving.
+/// These are what the snapshot persists in place of cleartext. Hashes the RAW
+/// (untrimmed) line so the diff's membership test is consistent.
+fn line_hashes(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(line_hash)
+        .collect()
 }
 
 // ─── shared helpers ────────────────────────────────────────────────────────────
@@ -719,13 +775,46 @@ pub fn load_snapshot(path: &Path) -> PersistenceSnapshot {
 }
 
 /// Persist `snapshot` to `path`, creating the parent directory if needed.
+///
+/// Written `0600` AT OPEN TIME (no umask-race window where it is briefly
+/// world-readable) and ATOMICALLY (write to a sibling temp file, then rename),
+/// matching [`crate::env_guard::save_snapshot`]. Even though the snapshot now
+/// stores only hashes (no cleartext — see the module doc), the set of tracked
+/// surfaces is mildly sensitive, so the same 0600 discipline applies. A perms
+/// failure is propagated, never swallowed.
 pub fn save_snapshot(path: &Path, snapshot: &PersistenceSnapshot) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(snapshot)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, json)
+
+    // Write to a sibling temp file first, then rename into place so a partial
+    // write can never leave a truncated/corrupt snapshot.
+    let tmp = path.with_extension("json.tmp");
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&tmp)?;
+    use std::io::Write as _;
+    f.write_all(json.as_bytes())?;
+    f.flush()?;
+    // `OpenOptions::mode` only applies on file *creation* — if the temp file
+    // already existed with looser perms, tighten it before the rename.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    drop(f);
+
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -917,6 +1006,34 @@ mod tests {
     }
 
     #[test]
+    fn ssh_config_indented_include_unchanged_does_not_fire() {
+        // An INDENTED `  Include …` that is unchanged must not look "added":
+        // the snapshot hashes the RAW line and `added_includes` must hash the
+        // same RAW line (the trimmed-vs-raw mismatch was a real bug).
+        let home = tempdir().unwrap();
+        let ssh = home.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let cfg = ssh.join("config");
+        std::fs::write(&cfg, b"Host *\n  Include ~/.ssh/config.d/work\n").unwrap();
+
+        let snap = snapshot_then(home.path(), None);
+
+        // Change an UNRELATED indented option — the indented Include is
+        // untouched, so the SSH-config rule must NOT fire.
+        std::fs::write(
+            &cfg,
+            b"Host *\n  Include ~/.ssh/config.d/work\n  ServerAliveInterval 60\n",
+        )
+        .unwrap();
+
+        let findings = diff_against_snapshot(home.path(), None, &snap);
+        assert!(
+            !rule_ids(&findings).contains(&RuleId::PersistenceSshConfigInclude),
+            "an unchanged indented Include must not fire, got {findings:?}"
+        );
+    }
+
+    #[test]
     fn ssh_config_non_include_edit_does_not_fire() {
         let home = tempdir().unwrap();
         let ssh = home.path().join(".ssh");
@@ -961,10 +1078,12 @@ mod tests {
 
     #[test]
     fn added_lines_are_credential_redacted() {
-        // A sourced AWS key in an rc diff must be redacted in added_lines.
+        // A sourced AWS key in an rc diff must be redacted in added_lines. The
+        // prior content is represented ONLY by its per-line hashes (the
+        // secret-at-rest contract) — the diff still finds the new line.
         let old = "export PATH=/usr/bin\n";
         let new = "export PATH=/usr/bin\nexport AWS_KEY=AKIAIOSFODNN7EXAMPLE\n";
-        let added = added_lines_redacted(old, new);
+        let added = added_lines_redacted(&line_hashes(old), new);
         assert_eq!(added.len(), 1);
         assert!(
             !added[0].contains("AKIAIOSFODNN7EXAMPLE"),
@@ -972,6 +1091,41 @@ mod tests {
             added
         );
         assert!(added[0].contains("[REDACTED"));
+    }
+
+    #[test]
+    fn snapshot_persists_no_cleartext_only_hashes() {
+        // The serialized snapshot must NOT contain the raw rc-file bytes (a
+        // secret in an rc/.envrc would otherwise land world-readable at rest).
+        let home = tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".zshrc"),
+            b"export AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE\n",
+        )
+        .unwrap();
+        let entries = scan_with_root(home.path(), None);
+        let snap = PersistenceSnapshot::from_entries(&entries);
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(
+            !json.contains("AKIAIOSFODNN7EXAMPLE"),
+            "snapshot must not persist raw rc content, got {json}"
+        );
+        // But the per-line hashes ARE present so the diff still works.
+        assert!(json.contains("line_hashes"), "{json}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_snapshot_writes_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("persistence_snapshot.json");
+        // Pre-create at a loose mode to prove the re-baseline path tightens it.
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save_snapshot(&path, &PersistenceSnapshot::default()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "snapshot must be 0600, got {mode:o}");
     }
 
     #[test]
@@ -1019,8 +1173,30 @@ mod tests {
         let loaded = load_snapshot(&path);
         assert_eq!(loaded.schema_version, 1);
         assert!(loaded.entries.contains_key("shell_rc:.bashrc"));
-        // Content survives the round-trip so a later diff can show added lines.
-        assert_eq!(loaded.entries["shell_rc:.bashrc"].content, "alias l=ls\n");
+        // Per-line hashes survive the round-trip (NOT cleartext) so a later
+        // diff can still detect added lines. The original line's hash is
+        // present; an unrelated line's is not.
+        let lh = &loaded.entries["shell_rc:.bashrc"].line_hashes;
+        assert!(lh.contains(&line_hash("alias l=ls")), "{lh:?}");
+        assert!(!lh.contains(&line_hash("alias x=cat")), "{lh:?}");
+
+        // End-to-end: appending a new line to the rc file and diffing against
+        // the loaded (hash-only) snapshot still surfaces the added line.
+        std::fs::write(
+            home.path().join(".bashrc"),
+            b"alias l=ls\nsource ~/evil.sh\n",
+        )
+        .unwrap();
+        let findings = diff_against_snapshot(home.path(), None, &loaded);
+        let f = findings
+            .iter()
+            .find(|f| f.rule_id == RuleId::PersistenceShellRcModified)
+            .expect("a later diff against the hash-only snapshot must still fire");
+        assert!(
+            f.added_lines.iter().any(|l| l.contains("evil.sh")),
+            "{:?}",
+            f.added_lines
+        );
     }
 
     #[test]

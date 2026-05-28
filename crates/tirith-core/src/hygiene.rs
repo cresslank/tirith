@@ -488,8 +488,10 @@ fn gitconfig_uses_store_helper(contents: &str) -> bool {
             in_credential_section = section == "credential";
             continue;
         }
-        // One-line dotted form anywhere: `credential.helper = store`.
-        let lower = line.to_ascii_lowercase();
+        // One-line dotted form anywhere: `credential.helper = store`; or a
+        // bare `helper = store` inside a `[credential]` section (the
+        // `in_credential_section` check is the real guard against a stray
+        // `helper = store` outside any section).
         if let Some((key, value)) = line.split_once('=') {
             let key_lc = key.trim().to_ascii_lowercase();
             let value_lc = value.trim().to_ascii_lowercase();
@@ -500,8 +502,6 @@ fn gitconfig_uses_store_helper(contents: &str) -> bool {
                 return true;
             }
         }
-        // Guard against a stray `helper=store` flagged outside any section.
-        let _ = lower;
     }
     false
 }
@@ -583,12 +583,19 @@ fn scan_repo_root(root: &Path) -> Vec<HygieneFinding> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            // `entry.file_type()` does NOT follow symlinks. We deliberately keep
+            // it for the DIRECTORY-descent decision so a symlinked directory is
+            // not descended into (loop / escape prevention). But for LEAF file
+            // candidates we must follow the link via `path.is_file()` — a
+            // world-readable `.env` exposed through a symlink would otherwise
+            // stay off-radar (an attacker could hide a secret behind a link).
             let file_type = match entry.file_type() {
                 Ok(t) => t,
                 Err(_) => continue,
             };
 
             if file_type.is_dir() {
+                // Real directory (not a symlink-to-dir): descend.
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     if is_skippable_dir(name) {
                         continue;
@@ -597,7 +604,11 @@ fn scan_repo_root(root: &Path) -> Vec<HygieneFinding> {
                 stack.push(path);
                 continue;
             }
-            if !file_type.is_file() {
+            // A regular file OR a symlink that resolves to a regular file is a
+            // leaf candidate (`is_file()` follows the link). A symlink pointing
+            // at a directory is not treated as a leaf and is not descended
+            // (loop prevention) — it simply falls through.
+            if !path.is_file() {
                 continue;
             }
 
@@ -1041,6 +1052,48 @@ mod tests {
         assert_eq!(dumps.len(), 2, "expected both .sql and .dump flagged");
         assert!(dumps.iter().all(|f| f.severity == Severity::Medium));
         assert!(dumps.iter().all(|f| f.fix_kind == FixKind::Manual));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_world_readable_env_is_flagged() {
+        // A world-readable `.env` exposed through a symlink in the repo must be
+        // flagged — `entry.file_type()` does not follow links, so following via
+        // `path.is_file()` for leaf candidates is what catches it.
+        let home = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        // The real secret lives outside the repo; a symlink named `.env`
+        // inside the repo points at it.
+        let real_env = target_dir.path().join("real_secret.env");
+        std::fs::write(&real_env, b"SECRET=hunter2\n").unwrap();
+        chmod(&real_env, 0o644);
+        std::os::unix::fs::symlink(&real_env, repo.path().join(".env")).unwrap();
+
+        let findings = scan_with_root(home.path(), Some(repo.path()));
+        assert!(
+            rule_ids(&findings).contains(&RuleId::HygieneEnvWorldReadable),
+            "a world-readable .env exposed via symlink must be flagged, got {:?}",
+            rule_ids(&findings)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_dir_is_not_descended() {
+        // A symlink-to-directory must NOT be descended (loop / escape
+        // prevention) — a dump inside the link target stays unflagged.
+        let home = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("backup.sql"), b"-- dump\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("linked_dir")).unwrap();
+
+        let findings = scan_with_root(home.path(), Some(repo.path()));
+        assert!(
+            !rule_ids(&findings).contains(&RuleId::HygieneDbDumpInRepo),
+            "a dump inside a symlinked directory must not be discovered (no descent)"
+        );
     }
 
     #[test]
