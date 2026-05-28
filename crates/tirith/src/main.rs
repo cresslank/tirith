@@ -1932,8 +1932,12 @@ reflect the cwd at the time you run the preview.
 
 Exit codes:
   0  no concerns
-  1  HIGH impact (system path / outside repo / empty-variable glob)
+  1  HIGH impact (system path / outside repo / a $VAR/ glob whose variable is
+     set-but-empty)
   2  review recommended (find -delete / rsync --delete / symlinks)
+
+A $VAR/ glob whose variable is merely ABSENT from tirith's environment is
+advisory (Info, exit 0): it may be a benign shell-local tirith cannot see.
 
 Examples:
   tirith preview -- \"rm -rf ./dist\"

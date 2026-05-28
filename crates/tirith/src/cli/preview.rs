@@ -34,9 +34,10 @@ use tirith_core::verdict::{action_from_findings, Action, Finding};
 ///
 /// Exit codes follow the standard tirith convention derived from the merged
 /// findings: 0 on Allow (no findings), 1 on Block (a High-severity finding
-/// fired — e.g. system-path / outside-repo / empty-var glob), 2 on Warn
-/// (Medium — `find -delete` / `rsync --delete` / symlinks). Info findings
-/// (large file count) do not change the exit code.
+/// fired — e.g. system-path / outside-repo / a present-and-empty `$VAR/` glob),
+/// 2 on Warn (Medium — `find -delete` / `rsync --delete` / symlinks). Info
+/// findings (large file count, and an ABSENT-var `$VAR/` glob that tirith cannot
+/// confirm is unset in the shell — see F2) do not change the exit code.
 pub fn run(command: &str, json: bool) -> i32 {
     let command = command.trim();
     if command.is_empty() {
@@ -140,6 +141,15 @@ fn print_human(
             "  note: walk stopped at the depth-{}/{}-file cap; counts are lower bounds.",
             blast_radius::MAX_WALK_DEPTH,
             blast_radius::MAX_FILE_COUNT
+        );
+    }
+
+    if report.walk_errors > 0 {
+        println!();
+        println!(
+            "  note: {} path(s) could not be read (permission denied / I/O error); \
+             counts are LOWER BOUNDS — the real blast radius may be larger.",
+            report.walk_errors
         );
     }
 
@@ -249,14 +259,22 @@ mod tests {
     }
 
     #[test]
-    fn preview_empty_var_glob_blocks() {
-        // EMPTY var is unset → `rm -rf "$TIRITH_PREVIEW_UNSET/"` collapses to
-        // root → BlastEmptyVarGlob (High) → exit 1.
+    fn preview_empty_var_glob_absent_is_advisory() {
+        // F2: `$TIRITH_PREVIEW_UNSET` is ABSENT from tirith's process env. Tirith
+        // cannot tell whether it is a benign non-exported shell-local or a truly
+        // unset var that would collapse `rm -rf "$VAR/"` to root, so the
+        // BlastEmptyVarGlob finding fires at Info (advisory) — NOT a Block.
+        // (A PRESENT-and-empty var is unambiguously High; that case is
+        // unit-tested in blast_radius.rs without a process-env mutation.)
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".git")).unwrap();
         let _guard = CwdGuard::enter(dir.path());
         let code = run("rm -rf \"$TIRITH_PREVIEW_UNSET/\"", false);
-        assert_eq!(code, Action::Block.exit_code(), "empty-var glob must block");
+        assert_eq!(
+            code,
+            Action::Allow.exit_code(),
+            "an absent (possibly shell-local) empty-var glob is advisory, not a block"
+        );
     }
 
     #[test]

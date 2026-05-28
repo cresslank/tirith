@@ -1048,6 +1048,13 @@ fn apply_baseline(
     if !policy.baseline_enabled {
         return; // D2: default OFF — zero baseline I/O on the hot path.
     }
+    // F4: if the per-install salt is neither readable nor writable, every hash
+    // would differ each run, so EVERY pattern would look "first time" forever.
+    // `baseline::session_disabled()` warns once and disables baseline for the
+    // session; skip the whole block rather than emit perpetual false anomalies.
+    if crate::baseline::session_disabled() {
+        return;
+    }
     // Only react to findings that already fired. Skip the anomaly rules
     // themselves so we never observe-on-observe.
     let real_findings: Vec<usize> = findings
@@ -1233,11 +1240,18 @@ fn tmp_roots() -> Vec<std::path::PathBuf> {
 ///
 ///   * [`crate::verdict::RuleId::BlastWritesSystemPath`] (High) — target is `/`,
 ///     `/home`, `/usr`, `/etc`, `~`, … by literal shape.
-///   * [`crate::verdict::RuleId::BlastEmptyVarGlob`] (High) — a `"$VAR/"`-shaped
-///     target where `VAR` resolves to empty in the env snapshot taken here and
-///     passed into the (otherwise pure) detector.
+///   * [`crate::verdict::RuleId::BlastEmptyVarGlob`] — a `"$VAR/"`-shaped target
+///     where `VAR` resolves to empty in the env snapshot taken here and passed
+///     into the (otherwise pure) detector. **Severity is split (F2):** High when
+///     `VAR` is PRESENT-and-empty in tirith's env (unambiguous collapse to `/`);
+///     Info when `VAR` is merely ABSENT (it could be a benign non-exported
+///     shell-local that IS set — tirith cannot see shell-locals, so it must not
+///     BLOCK on the ambiguous case).
 ///   * [`crate::verdict::RuleId::BlastFindDelete`] (Medium) — `find … -delete`.
 ///   * [`crate::verdict::RuleId::BlastRsyncDelete`] (Medium) — `rsync --delete`.
+///
+/// A leading `sudo`/`doas` is unwrapped before the destructive leader is
+/// matched, so `sudo rm -rf /home` is recognized as the `rm` it really is (C1).
 ///
 /// The cheap check does NOT stat, walk the filesystem, expand globs, or count
 /// anything — `rm -rf ./dist` (a repo-relative target) produces no hot-path
@@ -1253,6 +1267,35 @@ fn tmp_roots() -> Vec<std::path::PathBuf> {
 /// [`BlastLargeFileCount`](crate::verdict::RuleId::BlastLargeFileCount)). It is
 /// NEVER reachable from this `analyze` path — the `tirith check` hot path never
 /// walks the filesystem; that is `preview`'s job.
+///
+/// # M10 ch3 — tainted-content hot lookup
+///
+/// A THIRD hot subset runs in `ScanContext::Exec`: when the command leader (or,
+/// for an interpreter like `bash`/`sh`/`source`, its first script argument)
+/// resolves to a path recorded in the taint store
+/// ([`crate::taint`]), [`check_taint_hot`] fires
+/// [`crate::verdict::RuleId::ExecOfTaintedFile`] (High) or
+/// [`CommandSourcedFromTaintedFile`](crate::verdict::RuleId::CommandSourcedFromTaintedFile)
+/// (High). A tainted path is NOT a regex/byte signal, so — like the ch5/ch6
+/// subsets — the tier-1 fast-exit is forced past (the `taint_triggered` gate
+/// below) ONLY when the store is non-empty (a single `metadata()` stat), so a
+/// machine that has never run `tirith fetch --save` pays nothing. The per-leader
+/// lookup itself is backed by a per-process, mtime-invalidated cache.
+///
+/// # M10 ch5 — baseline gate (opt-in, default OFF)
+///
+/// AFTER tier-3 rules produce findings, [`apply_baseline`] runs — but it is a
+/// no-op unless `policy.baseline_enabled` is set (design-decision D2). When
+/// enabled AND at least one rule already fired, it records a privacy-hashed
+/// observation per firing finding and, for a first-time/rare pattern, appends an
+/// Info anomaly ([`AnomalyFirstTimeInThisRepo`](crate::verdict::RuleId::AnomalyFirstTimeInThisRepo) /
+/// [`AnomalyRareInBaseline`](crate::verdict::RuleId::AnomalyRareInBaseline)).
+/// It never changes the action. The store records only salted-sha256 hashes and
+/// low-cardinality categoricals — never raw hostnames/paths. If the per-install
+/// salt is neither readable nor writable, baseline is disabled for the session
+/// (warned once) rather than emitting perpetual false `first-time` anomalies
+/// (F4). Because it runs only when a finding already exists and is flag-gated, it
+/// adds NO tier-1 force-past and zero I/O on an opted-out machine.
 pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     analyze_inner(ctx).0
 }

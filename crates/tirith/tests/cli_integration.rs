@@ -8350,3 +8350,92 @@ fn temp_run_smoke_true_emits_isolation_kind() {
         let _ = fs::remove_dir_all(PathBuf::from(p));
     }
 }
+
+/// F1 + pr-test-analyzer #6: `tirith watch` ALWAYS runs the after-snapshot and
+/// diff once the child returns, surfaces a `.zshrc` persistence-line write as the
+/// High `PostRunShellRcModified` finding, preserves the CHILD's exit code, and
+/// reports `interrupted: false` on a normal (non-signalled) run. Drives the
+/// top-level `watch` spelling against a controlled HOME so the test never
+/// touches the real shell-rc files.
+#[cfg(unix)]
+#[test]
+fn watch_reports_shell_rc_modification_and_preserves_exit_code() {
+    let home = tempfile::tempdir().expect("home");
+    let workdir = tempfile::tempdir().expect("workdir");
+    let zshrc = home.path().join(".zshrc");
+    fs::write(&zshrc, "alias ll='ls -la'\n").unwrap();
+
+    // The watched command appends a persistence line to ~/.zshrc, then exits 3
+    // (a distinct non-zero code we assert is preserved).
+    let cmd = "printf 'source ~/.cache/evil.sh\\n' >> \"$HOME/.zshrc\"; exit 3";
+
+    let out = tirith()
+        .args(["watch", "--json", "--", cmd])
+        .current_dir(workdir.path())
+        .env("HOME", home.path())
+        .env("SHELL", "/bin/sh")
+        .output()
+        .expect("failed to run tirith watch");
+
+    // The child's exit code (3) is preserved — watch is a lens, not a gate.
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "watch must surface the child's exit code, got stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("watch --json should be valid JSON");
+
+    // The after-diff ran even though the child exited non-zero.
+    let modified_rc = json["shell_rc_modified"]
+        .as_array()
+        .expect("shell_rc_modified array");
+    assert!(
+        modified_rc.iter().any(|v| v == ".zshrc"),
+        "the modified .zshrc must be reported, got: {modified_rc:?}"
+    );
+
+    let findings = json["findings"].as_array().expect("findings array");
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["rule_id"] == "post_run_shell_rc_modified"),
+        "a PostRunShellRcModified finding must fire, got: {findings:?}"
+    );
+
+    // Normal (non-signalled) run → not interrupted.
+    assert_eq!(
+        json["interrupted"], false,
+        "a normally-exiting run must report interrupted=false"
+    );
+}
+
+/// pr-test-analyzer #6: the namespaced `checkpoint watch` spelling must produce
+/// the same JSON envelope and preserve the child exit code (here 0).
+#[cfg(unix)]
+#[test]
+fn checkpoint_watch_alias_matches_envelope_and_exit() {
+    let home = tempfile::tempdir().expect("home");
+    let workdir = tempfile::tempdir().expect("workdir");
+    fs::write(home.path().join(".bashrc"), "export EDITOR=vim\n").unwrap();
+
+    let out = tirith()
+        .args(["checkpoint", "watch", "--json", "--", "true"])
+        .current_dir(workdir.path())
+        .env("HOME", home.path())
+        .env("SHELL", "/bin/sh")
+        .output()
+        .expect("failed to run tirith checkpoint watch");
+
+    assert_eq!(out.status.code(), Some(0), "`true` exits 0");
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("checkpoint watch --json valid JSON");
+    // Same envelope keys as the top-level spelling.
+    assert!(json.get("shell_rc_modified").is_some());
+    assert!(json.get("new_files").is_some());
+    assert_eq!(json["interrupted"], false);
+    assert_eq!(json["exit_code"], 0);
+}

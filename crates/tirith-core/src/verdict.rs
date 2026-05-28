@@ -748,9 +748,14 @@ pub enum RuleId {
     BlastSymlinkTraversal,
     /// M10 ch1 (HOT) — a destructive command targets a `"$VAR/"`-shaped path
     /// where `VAR` resolves to empty (`rm -rf "$EMPTY/"` with `EMPTY` unset →
-    /// `rm -rf "/"`). High severity. Detected against an injected env-map (the
-    /// hot path snapshots `std::env` once and passes it in), so the detector is
-    /// pure and the empty-var case is unit-testable without an env mutation.
+    /// `rm -rf "/"`). **Severity depends on what tirith can see (F2):** High when
+    /// `VAR` is PRESENT-and-empty in tirith's env-map (an unambiguous collapse);
+    /// Info when `VAR` is merely ABSENT, because it could be a benign
+    /// non-exported shell-local that IS set — tirith cannot observe shell-locals,
+    /// so it must not BLOCK the ambiguous case. Detected against an injected
+    /// env-map (the hot path snapshots `std::env` once and passes it in), so the
+    /// detector is pure and the present-empty case is unit-testable without an
+    /// env mutation. A leading `sudo`/`doas` is unwrapped before matching (C1).
     BlastEmptyVarGlob,
     /// M10 ch1 (HOT) — `find … -delete` recursively unlinks every matching
     /// entry. Medium severity. Surfaced by string shape on the hot path; run

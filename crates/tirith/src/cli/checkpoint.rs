@@ -252,6 +252,10 @@ pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: b
         None
     };
 
+    // F1: keep tirith alive across a Ctrl-C so the AFTER snapshot + diff always
+    // run (the child is in its own process group, see `run_command`).
+    install_watch_sigint_handler();
+
     // --- RUN the command with the user's full privileges (no isolation) ---
     let run_status = run_command(&command_str);
     let exit_code = match run_status {
@@ -261,8 +265,9 @@ pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: b
             return 2;
         }
     };
+    let interrupted = WATCH_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed);
 
-    // --- AFTER: re-inventory + re-capture ---
+    // --- AFTER: re-inventory + re-capture (ALWAYS, even after an interrupt) ---
     let files_after = inventory_files(&snapshot_paths);
     let rt_after = checkpoint::capture_runtime_state(&home);
 
@@ -306,6 +311,7 @@ pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: b
             with_net_hints,
             &findings,
             action,
+            interrupted,
         );
     } else {
         print_watch_human(
@@ -317,6 +323,7 @@ pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: b
             &post_run_state,
             with_net_hints,
             &findings,
+            interrupted,
         );
     }
 
@@ -344,6 +351,19 @@ fn home_dir() -> Option<PathBuf> {
 /// behave as the user typed them. Returns the child's exit code (128 if killed
 /// by a signal with no code). The command runs with tirith's full privileges —
 /// this is NOT isolation.
+///
+/// F1: on Unix the child is placed in its OWN process group (`setpgid(0,0)` via
+/// `pre_exec`). Without this the child shares tirith's process group, so a
+/// terminal `Ctrl-C` (SIGINT) is delivered to the WHOLE group — killing tirith
+/// before it can run the AFTER snapshot + diff. A half-finished installer that
+/// wrote a `.zshrc` persistence line then got interrupted would produce NO
+/// `PostRunShellRcModified` finding. With the child in its own group, SIGINT
+/// goes to the child only; tirith's installed SIGINT handler (see
+/// [`install_watch_sigint_handler`]) merely notes the interrupt, and the caller
+/// ALWAYS runs the after-snapshot + diff once `status()` returns. The child
+/// still observes the interrupt (the terminal also signals the foreground group,
+/// and an interactive child reads it), so this does not swallow the user's
+/// Ctrl-C — it only keeps tirith alive long enough to report.
 fn run_command(command_str: &str) -> std::io::Result<i32> {
     use std::process::Command;
     let mut cmd = if cfg!(windows) {
@@ -356,9 +376,53 @@ fn run_command(command_str: &str) -> std::io::Result<i32> {
         c.arg("-c").arg(command_str);
         c
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `setpgid` is async-signal-safe and the only call made in the
+        // forked child before exec. Placing the child in its own process group
+        // (pgid = its own pid) keeps a terminal SIGINT from also killing tirith.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     let status = cmd.status()?;
     Ok(status.code().unwrap_or(128))
 }
+
+// ─── SIGINT handling (F1) ────────────────────────────────────────────────────
+
+/// Set by the watch SIGINT handler so the run path can note that the command was
+/// interrupted and still report an honest (possibly incomplete) diff.
+static WATCH_INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Install a SIGINT handler that flips [`WATCH_INTERRUPTED`] instead of letting
+/// the default action terminate tirith. The child runs in its own process group
+/// (see [`run_command`]), so the child still takes the terminal's SIGINT; this
+/// handler only keeps the PARENT (tirith) alive so it can run the after-snapshot
+/// and diff. Uses `libc::signal` directly (the handler does one atomic store,
+/// which is async-signal-safe).
+#[cfg(unix)]
+fn install_watch_sigint_handler() {
+    extern "C" fn handle(_sig: libc::c_int) {
+        WATCH_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    // SAFETY: `handle` only performs an atomic store, which is
+    // async-signal-safe. Registering a SIGINT handler is sound.
+    unsafe {
+        libc::signal(libc::SIGINT, handle as *const () as libc::sighandler_t);
+    }
+}
+
+/// On non-Unix, Ctrl-C uses the default behavior. `watch` still runs the diff
+/// on a normal child exit; the process-group nuance is Unix-only.
+#[cfg(not(unix))]
+fn install_watch_sigint_handler() {}
 
 /// Inventory files under the given roots as a `path -> mtime` map, capped to
 /// keep the before/after snapshot cheap. Symlinks are recorded by their own
@@ -479,10 +543,19 @@ fn print_watch_human(
     state: &PostRunState,
     with_net_hints: bool,
     findings: &[Finding],
+    interrupted: bool,
 ) {
     let s = tirith_core::style::Stream::Stdout;
     println!("{} {command}", tirith_core::style::bold("watched:", s));
     println!("  exit code: {exit_code}");
+    if interrupted {
+        let note = tirith_core::style::yellow(
+            "interrupted (Ctrl-C): the command may not have finished, but the \
+             after-snapshot below still ran",
+            s,
+        );
+        println!("  {note}");
+    }
 
     print_list_section("new files", new_files, false);
     print_list_section("modified files", modified_files, false);
@@ -545,6 +618,7 @@ fn emit_watch_json(
     with_net_hints: bool,
     findings: &[Finding],
     action: Action,
+    interrupted: bool,
 ) {
     // `net_hints` is only meaningful (and present) when the experimental flag is
     // set; otherwise null so a consumer never reads an empty array as "no
@@ -565,6 +639,10 @@ fn emit_watch_json(
     let json_val = serde_json::json!({
         "command": command,
         "exit_code": exit_code,
+        // True when tirith caught a SIGINT during the run. The after-snapshot
+        // still ran, but the command may not have finished — a consumer should
+        // treat the diff as a lower bound, not a clean result.
+        "interrupted": interrupted,
         "new_files": new_files,
         "modified_files": modified_files,
         "shell_rc_modified": dedup_rc,

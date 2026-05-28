@@ -213,24 +213,71 @@ fn salt_in(dir: &Path) -> PathBuf {
 
 // ─── salt ──────────────────────────────────────────────────────────────────--
 
-/// Load the per-install salt from `salt_path`, generating and persisting a fresh
-/// 32-byte random salt (mode `0600`) when absent. Returns the raw salt bytes.
-///
-/// On any I/O failure the call still returns a usable in-memory salt (generated
-/// fresh) so hashing never fails the hot path; a non-persisted salt only means
-/// the hashes won't be stable across processes, which is acceptable fail-open
-/// behavior (worst case: a pattern looks new once more than it should).
-fn load_or_create_salt(salt_file: &Path) -> Vec<u8> {
-    if let Ok(bytes) = std::fs::read(salt_file) {
-        if bytes.len() >= 16 {
-            return bytes;
+/// Fixed salt length. The salt file must be EXACTLY this many bytes; a
+/// shorter file (truncated, crash mid-write, or attacker-shrunk) is rejected and
+/// regenerated, so the documented 32-byte privacy guarantee can never silently
+/// degrade to a weak salt.
+const SALT_LEN: usize = 32;
+
+/// Per-process salt state. Resolved once (I1: no N+1 file reads on the hot path)
+/// and cached, keyed on the salt path so test entry points with distinct temp
+/// paths each resolve their own salt.
+enum SaltState {
+    /// A usable salt (read from disk or freshly generated AND persisted).
+    Ready(Vec<u8>),
+    /// The salt is corrupt/unreadable AND could not be persisted, so a fresh
+    /// per-run salt would churn every hash and make EVERY pattern look
+    /// "first time" forever (F4). Baseline is disabled for the session.
+    Disabled,
+}
+
+/// Cache of `(salt_path, state)`. Reloads only when the path differs (production
+/// always passes the same `state_dir()/baseline.salt`, so it loads once).
+static SALT_CACHE: std::sync::Mutex<Option<(PathBuf, std::sync::Arc<SaltState>)>> =
+    std::sync::Mutex::new(None);
+
+/// One-shot guard so the "baseline disabled" warning prints at most once per
+/// process even if many findings fire.
+static SALT_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Resolve the per-install salt for `salt_file`, caching the result for the
+/// process. See [`load_salt_state`] for the read/generate/persist logic.
+fn salt_state(salt_file: &Path) -> std::sync::Arc<SaltState> {
+    let mut guard = SALT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((path, state)) = guard.as_ref() {
+        if path == salt_file {
+            return std::sync::Arc::clone(state);
         }
     }
+    let state = std::sync::Arc::new(load_salt_state(salt_file));
+    *guard = Some((salt_file.to_path_buf(), std::sync::Arc::clone(&state)));
+    state
+}
+
+/// Read the salt from `salt_file` (must be exactly [`SALT_LEN`] bytes), or
+/// generate a fresh 32-byte salt and persist it atomically at `0600`.
+///
+/// Fail-open with a floor: if the file is absent/corrupt AND the fresh salt
+/// cannot be persisted, returns [`SaltState::Disabled`] (with a one-time stderr
+/// warning) rather than handing back an unpersisted salt that would churn every
+/// hash and fire `AnomalyFirstTimeInThisRepo` forever (F4).
+fn load_salt_state(salt_file: &Path) -> SaltState {
+    let mut existing_is_corrupt = false;
+    if let Ok(bytes) = std::fs::read(salt_file) {
+        if bytes.len() == SALT_LEN {
+            return SaltState::Ready(bytes);
+        }
+        // A short/oversized salt file is corrupt — must be OVERWRITTEN, not
+        // adopted (I2). Remember this so persist replaces it atomically rather
+        // than treating an `AlreadyExists` as "another process won the race".
+        existing_is_corrupt = true;
+    }
+
     // Generate a fresh 32-byte salt from the OS RNG. On the (extremely unlikely)
     // event that the OS entropy source fails, fall back to a time-derived salt
-    // so hashing never aborts the hot path — fail-open, since a weak salt only
-    // weakens the privacy guarantee for this one process, it never crashes.
-    let mut salt = [0u8; 32];
+    // so hashing never aborts — fail-open, since a weak salt only weakens the
+    // privacy guarantee for this one process, it never crashes.
+    let mut salt = [0u8; SALT_LEN];
     if getrandom::fill(&mut salt).is_err() {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -240,21 +287,107 @@ fn load_or_create_salt(salt_file: &Path) -> Vec<u8> {
     }
     let salt = salt.to_vec();
 
-    // Best-effort persist at 0600. A failure here is non-fatal.
-    if let Some(parent) = salt_file.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    match persist_salt(salt_file, &salt, existing_is_corrupt) {
+        Ok(persisted) => SaltState::Ready(persisted),
+        Err(_) => {
+            // Could neither read a stable salt nor write a fresh one. A per-run
+            // salt would make every pattern look new on every invocation,
+            // turning the anomaly signal into perpetual noise — so disable
+            // baseline for this session and tell the user once.
+            warn_baseline_disabled_once(salt_file);
+            SaltState::Disabled
+        }
     }
+}
+
+/// Install `salt` at `salt_file` (mode `0600`) and return the salt that is now
+/// ON DISK.
+///
+/// Two cases:
+///   * `replace_corrupt == false` (the file was ABSENT): claim it exclusively
+///     with `create_new`. If another process created it first (greptile #4
+///     concurrent-first-use race), ADOPT that process's salt by reading it back
+///     instead of clobbering it — so two processes that start together never
+///     diverge (one salt in memory, a different one on disk).
+///   * `replace_corrupt == true` (the file existed but was the wrong length):
+///     overwrite it atomically via a sibling temp file + rename (I2), so a
+///     short/truncated salt is regenerated rather than adopted.
+///
+/// In both cases a crash mid-write never leaves a half-written salt. The absent
+/// path's exclusive `create_new` followed by one `write_all` is the only writer
+/// of a fresh file, and the replace path renames a fully-written temp file into
+/// place.
+fn persist_salt(salt_file: &Path, salt: &[u8], replace_corrupt: bool) -> std::io::Result<Vec<u8>> {
+    if let Some(parent) = salt_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    if replace_corrupt {
+        // Atomic overwrite of a corrupt (wrong-length) salt.
+        let dir = salt_file.parent().unwrap_or_else(|| Path::new("."));
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        tmp.write_all(salt)?;
+        tmp.persist(salt_file).map_err(|e| e.error)?;
+        return Ok(salt.to_vec());
+    }
+
+    // Absent file: try to claim it exclusively so concurrent first-use does not
+    // produce two diverging salts.
     let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).write(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    if let Ok(mut f) = opts.open(salt_file) {
-        let _ = f.write_all(&salt);
+    match opts.open(salt_file) {
+        Ok(mut f) => {
+            f.write_all(salt)?;
+            f.sync_all().ok();
+            Ok(salt.to_vec())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Lost the race — adopt the on-disk salt when it is the right
+            // length; otherwise propagate so the caller disables baseline.
+            match std::fs::read(salt_file) {
+                Ok(bytes) if bytes.len() == SALT_LEN => Ok(bytes),
+                Ok(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "concurrent salt file is corrupt",
+                )),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
     }
-    salt
+}
+
+fn warn_baseline_disabled_once(salt_file: &Path) {
+    use std::sync::atomic::Ordering;
+    if !SALT_WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "tirith: WARNING: baseline salt at {} is unreadable and could not be \
+             written; anomaly baseline is disabled for this session (run \
+             `tirith doctor` to diagnose the state directory).",
+            salt_file.display()
+        );
+    }
+}
+
+/// `true` when the baseline is disabled for this session because the salt is
+/// neither readable nor writable. The engine consults this to skip the whole
+/// baseline block rather than emit perpetual false `first-time` anomalies (F4).
+pub fn session_disabled() -> bool {
+    match salt_path() {
+        Some(sp) => matches!(*salt_state(&sp), SaltState::Disabled),
+        None => true,
+    }
 }
 
 /// Salted-sha256 of `value`, hex, truncated to `len` chars. Used for both the
@@ -269,14 +402,17 @@ fn salted_hash(salt: &[u8], value: &str, len: usize) -> String {
 
 /// Compute the host hash for a raw hostname using the salt in `salt_file`.
 /// Hostnames are lowercased first so `GitHub.com` and `github.com` collapse.
-pub fn hash_host_at(salt_file: &Path, host: &str) -> String {
-    let salt = load_or_create_salt(salt_file);
-    salted_hash(&salt, &host.trim().to_ascii_lowercase(), 16)
+/// Returns `None` when the salt is disabled for the session (F4).
+pub fn hash_host_at(salt_file: &Path, host: &str) -> Option<String> {
+    match &*salt_state(salt_file) {
+        SaltState::Ready(salt) => Some(salted_hash(salt, &host.trim().to_ascii_lowercase(), 16)),
+        SaltState::Disabled => None,
+    }
 }
 
 /// Compute the cwd/repo hash. `cwd` is resolved to its repository root (nearest
 /// `.git` ancestor) in-process; when not in a repo, the cwd path is hashed
-/// directly. Returns `None` only when no cwd is resolvable.
+/// directly. Returns `None` when no cwd is resolvable OR the salt is disabled.
 pub fn hash_cwd_at(salt_file: &Path, cwd: Option<&str>) -> Option<String> {
     let resolved = crate::policy::find_repo_root(cwd)
         .map(|p| p.to_string_lossy().into_owned())
@@ -287,8 +423,10 @@ pub fn hash_cwd_at(salt_file: &Path, cwd: Option<&str>) -> Option<String> {
                     .map(|p| p.display().to_string())
             })
         })?;
-    let salt = load_or_create_salt(salt_file);
-    Some(salted_hash(&salt, &resolved, 8))
+    match &*salt_state(salt_file) {
+        SaltState::Ready(salt) => Some(salted_hash(salt, &resolved, 8)),
+        SaltState::Disabled => None,
+    }
 }
 
 // ─── store I/O ─────────────────────────────────────────────────────────────--
@@ -321,10 +459,16 @@ fn parse_seen_at(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
 /// `true` when `seen_at` is within `WINDOW_DAYS` of `now`. An unparseable
 /// timestamp is treated as out-of-window (dropped) so a corrupt row can't
-/// inflate a count forever.
+/// inflate a count forever. A FUTURE-dated row (negative age — clock skew or a
+/// tampered store) is also dropped: without the `age_days >= 0` guard such rows
+/// would be permanently in-window and could crowd out real observations under
+/// the LRU cap.
 fn in_window(seen_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
     match parse_seen_at(seen_at) {
-        Some(ts) => now.signed_duration_since(ts).num_days() < WINDOW_DAYS,
+        Some(ts) => {
+            let age_days = now.signed_duration_since(ts).num_days();
+            (0..WINDOW_DAYS).contains(&age_days)
+        }
         None => false,
     }
 }
@@ -550,7 +694,7 @@ pub fn reset() -> std::io::Result<usize> {
 
 /// Production host hash using the default salt path.
 pub fn hash_host(host: &str) -> Option<String> {
-    salt_path().map(|sp| hash_host_at(&sp, host))
+    hash_host_at(&salt_path()?, host)
 }
 
 /// Production cwd/repo hash using the default salt path.
@@ -712,14 +856,42 @@ mod tests {
     fn salt_is_persisted_and_stable() {
         let dir = tempdir().unwrap();
         let salt_file = salt_in(dir.path());
-        let h1 = hash_host_at(&salt_file, "github.com");
+        let h1 = hash_host_at(&salt_file, "github.com").unwrap();
         // A second call reuses the persisted salt → same hash.
-        let h2 = hash_host_at(&salt_file, "github.com");
+        let h2 = hash_host_at(&salt_file, "github.com").unwrap();
         assert_eq!(h1, h2);
         assert!(salt_file.exists(), "salt must be persisted");
         // Host hash is 16 hex chars; never the raw host.
         assert_eq!(h1.len(), 16);
         assert!(!h1.contains("github"));
+    }
+
+    #[test]
+    fn salt_file_is_32_bytes() {
+        // I2 regression: the persisted salt must be exactly 32 bytes (the
+        // documented length), not 16.
+        let dir = tempdir().unwrap();
+        let salt_file = salt_in(dir.path());
+        let _ = hash_host_at(&salt_file, "github.com").unwrap();
+        let bytes = std::fs::read(&salt_file).unwrap();
+        assert_eq!(bytes.len(), SALT_LEN);
+    }
+
+    #[test]
+    fn short_salt_file_is_regenerated() {
+        // I2 regression: a truncated/short salt file (e.g. 16 bytes from an old
+        // version or a crash mid-write) must be rejected and regenerated to the
+        // full 32 bytes, not accepted as-is.
+        let dir = tempdir().unwrap();
+        let salt_file = salt_in(dir.path());
+        std::fs::write(&salt_file, [0u8; 16]).unwrap();
+        let h = hash_host_at(&salt_file, "github.com").unwrap();
+        assert_eq!(h.len(), 16);
+        assert_eq!(
+            std::fs::read(&salt_file).unwrap().len(),
+            SALT_LEN,
+            "short salt must be regenerated to 32 bytes"
+        );
     }
 
     #[test]
@@ -736,8 +908,8 @@ mod tests {
     fn different_salts_give_different_hashes() {
         let dir1 = tempdir().unwrap();
         let dir2 = tempdir().unwrap();
-        let h1 = hash_host_at(&salt_in(dir1.path()), "github.com");
-        let h2 = hash_host_at(&salt_in(dir2.path()), "github.com");
+        let h1 = hash_host_at(&salt_in(dir1.path()), "github.com").unwrap();
+        let h2 = hash_host_at(&salt_in(dir2.path()), "github.com").unwrap();
         assert_ne!(h1, h2, "per-install salt must diverge hashes");
     }
 
@@ -752,15 +924,43 @@ mod tests {
     }
 
     #[test]
+    fn unwritable_corrupt_salt_disables_baseline() {
+        // F4 regression: when the salt is unreadable AND cannot be created
+        // (parent path is a FILE, not a dir → both read and create_dir_all
+        // fail), hashing returns None and the session is marked disabled —
+        // instead of churning a fresh per-run salt that fires
+        // AnomalyFirstTimeInThisRepo forever.
+        let dir = tempdir().unwrap();
+        // Make the salt's parent a regular file so create_dir_all/persist fail.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a dir").unwrap();
+        let salt_file = blocker.join("baseline.salt");
+
+        assert!(
+            hash_host_at(&salt_file, "github.com").is_none(),
+            "host hash must be None when the salt cannot be read or written"
+        );
+        assert!(
+            matches!(*salt_state(&salt_file), SaltState::Disabled),
+            "salt state must be Disabled for an unreadable+unwritable salt"
+        );
+    }
+
+    #[test]
     fn corrupt_line_is_skipped_not_fatal() {
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
+        // A valid, recent (in-window, NOT future-dated) observation alongside a
+        // junk line and a blank line.
+        let recent = chrono::Utc::now().to_rfc3339();
         std::fs::write(
             &store,
-            "not json\n{\"rule_id\":\"curl_pipe_shell\",\"sudo_flag\":false,\"seen_at\":\"2099-01-01T00:00:00Z\"}\n\n",
+            format!(
+                "not json\n{{\"rule_id\":\"curl_pipe_shell\",\"sudo_flag\":false,\"seen_at\":\"{recent}\"}}\n\n"
+            ),
         )
         .unwrap();
-        // The one valid (future-dated, in-window) row counts; the junk is skipped.
+        // The one valid in-window row counts; the junk is skipped.
         let k = PatternKey {
             rule_id: "curl_pipe_shell".to_string(),
             host_hash: None,
@@ -769,6 +969,34 @@ mod tests {
             cwd_repo_hash: None,
         };
         assert_eq!(lookup_at(&store, &k).count, 1);
+    }
+
+    #[test]
+    fn future_dated_observation_is_out_of_window() {
+        // Greptile P2 regression: a future-dated row (clock skew / tampered
+        // store) must NOT count as in-window forever.
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let future = (chrono::Utc::now() + chrono::Duration::days(10)).to_rfc3339();
+        std::fs::write(
+            &store,
+            format!(
+                "{{\"rule_id\":\"curl_pipe_shell\",\"sudo_flag\":false,\"seen_at\":\"{future}\"}}\n"
+            ),
+        )
+        .unwrap();
+        let k = PatternKey {
+            rule_id: "curl_pipe_shell".to_string(),
+            host_hash: None,
+            ecosystem: None,
+            sudo_flag: false,
+            cwd_repo_hash: None,
+        };
+        assert_eq!(
+            lookup_at(&store, &k).count,
+            0,
+            "a future-dated observation must be treated as out-of-window"
+        );
     }
 
     #[test]

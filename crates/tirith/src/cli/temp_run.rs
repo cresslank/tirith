@@ -41,7 +41,25 @@ filesystem-impact preview ONLY.";
 
 /// Stable machine-readable marker carried by every JSON envelope so a
 /// downstream consumer can never mistake `temp-run` for a security boundary.
+/// This is the string form of [`IsolationKind::FileOnlyNotASandbox`]; the
+/// `isolation_kind_const_matches_enum` test pins them together so the honesty
+/// contract has a single source of truth. Kept as a `pub` string for external
+/// consumers and the threat-model wording even though JSON is now emitted
+/// through the typed enum.
+#[allow(dead_code)]
 pub const ISOLATION_KIND: &str = "file_only_not_a_sandbox";
+
+/// The honesty-of-claim contract for `temp-run`, as a TYPE rather than a bare
+/// string literal (type-design #1). Serializing through this enum means a future
+/// edit cannot silently change or drop the `isolation_kind` marker — the only
+/// representable value is the not-a-sandbox one, and the serde rename pins the
+/// wire string. `temp-run`'s dominant requirement is that no consumer mistakes
+/// it for a sandbox, so the contract is worth encoding in the type system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum IsolationKind {
+    #[serde(rename = "file_only_not_a_sandbox")]
+    FileOnlyNotASandbox,
+}
 
 /// Environment variables preserved under `--strip-env`. Deliberately tiny:
 /// enough for most commands to find a home, a PATH, and render text, but not
@@ -233,8 +251,9 @@ fn emit_json(
 ) {
     let json_val = serde_json::json!({
         // The load-bearing honesty field: a consumer reading this can never
-        // mistake temp-run for a security boundary.
-        "isolation_kind": ISOLATION_KIND,
+        // mistake temp-run for a security boundary. Emitted through the typed
+        // `IsolationKind` enum so the contract cannot drift (type-design #1).
+        "isolation_kind": IsolationKind::FileOnlyNotASandbox,
         "not_a_sandbox": true,
         "disclaimer": NOT_A_SANDBOX_BANNER,
         "command": command_str,
@@ -414,6 +433,15 @@ mod tests {
         assert!(NOT_A_SANDBOX_BANNER.contains("full user privileges"));
         assert!(NOT_A_SANDBOX_BANNER.contains("keychain"));
         assert_eq!(ISOLATION_KIND, "file_only_not_a_sandbox");
+    }
+
+    #[test]
+    fn isolation_kind_const_matches_enum() {
+        // The typed enum and the string const must serialize to the SAME wire
+        // value so the honesty contract has one source of truth (type-design #1).
+        let serialized =
+            serde_json::to_value(IsolationKind::FileOnlyNotASandbox).expect("serialize enum");
+        assert_eq!(serialized, serde_json::Value::String(ISOLATION_KIND.into()));
     }
 
     #[test]

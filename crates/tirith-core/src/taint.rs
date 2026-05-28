@@ -383,6 +383,16 @@ mod tests {
         dir.join("taint.jsonl")
     }
 
+    // The Unix-path-shape assertions below are gated `#[cfg(unix)]` because
+    // `/work/repo` is NOT an absolute path on Windows (no drive prefix), so
+    // `normalize_key` would take the cwd-prefix branch and the expected key
+    // would be `<cwd>/work/repo/...`, not `/work/repo/...`. The `normalize_key`
+    // LOGIC itself is portable — it routes every component through
+    // `std::path::Component` (RootDir / Prefix / ParentDir / Normal) rather
+    // than splitting on a hard-coded `/`, so drive letters and `\` separators
+    // are handled by `std::path` on Windows. The `#[cfg(windows)]` twins below
+    // exercise the same code with drive-letter absolute paths.
+    #[cfg(unix)]
     #[test]
     fn normalize_key_resolves_relative_against_cwd() {
         let cwd = Path::new("/work/repo");
@@ -390,6 +400,7 @@ mod tests {
         assert_eq!(key, PathBuf::from("/work/repo/install.sh"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn normalize_key_resolves_parent_components() {
         let cwd = Path::new("/work/repo/sub");
@@ -397,12 +408,40 @@ mod tests {
         assert_eq!(key, PathBuf::from("/work/repo/install.sh"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn normalize_key_keeps_absolute_untouched() {
         let key = normalize_key(Path::new("/tmp/x/./y"), Some(Path::new("/work")));
         assert_eq!(key, PathBuf::from("/tmp/x/y"));
     }
 
+    // Windows twins: drive-letter absolute paths exercise the `Component::Prefix`
+    // and `Component::RootDir` arms of `normalize_key`, proving the keying is
+    // cross-platform (the same `.`/`..` lexical normalization on a `C:\…` base).
+    #[cfg(windows)]
+    #[test]
+    fn normalize_key_resolves_relative_against_cwd_windows() {
+        let cwd = Path::new(r"C:\work\repo");
+        let key = normalize_key(Path::new(r".\install.sh"), Some(cwd));
+        assert_eq!(key, PathBuf::from(r"C:\work\repo\install.sh"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_key_resolves_parent_components_windows() {
+        let cwd = Path::new(r"C:\work\repo\sub");
+        let key = normalize_key(Path::new(r"..\install.sh"), Some(cwd));
+        assert_eq!(key, PathBuf::from(r"C:\work\repo\install.sh"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_key_keeps_absolute_untouched_windows() {
+        let key = normalize_key(Path::new(r"C:\tmp\x\.\y"), Some(Path::new(r"C:\work")));
+        assert_eq!(key, PathBuf::from(r"C:\tmp\x\y"));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn mark_then_is_tainted_roundtrips() {
         let dir = tempdir().unwrap();
@@ -433,6 +472,39 @@ mod tests {
         // Same file reached via an absolute path must hit the same key.
         let found_abs =
             is_tainted_at(&store, Path::new("/work/repo/install.sh"), None).expect("abs lookup");
+        assert_eq!(found_abs.path, found.path);
+    }
+
+    // Windows twin of the round-trip: a relative mark and a drive-letter absolute
+    // lookup must agree on the same normalized key.
+    #[cfg(windows)]
+    #[test]
+    fn mark_then_is_tainted_roundtrips_windows() {
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let cwd = Path::new(r"C:\work\repo");
+
+        assert!(is_tainted_at(&store, Path::new(r".\install.sh"), Some(cwd)).is_none());
+
+        let entry = mark_tainted_at(
+            &store,
+            Path::new(r".\install.sh"),
+            Some(cwd),
+            "fetch --save",
+            Some("https://untrusted.example/install.sh".to_string()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(entry.path, r"C:\work\repo\install.sh");
+        assert_eq!(entry.origin, "fetch --save");
+
+        let found = is_tainted_at(&store, Path::new(r".\install.sh"), Some(cwd))
+            .expect("path should be tainted after mark");
+        assert_eq!(found.path, r"C:\work\repo\install.sh");
+
+        // Same file reached via an absolute drive-letter path must hit the same key.
+        let found_abs =
+            is_tainted_at(&store, Path::new(r"C:\work\repo\install.sh"), None).expect("abs lookup");
         assert_eq!(found_abs.path, found.path);
     }
 

@@ -73,6 +73,26 @@ pub struct BlastReport {
     /// True when the walk hit [`MAX_FILE_COUNT`] / [`MAX_WALK_DEPTH`] and the
     /// counts are therefore lower bounds, not exact.
     pub walk_truncated: bool,
+    /// Number of directories/entries the walk could NOT read (permission denied,
+    /// I/O error, symlink loop). When `> 0` the counts are LOWER BOUNDS for a
+    /// different reason than truncation: a subtree was skipped silently, so a
+    /// `preview` over a restricted tree must not present its counts as complete.
+    pub walk_errors: u64,
+}
+
+/// How an empty-`$VAR`-glob target resolved against the (tirith-process) env.
+/// Drives the severity split in [`cheap_check`] (F2): tirith only sees its OWN
+/// environment, not the interactive shell's, so an ABSENT var might be a benign
+/// non-exported shell-local — we must not BLOCK on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyVarKind {
+    /// The variable is present in tirith's env and set to the empty string.
+    /// Unambiguously collapses to a root path → High.
+    PresentEmpty,
+    /// The variable is absent from tirith's env. It collapses to root IFF the
+    /// shell also has it unset — but it could be a non-exported shell-local that
+    /// IS set. Tirith can't tell, so this is an advisory Info, not a Block (F2).
+    Absent,
 }
 
 /// A destructive filesystem operation recognized by the blast-radius surface.
@@ -172,17 +192,42 @@ pub fn cheap_check(
 
         for target in &parsed.targets {
             // Empty-`$VAR/` glob: `rm -rf "$EMPTY/"` collapses to `rm -rf "/"`.
-            if let Some(var) = empty_var_glob_var(target, env_map) {
+            // F2: tirith only sees its OWN process env, not the interactive
+            // shell's. A var that is PRESENT-and-empty is an unambiguous collapse
+            // (High/Block). A var that is merely ABSENT might be a non-exported
+            // shell-local that is actually set, so we cannot safely block — emit
+            // Info with a note instead of a false High.
+            if let Some((var, kind)) = empty_var_glob_var(target, env_map) {
+                let (severity, description) = match kind {
+                    EmptyVarKind::PresentEmpty => (
+                        Severity::High,
+                        "An argument of the shape `\"$VAR/\"` where `VAR` is set to the empty \
+                         string expands to `\"/\"`, so this command would operate on the \
+                         filesystem root. Quote-and-set the variable, or guard with \
+                         `${VAR:?must be set}`."
+                            .to_string(),
+                    ),
+                    EmptyVarKind::Absent => (
+                        Severity::Info,
+                        format!(
+                            "The argument references `${var}`, which is NOT set in tirith's \
+                             environment. If `${var}` is also unset in your shell, `\"${var}/\"` \
+                             collapses to `\"/\"` (a filesystem-root delete); if it is a \
+                             non-exported shell-local that IS set, this is harmless — tirith \
+                             cannot see shell-locals, so this is advisory only. Run \
+                             `tirith preview` in the same shell to resolve it, or guard with \
+                             `${{{var}:?must be set}}`."
+                        ),
+                    ),
+                };
                 findings.push(finding(
                     RuleId::BlastEmptyVarGlob,
-                    Severity::High,
-                    "destructive command targets an empty-variable path that collapses to root",
-                    "An argument of the shape `\"$VAR/\"` where `VAR` is unset/empty expands to \
-                     `\"/\"`, so this command would operate on the filesystem root. Quote-and-set \
-                     the variable, or guard with `${VAR:?must be set}`.",
+                    severity,
+                    "destructive command targets an empty-variable path that may collapse to root",
+                    &description,
                     Evidence::Text {
                         detail: format!(
-                            "argument '{target}' references empty variable '${var}' → collapses to a root path"
+                            "argument '{target}' references empty variable '${var}' → may collapse to a root path"
                         ),
                     },
                 ));
@@ -256,7 +301,7 @@ pub fn simulate(
 
             // Expand the target (glob against cwd, else literal) into concrete
             // paths.
-            let expanded = expand_target(target, cwd);
+            let expanded = expand_target(target, cwd, &mut report);
             if expanded.len() > 1 || target_is_glob(target) {
                 report.glob_expansion_count += expanded.len() as u64;
             }
@@ -342,14 +387,90 @@ fn parse_fs_op(seg: &tokenize::Segment) -> Option<ParsedFsOp> {
     let leader = seg.command.as_deref()?;
     let leader = leader_name(leader);
 
+    // Unwrap a leading `sudo`/`doas` so `sudo rm -rf /home` is recognized as the
+    // destructive `rm` it really is. Privilege escalation makes the op strictly
+    // MORE dangerous — it must NOT drop out of the blast-radius check. This
+    // mirrors `engine::baseline_shared_components`, which also de-sudo's the
+    // leader before classifying the wrapped command.
+    if matches!(leader, "sudo" | "doas") {
+        let (wrapped_leader, wrapped_args) = unwrap_sudo(&seg.args)?;
+        return parse_op_for_leader(leader_name(&wrapped_leader), &wrapped_args);
+    }
+
+    parse_op_for_leader(leader, &seg.args)
+}
+
+/// Match a (de-sudo'd) leader name + its args onto a destructive-op descriptor.
+fn parse_op_for_leader(leader: &str, args: &[String]) -> Option<ParsedFsOp> {
     match leader {
-        "rm" => Some(parse_simple(FsOp::Rm, &seg.args)),
-        "mv" => Some(parse_simple(FsOp::Mv, &seg.args)),
-        "chmod" => Some(parse_simple(FsOp::Chmod, &seg.args)),
-        "find" => parse_find(&seg.args),
-        "rsync" => parse_rsync(&seg.args),
+        "rm" => Some(parse_simple(FsOp::Rm, args)),
+        "mv" => Some(parse_simple(FsOp::Mv, args)),
+        "chmod" => Some(parse_simple(FsOp::Chmod, args)),
+        "find" => parse_find(args),
+        "rsync" => parse_rsync(args),
         _ => None,
     }
+}
+
+/// Given the args of a `sudo`/`doas` invocation, skip sudo's own flags (and
+/// their values), leading `VAR=value` environment assignments, and an optional
+/// `--` terminator, then return the WRAPPED command (leader + its args).
+/// Returns `None` when no wrapped command follows (e.g. `sudo -v`).
+fn unwrap_sudo(args: &[String]) -> Option<(String, Vec<String>)> {
+    // sudo short flags that consume the NEXT token as their value.
+    const VALUE_SHORT: [&str; 6] = ["-u", "-g", "-C", "-D", "-R", "-T"];
+    // sudo long flags that consume the next token (the `--flag=value` form is
+    // self-contained and handled by the `contains('=')` branch below).
+    const VALUE_LONG: [&str; 9] = [
+        "--user",
+        "--group",
+        "--close-from",
+        "--chdir",
+        "--role",
+        "--type",
+        "--other-user",
+        "--host",
+        "--prompt",
+    ];
+
+    let mut idx = 0;
+    while idx < args.len() {
+        let a = strip_outer_quotes(&args[idx]);
+        if a == "--" {
+            idx += 1;
+            break;
+        }
+        if a.starts_with("--") {
+            let name = a.split('=').next().unwrap_or(a);
+            // `--flag=value` is self-contained; a bare `--flag` from VALUE_LONG
+            // eats the following token.
+            if !a.contains('=') && VALUE_LONG.contains(&name) {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        if a.starts_with('-') && a.len() > 1 {
+            if VALUE_SHORT.contains(&a) {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        // A leading `VAR=value` is an environment assignment, not the command.
+        if a.contains('=') && !a.starts_with('/') {
+            idx += 1;
+            continue;
+        }
+        // First non-flag, non-assignment token is the wrapped leader.
+        break;
+    }
+
+    let leader = args.get(idx).map(|s| strip_outer_quotes(s).to_string())?;
+    let wrapped_args: Vec<String> = args[idx + 1..].to_vec();
+    Some((leader, wrapped_args))
 }
 
 /// Strip a leading path component from a leader so `/bin/rm` matches `rm`.
@@ -475,14 +596,35 @@ fn is_recursive_flag(a: &str) -> bool {
 /// (the trailing slash is the canonical footgun but a bare empty `$VAR` operand
 /// is equally a collapse). The variable must resolve to empty for the rule to
 /// fire — a set variable is a normal expansion and not flagged here.
-fn empty_var_glob_var(arg: &str, env_map: &HashMap<String, String>) -> Option<String> {
+///
+/// A braced form carrying a parameter-expansion operator
+/// (`${VAR:-default}`, `${VAR:?msg}`, `${VAR:+alt}`, `${VAR#pat}`, …) is NOT
+/// eligible: `:-`/`:=`/`:+` SUPPLY or substitute a value, `#`/`%`/`/` TRANSFORM
+/// it, and `:?`/`?` ABORT the command on empty — none of these can silently
+/// collapse to `"/"`. Treating them as empty-var globs false-positives on the
+/// rule's OWN recommended guard (`${VAR:?must be set}`). Only the bare
+/// `${NAME}` form (name = all `[A-Za-z0-9_]`) is eligible.
+fn empty_var_glob_var(
+    arg: &str,
+    env_map: &HashMap<String, String>,
+) -> Option<(String, EmptyVarKind)> {
     let rest = arg.strip_prefix('$')?;
 
     // `${VAR}` / `${VAR}/...` form.
     let (name, tail) = if let Some(braced) = rest.strip_prefix('{') {
         let end = braced.find('}')?;
-        let name = &braced[..end];
-        (name, &braced[end + 1..])
+        let body = &braced[..end];
+        // Reject any parameter-expansion operator inside the braces. The bare
+        // name runs while `[A-Za-z0-9_]`; if the body has trailing characters
+        // after the name, it carries an operator (`:-`, `-`, `=`, `?`, `+`,
+        // `#`, `%`, `/`, …) that defeats the empty-collapse, so it must not fire.
+        let name_end = body
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(body.len());
+        if name_end != body.len() {
+            return None;
+        }
+        (&body[..name_end], &braced[end + 1..])
     } else {
         // `$VAR` / `$VAR/...` form — name runs while alnum/underscore.
         let end = rest
@@ -501,11 +643,14 @@ fn empty_var_glob_var(arg: &str, env_map: &HashMap<String, String>) -> Option<St
         return None;
     }
 
-    let resolved = env_map.get(name).map(String::as_str).unwrap_or("");
-    if resolved.is_empty() {
-        Some(name.to_string())
-    } else {
-        None
+    match env_map.get(name) {
+        // Present and set to "" → unambiguous collapse → High.
+        Some(v) if v.is_empty() => Some((name.to_string(), EmptyVarKind::PresentEmpty)),
+        // Present and non-empty → normal expansion, never collapses.
+        Some(_) => None,
+        // Absent from tirith's env → MIGHT be an unset shell var (collapse) OR a
+        // non-exported shell-local that is actually set. Advisory only (F2).
+        None => Some((name.to_string(), EmptyVarKind::Absent)),
     }
 }
 
@@ -547,6 +692,9 @@ fn is_system_path(p: &str) -> bool {
             | "/sbin/"
             | "/boot/"
             | "/root/"
+            | "/sys/"
+            | "/proc/"
+            | "/dev/"
     )
 }
 
@@ -573,9 +721,9 @@ fn strip_outer_quotes(s: &str) -> &str {
 /// Expand a target into concrete paths. Globs (`*`/`?`/`[`) are expanded against
 /// `cwd` by a single-directory match (we do NOT implement recursive `**`).
 /// Non-glob targets resolve to a single cwd-relative path.
-fn expand_target(target: &str, cwd: &Path) -> Vec<PathBuf> {
+fn expand_target(target: &str, cwd: &Path, report: &mut BlastReport) -> Vec<PathBuf> {
     if target_is_glob(target) {
-        glob_in_cwd(target, cwd)
+        glob_in_cwd(target, cwd, report)
     } else {
         vec![resolve_relative(target, cwd)]
     }
@@ -601,7 +749,7 @@ fn resolve_relative(target: &str, cwd: &Path) -> PathBuf {
 /// `<dir>`, and keep entries whose name matches the basename pattern. Only the
 /// basename component may contain a wildcard (good enough for the common
 /// `./dist/*` / `*.log` shapes a preview needs).
-fn glob_in_cwd(pattern: &str, cwd: &Path) -> Vec<PathBuf> {
+fn glob_in_cwd(pattern: &str, cwd: &Path, report: &mut BlastReport) -> Vec<PathBuf> {
     let (dir_part, name_part) = match pattern.rsplit_once('/') {
         Some((d, n)) => (d.to_string(), n.to_string()),
         None => (String::new(), pattern.to_string()),
@@ -613,14 +761,19 @@ fn glob_in_cwd(pattern: &str, cwd: &Path) -> Vec<PathBuf> {
     };
 
     let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if glob_match(&name_part, &name) {
-                out.push(entry.path());
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if glob_match(&name_part, &name) {
+                    out.push(entry.path());
+                }
             }
         }
+        // A glob over an unreadable directory expands to nothing silently;
+        // record it so the report flags the walk as incomplete (F3).
+        Err(_) => report.walk_errors += 1,
     }
     out
 }
@@ -701,7 +854,15 @@ fn canonicalize_lexical(path: &Path, cwd: &Path) -> PathBuf {
 fn walk_into(path: &Path, _cwd: &Path, report: &mut BlastReport) {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
-        Err(_) => return, // nonexistent target — nothing to count.
+        Err(e) => {
+            // A nonexistent target (NotFound) is normal — nothing to count and
+            // not an "incomplete walk". Any OTHER error (e.g. permission denied
+            // on the target itself) means we under-counted; flag it.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                report.walk_errors += 1;
+            }
+            return;
+        }
     };
 
     if meta.file_type().is_symlink() {
@@ -725,7 +886,13 @@ fn walk_dir(dir: &Path, depth: usize, report: &mut BlastReport) {
     }
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(_) => {
+            // Could not read this directory (permission denied, I/O error): its
+            // whole subtree is silently uncounted. Record it so the report does
+            // not present a partial walk as complete (F3).
+            report.walk_errors += 1;
+            return;
+        }
     };
     for entry in entries.flatten() {
         if report.file_count >= MAX_FILE_COUNT as u64 {
@@ -735,7 +902,10 @@ fn walk_dir(dir: &Path, depth: usize, report: &mut BlastReport) {
         let path = entry.path();
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(_) => {
+                report.walk_errors += 1;
+                continue;
+            }
         };
         if meta.file_type().is_symlink() {
             report.symlink_count += 1;
@@ -854,6 +1024,50 @@ mod tests {
     }
 
     #[test]
+    fn cheap_check_brace_default_does_not_fire() {
+        // C2 regression: `${BUILD:-dist}` provides a default, so it can never
+        // collapse to "/". Must NOT fire even when BUILD is absent from the env.
+        let f = cheap_check("rm -rf \"${BUILD:-dist}/\"", ShellType::Posix, &empty_env());
+        assert!(
+            !f.iter().any(|f| f.rule_id == RuleId::BlastEmptyVarGlob),
+            "${{BUILD:-dist}} has a default and must not fire empty-var-glob, got {:?}",
+            f.iter().map(|f| f.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cheap_check_brace_required_guard_does_not_fire() {
+        // C2 regression: `${VAR:?msg}` is the rule's OWN recommended guard — it
+        // aborts on empty rather than collapsing, so it must not false-positive.
+        let f = cheap_check(
+            "rm -rf \"${BUILD:?must be set}/\"",
+            ShellType::Posix,
+            &empty_env(),
+        );
+        assert!(
+            !f.iter().any(|f| f.rule_id == RuleId::BlastEmptyVarGlob),
+            "${{BUILD:?msg}} aborts on empty and must not fire"
+        );
+    }
+
+    #[test]
+    fn cheap_check_brace_alt_and_transform_do_not_fire() {
+        // `:+alt`, `#pat`, `%pat`, `/from/to` all supply or transform — none
+        // collapse to root.
+        for form in [
+            "rm -rf \"${BUILD:+x}/\"",
+            "rm -rf \"${BUILD#pre}/\"",
+            "rm -rf \"${BUILD%suf}/\"",
+        ] {
+            let f = cheap_check(form, ShellType::Posix, &empty_env());
+            assert!(
+                !f.iter().any(|f| f.rule_id == RuleId::BlastEmptyVarGlob),
+                "{form} must not fire empty-var-glob"
+            );
+        }
+    }
+
+    #[test]
     fn cheap_check_flags_find_delete() {
         let f = cheap_check("find . -type f -delete", ShellType::Posix, &empty_env());
         assert!(f.iter().any(|f| f.rule_id == RuleId::BlastFindDelete));
@@ -902,6 +1116,54 @@ mod tests {
     fn cheap_check_mv_to_root() {
         let f = cheap_check("mv important /", ShellType::Posix, &empty_env());
         assert!(f.iter().any(|f| f.rule_id == RuleId::BlastWritesSystemPath));
+    }
+
+    #[test]
+    fn cheap_check_sudo_rm_rf_home_blocks() {
+        // C1 regression: `sudo rm -rf /home` must NOT bypass the blast-radius
+        // check. The sudo wrapper is stripped and the wrapped `rm` is matched.
+        let f = cheap_check("sudo rm -rf /home", ShellType::Posix, &empty_env());
+        assert!(
+            f.iter().any(|f| f.rule_id == RuleId::BlastWritesSystemPath),
+            "sudo rm -rf /home must fire BlastWritesSystemPath, got {:?}",
+            f.iter().map(|f| f.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cheap_check_doas_rm_rf_root_blocks() {
+        let f = cheap_check("doas rm -rf /", ShellType::Posix, &empty_env());
+        assert!(f.iter().any(|f| f.rule_id == RuleId::BlastWritesSystemPath));
+    }
+
+    #[test]
+    fn cheap_check_sudo_with_flags_and_assignment_unwraps() {
+        // sudo flags (`-u root`), an env assignment, and `--` must all be
+        // skipped to reach the wrapped destructive op.
+        let f = cheap_check(
+            "sudo -u root FOO=bar -- rm -rf /etc",
+            ShellType::Posix,
+            &empty_env(),
+        );
+        assert!(
+            f.iter().any(|f| f.rule_id == RuleId::BlastWritesSystemPath),
+            "wrapped rm under sudo flags must still fire"
+        );
+    }
+
+    #[test]
+    fn cheap_check_sudo_find_delete_unwraps() {
+        let f = cheap_check("sudo find / -delete", ShellType::Posix, &empty_env());
+        assert!(f.iter().any(|f| f.rule_id == RuleId::BlastFindDelete));
+        assert!(f.iter().any(|f| f.rule_id == RuleId::BlastWritesSystemPath));
+    }
+
+    #[test]
+    fn cheap_check_sudo_alone_is_silent() {
+        // `sudo -v` (refresh credentials) has no wrapped command — must not panic
+        // or fire.
+        let f = cheap_check("sudo -v", ShellType::Posix, &empty_env());
+        assert!(f.is_empty());
     }
 
     #[test]
@@ -1024,6 +1286,32 @@ mod tests {
     }
 
     #[test]
+    fn simulate_truncates_past_depth_cap() {
+        // pr-test-analyzer #2: a tree deeper than MAX_WALK_DEPTH must set
+        // walk_truncated = true (the depth-cap DoS guard).
+        let dir = tempfile::tempdir().unwrap();
+        // Build dir/d0/d1/.../d7 (8 levels > MAX_WALK_DEPTH=5), each with a file.
+        let mut nested = dir.path().join("deep");
+        fs::create_dir_all(&nested).unwrap();
+        for i in 0..(MAX_WALK_DEPTH + 3) {
+            nested = nested.join(format!("d{i}"));
+            fs::create_dir_all(&nested).unwrap();
+            fs::write(nested.join("f.txt"), b"x").unwrap();
+        }
+        let report = simulate(
+            "rm -rf ./deep",
+            ShellType::Posix,
+            dir.path(),
+            Some(dir.path()),
+            &empty_env(),
+        );
+        assert!(
+            report.walk_truncated,
+            "a tree deeper than MAX_WALK_DEPTH must set walk_truncated"
+        );
+    }
+
+    #[test]
     fn simulate_glob_expansion_counted() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.log"), b"x").unwrap();
@@ -1057,6 +1345,39 @@ mod tests {
         assert_eq!(report.file_count, 0);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn simulate_flags_unreadable_subdir_as_walk_error() {
+        // F3 regression: a read_dir permission error on a subtree must increment
+        // walk_errors so the report does not present a partial walk as complete.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tree");
+        let locked = target.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(target.join("visible.txt"), b"x").unwrap();
+        fs::write(locked.join("hidden.txt"), b"secret").unwrap();
+        // Remove read/exec on the subdir so its contents can't be enumerated.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = simulate(
+            "rm -rf ./tree",
+            ShellType::Posix,
+            dir.path(),
+            Some(dir.path()),
+            &empty_env(),
+        );
+
+        // Restore perms so tempdir cleanup can remove the tree.
+        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
+
+        assert!(
+            report.walk_errors >= 1,
+            "an unreadable subdir must increment walk_errors, got {}",
+            report.walk_errors
+        );
+    }
+
     #[test]
     fn glob_match_basic() {
         assert!(glob_match("*.log", "a.log"));
@@ -1070,17 +1391,18 @@ mod tests {
     #[test]
     fn empty_var_glob_var_recognizes_shapes() {
         let env = empty_env();
+        // Absent from the (empty) env → Absent kind.
         assert_eq!(
             empty_var_glob_var("$EMPTY/", &env),
-            Some("EMPTY".to_string())
+            Some(("EMPTY".to_string(), EmptyVarKind::Absent))
         );
         assert_eq!(
             empty_var_glob_var("${EMPTY}/", &env),
-            Some("EMPTY".to_string())
+            Some(("EMPTY".to_string(), EmptyVarKind::Absent))
         );
         assert_eq!(
             empty_var_glob_var("$EMPTY", &env),
-            Some("EMPTY".to_string())
+            Some(("EMPTY".to_string(), EmptyVarKind::Absent))
         );
         // A non-slash tail (`$EMPTY.bak`) is NOT a path-prefix shape — the var
         // name is `EMPTY` followed by `.bak`, which does not collapse to root.
@@ -1089,9 +1411,43 @@ mod tests {
         // which in shell collapses to root just like `$EMPTY` — so it fires.
         assert_eq!(
             empty_var_glob_var("$EMPTYsuffix", &env),
-            Some("EMPTYsuffix".to_string())
+            Some(("EMPTYsuffix".to_string(), EmptyVarKind::Absent))
         );
         // No `$` prefix.
         assert_eq!(empty_var_glob_var("dist/", &env), None);
+    }
+
+    #[test]
+    fn empty_var_present_empty_is_high_absent_is_info() {
+        // F2: a var PRESENT-and-empty in tirith's env is an unambiguous collapse
+        // → High. A var merely ABSENT (possible shell-local) → Info, not Block.
+        let mut env = HashMap::new();
+        env.insert("PRESENT_EMPTY".to_string(), String::new());
+        assert_eq!(
+            empty_var_glob_var("$PRESENT_EMPTY/", &env),
+            Some(("PRESENT_EMPTY".to_string(), EmptyVarKind::PresentEmpty))
+        );
+
+        let f_present = cheap_check("rm -rf \"$PRESENT_EMPTY/\"", ShellType::Posix, &env);
+        let present = f_present
+            .iter()
+            .find(|f| f.rule_id == RuleId::BlastEmptyVarGlob)
+            .expect("present-empty var must fire");
+        assert_eq!(
+            present.severity,
+            Severity::High,
+            "a present-and-empty var collapses unambiguously → High"
+        );
+
+        let f_absent = cheap_check("rm -rf \"$ABSENT_SHELL_LOCAL/\"", ShellType::Posix, &env);
+        let absent = f_absent
+            .iter()
+            .find(|f| f.rule_id == RuleId::BlastEmptyVarGlob)
+            .expect("absent var still fires, but advisory");
+        assert_eq!(
+            absent.severity,
+            Severity::Info,
+            "an absent var might be a shell-local → Info, never Block"
+        );
     }
 }

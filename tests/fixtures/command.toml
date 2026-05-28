@@ -2068,12 +2068,24 @@ context = "exec"
 expected_action = "block"
 expected_rules = ["blast_writes_system_path"]
 
+# F2: tirith sees only its OWN process env, not the interactive shell's. A var
+# that is merely ABSENT from tirith's env (like `TIRITH_FIXTURE_UNSET_DIR`) might
+# be a benign non-exported shell-local, so the rule fires at Info (advisory),
+# NOT High/Block — over-blocking a safe command teaches users to `--bypass`.
+# A var that is PRESENT-and-empty IS an unambiguous collapse and fires High;
+# that case is unit-tested in blast_radius.rs (`empty_var_present_empty_is_high…`)
+# because a fixture cannot inject a present-and-empty var into the live process
+# env without an env mutation (the libc setenv race — see PR #125).
+# DEPENDENCY: this fixture relies on `TIRITH_FIXTURE_UNSET_DIR` being absent in
+# the test process env; if CI ever sets that name the rule would resolve it and
+# this fixture would change shape. The rule still fires (so the tier-1-reachable
+# safeguard covers it), just at Info → Allow.
 [[fixture]]
 name = "blast_empty_var_glob_collapses_to_root"
 min_milestone = 10
 input = 'rm -rf "$TIRITH_FIXTURE_UNSET_DIR/"'
 context = "exec"
-expected_action = "block"
+expected_action = "allow"
 expected_rules = ["blast_empty_var_glob"]
 
 [[fixture]]
