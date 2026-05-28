@@ -134,7 +134,7 @@ fn triage_empty(json: bool, scanned_path: &str) -> i32 {
 /// provider, `2` on an unknown one (with the valid list).
 pub fn rotate(provider: &str, json: bool, verbose: bool) -> i32 {
     let Some(p) = secret_rotation::lookup(provider) else {
-        return unknown_provider("rotate", provider);
+        return unknown_provider("rotate", provider, json);
     };
 
     if json {
@@ -178,7 +178,7 @@ pub fn rotate(provider: &str, json: bool, verbose: bool) -> i32 {
 /// provider data as `rotate`, leading with the revocation URL prominently.
 pub fn revoke(provider: &str, json: bool, verbose: bool) -> i32 {
     let Some(p) = secret_rotation::lookup(provider) else {
-        return unknown_provider("revoke", provider);
+        return unknown_provider("revoke", provider, json);
     };
 
     if json {
@@ -213,11 +213,34 @@ pub fn revoke(provider: &str, json: bool, verbose: bool) -> i32 {
 }
 
 /// Shared "unknown provider" error: list the 11 valid providers and exit 2.
-fn unknown_provider(action: &str, provider: &str) -> i32 {
-    eprintln!(
-        "tirith secret {action}: unknown provider '{provider}' — valid providers: {}",
-        secret_rotation::provider_names().join(", ")
-    );
+///
+/// In `--json` mode this emits a structured `{"error": ..., "valid_providers":
+/// [...]}` object on stdout rather than a text-only stderr line, so a machine
+/// consumer that asked for JSON always parses JSON — never a bare error string.
+/// Exit is always 2 (the unknown-provider code); a JSON-write failure stays
+/// non-zero so a piped consumer never reads success with truncated output.
+fn unknown_provider(action: &str, provider: &str, json: bool) -> i32 {
+    let valid = secret_rotation::provider_names();
+    if json {
+        let payload = serde_json::json!({
+            "error": format!("unknown provider '{provider}'"),
+            "action": action,
+            "valid_providers": valid,
+        });
+        // Best-effort: the exit code (2) is already non-zero, so even a failed
+        // write does not need a distinct code — but route through
+        // write_json_stdout so the trailing newline + stderr diagnostic are
+        // consistent with every other JSON surface.
+        let _ = write_json_stdout(
+            &payload,
+            &format!("tirith secret {action}: failed to write JSON output"),
+        );
+    } else {
+        eprintln!(
+            "tirith secret {action}: unknown provider '{provider}' — valid providers: {}",
+            valid.join(", ")
+        );
+    }
     2
 }
 

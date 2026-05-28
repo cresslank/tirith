@@ -469,8 +469,12 @@ pub const STARTER_MANIFEST: &str = r#"# tirith repo command manifest (.tirith/co
 #      listed under `allowed[]`.
 #
 #   2. `dangerous[]` — glob patterns (only `*` is supported in v1) that, when
-#      matched, ADD a blocking `repo_command_dangerous_pattern` finding,
-#      regardless of what the engine found. Use this to make a repo stricter.
+#      matched, ADD a `repo_command_dangerous_pattern` finding regardless of
+#      what the engine found. Each entry's `action` chooses the severity:
+#        - action: block  (default) -> High, BLOCKS the command.
+#        - action: warn             -> Medium, WARNS (surfaced + acknowledgeable,
+#                                      not blocked).
+#      Either way the manifest only makes a repo STRICTER, never weaker.
 #
 # Run `tirith commands list` to see the catalogue, `tirith commands run <name>`
 # to execute an allowed command, and `tirith commands check -- "<cmd>"` to

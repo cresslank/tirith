@@ -78,7 +78,12 @@ pub fn start(reason: Option<String>, json: bool) -> i32 {
                     started_at_display: String,
                     reason: &'a str,
                 }
-                let _ = write_json_stdout(
+                // A failed JSON write must surface non-zero distinctly from the
+                // "already active" exit 1: a piped consumer that saw truncated
+                // JSON must not read a clean already-active record. Exit 2
+                // mirrors the other incident JSON branches (start/stop/status/
+                // report) which all return 2 on a write failure.
+                if !write_json_stdout(
                     &AlreadyOut {
                         started: false,
                         already_active: true,
@@ -87,7 +92,9 @@ pub fn start(reason: Option<String>, json: bool) -> i32 {
                         reason: &existing.reason,
                     },
                     "tirith incident start: failed to write JSON output",
-                );
+                ) {
+                    return 2;
+                }
                 return 1;
             }
             eprintln!(

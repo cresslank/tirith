@@ -673,8 +673,11 @@ pub fn fire_callback(hit: &CanaryHit, context: &str) {
                 .build()
             {
                 Ok(c) => c,
-                Err(e) => {
-                    log_callback_failure(&id, &format!("client build failed: {e}"));
+                Err(_e) => {
+                    // The URL is not given to the builder, so this error cannot
+                    // carry it — but keep the audit reason coarse and URL-free
+                    // for consistency with the send-error path below.
+                    log_callback_failure(&id, "client build failed");
                     return;
                 }
             };
@@ -682,13 +685,42 @@ pub fn fire_callback(hit: &CanaryHit, context: &str) {
             match client.post(&url).json(&body).send() {
                 Ok(resp) if resp.status().is_success() => {}
                 Ok(resp) => {
-                    log_callback_failure(&id, &format!("callback returned HTTP {}", resp.status()));
+                    // Only the numeric status — never the URL.
+                    log_callback_failure(
+                        &id,
+                        &format!("callback returned HTTP {}", resp.status().as_u16()),
+                    );
                 }
                 Err(e) => {
-                    log_callback_failure(&id, &format!("callback POST failed: {e}"));
+                    // CRITICAL: a `reqwest::Error`'s Display embeds the request
+                    // URL (e.g. "error sending request for url (https://…)").
+                    // The callback URL is operator-private (a self-hosted
+                    // endpoint), so NEVER interpolate the raw error into the
+                    // audit log — classify it to a coarse, URL-free reason.
+                    log_callback_failure(&id, classify_callback_error(&e));
                 }
             }
         });
+}
+
+/// Map a `reqwest` send error to a coarse, NON-sensitive reason string. The raw
+/// `Display` of a `reqwest::Error` embeds the request URL (the operator-private
+/// callback endpoint), so it must never reach the audit log. This returns only
+/// the error *category* — no URL, host, or other request detail.
+fn classify_callback_error(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "callback POST failed: timeout"
+    } else if e.is_connect() {
+        "callback POST failed: connection error"
+    } else if e.is_redirect() {
+        "callback POST failed: too many redirects"
+    } else if e.is_body() {
+        "callback POST failed: request body error"
+    } else if e.is_request() {
+        "callback POST failed: request error"
+    } else {
+        "callback POST failed: network error"
+    }
 }
 
 /// Log a non-blocking canary-callback failure to the audit log. Reuses the
@@ -1039,5 +1071,43 @@ mod tests {
         };
         // Must return immediately without panicking or hanging.
         fire_callback(&hit, "exec");
+    }
+
+    #[test]
+    fn callback_error_reason_never_contains_the_url_or_host() {
+        // CRITICAL (finding D): a failed callback's audit reason must NOT embed
+        // the operator-private callback URL/host. A raw `reqwest::Error`'s
+        // Display normally includes the request URL, so we provoke a real send
+        // error against a unique, recognizable host and assert the CLASSIFIED
+        // reason carries none of it — only a coarse category.
+        let unique_host = "canary-secret-endpoint.invalid";
+        let url = format!("http://{unique_host}:9/callback");
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_millis(200))
+            .timeout(Duration::from_millis(400))
+            .build()
+            .expect("client build");
+
+        // `.invalid` is reserved (RFC 6761) and never resolves, so this is a
+        // deterministic connect/request failure with no real network access.
+        let err = client
+            .post(&url)
+            .json(&serde_json::json!({"k": "v"}))
+            .send()
+            .expect_err("a POST to a .invalid host must fail");
+
+        let reason = classify_callback_error(&err);
+        assert!(
+            !reason.contains(unique_host),
+            "classified reason must not contain the callback host; got: {reason}"
+        );
+        assert!(
+            !reason.contains("://") && !reason.contains("/callback"),
+            "classified reason must not contain any URL fragment; got: {reason}"
+        );
+        assert!(
+            reason.starts_with("callback POST failed: "),
+            "classified reason must be a coarse category string; got: {reason}"
+        );
     }
 }

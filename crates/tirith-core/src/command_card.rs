@@ -480,6 +480,14 @@ pub enum CardRef {
 /// fetched on the hot path); anything else is a [`CardRef::LocalPath`].
 /// Returns the first such reference found.
 ///
+/// SCOPE: only the LEADING prelude is scanned. We iterate from the top and stop
+/// at the first non-empty line that is NOT a `# tirith-card:` marker — that line
+/// is where the real command begins. A `# tirith-card:` string appearing AFTER
+/// the command starts (e.g. inside a heredoc body or a later script line) is
+/// command content, NOT transport metadata, and must be ignored here; otherwise
+/// a heredoc carrying that text would skew the manifest match and spuriously
+/// trip [`CardOutcome::Mismatch`].
+///
 /// Whitespace between the `#` and `tirith-card:` is flexible to stay in sync
 /// with the tier-1 marker regex (`#\s*tirith-card:`): `#tirith-card:` (no space)
 /// and `#  tirith-card:` (multiple) parse identically to the canonical
@@ -487,12 +495,24 @@ pub enum CardRef {
 /// fast-exit yet be silently dropped here.
 pub fn find_card_comment(input: &str) -> Option<CardRef> {
     for line in input.lines() {
-        if let Some(rest) = card_comment_value(line) {
-            let value = rest.trim();
-            if value.is_empty() {
-                continue;
+        match card_comment_value(line) {
+            Some(rest) => {
+                let value = rest.trim();
+                if value.is_empty() {
+                    // A bare `# tirith-card:` with no ref: keep scanning the
+                    // prelude (a later marker line may carry the ref).
+                    continue;
+                }
+                return Some(classify_card_ref(value));
             }
-            return Some(classify_card_ref(value));
+            None => {
+                // A blank line stays inside the leading prelude; a non-empty
+                // non-marker line is the start of the real command — stop.
+                if line.trim().is_empty() {
+                    continue;
+                }
+                return None;
+            }
         }
     }
     None
@@ -533,12 +553,36 @@ pub fn classify_card_ref(value: &str) -> CardRef {
 /// up as the card ref would survive the strip and make the command falsely
 /// mismatch its own signed card. Surviving lines are rejoined with `\n`;
 /// surrounding whitespace is left to [`Card::command_matches`]'s own trim.
+///
+/// SCOPE (mirrors [`find_card_comment`]): only marker lines in the LEADING
+/// prelude are stripped. Iteration stops at the first non-empty line that is not
+/// a marker — every line from there on (the real command, including any heredoc
+/// body) is preserved VERBATIM, even if it happens to contain the text
+/// `# tirith-card:`. Stripping such an in-body line would mutate the command
+/// before [`Card::command_matches`] and cause a spurious mismatch.
 pub fn strip_card_comment_lines(input: &str) -> String {
-    input
-        .lines()
-        .filter(|line| card_comment_value(line).is_none())
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out: Vec<&str> = Vec::new();
+    let mut in_prelude = true;
+    for line in input.lines() {
+        if in_prelude {
+            if card_comment_value(line).is_some() {
+                // A prelude marker line: drop it (transport metadata).
+                continue;
+            }
+            if line.trim().is_empty() {
+                // Blank prelude line: keep it (it is not the command yet, but
+                // preserving it keeps surrounding whitespace stable; the final
+                // `command_matches` trim absorbs leading blanks anyway).
+                out.push(line);
+                continue;
+            }
+            // First real-command line — the prelude ends here. Everything from
+            // now on is command content and is preserved verbatim.
+            in_prelude = false;
+        }
+        out.push(line);
+    }
+    out.join("\n")
 }
 
 /// Evaluate an already-loaded card against the analyzed command, given the
@@ -922,6 +966,76 @@ mod tests {
         // A `#` comment that is NOT a tirith-card marker is preserved.
         let other = "# just a note\necho hi";
         assert_eq!(strip_card_comment_lines(other), other);
+    }
+
+    #[test]
+    fn card_marker_only_parsed_in_leading_prelude_not_heredoc_body() {
+        // A `# tirith-card:` line that appears AFTER the real command starts
+        // (here inside a heredoc body) is COMMAND CONTENT, not transport
+        // metadata. It must NOT be parsed as a card reference, and it must NOT
+        // be stripped — otherwise the marker text in the body would skew the
+        // manifest match and spuriously trip CommandCardMismatch.
+        let body_marker = "cat <<'EOF' > script.sh\n# tirith-card: ./evil.json\necho hi\nEOF";
+        assert_eq!(
+            find_card_comment(body_marker),
+            None,
+            "a marker inside a heredoc body (after the command starts) is not a card ref"
+        );
+        assert_eq!(
+            strip_card_comment_lines(body_marker),
+            body_marker,
+            "a marker inside a heredoc body must be preserved verbatim, not stripped"
+        );
+
+        // A non-marker `#` comment as the first line ends the prelude, so a
+        // later marker is also treated as command content (consistent scope).
+        let comment_then_marker = "# build script\n# tirith-card: ./c.json\necho hi";
+        assert_eq!(find_card_comment(comment_then_marker), None);
+        assert_eq!(
+            strip_card_comment_lines(comment_then_marker),
+            comment_then_marker
+        );
+
+        // Sanity: a LEADING marker is still parsed/stripped (the prelude case).
+        let leading = "# tirith-card: ./c.json\necho hi";
+        assert_eq!(
+            find_card_comment(leading),
+            Some(CardRef::LocalPath("./c.json".to_string()))
+        );
+        assert_eq!(strip_card_comment_lines(leading), "echo hi");
+    }
+
+    #[test]
+    fn heredoc_body_marker_does_not_cause_spurious_mismatch() {
+        // End-to-end (CRITICAL): a trusted, signed card whose `command` is a
+        // multi-line heredoc that itself CONTAINS the text `# tirith-card:` in
+        // its body must still VERIFY. Before the prelude-scoping fix, the body
+        // marker line was stripped, mutating the command, so command_matches
+        // failed and the outcome was a spurious Mismatch.
+        let dir = tempfile::tempdir().unwrap();
+        let (secret, pubkey) = generate_keypair().unwrap();
+        write_trusted_key(dir.path(), &pubkey);
+
+        let command = "cat <<'EOF' > out.sh\n# tirith-card: ./inner.json\necho hello\nEOF";
+        let mut card = sample_card();
+        card.command = command.to_string();
+        card.sign(&secret).unwrap();
+
+        // The analyzed input has a LEADING marker (real transport metadata)
+        // plus the command, whose body coincidentally contains a marker too.
+        let analyzed_input = format!("# tirith-card: ./card.json\n{command}");
+        let stripped = strip_card_comment_lines(&analyzed_input);
+        assert_eq!(
+            stripped, command,
+            "only the leading marker is stripped; the heredoc-body marker survives"
+        );
+
+        let outcome = evaluate_card(&card, &stripped, dir.path(), today());
+        assert_eq!(
+            outcome,
+            CardOutcome::Verified,
+            "a heredoc command containing `# tirith-card:` in its body must verify, not mismatch"
+        );
     }
 
     #[test]

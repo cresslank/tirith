@@ -9288,12 +9288,26 @@ fn incident_start_disables_tirith_zero_bypass() {
         .env("TIRITH", "0")
         .output()
         .expect("during-incident check");
-    assert_ne!(
+    let during_stderr = String::from_utf8_lossy(&during.stderr);
+    // Pin the actual BLOCK verdict, not merely "some non-zero exit": a bare
+    // `!= 0` would also pass on an unrelated pre-verdict error (bad args, state
+    // I/O), which would NOT prove the incident elevation took effect. The Block
+    // action's exit code is exactly 1, and the human surface announces the block
+    // with the firing rule — assert both so this can only pass when the runtime
+    // override genuinely blocked the pipe-to-shell command.
+    assert_eq!(
         during.status.code(),
-        Some(0),
-        "during an incident, TIRITH=0 must NOT bypass — the check must block; got {:?}\nstderr:\n{}",
+        Some(1),
+        "during an incident, TIRITH=0 must NOT bypass — the check must BLOCK with exit 1; got {:?}\nstderr:\n{during_stderr}",
         during.status.code(),
-        String::from_utf8_lossy(&during.stderr)
+    );
+    assert!(
+        during_stderr.contains("BLOCKED"),
+        "the during-incident check must announce a BLOCK verdict; got stderr:\n{during_stderr}"
+    );
+    assert!(
+        during_stderr.contains("curl_pipe_shell"),
+        "the block must be driven by the pipe-to-shell rule, proving the command was actually analyzed and blocked; got stderr:\n{during_stderr}"
     );
 }
 
@@ -10035,5 +10049,72 @@ fn commands_run_audit_applies_operator_dlp_patterns() {
     assert!(
         !combined.contains("INTERNAL-12345"),
         "the sensitive token must NOT appear verbatim in any audit log, got:\n{combined}"
+    );
+}
+
+// ── M11 ch4: `tirith secret` --json error consistency ──────────────────────
+
+/// `tirith secret rotate --json <unknown>` must emit a PARSEABLE JSON error
+/// object on stdout (not a text-only stderr line) and exit 2. A machine
+/// consumer that asked for JSON must always be able to parse JSON, even on the
+/// unknown-provider error path.
+#[test]
+fn secret_rotate_json_unknown_provider_emits_json_error() {
+    let out = tirith()
+        .args(["secret", "rotate", "definitely-not-a-provider", "--json"])
+        .output()
+        .expect("failed to run tirith secret rotate");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "unknown provider must exit 2; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json unknown-provider output must be parseable JSON: {e}\nstdout:\n{stdout}")
+    });
+    assert!(
+        parsed.get("error").and_then(|v| v.as_str()).is_some(),
+        "JSON error object must carry an `error` string, got:\n{parsed}"
+    );
+    // The valid-provider list must be machine-readable too, so a consumer can
+    // recover without scraping a human string.
+    let valid = parsed
+        .get("valid_providers")
+        .and_then(|v| v.as_array())
+        .expect("JSON error must list valid_providers as an array");
+    assert!(
+        valid.iter().any(|v| v.as_str() == Some("github")),
+        "valid_providers must include known providers, got:\n{parsed}"
+    );
+}
+
+/// Same contract for `tirith secret revoke --json --provider <unknown>`.
+#[test]
+fn secret_revoke_json_unknown_provider_emits_json_error() {
+    let out = tirith()
+        .args([
+            "secret",
+            "revoke",
+            "--provider",
+            "definitely-not-a-provider",
+            "--json",
+        ])
+        .output()
+        .expect("failed to run tirith secret revoke");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "unknown provider must exit 2; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json unknown-provider output must be parseable JSON: {e}\nstdout:\n{stdout}")
+    });
+    assert!(
+        parsed.get("error").and_then(|v| v.as_str()).is_some(),
+        "JSON error object must carry an `error` string, got:\n{parsed}"
     );
 }

@@ -381,11 +381,35 @@ pub fn stop() -> Result<bool, String> {
 }
 
 /// [`stop`] against an explicit path (test seam).
+///
+/// LOCKOUT SAFETY: `read_flag_at` treats ANY non-`NotFound` read error on the
+/// flag path as a (fail-safe) active incident — including the case where the
+/// path is a DIRECTORY (a `read` of a dir is `EISDIR`, not `NotFound`). A plain
+/// `remove_file` would then error on that directory and leave the posture stuck
+/// fail-closed forever. So `stop` must clear a removable non-file sentinel too:
+/// if `remove_file` fails because the path is a directory, fall back to
+/// `remove_dir_all`. `stop` must ALWAYS be able to clear the active posture.
 pub fn stop_at(path: &Path) -> Result<bool, String> {
     let removed = match std::fs::remove_file(path) {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(format!("remove {}: {e}", path.display())),
+        Err(file_err) => {
+            // Not a regular file we could unlink. If it is a directory (the
+            // EISDIR / Windows access-denied case that `read_flag_at` reports
+            // as an active incident), remove it recursively so the incident is
+            // genuinely cleared. Anything still unremovable is a real error.
+            match std::fs::metadata(path) {
+                Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path)
+                    .map(|()| true)
+                    .map_err(|e| format!("remove dir {}: {e}", path.display()))?,
+                // It vanished between the failed unlink and the stat → treat as
+                // already-gone (idempotent success, same as NotFound above).
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                // A real, non-directory removal failure (e.g. permissions on a
+                // regular file): surface the original error.
+                _ => return Err(format!("remove {}: {file_err}", path.display())),
+            }
+        }
     };
     invalidate_cache();
     Ok(removed)
@@ -664,6 +688,42 @@ mod tests {
         let state = read_state_at(&flag).expect("corrupt flag must read as active");
         assert_eq!(state.started_at, 0);
         assert_eq!(state.reason, CORRUPT_FLAG_REASON);
+    }
+
+    #[test]
+    fn stop_clears_a_directory_sentinel_no_lockout() {
+        // LOCKOUT SAFETY (finding E): if the flag PATH is a directory (not a
+        // regular file), `read_flag_at` reads it as an active incident (a `read`
+        // of a dir is EISDIR → Corrupt → active). A plain `remove_file` would
+        // error on the directory and leave the posture stuck fail-closed. `stop`
+        // MUST still clear it. We create the flag path as a NON-EMPTY directory
+        // (so a naive `remove_dir` would also fail) and assert recovery.
+        let dir = tempdir().unwrap();
+        let flag = flag_in(dir.path());
+        std::fs::create_dir_all(&flag).unwrap();
+        std::fs::write(flag.join("stray-child"), b"x").unwrap();
+
+        // Precondition: the directory sentinel reads as an ACTIVE incident.
+        assert_eq!(read_flag_at(&flag), FlagRead::Corrupt);
+        assert!(
+            read_state_at(&flag).is_some(),
+            "a directory at the flag path must read as active (fail-safe)"
+        );
+
+        // stop must succeed and report it removed something.
+        assert!(
+            stop_at(&flag).unwrap(),
+            "stop must clear a directory sentinel, not error out"
+        );
+
+        // And the incident is genuinely cleared afterwards — no lockout.
+        assert_eq!(read_flag_at(&flag), FlagRead::Absent);
+        assert!(
+            read_state_at(&flag).is_none(),
+            "after stop the directory sentinel is gone and the incident reads inactive"
+        );
+        // Idempotent: a second stop finds nothing.
+        assert!(!stop_at(&flag).unwrap());
     }
 
     #[test]

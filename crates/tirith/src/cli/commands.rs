@@ -78,7 +78,12 @@ pub fn init(force: bool, json: bool) -> i32 {
             "written": path.display().to_string(),
             "forced": force,
         });
-        super::write_json_stdout(&v, "tirith commands init: failed to write JSON output");
+        // A failed JSON write (e.g. broken pipe) must exit non-zero: the manifest
+        // WAS written on disk, but a piped consumer that saw truncated JSON must
+        // not also read a success code (mirrors command-card sign/verify).
+        if !super::write_json_stdout(&v, "tirith commands init: failed to write JSON output") {
+            return 2;
+        }
     } else {
         println!("Wrote starter command manifest to {}", path.display());
         eprintln!("Edit it, then `tirith commands list` to review the catalogue.");
@@ -97,7 +102,14 @@ pub fn list(json: bool) -> i32 {
         Ok(None) => {
             if json {
                 let v = serde_json::json!({ "manifest": null, "allowed": [], "dangerous": [] });
-                super::write_json_stdout(&v, "tirith commands list: failed to write JSON output");
+                // A failed JSON write must surface non-zero so a piped consumer
+                // never pairs truncated/absent JSON with a success exit.
+                if !super::write_json_stdout(
+                    &v,
+                    "tirith commands list: failed to write JSON output",
+                ) {
+                    return 2;
+                }
             } else {
                 println!(
                     "No .tirith/commands.yaml found for this repo. Run `tirith commands init` to create one."
@@ -123,7 +135,11 @@ pub fn list(json: bool) -> i32 {
             .map(|e| serde_json::json!({ "pattern": e.pattern, "action": dangerous_action_label(e.action) }))
             .collect();
         let v = serde_json::json!({ "allowed": allowed, "dangerous": dangerous });
-        super::write_json_stdout(&v, "tirith commands list: failed to write JSON output");
+        // A failed JSON write must surface non-zero so a piped consumer never
+        // pairs a truncated catalogue with a success exit.
+        if !super::write_json_stdout(&v, "tirith commands list: failed to write JSON output") {
+            return 2;
+        }
     } else {
         if manifest.allowed.is_empty() {
             println!("allowed: (none)");
@@ -268,7 +284,13 @@ pub fn run(name: &str, json: bool) -> i32 {
             "running": name,
             "command": command,
         });
-        super::write_json_stdout(&v, "tirith commands run: failed to write JSON output");
+        // A failed JSON write must abort BEFORE we execute the command: a piped
+        // consumer that asked for `--json` and saw a truncated/absent "running"
+        // record must not have the command silently run anyway. Exit 2 (distinct
+        // from a command's own exit code) signals the harness I/O failure.
+        if !super::write_json_stdout(&v, "tirith commands run: failed to write JSON output") {
+            return 2;
+        }
     } else {
         eprintln!("Running allowed command '{name}': {command}");
     }
