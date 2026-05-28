@@ -160,6 +160,14 @@ help_example_tests! {
     help_env_guard             => (["env", "guard", "--help"], "tirith env guard status --json");
     help_env_diff              => (["env", "diff", "--help"], "tirith env diff --reset");
     help_env_explain           => (["env", "explain", "--help"], "tirith env explain AWS_SECRET_ACCESS_KEY");
+    // M9 ch5 — `tirith exec check|provenance` and `tirith path audit|watch|which`.
+    help_exec                  => (["exec", "--help"], "tirith exec check kubectl");
+    help_exec_check            => (["exec", "check", "--help"], "tirith exec check git --json");
+    help_exec_provenance       => (["exec", "provenance", "--help"], "tirith exec provenance /tmp/installer");
+    help_path                  => (["path", "--help"], "tirith path audit");
+    help_path_audit            => (["path", "audit", "--help"], "tirith path audit --json");
+    help_path_watch            => (["path", "watch", "--help"], "tirith path watch --interval 30");
+    help_path_which            => (["path", "which", "--help"], "tirith path which git --secure");
 }
 
 #[test]

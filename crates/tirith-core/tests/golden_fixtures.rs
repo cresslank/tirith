@@ -719,6 +719,17 @@ const ALL_RULE_IDS: &[&str] = &[
     "env_sensitive_exposed_to_unknown_script",
     "env_sensitive_persisted_in_shell_rc",
     "env_printenv_to_network_sink",
+    // Executable-provenance + PATH-shadowing rules (M9 ch5)
+    "exec_in_tmp",
+    "exec_recently_modified",
+    "exec_world_writable",
+    "exec_shadows_system_command",
+    "exec_unsigned",
+    "exec_in_repo_bin",
+    "path_writable_dir_before_system",
+    "path_duplicate_command_name",
+    "path_dir_in_repo",
+    "path_dir_in_tmp",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -930,6 +941,31 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "env_sensitive_exposed_to_unknown_script",
     "env_sensitive_persisted_in_shell_rc",
     "env_printenv_to_network_sink",
+    // M9 ch5 — executable-provenance + PATH-shadowing rules. The THREE cheap
+    // hot-path rules (`exec_in_tmp`, `exec_in_repo_bin`,
+    // `path_writable_dir_before_system`) fire from `engine::analyze` (Exec)
+    // ONLY when `policy.exec_guard_enabled` is set — opt-in, default false — so
+    // the static golden-fixture runner (default policy) never fires them, and
+    // they additionally need a real on-disk leader path / a real writable
+    // `$PATH` dir, which a static text fixture cannot reproduce. The SEVEN
+    // expensive rules fire only from explicit `tirith exec check|provenance` /
+    // `tirith path audit|which` (they stat the file, shell out to
+    // `file`/`codesign`, and resolve the full PATH). All ten are covered by
+    // unit tests in `crates/tirith-core/src/exec_provenance.rs` and
+    // `crates/tirith-core/src/path_audit.rs` against `tempfile::tempdir()`
+    // roots with string-`$PATH` entry points (no `std::env::PATH` mutation —
+    // the libc setenv race, PR #125). `command.toml` carries rows documenting
+    // the no-fire default-policy hot-path behavior.
+    "exec_in_tmp",
+    "exec_recently_modified",
+    "exec_world_writable",
+    "exec_shadows_system_command",
+    "exec_unsigned",
+    "exec_in_repo_bin",
+    "path_writable_dir_before_system",
+    "path_duplicate_command_name",
+    "path_dir_in_repo",
+    "path_dir_in_tmp",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1272,6 +1308,17 @@ fn test_rule_id_list_is_complete() {
         RuleId::EnvSensitiveExposedToUnknownScript,
         RuleId::EnvSensitivePersistedInShellRc,
         RuleId::EnvPrintenvToNetworkSink,
+        // Executable-provenance + PATH-shadowing rules (M9 ch5)
+        RuleId::ExecInTmp,
+        RuleId::ExecRecentlyModified,
+        RuleId::ExecWorldWritable,
+        RuleId::ExecShadowsSystemCommand,
+        RuleId::ExecUnsigned,
+        RuleId::ExecInRepoBin,
+        RuleId::PathWritableDirBeforeSystem,
+        RuleId::PathDuplicateCommandName,
+        RuleId::PathDirInRepo,
+        RuleId::PathDirInTmp,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();

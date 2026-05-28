@@ -286,7 +286,20 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         // `tirith env`; no threat-DB involvement.
         | RuleId::EnvSensitiveExposedToUnknownScript
         | RuleId::EnvSensitivePersistedInShellRc
-        | RuleId::EnvPrintenvToNetworkSink => false,
+        | RuleId::EnvPrintenvToNetworkSink
+        // M9 ch5 — executable-provenance + PATH-shadowing rules. Stat / path /
+        // signature heuristics from `tirith exec`/`path` + the cheap hot-path
+        // leader-location subset; no threat-DB involvement.
+        | RuleId::ExecInTmp
+        | RuleId::ExecRecentlyModified
+        | RuleId::ExecWorldWritable
+        | RuleId::ExecShadowsSystemCommand
+        | RuleId::ExecUnsigned
+        | RuleId::ExecInRepoBin
+        | RuleId::PathWritableDirBeforeSystem
+        | RuleId::PathDuplicateCommandName
+        | RuleId::PathDirInRepo
+        | RuleId::PathDirInTmp => false,
     }
 }
 

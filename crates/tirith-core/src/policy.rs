@@ -342,6 +342,32 @@ pub struct Policy {
     /// code change. The built-in list is always included; these are appended.
     #[serde(default)]
     pub env_guard_sensitive_vars: Vec<String>,
+
+    /// **M9 ch5 — exec-provenance / PATH-shadowing hot-path guard.**
+    ///
+    /// When `true`, the three CHEAP exec-provenance rules in
+    /// [`crate::path_audit`] fire from `engine::analyze` (Exec context only):
+    ///   * [`crate::verdict::RuleId::ExecInTmp`] (Medium) — the resolved
+    ///     leader lives under `/tmp` (or `$TMPDIR`).
+    ///   * [`crate::verdict::RuleId::ExecInRepoBin`] (Medium) — the resolved
+    ///     leader lives inside the current repo's working tree.
+    ///   * [`crate::verdict::RuleId::PathWritableDirBeforeSystem`] (High) — the
+    ///     resolved leader sits in a user-writable, repo-local-or-`/tmp` `$PATH`
+    ///     dir that precedes a system dir (`/usr/bin`, `/bin`, `/usr/sbin`).
+    ///
+    /// These are stat-free string compares (no `codesign`, no `file`, no
+    /// mtime/ownership stat). The seven EXPENSIVE provenance signals
+    /// (`ExecRecentlyModified`, `ExecWorldWritable`, `ExecUnsigned`,
+    /// `ExecShadowsSystemCommand`, `PathDuplicateCommandName`, `PathDirInRepo`,
+    /// `PathDirInTmp`) NEVER fire on the hot path — they run only under explicit
+    /// `tirith exec check|provenance` / `tirith path audit|which`.
+    ///
+    /// When `false` (the default), no exec-provenance rule fires from the hot
+    /// path; the `tirith exec` / `tirith path` surfaces still work (they call
+    /// the library directly and do not consult this flag). Toggled by
+    /// `tirith path guard on|off`.
+    #[serde(default)]
+    pub exec_guard_enabled: bool,
 }
 
 /// **M7 ch2** — `tirith share` policy configuration.
@@ -827,6 +853,7 @@ impl Default for Policy {
             sudo_session_ttl: None,
             env_guard_enabled: false,
             env_guard_sensitive_vars: Vec::new(),
+            exec_guard_enabled: false,
         }
     }
 }

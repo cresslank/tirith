@@ -610,7 +610,98 @@ impl ScanSnapshot {
     }
 }
 
+/// M9 ch5 — the exec-provenance HOT subset. Resolve the command leader to a
+/// path and classify it with the three cheap, stat-free checks. Returns the
+/// (possibly empty) set of hot findings. Caller gates this behind
+/// `policy.exec_guard_enabled` and `ScanContext::Exec`.
+///
+/// Resolution uses the command leader of the FIRST tokenized segment. We do
+/// NOT unwrap `sudo`/`env` wrappers here — the cheap hot path resolves the
+/// literal leader (the common direct-invocation case); the richer wrapper
+/// unwrapping lives in `tirith exec check`. Tokens that resolve nowhere (a
+/// bare name not on `$PATH`) produce no finding.
+fn check_exec_provenance_hot(ctx: &AnalysisContext) -> Vec<Finding> {
+    use crate::tokenize;
+
+    let segs = tokenize::tokenize(&ctx.input, ctx.shell);
+    let Some(leader) = segs.first().and_then(|s| s.command.as_deref()) else {
+        return Vec::new();
+    };
+    // Strip surrounding quotes a tokenizer may keep on a quoted leader.
+    let leader = leader.trim_matches(|c: char| c == '"' || c == '\'');
+    if leader.is_empty() {
+        return Vec::new();
+    }
+
+    let cwd: Option<std::path::PathBuf> = ctx
+        .cwd
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
+    let home = home::home_dir();
+    let path_value = std::env::var("PATH").unwrap_or_default();
+
+    let Some(resolved) =
+        crate::path_audit::resolve_leader(leader, cwd.as_deref(), home.as_deref(), &path_value)
+    else {
+        return Vec::new();
+    };
+
+    let repo_root = crate::policy::find_repo_root(ctx.cwd.as_deref());
+    let tmp_roots = tmp_roots();
+    let path_dirs = crate::path_audit::split_path(&path_value);
+
+    let lctx = crate::path_audit::LeaderContext {
+        resolved_path: Some(resolved.path.clone()),
+        repo_root: repo_root.as_deref(),
+        resolved_dir: Some(resolved.dir.as_path()),
+        path_dirs: &path_dirs,
+        tmp_roots: &tmp_roots,
+    };
+    let locations = crate::path_audit::classify_leader_path(&lctx);
+    crate::path_audit::leader_findings(&locations, &resolved.path.display().to_string())
+}
+
+/// The `/tmp`-equivalent roots: `/tmp` plus `$TMPDIR` (macOS uses a per-user
+/// `$TMPDIR` under `/var/folders`). Used by the hot-path `ExecInTmp` /
+/// writable-dir checks.
+fn tmp_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = vec![std::path::PathBuf::from("/tmp")];
+    if let Some(tmp) = std::env::var_os("TMPDIR") {
+        let p = std::path::PathBuf::from(tmp);
+        if !p.as_os_str().is_empty() {
+            roots.push(p);
+        }
+    }
+    roots
+}
+
 /// Run the tiered analysis pipeline.
+///
+/// # M9 ch5 — exec-provenance hot/cold split (load-bearing)
+///
+/// The exec/paste hot path runs ONLY the THREE CHEAP, stat-free exec-provenance
+/// rules, and only in `ScanContext::Exec` behind `policy.exec_guard_enabled`:
+///
+///   * [`crate::verdict::RuleId::ExecInTmp`] — resolved leader under `/tmp`.
+///   * [`crate::verdict::RuleId::ExecInRepoBin`] — resolved leader inside the
+///     current repo working tree.
+///   * [`crate::verdict::RuleId::PathWritableDirBeforeSystem`] — resolved
+///     leader sits in a user-writable, repo-local/`/tmp` `$PATH` dir that
+///     precedes a system dir.
+///
+/// These are pure string compares plus a single `libc::access(W_OK)` probe
+/// (see [`crate::path_audit::classify_leader_path`]). They do NOT stat the
+/// file's mtime/mode/ownership, do NOT shell out to `file`/`codesign`, and do
+/// NOT enumerate the whole PATH.
+///
+/// The OTHER SEVEN exec-provenance rules NEVER fire here. They run only under
+/// explicit `tirith exec check|provenance` / `tirith path audit|which`:
+/// `ExecRecentlyModified`, `ExecWorldWritable`, `ExecUnsigned`,
+/// `ExecShadowsSystemCommand` (off-hot-path; stat + 2s codesign/file
+/// child-process), and `PathDuplicateCommandName`, `PathDirInRepo`,
+/// `PathDirInTmp` (off-hot-path; full-PATH enumeration). See
+/// `crate::exec_provenance` and `crate::path_audit` module docs.
 pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     analyze_inner(ctx).0
 }
@@ -693,9 +784,19 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         false
     };
 
+    // M9 ch5 — the exec-provenance hot subset is NOT a regex/byte signal, so a
+    // bare `/tmp/foo` command would fast-exit at tier-1 before the exec-rule
+    // block ever ran (the tier-1 gating bug class — see CLAUDE.md). When the
+    // opt-in `exec_guard_enabled` flag is set in Exec context, force past the
+    // fast-exit so `check_exec_provenance_hot` gets a chance to run. The flag
+    // read is a cheap partial-policy discover (local files only), gated to Exec
+    // so the common no-flag path adds nothing. Mirrors `exec_bidi_triggered`.
+    let exec_guard_triggered = ctx.scan_context == ScanContext::Exec
+        && Policy::discover_partial(ctx.cwd.as_deref()).exec_guard_enabled;
+
     let tier1_ms = tier1_start.elapsed().as_secs_f64() * 1000.0;
 
-    if !byte_scan_triggered && !regex_triggered && !exec_bidi_triggered {
+    if !byte_scan_triggered && !regex_triggered && !exec_bidi_triggered && !exec_guard_triggered {
         let total_ms = start.elapsed().as_secs_f64() * 1000.0;
         return (
             Verdict::allow_fast(
@@ -1055,6 +1156,17 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
                 {
                     findings.push(f);
                 }
+            }
+
+            // M9 ch5 — exec-provenance HOT subset (3 cheap rules). Behind the
+            // opt-in `policy.exec_guard_enabled` switch. Resolves the command
+            // leader to a path (string ops + at most one `which` lookup) and
+            // classifies it as in-/tmp / in-repo / writable-dir-before-system.
+            // NO stat / codesign / file / full-PATH enumeration — those are the
+            // 7 cold rules under `tirith exec`/`path`. See the `analyze`
+            // doc-comment for the full split.
+            if policy.exec_guard_enabled {
+                findings.extend(check_exec_provenance_hot(ctx));
             }
         }
 

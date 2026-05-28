@@ -600,6 +600,80 @@ pub enum RuleId {
     /// from the exec hot path under `policy.env_guard_enabled`; tier-1 gate is
     /// the `env_to_network_sink` PATTERN_TABLE entry.
     EnvPrintenvToNetworkSink,
+
+    // Executable-provenance + PATH-shadowing rules (M9 ch5). Split into a
+    // CHEAP hot-path subset and an EXPENSIVE off-hot-path subset.
+    //
+    // HOT PATH (3 rules) — fire from `engine::analyze` (Exec context) ONLY when
+    // `policy.exec_guard_enabled` is set. They are stat-free string compares
+    // against the resolved leader's path (no `stat`, no `codesign`, no shell-
+    // out): is the leader inside (i) `/tmp`, (ii) the current repo, or (iii) a
+    // user-writable repo-local/`/tmp` `$PATH` dir that precedes a system dir.
+    // Producers live in `crate::path_audit`. They carry no PATTERN_TABLE entry
+    // (the leader-path check is not a regex match) and live in
+    // `EXTERNALLY_TRIGGERED_RULES`, covered by unit tests in `path_audit.rs`
+    // plus `command.toml` fixtures that exercise the no-fire default-policy
+    // path.
+    //
+    // OFF HOT PATH (7 rules) — fire ONLY from explicit `tirith exec
+    // check|provenance` / `tirith path audit|which`. They stat the file
+    // (mtime / mode / uid-gid), shell out to `file --brief` and `codesign
+    // --verify` (macOS, 2s timeout via `util::run_shell_with_timeout`), and
+    // compare against package-manager paths. NEVER reached from the hot path.
+    // Producers live in `crate::exec_provenance` / `crate::path_audit`; covered
+    // by unit tests with temp-dir entry points.
+    /// M9 ch5 (HOT) — the resolved command leader lives under `/tmp` (or
+    /// `$TMPDIR`). Medium severity — a binary in a world-writable scratch dir
+    /// is a classic drop-and-run staging location. Stat-free path check.
+    ExecInTmp,
+    /// M9 ch5 (COLD) — the executable was modified within the last 5 minutes
+    /// (mtime). High severity — a freshly-written binary about to be executed
+    /// is the signature of a just-dropped payload. Fires only from
+    /// `tirith exec check|provenance` (stats the file).
+    ExecRecentlyModified,
+    /// M9 ch5 (COLD) — the executable is world-writable (`mode & 0o002 != 0`).
+    /// High severity — any local process can replace it before the next run.
+    /// Fires only from `tirith exec check|provenance` (stats the file).
+    ExecWorldWritable,
+    /// M9 ch5 (COLD) — the resolved binary shadows a system command of the
+    /// same name that also exists in a system dir (`/usr/bin`, `/bin`,
+    /// `/usr/sbin`, `/sbin`), and the resolved one is NOT the system copy.
+    /// Medium severity. Fires only from `tirith exec check` / `tirith path
+    /// which` (resolves the full PATH).
+    ExecShadowsSystemCommand,
+    /// M9 ch5 (COLD) — the executable carries no valid code signature
+    /// (`codesign --verify` fails on macOS; Authenticode absent on Windows).
+    /// Medium severity, macOS/Windows only — a no-op on Linux (no platform
+    /// signing baseline). Fires only from `tirith exec check|provenance`
+    /// (2s `codesign` shell-out, NEVER hot path).
+    ExecUnsigned,
+    /// M9 ch5 (HOT) — the resolved command leader lives inside the current
+    /// repo's working tree (e.g. `./node_modules/.bin/<x>`, `./scripts/<x>`).
+    /// Medium severity — running a repo-checked-in binary executes code an
+    /// attacker can land via a PR. Stat-free path check.
+    ExecInRepoBin,
+    /// M9 ch5 (HOT) — a `$PATH` entry that the current user can WRITE precedes
+    /// a system dir (`/usr/bin`, `/bin`, `/usr/sbin`) AND is repo-local or
+    /// under `/tmp`, and the resolved leader is found there. High severity —
+    /// a writable dir ahead of the system path lets any local process shadow
+    /// every system command. Repo-local / `/tmp` focused to avoid flagging the
+    /// near-universal `~/.local/bin` (Intel-macOS `/usr/local/bin` is
+    /// world-writable by default — see module doc). Stat-free string compare
+    /// of `$PATH` ordering + a `libc::access(W_OK)` writability probe.
+    PathWritableDirBeforeSystem,
+    /// M9 ch5 (COLD) — the same command name resolves in more than one `$PATH`
+    /// dir (PATH duplicate). Medium severity — surfaces shadowing ambiguity.
+    /// Fires only from `tirith path audit`.
+    PathDuplicateCommandName,
+    /// M9 ch5 (COLD) — a `$PATH` entry resolves inside the current repo's
+    /// working tree. Medium severity. Fires only from `tirith path audit`
+    /// (the hot-path equivalent is `ExecInRepoBin`, scoped to the resolved
+    /// leader rather than enumerating the whole PATH).
+    PathDirInRepo,
+    /// M9 ch5 (COLD) — a `$PATH` entry is under `/tmp` (or `$TMPDIR`). High
+    /// severity — a scratch dir on PATH means anything dropped there shadows
+    /// real commands. Fires only from `tirith path audit`.
+    PathDirInTmp,
 }
 
 impl fmt::Display for RuleId {

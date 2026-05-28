@@ -1202,6 +1202,20 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "EnvSensitivePersistedInShellRc",
     ),
     ("env_printenv_to_network_sink", "EnvPrintenvToNetworkSink"),
+    // Executable-provenance + PATH-shadowing rules (M9 ch5).
+    ("exec_in_tmp", "ExecInTmp"),
+    ("exec_recently_modified", "ExecRecentlyModified"),
+    ("exec_world_writable", "ExecWorldWritable"),
+    ("exec_shadows_system_command", "ExecShadowsSystemCommand"),
+    ("exec_unsigned", "ExecUnsigned"),
+    ("exec_in_repo_bin", "ExecInRepoBin"),
+    (
+        "path_writable_dir_before_system",
+        "PathWritableDirBeforeSystem",
+    ),
+    ("path_duplicate_command_name", "PathDuplicateCommandName"),
+    ("path_dir_in_repo", "PathDirInRepo"),
+    ("path_dir_in_tmp", "PathDirInTmp"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -1229,6 +1243,7 @@ const VALID_CATEGORIES: &[&str] = &[
     "hygiene",
     "persistence",
     "aliases",
+    "exec",
 ];
 
 #[derive(Deserialize)]

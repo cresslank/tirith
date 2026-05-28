@@ -1719,6 +1719,60 @@ Examples:
         #[command(subcommand)]
         action: EnvAction,
     },
+
+    /// Inspect executable provenance — origin, signature, shadowing (M9 ch5)
+    #[command(after_help = "\
+Subcommands:
+  tirith exec check <BIN>        — resolve <BIN> on $PATH, then report its
+        [--json]                   package manager, code signature, file type,
+                                   permissions, modification time, and whether
+                                   it shadows a system command. Exit 1 on a HIGH
+                                   finding, 2 if not on $PATH.
+  tirith exec provenance <PATH>  — same provenance for a specific file path.
+        [--json]                   Exit 1 on a HIGH finding, 2 if not a file.
+
+What it checks (COLD — never on the exec hot path):
+  stat (mtime / mode / owner), `file --brief`, `codesign --verify` (macOS, 2s
+  timeout), and package-manager ownership (Homebrew / nix / cargo / rustup /
+  user-local). The exec hot path runs only three cheap string-compare rules
+  (in /tmp, in repo, writable-PATH-dir-before-system) under
+  `tirith path guard on`.
+
+Examples:
+  tirith exec check kubectl
+  tirith exec check git --json
+  tirith exec provenance /tmp/installer")]
+    Exec {
+        #[command(subcommand)]
+        action: ExecAction,
+    },
+
+    /// Audit $PATH for shadowing / hijack risks (M9 ch5)
+    #[command(after_help = "\
+Subcommands:
+  tirith path audit              — flag repo-local / /tmp / user-writable-
+        [--json]                   before-system $PATH dirs and duplicate
+                                   command names. Exit 1 on a HIGH finding.
+  tirith path watch              — re-audit $PATH every --interval seconds,
+        [--interval N] [--json]    printing only when findings change.
+  tirith path which <CMD>        — resolve <CMD> across $PATH (first hit wins).
+        [--secure] [--json]        With --secure, exit 1 if the resolved copy
+                                   is NOT a system binary.
+
+Canonical longer spelling:
+  `tirith path which` is the canonical form of the shorter `tirith which`
+  spelling. The `which` action lives under the `path` namespace so all
+  shadowing tooling shares one command group.
+
+Examples:
+  tirith path audit
+  tirith path audit --json
+  tirith path watch --interval 30
+  tirith path which git --secure")]
+    Path {
+        #[command(subcommand)]
+        action: PathAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2470,6 +2524,143 @@ Examples:
     /// Internal: write the shell-start env snapshot (used by the shell hook)
     #[command(hide = true)]
     Snapshot,
+}
+
+#[derive(Subcommand)]
+enum ExecAction {
+    /// Resolve a command on $PATH and report its full provenance
+    #[command(after_help = "\
+What it shows:
+  Resolves <BIN> on $PATH (first hit = what the shell runs), then reports the
+  package manager that owns it, its code-signature status (codesign on macOS),
+  file type, permissions, modification time, every $PATH copy, and whether it
+  shadows a same-named system command.
+
+Exit codes:
+  0  resolved, no HIGH-severity provenance finding.
+  1  a HIGH finding fired (recently modified, world-writable).
+  2  <BIN> is not on $PATH.
+
+Examples:
+  tirith exec check kubectl
+  tirith exec check git --json")]
+    Check {
+        /// The command name to resolve and inspect.
+        bin: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Inspect provenance for a specific executable path
+    #[command(after_help = "\
+What it shows:
+  The same provenance record as `exec check`, but for an explicit file path
+  rather than a $PATH-resolved command. Useful for a downloaded binary you have
+  not yet put on $PATH (e.g. /tmp/installer, ./build/tool).
+
+Exit codes:
+  0  inspected, no HIGH-severity finding.
+  1  a HIGH finding fired.
+  2  <PATH> is not a regular file.
+
+Examples:
+  tirith exec provenance /tmp/installer
+  tirith exec provenance ./node_modules/.bin/esbuild --json")]
+    Provenance {
+        /// The file path to inspect (a leading ~/ is expanded).
+        path: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PathAction {
+    /// Audit $PATH for shadowing / hijack risks
+    #[command(after_help = "\
+What it flags:
+  $PATH directories that are repo-local, under /tmp, or user-writable AND ahead
+  of the system path, plus command names that resolve in more than one dir.
+
+Exit codes:
+  0  $PATH is clean of HIGH-severity risks.
+  1  a HIGH finding fired (a /tmp dir, or a writable dir before the system path).
+
+Examples:
+  tirith path audit
+  tirith path audit --json")]
+    Audit {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Re-audit $PATH on an interval until Ctrl-C
+    #[command(after_help = "\
+What it does:
+  Re-runs `path audit` every --interval seconds and prints only when the set of
+  findings changes. Exits 0 on Ctrl-C.
+
+Examples:
+  tirith path watch
+  tirith path watch --interval 30
+  tirith path watch --interval 10 --json")]
+    Watch {
+        /// Poll interval in seconds (minimum 1).
+        #[arg(long, default_value_t = 30)]
+        interval: u64,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Resolve a command across $PATH (canonical form of `tirith which`)
+    #[command(after_help = "\
+What it shows:
+  Every $PATH directory that resolves <CMD> to an executable, in order. The
+  first hit is what the shell runs (marked with an arrow); system copies are
+  tagged [system].
+
+--secure:
+  Exit 1 when the first-resolved copy is NOT a system binary (/usr/bin, /bin,
+  /usr/sbin, /sbin) — i.e. a non-system <CMD> would win.
+
+Exit codes:
+  0  resolved (and, with --secure, the first hit is a system binary).
+  1  --secure and a non-system copy resolves first.
+  2  <CMD> is not on $PATH.
+
+Examples:
+  tirith path which git
+  tirith path which git --secure
+  tirith path which python --secure --json")]
+    Which {
+        /// The command name to resolve.
+        cmd: String,
+        /// Exit 1 if the resolved binary is not a system binary.
+        #[arg(long)]
+        secure: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -5173,6 +5364,39 @@ fn run() {
                 cli::env_guard::explain(&var, json)
             }
             EnvAction::Snapshot => cli::env_guard::snapshot_write(),
+        },
+        Commands::Exec { action } => match action {
+            ExecAction::Check { bin, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::exec::check(&bin, json)
+            }
+            ExecAction::Provenance { path, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::exec::provenance(&path, json)
+            }
+        },
+        Commands::Path { action } => match action {
+            PathAction::Audit { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::path::audit(json)
+            }
+            PathAction::Watch {
+                interval,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::path::watch(interval, json)
+            }
+            PathAction::Which {
+                cmd,
+                secure,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::path::which(&cmd, secure, json)
+            }
         },
     };
 

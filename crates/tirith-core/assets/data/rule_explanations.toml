@@ -2174,3 +2174,128 @@ examples_good = ["printenv | less — inspect your environment locally with no n
 false_positive_guidance = "A debugging one-liner that posts your environment to a paste service you control will trip this. Confirm the destination host is yours; prefer redacting secrets before sending an environment dump anywhere."
 remediation = "Do not pipe your full environment to a network destination. If you must share environment state for debugging, redact secrets first (or unset them) and send only the specific non-sensitive variables you need."
 mitre_id = "T1041"
+
+# ─── Executable-provenance + PATH-shadowing rules (M9 ch5) ───────────────────
+# Three CHEAP rules (exec_in_tmp, exec_in_repo_bin, path_writable_dir_before_system)
+# fire from the engine hot path under policy.exec_guard_enabled; the other seven
+# fire only from `tirith exec check|provenance` / `tirith path audit|which`.
+
+[[rule]]
+id = "exec_in_tmp"
+title = "Command resolves to a binary under /tmp"
+category = "exec"
+severity_rationale = "Medium — a command leader that resolves to a binary in /tmp (or $TMPDIR) is running from a world-writable scratch directory. Dropping a payload in /tmp and executing it is a classic run-once pattern, but /tmp is also used legitimately for ad-hoc builds, hence Medium rather than High."
+description = "The engine (with `exec_guard_enabled`) resolved the command leader to a path under /tmp or $TMPDIR using a stat-free string compare. No stat / signature / file-type probe runs on this hot-path check — run `tirith exec check` for full provenance."
+examples_bad = ["/tmp/installer", "./payload after `cd /tmp`"]
+examples_good = ["A reviewed build artifact you placed in /tmp deliberately and intend to run once", "Running the same tool from a package-managed location (/opt/homebrew/bin, /usr/bin)"]
+false_positive_guidance = "Ad-hoc builds and one-off scripts in /tmp will trip this. If you placed the binary there yourself and trust it, this is informational. Prefer running tools from a package-managed or repo-tracked location."
+remediation = "Confirm you trust the binary in /tmp. Move durable tools to a package-managed location. Run `tirith exec check <path>` to inspect ownership, signature, and modification time."
+mitre_id = "T1059"
+
+[[rule]]
+id = "exec_recently_modified"
+title = "Executable was modified within the last 5 minutes"
+category = "exec"
+severity_rationale = "High — a binary whose mtime is within the last 5 minutes was written immediately before you ran it, which is the signature of a freshly-dropped payload (download-then-execute, a compromised update, a planted shim). This is an off-hot-path check that stats the file; it fires only from `tirith exec check|provenance`."
+description = "`tirith exec check|provenance` stat'd the resolved executable and found its modification time within the 5-minute window. NEVER runs on the engine hot path (it requires a stat)."
+examples_bad = ["A `kubectl` whose mtime is 30 seconds ago", "A just-downloaded `installer` you are about to run"]
+examples_good = ["A tool you just (knowingly) rebuilt from source", "A package you just installed from a trusted manager"]
+false_positive_guidance = "Rebuilding a tool from source or installing a fresh package legitimately updates the mtime. If you just performed that action, this is expected."
+remediation = "If you did not just build or install this binary, treat it as suspect: do not run it, inspect its origin, and rotate any credential it could have accessed. Run `tirith exec check <bin>` for the full provenance record."
+mitre_id = "T1036.005"
+
+[[rule]]
+id = "exec_world_writable"
+title = "Executable is world-writable"
+category = "exec"
+severity_rationale = "High — a world-writable executable (mode bit 0o002) can be overwritten by ANY local process, so the binary you inspect is not guaranteed to be the binary that runs next time. This is a textbook local-privilege / persistence foothold. Off-hot-path; fires only from `tirith exec check|provenance` (requires a stat)."
+description = "`tirith exec check|provenance` found the world-write bit set on the resolved executable. NEVER runs on the engine hot path."
+examples_bad = ["A binary at mode 0777 in a shared directory", "An installer left world-writable by a careless `chmod -R 777`"]
+examples_good = ["A binary at 0755 owned by root or your user", "A package-managed binary with standard permissions"]
+false_positive_guidance = "Almost never legitimate for an executable. A 0777 from an over-broad `chmod` should be tightened regardless."
+remediation = "Remove the world-write bit: `chmod o-w <path>` (or `chmod 0755`). Investigate how it became world-writable. Prefer reinstalling from a trusted package manager."
+mitre_id = "T1222.002"
+
+[[rule]]
+id = "exec_shadows_system_command"
+title = "Command resolves outside the system path"
+category = "exec"
+severity_rationale = "Medium — when a command name also exists in a system directory (/usr/bin, /bin, /usr/sbin, /sbin) but resolves to a copy elsewhere, the non-system copy shadows the trusted one. This is often legitimate (Homebrew, asdf, a venv) but is exactly the shape a PATH-hijack attack takes, so it is surfaced at Medium. Off-hot-path; fires from `tirith exec check` / `tirith path which`."
+description = "`tirith exec check` / `tirith path which` resolved the full $PATH and found the command resolves to a non-system path while a same-named binary exists in a system dir. NEVER runs on the engine hot path."
+examples_bad = ["`python` resolving to /tmp/python while /usr/bin/python exists", "A planted `git` in a writable PATH dir ahead of /usr/bin/git"]
+examples_good = ["`python` resolving to a Homebrew or pyenv shim ahead of /usr/bin/python (a deliberate toolchain choice)", "A venv `pip` shadowing the system pip inside an activated environment"]
+false_positive_guidance = "Version managers (asdf, pyenv, nvm), Homebrew, and virtualenvs all deliberately shadow system commands. Confirm the resolved path belongs to a toolchain you installed."
+remediation = "Confirm the resolved binary is the one you intend. Run `tirith path which <cmd> --secure` to see every copy on $PATH and whether the first hit is the system one. Reorder $PATH if an untrusted dir is winning."
+mitre_id = "T1574.007"
+
+[[rule]]
+id = "exec_unsigned"
+title = "Executable has no valid code signature"
+category = "exec"
+severity_rationale = "Medium — on macOS (and Windows), a binary that fails code-signature verification cannot be attributed to a trusted publisher. Reported at Medium because many legitimate dev tools (locally-built binaries, some open-source releases) are unsigned. No-op on Linux, which has no platform signing baseline. Off-hot-path; the 2s `codesign` child process NEVER runs on the engine hot path."
+description = "`tirith exec check|provenance` ran `codesign --verify --strict` (macOS) with a 2-second timeout and it failed. On Linux/Windows the check reports not-applicable and this rule does not fire. NEVER runs on the engine hot path."
+examples_bad = ["A downloaded macOS binary with a broken or absent signature", "A tampered system binary that no longer verifies"]
+examples_good = ["A locally-built binary you compiled yourself (expected to be unsigned)", "An open-source tool the author did not notarize"]
+false_positive_guidance = "Locally-built and many open-source binaries are legitimately unsigned on macOS. Treat this as one signal among several (combine with modification time, ownership, and package-manager ownership)."
+remediation = "Prefer signed/notarized releases or package-manager installs for tools you did not build. If you built it yourself, this is expected. Verify the download source for anything you did not compile."
+mitre_id = "T1553.001"
+
+[[rule]]
+id = "exec_in_repo_bin"
+title = "Command resolves to a binary inside the repository"
+category = "exec"
+severity_rationale = "Medium — a command leader that resolves inside the current repository's working tree (e.g. ./node_modules/.bin, ./scripts, a repo-local bin dir on $PATH) executes code that an attacker can introduce through a pull request. Reported at Medium because running repo-local tooling (linters, formatters, task binaries) is routine. Cheap stat-free hot-path check under `exec_guard_enabled`."
+description = "The engine (with `exec_guard_enabled`) resolved the command leader to a path inside the repo root via a stat-free prefix compare. No stat / signature / file-type probe runs here. Run `tirith exec check` for full provenance."
+examples_bad = ["A backdoored ./node_modules/.bin/eslint introduced in a dependency update", "A repo-checked-in ./bin/deploy that an unreviewed PR modified"]
+examples_good = ["Running your project's own linter/formatter from node_modules/.bin", "A repo task binary you maintain and review"]
+false_positive_guidance = "Most repo-local tool invocations are legitimate. The risk is that the binary's contents can change via a PR/dependency bump. Combine with `tirith exec check` to inspect modification time and signature when a repo-local binary is unexpected."
+remediation = "Confirm the repo-local binary is the one you expect (review recent diffs to it / its dependency). Run `tirith exec check <path>` for full provenance. Pin and review dependency-provided binaries."
+mitre_id = "T1195.002"
+
+[[rule]]
+id = "path_writable_dir_before_system"
+title = "Command resolved from a user-writable PATH dir ahead of the system path"
+category = "exec"
+severity_rationale = "High — a $PATH directory that the current user can write AND that precedes /usr/bin (and is repo-local or under /tmp) lets any local process shadow every system command by dropping a same-named binary there. The hot-path rule is scoped to repo-local / /tmp writable dirs to avoid flagging the near-universal ~/.local/bin and the world-writable Intel-macOS /usr/local/bin. Cheap stat-free ordering compare + one access(W_OK) probe under `exec_guard_enabled`."
+description = "The engine (with `exec_guard_enabled`) resolved the command leader from a directory that (a) appears in $PATH before a system dir, (b) is repo-local or under /tmp, and (c) is writable by the current user. The broader 'any writable dir before system' inventory is surfaced (informationally) by `tirith path audit`."
+examples_bad = ["A repo `./bin` placed ahead of /usr/bin on $PATH, writable, containing `ls`", "A /tmp dir on $PATH before /usr/bin"]
+examples_good = ["A read-only system dir ahead of writable dirs", "~/.local/bin ahead of /usr/bin (allowed — not flagged by the hot rule)"]
+false_positive_guidance = "If you deliberately put a repo-local bin dir at the front of $PATH for a project, this is expected — but it does mean anything written there shadows system commands. Move it after the system dirs if you do not need the precedence."
+remediation = "Reorder $PATH so system directories (/usr/bin, /bin, /usr/sbin) come before user-writable repo-local/ /tmp directories. Run `tirith path audit` to review the full ordering."
+mitre_id = "T1574.007"
+
+[[rule]]
+id = "path_duplicate_command_name"
+title = "Command name resolves in more than one PATH directory"
+category = "exec"
+severity_rationale = "Medium — the same command name present in multiple $PATH dirs means the shell silently picks the first, and which one it is depends on ordering you may not have intended. Duplicates are common with version managers but are also how a shadowing attack hides. Off-hot-path; fires only from `tirith path audit`."
+description = "`tirith path audit` enumerated executables across $PATH dirs and found a name resolving in more than one. The reported entry points at the SHADOWED (later) copy. NEVER runs on the engine hot path."
+examples_bad = ["A second `kubectl` in a writable dir shadowing the real one", "Two copies of `python` from different installs with surprising precedence"]
+examples_good = ["A version-manager shim and the underlying tool both on PATH (expected)", "A Homebrew and a system copy of a common utility"]
+false_positive_guidance = "Version managers and multiple toolchains routinely produce duplicates. Confirm the FIRST hit (what the shell runs) is the one you intend."
+remediation = "Run `tirith path which <cmd>` to see every copy and which wins. Remove or reorder the unintended copy."
+mitre_id = "T1574.007"
+
+[[rule]]
+id = "path_dir_in_repo"
+title = "PATH directory resolves inside the repository"
+category = "exec"
+severity_rationale = "Medium — a $PATH entry inside the current repository's working tree means every bare command can resolve to a repo-checked-in binary, which an attacker can land via a pull request. Reported at Medium because repo-local tool dirs (node_modules/.bin) are common in dev workflows. Off-hot-path; fires only from `tirith path audit` (the hot-path equivalent, scoped to the resolved leader, is exec_in_repo_bin)."
+description = "`tirith path audit` found a $PATH directory inside the repo root. NEVER runs on the engine hot path."
+examples_bad = ["A repo `./bin` on $PATH containing checked-in binaries of unknown provenance"]
+examples_good = ["node_modules/.bin added to $PATH by a tool runner for the project's own tooling"]
+false_positive_guidance = "Adding node_modules/.bin or a repo task-bin dir to $PATH is routine. The risk is that contents change via PRs/dependency bumps."
+remediation = "Be aware that bare commands can resolve to repo-local binaries. Review changes to checked-in binaries and their dependencies. Run `tirith path audit` to see the full PATH."
+mitre_id = "T1195.002"
+
+[[rule]]
+id = "path_dir_in_tmp"
+title = "PATH directory is under /tmp"
+category = "exec"
+severity_rationale = "High — a $PATH entry under /tmp (or $TMPDIR) is world-writable, so anything dropped there shadows real commands for every bare invocation. A /tmp directory on PATH is almost never intentional and is a strong PATH-hijack signal. Off-hot-path; fires only from `tirith path audit`."
+description = "`tirith path audit` found a $PATH directory under /tmp or $TMPDIR. NEVER runs on the engine hot path."
+examples_bad = ["`export PATH=/tmp/bin:$PATH` set by a malicious script", "A scratch dir under /tmp left on $PATH"]
+examples_good = ["There is essentially no benign reason for /tmp to be on $PATH"]
+false_positive_guidance = "Almost never legitimate. If a tool added /tmp to your $PATH, investigate it."
+remediation = "Remove the /tmp directory from $PATH immediately and investigate how it got there. Run `tirith path audit` to confirm it is gone."
+mitre_id = "T1574.007"

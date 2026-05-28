@@ -1977,3 +1977,51 @@ input = "docker run --rm alpine echo ok"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# M9 ch5 — exec-provenance HOT subset (3 cheap rules: exec_in_tmp,
+# exec_in_repo_bin, path_writable_dir_before_system).
+#
+# These fire from `engine::analyze` (Exec) ONLY when `policy.exec_guard_enabled`
+# is set — opt-in, default false. The standard golden-fixture runner uses the
+# default policy and `cwd = None`, so the exec-guard block never runs and none
+# of the three hot rules can fire. These fixtures PIN that no-fire default: a
+# regression that ran the exec-provenance hot path unconditionally (ignoring the
+# flag) would flip these to a finding and fail here. The positive behavior is
+# covered by unit tests in `crates/tirith-core/src/path_audit.rs` (which inject
+# a synthetic repo/PATH/tmp context) and the `tirith exec`/`path` CLIs.
+
+[[fixture]]
+name = "exec_leader_in_tmp_no_fire_at_default_policy"
+min_milestone = 9
+input = "/tmp/installer --yes"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+# exec_guard_enabled defaults off → the /tmp leader path must NOT raise the
+# hot-path rule from the default-policy fixture runner.
+forbidden_rules = ["exec_in_tmp", "path_writable_dir_before_system"]
+
+[[fixture]]
+name = "exec_leader_in_repo_bin_no_fire_at_default_policy"
+min_milestone = 9
+input = "./node_modules/.bin/eslint --fix"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+# A repo-local leader path must NOT raise exec_in_repo_bin at default policy.
+forbidden_rules = ["exec_in_repo_bin", "path_writable_dir_before_system"]
+
+[[fixture]]
+name = "exec_bare_command_no_fire_at_default_policy"
+min_milestone = 9
+input = "kubectl get pods"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+# A normal bare command resolving on $PATH must stay clean; none of the three
+# hot exec-provenance rules fire from the default-policy runner.
+forbidden_rules = [
+    "exec_in_tmp",
+    "exec_in_repo_bin",
+    "path_writable_dir_before_system",
+]
