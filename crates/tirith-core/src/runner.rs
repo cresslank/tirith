@@ -270,6 +270,128 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     })
 }
 
+/// Outcome of [`download_to_path`].
+pub struct DownloadResult {
+    /// The path the content was written to (the caller-supplied destination).
+    pub path: std::path::PathBuf,
+    /// SHA-256 of the downloaded content.
+    pub sha256: String,
+    /// Final URL after redirects.
+    pub final_url: String,
+    /// Number of bytes written.
+    pub size: u64,
+    /// Detected interpreter from the shebang (best-effort, for display).
+    pub interpreter: String,
+}
+
+/// Download `url` to `dest` WITHOUT executing it. Shares the redirect / 30s
+/// timeout / 10 MiB-cap policy with [`run`]. Verifies `expected_sha256` when
+/// supplied. Writes atomically (sibling temp + rename, `0600`) so a partial
+/// download never leaves a truncated file at `dest`. This is the
+/// download-and-keep primitive behind `tirith fetch --save`; the caller marks
+/// `dest` tainted (see `crate::taint`).
+pub fn download_to_path(
+    url: &str,
+    dest: &std::path::Path,
+    expected_sha256: Option<&str>,
+) -> Result<DownloadResult, String> {
+    let redirect_list = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let redirect_list_clone = redirect_list.clone();
+
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if let Ok(mut list) = redirect_list_clone.lock() {
+                list.push(attempt.url().to_string());
+            }
+            if attempt.previous().len() >= 10 {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+
+    let response = client
+        .get(url)
+        .send()
+        .map_err(|e| format!("download failed: {e}"))?;
+
+    let final_url = response.url().to_string();
+
+    const MAX_BODY: u64 = 10 * 1024 * 1024; // 10 MiB
+
+    if let Some(len) = response.content_length() {
+        if len > MAX_BODY {
+            return Err(format!(
+                "response too large: {len} bytes (max {} MiB)",
+                MAX_BODY / 1024 / 1024
+            ));
+        }
+    }
+
+    use std::io::Read;
+    let mut buf = Vec::new();
+    response
+        .take(MAX_BODY + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read body: {e}"))?;
+    if buf.len() as u64 > MAX_BODY {
+        return Err(format!(
+            "response body exceeds {} MiB limit",
+            MAX_BODY / 1024 / 1024
+        ));
+    }
+    let content = buf;
+
+    let mut hasher = Sha256::new();
+    hasher.update(&content);
+    let sha256 = format!("{:x}", hasher.finalize());
+
+    if let Some(expected) = expected_sha256 {
+        let expected_lower = expected.to_lowercase();
+        if sha256 != expected_lower {
+            return Err(format!(
+                "SHA-256 mismatch: expected {expected_lower}, got {sha256}"
+            ));
+        }
+    }
+
+    // Atomic write: sibling temp + rename, 0600.
+    let dir = dest.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = dir {
+        fs::create_dir_all(parent).map_err(|e| format!("create dest dir: {e}"))?;
+    }
+    let tmp_dir = dir.unwrap_or_else(|| std::path::Path::new("."));
+    {
+        use tempfile::NamedTempFile;
+        let mut tmp = NamedTempFile::new_in(tmp_dir).map_err(|e| format!("tempfile: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("permissions: {e}"))?;
+        }
+        tmp.write_all(&content)
+            .map_err(|e| format!("write download: {e}"))?;
+        tmp.persist(dest)
+            .map_err(|e| format!("persist download: {e}"))?;
+    }
+
+    let content_str = String::from_utf8_lossy(&content);
+    let interpreter = script_analysis::detect_interpreter(&content_str).to_string();
+
+    Ok(DownloadResult {
+        path: dest.to_path_buf(),
+        sha256,
+        final_url,
+        size: content.len() as u64,
+        interpreter,
+    })
+}
+
 /// Detect git repo remote URL and current branch.
 fn detect_git_info() -> (Option<String>, Option<String>) {
     let repo = Command::new("git")

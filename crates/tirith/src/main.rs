@@ -565,15 +565,35 @@ Built-in --profile values:
         profile: Option<String>,
     },
 
-    /// Check a URL for server-side cloaking (different content for bots vs browsers)
+    /// Check a URL for server-side cloaking, or download-and-keep with --save
     #[cfg(unix)]
     #[command(after_help = "\
+Without --save: checks the URL for server-side cloaking (different content
+served to bots vs browsers).
+
+With --save <path>: downloads the URL to <path> (without executing it) and
+marks that path TAINTED in the local taint store. A later `bash <path>` or
+`source <path>` then fires the engine's tainted-file rule. This is the
+download-and-keep half of `tirith run` — `run` executes from a temp file that
+is normally cleaned up, so it never taints a stable path; `fetch --save` keeps
+the file at a path YOU choose and taints exactly that path.
+
 Examples:
   tirith fetch https://example.com/install.sh
-  tirith fetch --format json https://example.com/install.sh")]
+  tirith fetch --format json https://example.com/install.sh
+  tirith fetch --save ./install.sh https://untrusted.example/install.sh
+  tirith fetch --save ./install.sh --sha256 abc123 https://untrusted.example/install.sh")]
     Fetch {
-        /// URL to check for cloaking
+        /// URL to check for cloaking (or to download when --save is set)
         url: String,
+
+        /// Download the URL to this path and mark it tainted (no execution)
+        #[arg(long, value_name = "PATH")]
+        save: Option<String>,
+
+        /// With --save: expected SHA-256 of the download (abort on mismatch)
+        #[arg(long, requires = "save")]
+        sha256: Option<String>,
 
         /// Output format (default: human)
         #[arg(long, value_enum)]
@@ -1915,6 +1935,93 @@ Examples:
         /// The command to run and watch (everything after `--`)
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         command: Vec<String>,
+    },
+
+    /// Track files downloaded from risky sources (tainted-content) (M10 ch3)
+    #[command(after_help = "\
+A file becomes tainted when you download-and-keep it from an untrusted source.
+The mark is stored in a path-keyed JSONL file at <state-dir>/taint.jsonl. When
+a later command executes that exact path (`bash ./install.sh`) or sources it
+(`source ./env.sh`), the engine fires ExecOfTaintedFile (High) /
+CommandSourcedFromTaintedFile (Medium).
+
+How a file gets tainted:
+  tirith fetch --save ./install.sh https://untrusted.example/install.sh
+
+Limitations:
+  The store is PATH-KEYED — `mv ./install.sh ./run.sh` loses the mark. The mark
+  is NEVER auto-cleared by `chmod +x` or a `bash -n` parse check; only an
+  explicit `tirith taint clear` removes it.
+
+Examples:
+  tirith taint list
+  tirith taint list --json
+  tirith taint explain ./install.sh
+  tirith taint clear ./install.sh
+  tirith taint clear ./install.sh --yes")]
+    Taint {
+        #[command(subcommand)]
+        action: TaintAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaintAction {
+    /// List every recorded tainted file
+    #[command(after_help = "\
+Examples:
+  tirith taint list
+  tirith taint list --json")]
+    List {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Show the recorded taint mark for one file (where it came from)
+    #[command(after_help = "\
+Exit codes:
+  0  the file is NOT tainted.
+  1  the file IS tainted (review it, then `tirith taint clear <file>`).
+
+Examples:
+  tirith taint explain ./install.sh
+  tirith taint explain ./install.sh --json")]
+    Explain {
+        /// Path to inspect.
+        file: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Remove the taint mark for one file (prompts for confirmation)
+    #[command(after_help = "\
+Prompts before removing the mark unless --yes is passed. In a non-interactive
+shell without --yes the removal is refused (no silent clear). In --json mode,
+--yes is required to confirm.
+
+Examples:
+  tirith taint clear ./install.sh
+  tirith taint clear ./install.sh --yes")]
+    Clear {
+        /// Path whose taint mark to remove.
+        file: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
     },
 }
 
@@ -4715,9 +4822,18 @@ fn run() {
         }
 
         #[cfg(unix)]
-        Commands::Fetch { url, format, json } => {
+        Commands::Fetch {
+            url,
+            save,
+            sha256,
+            format,
+            json,
+        } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::fetch::run(&url, json)
+            match save {
+                Some(path) => cli::fetch::save(&url, &path, sha256, json),
+                None => cli::fetch::run(&url, json),
+            }
         }
 
         Commands::Fix {
@@ -5734,6 +5850,25 @@ fn run() {
             // Identical impl to `tirith checkpoint watch` (CheckpointAction::Watch).
             cli::checkpoint::watch(&command, &paths, with_net_hints, json)
         }
+        Commands::Taint { action } => match action {
+            TaintAction::List { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::taint::list(json)
+            }
+            TaintAction::Explain { file, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::taint::explain(&file, json)
+            }
+            TaintAction::Clear {
+                file,
+                yes,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::taint::clear(&file, yes, json)
+            }
+        },
     };
 
     std::process::exit(exit_code);

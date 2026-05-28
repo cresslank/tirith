@@ -57,6 +57,7 @@ pub mod session;
 pub mod session_warnings;
 pub mod style;
 pub mod sudo_session;
+pub mod taint;
 pub mod text_confusables;
 pub mod threatdb;
 pub mod threatdb_api;

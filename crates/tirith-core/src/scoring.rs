@@ -318,7 +318,11 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::BlastLargeFileCount
         // M10 ch2 — post-run shell-rc modification. Snapshot-diff state change
         // from `tirith watch`; no threat-DB involvement.
-        | RuleId::PostRunShellRcModified => false,
+        | RuleId::PostRunShellRcModified
+        // M10 ch3 — tainted-content tracking. Path-key match against the local
+        // taint store; no threat-DB involvement.
+        | RuleId::ExecOfTaintedFile
+        | RuleId::CommandSourcedFromTaintedFile => false,
     }
 }
 

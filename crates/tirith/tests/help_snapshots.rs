@@ -179,6 +179,11 @@ help_example_tests! {
     // the top-level shortcut and the namespaced `checkpoint watch` form.
     help_watch                 => (["watch", "--help"], "tirith watch -- npm install left-pad");
     help_checkpoint_watch      => (["checkpoint", "watch", "--help"], "tirith watch -- npm install left-pad");
+    // M10 ch3 — `tirith taint` tainted-content tracking.
+    help_taint                 => (["taint", "--help"], "tirith taint list");
+    help_taint_list            => (["taint", "list", "--help"], "tirith taint list --json");
+    help_taint_explain         => (["taint", "explain", "--help"], "tirith taint explain ./install.sh");
+    help_taint_clear           => (["taint", "clear", "--help"], "tirith taint clear ./install.sh --yes");
 }
 
 #[test]

@@ -775,6 +775,33 @@ pub enum RuleId {
     /// `EXTERNALLY_TRIGGERED_RULES`, covered by a unit test in
     /// `crates/tirith/src/cli/checkpoint.rs`.
     PostRunShellRcModified,
+
+    // Tainted-content tracking rules (M10 ch3). These fire from
+    // `engine::analyze` (Exec context) when the parsed command's leader (or, for
+    // `source`/`.`, the sourced file argument) is a path recorded as tainted in
+    // the JSONL store at `state_dir()/taint.jsonl` (`crate::taint`). A file
+    // becomes tainted via `tirith fetch --save <path> <url>` (a downloaded file
+    // kept at a known path). The lookup is a per-leader path-key match against a
+    // per-process-cached store; when the store is empty/absent the engine never
+    // forces past its tier-1 fast-exit for the check, so a machine that has
+    // never marked a file pays nothing. They carry no PATTERN_TABLE entry (the
+    // trigger is runtime state + a path the user typed, not a regex on the
+    // input) and live in `EXTERNALLY_TRIGGERED_RULES`, covered by unit tests in
+    // `crates/tirith-core/src/taint.rs` against a `tempfile::tempdir()` store.
+    /// M10 ch3 — the parsed command leader is a path recorded as tainted
+    /// (downloaded from a risky source via `tirith fetch --save`). High
+    /// severity: executing a freshly-downloaded-from-untrusted-source file is
+    /// the exact flow this tracking exists to surface (`bash ./install.sh`
+    /// after `tirith fetch --save ./install.sh https://untrusted.example/…`).
+    /// The mark persists until an explicit `tirith taint clear` — it is NOT
+    /// auto-cleared by `chmod +x` or a `bash -n` parse check.
+    ExecOfTaintedFile,
+    /// M10 ch3 — a `source ./tainted.sh` / `. ./tainted.sh` sources a file
+    /// recorded as tainted. Medium severity (best-effort): sourcing runs the
+    /// file's commands in the current shell, but the `source`/`.` builtin shape
+    /// is only matched when it is the command leader, so this is a narrower,
+    /// lower-confidence signal than `ExecOfTaintedFile`.
+    CommandSourcedFromTaintedFile,
 }
 
 impl fmt::Display for RuleId {

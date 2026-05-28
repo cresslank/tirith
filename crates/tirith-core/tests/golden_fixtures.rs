@@ -746,6 +746,9 @@ const ALL_RULE_IDS: &[&str] = &[
     "blast_large_file_count",
     // Post-run diff rule (M10 ch2)
     "post_run_shell_rc_modified",
+    // Tainted-content tracking rules (M10 ch3)
+    "exec_of_tainted_file",
+    "command_sourced_from_tainted_file",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -1024,6 +1027,17 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // (`watch_flags_shell_rc_modification`), following the M9-ch2 runtime-state
     // pattern.
     "post_run_shell_rc_modified",
+    // M10 ch3 — tainted-content tracking rules fire from `engine::analyze` (Exec)
+    // ONLY when the parsed leader (or an interpreter/`source` file argument) is a
+    // path recorded in the JSONL taint store at `state_dir()/taint.jsonl`. The
+    // static golden-fixture runner uses no taint store (and never writes to the
+    // real `state_dir()`), so a text fixture cannot drive either rule — the
+    // trigger is runtime state, not input content. Covered by unit tests in
+    // `crates/tirith-core/src/taint.rs` (store round-trip against a
+    // `tempfile::tempdir()`) plus `engine.rs` taint hot-path tests that point the
+    // lookup at a temp store, following the M8/M9 runtime-state pattern.
+    "exec_of_tainted_file",
+    "command_sourced_from_tainted_file",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1393,6 +1407,9 @@ fn test_rule_id_list_is_complete() {
         RuleId::BlastLargeFileCount,
         // Post-run diff rule (M10 ch2)
         RuleId::PostRunShellRcModified,
+        // Tainted-content tracking rules (M10 ch3)
+        RuleId::ExecOfTaintedFile,
+        RuleId::CommandSourcedFromTaintedFile,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();

@@ -2462,3 +2462,27 @@ examples_good = ["`tirith watch -- rustup-init` legitimately appending a `. \"$H
 false_positive_guidance = "Many legitimate installers edit a shell rc file to add their bin directory to PATH (rustup, nvm, conda, pyenv). This rule reports the CHANGE, not maliciousness — open the rc file, review the added lines, and accept them if you recognize the tool. It fires per watched run; it is not a persistent baseline."
 remediation = "Open the modified rc file and review what the command added. If it is an expected PATH/env line from a tool you just installed, keep it. If you do not recognize it, remove the line and investigate the command's provenance before running it again."
 mitre_id = "T1546.004"
+
+[[rule]]
+id = "exec_of_tainted_file"
+title = "Executing a file downloaded from a risky source"
+category = "taint"
+severity_rationale = "High — the command leader is a path tirith recorded as tainted: a file written to disk from an untrusted source (a `tirith fetch --save <path> <url>` download). Running a freshly-downloaded installer/script before reading it is the exact supply-chain flow this tracking exists to catch. The taint persists until you explicitly clear it, so this fires every time you run the file."
+description = "Fired by the exec hot path when the parsed command leader resolves to a path present in the taint store (`state-dir/taint.jsonl`). A path becomes tainted when `tirith fetch --save ./install.sh https://untrusted.example/install.sh` keeps a downloaded file at a known path. A later `bash ./install.sh` (or `./install.sh`) against that same path then fires this rule. The store is path-keyed: moving the file with `mv` loses the mark (documented limitation). The mark is NEVER auto-cleared by `chmod +x` or a `bash -n` parse check — only `tirith taint clear <file>` removes it."
+examples_bad = ["`bash ./install.sh` right after `tirith fetch --save ./install.sh https://untrusted.example/install.sh`", "`./setup.sh` where setup.sh was saved from an untrusted URL and never reviewed"]
+examples_good = ["reviewing the saved file, confirming it is benign, then `tirith taint clear ./install.sh` before running it", "running a script you wrote yourself or installed via a signed package (never marked tainted)"]
+false_positive_guidance = "This rule reports PROVENANCE, not malice — a file you downloaded and reviewed is still tainted until you clear the mark. After you have read the file and decided to trust it, run `tirith taint clear <file>` to remove the mark; subsequent runs will not fire. Use `tirith taint explain <file>` to see where the mark came from."
+remediation = "Open the file and read it before executing — confirm the interpreter, any network calls, and any sudo/privileged operations. Once you trust it, run `tirith taint clear <file>` to clear the mark. Prefer installing software from signed packages over downloaded scripts where possible."
+mitre_id = "T1105"
+
+[[rule]]
+id = "command_sourced_from_tainted_file"
+title = "Sourcing a file downloaded from a risky source"
+category = "taint"
+severity_rationale = "Medium — a `source ./tainted.sh` / `. ./tainted.sh` sources a file tirith recorded as tainted. Sourcing runs the file's commands in your current shell (it can export variables, define functions, and alter your environment), so it is at least as powerful as executing it. Best-effort and Medium because the `source`/`.` builtin shape is only matched when it is the command leader — a lower-confidence signal than a direct exec."
+description = "Fired by the exec hot path when the command leader is the `source` builtin or `.` and its first file argument resolves to a path in the taint store (`state-dir/taint.jsonl`). A path becomes tainted via `tirith fetch --save`. Like `exec_of_tainted_file`, the store is path-keyed (a `mv` loses the mark) and the mark is never auto-cleared — only `tirith taint clear <file>` removes it."
+examples_bad = ["`source ./env.sh` where env.sh was saved from an untrusted URL", "`. ./completions.sh` for a completions file downloaded from a risky source and never reviewed"]
+examples_good = ["reviewing the file then `tirith taint clear ./env.sh` before sourcing it", "sourcing a file you wrote or that ships with a trusted package (never marked tainted)"]
+false_positive_guidance = "Reports provenance, not malice. After you have read the sourced file and decided to trust it, run `tirith taint clear <file>`; subsequent `source`/`.` of that path will not fire. Use `tirith taint explain <file>` to see the recorded origin."
+remediation = "Read the file before sourcing it — sourcing runs its contents in your live shell. Once you trust it, run `tirith taint clear <file>` to clear the mark."
+mitre_id = "T1105"

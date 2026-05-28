@@ -765,6 +765,171 @@ fn check_repo_hooks_hot(ctx: &AnalysisContext) -> Vec<Finding> {
         .collect()
 }
 
+/// Interpreters / exec wrappers whose first non-flag file argument is the thing
+/// actually run. `bash ./install.sh` runs `./install.sh`, so a tainted
+/// `./install.sh` must fire even though the leader is `bash`. Matched by base
+/// name (path-stripped). Kept small + literal — this is the hot path.
+const TAINT_INTERPRETER_LEADERS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "python", "python2", "python3", "ruby", "perl",
+    "node", "nodejs", "deno", "bun", "php",
+];
+
+/// `source` / `.` builtins — sourcing runs the file's commands in the current
+/// shell. A tainted sourced file fires `CommandSourcedFromTaintedFile`.
+const TAINT_SOURCE_LEADERS: &[&str] = &["source", "."];
+
+/// Does `leader` look like a path (so the leader ITSELF is the executed file,
+/// e.g. `./install.sh`, `/tmp/x.sh`, `bin/run`)? A bare command name resolved
+/// via `$PATH` (`bash`, `git`) is NOT a path. We treat anything containing a
+/// path separator as a path — the common `./x`, `dir/x`, `/abs/x` shapes.
+fn taint_leader_is_pathlike(leader: &str) -> bool {
+    leader.contains('/') || leader.contains('\\')
+}
+
+/// M10 ch3 — the tainted-content hot check. When the parsed command leader is a
+/// tainted path (`./install.sh`), fire [`crate::verdict::RuleId::ExecOfTaintedFile`]
+/// (High). When the leader is an interpreter (`bash ./install.sh`) whose first
+/// non-flag file argument is tainted, fire the same rule against that argument.
+/// When the leader is `source` / `.` and the sourced file is tainted, fire
+/// [`crate::verdict::RuleId::CommandSourcedFromTaintedFile`] (Medium).
+///
+/// Caller gates this behind `ScanContext::Exec` and a non-empty taint store
+/// (the `taint_triggered` tier-1 force-past). The per-leader lookup itself is a
+/// path-key match against the per-process-cached store
+/// ([`crate::taint::is_tainted`]).
+fn check_taint_hot(ctx: &AnalysisContext) -> Vec<Finding> {
+    let Some(store) = crate::taint::store_path() else {
+        return Vec::new();
+    };
+    check_taint_hot_with_store(ctx, &store)
+}
+
+/// Store-parameterized core of [`check_taint_hot`]. Split out so the leader /
+/// interpreter / `source` parsing is unit-testable against a
+/// `tempfile::tempdir()` store WITHOUT touching the real `state_dir()` or
+/// mutating `XDG_STATE_HOME` (the libc setenv race, PR #125).
+fn check_taint_hot_with_store(ctx: &AnalysisContext, store: &std::path::Path) -> Vec<Finding> {
+    use crate::tokenize;
+    use crate::verdict::{RuleId, Severity};
+
+    let segs = tokenize::tokenize(&ctx.input, ctx.shell);
+    let Some(first) = segs.first() else {
+        return Vec::new();
+    };
+    let Some(leader_raw) = first.command.as_deref() else {
+        return Vec::new();
+    };
+    let leader = leader_raw.trim_matches(|c: char| c == '"' || c == '\'');
+    if leader.is_empty() {
+        return Vec::new();
+    }
+
+    let cwd: Option<std::path::PathBuf> = ctx
+        .cwd
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
+    let cwd_ref = cwd.as_deref();
+    let base = leader.rsplit('/').next().unwrap_or(leader);
+
+    // First non-flag argument (the script path for interpreters / source).
+    let file_arg = first
+        .args
+        .iter()
+        .map(|a| a.trim_matches(|c: char| c == '"' || c == '\''))
+        .find(|a| !a.is_empty() && !a.starts_with('-'));
+
+    // Case 1 — `source ./tainted.sh` / `. ./tainted.sh`. Medium.
+    if TAINT_SOURCE_LEADERS.contains(&base) {
+        if let Some(arg) = file_arg {
+            if let Some(entry) =
+                crate::taint::is_tainted_at(store, std::path::Path::new(arg), cwd_ref)
+            {
+                return vec![taint_finding(
+                    RuleId::CommandSourcedFromTaintedFile,
+                    Severity::Medium,
+                    "Sourcing a file downloaded from a risky source",
+                    arg,
+                    &entry,
+                )];
+            }
+        }
+        return Vec::new();
+    }
+
+    // Case 2 — interpreter wrapper (`bash ./tainted.sh`). High, against the
+    // script argument (the thing actually executed).
+    if TAINT_INTERPRETER_LEADERS.contains(&base) {
+        if let Some(arg) = file_arg {
+            if let Some(entry) =
+                crate::taint::is_tainted_at(store, std::path::Path::new(arg), cwd_ref)
+            {
+                return vec![taint_finding(
+                    RuleId::ExecOfTaintedFile,
+                    Severity::High,
+                    "Executing a file downloaded from a risky source",
+                    arg,
+                    &entry,
+                )];
+            }
+        }
+        return Vec::new();
+    }
+
+    // Case 3 — the leader itself is the executed file (`./install.sh`). High.
+    if taint_leader_is_pathlike(leader) {
+        if let Some(entry) =
+            crate::taint::is_tainted_at(store, std::path::Path::new(leader), cwd_ref)
+        {
+            return vec![taint_finding(
+                RuleId::ExecOfTaintedFile,
+                Severity::High,
+                "Executing a file downloaded from a risky source",
+                leader,
+                &entry,
+            )];
+        }
+    }
+
+    Vec::new()
+}
+
+/// Build a taint finding. Echoes the recorded origin / source so `tirith why`
+/// and the prompt show where the mark came from, without re-reading the store.
+fn taint_finding(
+    rule_id: crate::verdict::RuleId,
+    severity: crate::verdict::Severity,
+    title: &str,
+    typed_path: &str,
+    entry: &crate::taint::TaintEntry,
+) -> Finding {
+    use crate::verdict::Evidence;
+    let mut detail = format!("origin: {}", entry.origin);
+    if let Some(ref url) = entry.source_url {
+        detail.push_str(&format!("; source_url: {url}"));
+    }
+    if let Some(ref repo) = entry.source_repo {
+        detail.push_str(&format!("; source_repo: {repo}"));
+    }
+    Finding {
+        rule_id,
+        severity,
+        title: title.to_string(),
+        description: format!(
+            "`{typed_path}` was recorded as tainted (downloaded from a risky source). \
+             {detail}. Review the file, then run `tirith taint clear {typed_path}` once you \
+             trust it. The mark is not auto-cleared by chmod +x or a parse check."
+        ),
+        evidence: vec![Evidence::Text {
+            detail: format!("tainted path: {} ({})", entry.path, detail),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: Some("T1105".to_string()),
+        custom_rule_id: None,
+    }
+}
+
 /// The `/tmp`-equivalent roots: `/tmp` plus `$TMPDIR` (macOS uses a per-user
 /// `$TMPDIR` under `/var/folders`). Used by the hot-path `ExecInTmp` /
 /// writable-dir checks.
@@ -967,6 +1132,15 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         (false, false)
     };
 
+    // M10 ch3 — the tainted-content check is a runtime-state lookup (the parsed
+    // leader being a tainted path is not a regex/byte signal), so a tainted
+    // `bash ./install.sh` would fast-exit at tier-1 before the taint block ran
+    // (the tier-1 gating bug class — see CLAUDE.md). Force past the fast-exit
+    // ONLY when the taint store is non-empty: a single `metadata()` stat, so a
+    // machine that has never marked a file pays nothing. Gated to Exec so paste
+    // / file scan never pay even the stat. Mirrors `exec_guard_triggered`.
+    let taint_triggered = ctx.scan_context == ScanContext::Exec && crate::taint::store_nonempty();
+
     let tier1_ms = tier1_start.elapsed().as_secs_f64() * 1000.0;
 
     if !byte_scan_triggered
@@ -974,6 +1148,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         && !exec_bidi_triggered
         && !exec_guard_triggered
         && !hooks_guard_triggered
+        && !taint_triggered
     {
         let total_ms = start.elapsed().as_secs_f64() * 1000.0;
         return (
@@ -1380,6 +1555,18 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             findings.extend(crate::blast_radius::cheap_check(
                 &ctx.input, ctx.shell, &blast_env,
             ));
+
+            // M10 ch3 — tainted-content check. Always-on (no policy flag), but
+            // the per-leader lookup short-circuits to a near-noop when the taint
+            // store is empty/absent (and the tier-1 force-past `taint_triggered`
+            // only fires when the store is non-empty, so a no-taint machine
+            // never even reaches here unless some OTHER signal already pulled us
+            // past the fast-exit). When the parsed leader (or, for an
+            // interpreter wrapper / `source`, its file argument) is a tainted
+            // path, this fires ExecOfTaintedFile (High) /
+            // CommandSourcedFromTaintedFile (Medium). The store is path-keyed
+            // and cached per-process (5s TTL) — see `crate::taint`.
+            findings.extend(check_taint_hot(ctx));
         }
 
         let cred_findings =
@@ -2541,5 +2728,133 @@ mod tests {
             })
             .count();
         assert_eq!(n, 1, "duplicate seed must emit exactly once across chunks");
+    }
+
+    // ---- M10 ch3 — tainted-content hot-path tests --------------------------
+    //
+    // These drive `check_taint_hot_with_store` against a `tempfile::tempdir()`
+    // store + cwd so they never touch the real `state_dir()` and never mutate
+    // `XDG_STATE_HOME` (the libc setenv race, PR #125).
+
+    fn taint_store(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("taint.jsonl")
+    }
+
+    #[test]
+    fn taint_hot_fires_on_tainted_leader_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = taint_store(dir.path());
+        let cwd = dir.path();
+        crate::taint::mark_tainted_at(
+            &store,
+            std::path::Path::new("./install.sh"),
+            Some(cwd),
+            "fetch --save",
+            Some("https://untrusted.example/install.sh".to_string()),
+            None,
+        )
+        .unwrap();
+
+        let ctx = exec_ctx_in("./install.sh --yes", cwd);
+        let findings = check_taint_hot_with_store(&ctx, &store);
+        assert_eq!(findings.len(), 1, "tainted leader should fire one finding");
+        assert_eq!(
+            findings[0].rule_id,
+            crate::verdict::RuleId::ExecOfTaintedFile
+        );
+        assert_eq!(findings[0].severity, crate::verdict::Severity::High);
+    }
+
+    #[test]
+    fn taint_hot_fires_on_interpreter_wrapped_tainted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = taint_store(dir.path());
+        let cwd = dir.path();
+        crate::taint::mark_tainted_at(
+            &store,
+            std::path::Path::new("./install.sh"),
+            Some(cwd),
+            "fetch --save",
+            None,
+            None,
+        )
+        .unwrap();
+
+        // `bash ./install.sh` runs the tainted file even though the leader is bash.
+        let ctx = exec_ctx_in("bash ./install.sh", cwd);
+        let findings = check_taint_hot_with_store(&ctx, &store);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].rule_id,
+            crate::verdict::RuleId::ExecOfTaintedFile
+        );
+        assert_eq!(findings[0].severity, crate::verdict::Severity::High);
+    }
+
+    #[test]
+    fn taint_hot_fires_medium_on_sourced_tainted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = taint_store(dir.path());
+        let cwd = dir.path();
+        crate::taint::mark_tainted_at(
+            &store,
+            std::path::Path::new("./env.sh"),
+            Some(cwd),
+            "fetch --save",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let ctx = exec_ctx_in("source ./env.sh", cwd);
+        let findings = check_taint_hot_with_store(&ctx, &store);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].rule_id,
+            crate::verdict::RuleId::CommandSourcedFromTaintedFile
+        );
+        assert_eq!(findings[0].severity, crate::verdict::Severity::Medium);
+
+        // The `.` builtin form fires the same Medium rule.
+        let ctx_dot = exec_ctx_in(". ./env.sh", cwd);
+        let findings_dot = check_taint_hot_with_store(&ctx_dot, &store);
+        assert_eq!(findings_dot.len(), 1);
+        assert_eq!(
+            findings_dot[0].rule_id,
+            crate::verdict::RuleId::CommandSourcedFromTaintedFile
+        );
+    }
+
+    #[test]
+    fn taint_hot_no_fire_on_untainted_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = taint_store(dir.path());
+        let cwd = dir.path();
+        crate::taint::mark_tainted_at(
+            &store,
+            std::path::Path::new("./install.sh"),
+            Some(cwd),
+            "fetch --save",
+            None,
+            None,
+        )
+        .unwrap();
+
+        // A different, untainted file produces nothing.
+        let ctx = exec_ctx_in("bash ./other.sh", cwd);
+        assert!(check_taint_hot_with_store(&ctx, &store).is_empty());
+
+        // A PATH-resolved bare command (no path separator) is not a leader path.
+        let ctx_bare = exec_ctx_in("ls -la", cwd);
+        assert!(check_taint_hot_with_store(&ctx_bare, &store).is_empty());
+    }
+
+    #[test]
+    fn taint_hot_empty_store_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = taint_store(dir.path());
+        // No marks written.
+        let ctx = exec_ctx_in("bash ./install.sh", dir.path());
+        assert!(check_taint_hot_with_store(&ctx, &store).is_empty());
     }
 }

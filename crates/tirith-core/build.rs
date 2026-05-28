@@ -1257,6 +1257,12 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("blast_large_file_count", "BlastLargeFileCount"),
     // Post-run diff rule (M10 ch2).
     ("post_run_shell_rc_modified", "PostRunShellRcModified"),
+    // Tainted-content tracking rules (M10 ch3).
+    ("exec_of_tainted_file", "ExecOfTaintedFile"),
+    (
+        "command_sourced_from_tainted_file",
+        "CommandSourcedFromTaintedFile",
+    ),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -1287,6 +1293,7 @@ const VALID_CATEGORIES: &[&str] = &[
     "exec",
     "hooks",
     "blast",
+    "taint",
 ];
 
 #[derive(Deserialize)]
