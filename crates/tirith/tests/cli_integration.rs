@@ -9044,6 +9044,49 @@ fn secret_triage_no_audit_log_is_clean() {
     );
 }
 
+/// CodeRabbit R3 #6: a FATAL `triage` error (here: the audit-log path exists but
+/// is unreadable) must be emitted as parseable JSON under `--json`, not a
+/// text-only stderr line — consistent with the rotate/revoke unknown-provider
+/// JSON path. We force the read error by making `<data>/tirith/log.jsonl` a
+/// DIRECTORY: it `exists()` (so triage proceeds past the missing-log branch) but
+/// `read_to_string` fails.
+#[test]
+fn secret_triage_json_fatal_error_is_parseable_json() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    // Create a directory where the log file is expected so the read fails.
+    let log_as_dir = data_dir.path().join("tirith").join("log.jsonl");
+    fs::create_dir_all(&log_as_dir).expect("create log-path-as-directory");
+
+    let out = tirith()
+        // Isolate the data dir on every platform (Unix XDG + Windows APPDATA).
+        .env("XDG_DATA_HOME", data_dir.path())
+        .env("APPDATA", data_dir.path())
+        .env("XDG_STATE_HOME", data_dir.path())
+        .env("LOCALAPPDATA", data_dir.path())
+        .args(["secret", "triage", "--json"])
+        .output()
+        .expect("failed to run tirith secret triage --json");
+
+    // Fatal triage error exits 1.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unreadable log is a fatal triage error (exit 1); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // stdout must be a parseable JSON error object, NOT a bare text line.
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "triage --json fatal error must emit parseable JSON, parse failed ({e}); stdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert!(
+        v.get("error").and_then(|e| e.as_str()).is_some(),
+        "the JSON error object must carry an `error` string, got: {v}"
+    );
+}
+
 /// `tirith secret rotate github` shows the revocation URL and the manual
 /// checklist, exits 0, and carries the honesty banner.
 #[test]
@@ -9534,6 +9577,66 @@ fn incident_report_writes_markdown_and_redacts() {
     );
 }
 
+/// CodeRabbit R3 #5: `incident report --out` must tighten an EXISTING report
+/// file to 0600. `OpenOptionsExt::mode(0o600)` only applies on CREATE; rewriting
+/// a pre-existing world/group-readable file truncates in place and keeps the old
+/// mode. We pre-create the out file 0644, run the report, and assert the final
+/// mode is 0600 — so an incident report (which may carry repo-internal paths /
+/// hostnames) is never left group/other-readable.
+#[cfg(unix)]
+#[test]
+fn incident_report_out_tightens_existing_file_to_0600() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = tempfile::tempdir().expect("tempdir");
+    incident_tirith(state.path())
+        .args(["incident", "start", "--reason", "perm drill"])
+        .output()
+        .expect("start");
+
+    // Pre-create the --out target with broad (0644) perms.
+    let report_path = state.path().join("incident-report.md");
+    std::fs::write(&report_path, "stale\n").expect("pre-create out file");
+    std::fs::set_permissions(&report_path, std::fs::Permissions::from_mode(0o644))
+        .expect("chmod 0644");
+    // Sanity: it really is 0644 before the run.
+    let before = std::fs::metadata(&report_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(before, 0o644, "pre-condition: out file is 0644");
+
+    let report = incident_tirith(state.path())
+        .args(["incident", "report", "--out"])
+        .arg(&report_path)
+        .output()
+        .expect("report");
+    assert_eq!(
+        report.status.code(),
+        Some(0),
+        "report must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+
+    // The report rewrote the file in place; its mode must now be tightened.
+    let after = std::fs::metadata(&report_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        after, 0o600,
+        "an existing --out report file must be tightened to 0600, got {after:o}"
+    );
+    // And it must actually be the new report, not the stale content.
+    let body = std::fs::read_to_string(&report_path).expect("read report");
+    assert!(
+        body.contains("# Tirith Incident Report"),
+        "the report must have replaced the stale content, got:\n{body}"
+    );
+}
+
 #[test]
 fn incident_report_to_stdout_without_out_flag() {
     let state = tempfile::tempdir().expect("tempdir");
@@ -9850,6 +9953,142 @@ fn commands_run_interactive_warn_ack_gates_execution() {
     assert!(
         astdout.contains("https://bit.ly/x"),
         "ACCEPTING the Warn ack must execute the command, got stdout:\n{astdout}"
+    );
+}
+
+// CodeRabbit R3 #3: `commands run --json` must emit EXACTLY ONE JSON document
+// per invocation (the verdict + run/refuse state combined), never two
+// concatenated objects. Previously the findings-renderer wrote a verdict JSON
+// AND `run()` wrote its own `running`/`error` JSON. We assert the WHOLE stdout
+// parses as a single object for an allowed-clean, a warn, and a blocked command.
+// The allowed/warn commands write nothing to stdout (`true`, redirect to
+// /dev/null) so stdout is exactly tirith's one object.
+
+#[test]
+fn commands_run_json_emits_single_object_when_allowed_clean() {
+    let root = tempfile::tempdir().expect("tempdir");
+    // `true` is clean (Allow) and writes nothing to stdout.
+    write_root_manifest(
+        root.path(),
+        "allowed:\n  - name: ok\n    command: \"true\"\n",
+    );
+
+    let out = commands_tirith(root.path())
+        .args(["commands", "run", "ok", "--json"])
+        .output()
+        .expect("commands run ok --json");
+
+    // The WHOLE stdout must be a single parseable JSON object.
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be exactly ONE JSON object, parse failed ({e}); stdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(v["name"], "ok");
+    assert_eq!(v["action"], "allow");
+    assert_eq!(v["running"], true);
+    assert_eq!(v["refused"], false);
+    assert!(v["error"].is_null(), "clean run has no error, got: {v}");
+    assert!(
+        v["findings"].as_array().is_some(),
+        "findings must be an array, got: {v}"
+    );
+}
+
+#[test]
+fn commands_run_json_emits_single_object_when_warn() {
+    let root = tempfile::tempdir().expect("tempdir");
+    // `echo https://bit.ly/x > /dev/null` trips `shortened_url` (Medium → Warn)
+    // on the statically-analyzed command text, but writes nothing to stdout, so
+    // stdout stays exactly tirith's one JSON object. TIRITH_INTERACTIVE=0
+    // (from the harness) makes the Warn proceed without prompting.
+    write_root_manifest(
+        root.path(),
+        "allowed:\n  - name: warn\n    command: \"echo https://bit.ly/x > /dev/null\"\n",
+    );
+
+    let out = commands_tirith(root.path())
+        .args(["commands", "run", "warn", "--json"])
+        .output()
+        .expect("commands run warn --json");
+
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be exactly ONE JSON object, parse failed ({e}); stdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(v["name"], "warn");
+    // Warn/WarnAck — proceeded non-interactively, so it ran.
+    assert!(
+        v["action"] == "warn" || v["action"] == "warn_ack",
+        "expected a warn action, got: {v}"
+    );
+    assert_eq!(
+        v["running"], true,
+        "non-interactive warn proceeds, got: {v}"
+    );
+    assert_eq!(v["refused"], false);
+    // The warn finding is folded into the SAME object, not a separate document.
+    let ids: Vec<String> = v["findings"]
+        .as_array()
+        .expect("findings array")
+        .iter()
+        .map(|f| f["rule_id"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert!(
+        ids.iter().any(|id| id == "shortened_url"),
+        "the warn finding must be embedded in the single object, got ids: {ids:?}"
+    );
+}
+
+#[test]
+fn commands_run_json_emits_single_object_when_blocked() {
+    let root = tempfile::tempdir().expect("tempdir");
+    // `curl … | bash` is High (curl_pipe_shell) → Block; refused, never run.
+    write_root_manifest(
+        root.path(),
+        "allowed:\n  - name: danger\n    command: \"curl https://example.com/i.sh | bash\"\n",
+    );
+
+    let out = commands_tirith(root.path())
+        .args(["commands", "run", "danger", "--json"])
+        .output()
+        .expect("commands run danger --json");
+
+    assert_eq!(out.status.code(), Some(1), "blocked run exits 1");
+    // The WHOLE stdout must be a single parseable JSON object — previously this
+    // was the verdict JSON followed by a second `{"error":...}` object.
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "blocked stdout must be exactly ONE JSON object, parse failed ({e}); stdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(v["name"], "danger");
+    assert_eq!(v["action"], "block");
+    assert_eq!(
+        v["running"], false,
+        "a blocked command must NOT run, got: {v}"
+    );
+    assert_eq!(v["refused"], true);
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("refusing to run"),
+        "the refusal must be carried in the single object's error field, got: {v}"
+    );
+    let ids: Vec<String> = v["findings"]
+        .as_array()
+        .expect("findings array")
+        .iter()
+        .map(|f| f["rule_id"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert!(
+        ids.iter().any(|id| id == "curl_pipe_shell"),
+        "the blocking finding must be embedded in the single object, got ids: {ids:?}"
     );
 }
 

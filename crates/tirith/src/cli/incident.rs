@@ -373,6 +373,17 @@ fn write_report_file(path: &std::path::Path, body: &str) -> Result<(), String> {
     let mut f = opts
         .open(path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
+    // `OpenOptionsExt::mode(0o600)` only applies when the file is CREATED. When
+    // `--out` points at a pre-existing file, the open above truncates it in place
+    // but keeps its old (possibly group/other-readable) mode. Re-assert 0600
+    // explicitly so an incident report — which may carry repo-internal paths /
+    // hostnames — is never left world-readable (mirrors audit.rs's post-open
+    // chmod). Best-effort: a chmod failure must not abort the report write.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
     f.write_all(body.as_bytes())
         .map_err(|e| format!("write {}: {e}", path.display()))
 }

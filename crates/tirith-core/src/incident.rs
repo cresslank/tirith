@@ -308,7 +308,12 @@ pub fn start_at(path: &Path, reason: impl Into<String>) -> Result<IncidentState,
                 .as_file()
                 .set_permissions(std::fs::Permissions::from_mode(0o600));
         }
-        if tmp.write_all(&body).is_ok() && tmp.flush().is_ok() {
+        // Durability: fsync the body to stable storage BEFORE `hard_link`
+        // publishes the inode at the final path. `flush()` only drains the
+        // userspace buffer; without the sync a crash after the link could leave a
+        // zero/partial flag. (A partial flag still reads as an active incident —
+        // fail-safe — but a durable full write keeps the recorded reason intact.)
+        if tmp.write_all(&body).is_ok() && tmp.flush().is_ok() && tmp.as_file().sync_all().is_ok() {
             match std::fs::hard_link(tmp.path(), path) {
                 Ok(()) => {
                     // We won the race; the final path now points at the fully

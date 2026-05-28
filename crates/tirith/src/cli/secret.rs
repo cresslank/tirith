@@ -32,8 +32,7 @@ const TRIAGE_RECENT: usize = 25;
 /// `1` only when the audit-log path cannot be resolved or read.
 pub fn triage(json: bool, verbose: bool) -> i32 {
     let Some(log_path) = tirith_core::audit::audit_log_path() else {
-        eprintln!("tirith secret triage: cannot determine the audit log path");
-        return 1;
+        return triage_fatal(json, "cannot determine the audit log path");
     };
 
     // A missing log is the common "nothing has been audited yet" case — report
@@ -45,8 +44,7 @@ pub fn triage(json: bool, verbose: bool) -> i32 {
     let records = match tirith_core::audit_aggregator::read_log(&log_path) {
         Ok(result) => result.records,
         Err(e) => {
-            eprintln!("tirith secret triage: {e}");
-            return 1;
+            return triage_fatal(json, &e);
         }
     };
 
@@ -127,6 +125,25 @@ fn triage_empty(json: bool, scanned_path: &str) -> i32 {
         secret_rotation::provider_names().join(", ")
     );
     0
+}
+
+/// Emit a fatal `triage` error (unresolvable / unreadable audit log) and return
+/// exit code 1. In `--json` mode this writes a structured `{"error": ...}`
+/// object on stdout — consistent with the `rotate`/`revoke` unknown-provider
+/// JSON path — so a machine consumer that asked for `--json` always parses JSON
+/// rather than a bare stderr line. Exit stays 1 (the triage fatal code) even if
+/// the JSON write fails, so a piped consumer never reads success.
+fn triage_fatal(json: bool, msg: &str) -> i32 {
+    if json {
+        let payload = serde_json::json!({ "error": msg });
+        let _ = write_json_stdout(
+            &payload,
+            "tirith secret triage: failed to write JSON output",
+        );
+    } else {
+        eprintln!("tirith secret triage: {msg}");
+    }
+    1
 }
 
 /// `tirith secret rotate <provider> [--json] [--verbose]` — print the provider's

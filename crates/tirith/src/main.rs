@@ -166,13 +166,15 @@ Examples:
         #[arg(long = "suggest", visible_alias = "suggest-safe-command")]
         suggest_safe_command: bool,
 
-        /// Path to a signed command card (M11 ch1) attesting to this command.
-        /// Always read from disk — never fetched. A verified card emits an
-        /// Info `command_card_verified` finding but does NOT change the verdict
-        /// (other findings still apply); a command that differs from the card
-        /// emits a High `command_card_mismatch`. To use a maintainer's card
-        /// hosted at a URL, download it to a local file first, then pass that
-        /// path here (`tirith check` never fetches a card itself). On Unix,
+        /// Reference to a signed command card (M11 ch1) attesting to this
+        /// command: a local path OR a URL. A URL is accepted but NEVER fetched on
+        /// the hot path — it surfaces a "download this card first" hint (Info
+        /// `command_card_unverified`) and is otherwise treated as if no card were
+        /// present. A verified (local) card emits an Info `command_card_verified`
+        /// finding but does NOT change the verdict (other findings still apply);
+        /// a command that differs from the card emits a High
+        /// `command_card_mismatch`. To verify a card hosted at a URL, download it
+        /// to a local file first, then pass that path here. On Unix,
         /// `tirith command-card fetch <url>` does this download for you.
         #[arg(long)]
         card: Option<String>,
@@ -2197,9 +2199,12 @@ have explicitly trusted by dropping `<key_id>.pub` into
 directory is treated as unverified.
 
 NO HOT-PATH NETWORK: `tirith check` NEVER fetches a card. A `# tirith-card:`
-comment value or `--card` argument must be a LOCAL path. To use a card hosted
-at a URL, run `tirith command-card fetch <url>` first (the only remote-I/O
-path), then pass the cached path to `tirith check --card`.
+comment value or `--card` argument may be a local path OR a URL — but a URL is
+NOT fetched on the hot path; it surfaces a 'download this card first' hint
+(Info `command_card_unverified`) and is otherwise treated as if no card were
+present. To actually verify a card hosted at a URL, run
+`tirith command-card fetch <url>` first (the only remote-I/O path), then pass
+the cached local path to `tirith check --card`.
 
 PRIVACY: `tirith command-card fetch <url>` reveals to the maintainer's domain
 that a tirith user is pulling their card (your IP + a timestamp). This is
@@ -2240,10 +2245,13 @@ have explicitly trusted by dropping `<key_id>.pub` into
 directory is treated as unverified.
 
 NO HOT-PATH NETWORK: `tirith check` NEVER fetches a card. A `# tirith-card:`
-comment value or `--card` argument must be a LOCAL path. To use a card hosted
-at a URL, download it to a local file first (e.g. with your browser or a
-download tool), then pass that path to `tirith check --card`. The automated
-`command-card fetch` downloader is not available on this platform.
+comment value or `--card` argument may be a local path OR a URL — but a URL is
+NOT fetched on the hot path; it surfaces a 'download this card first' hint
+(Info `command_card_unverified`) and is otherwise treated as if no card were
+present. To actually verify a card hosted at a URL, download it to a local file
+first (e.g. with your browser or a download tool), then pass that path to
+`tirith check --card`. The automated `command-card fetch` downloader is not
+available on this platform.
 
 Subcommands:
   create  build an unsigned card from flags (or prompts) and print JSON

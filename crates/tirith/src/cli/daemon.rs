@@ -80,6 +80,12 @@ pub struct DaemonResponse {
     /// Action AFTER enrichment but BEFORE paranoia.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub raw_action: Option<String>,
+    /// M11 ch2 — the repo-command-manifest `allowed[]` entry name this command
+    /// matched (if any), carried so the client can annotate the audit context.
+    /// The daemon DOES evaluate the manifest (it runs the full `engine::analyze`),
+    /// so this is populated from the analyzed verdict rather than dropped.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub manifest_allowed_match: Option<String>,
 }
 
 /// Try to connect to the daemon and run a check. Returns `None` if the daemon
@@ -160,6 +166,7 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
         tier_reached: 0,
         raw_findings: None,
         raw_action: None,
+        manifest_allowed_match: None,
     };
 
     if req.command == "ping" {
@@ -210,6 +217,7 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
                 tier_reached: 2,
                 raw_findings: None,
                 raw_action: None,
+                manifest_allowed_match: None,
             };
         }
     }
@@ -252,6 +260,9 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
 
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
 
+    // Capture before `verdict.findings` is moved into the response below.
+    let manifest_allowed_match = verdict.manifest_allowed_match.clone();
+
     DaemonResponse {
         action: verdict.action,
         findings: verdict.findings,
@@ -265,6 +276,7 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
         tier_reached: verdict.tier_reached,
         raw_findings,
         raw_action: raw_action_str,
+        manifest_allowed_match,
     }
 }
 
@@ -502,6 +514,7 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
                                                 policy_path_used: None, timings_ms: Default::default(),
                                                 urls_extracted_count: None, tier_reached: 0,
                                                 raw_findings: None, raw_action: None,
+                                                manifest_allowed_match: None,
                                             })
                                     }
                                     Err(e) => DaemonResponse {
@@ -511,6 +524,7 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
                                         policy_path_used: None, timings_ms: Default::default(),
                                         urls_extracted_count: None, tier_reached: 0,
                                         raw_findings: None, raw_action: None,
+                                        manifest_allowed_match: None,
                                     },
                                 };
 
@@ -770,4 +784,67 @@ pub fn status() -> i32 {
 pub fn status() -> i32 {
     eprintln!("tirith: daemon status is not yet supported on this platform");
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DaemonResponse;
+    use tirith_core::verdict::Action;
+
+    fn base_response() -> DaemonResponse {
+        DaemonResponse {
+            action: Action::Allow,
+            findings: vec![],
+            exit_code: 0,
+            error: None,
+            bypass_honored: false,
+            bypass_available: false,
+            policy_path_used: None,
+            timings_ms: Default::default(),
+            urls_extracted_count: None,
+            tier_reached: 0,
+            raw_findings: None,
+            raw_action: None,
+            manifest_allowed_match: None,
+        }
+    }
+
+    /// CodeRabbit R3 #4: the daemon evaluates the full manifest, so the matched
+    /// `allowed[]` entry name must survive the daemon→client serde boundary
+    /// (previously `check.rs` hardcoded `None`, dropping the audit annotation).
+    #[test]
+    fn daemon_response_round_trips_manifest_allowed_match() {
+        let resp = DaemonResponse {
+            manifest_allowed_match: Some("deploy".to_string()),
+            ..base_response()
+        };
+        let wire = serde_json::to_string(&resp).expect("serialize");
+        assert!(
+            wire.contains("manifest_allowed_match"),
+            "the field must be on the wire when Some, got: {wire}"
+        );
+        let back: DaemonResponse = serde_json::from_str(&wire).expect("deserialize");
+        assert_eq!(back.manifest_allowed_match.as_deref(), Some("deploy"));
+    }
+
+    /// `None` is omitted from the wire (skip_serializing_if), and a payload from
+    /// a PRE-UPGRADE daemon that lacks the field deserializes cleanly to `None`
+    /// (serde `default`) — so the wiring is backward-compatible.
+    #[test]
+    fn daemon_response_omits_and_defaults_manifest_allowed_match() {
+        // None => omitted on the wire.
+        let resp = base_response();
+        let wire = serde_json::to_string(&resp).expect("serialize");
+        assert!(
+            !wire.contains("manifest_allowed_match"),
+            "None must be omitted (skip_serializing_if), got: {wire}"
+        );
+        // A pre-upgrade payload with no such key still parses, defaulting to None.
+        let legacy = r#"{"action":"allow","findings":[],"exit_code":0}"#;
+        let back: DaemonResponse = serde_json::from_str(legacy).expect("deserialize legacy");
+        assert!(
+            back.manifest_allowed_match.is_none(),
+            "a payload without the field must default to None"
+        );
+    }
 }

@@ -250,6 +250,9 @@ fn help_secret_states_assistant_only_and_no_network() {
         let out = tirith().args(args).output().expect("failed to run tirith");
         let stdout = String::from_utf8_lossy(&out.stdout);
         let lower = stdout.to_ascii_lowercase();
+        // Collapse runs of whitespace/newlines to single spaces so a clap
+        // line-wrap between two words of a phrase doesn't break the match.
+        let collapsed: String = lower.split_whitespace().collect::<Vec<_>>().join(" ");
         // Honesty: tirith does NOT perform rotation / revocation.
         assert!(
             stdout.contains("NOT")
@@ -257,10 +260,19 @@ fn help_secret_states_assistant_only_and_no_network() {
                 && (lower.contains("revocation") || lower.contains("revoke")),
             "{args:?} --help must carry the 'tirith does NOT rotate/revoke' honesty banner, got:\n{stdout}"
         );
-        // Zero network calls.
+        // Zero network calls. Require a NEGATION adjacent to "network" (the
+        // current contract phrase is "ZERO network calls") — a bare
+        // `contains("network")` would also pass on a "may perform network calls"
+        // regression, so demand one of the explicit no-network phrasings.
         assert!(
-            lower.contains("network"),
-            "{args:?} --help must state it makes zero network calls, got:\n{stdout}"
+            collapsed.contains("zero network")
+                || collapsed.contains("no network")
+                || collapsed.contains("never makes network")
+                || collapsed.contains("makes no network")
+                || collapsed.contains("does not make network")
+                || collapsed.contains("never fetched"),
+            "{args:?} --help must state it makes NO network calls (a negation adjacent to \
+             'network'), got:\n{stdout}"
         );
     }
 }
@@ -293,15 +305,23 @@ fn help_incident_states_no_new_rules_and_lockout_safety() {
     ] {
         let out = tirith().args(args).output().expect("failed to run tirith");
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let lower = stdout.to_ascii_lowercase();
+        // Collapse runs of whitespace/newlines to single spaces BEFORE matching:
+        // a multi-word phrase like "lockout safety" can be clap line-wrapped
+        // (e.g. "LOCKOUT" at end of one line, "SAFETY" at the start of the next),
+        // which would break a raw substring match on the un-normalized text.
+        let collapsed: String = stdout
+            .to_ascii_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         // F13: require the SPECIFIC lockout/recoverability wording. The bare
         // word "always" is too generic (it appears in unrelated help text like
         // "always exits 0") and could let the real safety note go missing while
         // the test still passed. Demand the "lockout" marker AND an explicit
         // recoverability promise ("recoverable" or "always succeeds").
         assert!(
-            lower.contains("lockout safety")
-                && (lower.contains("recoverable") || lower.contains("always succeeds")),
+            collapsed.contains("lockout safety")
+                && (collapsed.contains("recoverable") || collapsed.contains("always succeeds")),
             "{args:?} --help must carry the explicit lockout-safety + recoverability note, \
              got:\n{stdout}"
         );

@@ -122,10 +122,13 @@ pub fn run(
                         approval_description: None,
                         escalation_reason: None,
                         agent_origin: None,
-                        // M11 ch2 — daemon responses don't carry the
-                        // repo-command-manifest match; the local fast path
-                        // would (this branch is a pre-upgrade-daemon fallback).
-                        manifest_allowed_match: None,
+                        // M11 ch2 — the daemon evaluates the full manifest
+                        // (`engine::analyze`) and now carries the matched
+                        // `allowed[]` entry name across the boundary, so the
+                        // audit-context annotation survives the daemon path.
+                        // (A pre-upgrade daemon omits the field; serde defaults
+                        // it to None.)
+                        manifest_allowed_match: resp.manifest_allowed_match.clone(),
                     },
                     None,
                 )

@@ -901,6 +901,23 @@ fn check_command_manifest_hot(
 /// these findings change any OTHER finding's action — they are appended to the
 /// same list `action_from_findings` later folds.
 fn check_command_card_hot(ctx: &AnalysisContext) -> Vec<Finding> {
+    // Resolve the trusted-keys dir here (production), then delegate to the
+    // inner form so the unresolvable-trust-store branch can be exercised
+    // deterministically in tests (mirrors `check_taint_hot_with_store`).
+    let trusted_dir = crate::command_card::trusted_card_keys_dir();
+    check_command_card_hot_with_trusted_dir(ctx, trusted_dir)
+}
+
+/// Inner form of [`check_command_card_hot`] taking the already-resolved
+/// trusted-keys directory. `trusted_dir == None` means the trust store could
+/// not be resolved (no config dir): when a card ref was actually supplied, this
+/// surfaces an Info `CommandCardUnverified` ("trust store unavailable") rather
+/// than silently dropping the attestation — a card-less command still stays
+/// silent (it returns early before the trust-store check).
+fn check_command_card_hot_with_trusted_dir(
+    ctx: &AnalysisContext,
+    trusted_dir: Option<std::path::PathBuf>,
+) -> Vec<Finding> {
     use crate::command_card::{self, CardRef};
 
     // Sidecar `--card` flag wins; otherwise look for a `# tirith-card:` comment.
@@ -996,9 +1013,36 @@ fn check_command_card_hot(ctx: &AnalysisContext) -> Vec<Finding> {
         }
     };
 
-    let trusted_dir = match command_card::trusted_card_keys_dir() {
+    let trusted_dir = match trusted_dir {
         Some(d) => d,
-        None => return Vec::new(),
+        None => {
+            // A card ref WAS supplied (we only reach here past the
+            // `find_card_comment`/`--card` resolution above), but the trusted-keys
+            // directory cannot be resolved (no resolvable config dir). Verification
+            // was ATTEMPTED and could not complete — surface that as an Info note
+            // rather than silently dropping the card's attestation visibility. A
+            // card-less command never reaches this branch (it returned early), so
+            // it stays silent.
+            return vec![Finding {
+                rule_id: crate::verdict::RuleId::CommandCardUnverified,
+                severity: crate::verdict::Severity::Info,
+                title: "Command card could not be verified (trust store unavailable)".to_string(),
+                description: "A command card was supplied, but tirith could not resolve the \
+                              trusted-keys directory (`~/.config/tirith/trusted-card-keys/`). \
+                              Verification was attempted but could not complete; treating the \
+                              command as if no card were present."
+                    .to_string(),
+                evidence: vec![crate::verdict::Evidence::Text {
+                    detail:
+                        "trust store unavailable; verification attempted but could not complete"
+                            .to_string(),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }];
+        }
     };
     let today = chrono::Utc::now().date_naive();
     // Strip any `# tirith-card:` marker line(s) before the byte-for-byte command
@@ -3035,6 +3079,69 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
         }
+    }
+
+    /// CodeRabbit R3 #1: when a card ref IS supplied but the trusted-keys
+    /// directory cannot be resolved (no config dir), the card check must NOT
+    /// silently return empty — it surfaces an Info `CommandCardUnverified`
+    /// ("trust store unavailable; verification attempted but could not
+    /// complete") so attestation visibility is preserved. Driven through the
+    /// inner `_with_trusted_dir` form with `None`, which is the production
+    /// trust-store-unavailable state, without mutating process env.
+    #[test]
+    fn command_card_unverified_when_trust_store_unresolvable() {
+        // A `--card` ref is supplied (the file need not exist — the trust-store
+        // check happens only AFTER the card reads & parses, so use a real temp
+        // card so we reach the trust-store branch).
+        let dir = tempfile::tempdir().unwrap();
+        let card_path = dir.path().join("card.json");
+        let card = crate::command_card::Card::new(
+            "echo hi".to_string(),
+            vec!["example.com".to_string()],
+            None,
+            vec![],
+            false,
+            "2099-01-01".to_string(),
+        );
+        std::fs::write(&card_path, card.to_json_pretty().unwrap()).unwrap();
+
+        let mut ctx = exec_ctx("echo hi");
+        ctx.card_ref = Some(card_path.display().to_string());
+
+        // trusted_dir = None => trust store unavailable.
+        let findings = check_command_card_hot_with_trusted_dir(&ctx, None);
+        assert_eq!(
+            findings.len(),
+            1,
+            "supplied card with no resolvable trust store must emit exactly one finding"
+        );
+        assert_eq!(
+            findings[0].rule_id,
+            crate::verdict::RuleId::CommandCardUnverified
+        );
+        assert_eq!(findings[0].severity, crate::verdict::Severity::Info);
+        let detail = match &findings[0].evidence[0] {
+            crate::verdict::Evidence::Text { detail } => detail.clone(),
+            other => panic!("expected Text evidence, got {other:?}"),
+        };
+        assert!(
+            detail.contains("trust store unavailable")
+                && detail.contains("verification attempted but could not complete"),
+            "evidence must explain the trust store was unavailable, got: {detail}"
+        );
+    }
+
+    /// Counterpart to the above: a card-LESS command must stay completely silent
+    /// even when the trust store is unavailable (no card ref => early return,
+    /// never reaches the trust-store branch).
+    #[test]
+    fn no_card_stays_silent_even_when_trust_store_unresolvable() {
+        let ctx = exec_ctx("echo hi"); // card_ref: None, no `# tirith-card:` line
+        let findings = check_command_card_hot_with_trusted_dir(&ctx, None);
+        assert!(
+            findings.is_empty(),
+            "a command with no card must emit nothing, got: {findings:?}"
+        );
     }
 
     /// Write a `.tirith/policy.yaml` under `dir` (a `.git` marker too, so it is

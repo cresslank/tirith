@@ -1559,6 +1559,13 @@ fn atomic_self_replace(dest: &Path, new_binary: &Path) -> Result<SwapResult, Str
         .map_err(|e| format!("could not write the new binary: {e}"))?;
     tmp.flush()
         .map_err(|e| format!("could not flush the new binary: {e}"))?;
+    // Durability: fsync the new binary's bytes to stable storage BEFORE the
+    // rename makes it the live `tirith`. `flush()` only drains the userspace
+    // buffer; a crash after the rename could otherwise leave a zero/partial
+    // (un-runnable) binary at `dest`.
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("could not sync the new binary: {e}"))?;
 
     // 3. Make the temp file executable BEFORE it becomes the live binary, so
     //    there is never an instant where `tirith` exists but is not runnable.
@@ -1623,6 +1630,11 @@ fn atomic_restore_from(dest: &Path, source: &Path) -> Result<(), String> {
         .map_err(|e| format!("could not write the rollback binary: {e}"))?;
     tmp.flush()
         .map_err(|e| format!("could not flush the rollback binary: {e}"))?;
+    // Durability: fsync before the rename makes this the live binary, so a crash
+    // after the rename cannot leave a zero/partial (un-runnable) binary at `dest`.
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("could not sync the rollback binary: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

@@ -230,16 +230,30 @@ pub fn run(name: &str, json: bool) -> i32 {
             None,
             &policy.dlp_custom_patterns,
         );
-        // Surface WHY it was blocked, mirroring `tirith check`, before refusing.
-        render_findings(&verdict, &policy.dlp_custom_patterns, json);
-        emit_error(
-            json,
-            "tirith commands run",
-            &format!(
-                "refusing to run '{name}' ({command}): tirith blocked it. \
-                 Inspect with `tirith commands check -- \"{command}\"`."
-            ),
+        let refusal = format!(
+            "refusing to run '{name}' ({command}): tirith blocked it. \
+             Inspect with `tirith commands check -- \"{command}\"`."
         );
+        if json {
+            // ONE combined JSON object: the verdict (action + findings) AND the
+            // refusal, never two concatenated documents. (Previously
+            // `render_findings` wrote a verdict JSON and `emit_error` wrote a
+            // second `{"error":...}` JSON.)
+            emit_run_json(
+                name,
+                &command,
+                &verdict,
+                &policy.dlp_custom_patterns,
+                /* running */ false,
+                /* refused */ true,
+                Some(&refusal),
+            );
+        } else {
+            // Human: surface WHY it was blocked (findings to stderr), then the
+            // refusal line (also stderr) — mirroring `tirith check`.
+            render_findings(&verdict, &policy.dlp_custom_patterns, json);
+            emit_error(json, "tirith commands run", &refusal);
+        }
         return verdict.action.exit_code();
     }
 
@@ -257,8 +271,14 @@ pub fn run(name: &str, json: bool) -> i32 {
     // interactive TTY, require explicit acknowledgement before running (mirrors
     // check.rs's strict-warn prompt); non-interactive callers see the findings
     // and proceed. (Block already returned above.)
+    //
+    // In JSON mode the findings are NOT rendered here (that would emit a
+    // standalone verdict JSON); they are folded into the single combined object
+    // emitted at the running/abort exit below.
     if verdict.action != tirith_core::verdict::Action::Allow {
-        render_findings(&verdict, &policy.dlp_custom_patterns, json);
+        if !json {
+            render_findings(&verdict, &policy.dlp_custom_patterns, json);
+        }
 
         let interactive = if let Ok(val) = std::env::var("TIRITH_INTERACTIVE") {
             val == "1"
@@ -266,6 +286,7 @@ pub fn run(name: &str, json: bool) -> i32 {
             is_terminal::is_terminal(std::io::stderr())
         };
         if interactive {
+            // Prompt always goes to stderr so stdout stays a single JSON object.
             eprint!(
                 "tirith: proceed with {} warning(s) and run '{name}'? [y/N] ",
                 verdict.findings.len()
@@ -273,22 +294,41 @@ pub fn run(name: &str, json: bool) -> i32 {
             let mut input = String::new();
             std::io::stdin().read_line(&mut input).ok();
             if !matches!(input.trim(), "y" | "Y" | "yes" | "Yes") {
-                eprintln!("tirith commands run: aborted by user.");
+                if json {
+                    // Declined: ONE object recording the warn verdict + that we
+                    // did not run it (refused by the user).
+                    emit_run_json(
+                        name,
+                        &command,
+                        &verdict,
+                        &policy.dlp_custom_patterns,
+                        /* running */ false,
+                        /* refused */ true,
+                        Some("aborted by user"),
+                    );
+                } else {
+                    eprintln!("tirith commands run: aborted by user.");
+                }
                 return 1;
             }
         }
     }
 
     if json {
-        let v = serde_json::json!({
-            "running": name,
-            "command": command,
-        });
-        // A failed JSON write must abort BEFORE we execute the command: a piped
-        // consumer that asked for `--json` and saw a truncated/absent "running"
-        // record must not have the command silently run anyway. Exit 2 (distinct
-        // from a command's own exit code) signals the harness I/O failure.
-        if !super::write_json_stdout(&v, "tirith commands run: failed to write JSON output") {
+        // The single combined object for an allow / warn-proceed run. Emitted
+        // BEFORE the spawn so a failed JSON write aborts BEFORE the command runs:
+        // a piped consumer that asked for `--json` and saw a truncated record
+        // must not have the command silently run anyway. Exit 2 (distinct from a
+        // command's own exit code) signals the harness I/O failure.
+        if !emit_run_json(
+            name,
+            &command,
+            &verdict,
+            &policy.dlp_custom_patterns,
+            /* running */ true,
+            /* refused */ false,
+            None,
+        ) {
             return 2;
         }
     } else {
@@ -298,14 +338,53 @@ pub fn run(name: &str, json: bool) -> i32 {
     match run_shell_command(&command) {
         Ok(code) => code,
         Err(e) => {
-            emit_error(
-                json,
-                "tirith commands run",
-                &format!("failed to spawn command: {e}"),
-            );
+            // The combined object (running:true) was already written to stdout;
+            // a spawn failure now reports ONLY to stderr so stdout stays a single
+            // JSON document. Human mode already routes through emit_error→stderr.
+            if json {
+                eprintln!("tirith commands run: failed to spawn command: {e}");
+            } else {
+                emit_error(
+                    json,
+                    "tirith commands run",
+                    &format!("failed to spawn command: {e}"),
+                );
+            }
             1
         }
     }
+}
+
+/// Emit the single combined `commands run --json` object and return whether the
+/// write succeeded. This is the ONLY JSON writer on the `commands run` stdout
+/// path — every exit (block-refuse, warn-decline, allow/warn-proceed) routes
+/// through it so a machine consumer always reads exactly one parseable object
+/// per invocation, never two concatenated documents.
+///
+/// Shape: `{"name","command","action","findings":[...],"running":bool,
+/// "refused":bool,"error":null|"..."}`. `findings` carries the same redacted
+/// `Finding` records `tirith check` emits (DLP-redacted with the repo policy's
+/// custom patterns).
+fn emit_run_json(
+    name: &str,
+    command: &str,
+    verdict: &tirith_core::verdict::Verdict,
+    dlp_custom_patterns: &[String],
+    running: bool,
+    refused: bool,
+    error: Option<&str>,
+) -> bool {
+    let findings = tirith_core::redact::redacted_findings(&verdict.findings, dlp_custom_patterns);
+    let v = serde_json::json!({
+        "name": name,
+        "command": command,
+        "action": verdict.action,
+        "findings": findings,
+        "running": running,
+        "refused": refused,
+        "error": error,
+    });
+    super::write_json_stdout(&v, "tirith commands run: failed to write JSON output")
 }
 
 /// Render a non-Allow verdict's findings the SAME way `tirith check` does so a

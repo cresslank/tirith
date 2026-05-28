@@ -429,6 +429,13 @@ fn write_card_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     };
     tmp.write_all(contents.as_bytes())?;
     tmp.flush()?;
+    // Durability: `flush()` only drains the userspace buffer into the kernel; a
+    // crash/power-loss after the rename could otherwise leave a zero-length or
+    // partially-written card at `path`. `sync_all()` forces the file's data (and
+    // metadata) to stable storage BEFORE the rename publishes it, so a reader
+    // after a crash sees either the old card or the complete new one — never a
+    // truncated one.
+    tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
@@ -465,6 +472,15 @@ mod tests {
         // rename) so a crash mid-write cannot lose the original. Prove the write
         // lands exactly, an overwrite fully replaces the prior content, and no
         // temp file is left behind in the directory.
+        //
+        // DURABILITY (CodeRabbit R3 #2): `write_card_atomic` now calls
+        // `sync_all()` on the temp file BEFORE the rename, so a crash/power-loss
+        // after the rename cannot leave a zero/partial card at `path`. fsync is
+        // not directly observable in a unit test (it forces kernel buffers to
+        // stable storage); the content-integrity assertions below cover the
+        // userspace-visible post-condition, and the sync is exercised on every
+        // call here (a sync error would surface as an `Err` from
+        // `write_card_atomic` and fail the `.unwrap()`).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("card.json");
 

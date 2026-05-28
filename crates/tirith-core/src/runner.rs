@@ -155,6 +155,12 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         }
         tmp.write_all(&content)
             .map_err(|e| format!("write cache: {e}"))?;
+        // Durability: fsync the cached bytes before the rename publishes them so
+        // a crash after the rename cannot leave a zero/partial cache entry that a
+        // later run treats as a complete download.
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| format!("sync cache: {e}"))?;
         tmp.persist(&cached_path)
             .map_err(|e| format!("persist cache: {e}"))?;
     }
@@ -376,6 +382,13 @@ pub fn download_to_path(
         }
         tmp.write_all(&content)
             .map_err(|e| format!("write download: {e}"))?;
+        // Durability: force the downloaded bytes to stable storage BEFORE the
+        // rename publishes them. `write_all` only buffers into the kernel; a
+        // crash after the rename could otherwise leave a zero/partial file at
+        // `dest` that a later read treats as a complete download.
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| format!("sync download: {e}"))?;
         tmp.persist(dest)
             .map_err(|e| format!("persist download: {e}"))?;
     }
