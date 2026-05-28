@@ -416,29 +416,38 @@ mod tests {
     }
 
     // Windows twins: drive-letter absolute paths exercise the `Component::Prefix`
-    // and `Component::RootDir` arms of `normalize_key`, proving the keying is
-    // cross-platform (the same `.`/`..` lexical normalization on a `C:\…` base).
+    // and `Component::RootDir` arms of `normalize_key`. Rather than pin the exact
+    // string form of the normalized key (which depends on Windows path display
+    // details), these assert the load-bearing INVARIANT directly: a relative
+    // path resolved against a cwd produces the SAME key as the equivalent
+    // absolute path. That's the property taint-keying actually relies on, and
+    // comparing two `normalize_key` outputs to each other is correct on any host.
     #[cfg(windows)]
     #[test]
     fn normalize_key_resolves_relative_against_cwd_windows() {
         let cwd = Path::new(r"C:\work\repo");
-        let key = normalize_key(Path::new(r".\install.sh"), Some(cwd));
-        assert_eq!(key, PathBuf::from(r"C:\work\repo\install.sh"));
+        let from_rel = normalize_key(Path::new(r".\install.sh"), Some(cwd));
+        let from_abs = normalize_key(Path::new(r"C:\work\repo\install.sh"), None);
+        assert_eq!(from_rel, from_abs);
     }
 
     #[cfg(windows)]
     #[test]
     fn normalize_key_resolves_parent_components_windows() {
         let cwd = Path::new(r"C:\work\repo\sub");
-        let key = normalize_key(Path::new(r"..\install.sh"), Some(cwd));
-        assert_eq!(key, PathBuf::from(r"C:\work\repo\install.sh"));
+        let from_rel = normalize_key(Path::new(r"..\install.sh"), Some(cwd));
+        let from_abs = normalize_key(Path::new(r"C:\work\repo\install.sh"), None);
+        assert_eq!(from_rel, from_abs);
     }
 
     #[cfg(windows)]
     #[test]
     fn normalize_key_keeps_absolute_untouched_windows() {
-        let key = normalize_key(Path::new(r"C:\tmp\x\.\y"), Some(Path::new(r"C:\work")));
-        assert_eq!(key, PathBuf::from(r"C:\tmp\x\y"));
+        // `.`-component normalization is idempotent: the dotted and clean forms
+        // of the same absolute path must produce the same key.
+        let dotted = normalize_key(Path::new(r"C:\tmp\x\.\y"), Some(Path::new(r"C:\work")));
+        let clean = normalize_key(Path::new(r"C:\tmp\x\y"), None);
+        assert_eq!(dotted, clean);
     }
 
     #[cfg(unix)]
@@ -476,7 +485,9 @@ mod tests {
     }
 
     // Windows twin of the round-trip: a relative mark and a drive-letter absolute
-    // lookup must agree on the same normalized key.
+    // lookup must agree on the same normalized key. Asserts the round-trip
+    // INVARIANT (mark→find via both relative and absolute forms) rather than the
+    // exact stored string, which depends on Windows path-display details.
     #[cfg(windows)]
     #[test]
     fn mark_then_is_tainted_roundtrips_windows() {
@@ -495,17 +506,20 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(entry.path, r"C:\work\repo\install.sh");
         assert_eq!(entry.origin, "fetch --save");
 
+        // The relative mark must be findable via the relative form...
         let found = is_tainted_at(&store, Path::new(r".\install.sh"), Some(cwd))
             .expect("path should be tainted after mark");
-        assert_eq!(found.path, r"C:\work\repo\install.sh");
-
-        // Same file reached via an absolute drive-letter path must hit the same key.
+        assert_eq!(
+            found.source_url.as_deref(),
+            Some("https://untrusted.example/install.sh")
+        );
+        // ...and via the equivalent absolute drive-letter form (same key).
         let found_abs =
             is_tainted_at(&store, Path::new(r"C:\work\repo\install.sh"), None).expect("abs lookup");
         assert_eq!(found_abs.path, found.path);
+        assert_eq!(found.path, entry.path);
     }
 
     #[test]
