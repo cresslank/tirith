@@ -100,7 +100,22 @@ pub struct Provider {
     /// redacted finding text). Best-effort: a redacted finding may not retain
     /// enough of the prefix to match, in which case triage falls back to
     /// generic guidance.
+    ///
+    /// These are VALUE shapes — fragments of the credential itself (`AKIA…`,
+    /// `sk-ant-api…`). They are TIER-1 in [`match_provider`]: a value-shape
+    /// match always beats an [`Provider::env_name_markers`] match (CodeRabbit
+    /// R15 #2), so `OPENAI_API_KEY=[REDACTED] sk-ant-api03-…` routes to
+    /// anthropic on the real prefix, not to openai on the env-var name.
     pub key_prefix_shapes: &'static [&'static str],
+    /// Env-var / config-key NAME markers (e.g. `OPENAI_API_KEY`,
+    /// `aws_secret_access_key`). Substring-matched only as a TIER-2 FALLBACK
+    /// when NO provider's [`Provider::key_prefix_shapes`] matched: a redacted
+    /// record masks the secret VALUE (`OPENAI_API_KEY=[REDACTED]`) but keeps
+    /// the var name, which is enough to attribute when no real shape survives.
+    /// A name marker must never outrank another provider's real value shape
+    /// (these names are longer than `sk-ant-`, so a single-tier longest-match
+    /// would mis-route — hence the separate tier).
+    pub env_name_markers: &'static [&'static str],
     /// The date this entry was last hand-verified (see [`LAST_VERIFIED`]).
     pub last_verified: &'static str,
 }
@@ -120,7 +135,12 @@ pub static PROVIDERS: &[Provider] = &[
             "DELETE the old key once traffic has fully moved off it.",
             "Review CloudTrail for unauthorized use of the leaked key.",
         ],
-        key_prefix_shapes: &["AKIA", "ASIA", "aws_access_key_id", "aws_secret_access_key"],
+        key_prefix_shapes: &["AKIA", "ASIA"],
+        // Config-key NAME markers (the `~/.aws/credentials` INI keys): TIER-2
+        // fallback only, so a redacted `aws_secret_access_key=[REDACTED]` still
+        // routes to aws when no `AKIA…` value survives, without outranking
+        // another provider's real value shape.
+        env_name_markers: &["aws_access_key_id", "aws_secret_access_key"],
         last_verified: LAST_VERIFIED,
     },
     Provider {
@@ -136,6 +156,7 @@ pub static PROVIDERS: &[Provider] = &[
             "If it was an OAuth app or fine-grained token, rotate that credential too.",
         ],
         key_prefix_shapes: &["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"],
+        env_name_markers: &[],
         last_verified: LAST_VERIFIED,
     },
     Provider {
@@ -150,6 +171,7 @@ pub static PROVIDERS: &[Provider] = &[
             "Audit recently published package versions for unexpected releases.",
         ],
         key_prefix_shapes: &["npm_", "//registry.npmjs.org/:_authToken"],
+        env_name_markers: &[],
         last_verified: LAST_VERIFIED,
     },
     Provider {
@@ -164,6 +186,7 @@ pub static PROVIDERS: &[Provider] = &[
             "Review your projects' release history for unexpected uploads.",
         ],
         key_prefix_shapes: &["pypi-"],
+        env_name_markers: &[],
         last_verified: LAST_VERIFIED,
     },
     Provider {
@@ -182,6 +205,7 @@ pub static PROVIDERS: &[Provider] = &[
         // mis-route an unrelated leak to crates.io. Match cargo only via the
         // explicit `cargo-registry-token` config key — no short-prefix shape.
         key_prefix_shapes: &["cargo-registry-token"],
+        env_name_markers: &[],
         last_verified: LAST_VERIFIED,
     },
     Provider {
@@ -197,6 +221,7 @@ pub static PROVIDERS: &[Provider] = &[
             "If a restricted or webhook signing secret leaked, rotate that too.",
         ],
         key_prefix_shapes: &["sk_live_", "sk_test_", "rk_live_", "rk_test_", "whsec_"],
+        env_name_markers: &[],
         last_verified: LAST_VERIFIED,
     },
     Provider {
@@ -211,6 +236,7 @@ pub static PROVIDERS: &[Provider] = &[
             "Update every service holding the old token, then confirm revocation.",
         ],
         key_prefix_shapes: &["xoxb-", "xoxp-", "xoxa-", "xoxr-", "xapp-"],
+        env_name_markers: &[],
         last_verified: LAST_VERIFIED,
     },
     Provider {
@@ -224,11 +250,15 @@ pub static PROVIDERS: &[Provider] = &[
             "Update env files, CI secrets, and any SDK configuration.",
             "Review usage in the dashboard for unexpected spend.",
         ],
-        // Env-var NAME marker (CodeRabbit R9 #I): a redacted audit record masks the
-        // `sk-…` value (`OPENAI_API_KEY=[REDACTED]` / `[REDACTED:OpenAI API Key]`),
-        // so the `sk-` shape is gone post-mask — but the var name survives and is
-        // enough to attribute. Mirrors aws's `aws_secret_access_key` marker.
-        key_prefix_shapes: &["sk-proj-", "sk-svcacct-", "sk-", "OPENAI_API_KEY"],
+        key_prefix_shapes: &["sk-proj-", "sk-svcacct-", "sk-"],
+        // Env-var NAME marker (CodeRabbit R9 #I): a redacted audit record masks
+        // the `sk-…` value (`OPENAI_API_KEY=[REDACTED]` / `[REDACTED:OpenAI API
+        // Key]`), so the `sk-` shape is gone post-mask — but the var name
+        // survives and attributes as a TIER-2 fallback. It is intentionally NOT
+        // a value shape: as a 14-byte fragment it would otherwise longest-match
+        // over anthropic's `sk-ant-api` and steal a real Anthropic key
+        // (CodeRabbit R15 #2). Mirrors aws's `aws_secret_access_key` marker.
+        env_name_markers: &["OPENAI_API_KEY"],
         last_verified: LAST_VERIFIED,
     },
     Provider {
@@ -242,12 +272,13 @@ pub static PROVIDERS: &[Provider] = &[
             "Update env files, CI secrets, and any SDK configuration.",
             "Review usage for unexpected activity.",
         ],
+        key_prefix_shapes: &["sk-ant-api", "sk-ant-"],
         // Env-var NAME marker (CodeRabbit R9 #I): same rationale as openai — the
-        // masked record keeps `ANTHROPIC_API_KEY` even after the `sk-ant-…` value
-        // is redacted. `ANTHROPIC_API_KEY` (17 bytes) is longer than openai's
-        // `OPENAI_API_KEY` (14) and shares no substring, so the longest-match
-        // tie-break still routes each var name to the right provider.
-        key_prefix_shapes: &["sk-ant-api", "sk-ant-", "ANTHROPIC_API_KEY"],
+        // masked record keeps `ANTHROPIC_API_KEY` even after the `sk-ant-…`
+        // value is redacted. A TIER-2 fallback so it never outranks a real
+        // value shape; the two var-name markers share no substring, so a record
+        // carrying only one routes to exactly the right provider.
+        env_name_markers: &["ANTHROPIC_API_KEY"],
         last_verified: LAST_VERIFIED,
     },
     Provider {
@@ -279,6 +310,7 @@ pub static PROVIDERS: &[Provider] = &[
             "\"type\": \"service_account\"",
             "\"type\":\"service_account\"",
         ],
+        env_name_markers: &[],
         last_verified: LAST_VERIFIED,
     },
     Provider {
@@ -293,6 +325,7 @@ pub static PROVIDERS: &[Provider] = &[
             "Review the sign-in / audit logs for unauthorized use.",
         ],
         key_prefix_shapes: &["AccountKey=", "SharedAccessKey=", "DefaultEndpointsProtocol="],
+        env_name_markers: &[],
         last_verified: LAST_VERIFIED,
     },
 ];
@@ -312,15 +345,28 @@ pub fn provider_names() -> Vec<&'static str> {
 
 /// Attribute a leaked-secret `finding_text` (typically the redacted command
 /// from an audit record) to a provider by substring-matching the provider's
-/// [`Provider::key_prefix_shapes`]. Returns the provider owning the LONGEST
-/// matching shape; ties (same shape length) are broken by [`PROVIDERS`] order.
-/// `None` when no shape matches (the caller then prints generic guidance).
+/// shapes. Returns the provider owning the LONGEST matching shape; ties (same
+/// shape length) are broken by [`PROVIDERS`] order. `None` when nothing matches
+/// (the caller then prints generic guidance).
 ///
-/// **Longest-match, not first-match.** Several providers share an `sk-` family
-/// prefix (OpenAI `sk-`, Anthropic `sk-ant-…`, Stripe `sk_live_…`). A naive
-/// first-provider scan would mis-route an Anthropic `sk-ant-api03-…` key to
-/// OpenAI because `sk-` matches first. Preferring the longest shape means the
-/// more specific `sk-ant-api` wins, so a key is routed to the right provider.
+/// **Two tiers (CodeRabbit R15 #2).** A real value-shape match always beats an
+/// env-var-NAME marker:
+///   1. TIER-1 — [`Provider::key_prefix_shapes`] (fragments of the credential
+///      value itself). Longest-match, table-order tie-break.
+///   2. TIER-2 — [`Provider::env_name_markers`] (var/config-key NAMES), tried
+///      ONLY when no tier-1 shape matched anywhere.
+///
+/// Without the split, the env-var name `OPENAI_API_KEY` (14 bytes) would
+/// longest-match over anthropic's real `sk-ant-api` (10 bytes), so
+/// `OPENAI_API_KEY=[REDACTED] sk-ant-api03-…` would mis-route to openai even
+/// though a real Anthropic prefix is present. Tiering routes that to anthropic
+/// while a LONE `OPENAI_API_KEY=[REDACTED]` (no value shape survives) still
+/// falls through to openai via the marker.
+///
+/// **Longest-match, not first-match (within a tier).** Several providers share
+/// an `sk-` family prefix (OpenAI `sk-`, Anthropic `sk-ant-…`, Stripe
+/// `sk_live_…`). Preferring the longest shape means the more specific
+/// `sk-ant-api` wins over `sk-`, so a key is routed to the right provider.
 ///
 /// This is intentionally a cheap substring scan, not a parser: redacted audit
 /// text often keeps a credential's leading prefix (`AKIA…`, `ghp_…`) even after
@@ -332,12 +378,25 @@ pub fn match_provider(finding_text: &str) -> Option<&'static Provider> {
     // longest-match (then table-order) tie-break is preserved — lengths are
     // unchanged by ASCII-lowercasing, so `sk-ant-api` still beats `sk-`.
     let haystack = finding_text.to_ascii_lowercase();
+    // TIER-1: real value shapes. A match here wins outright over any marker.
+    match_longest(&haystack, |p| p.key_prefix_shapes)
+        // TIER-2: env-var/config-key NAME markers, only when no value shape hit.
+        .or_else(|| match_longest(&haystack, |p| p.env_name_markers))
+}
+
+/// Longest-match (table-order tie-break) of `lowercase_haystack` against the
+/// shape set `shapes_of(p)` for each provider. Shared by both tiers of
+/// [`match_provider`]; `lowercase_haystack` is pre-lowercased by the caller.
+fn match_longest(
+    lowercase_haystack: &str,
+    shapes_of: impl Fn(&'static Provider) -> &'static [&'static str],
+) -> Option<&'static Provider> {
     PROVIDERS
         .iter()
         .filter_map(|p| {
-            p.key_prefix_shapes
+            shapes_of(p)
                 .iter()
-                .filter(|shape| haystack.contains(&shape.to_ascii_lowercase()))
+                .filter(|shape| lowercase_haystack.contains(&shape.to_ascii_lowercase()))
                 .map(|shape| shape.len())
                 .max()
                 .map(|best| (p, best))
@@ -533,8 +592,8 @@ mod tests {
                 p.provider
             );
             assert!(
-                !p.key_prefix_shapes.is_empty(),
-                "{}: needs at least one triage shape",
+                !p.key_prefix_shapes.is_empty() || !p.env_name_markers.is_empty(),
+                "{}: needs at least one triage shape (value shape or env-name marker)",
                 p.provider
             );
             assert_eq!(
@@ -606,6 +665,56 @@ mod tests {
             match_provider("ANTHROPIC_API_KEY=[REDACTED:Anthropic API Key]").map(|p| p.provider),
             Some("anthropic"),
             "ANTHROPIC_API_KEY must not be mis-routed to openai"
+        );
+    }
+
+    #[test]
+    fn real_prefix_outranks_env_var_name_marker() {
+        // CodeRabbit R15 #2 — regression pinning BOTH properties of the two-tier
+        // matcher at once.
+        //
+        // (1) NEW FIX: when a record carries BOTH an env-var NAME marker AND a
+        // real credential prefix, the REAL prefix wins — even though the marker
+        // (`OPENAI_API_KEY`, 14 bytes) is LONGER than the real prefix
+        // (`sk-ant-api`, 10 bytes). A single-tier longest-match would mis-route
+        // this to openai; the value-shape tier must take precedence.
+        assert_eq!(
+            match_provider("OPENAI_API_KEY=[REDACTED] sk-ant-api03-xxxx").map(|p| p.provider),
+            Some("anthropic"),
+            "a real sk-ant-api prefix must outrank the longer OPENAI_API_KEY marker"
+        );
+        // Order-independent: marker after the real prefix routes the same way.
+        assert_eq!(
+            match_provider("sk-ant-api03-xxxx leaked; was in OPENAI_API_KEY").map(|p| p.provider),
+            Some("anthropic"),
+            "tier-1 value shape wins regardless of textual order"
+        );
+        // The same precedence holds for the AWS config-key markers vs another
+        // provider's real value shape (marker must not steal a real github key).
+        assert_eq!(
+            match_provider("aws_secret_access_key was next to ghp_xxxxxxxxxxxxxxxxxxxx")
+                .map(|p| p.provider),
+            Some("github"),
+            "a real ghp_ value shape must outrank the aws_secret_access_key marker"
+        );
+
+        // (2) PRIOR-ROUND PROPERTY PRESERVED: a LONE env-var-name marker (no
+        // real prefix survives the redaction) still attributes via the tier-2
+        // fallback. This is the round-9/12 behavior the new tiering must keep.
+        assert_eq!(
+            match_provider("OPENAI_API_KEY=[REDACTED]").map(|p| p.provider),
+            Some("openai"),
+            "a lone OPENAI_API_KEY marker must still attribute to openai (tier-2 fallback)"
+        );
+        assert_eq!(
+            match_provider("ANTHROPIC_API_KEY=[REDACTED]").map(|p| p.provider),
+            Some("anthropic"),
+            "a lone ANTHROPIC_API_KEY marker must still attribute to anthropic (tier-2 fallback)"
+        );
+        assert_eq!(
+            match_provider("aws_secret_access_key=[REDACTED]").map(|p| p.provider),
+            Some("aws"),
+            "a lone aws_secret_access_key marker must still attribute to aws (tier-2 fallback)"
         );
     }
 

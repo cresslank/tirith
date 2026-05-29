@@ -487,7 +487,11 @@ enum StoreLine {
 /// truncated prefix — `prune`/`rotate` must NOT rewrite the store from it (that
 /// would permanently drop the unread tail) and abort instead.
 fn read_store_partitioned(path: &Path) -> (Vec<StoreLine>, bool) {
-    let (lines, complete) = crate::util::read_store_lines_complete(path);
+    // RAW (untrimmed) read (CodeRabbit R15 #3): an unparseable line is kept
+    // verbatim as `StoreLine::Unparseable` and written back as-is on rewrite, so
+    // it must retain its original surrounding whitespace. Parseable entries are
+    // unaffected — `serde_json` tolerates the whitespace.
+    let (lines, complete) = crate::util::read_store_lines_raw_complete(path);
     let parsed = lines
         .into_iter()
         .map(|line| match serde_json::from_str::<CanaryEntry>(&line) {

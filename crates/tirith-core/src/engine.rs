@@ -470,6 +470,23 @@ pub(crate) fn analyze_output_chunk_at(
         &mut state.scan_state,
         &mut state.scan_result,
     );
+
+    // Decide whether a canary scan will run, BEFORE `append_tail` mutates the
+    // tail. For the production (default-store) path this is a SINGLE
+    // `store_nonempty()` stat, so a no-canary machine pays one stat and nothing
+    // else (no tail clone, no allocation). When we WILL scan, capture the
+    // retained tail NOW — before `append_tail` truncates it to its last 16 KiB —
+    // so the scan below can join it with the FULL incoming `chunk` (CodeRabbit
+    // R15 #5): a token located ANYWHERE in a chunk larger than the tail window
+    // would otherwise be dropped before it was ever scanned, and prepending the
+    // prior tail also still catches a token straddling the chunk boundary.
+    let will_scan_canaries = canary_store.is_some() || crate::canary::store_nonempty();
+    let prior_tail_for_canary = if will_scan_canaries {
+        Some(state.tail_text.clone()) // bounded: ≤16 KiB
+    } else {
+        None
+    };
+
     state.append_tail(chunk);
 
     let mut findings = before.new_findings(&state.scan_result);
@@ -495,19 +512,42 @@ pub(crate) fn analyze_output_chunk_at(
     // tool echoes back (e.g. an MCP tool result that read a decoy file) must
     // fire CanaryTokenTouched just like on the exec/paste path. Near-noop when
     // the store is empty (a single `metadata()` stat short-circuits), so a
-    // no-canary machine pays nothing. We scan the retained tail (`tail_text`,
-    // already updated by `append_tail` above) rather than the raw chunk so a
-    // token straddling a chunk boundary is still caught; dedupe by canary id so
-    // a token spanning chunks fires once. The opt-in callback fires with
-    // context "output" (never the token value; non-blocking).
-    let canary_hits = match canary_store {
-        // Test seam: scan an explicit (tempdir) store. The caller has already
-        // ensured it is non-empty, so we skip the `store_nonempty()` fast-gate.
-        Some(store) => crate::canary::detect_at(store, &state.tail_text),
-        // Production: near-noop when the default store is empty/absent (a single
-        // `metadata()` stat short-circuits before any parse).
-        None if crate::canary::store_nonempty() => crate::redact::detect_canaries(&state.tail_text),
+    // no-canary machine pays nothing.
+    //
+    // We scan `prior_tail + chunk` rather than the post-truncation `tail_text`
+    // (CodeRabbit R15 #5): a canary anywhere in a chunk LARGER than the tail
+    // window would otherwise be dropped before it was ever scanned. Joining the
+    // prior tail also still catches a token straddling the chunk boundary.
+    // Dedupe by canary id (`canary_seen`) so a token spanning chunks — or echoed
+    // again later — fires exactly once. The opt-in callback fires with context
+    // "output" (never the token value; non-blocking).
+    let canary_hits = match prior_tail_for_canary {
+        // `will_scan_canaries` was false (no store): the no-canary hot path, no
+        // tail clone and no allocation were taken.
         None => Vec::new(),
+        Some(prior_tail) => {
+            // Build the scan input lazily: scan the chunk directly when there is
+            // no prior tail to prepend (first chunk), else the joined buffer.
+            // Bounded by (≤16 KiB prior tail + chunk).
+            let joined;
+            let scan_text: &str = if prior_tail.is_empty() {
+                chunk
+            } else {
+                let mut s = String::with_capacity(prior_tail.len() + chunk.len());
+                s.push_str(&prior_tail);
+                s.push_str(chunk);
+                joined = s;
+                &joined
+            };
+            match canary_store {
+                // Test seam: scan an explicit (tempdir) store. The caller ensured
+                // it is non-empty, so the `store_nonempty()` fast-gate is skipped.
+                Some(store) => crate::canary::detect_at(store, scan_text),
+                // Production: `will_scan_canaries` already confirmed via
+                // `store_nonempty()` that the default store is non-empty.
+                None => crate::redact::detect_canaries(scan_text),
+            }
+        }
     };
     for hit in canary_hits {
         if state.canary_seen.insert(hit.id.clone()) {
@@ -4413,6 +4453,73 @@ mod tests {
             "finding must not echo the canary token value"
         );
         assert!(canary_findings[0].description.contains(&entry.id));
+    }
+
+    #[test]
+    fn analyze_output_chunk_detects_canary_beyond_tail_window() {
+        // CodeRabbit R15 #5 — regression pinning BOTH properties at once: a canary
+        // that sits near the START of a chunk LARGER than the 16 KiB tail window
+        // must STILL fire (the fix scans `prior_tail + chunk` BEFORE `append_tail`
+        // truncates the tail), and it must fire EXACTLY ONCE (the `canary_seen`
+        // dedup the prior round added is preserved).
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("canaries.jsonl");
+        let entry =
+            crate::canary::create_at(&store, crate::canary::CanaryKind::AwsLike, None).unwrap();
+        let token = &entry.token;
+
+        // One chunk: the token up front, then enough filler that the total
+        // exceeds the 32 KiB high-water mark (`OUTPUT_TAIL_KEEP * 2`) at which
+        // `append_tail` truncates to the last 16 KiB. With the token near the
+        // FRONT, it lands OUTSIDE that retained window — so scanning the
+        // post-truncation `tail_text` (the old behavior) would miss it entirely.
+        // Use a filler byte the canary scan never matches so the only possible
+        // hit is the planted token.
+        let filler = "x".repeat(OUTPUT_TAIL_KEEP * 2 + 4096);
+        let chunk = format!("echoed decoy: {token}\n{filler}");
+        assert!(
+            chunk.len() > OUTPUT_TAIL_KEEP * 2,
+            "chunk must exceed the 32 KiB truncation high-water mark to evict the token"
+        );
+
+        let mut state = OutputAnalyzerState::default();
+        let findings = analyze_output_chunk_at(&chunk, &mut state, Some(&store));
+        let n = findings
+            .iter()
+            .filter(|f| f.rule_id == crate::verdict::RuleId::CanaryTokenTouched)
+            .count();
+        assert_eq!(
+            n, 1,
+            "a canary beyond the 16 KiB tail window must fire exactly once"
+        );
+
+        // The token must now be GONE from the retained tail — proving the hit
+        // came from the pre-truncation scan, not the (truncated) tail_text.
+        assert!(
+            !state.tail_text.contains(token.as_str()),
+            "the token must have been evicted from the retained tail (so the fix, \
+             not the tail scan, is what caught it)"
+        );
+
+        // Dedup across the rest of the stream: echoing the token again must NOT
+        // re-fire (canary_seen), and the whole-stream verdict still carries one.
+        let again = analyze_output_chunk_at(&format!("again: {token}\n"), &mut state, Some(&store));
+        assert!(
+            !again
+                .iter()
+                .any(|f| f.rule_id == crate::verdict::RuleId::CanaryTokenTouched),
+            "a repeated token must be deduped by canary_seen"
+        );
+        let verdict = analyze_output_finalize(&state);
+        assert_eq!(
+            verdict
+                .findings
+                .iter()
+                .filter(|f| f.rule_id == crate::verdict::RuleId::CanaryTokenTouched)
+                .count(),
+            1,
+            "exactly one canary finding across the whole stream"
+        );
     }
 
     #[test]

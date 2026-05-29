@@ -613,10 +613,11 @@ fn run_shell_command(command: &str, json: bool) -> std::io::Result<i32> {
     let mut child = cmd.spawn()?;
     let pump = child.stdout.take().map(|mut out| {
         std::thread::spawn(move || {
-            // Stream child stdout → tirith's stderr. Best-effort: a copy error
-            // (e.g. closed stderr) must not abort the child wait below.
-            let mut err = std::io::stderr();
-            let _ = std::io::copy(&mut out, &mut err);
+            // Stream child stdout → tirith's stderr on a helper thread so a large
+            // output cannot deadlock by filling the pipe. See
+            // [`pump_stdout_draining`] for the drain-after-stderr-error contract
+            // that keeps the child from blocking when our stderr is broken.
+            pump_stdout_draining(&mut out, &mut std::io::stderr());
         })
     });
     let status = child.wait()?;
@@ -627,6 +628,38 @@ fn run_shell_command(command: &str, json: bool) -> std::io::Result<i32> {
         let _ = h.join();
     }
     Ok(status.code().unwrap_or(128))
+}
+
+/// Forward everything `reader` (the child's stdout) produces to `writer`
+/// (tirith's stderr), reading to EOF.
+///
+/// We DELIBERATELY do not use [`std::io::copy`]: it stops on the FIRST writer
+/// error. If tirith's stderr is closed/broken while the child keeps writing,
+/// stopping the read would let the child's stdout pipe FILL, and the child would
+/// then BLOCK forever on its next write — `child.wait()` would hang with it
+/// (CodeRabbit R15 #4). Instead, on a writer error we drop to DRAIN-ONLY mode:
+/// keep reading `reader` to EOF (discarding bytes), just stop forwarding. The
+/// child never blocks on a full pipe, so `wait()` always returns.
+fn pump_stdout_draining<R: std::io::Read, W: std::io::Write>(reader: &mut R, writer: &mut W) {
+    let mut buf = [0u8; 8 * 1024];
+    let mut forwarding = true;
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break, // EOF — the child closed its stdout.
+            Ok(n) => {
+                if forwarding && writer.write_all(&buf[..n]).is_err() {
+                    // Writer (stderr) is gone: stop forwarding but keep draining
+                    // so the child's pipe never fills.
+                    forwarding = false;
+                }
+                // When `!forwarding` we discard `buf[..n]` and keep looping.
+            }
+            // Retry an interrupted read; any other read error means the pipe is
+            // gone, so there is nothing left to drain.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
 }
 
 /// Stable label for a `dangerous[]` entry's action, shared by the JSON and
@@ -808,5 +841,89 @@ mod tests {
             "got: {refusal}"
         );
         assert!(refusal.contains("deploy --token"), "got: {refusal}");
+    }
+
+    /// CodeRabbit R15 #4: the `commands run --json` stdout→stderr pump must KEEP
+    /// DRAINING the child's stdout after a stderr write error, so a child that
+    /// emits a lot of stdout while our stderr is broken never blocks on a full
+    /// pipe (which would hang `child.wait()`).
+    ///
+    /// The pump loop is factored into [`super::pump_stdout_draining`] over generic
+    /// `Read`/`Write` so we can drive it with an always-erroring writer and a
+    /// large in-memory reader — no real process, no real pipe, fully time-boxed
+    /// (the reader yields EOF, so the loop cannot actually hang). We pin BOTH
+    /// properties: (1) the drain reads the reader to EOF even when every write
+    /// fails, and (2) a working writer still receives every byte (forwarding is
+    /// unchanged from the prior `std::io::copy` behavior).
+    #[test]
+    fn pump_drains_stdout_after_stderr_write_error() {
+        use super::pump_stdout_draining;
+        use std::io::{self, Read, Write};
+
+        // A reader that hands out a large, finite payload, counting bytes read so
+        // we can prove the pump consumed ALL of it (drained to EOF).
+        struct CountingReader {
+            remaining: usize,
+            read_total: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl Read for CountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.remaining == 0 {
+                    return Ok(0); // EOF
+                }
+                let n = buf.len().min(self.remaining).min(4096);
+                for b in &mut buf[..n] {
+                    *b = b'x';
+                }
+                self.remaining -= n;
+                self.read_total.set(self.read_total.get() + n);
+                Ok(n)
+            }
+        }
+
+        // (1) Writer that ALWAYS errors (simulates a closed/broken stderr).
+        struct BrokenWriter;
+        impl Write for BrokenWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+        }
+
+        // Far more than one pipe buffer's worth — the bug would block a real child
+        // here; the helper must still consume every byte.
+        let payload = 512 * 1024;
+        let read_total = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let mut reader = CountingReader {
+            remaining: payload,
+            read_total: read_total.clone(),
+        };
+        pump_stdout_draining(&mut reader, &mut BrokenWriter);
+        assert_eq!(
+            read_total.get(),
+            payload,
+            "the pump must drain the child's stdout to EOF even when every stderr write fails"
+        );
+
+        // (2) A WORKING writer must still receive every byte (prior behavior).
+        let read_total2 = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let mut reader2 = CountingReader {
+            remaining: payload,
+            read_total: read_total2.clone(),
+        };
+        let mut sink: Vec<u8> = Vec::new();
+        pump_stdout_draining(&mut reader2, &mut sink);
+        assert_eq!(read_total2.get(), payload, "all stdout must be read");
+        assert_eq!(
+            sink.len(),
+            payload,
+            "a working stderr must receive every forwarded byte"
+        );
+        assert!(
+            sink.iter().all(|&b| b == b'x'),
+            "forwarded bytes must be the child's stdout unchanged"
+        );
     }
 }

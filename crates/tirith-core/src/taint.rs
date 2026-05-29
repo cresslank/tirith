@@ -341,7 +341,11 @@ pub fn clear_taint_at(store: &Path, path: &Path, cwd: Option<&Path>) -> std::io:
     // markers for OTHER paths (a security miss: a tainted path silently reads as
     // clean). When the read is incomplete, ABORT the clear (report it as an I/O
     // error so the caller knows nothing was removed) rather than truncating.
-    let (lines, complete) = crate::util::read_store_lines_complete(store);
+    // RAW (untrimmed) read (CodeRabbit R15 #3): an unparseable/unknown-schema
+    // line is kept verbatim and written back, so it must retain its original
+    // surrounding whitespace. Parseable `TaintEntry` lines are unaffected —
+    // `serde_json` tolerates the whitespace.
+    let (lines, complete) = crate::util::read_store_lines_raw_complete(store);
     if !complete {
         return Err(std::io::Error::other(
             "taint store could not be read completely; clear aborted to avoid truncating it",

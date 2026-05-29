@@ -253,17 +253,21 @@ fn help_secret_states_assistant_only_and_no_network() {
         // Collapse runs of whitespace/newlines to single spaces so a clap
         // line-wrap between two words of a phrase doesn't break the match.
         let collapsed: String = lower.split_whitespace().collect::<Vec<_>>().join(" ");
-        // Honesty: tirith does NOT perform rotation / revocation. Match the
-        // whitespace-normalized LOWERCASE string for an explicit negation
-        // ("does not ...") adjacent to the rotation/revocation tokens — a
-        // case-sensitive `stdout.contains("NOT")` was brittle (a future edit
-        // could lower-case the banner and silently pass), and a bare
-        // `contains("not")` would also match unrelated words like "annotation".
+        // Honesty: tirith does NOT perform rotation / revocation. Require the
+        // negation ADJACENT to the rotate/revoke claim — the contiguous
+        // assistant-only banner phrase — on the whitespace-normalized LOWERCASE
+        // text (CodeRabbit R15 #7). The previous three independent substring
+        // checks (`does not` AND `rotation|rotate` AND `revocation|revoke`) could
+        // pass when "does not" came from the no-NETWORK sentence ("does not make
+        // network calls") while "rotate"/"revoke" came only from the Examples —
+        // so the honesty banner could be removed and the test still pass. Pinning
+        // the contiguous phrase ties the negation to the rotation/revocation claim
+        // itself. (Lowercase match keeps it robust to a future case change; the
+        // collapse already neutralizes clap's wrap width.)
         assert!(
-            collapsed.contains("does not")
-                && (collapsed.contains("rotation") || collapsed.contains("rotate"))
-                && (collapsed.contains("revocation") || collapsed.contains("revoke")),
-            "{args:?} --help must carry the 'tirith does NOT rotate/revoke' honesty banner, got:\n{stdout}"
+            collapsed.contains("does not perform rotation or revocation"),
+            "{args:?} --help must carry the contiguous 'tirith does NOT perform rotation or \
+             revocation' honesty banner (negation adjacent to the rotate/revoke claim), got:\n{stdout}"
         );
         // Zero network calls. Require a NEGATION adjacent to "network" (the
         // current contract phrase is "ZERO network calls") — a bare

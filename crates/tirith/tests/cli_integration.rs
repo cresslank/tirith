@@ -2685,6 +2685,148 @@ fn policy_init_default_unchanged_without_template() {
     );
 }
 
+/// CodeRabbit R15 #1: `tirith policy init` / `commands init` must REFUSE to
+/// overwrite an existing file WITHOUT `--force`, and atomically REPLACE it WITH
+/// `--force`. The round-12 atomic-write refactor (`write_file_atomic` always
+/// `persist`s over the target) made the at-caller noclobber guard the ONLY thing
+/// preserving refuse-without-force, so pin BOTH properties — and that the
+/// atomic-write path leaves no stray temp file behind.
+///
+/// Count the `.tirith` directory entries to assert no `.tmp…` sibling lingers
+/// after the atomic rename (the temp file is created in the same dir).
+fn dir_entry_count(p: &std::path::Path) -> usize {
+    fs::read_dir(p).map(|rd| rd.count()).unwrap_or(0)
+}
+
+#[test]
+fn policy_init_refuses_without_force_then_replaces_with_force() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tirith_dir = dir.path().join(".tirith");
+    fs::create_dir_all(&tirith_dir).expect("create .tirith");
+    let policy_path = tirith_dir.join("policy.yaml");
+    // Pre-existing, hand-edited policy with a unique sentinel.
+    let sentinel = "# HAND EDITED DO NOT CLOBBER\nparanoia: 3\n";
+    fs::write(&policy_path, sentinel).expect("seed policy");
+
+    // (1) Without --force: REFUSE (exit 1) and leave the file BYTE-FOR-BYTE.
+    let refuse = tirith()
+        .args(["policy", "init"])
+        .current_dir(dir.path())
+        .env_remove("TIRITH_POLICY_ROOT")
+        .output()
+        .expect("run policy init");
+    assert_eq!(
+        refuse.status.code(),
+        Some(1),
+        "policy init without --force on an existing file must exit 1: {}",
+        String::from_utf8_lossy(&refuse.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&refuse.stderr).contains("already exists"),
+        "refusal must explain the file already exists: {}",
+        String::from_utf8_lossy(&refuse.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&policy_path).unwrap(),
+        sentinel,
+        "the existing policy must be untouched when --force is absent"
+    );
+    assert_eq!(
+        dir_entry_count(&tirith_dir),
+        1,
+        "a refused init must not leave a temp file behind"
+    );
+
+    // (2) With --force: ATOMICALLY replace with the template (exit 0).
+    let forced = tirith()
+        .args(["policy", "init", "--force"])
+        .current_dir(dir.path())
+        .env_remove("TIRITH_POLICY_ROOT")
+        .output()
+        .expect("run policy init --force");
+    assert_eq!(
+        forced.status.code(),
+        Some(0),
+        "policy init --force must exit 0: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    let replaced = fs::read_to_string(&policy_path).unwrap();
+    assert!(
+        !replaced.contains("HAND EDITED") && replaced.contains("# Tirith security policy"),
+        "--force must replace the file with the template: {replaced}"
+    );
+    assert_eq!(
+        dir_entry_count(&tirith_dir),
+        1,
+        "the atomic replace must leave exactly the policy file (no temp sibling)"
+    );
+}
+
+#[test]
+fn commands_init_refuses_without_force_then_replaces_with_force() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tirith_dir = dir.path().join(".tirith");
+    fs::create_dir_all(&tirith_dir).expect("create .tirith");
+    let manifest_path = tirith_dir.join("commands.yaml");
+    // Pre-existing, hand-edited manifest with a unique sentinel.
+    let sentinel = "# HAND EDITED DO NOT CLOBBER\nallowed: []\n";
+    fs::write(&manifest_path, sentinel).expect("seed manifest");
+
+    // (1) Without --force: REFUSE (exit 1) and leave the file BYTE-FOR-BYTE.
+    // `commands init` resolves its target relative to cwd (no .git → cwd fallback).
+    let refuse = tirith()
+        .args(["commands", "init"])
+        .current_dir(dir.path())
+        .env_remove("TIRITH_POLICY_ROOT")
+        .output()
+        .expect("run commands init");
+    assert_eq!(
+        refuse.status.code(),
+        Some(1),
+        "commands init without --force on an existing file must exit 1: {}",
+        String::from_utf8_lossy(&refuse.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&refuse.stderr).contains("already exists"),
+        "refusal must explain the file already exists: {}",
+        String::from_utf8_lossy(&refuse.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&manifest_path).unwrap(),
+        sentinel,
+        "the existing manifest must be untouched when --force is absent"
+    );
+    assert_eq!(
+        dir_entry_count(&tirith_dir),
+        1,
+        "a refused init must not leave a temp file behind"
+    );
+
+    // (2) With --force: ATOMICALLY replace with the starter manifest (exit 0).
+    let forced = tirith()
+        .args(["commands", "init", "--force"])
+        .current_dir(dir.path())
+        .env_remove("TIRITH_POLICY_ROOT")
+        .output()
+        .expect("run commands init --force");
+    assert_eq!(
+        forced.status.code(),
+        Some(0),
+        "commands init --force must exit 0: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    let replaced = fs::read_to_string(&manifest_path).unwrap();
+    assert!(
+        !replaced.contains("HAND EDITED") && replaced.contains("tirith repo command manifest"),
+        "--force must replace the file with the starter manifest: {replaced}"
+    );
+    assert_eq!(
+        dir_entry_count(&tirith_dir),
+        1,
+        "the atomic replace must leave exactly the manifest file (no temp sibling)"
+    );
+}
+
 /// #112: `tirith policy validate` (no --file) must locate a present-but-corrupt
 /// policy and report its error, rather than collapsing to "no policy file found"
 /// the way the old parse-aware discovery (`Policy::discover().path`) did.

@@ -175,6 +175,24 @@ pub fn read_store_lines(path: &Path) -> Vec<String> {
 /// An ABSENT store (`NotFound`) is genuinely empty and returns `(vec![], true)`:
 /// a rewrite from "no lines" is correct (the store does not exist yet).
 pub fn read_store_lines_complete(path: &Path) -> (Vec<String>, bool) {
+    read_store_lines_complete_inner(path, true)
+}
+
+/// Like [`read_store_lines_complete`] but yields each non-blank line RAW
+/// (UNTRIMMED) for the REWRITE/preserve path (CodeRabbit R15 #3). The
+/// open/stat/`complete` semantics are identical to [`read_store_lines_complete`];
+/// only the per-line trimming differs (see [`collect_store_lines_raw_complete`]).
+/// Rewrite callers (taint clear, canary prune/rotate, baseline compaction) use
+/// THIS so an unparseable line survives byte-for-byte through the rewrite.
+pub fn read_store_lines_raw_complete(path: &Path) -> (Vec<String>, bool) {
+    read_store_lines_complete_inner(path, false)
+}
+
+/// Shared open/stat core of the trimmed / raw store readers. `trim` selects the
+/// per-line policy ([`collect_store_lines_complete`] vs
+/// [`collect_store_lines_raw_complete`]); the unreadable/absent classification
+/// and `complete` flag are identical in both.
+fn read_store_lines_complete_inner(path: &Path, trim: bool) -> (Vec<String>, bool) {
     let file = match open_regular_capped(path, u64::MAX) {
         Ok(f) => f,
         // Truly absent: an empty, COMPLETE image — rewriting from it is correct.
@@ -194,7 +212,12 @@ pub fn read_store_lines_complete(path: &Path) -> (Vec<String>, bool) {
             return (Vec::new(), false);
         }
     };
-    collect_store_lines_complete(std::io::BufReader::new(file))
+    let reader = std::io::BufReader::new(file);
+    if trim {
+        collect_store_lines_complete(reader)
+    } else {
+        collect_store_lines_raw_complete(reader)
+    }
 }
 
 /// One-line stderr diagnostic when a PRESENT security store cannot be read (vs a
@@ -233,7 +256,40 @@ pub fn collect_store_lines<R: BufRead>(reader: R) -> Vec<String> {
 /// would PERMANENTLY DROP every unread tail entry (data loss). Such callers use
 /// [`read_store_lines_complete`] and ABORT the rewrite when `complete == false`,
 /// leaving the store intact for a future attempt.
+///
+/// This is the TRIMMED variant: each retained line is whitespace-trimmed. Use it
+/// for the JSON-parse READ path (`serde_json` ignores surrounding whitespace, so
+/// trimming is harmless and the output is tidy). REWRITE paths that preserve an
+/// unparseable line verbatim must instead use [`collect_store_lines_raw_complete`]
+/// — trimming would corrupt a `  {unknown}  ` line's whitespace on write-back
+/// (CodeRabbit R15 #3).
 pub fn collect_store_lines_complete<R: BufRead>(reader: R) -> (Vec<String>, bool) {
+    collect_lines_inner(reader, true)
+}
+
+/// Like [`collect_store_lines_complete`] but yields each non-blank line RAW
+/// (UNTRIMMED). The REWRITE/preserve path (taint clear, canary prune/rotate,
+/// baseline compaction) keeps unparseable lines verbatim, so it must read them
+/// byte-for-byte: a leading/trailing-whitespace `  {"unknown":1}  ` line would
+/// otherwise be silently re-written without its surrounding whitespace
+/// (CodeRabbit R15 #3). Parseable lines are unaffected — `serde_json` tolerates
+/// the surrounding whitespace, so they still deserialize identically.
+///
+/// Genuinely blank (whitespace-only) lines are STILL dropped: they carry no
+/// data, are inert to every reader, and preserving them would let the store
+/// accumulate blank noise across rewrites. "Verbatim" therefore means
+/// "byte-for-byte for any line with content", not "re-emit empty lines".
+/// `complete` has the identical meaning as the trimmed variant.
+pub fn collect_store_lines_raw_complete<R: BufRead>(reader: R) -> (Vec<String>, bool) {
+    collect_lines_inner(reader, false)
+}
+
+/// Shared core of the trimmed / raw line collectors. `trim == true` pushes the
+/// whitespace-trimmed line (read path); `trim == false` pushes the line verbatim
+/// (rewrite/preserve path). Either way a line that is blank AFTER trimming is
+/// skipped, and the `complete` flag follows the same skip-`InvalidData` /
+/// break-on-other-fault contract documented on [`collect_store_lines_complete`].
+fn collect_lines_inner<R: BufRead>(reader: R, trim: bool) -> (Vec<String>, bool) {
     let mut out = Vec::new();
     // Optimistically complete; flipped to false only if we BREAK on a real fault.
     // A clean EOF or a sequence of skipped InvalidData lines both leave this true.
@@ -249,9 +305,14 @@ pub fn collect_store_lines_complete<R: BufRead>(reader: R) -> (Vec<String>, bool
                 break;
             }
         };
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            out.push(trimmed.to_string());
+        // Skip blank/whitespace-only lines in BOTH modes — they hold no data.
+        if line.trim().is_empty() {
+            continue;
+        }
+        if trim {
+            out.push(line.trim().to_string());
+        } else {
+            out.push(line);
         }
     }
     (out, complete)
@@ -683,6 +744,45 @@ mod store_line_tests {
         assert!(
             complete,
             "a clean EOF (even skipping bad UTF-8) is complete"
+        );
+    }
+
+    #[test]
+    fn raw_variant_preserves_surrounding_whitespace_but_drops_blank_lines() {
+        use super::collect_store_lines_raw_complete;
+        // CodeRabbit R15 #3 — regression pinning BOTH properties of the raw
+        // collector used by the REWRITE/preserve path.
+        //
+        // A store with an unknown line that carries surrounding whitespace must
+        // come back EXACTLY (whitespace included) so a verbatim rewrite writes it
+        // byte-for-byte; a blank/whitespace-only line carries no data and is still
+        // dropped (so rewrites don't accumulate blank noise).
+        let input = "  {\"unknown\":\"x\"}  \n\t{\"a\":1}\n   \n\n\tplain content\t\n";
+        let (raw, complete) =
+            collect_store_lines_raw_complete(std::io::BufReader::new(input.as_bytes()));
+        assert!(complete, "a clean read is complete");
+        assert_eq!(
+            raw,
+            vec![
+                "  {\"unknown\":\"x\"}  ".to_string(), // (1) verbatim: surrounding spaces kept
+                "\t{\"a\":1}".to_string(),             // verbatim: leading tab kept
+                "\tplain content\t".to_string(),       // verbatim: leading + trailing tab kept
+            ],
+            "raw variant must keep each non-blank line byte-for-byte and drop blank lines"
+        );
+
+        // CONTRAST: the TRIMMED variant (read path) strips that same whitespace.
+        // Proves the two variants differ exactly on the preserve property — and
+        // that the prior trimmed behavior the read path relies on is unchanged.
+        let (trimmed, _) = collect_store_lines_complete(std::io::BufReader::new(input.as_bytes()));
+        assert_eq!(
+            trimmed,
+            vec![
+                "{\"unknown\":\"x\"}".to_string(),
+                "{\"a\":1}".to_string(),
+                "plain content".to_string(),
+            ],
+            "trimmed variant must still strip whitespace for the parse path"
         );
     }
 }

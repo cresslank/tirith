@@ -633,7 +633,10 @@ fn compact_store_at(store: &Path, now: chrono::DateTime<chrono::Utc>) -> std::io
     // rewriting from them would PERMANENTLY DROP the unread tail. When the read is
     // incomplete, SKIP compaction this cycle and leave the store intact; the
     // append already succeeded and the next `record_at` past the trigger retries.
-    let (lines, complete) = crate::util::read_store_lines_complete(store);
+    // RAW (untrimmed) read (CodeRabbit R15 #3): an unparseable line is preserved
+    // verbatim through the rewrite, so it must keep its surrounding whitespace.
+    // Parseable `Observation` lines are unaffected — `serde_json` tolerates it.
+    let (lines, complete) = crate::util::read_store_lines_raw_complete(store);
     if !complete {
         return Ok(());
     }

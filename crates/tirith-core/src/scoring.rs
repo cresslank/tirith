@@ -86,6 +86,20 @@ fn is_note_only_rule(rule: RuleId) -> bool {
     )
 }
 
+/// Whether a finding is an EXCLUDED note — a note-only rule that is STILL at its
+/// documented `Info` severity. Such a finding is metadata, not a risk signal, so
+/// it is dropped from the substantive-findings count (factors 2 and 3).
+///
+/// The severity check matters (CodeRabbit R15 #6): `policy.severity_overrides`
+/// can PROMOTE a note-only rule (e.g. an operator raises `CommandCardVerified` to
+/// Medium to make an unverified-card run count). Once promoted, the finding is no
+/// longer "just a note" — the operator has declared it risk-relevant — so it must
+/// be COUNTED. Exempting it purely by `rule_id` (ignoring severity) would silently
+/// discard that operator intent. Exempt ONLY while severity is exactly `Info`.
+fn is_excluded_note(finding: &Finding) -> bool {
+    is_note_only_rule(finding.rule_id) && finding.severity == Severity::Info
+}
+
 /// Contribution when a threat-intel finding corroborates other findings.
 const THREAT_INTEL_CORROBORATION_WEIGHT: u32 = 5;
 
@@ -469,17 +483,16 @@ pub fn score_findings(findings: &[Finding]) -> ScoreBreakdown {
         detail: base_detail,
     });
 
-    // Factor 2 — additional findings. Each finding past the first adds +5, but
-    // note-only Info annotations (verified/unverified card, uncatalogued-command
-    // note) are EXCLUDED from the count: they are metadata about the command, not
-    // a second independent problem, so they must not inflate the score
-    // (CodeRabbit R11 #3). Base severity already ignores them too — they are all
-    // Info (0 base) — so a verdict carrying only such a note scores exactly the
-    // same as one carrying none.
-    let substantive = findings
-        .iter()
-        .filter(|f| !is_note_only_rule(f.rule_id))
-        .count();
+    // Factor 2 — additional findings. Each finding past the first adds +5, but a
+    // note-only annotation (verified/unverified card, uncatalogued-command note)
+    // STILL AT ITS Info severity is EXCLUDED from the count: it is metadata about
+    // the command, not a second independent problem, so it must not inflate the
+    // score (CodeRabbit R11 #3). When `severity_overrides` PROMOTES such a note
+    // above Info, the operator has declared it risk-relevant, so it is COUNTED
+    // (CodeRabbit R15 #6) — and factor 1 (max-severity) naturally picks up the
+    // promotion too. A verdict carrying only an UN-promoted note scores exactly
+    // the same as one carrying none.
+    let substantive = findings.iter().filter(|f| !is_excluded_note(f)).count();
     let extra = substantive.saturating_sub(1) as u32;
     let extra_points = extra * ADDITIONAL_FINDING_WEIGHT;
     let extra_detail = match substantive {
@@ -678,6 +691,57 @@ mod tests {
         ]);
         assert_eq!(b.score, 75, "canary-touched must still count as a finding");
         assert!(b.verify());
+    }
+
+    #[test]
+    fn promoted_note_only_rule_is_counted_but_info_one_is_not() {
+        // CodeRabbit R15 #6 — regression pinning BOTH properties: a note-only rule
+        // is exempt ONLY while at Info; an operator promotion via
+        // `severity_overrides` makes it count.
+        //
+        // (1) PRIOR-ROUND PROPERTY PRESERVED: a CommandCardVerified note STILL AT
+        // Info adds nothing alongside a real High finding (score stays 70).
+        let at_info = score_findings(&[
+            finding(RuleId::PlainHttpToSink, Severity::High),
+            finding(RuleId::CommandCardVerified, Severity::Info),
+        ]);
+        assert_eq!(
+            at_info.score, 70,
+            "an Info note-only finding must not add an additional-finding point"
+        );
+        assert!(at_info.verify());
+
+        // (2) NEW FIX: the SAME rule PROMOTED to Medium is now a risk signal the
+        // operator opted into — it must be COUNTED. Alongside the High finding it
+        // adds the +5 additional-finding point (70 → 75); base severity stays High
+        // (Medium < High), so the delta is exactly the additive +5 the promotion
+        // unlocked.
+        let promoted = score_findings(&[
+            finding(RuleId::PlainHttpToSink, Severity::High),
+            finding(RuleId::CommandCardVerified, Severity::Medium),
+        ]);
+        assert_eq!(
+            promoted.score, 75,
+            "a promoted (Medium) CommandCardVerified must count as an additional finding"
+        );
+        assert!(promoted.verify());
+        assert!(
+            promoted.score > at_info.score,
+            "promotion must raise the score relative to the Info note (75 > 70)"
+        );
+
+        // And a LONE promoted note now scores on its own severity (Medium = 40),
+        // not 0 — proving the exemption is fully severity-gated, not rule-id-only.
+        let lone_promoted =
+            score_findings(&[finding(RuleId::CommandCardVerified, Severity::Medium)]);
+        assert_eq!(
+            lone_promoted.score, 40,
+            "a lone promoted note scores on its (Medium) severity, not 0"
+        );
+        assert!(lone_promoted.verify());
+        // Contrast: a lone Info note still scores 0 (unchanged prior behavior).
+        let lone_info = score_findings(&[finding(RuleId::CommandCardVerified, Severity::Info)]);
+        assert_eq!(lone_info.score, 0, "a lone Info note still scores 0");
     }
 
     #[test]
