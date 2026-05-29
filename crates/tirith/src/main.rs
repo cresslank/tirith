@@ -2194,9 +2194,10 @@ one. A command that differs from its trusted card emits a High
 suppression in v1.
 
 TRUST (manual in v1): card signatures verify against ed25519 public keys you
-have explicitly trusted by dropping `<key_id>.pub` into
-`~/.config/tirith/trusted-card-keys/`. A card signed by a key not in that
-directory is treated as unverified.
+have explicitly trusted by dropping `<key_id>.pub` into the `trusted-card-keys/`
+directory under tirith's config dir (`~/.config/tirith/` on Linux; the platform
+config dir on macOS/Windows). A card signed by a key not in that directory is
+treated as unverified.
 
 NO HOT-PATH NETWORK: `tirith check` NEVER fetches a card. A `# tirith-card:`
 comment value or `--card` argument may be a local path OR a URL — but a URL is
@@ -2240,9 +2241,10 @@ one. A command that differs from its trusted card emits a High
 suppression in v1.
 
 TRUST (manual in v1): card signatures verify against ed25519 public keys you
-have explicitly trusted by dropping `<key_id>.pub` into
-`~/.config/tirith/trusted-card-keys/`. A card signed by a key not in that
-directory is treated as unverified.
+have explicitly trusted by dropping `<key_id>.pub` into the `trusted-card-keys/`
+directory under tirith's config dir (`~/.config/tirith/` on Linux; the platform
+config dir on macOS/Windows). A card signed by a key not in that directory is
+treated as unverified.
 
 NO HOT-PATH NETWORK: `tirith check` NEVER fetches a card. A `# tirith-card:`
 comment value or `--card` argument may be a local path OR a URL — but a URL is
@@ -2796,7 +2798,8 @@ Examples:
     /// Verify a command card against your trusted-keys directory
     #[command(after_help = "\
 Verifies the card's ed25519 signature against a public key under
-`~/.config/tirith/trusted-card-keys/<key_id>.pub` and checks the card has not
+`trusted-card-keys/<key_id>.pub` in tirith's config dir (`~/.config/tirith/` on
+Linux; the platform config dir on macOS/Windows) and checks the card has not
 expired. Does NOT check the command — use `tirith check --card` for the
 command-vs-card match.
 

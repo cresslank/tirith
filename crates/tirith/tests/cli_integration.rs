@@ -8480,9 +8480,13 @@ fn check_url_card_comment_is_not_fetched() {
     // platform cache dir) to a tempdir. `choose_base_strategy()` uses the XDG
     // strategy on Linux AND macOS (so `XDG_CACHE_HOME` covers both) and the
     // Windows strategy on Windows (so `LOCALAPPDATA` covers the cache dir there);
-    // `APPDATA` is set too for completeness. After the run we assert NOTHING was
-    // written under this root — a fetched card would land at
-    // `<cache>/tirith/cards/<sha256>.json`.
+    // `APPDATA` is set too for completeness. After the run we assert the CARD
+    // CACHE SUBDIR specifically (`<cache>/tirith/cards/`, i.e. `cards_cache_dir()
+    // = base.cache_dir()/tirith/cards`) holds NO files — a fetched card would
+    // land at `<cache>/tirith/cards/<sha256>.json`. We scope to that subdir, NOT
+    // the whole cache root, because on Windows `APPDATA` ALSO drives `data_dir()`,
+    // so the audit log (`<cache>/tirith/log.jsonl`) lands under the cache root
+    // here; that log is NOT under `cards/`, so it no longer pollutes the check.
     let cache = tempfile::tempdir().unwrap();
 
     let out = tirith()
@@ -8541,10 +8545,15 @@ fn check_url_card_comment_is_not_fetched() {
         note["description"]
     );
 
-    // OBSERVABLE no-fetch invariant: nothing was persisted under the isolated
-    // cache root. A regression that fetched-then-collapsed-to-unverified would
-    // have written `<cache>/tirith/cards/<sha256>.json` here. Count every regular
-    // file under the cache root (order-independent, depth-first).
+    // OBSERVABLE no-fetch invariant: nothing was persisted under the CARD CACHE
+    // SUBDIR. A regression that fetched-then-collapsed-to-unverified would have
+    // written `<cache>/tirith/cards/<sha256>.json` here. Count every regular file
+    // under `cards/` (order-independent, depth-first). We scope to `cards/` — NOT
+    // the whole cache root — so the audit log that lands at
+    // `<cache>/tirith/log.jsonl` on Windows (where `data_dir()` also resolves
+    // under the isolated `APPDATA`) does not pollute the check. A missing
+    // `cards/` dir reads as empty (the recursive walk returns early on the
+    // `read_dir` error), which is exactly the "never created" expectation.
     fn count_files(dir: &std::path::Path, files: &mut Vec<PathBuf>) {
         let Ok(rd) = fs::read_dir(dir) else { return };
         for entry in rd.flatten() {
@@ -8556,11 +8565,12 @@ fn check_url_card_comment_is_not_fetched() {
             }
         }
     }
-    let mut cache_files: Vec<PathBuf> = Vec::new();
-    count_files(cache.path(), &mut cache_files);
+    let cards_dir = cache.path().join("tirith").join("cards");
+    let mut card_cache_files: Vec<PathBuf> = Vec::new();
+    count_files(&cards_dir, &mut card_cache_files);
     assert!(
-        cache_files.is_empty(),
-        "the hot path must not fetch/persist the card; found cache files: {cache_files:?}"
+        card_cache_files.is_empty(),
+        "the hot path must not fetch/persist the card; found card cache files: {card_cache_files:?}"
     );
 }
 
@@ -8896,6 +8906,9 @@ fn command_card_fetch_rejects_unreachable_url() {
 fn command_card_fetch_is_idempotent_for_identical_bytes() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     // A minimal, valid card to serve. Build it via the CLI so it really parses.
     let home = tempfile::tempdir().unwrap();
@@ -8919,22 +8932,44 @@ fn command_card_fetch_is_idempotent_for_identical_bytes() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let port = listener.local_addr().unwrap().port();
     let body = card_bytes.clone();
+    // Cancellable, non-blocking accept loop: serve EVERY inbound connection (the
+    // count is not asserted — the 2nd fetch may legitimately be a cache hit that
+    // never connects) until the test signals `stop`. A blocking `accept()` loop
+    // bounded to exactly two connections would HANG `server.join()` forever the
+    // moment the request count changes; this loop cannot hang on any platform.
+    listener
+        .set_nonblocking(true)
+        .expect("listener non-blocking");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_srv = Arc::clone(&stop);
     let server = std::thread::spawn(move || {
-        for _ in 0..2 {
-            let (mut stream, _) = match listener.accept() {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            // Drain the request headers (we don't care about them).
-            let mut buf = [0u8; 1024];
-            let _ = stream.read(&mut buf);
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = stream.write_all(header.as_bytes());
-            let _ = stream.write_all(&body);
-            let _ = stream.flush();
+        while !stop_srv.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // The listener is non-blocking so the accept LOOP can poll
+                    // `stop`; but on BSD/macOS the accepted stream inherits
+                    // O_NONBLOCK, which would make the request read / response
+                    // write below hit WouldBlock and deliver a truncated reply.
+                    // Force this per-connection socket back to BLOCKING so the
+                    // serve is reliable on every platform.
+                    let _ = stream.set_nonblocking(false);
+                    // Drain the request headers (we don't care about them).
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(&body);
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No pending connection yet; nap briefly and re-check `stop`.
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
         }
     });
 
@@ -8973,6 +9008,9 @@ fn command_card_fetch_is_idempotent_for_identical_bytes() {
         "both fetches must resolve to the same content-addressed cache path"
     );
 
+    // Signal the cancellable accept loop to exit, THEN join — without this the
+    // `while !stop` server thread loops forever and `join()` hangs the test.
+    stop.store(true, Ordering::Relaxed);
     let _ = server.join();
 }
 
@@ -9931,13 +9969,22 @@ fn commands_run_still_refuses_and_renders_on_block() {
 }
 
 #[test]
-fn commands_run_interactive_warn_ack_gates_execution() {
-    // Fix-verification gap: the interactive Warn-ack branch (TIRITH_INTERACTIVE=1)
-    // gates an execute-or-not decision. Declining ("n") must NOT run the command
-    // (exit 1, "aborted by user"); accepting ("y") must proceed. Driven via piped
-    // stdin — no real TTY, deterministic, not flaky. (Findings render to stderr,
-    // the echoed URL only reaches stdout if the command actually executed, so
-    // stdout is the execution proof.)
+fn commands_run_interactive_warn_decline_refuses() {
+    // The security-critical half of the interactive Warn-ack branch: when the
+    // prompt fires and the operator DECLINES ("n"), the command must NOT run
+    // (exit 1, "aborted by user", no echo on stdout).
+    //
+    // We only pin the DECLINE path here. We deliberately do NOT assert that a
+    // piped "y" proceeds: the shipped contract is that a Warn ack requires a real
+    // TTY, and the non-TTY shipped behavior (no `TIRITH_INTERACTIVE` override) is
+    // "no prompt, render + proceed" — which `commands_run_surfaces_warn_findings_
+    // instead_of_swallowing` already covers with `TIRITH_INTERACTIVE=0`. Blessing
+    // a piped "y" as an approval would let an automated (non-TTY) context approve
+    // a warned command via stdin, exactly the failure mode this gate guards
+    // against, so that direction is intentionally left untested here rather than
+    // pinned. (`TIRITH_INTERACTIVE=1` is only the test seam that forces the
+    // prompt to fire without a PTY; the repo's PTY tests are flaky, so we do not
+    // add one.)
     use std::io::Write as _;
     use std::process::Stdio;
 
@@ -9947,21 +9994,14 @@ fn commands_run_interactive_warn_ack_gates_execution() {
         "allowed:\n  - name: greet\n    command: \"echo https://bit.ly/x\"\n",
     );
 
-    // A `commands_tirith` that ENABLES the prompt instead of auto-proceeding.
-    let interactive = |root: &std::path::Path| {
-        let mut cmd = commands_tirith(root);
-        cmd.env("TIRITH_INTERACTIVE", "1");
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        cmd
-    };
-
     // Decline: "n" → abort, exit 1, command does NOT execute (no echo on stdout).
-    let mut child = interactive(root.path())
-        .args(["commands", "run", "greet"])
-        .spawn()
-        .expect("spawn (decline)");
+    let mut cmd = commands_tirith(root.path());
+    cmd.env("TIRITH_INTERACTIVE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(["commands", "run", "greet"]);
+    let mut child = cmd.spawn().expect("spawn (decline)");
     child.stdin.take().unwrap().write_all(b"n\n").unwrap();
     let declined = child.wait_with_output().expect("wait (decline)");
     let dstdout = String::from_utf8_lossy(&declined.stdout);
@@ -9978,19 +10018,6 @@ fn commands_run_interactive_warn_ack_gates_execution() {
     assert!(
         !dstdout.contains("https://bit.ly/x"),
         "a DECLINED command must NOT execute (no echo on stdout), got stdout:\n{dstdout}"
-    );
-
-    // Accept: "y" → proceeds and executes (the echo reaches stdout).
-    let mut child = interactive(root.path())
-        .args(["commands", "run", "greet"])
-        .spawn()
-        .expect("spawn (accept)");
-    child.stdin.take().unwrap().write_all(b"y\n").unwrap();
-    let accepted = child.wait_with_output().expect("wait (accept)");
-    let astdout = String::from_utf8_lossy(&accepted.stdout);
-    assert!(
-        astdout.contains("https://bit.ly/x"),
-        "ACCEPTING the Warn ack must execute the command, got stdout:\n{astdout}"
     );
 }
 

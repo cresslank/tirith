@@ -41,23 +41,26 @@ pub const LAST_VERIFIED: &str = "2026-05-28";
 pub const HONESTY_BANNER: &str =
     "tirith does NOT perform rotation or revocation; it shows you where and how. You do the rotation.";
 
-/// The credential-type audit rule IDs `tirith secret triage` scans for, as the
-/// `snake_case` strings they serialize to in the audit log's `rule_ids` array
-/// (serde `rename_all = "snake_case"` on [`crate::verdict::RuleId`]).
+/// The credential-EXPOSURE audit rule IDs `tirith secret triage` scans for, as
+/// the `snake_case` strings they serialize to in the audit log's `rule_ids`
+/// array (serde `rename_all = "snake_case"` on [`crate::verdict::RuleId`]).
 ///
-/// Includes the three direct credential rules, the threat-DB package rules that
-/// imply a leaked / malicious credential surface, and the M11 ch3
-/// `canary_token_touched` rule (a touched bait token is a strong "rotate now"
-/// signal).
+/// SCOPE: only rules that signal an ACTUAL leaked / exposed secret — for which
+/// "rotate this credential" is the correct playbook. That is the three direct
+/// credential rules (`credential_in_text`, `high_entropy_secret`,
+/// `private_key_exposed`) plus the M11 ch3 `canary_token_touched` rule (a touched
+/// bait token IS a planted secret being read — a strong "rotate now" signal).
+///
+/// Deliberately EXCLUDES the `threat_*package*` reputation rules (malicious /
+/// typosquat / similar-name / suspicious package). Those fire on a package's
+/// NAME / reputation, not on a leaked credential — emitting a "rotate this
+/// credential" next-step for them would be the wrong playbook (there is no secret
+/// to rotate).
 pub const CREDENTIAL_RULE_IDS: &[&str] = &[
     "credential_in_text",
     "high_entropy_secret",
     "private_key_exposed",
     "canary_token_touched",
-    "threat_malicious_package",
-    "threat_package_typosquat",
-    "threat_package_similar_name",
-    "threat_suspicious_package",
 ];
 
 /// `true` when `rule_id` is one of the credential-type rules
@@ -673,6 +676,60 @@ mod tests {
         );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].rule_id, "canary_token_touched");
+    }
+
+    #[test]
+    fn package_risk_findings_are_not_credential_exposure() {
+        // CodeRabbit R5 #2: the `threat_*package*` reputation rules fire on a
+        // package NAME / reputation, NOT on a leaked credential. They must be
+        // OUT of the triage (credential-rotation) scope — "rotate this
+        // credential" is the wrong playbook when there is no secret to rotate.
+        for rid in [
+            "threat_malicious_package",
+            "threat_package_typosquat",
+            "threat_package_similar_name",
+            "threat_suspicious_package",
+        ] {
+            assert!(
+                !is_credential_rule(rid),
+                "{rid} is a package-risk rule and must not be a credential-exposure signal"
+            );
+        }
+        // A verdict carrying ONLY a package-risk rule yields NO triage item.
+        let pkg = triage_records(
+            &[verdict(
+                "2026-05-28T10:00:00Z",
+                &["threat_package_typosquat"],
+                "npm install reqeusts",
+            )],
+            0,
+        );
+        assert!(
+            pkg.is_empty(),
+            "a package-risk finding must produce no rotation item, got {pkg:?}"
+        );
+        // A real credential finding in the SAME batch still produces one.
+        let mixed = triage_records(
+            &[
+                verdict(
+                    "2026-05-28T10:00:00Z",
+                    &["threat_package_typosquat"],
+                    "npm install reqeusts",
+                ),
+                verdict(
+                    "2026-05-28T10:01:00Z",
+                    &["credential_in_text"],
+                    "export AWS_ACCESS_KEY_ID=AKIA…",
+                ),
+            ],
+            0,
+        );
+        assert_eq!(
+            mixed.len(),
+            1,
+            "only the real credential finding is triaged, got {mixed:?}"
+        );
+        assert_eq!(mixed[0].rule_id, "credential_in_text");
     }
 
     #[test]

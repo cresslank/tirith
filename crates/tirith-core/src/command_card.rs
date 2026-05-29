@@ -551,38 +551,63 @@ pub fn classify_card_ref(value: &str) -> CardRef {
 /// the card reference are removed — including `#tirith-card:` / `#  tirith-card:`
 /// variants. If this diverged from the resolver, a `#tirith-card:` line picked
 /// up as the card ref would survive the strip and make the command falsely
-/// mismatch its own signed card. Surviving lines are rejoined with `\n`;
-/// surrounding whitespace is left to [`Card::command_matches`]'s own trim.
+/// mismatch its own signed card.
+///
+/// LINE ENDINGS ARE PRESERVED BYTE-FOR-BYTE. The body (everything from the first
+/// real command line on) is returned verbatim — we do NOT split-and-rejoin it,
+/// so a card command authored with `\r\n` (CRLF) endings still compares equal in
+/// [`Card::command_matches`] instead of being silently normalized to `\n`. Only
+/// the LEADING prelude (marker + any blank lines before the command) is removed;
+/// the returned tail is exactly `&input[offset..]` where `offset` is the byte
+/// position at which the command begins.
 ///
 /// SCOPE (mirrors [`find_card_comment`]): only marker lines in the LEADING
-/// prelude are stripped. Iteration stops at the first non-empty line that is not
-/// a marker — every line from there on (the real command, including any heredoc
+/// prelude are stripped. Scanning stops at the first non-empty line that is not
+/// a marker — every byte from there on (the real command, including any heredoc
 /// body) is preserved VERBATIM, even if it happens to contain the text
 /// `# tirith-card:`. Stripping such an in-body line would mutate the command
 /// before [`Card::command_matches`] and cause a spurious mismatch.
 pub fn strip_card_comment_lines(input: &str) -> String {
-    let mut out: Vec<&str> = Vec::new();
-    let mut in_prelude = true;
-    for line in input.lines() {
-        if in_prelude {
-            if card_comment_value(line).is_some() {
-                // A prelude marker line: drop it (transport metadata).
-                continue;
-            }
-            if line.trim().is_empty() {
-                // Blank prelude line: keep it (it is not the command yet, but
-                // preserving it keeps surrounding whitespace stable; the final
-                // `command_matches` trim absorbs leading blanks anyway).
-                out.push(line);
-                continue;
-            }
-            // First real-command line — the prelude ends here. Everything from
-            // now on is command content and is preserved verbatim.
-            in_prelude = false;
+    input[prelude_end_offset(input)..].to_string()
+}
+
+/// Byte offset into `input` at which the real command begins, i.e. where the
+/// leading `# tirith-card:` prelude (marker line(s) + any blank lines between
+/// them and the command) ends. Returns `0` when there is no leading prelude (the
+/// first non-empty line is not a marker), so the whole input is the command.
+///
+/// This is the single source of truth for "where does the prelude end"; both
+/// [`strip_card_comment_lines`] (which returns `&input[offset..]` verbatim) and
+/// [`has_card_comment_prelude`] derive from the same line scan, so the strip and
+/// the resolver always agree on which leading lines are transport metadata. The
+/// returned offset is always a line boundary, hence a valid `str` boundary.
+fn prelude_end_offset(input: &str) -> usize {
+    let mut offset = 0usize;
+    // `split_inclusive('\n')` keeps each line's trailing separator (`\r\n` or
+    // `\n`) attached, so summing the chunk lengths walks real byte offsets and
+    // never drops a `\r`. The line content we classify is the chunk with its
+    // line ending trimmed.
+    for chunk in input.split_inclusive('\n') {
+        let line = chunk.strip_suffix('\n').unwrap_or(chunk);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if card_comment_value(line).is_some() {
+            // A prelude marker line: drop it (transport metadata).
+            offset += chunk.len();
+            continue;
         }
-        out.push(line);
+        if line.trim().is_empty() {
+            // Blank prelude line: also part of the leading prelude, drop it. The
+            // command's own leading whitespace (if any) is handled by
+            // `command_matches`'s trim; transport blanks are never part of the
+            // signed command body.
+            offset += chunk.len();
+            continue;
+        }
+        // First non-empty non-marker line: the command starts here. Everything
+        // from this byte on is returned verbatim.
+        break;
     }
-    out.join("\n")
+    offset
 }
 
 /// `true` when `input`'s LEADING prelude contains at least one
@@ -609,9 +634,10 @@ pub fn has_card_comment_prelude(input: &str) -> bool {
 
 /// Like [`strip_card_comment_lines`] but ZERO-allocation on the common path:
 /// when `input` carries no leading `# tirith-card:` prelude marker, the original
-/// is borrowed UNCHANGED (no line re-join, so trailing newlines / `\r\n` endings
-/// are preserved exactly as today). Only when a prelude marker is present do we
-/// allocate the stripped, prelude-free command.
+/// is borrowed UNCHANGED. When a prelude marker IS present we allocate the
+/// stripped command — but even then the body is preserved byte-for-byte
+/// (`&input[offset..]`), so trailing newlines and `\r\n` (CRLF) endings survive
+/// on both paths.
 ///
 /// This is the form the engine's EXEC analysis path uses to feed prelude-free
 /// command text into URL extraction and the exec-scoped rule set without paying
@@ -1141,6 +1167,50 @@ mod tests {
         let findings = findings_for_outcome(&outcome);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, RuleId::CommandCardVerified);
+    }
+
+    #[test]
+    fn crlf_multiline_command_carried_card_verifies_without_normalization() {
+        // Regression (CodeRabbit R5 #1): a multi-LINE card command authored with
+        // `\r\n` (CRLF) endings, referenced via a CRLF-terminated `# tirith-card:`
+        // prelude, must still VERIFY. The previous `lines()` + `join("\n")` strip
+        // silently normalized CRLF→LF, so `command_matches` compared LF-joined
+        // text against the card's CRLF `command` field and falsely Mismatched.
+        let dir = tempfile::tempdir().unwrap();
+        let (secret, pubkey) = generate_keypair().unwrap();
+        write_trusted_key(dir.path(), &pubkey);
+
+        // A genuine multi-line command with Windows CRLF line endings.
+        let command = "cat <<'EOF' > out.sh\r\necho one\r\necho two\r\nEOF";
+        let mut card = sample_card();
+        card.command = command.to_string();
+        card.sign(&secret).unwrap();
+
+        // Analyzed input: a CRLF-terminated prelude marker, then the CRLF body.
+        let analyzed_input = format!("# tirith-card: ./card.json\r\n{command}");
+
+        // The strip must preserve the body byte-for-byte (CRLF intact), removing
+        // ONLY the leading prelude marker line.
+        let stripped = strip_card_comment_lines(&analyzed_input);
+        assert_eq!(
+            stripped, command,
+            "only the leading marker is stripped; the CRLF body is preserved verbatim"
+        );
+        assert!(
+            stripped.contains("\r\n"),
+            "CRLF must NOT be normalized to LF; got {stripped:?}"
+        );
+
+        let outcome = evaluate_card(&card, &stripped, dir.path(), today());
+        assert_eq!(
+            outcome,
+            CardOutcome::Verified,
+            "a CRLF-authored multiline card must verify (no CRLF→LF normalization)"
+        );
+
+        // The Cow form (engine hot path) must reach the SAME stripped bytes.
+        let cow = strip_card_comment_lines_cow(&analyzed_input);
+        assert_eq!(cow.as_ref(), command, "cow strip must also preserve CRLF");
     }
 
     #[test]
