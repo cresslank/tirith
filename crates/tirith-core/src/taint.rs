@@ -127,6 +127,11 @@ pub fn normalize_key(path: &Path, cwd: Option<&Path>) -> PathBuf {
 struct CacheState {
     path: PathBuf,
     entries: Vec<TaintEntry>,
+    /// Whether the underlying store read reached EOF cleanly. `false` means the
+    /// read broke on a persistent mid-file I/O fault (or the store was present
+    /// but unreadable) so `entries` is a PARTIAL prefix — a lookup miss against
+    /// it is NOT a definitive "not tainted" (CodeRabbit R16 #3, fail-safe).
+    complete: bool,
     loaded_at: Instant,
     /// Store-file mtime at load time (nanos since epoch), for invalidation.
     mtime_nanos: u128,
@@ -147,22 +152,34 @@ fn mtime_nanos(path: &Path) -> u128 {
 }
 
 /// Parse the JSONL store, skipping blank and unparseable lines (fail-open: a
-/// corrupt line never aborts the lookup). Returns an empty vec when the file is
-/// absent.
-fn parse_store(path: &Path) -> Vec<TaintEntry> {
-    // `read_store_lines` skips blank lines, skips a single recoverable
+/// corrupt line never aborts the lookup). Returns `(entries, complete)`.
+///
+/// `complete == false` means the underlying read did NOT reach EOF (a persistent
+/// mid-file I/O fault left the tail unread, or the store is present-but-unreadable)
+/// so `entries` is a PARTIAL prefix. A skipped invalid-UTF-8 line is NOT a
+/// truncation — the file is still read to EOF and `complete` stays `true`. A
+/// genuinely-absent store is empty AND complete. The lookup side
+/// ([`is_tainted_at`]) treats an incomplete read as fail-SAFE (CodeRabbit R16 #3):
+/// a miss against a partial prefix is "unknown", not "clean".
+fn parse_store(path: &Path) -> (Vec<TaintEntry>, bool) {
+    // `read_store_lines_complete` skips blank lines, skips a single recoverable
     // invalid-UTF-8 line (so a corrupt byte does not abort the lookup), and
-    // BREAKS on any other (persistent) read error so the reader cannot spin
-    // forever. Lines that don't parse as a `TaintEntry` are dropped (fail-open).
-    crate::util::read_store_lines(path)
+    // BREAKS on any other (persistent) read error — reporting `complete == false`
+    // — so the reader cannot spin forever and a truncated read is observable.
+    // Lines that don't parse as a `TaintEntry` are dropped (fail-open).
+    let (lines, complete) = crate::util::read_store_lines_complete(path);
+    let entries = lines
         .iter()
         .filter_map(|line| serde_json::from_str::<TaintEntry>(line).ok())
-        .collect()
+        .collect();
+    (entries, complete)
 }
 
 /// Load entries through the per-process cache. Reloads when the cached path
-/// differs, the TTL expired, or the store's mtime changed.
-fn cached_entries(path: &Path) -> Vec<TaintEntry> {
+/// differs, the TTL expired, or the store's mtime changed. Returns
+/// `(entries, complete)` — `complete == false` flags a partial/truncated read so
+/// the lookup can fail safe (CodeRabbit R16 #3).
+fn cached_entries(path: &Path) -> (Vec<TaintEntry>, bool) {
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     let cur_mtime = mtime_nanos(path);
@@ -172,18 +189,19 @@ fn cached_entries(path: &Path) -> Vec<TaintEntry> {
             && now.duration_since(state.loaded_at) < CACHE_TTL
             && state.mtime_nanos == cur_mtime;
         if fresh {
-            return state.entries.clone();
+            return (state.entries.clone(), state.complete);
         }
     }
 
-    let entries = parse_store(path);
+    let (entries, complete) = parse_store(path);
     *guard = Some(CacheState {
         path: path.to_path_buf(),
         entries: entries.clone(),
+        complete,
         loaded_at: now,
         mtime_nanos: cur_mtime,
     });
-    entries
+    (entries, complete)
 }
 
 /// Drop the per-process cache. Tests that write a store directly then assert via
@@ -260,14 +278,77 @@ pub fn mark_tainted(
     mark_tainted_at(&store, path, None, origin, source_url, source_repo)
 }
 
+/// Origin label stamped on the synthetic [`TaintEntry`] returned when the store
+/// could not be read to completion and the queried path was NOT found in the
+/// partial prefix. Makes the fail-safe "treated as tainted because the store is
+/// unreadable" reason obvious in a `tirith why` / finding detail.
+pub const UNKNOWN_TAINT_ORIGIN: &str =
+    "taint store could not be read completely — treated as tainted (fail-safe)";
+
 /// Look up `path` in the store at `store` (cached). Returns the LAST recorded
 /// entry for the normalized key, or `None` if the path is not tainted. `cwd`
 /// controls relative-path normalization.
+///
+/// FAIL-SAFE ON A TRUNCATED READ (CodeRabbit R16 #3): the store read can stop on
+/// a persistent mid-file I/O fault and yield only the PREFIX it consumed. A query
+/// for a path in the UNREAD tail would then miss and read as "not tainted"
+/// (fail-OPEN — a security miss). So when the read was INCOMPLETE and the key is
+/// not present in the prefix, we do NOT answer a definitive `None`: we emit a
+/// one-line stderr diagnostic and return a synthetic entry (`origin =
+/// [`UNKNOWN_TAINT_ORIGIN`]`) so the security check errs toward "tainted/unknown".
+/// A definite HIT in the prefix is returned as-is (it is genuinely tainted). A
+/// COMPLETE read (the common path — including one that skipped a recoverable
+/// invalid-UTF-8 line) keeps the exact prior semantics: a miss is a clean `None`.
+/// An InvalidData line skip is NOT a truncation, so it never trips this path.
 pub fn is_tainted_at(store: &Path, path: &Path, cwd: Option<&Path>) -> Option<TaintEntry> {
     let key = normalize_key(path, cwd);
     let key_str = key.to_string_lossy();
-    let entries = cached_entries(store);
-    entries.into_iter().rev().find(|e| e.path == key_str)
+    let (entries, complete) = cached_entries(store);
+    if let Some(found) = entries.into_iter().rev().find(|e| e.path == key_str) {
+        return Some(found);
+    }
+    if !complete {
+        // Truncated/unreadable store + a lookup miss → the path's taint state is
+        // UNKNOWN, not proven-clean. Fail safe: surface a synthetic tainted entry
+        // so the rule fires, and warn once (rate-limited per (path, mtime)) so the
+        // operator knows why a never-marked path is being flagged.
+        warn_incomplete_store_once(store);
+        return Some(unknown_taint_entry(&key_str));
+    }
+    None
+}
+
+/// Synthetic [`TaintEntry`] for the fail-safe "store unreadable, taint unknown"
+/// case. Carries the queried `path` and a clearly-labelled origin so the
+/// downstream finding explains itself; no `source_url`/`source_repo`.
+fn unknown_taint_entry(path: &str) -> TaintEntry {
+    TaintEntry {
+        path: path.to_string(),
+        origin: UNKNOWN_TAINT_ORIGIN.to_string(),
+        marked_at: chrono::Utc::now().to_rfc3339(),
+        source_url: None,
+        source_repo: None,
+    }
+}
+
+/// One-line stderr diagnostic when a taint lookup runs against an INCOMPLETELY
+/// read store, de-duplicated per `(path, mtime)` so the 5s-cache hot path does
+/// not spam. The lookup result is still fail-safe regardless; this just tells the
+/// operator why an unmarked path is being treated as tainted.
+fn warn_incomplete_store_once(store: &Path) {
+    static LAST_WARNED: Mutex<Option<(PathBuf, u128)>> = Mutex::new(None);
+    let mtime = mtime_nanos(store);
+    let mut guard = LAST_WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (store.to_path_buf(), mtime);
+    if guard.as_ref() == Some(&key) {
+        return;
+    }
+    *guard = Some(key);
+    eprintln!(
+        "tirith: warning: taint store {} could not be read completely; \
+         treating unresolved paths as tainted (fail-safe)",
+        store.display()
+    );
 }
 
 /// Production entry point: look up `path` in the default store, normalizing
@@ -295,7 +376,11 @@ pub fn store_nonempty() -> bool {
 /// recorded entry per path wins, mirroring [`is_tainted_at`]). Order is by
 /// first appearance.
 pub fn list_taints_at(store: &Path) -> Vec<TaintEntry> {
-    let entries = parse_store(store);
+    // `list` is a display path: an incomplete read yields a partial prefix
+    // (already diagnosed on stderr by the reader) — we list what we could read
+    // rather than synthesizing entries. The lookup hot path (`is_tainted_at`) is
+    // the one that fails safe on `complete == false` (CodeRabbit R16 #3).
+    let (entries, _complete) = parse_store(store);
     let mut order: Vec<String> = Vec::new();
     let mut latest: std::collections::HashMap<String, TaintEntry> =
         std::collections::HashMap::new();
@@ -597,6 +682,54 @@ mod tests {
         assert_eq!(found.path, entry.path);
     }
 
+    /// CodeRabbit R16 #3: `is_tainted_at` must NOT report a path as clean when the
+    /// store read was INCOMPLETE — a persistent mid-file fault leaves the tail
+    /// unread, so a queried path in that tail would falsely read "not tainted"
+    /// (fail-OPEN). A FIFO store is reported incomplete by
+    /// `read_store_lines_complete` (not a readable regular file), so a lookup miss
+    /// against it must fail SAFE: a synthetic `UNKNOWN_TAINT_ORIGIN` entry, never
+    /// `None`. Unix-only (needs mkfifo); cannot hang (O_NONBLOCK open returns
+    /// immediately).
+    #[cfg(unix)]
+    #[test]
+    fn lookup_fails_safe_on_incomplete_read_not_clean() {
+        use std::ffi::CString;
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let c_path = CString::new(store.as_os_str().to_str().unwrap()).unwrap();
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+            eprintln!("skipping: mkfifo unsupported here");
+            return;
+        }
+        invalidate_cache();
+
+        // A path never marked tainted, queried against an unreadable (incomplete)
+        // store, must NOT come back clean — it fails safe to a synthetic entry.
+        let res = is_tainted_at(&store, Path::new("/tmp/never-marked.sh"), None);
+        let entry = res.expect("an incomplete-read lookup miss must fail safe to Some, not None");
+        assert_eq!(
+            entry.origin, UNKNOWN_TAINT_ORIGIN,
+            "the fail-safe entry must carry the unknown-store origin"
+        );
+        assert_eq!(entry.path, "/tmp/never-marked.sh");
+    }
+
+    #[test]
+    fn lookup_on_complete_read_miss_is_clean_none() {
+        // Contrast: a normal (complete) read with a genuine miss stays a clean
+        // `None`. This pins that the fail-safe path is NOT entered on the common
+        // path — only on an incomplete read.
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let cwd = Path::new("/work/repo");
+        mark_tainted_at(&store, Path::new("./a.sh"), Some(cwd), "x", None, None).unwrap();
+        // A different path on a fully-readable store → definitively not tainted.
+        assert!(
+            is_tainted_at(&store, Path::new("./b.sh"), Some(cwd)).is_none(),
+            "a miss on a COMPLETE read must stay a clean None"
+        );
+    }
+
     #[test]
     fn untainted_path_returns_none() {
         let dir = tempdir().unwrap();
@@ -667,11 +800,9 @@ mod tests {
 
         // Sanity: the lenient reader skips the unknown line (only the real entry
         // is visible), proving it is genuinely unparseable-as-TaintEntry.
-        assert_eq!(
-            parse_store(&store).len(),
-            1,
-            "reader skips the unknown line"
-        );
+        let (parsed, complete) = parse_store(&store);
+        assert!(complete, "a clean read of a regular file is complete");
+        assert_eq!(parsed.len(), 1, "reader skips the unknown line");
 
         let removed = clear_taint_at(&store, Path::new("./a.sh"), Some(cwd)).unwrap();
         assert_eq!(removed, 1, "the real entry is cleared");

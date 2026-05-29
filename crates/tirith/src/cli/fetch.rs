@@ -15,12 +15,19 @@ pub fn save(url: &str, save_path: &str, sha256: Option<String>, json: bool) -> i
         Err(e) => {
             if json {
                 let err = serde_json::json!({ "error": e });
-                // Always exits 1 below (guaranteed non-zero), so a failed JSON
-                // write needs no distinct code; drop the status explicitly.
-                let _ = super::write_json_stdout(
+                // Propagate a broken `--json` write (CodeRabbit R16 #4): a
+                // consumer that asked for `--json` must not receive the semantic
+                // download-failure code (1) while its JSON never arrived. Route
+                // through the write-STATUS-returning path and exit with the
+                // JSON-write-failure code (2) when the write fails — consistent
+                // with the success path below and the other CLI presenters
+                // (e.g. `secret rotate`). Exit 1 only when the JSON was delivered.
+                if !super::write_json_stdout(
                     &err,
                     "tirith fetch --save: failed to write JSON output",
-                );
+                ) {
+                    return 2;
+                }
             } else {
                 eprintln!("tirith fetch --save: {e}");
             }

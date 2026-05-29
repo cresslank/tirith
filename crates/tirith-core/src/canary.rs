@@ -294,6 +294,12 @@ fn new_id() -> String {
 struct CacheState {
     path: PathBuf,
     entries: Vec<CanaryEntry>,
+    /// Whether the underlying store read reached EOF cleanly. `false` means a
+    /// persistent mid-file I/O fault (or a present-but-unreadable store) left the
+    /// tail unread, so `entries` is a PARTIAL prefix — a touched canary in the
+    /// unread tail would otherwise read as untouched (fail-OPEN). `detect_at`
+    /// surfaces the incompleteness on a miss (CodeRabbit R16 #3).
+    complete: bool,
     loaded_at: Instant,
     mtime_nanos: u128,
 }
@@ -321,20 +327,27 @@ fn mtime_nanos(path: &Path) -> u128 {
 /// dropping every canary AFTER it — a later touched canary would never fire.
 /// We now `continue` on a line error so a single bad line cannot mask the rest
 /// of the store (matching the corrupt-line-skip-but-continue contract).
-fn parse_store(path: &Path) -> Vec<CanaryEntry> {
-    // `read_store_lines` skips blank lines, skips a single recoverable
+fn parse_store(path: &Path) -> (Vec<CanaryEntry>, bool) {
+    // `read_store_lines_complete` skips blank lines, skips a single recoverable
     // invalid-UTF-8 line (so a corrupt byte cannot hide later canaries), and
-    // BREAKS on any other (persistent) read error so the reader cannot spin
-    // forever. Lines that don't parse as a `CanaryEntry` are dropped (fail-open).
-    crate::util::read_store_lines(path)
+    // BREAKS on any other (persistent) read error — reporting `complete == false`
+    // — so the reader cannot spin forever and a truncated read is observable.
+    // Lines that don't parse as a `CanaryEntry` are dropped (fail-open). An
+    // InvalidData line skip is NOT a truncation (the file is still read to EOF),
+    // so `complete` stays `true` for it.
+    let (lines, complete) = crate::util::read_store_lines_complete(path);
+    let entries = lines
         .iter()
         .filter_map(|line| serde_json::from_str::<CanaryEntry>(line).ok())
-        .collect()
+        .collect();
+    (entries, complete)
 }
 
 /// Load entries through the per-process cache. Reloads when the cached path
-/// differs, the TTL expired, or the store's mtime changed.
-fn cached_entries(path: &Path) -> Vec<CanaryEntry> {
+/// differs, the TTL expired, or the store's mtime changed. Returns
+/// `(entries, complete)` — `complete == false` flags a partial/truncated read so
+/// `detect_at` can surface the incompleteness on a miss (CodeRabbit R16 #3).
+fn cached_entries(path: &Path) -> (Vec<CanaryEntry>, bool) {
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     let cur_mtime = mtime_nanos(path);
@@ -344,18 +357,19 @@ fn cached_entries(path: &Path) -> Vec<CanaryEntry> {
             && now.duration_since(state.loaded_at) < CACHE_TTL
             && state.mtime_nanos == cur_mtime;
         if fresh {
-            return state.entries.clone();
+            return (state.entries.clone(), state.complete);
         }
     }
 
-    let entries = parse_store(path);
+    let (entries, complete) = parse_store(path);
     *guard = Some(CacheState {
         path: path.to_path_buf(),
         entries: entries.clone(),
+        complete,
         loaded_at: now,
         mtime_nanos: cur_mtime,
     });
-    entries
+    (entries, complete)
 }
 
 /// Drop the per-process cache. Tests that write a store directly then assert via
@@ -592,9 +606,12 @@ pub fn create(kind: CanaryKind, callback_url: Option<String>) -> std::io::Result
     create_at(&store, kind, callback_url)
 }
 
-/// List every recorded canary in the store at `store`, in file order.
+/// List every recorded canary in the store at `store`, in file order. A display
+/// path: an incomplete read (already diagnosed on stderr by the reader) returns
+/// the partial prefix rather than failing safe — the DETECTION path
+/// ([`detect_at`]) is the one that surfaces incompleteness (CodeRabbit R16 #3).
 pub fn list_at(store: &Path) -> Vec<CanaryEntry> {
-    parse_store(store)
+    parse_store(store).0
 }
 
 /// Production entry point: list every recorded canary in the default store.
@@ -743,7 +760,7 @@ pub fn detect_at(store: &Path, text: &str) -> Vec<CanaryHit> {
     if text.is_empty() {
         return Vec::new();
     }
-    let entries = cached_entries(store);
+    let (entries, complete) = cached_entries(store);
     let mut hits = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for e in entries {
@@ -764,7 +781,41 @@ pub fn detect_at(store: &Path, text: &str) -> Vec<CanaryHit> {
             }
         }
     }
+    // FAIL-SAFE ON A TRUNCATED READ (CodeRabbit R16 #3, mirroring `taint`): the
+    // store read can stop on a persistent mid-file I/O fault and yield only the
+    // PREFIX it consumed. A canary planted in the UNREAD tail would then never
+    // match — a touched canary reading as untouched (fail-OPEN, a detection miss).
+    // We cannot synthesize a hit (no token/id/callback to attach, and firing a
+    // spurious opt-in callback would be wrong), so the least-disruptive fail-safe
+    // is to SURFACE the incompleteness: a one-line stderr diagnostic (rate-limited
+    // per (path, mtime)) so the operator knows the canary scan was not exhaustive.
+    // A genuine match in the prefix still fires normally; an InvalidData line skip
+    // keeps `complete == true` and never trips this.
+    if !complete {
+        warn_incomplete_store_once(store);
+    }
     hits
+}
+
+/// One-line stderr diagnostic when a canary scan runs against an INCOMPLETELY
+/// read store, de-duplicated per `(path, mtime)` so the 5s-cache hot path does
+/// not spam. Unlike `taint` (whose lookup can fail safe to a synthetic tainted
+/// entry), a canary scan cannot synthesize a hit, so surfacing the incompleteness
+/// is the fail-safe (CodeRabbit R16 #3).
+fn warn_incomplete_store_once(store: &Path) {
+    static LAST_WARNED: Mutex<Option<(PathBuf, u128)>> = Mutex::new(None);
+    let mtime = mtime_nanos(store);
+    let mut guard = LAST_WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (store.to_path_buf(), mtime);
+    if guard.as_ref() == Some(&key) {
+        return;
+    }
+    *guard = Some(key);
+    eprintln!(
+        "tirith: warning: canary store {} could not be read completely; \
+         a planted canary may not have been checked",
+        store.display()
+    );
 }
 
 /// Production entry point: scan `text` against the default store.
@@ -972,6 +1023,39 @@ mod tests {
         );
     }
 
+    /// CodeRabbit R16 #3 (canary analog of the taint fail-safe): a store whose
+    /// read does NOT complete (here a FIFO, reported incomplete by
+    /// `read_store_lines_complete`) must be flagged `complete == false` so
+    /// `detect_at` surfaces the incompleteness rather than treating a planted
+    /// canary as definitively untouched. We assert the load-bearing precondition
+    /// (the read reports incomplete) and that `detect_at` returns promptly without
+    /// hanging or panicking. Unix-only (needs mkfifo); cannot hang (O_NONBLOCK).
+    #[cfg(unix)]
+    #[test]
+    fn detect_surfaces_incomplete_read_not_silent_clean() {
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        if !mkfifo_at(&store) {
+            eprintln!("skipping: mkfifo unsupported here");
+            return;
+        }
+        invalidate_cache();
+
+        // The read is reported INCOMPLETE for the unreadable FIFO store — this is
+        // the signal `detect_at` keys on to fail safe (warn) instead of silently
+        // returning "no canaries touched".
+        let (_entries, complete) = cached_entries(&store);
+        assert!(
+            !complete,
+            "an unreadable (FIFO) store must report complete == false"
+        );
+
+        // detect_at must return promptly (a blocking read would hang here) and not
+        // panic; it emits the fail-safe diagnostic on the incomplete read.
+        invalidate_cache();
+        let _hits = detect_at(&store, "some text that could contain a canary");
+    }
+
     #[test]
     fn aws_like_token_is_clearly_synthetic() {
         let tok = generate_token(CanaryKind::AwsLike);
@@ -1083,7 +1167,7 @@ mod tests {
         );
         // And it must be persisted as None too (read straight from disk, not the
         // in-process cache).
-        let on_disk = parse_store(&store);
+        let on_disk = parse_store(&store).0;
         assert_eq!(on_disk.len(), 1);
         assert!(on_disk[0].callback_url.is_none());
 
@@ -1119,7 +1203,7 @@ mod tests {
         // create → the appended line is on disk and round-trips.
         let a = create_at(&store, CanaryKind::AwsLike, None).unwrap();
         let b = create_at(&store, CanaryKind::GithubLike, None).unwrap();
-        let on_disk = parse_store(&store);
+        let on_disk = parse_store(&store).0;
         assert_eq!(on_disk.len(), 2, "both created entries must be on disk");
         assert!(on_disk.iter().any(|e| e.id == a.id && e.token == a.token));
         assert!(on_disk.iter().any(|e| e.id == b.id && e.token == b.token));
@@ -1127,7 +1211,7 @@ mod tests {
         // prune → the rewritten (synced) store is on disk with exactly the kept
         // entry; the pruned id is gone.
         assert_eq!(prune_at(&store, &a.id).unwrap(), 1);
-        let on_disk = parse_store(&store);
+        let on_disk = parse_store(&store).0;
         assert_eq!(on_disk.len(), 1, "prune must durably rewrite the store");
         assert_eq!(on_disk[0].id, b.id);
 
@@ -1135,7 +1219,7 @@ mod tests {
         // same id; the old token is gone from disk.
         let rotated = rotate_at(&store, &b.id).unwrap().expect("known id");
         assert_ne!(rotated.token, b.token, "rotate must regenerate the token");
-        let on_disk = parse_store(&store);
+        let on_disk = parse_store(&store).0;
         assert_eq!(on_disk.len(), 1);
         assert_eq!(on_disk[0].id, b.id);
         assert_eq!(
@@ -1275,7 +1359,7 @@ mod tests {
         let b = create_at(&store, CanaryKind::GithubLike, None).unwrap();
         let unknown = append_unparseable_line(&store);
         assert_eq!(
-            parse_store(&store).len(),
+            parse_store(&store).0.len(),
             2,
             "reader skips the unknown line"
         );

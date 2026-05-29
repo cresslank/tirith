@@ -128,13 +128,50 @@ pub struct IncidentState {
     pub reason: String,
 }
 
+/// Upper bound on the stored `reason` length, in bytes. A reason longer than
+/// this is TRUNCATED (with an explicit marker) before the flag is written.
+///
+/// WHY (CodeRabbit R16 #1): the flag body is published to disk by [`start_at`]
+/// but read back through [`read_flag_at`], which rejects any body larger than
+/// [`FLAG_READ_CAP`] as `Corrupt`. An operator passing a very long `--reason`
+/// could otherwise persist a body the reader immediately rejects — `start`
+/// returns `Ok` yet the flag reads back self-corrupt. Capping the reason well
+/// below `FLAG_READ_CAP` (the rest of the body — `started_at`, `started_by`,
+/// JSON punctuation — is tiny) guarantees the written body is ALWAYS within the
+/// read cap, so a flag written by `start` always reads back `Valid`. 8 KiB is
+/// far more than any genuine human-written reason and leaves ~56 KiB of slack
+/// under the 64 KiB read cap for the rest of the (small) object.
+pub const MAX_REASON_BYTES: usize = 8 * 1024;
+
+/// Marker appended to a `reason` that was truncated to fit [`MAX_REASON_BYTES`],
+/// so the recorded reason makes the truncation obvious rather than silently
+/// dropping the tail.
+const REASON_TRUNCATED_MARKER: &str = "… [truncated]";
+
+/// Truncate `reason` to at most [`MAX_REASON_BYTES`] bytes (on a UTF-8 char
+/// boundary), appending [`REASON_TRUNCATED_MARKER`] when truncation occurred.
+/// The result is guaranteed `<= MAX_REASON_BYTES + REASON_TRUNCATED_MARKER.len()`,
+/// which is still vastly under [`FLAG_READ_CAP`].
+fn cap_reason(reason: String) -> String {
+    if reason.len() <= MAX_REASON_BYTES {
+        return reason;
+    }
+    let mut out = crate::util::truncate_bytes(&reason, MAX_REASON_BYTES);
+    out.push_str(REASON_TRUNCATED_MARKER);
+    out
+}
+
 impl IncidentState {
-    /// Construct fresh incident state anchored at `SystemTime::now()`.
+    /// Construct fresh incident state anchored at `SystemTime::now()`. The
+    /// `reason` is capped to [`MAX_REASON_BYTES`] (CodeRabbit R16 #1) so the
+    /// serialized flag body can never exceed [`FLAG_READ_CAP`] — i.e. a flag
+    /// written by [`start_at`] always reads back as [`FlagRead::Valid`], never
+    /// `Corrupt`.
     pub fn now(reason: impl Into<String>) -> Self {
         Self {
             started_at: unix_now(),
             started_by: current_user(),
-            reason: reason.into(),
+            reason: cap_reason(reason.into()),
         }
     }
 
@@ -243,8 +280,24 @@ const FLAG_READ_CAP: u64 = 64 * 1024;
 pub fn read_flag_at(path: &Path) -> FlagRead {
     let bytes = match crate::util::read_regular_capped(path, FLAG_READ_CAP) {
         Ok(b) => b,
-        // Truly absent (ENOENT) → no incident.
-        Err(crate::util::OpenRegularError::NotFound) => return FlagRead::Absent,
+        // ENOENT from the (symlink-FOLLOWING) open. This is ONLY truly-absent
+        // when no path ENTRY exists at all. A DANGLING SYMLINK at the flag path
+        // also opens ENOENT (the symlink resolves to a missing target), yet a
+        // sentinel WAS placed there — mapping it to `Absent` would silently turn
+        // incident mode OFF (fail-OPEN), the inverse of the lockout guarantee. So
+        // we distinguish via `symlink_metadata` (does NOT follow the link): if a
+        // path entry exists (a dangling symlink, or any other lstat-able entry),
+        // it is fail-safe ACTIVE → Corrupt; only a genuinely-missing entry
+        // (lstat also ENOENT) stays `Absent`. `stop_at` clears such a sentinel.
+        Err(crate::util::OpenRegularError::NotFound) => {
+            return match std::fs::symlink_metadata(path) {
+                // No entry at all → truly absent → no incident.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => FlagRead::Absent,
+                // A path entry exists (dangling symlink, etc.) but the regular-file
+                // open failed → an incident WAS declared; fail-safe ACTIVE.
+                _ => FlagRead::Corrupt,
+            };
+        }
         // A non-regular flag (FIFO/device/socket/dir), an oversized flag, or any
         // open/read error on a present path is fail-safe ACTIVE → Corrupt.
         // `stop_at` clears a directory sentinel separately.
@@ -956,6 +1009,45 @@ mod tests {
         assert!(read_state_at(&flag).is_some());
     }
 
+    /// CodeRabbit R16 #2: a DANGLING SYMLINK at the flag path opens ENOENT (the
+    /// target is missing), but a sentinel WAS placed — mapping it to `Absent`
+    /// would silently turn incident mode OFF (fail-OPEN). It must read as
+    /// `Corrupt` (fail-SAFE → active). A truly-absent path (no entry at all)
+    /// still reads `Absent`. And `stop` must still be able to clear the dangling
+    /// symlink (lockout safety). Unix-only (needs `symlink`).
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_flag_is_corrupt_not_absent() {
+        let dir = tempdir().unwrap();
+        let flag = flag_in(dir.path());
+
+        // Contrast: a path with no entry at all is genuinely Absent.
+        assert_eq!(read_flag_at(&flag), FlagRead::Absent);
+
+        // A symlink pointing at a non-existent target. `read_regular_capped`'s
+        // (symlink-following) open returns ENOENT, but the symlink ENTRY exists.
+        let missing_target = dir.path().join("does-not-exist.json");
+        std::os::unix::fs::symlink(&missing_target, &flag).unwrap();
+
+        // Must be Corrupt (fail-safe active), NOT Absent.
+        assert_eq!(
+            read_flag_at(&flag),
+            FlagRead::Corrupt,
+            "a dangling symlink sentinel must read as Corrupt (active), not Absent"
+        );
+        assert!(
+            read_state_at(&flag).is_some(),
+            "a dangling symlink at the flag path must read as an active incident"
+        );
+
+        // Lockout safety: stop must still clear the dangling symlink.
+        assert!(
+            stop_at(&flag).unwrap(),
+            "stop must clear a dangling symlink sentinel"
+        );
+        assert_eq!(read_flag_at(&flag), FlagRead::Absent);
+    }
+
     #[test]
     fn oversized_flag_is_corrupt() {
         // CodeRabbit R9 #C: an oversized flag file must be treated as corrupt
@@ -970,6 +1062,57 @@ mod tests {
             read_state_at(&flag).is_some(),
             "an oversized flag must read as active (fail-safe), not be buffered"
         );
+    }
+
+    #[test]
+    fn start_with_oversized_reason_reads_back_valid_not_corrupt() {
+        // CodeRabbit R16 #1: `read_flag_at` rejects any body > FLAG_READ_CAP as
+        // Corrupt, but `start_at` used to persist whatever `--reason` it was
+        // handed. A reason far larger than the read cap would write a flag that
+        // immediately reads back Corrupt → `start` returns Ok yet the flag is
+        // self-corrupt. `IncidentState::now` now caps the reason, so a flag
+        // written with a huge reason ALWAYS reads back Valid.
+        let dir = tempdir().unwrap();
+        let flag = flag_in(dir.path());
+
+        // A reason an order of magnitude over the read cap.
+        let huge = "A".repeat((FLAG_READ_CAP as usize) * 4);
+        let state = start_at(&flag, huge).unwrap();
+
+        // The stored reason was capped well under the read cap and carries the
+        // truncation marker.
+        assert!(
+            state.reason.len() <= MAX_REASON_BYTES + REASON_TRUNCATED_MARKER.len(),
+            "reason must be capped, got {} bytes",
+            state.reason.len()
+        );
+        assert!(state.reason.ends_with(REASON_TRUNCATED_MARKER));
+
+        // The written body is within the read cap → reads back Valid, NOT Corrupt.
+        let on_disk = std::fs::read(&flag).unwrap();
+        assert!(
+            (on_disk.len() as u64) <= FLAG_READ_CAP,
+            "written flag body must be <= FLAG_READ_CAP, got {} bytes",
+            on_disk.len()
+        );
+        match read_flag_at(&flag) {
+            FlagRead::Valid(s) => {
+                assert!(s.reason.ends_with(REASON_TRUNCATED_MARKER));
+            }
+            other => panic!("an oversized-reason flag must read back Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normal_reason_is_not_truncated() {
+        // A genuine human reason is stored verbatim — the cap only affects
+        // pathologically long inputs.
+        let dir = tempdir().unwrap();
+        let flag = flag_in(dir.path());
+        let reason = "compromised CI token, rotating now";
+        let state = start_at(&flag, reason).unwrap();
+        assert_eq!(state.reason, reason);
+        assert!(!state.reason.contains(REASON_TRUNCATED_MARKER));
     }
 
     #[test]
