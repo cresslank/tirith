@@ -502,10 +502,13 @@ pub enum CardRef {
 /// `# tirith-card:`. If they didn't, such a line would force past the tier-1
 /// fast-exit yet be silently dropped here.
 pub fn find_card_comment(input: &str) -> Option<CardRef> {
+    let ascii_ws = |c: char| c.is_ascii_whitespace();
     for line in input.lines() {
         match card_comment_value(line) {
             Some(rest) => {
-                let value = rest.trim();
+                // ASCII-only trim of the reference value, consistent with the
+                // ASCII-only marker detection in `card_comment_value`.
+                let value = rest.trim_matches(ascii_ws);
                 if value.is_empty() {
                     // A bare `# tirith-card:` with no ref: keep scanning the
                     // prelude (a later marker line may carry the ref).
@@ -514,9 +517,11 @@ pub fn find_card_comment(input: &str) -> Option<CardRef> {
                 return Some(classify_card_ref(value));
             }
             None => {
-                // A blank line stays inside the leading prelude; a non-empty
-                // non-marker line is the start of the real command — stop.
-                if line.trim().is_empty() {
+                // An ASCII-blank line stays inside the leading prelude; a
+                // non-blank non-marker line is the start of the real command —
+                // stop. (ASCII-only so a pure-Unicode-whitespace line ends the
+                // prelude, matching `card_comment_value`'s ASCII-only gate.)
+                if is_ascii_blank_line(line) {
                     continue;
                 }
                 return None;
@@ -531,10 +536,36 @@ pub fn find_card_comment(input: &str) -> Option<CardRef> {
 /// reference text (un-trimmed). `None` for any non-marker line. Shared by
 /// [`find_card_comment`] and [`strip_card_comment_lines`] so the resolver and
 /// the strip-before-compare step treat exactly the same lines as card markers.
+///
+/// ASCII-ONLY whitespace (CodeRabbit R8 #1, sibling of the R7 `command_matches`
+/// fix). Both trims strip ONLY ASCII whitespace, never the full Unicode
+/// `White_Space` set. A line whose leading indentation or `#`-to-keyword gap is a
+/// Unicode-whitespace character — e.g. a U+00A0 NO-BREAK SPACE — is NOT treated as
+/// an ASCII-whitespace-prefixed marker. This keeps the marker/prelude parsers in
+/// lockstep with the ASCII-only [`Card::command_matches`] mismatch gate: a marker
+/// the resolver recognizes is stripped before the byte-for-byte command compare,
+/// so the two must agree on EXACTLY which lines are markers. (Stripping a Unicode-
+/// whitespace-padded line the gate would not have trimmed could mutate the command
+/// out from under a signed card.)
 fn card_comment_value(line: &str) -> Option<&str> {
-    let after_hash = line.trim_start().strip_prefix('#')?;
-    // `#\s*tirith-card:` — zero-or-more spaces between `#` and the keyword.
-    after_hash.trim_start().strip_prefix("tirith-card:")
+    let ascii_ws = |c: char| c.is_ascii_whitespace();
+    let after_hash = line.trim_start_matches(ascii_ws).strip_prefix('#')?;
+    // `#\s*tirith-card:` — zero-or-more ASCII spaces between `#` and the keyword.
+    after_hash
+        .trim_start_matches(ascii_ws)
+        .strip_prefix("tirith-card:")
+}
+
+/// `true` when `line` is blank (empty or only ASCII whitespace). Used by the
+/// prelude scanners to decide whether a line is transport padding inside the
+/// leading prelude. ASCII-only to stay in lockstep with [`card_comment_value`]
+/// and the ASCII-only [`Card::command_matches`] gate: a line of pure Unicode
+/// whitespace (e.g. a lone U+00A0) is NOT a blank prelude line — it ends the
+/// prelude, exactly as it would be the start of the command for the mismatch
+/// gate. (Treating it as blank could let the prelude scan walk past a line the
+/// command compare considers content.)
+fn is_ascii_blank_line(line: &str) -> bool {
+    line.bytes().all(|b| b.is_ascii_whitespace())
 }
 
 /// Classify a card reference value as a local path or a remote URL.
@@ -612,7 +643,7 @@ fn prelude_end_offset(input: &str) -> usize {
             offset += chunk.len();
             continue;
         }
-        if line.trim().is_empty() {
+        if is_ascii_blank_line(line) {
             // Blank prelude line: provisionally part of the leading prelude. Kept
             // ONLY if a marker is present somewhere in the prelude (checked below);
             // otherwise the offset is reset to 0 so a marker-less blank prefix
@@ -644,11 +675,11 @@ pub fn has_card_comment_prelude(input: &str) -> bool {
         if card_comment_value(line).is_some() {
             return true;
         }
-        if line.trim().is_empty() {
+        if is_ascii_blank_line(line) {
             // Blank line stays inside the leading prelude.
             continue;
         }
-        // First non-empty non-marker line: the command starts here, no prelude
+        // First non-blank non-marker line: the command starts here, no prelude
         // marker preceded it.
         return false;
     }
@@ -1100,6 +1131,69 @@ mod tests {
         );
         assert_eq!(
             strip_card_comment_lines("#  tirith-card: ./c.json\necho hi"),
+            "echo hi"
+        );
+    }
+
+    #[test]
+    fn card_marker_whitespace_handling_is_ascii_only() {
+        // CodeRabbit R8 #1 (sibling of the R7 `command_matches` Critical): the
+        // marker/prelude parsers must restrict whitespace handling to ASCII, so
+        // they stay in lockstep with the ASCII-only `command_matches` gate. A
+        // U+00A0 NO-BREAK SPACE is Unicode whitespace but NOT ASCII whitespace,
+        // so a marker padded with it must NOT be recognized as an ASCII-WS-
+        // prefixed marker (otherwise the strip step could mutate a command the
+        // mismatch gate would never have trimmed equal).
+        let nbsp = '\u{A0}';
+
+        // Leading U+00A0 before `#`: NOT a marker (a real ASCII-space-indented
+        // marker still is — see below).
+        let lead_nbsp = format!("{nbsp}# tirith-card: ./c.json\necho hi");
+        assert_eq!(
+            find_card_comment(&lead_nbsp),
+            None,
+            "U+00A0 before `#` must not be treated as ASCII indentation"
+        );
+        assert!(!has_card_comment_prelude(&lead_nbsp));
+        // No prelude marker recognized → the input is left verbatim (the first
+        // line is the command), not stripped.
+        assert_eq!(strip_card_comment_lines(&lead_nbsp), lead_nbsp);
+        assert_eq!(prelude_end_offset(&lead_nbsp), 0);
+
+        // U+00A0 between `#` and the keyword: also NOT a marker (tier-1 `\s*`
+        // is matched ASCII-only here for the same lockstep reason).
+        let gap_nbsp = format!("#{nbsp}tirith-card: ./c.json\necho hi");
+        assert_eq!(find_card_comment(&gap_nbsp), None);
+        assert!(!has_card_comment_prelude(&gap_nbsp));
+
+        // A line of ONLY Unicode whitespace ends the prelude (it is not a blank
+        // ASCII line), so a marker that follows it is command content, not a
+        // prelude marker.
+        let unicode_blank_then_marker = format!("{nbsp}\n# tirith-card: ./c.json\necho hi");
+        assert_eq!(find_card_comment(&unicode_blank_then_marker), None);
+        assert!(!has_card_comment_prelude(&unicode_blank_then_marker));
+        assert_eq!(
+            strip_card_comment_lines(&unicode_blank_then_marker),
+            unicode_blank_then_marker
+        );
+
+        // Regression guard: ASCII-space/tab-indented markers STILL parse and
+        // strip, and an ASCII-blank line before the marker is still transport
+        // padding inside the prelude.
+        let expected = Some(CardRef::LocalPath("./c.json".to_string()));
+        assert_eq!(
+            find_card_comment("  \t# tirith-card: ./c.json\necho hi"),
+            expected
+        );
+        assert!(has_card_comment_prelude(
+            "  \t# tirith-card: ./c.json\necho hi"
+        ));
+        assert_eq!(
+            strip_card_comment_lines("  \t# tirith-card: ./c.json\necho hi"),
+            "echo hi"
+        );
+        assert_eq!(
+            strip_card_comment_lines("\n# tirith-card: ./c.json\necho hi"),
             "echo hi"
         );
     }

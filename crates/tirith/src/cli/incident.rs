@@ -163,7 +163,15 @@ pub fn stop(yes: bool, json: bool) -> i32 {
     // Confirmation. In JSON mode require --yes (no prompt on a machine surface).
     if json {
         if !yes {
-            eprintln!("tirith incident stop: --yes required in JSON mode to confirm");
+            // Route the fatal "--yes required" branch through the JSON-error path
+            // so `incident stop --json` stays parseable (CodeRabbit R8 #6); a plain
+            // stderr line here left the `--json` surface non-parseable. Exit code
+            // unchanged (2).
+            emit_error(
+                json,
+                "tirith incident stop",
+                "--yes required in JSON mode to confirm",
+            );
             return 2;
         }
     } else if !confirm(

@@ -480,6 +480,17 @@ pub fn stop_at(path: &Path) -> Result<bool, String> {
             }
         }
     };
+    // DURABILITY (CodeRabbit R8 #2): a `remove_file`/`remove_dir_all` mutates the
+    // PARENT directory's entries, but that mutation is not crash-durable until the
+    // directory itself is fsync'd. Without this, a crash/power-loss right after
+    // `stop` could resurrect the (un-unlinked) flag, leaving incident mode wrongly
+    // ACTIVE — the inverse of the `start`-side parent fsync. Best-effort, unix-only
+    // (directory fsync is not portable), and only after an ACTUAL removal: if
+    // nothing was removed there is no entry change to make durable. A failure here
+    // must never make `stop` report an error after the flag is already gone.
+    if removed {
+        fsync_parent_dir(path);
+    }
     invalidate_cache();
     Ok(removed)
 }

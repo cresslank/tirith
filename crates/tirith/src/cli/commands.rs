@@ -32,44 +32,54 @@ pub fn init(force: bool, json: bool) -> i32 {
     let path = match tirith_core::commands_manifest::init_manifest_path(cwd.as_deref()) {
         Some(p) => p,
         None => {
-            emit_error(
+            // A broken-pipe JSON write returns 2 (the JSON error never reached the
+            // consumer); otherwise the semantic 1.
+            if !emit_error(
                 json,
                 "tirith commands init",
                 "could not resolve a target directory for .tirith/commands.yaml",
-            );
+            ) {
+                return 2;
+            }
             return 1;
         }
     };
 
     if path.exists() && !force {
-        emit_error(
+        if !emit_error(
             json,
             "tirith commands init",
             &format!(
                 "{} already exists; pass --force to overwrite",
                 path.display()
             ),
-        );
+        ) {
+            return 2;
+        }
         return 1;
     }
 
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            emit_error(
+            if !emit_error(
                 json,
                 "tirith commands init",
                 &format!("create {}: {e}", parent.display()),
-            );
+            ) {
+                return 2;
+            }
             return 1;
         }
     }
 
     if let Err(e) = std::fs::write(&path, tirith_core::commands_manifest::STARTER_MANIFEST) {
-        emit_error(
+        if !emit_error(
             json,
             "tirith commands init",
             &format!("write {}: {e}", path.display()),
-        );
+        ) {
+            return 2;
+        }
         return 1;
     }
 
@@ -118,7 +128,9 @@ pub fn list(json: bool) -> i32 {
             return 0;
         }
         Err(e) => {
-            emit_error(json, "tirith commands list", &manifest_err(&e));
+            if !emit_error(json, "tirith commands list", &manifest_err(&e)) {
+                return 2;
+            }
             return 1;
         }
     };
@@ -178,15 +190,19 @@ pub fn run(name: &str, json: bool) -> i32 {
     let manifest = match CommandsManifest::discover(cwd.as_deref()) {
         Ok(Some(m)) => m,
         Ok(None) => {
-            emit_error(
+            if !emit_error(
                 json,
                 "tirith commands run",
                 "no .tirith/commands.yaml found for this repo (run `tirith commands init`)",
-            );
+            ) {
+                return 2;
+            }
             return 1;
         }
         Err(e) => {
-            emit_error(json, "tirith commands run", &manifest_err(&e));
+            if !emit_error(json, "tirith commands run", &manifest_err(&e)) {
+                return 2;
+            }
             return 1;
         }
     };
@@ -195,7 +211,7 @@ pub fn run(name: &str, json: bool) -> i32 {
         Some(e) => e,
         None => {
             let names: Vec<&str> = manifest.allowed.iter().map(|e| e.name.as_str()).collect();
-            emit_error(
+            if !emit_error(
                 json,
                 "tirith commands run",
                 &format!(
@@ -206,7 +222,9 @@ pub fn run(name: &str, json: bool) -> i32 {
                         names.join(", ")
                     }
                 ),
-            );
+            ) {
+                return 2;
+            }
             return 1;
         }
     };
@@ -563,12 +581,18 @@ fn manifest_err(e: &ManifestError) -> String {
 }
 
 /// Emit an error to stderr (human) or as a JSON `{"error": ...}` object.
-fn emit_error(json: bool, ctx: &str, msg: &str) {
+///
+/// Returns `false` when the JSON write itself failed (broken pipe / truncated
+/// output) so a `--json` caller can surface a write failure rather than pairing a
+/// semantic exit code with no JSON delivered (CodeRabbit R8 #5). Human mode
+/// always returns `true` — the stderr line is best-effort and not gated.
+fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
     if json {
         let v = serde_json::json!({ "error": msg });
-        super::write_json_stdout(&v, &format!("{ctx}: failed to write JSON output"));
+        super::write_json_stdout(&v, &format!("{ctx}: failed to write JSON output"))
     } else {
         eprintln!("{ctx}: {msg}");
+        true
     }
 }
 

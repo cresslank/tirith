@@ -27,16 +27,24 @@ pub fn create(
     expires: Option<String>,
     json: bool,
 ) -> i32 {
+    // Resolve the command from `--command` or the TTY prompt, then require it to
+    // be non-empty AFTER trimming. CodeRabbit R8 #4: the `Some(c)` branch
+    // previously skipped the non-empty check, so `create --command "   "` built a
+    // card whose `command` is unusable (and would never match a real command).
+    // Both the explicit-flag and prompt paths now reject a blank/whitespace-only
+    // value with the same validation error (JSON-aware under `--json`).
     let command = match command {
         Some(c) => c,
-        None => match prompt("command the card attests to") {
-            Some(c) if !c.trim().is_empty() => c,
-            _ => {
-                eprintln!("tirith command-card create: a non-empty --command is required");
-                return 2;
-            }
-        },
+        None => prompt("command the card attests to").unwrap_or_default(),
     };
+    if command.trim().is_empty() {
+        emit_error(
+            json,
+            "tirith command-card create",
+            "a non-empty --command is required",
+        );
+        return 2;
+    }
 
     // Default expiry: 90 days out, so a card created with no --expires is still
     // usable but does not last forever.

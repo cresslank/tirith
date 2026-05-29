@@ -26,12 +26,18 @@ use super::{confirm, write_json_stdout};
 /// surfaces parseable on the validation-failure paths (unknown kind, bad
 /// callback URL, missing `--yes`) instead of emitting plain stderr that a JSON
 /// consumer cannot parse. Mirrors `cli::command_card::emit_error`.
-fn emit_error(json: bool, ctx: &str, msg: &str) {
+///
+/// Returns `false` when the JSON write itself failed (broken pipe / truncated
+/// output) so a `--json` caller can surface a write failure instead of pairing a
+/// semantic exit code with no JSON delivered (CodeRabbit R8 #3). Human mode
+/// always returns `true` — the stderr line is best-effort and not gated.
+fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
     if json {
         let v = serde_json::json!({ "error": msg });
-        write_json_stdout(&v, &format!("{ctx}: failed to write JSON output"));
+        write_json_stdout(&v, &format!("{ctx}: failed to write JSON output"))
     } else {
         eprintln!("{ctx}: {msg}");
+        true
     }
 }
 
@@ -39,7 +45,9 @@ fn emit_error(json: bool, ctx: &str, msg: &str) {
 /// fresh synthetic canary token, printing the token + metadata.
 pub fn create(kind: &str, callback_url: Option<String>, json: bool) -> i32 {
     let Some(kind) = CanaryKind::parse(kind) else {
-        emit_error(
+        // A failed JSON write returns 2 anyway here (same as this validation
+        // code), but routing through the bool keeps the broken-pipe path explicit.
+        let _ = emit_error(
             json,
             "tirith canary create",
             &format!(
@@ -60,7 +68,7 @@ pub fn create(kind: &str, callback_url: Option<String>, json: bool) -> i32 {
         Some(url) => {
             let trimmed = url.trim();
             if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-                emit_error(
+                let _ = emit_error(
                     json,
                     "tirith canary create",
                     &format!("--callback-url must be an http(s) URL (got '{url}')"),
@@ -84,7 +92,12 @@ pub fn create(kind: &str, callback_url: Option<String>, json: bool) -> i32 {
             0
         }
         Err(e) => {
-            emit_error(json, "tirith canary create", &e.to_string());
+            // On a broken-pipe JSON write the error JSON never reached the
+            // consumer; surface that as a write-failure exit (2) rather than the
+            // semantic 1 paired with no output (mirrors command-card sign).
+            if !emit_error(json, "tirith canary create", &e.to_string()) {
+                return 2;
+            }
             1
         }
     }
@@ -189,7 +202,7 @@ pub fn prune(id: &str, yes: bool, json: bool) -> i32 {
     // In JSON mode, require --yes to proceed non-interactively (no prompt on a
     // machine-readable surface). Without it, refuse rather than silently prune.
     if json && !yes {
-        emit_error(
+        let _ = emit_error(
             json,
             "tirith canary prune",
             "--yes required in JSON mode to confirm removal",
@@ -216,7 +229,9 @@ pub fn prune(id: &str, yes: bool, json: bool) -> i32 {
             0
         }
         Err(e) => {
-            emit_error(json, "tirith canary prune", &e.to_string());
+            // Write-failure exit (2) already matches this error's exit code; the
+            // bool is routed through for an explicit broken-pipe path.
+            let _ = emit_error(json, "tirith canary prune", &e.to_string());
             2
         }
     }
@@ -265,7 +280,9 @@ pub fn rotate(id: &str, json: bool) -> i32 {
             1
         }
         Err(e) => {
-            emit_error(json, "tirith canary rotate", &e.to_string());
+            // Write-failure exit (2) already matches this error's exit code; the
+            // bool is routed through for an explicit broken-pipe path.
+            let _ = emit_error(json, "tirith canary rotate", &e.to_string());
             2
         }
     }

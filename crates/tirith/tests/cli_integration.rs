@@ -8755,14 +8755,21 @@ fn command_card_create_trims_padded_expires_and_verifies() {
             card_path.to_str().unwrap(),
         ])
         .env("HOME", home.path())
+        .env("APPDATA", home.path())
+        .env("LOCALAPPDATA", home.path())
         .output()
         .expect("sign");
     assert_eq!(sign.status.code(), Some(0), "sign exits 0");
 
     let key_id = command_card::key_id_for_pubkey(&pubkey);
+    // Seed the trusted key at every platform's config_dir layout so `verify`
+    // finds it regardless of OS. On Windows config_dir() resolves from APPDATA
+    // (which we point at the test home below), so the trusted-keys dir is
+    // `<APPDATA>/tirith/trusted-card-keys` — NOT under `.config`.
     for sub in [
-        ".config/tirith/trusted-card-keys",
-        "Library/Application Support/tirith/trusted-card-keys",
+        ".config/tirith/trusted-card-keys", // Linux (XDG)
+        "Library/Application Support/tirith/trusted-card-keys", // macOS
+        "tirith/trusted-card-keys",         // Windows (APPDATA)
     ] {
         let dir = home.path().join(sub);
         fs::create_dir_all(&dir).unwrap();
@@ -8777,6 +8784,8 @@ fn command_card_create_trims_padded_expires_and_verifies() {
             card_path.to_str().unwrap(),
         ])
         .env("HOME", home.path())
+        .env("APPDATA", home.path())
+        .env("LOCALAPPDATA", home.path())
         .env_remove("XDG_CONFIG_HOME")
         .output()
         .expect("verify");
@@ -8787,6 +8796,50 @@ fn command_card_create_trims_padded_expires_and_verifies() {
     );
     let vjson: serde_json::Value = serde_json::from_slice(&verify.stdout).unwrap();
     assert_eq!(vjson["verified"], true, "verified must be true");
+}
+
+/// CodeRabbit R8 #4: `command-card create --command "   "` (whitespace-only) must
+/// be REJECTED, not silently turned into a card with an unusable command. The
+/// explicit-flag branch previously skipped the non-empty check that the prompt
+/// path already enforced. Pins exit 2 in both human and JSON mode, and a
+/// machine-readable `{"error": ...}` object under `--json`.
+#[test]
+fn command_card_create_rejects_whitespace_only_command() {
+    // stdin is closed (null) so a regression that fell through to the TTY prompt
+    // cannot hang the test — it would read EOF and still reject.
+    let human = tirith()
+        .args(["command-card", "create", "--command", "   "])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("create (human)");
+    assert_eq!(
+        human.status.code(),
+        Some(2),
+        "whitespace-only --command must be rejected with exit 2"
+    );
+    assert!(
+        String::from_utf8_lossy(&human.stderr).contains("non-empty --command is required"),
+        "human stderr must explain the validation failure, got: {}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    // A whitespace-only command must NOT produce a card on stdout.
+    assert!(
+        human.stdout.is_empty(),
+        "no card JSON should be emitted on the rejection path"
+    );
+
+    let json = tirith()
+        .args(["command-card", "create", "--json", "--command", "  \t "])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("create (json)");
+    assert_eq!(json.status.code(), Some(2), "JSON mode also exits 2");
+    let v: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("error JSON on stdout under --json");
+    assert_eq!(
+        v["error"], "a non-empty --command is required",
+        "JSON error object must carry the validation message, got: {v}"
+    );
 }
 
 /// Regression (CRITICAL): a card carried via a `# tirith-card: <path>` COMMENT
