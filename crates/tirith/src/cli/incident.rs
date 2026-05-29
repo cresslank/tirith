@@ -396,6 +396,34 @@ const REPORT_TIMELINE_ROWS: usize = 50;
 /// Assemble the full markdown report. Each section is best-effort: a subsystem
 /// that errors degrades to a one-line "unavailable" note rather than aborting
 /// the report.
+/// Escape a single-line value for safe inline embedding in the Markdown report.
+///
+/// Two distinct hazards are neutralized:
+/// * STRUCTURE: any CR/LF is collapsed to a single space, so a multi-line value
+///   (e.g. a `--reason` carrying a newline) cannot break out of its list item or
+///   inject a new heading/section. This is the load-bearing fix — a lone `#` on
+///   its own line would otherwise render as an `<h1>`.
+/// * RENDERING: the inline Markdown-significant characters that could distort the
+///   line (`` ` `` `*` `_` `[` `]` `<` `>` `\` `#` `|`) are backslash-escaped.
+///   `#` is escaped too so a value beginning with it is not read as a heading
+///   even after the newline collapse leaves it mid-line.
+fn md_inline_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            // Collapse every line break (and a bare CR) to a space so the value
+            // stays on one line. A `\r\n` becomes two spaces — harmless.
+            '\n' | '\r' => out.push(' '),
+            '`' | '*' | '_' | '[' | ']' | '<' | '>' | '\\' | '#' | '|' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn build_report(state: Option<&IncidentState>) -> String {
     let mut s = String::new();
     let now = chrono::Utc::now().to_rfc3339();
@@ -407,13 +435,21 @@ fn build_report(state: Option<&IncidentState>) -> String {
         Some(st) => {
             s.push_str("Status: **ACTIVE**\n\n");
             s.push_str(&format!("- Started at: {}\n", st.started_at_display()));
-            s.push_str(&format!("- Started by: {}\n", st.started_by));
+            // `started_by` (from $USER/$LOGNAME/$USERNAME) and `reason` (from
+            // `--reason`) are operator/environment-controlled, so escape them
+            // before embedding: a newline in `--reason` would otherwise break the
+            // list structure or inject new Markdown sections (e.g. a `#` heading),
+            // and `*`/`_`/`` ` ``/`[` could distort rendering.
+            s.push_str(&format!(
+                "- Started by: {}\n",
+                md_inline_escape(&st.started_by)
+            ));
             s.push_str(&format!(
                 "- Reason: {}\n\n",
                 if st.reason.is_empty() {
-                    "<none>"
+                    "<none>".to_string()
                 } else {
-                    &st.reason
+                    md_inline_escape(&st.reason)
                 }
             ));
         }
@@ -769,4 +805,56 @@ impl From<&IncidentState> for StartedOut {
 struct StoppedOut {
     stopped: bool,
     was_active: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_report, md_inline_escape};
+    use tirith_core::incident::IncidentState;
+
+    #[test]
+    fn md_inline_escape_neutralizes_newlines_and_markdown() {
+        // Newlines collapse to spaces (so structure can't break); a leading `#`
+        // is backslash-escaped so it can't become a heading even mid-line.
+        assert_eq!(md_inline_escape("a\nb"), "a b");
+        assert_eq!(md_inline_escape("a\r\nb"), "a  b");
+        assert_eq!(md_inline_escape("# heading"), "\\# heading");
+        assert_eq!(md_inline_escape("a*b_c`d"), "a\\*b\\_c\\`d");
+        // A clean value is unchanged.
+        assert_eq!(md_inline_escape("alice"), "alice");
+    }
+
+    #[test]
+    fn report_escapes_reason_with_newline_and_heading_injection() {
+        // CodeRabbit R6 #11: a `--reason` carrying a newline + `#` must NOT break
+        // the report structure or inject a new heading. Before the fix the raw
+        // reason was embedded verbatim, so the injected line rendered as content.
+        let state = IncidentState {
+            started_at: 1_700_000_000,
+            started_by: "alice\n# Injected Heading".to_string(),
+            reason: "real reason\n# Pwned\n- fake bullet".to_string(),
+        };
+
+        let report = build_report(Some(&state));
+
+        // The injected newlines are gone from the metadata lines: no line in the
+        // report is a bare `# Pwned` / `# Injected Heading` heading.
+        for line in report.lines() {
+            assert_ne!(line.trim_start(), "# Pwned", "reason injected a heading");
+            assert_ne!(
+                line.trim_start(),
+                "# Injected Heading",
+                "started_by injected a heading"
+            );
+        }
+        // The escaped forms ARE present on their single metadata lines.
+        assert!(
+            report.contains("- Reason: real reason \\# Pwned - fake bullet"),
+            "reason must be newline-collapsed and Markdown-escaped, got:\n{report}"
+        );
+        assert!(
+            report.contains("- Started by: alice \\# Injected Heading"),
+            "started_by must be newline-collapsed and Markdown-escaped, got:\n{report}"
+        );
+    }
 }

@@ -437,6 +437,19 @@ fn write_card_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     // truncated one.
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
+    // Durability of the RENAME itself: `persist()` renames the temp file over
+    // `path` but does NOT fsync the containing directory. On Unix a crash right
+    // after the rename can lose the new name→inode directory entry (the file's
+    // data is synced above, but the directory metadata recording the new name is
+    // not). fsync the parent directory so the rename is durable too. Best-effort:
+    // a directory that cannot be opened/synced (rare) must not fail an otherwise-
+    // successful sign. No-op on non-Unix (Windows has no directory-fsync).
+    #[cfg(unix)]
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 

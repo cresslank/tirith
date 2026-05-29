@@ -9815,6 +9815,77 @@ fn canary_create_persists_trimmed_callback_url() {
     );
 }
 
+/// CodeRabbit R6 #10: `canary create --json` validation failures (unknown kind,
+/// bad callback URL) and `canary prune --json` without `--yes` must emit a
+/// PARSEABLE JSON `{"error": ...}` object, not plain stderr — a JSON consumer
+/// must always get JSON on the `--json` surface.
+#[test]
+fn canary_json_validation_errors_are_machine_readable() {
+    let state = tempfile::tempdir().expect("tempdir");
+
+    // Unknown kind → parseable JSON error on stdout, exit 2.
+    let bad_kind = canary_tirith(state.path())
+        .args(["canary", "create", "not-a-kind", "--json"])
+        .output()
+        .expect("canary create bad kind");
+    assert_eq!(bad_kind.status.code(), Some(2), "unknown kind exits 2");
+    let v: serde_json::Value = serde_json::from_slice(&bad_kind.stdout)
+        .expect("unknown-kind --json must emit parseable JSON on stdout");
+    assert!(
+        v.get("error")
+            .and_then(|e| e.as_str())
+            .is_some_and(|s| s.contains("unknown kind")),
+        "JSON error must name the unknown kind, got: {v}"
+    );
+
+    // Bad callback URL → parseable JSON error, exit 2.
+    let bad_url = canary_tirith(state.path())
+        .args([
+            "canary",
+            "create",
+            "aws-like",
+            "--callback-url",
+            "ftp://nope.example",
+            "--json",
+        ])
+        .output()
+        .expect("canary create bad url");
+    assert_eq!(bad_url.status.code(), Some(2), "bad callback URL exits 2");
+    let v: serde_json::Value = serde_json::from_slice(&bad_url.stdout)
+        .expect("bad-callback-url --json must emit parseable JSON on stdout");
+    assert!(
+        v.get("error")
+            .and_then(|e| e.as_str())
+            .is_some_and(|s| s.contains("http(s)")),
+        "JSON error must explain the http(s) requirement, got: {v}"
+    );
+
+    // prune --json without --yes → parseable JSON error, exit 2. The `--yes`
+    // guard only fires for an EXISTING canary (a missing id returns 0 with a
+    // {pruned:false} record), so register one first, then prune it without --yes.
+    let created = canary_tirith(state.path())
+        .args(["canary", "create", "github-like", "--json"])
+        .output()
+        .expect("canary create for prune");
+    assert_eq!(created.status.code(), Some(0));
+    let cjson: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    let id = cjson["id"].as_str().expect("created entry has an id");
+
+    let prune = canary_tirith(state.path())
+        .args(["canary", "prune", id, "--json"])
+        .output()
+        .expect("canary prune without --yes");
+    assert_eq!(prune.status.code(), Some(2), "prune without --yes exits 2");
+    let v: serde_json::Value = serde_json::from_slice(&prune.stdout)
+        .expect("prune-without-yes --json must emit parseable JSON on stdout");
+    assert!(
+        v.get("error")
+            .and_then(|e| e.as_str())
+            .is_some_and(|s| s.contains("--yes")),
+        "JSON error must mention the required --yes flag, got: {v}"
+    );
+}
+
 // ── M11 ch2: `tirith commands` CLI (PR #130 review batch B) ──────────────
 //
 // These drive the `tirith commands list|run` CLI. The manifest is discovered

@@ -401,17 +401,45 @@ fn emit_run_json(
     refused: bool,
     error: Option<&str>,
 ) -> bool {
+    let v = build_run_json(
+        name,
+        command,
+        verdict,
+        dlp_custom_patterns,
+        running,
+        refused,
+        error,
+    );
+    super::write_json_stdout(&v, "tirith commands run: failed to write JSON output")
+}
+
+/// Build the `commands run --json` object. Pure (no I/O) so the redaction
+/// contract is unit-testable without a capturable stdout (mirrors the
+/// `json_refusal_exit_code` seam). BOTH the `findings` AND the top-level
+/// `command` are scrubbed with the same built-in + custom DLP patterns — leaving
+/// the raw `command` would leak credentials / custom-DLP matches into JSON
+/// stdout (and any log collector consuming it) even though `findings` is
+/// redacted.
+fn build_run_json(
+    name: &str,
+    command: &str,
+    verdict: &tirith_core::verdict::Verdict,
+    dlp_custom_patterns: &[String],
+    running: bool,
+    refused: bool,
+    error: Option<&str>,
+) -> serde_json::Value {
     let findings = tirith_core::redact::redacted_findings(&verdict.findings, dlp_custom_patterns);
-    let v = serde_json::json!({
+    let redacted_command = tirith_core::redact::redact_command_text(command, dlp_custom_patterns);
+    serde_json::json!({
         "name": name,
-        "command": command,
+        "command": redacted_command,
         "action": verdict.action,
         "findings": findings,
         "running": running,
         "refused": refused,
         "error": error,
-    });
-    super::write_json_stdout(&v, "tirith commands run: failed to write JSON output")
+    })
 }
 
 /// Render a non-Allow verdict's findings the SAME way `tirith check` does so a
@@ -603,5 +631,51 @@ mod tests {
         // write and overridden to 2 on failure.
         assert_eq!(json_refusal_exit_code(true, 3), 3);
         assert_eq!(json_refusal_exit_code(false, 3), 2);
+    }
+
+    /// CodeRabbit R6 #1: `commands run --json` must DLP-redact the top-level
+    /// `command` string with the same patterns the findings use. A raw command
+    /// would leak credentials / custom-DLP matches into JSON stdout (and any log
+    /// collector), even though `findings` is already scrubbed.
+    #[test]
+    fn run_json_redacts_top_level_command_with_custom_dlp() {
+        use super::build_run_json;
+        use tirith_core::verdict::{Timings, Verdict};
+
+        // A custom DLP pattern that matches an internal token shape, plus a
+        // built-in-matching GitHub PAT to prove built-in patterns apply too.
+        let custom = vec![r"ACME-[A-Z0-9]{6}".to_string()];
+        let secret_token = "ACME-AB12CD";
+        // 40 chars after `ghp_` to satisfy the built-in `ghp_[A-Za-z0-9]{36,}`.
+        let pat = "ghp_0123456789abcdefghij0123456789abcdefgh";
+        let command = format!("deploy --token {secret_token} --pat {pat}");
+
+        let verdict = Verdict::allow_fast(1, Timings::default());
+        let v = build_run_json(
+            "deploy", &command, &verdict, &custom, /* running */ true,
+            /* refused */ false, None,
+        );
+
+        let emitted = v
+            .get("command")
+            .and_then(|c| c.as_str())
+            .expect("command field is a string");
+
+        // The raw secret token MUST NOT appear; the redaction placeholder MUST.
+        assert!(
+            !emitted.contains(secret_token),
+            "custom-DLP token leaked into the JSON command field: {emitted}"
+        );
+        assert!(
+            emitted.contains("[REDACTED:custom]"),
+            "custom-DLP match should be replaced with the redaction placeholder: {emitted}"
+        );
+        // The built-in GitHub-PAT pattern is also applied (the raw PAT is gone).
+        assert!(
+            !emitted.contains(pat),
+            "built-in DLP (GitHub PAT) leaked into the JSON command field: {emitted}"
+        );
+        // The non-secret parts of the command survive so the record stays useful.
+        assert!(emitted.contains("deploy --token"), "got: {emitted}");
     }
 }

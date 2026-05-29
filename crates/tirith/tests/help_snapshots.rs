@@ -253,11 +253,16 @@ fn help_secret_states_assistant_only_and_no_network() {
         // Collapse runs of whitespace/newlines to single spaces so a clap
         // line-wrap between two words of a phrase doesn't break the match.
         let collapsed: String = lower.split_whitespace().collect::<Vec<_>>().join(" ");
-        // Honesty: tirith does NOT perform rotation / revocation.
+        // Honesty: tirith does NOT perform rotation / revocation. Match the
+        // whitespace-normalized LOWERCASE string for an explicit negation
+        // ("does not ...") adjacent to the rotation/revocation tokens — a
+        // case-sensitive `stdout.contains("NOT")` was brittle (a future edit
+        // could lower-case the banner and silently pass), and a bare
+        // `contains("not")` would also match unrelated words like "annotation".
         assert!(
-            stdout.contains("NOT")
-                && (lower.contains("rotation") || lower.contains("rotate"))
-                && (lower.contains("revocation") || lower.contains("revoke")),
+            collapsed.contains("does not")
+                && (collapsed.contains("rotation") || collapsed.contains("rotate"))
+                && (collapsed.contains("revocation") || collapsed.contains("revoke")),
             "{args:?} --help must carry the 'tirith does NOT rotate/revoke' honesty banner, got:\n{stdout}"
         );
         // Zero network calls. Require a NEGATION adjacent to "network" (the

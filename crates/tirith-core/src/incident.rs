@@ -334,8 +334,20 @@ pub fn start_at(path: &Path, reason: impl Into<String>) -> Result<IncidentState,
         }
     }
 
-    // Fallback: O_EXCL create then write. Momentary empty window is fail-safe
-    // (a partial read is treated as an active incident).
+    // Fallback (hard_link unsupported on this filesystem, or the temp file could
+    // not be created): O_EXCL create then write. We claim the final path first
+    // (O_EXCL fails rather than clobber a concurrent incident), then write +
+    // fsync the body.
+    //
+    // TRANSACTIONAL on the error path: if the write/flush/sync fails we must
+    // REMOVE the file we just created. `read_flag_at` treats ANY present
+    // non-empty-or-even-empty flag as fail-safe ACTIVE, so a partial flag left
+    // behind after a FAILED `start` would turn incident mode ON while `start`
+    // reports Err — exactly the inconsistency this fixes. After removal the read
+    // path sees no flag (inactive), matching the returned Err.
+    //
+    // DURABLE on the success path: fsync the body before returning Ok so a crash
+    // immediately after `start` keeps the recorded reason intact.
     let mut opts = std::fs::OpenOptions::new();
     // create_new => O_EXCL: fail rather than clobber a concurrent incident.
     opts.write(true).create_new(true);
@@ -345,15 +357,41 @@ pub fn start_at(path: &Path, reason: impl Into<String>) -> Result<IncidentState,
         opts.mode(0o600);
     }
     match opts.open(path) {
-        Ok(mut f) => {
-            use std::io::Write as _;
-            f.write_all(&body).map_err(StartError::Io)?;
+        Ok(f) => {
+            finish_excl_write(f, &body, path)?;
             invalidate_cache();
             Ok(state)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(already_active(path)),
         Err(e) => Err(StartError::Io(e)),
     }
+}
+
+/// Write `body` to the just-O_EXCL-created flag `file`, flush, and fsync as one
+/// fallible unit. On ANY failure REMOVE `path` so no partial flag is left behind
+/// (`read_flag_at` treats any present flag as fail-safe ACTIVE, so a partial
+/// flag after a FAILED `start` would wrongly turn incident mode on), then
+/// surface the original write error. On success the body is durable on disk
+/// before returning.
+///
+/// Split out so the failure-path cleanup is unit-testable: a caller can pass a
+/// read-only-opened handle to force `write_all` to fail deterministically and
+/// assert the flag file is removed.
+fn finish_excl_write(mut file: std::fs::File, body: &[u8], path: &Path) -> Result<(), StartError> {
+    use std::io::Write as _;
+    let write_result = file
+        .write_all(body)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all());
+    if let Err(e) = write_result {
+        // Best-effort cleanup: drop the handle first, then unlink the partial
+        // flag. A failure to remove is swallowed — the original write error is
+        // the one worth surfacing.
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(StartError::Io(e));
+    }
+    Ok(())
 }
 
 /// Build the [`StartError::AlreadyActive`] for a start that lost the race:
@@ -627,6 +665,62 @@ mod tests {
             stray.is_empty(),
             "atomic publish must not leave a temp file behind, found: {stray:?}"
         );
+    }
+
+    #[test]
+    fn excl_write_failure_leaves_no_flag_so_incident_reads_inactive() {
+        // CodeRabbit R6 #3: the O_EXCL fallback used to create the flag then
+        // write; a write failure returned Err but LEFT a zero/partial flag, and
+        // `read_flag_at` treats any present flag as fail-safe ACTIVE — so `start`
+        // failed yet incident mode turned ON. `finish_excl_write` now removes the
+        // partial file on any write failure. Force the failure deterministically
+        // by handing it a READ-ONLY handle (so `write_all` returns an error on
+        // every platform), and assert no flag remains → the read path is inactive.
+        let dir = tempdir().unwrap();
+        let flag = flag_in(dir.path());
+
+        // Create the flag, then reopen it read-only to model the
+        // "O_EXCL-created, write fails" case.
+        std::fs::File::create(&flag).unwrap();
+        let ro = std::fs::OpenOptions::new().read(true).open(&flag).unwrap();
+
+        let err = finish_excl_write(ro, b"{\"x\":1}", &flag).unwrap_err();
+        assert!(
+            matches!(err, StartError::Io(_)),
+            "write to a RO fd must error"
+        );
+
+        // The partial flag is gone, so the incident read path is INACTIVE
+        // (matching the returned Err) rather than stuck fail-closed.
+        assert!(
+            !flag.exists(),
+            "a failed excl write must leave no flag behind"
+        );
+        assert!(matches!(read_flag_at(&flag), FlagRead::Absent));
+        assert!(read_state_at(&flag).is_none());
+    }
+
+    #[test]
+    fn excl_write_success_is_durable_and_complete() {
+        // The success path of the O_EXCL fallback fsyncs before returning, so the
+        // body is fully on disk and reads back as a Valid state.
+        let dir = tempdir().unwrap();
+        let flag = flag_in(dir.path());
+
+        let state = IncidentState::now("excl durable");
+        let body = serde_json::to_vec_pretty(&state).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&flag)
+            .unwrap();
+        finish_excl_write(f, &body, &flag).expect("excl write succeeds");
+
+        let bytes = std::fs::read(&flag).unwrap();
+        assert!(!bytes.is_empty());
+        let parsed: IncidentState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.reason, "excl durable");
+        assert!(matches!(read_flag_at(&flag), FlagRead::Valid(_)));
     }
 
     #[test]

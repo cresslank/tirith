@@ -48,7 +48,7 @@
 //! it. The mark persists until an explicit [`clear_taint`] (the
 //! `tirith taint clear <file>` command).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -150,27 +150,14 @@ fn mtime_nanos(path: &Path) -> u128 {
 /// corrupt line never aborts the lookup). Returns an empty vec when the file is
 /// absent.
 fn parse_store(path: &Path) -> Vec<TaintEntry> {
-    let Ok(file) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
-    let reader = BufReader::new(file);
-    let mut out = Vec::new();
-    // Skip blank / unparseable lines AND continue past reader I/O errors
-    // (invalid UTF-8 mid-file). A previous `map_while(Result::ok)` stopped at
-    // the first reader Err, silently dropping every entry after it.
-    for line in reader.lines() {
-        let Ok(line) = line else {
-            continue;
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<TaintEntry>(trimmed) {
-            out.push(entry);
-        }
-    }
-    out
+    // `read_store_lines` skips blank lines, skips a single recoverable
+    // invalid-UTF-8 line (so a corrupt byte does not abort the lookup), and
+    // BREAKS on any other (persistent) read error so the reader cannot spin
+    // forever. Lines that don't parse as a `TaintEntry` are dropped (fail-open).
+    crate::util::read_store_lines(path)
+        .iter()
+        .filter_map(|line| serde_json::from_str::<TaintEntry>(line).ok())
+        .collect()
 }
 
 /// Load entries through the per-process cache. Reloads when the cached path

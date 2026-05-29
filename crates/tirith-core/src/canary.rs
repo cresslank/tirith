@@ -65,7 +65,7 @@
 //! [`store_nonempty`]). A machine that has never run `tirith canary create`
 //! pays nothing.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -272,26 +272,14 @@ fn mtime_nanos(path: &Path) -> u128 {
 /// We now `continue` on a line error so a single bad line cannot mask the rest
 /// of the store (matching the corrupt-line-skip-but-continue contract).
 fn parse_store(path: &Path) -> Vec<CanaryEntry> {
-    let Ok(file) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
-    let reader = BufReader::new(file);
-    let mut out = Vec::new();
-    for line in reader.lines() {
-        // A reader error (e.g. invalid UTF-8) skips THIS line but must not stop
-        // us reading the rest — otherwise a corrupt byte hides later canaries.
-        let Ok(line) = line else {
-            continue;
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<CanaryEntry>(trimmed) {
-            out.push(entry);
-        }
-    }
-    out
+    // `read_store_lines` skips blank lines, skips a single recoverable
+    // invalid-UTF-8 line (so a corrupt byte cannot hide later canaries), and
+    // BREAKS on any other (persistent) read error so the reader cannot spin
+    // forever. Lines that don't parse as a `CanaryEntry` are dropped (fail-open).
+    crate::util::read_store_lines(path)
+        .iter()
+        .filter_map(|line| serde_json::from_str::<CanaryEntry>(line).ok())
+        .collect()
 }
 
 /// Load entries through the per-process cache. Reloads when the cached path
@@ -469,6 +457,21 @@ pub fn create_at(
     kind: CanaryKind,
     callback_url: Option<String>,
 ) -> std::io::Result<CanaryEntry> {
+    // Normalize the callback URL HERE — the single invariant for every caller
+    // (CLI, tests, library). Trim surrounding whitespace and collapse a
+    // blank-after-trim value to `None`. Without this, `Some("   ")` would be
+    // PERSISTED as a configured callback, yet `fire_callback` trims it to empty
+    // and no-ops — the store would claim "callback configured" while runtime
+    // treated the canary as local-only. Storing `None` keeps disk and runtime
+    // semantics identical.
+    let callback_url = callback_url.and_then(|u| {
+        let t = u.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    });
     let entry = CanaryEntry {
         id: new_id(),
         token: generate_token(kind),
@@ -665,10 +668,16 @@ pub fn fire_callback(hit: &CanaryHit, context: &str) {
     let context = context.to_string();
     let detected_at = chrono::Utc::now().to_rfc3339();
 
+    // Keep an `id` copy on this side of the move so a SPAWN failure (the OS
+    // refusing a new thread — e.g. resource limits) can still be audited: the
+    // closure below consumes `id`, so without this clone a failed spawn would
+    // drop the callback with no record, unlike the HTTP-path failures which all
+    // reach `log_callback_failure`.
+    let id_for_spawn_failure = id.clone();
     // Detached: the engine returns its verdict without waiting on the network.
     // If the process exits before the POST completes the callback is simply
     // dropped — best-effort by design. We do not join the handle.
-    let _ = std::thread::Builder::new()
+    let spawn_result = std::thread::Builder::new()
         .name("tirith-canary-callback".to_string())
         .spawn(move || {
             #[derive(Serialize)]
@@ -717,6 +726,13 @@ pub fn fire_callback(hit: &CanaryHit, context: &str) {
                 }
             }
         });
+
+    // A spawn failure (the OS refused a new thread) silently dropped the
+    // callback before this — route it through the same audit sink as the
+    // in-thread HTTP failures, with a coarse, URL-free reason.
+    if spawn_result.is_err() {
+        log_callback_failure(&id_for_spawn_failure, "callback worker spawn failed");
+    }
 }
 
 /// Map a `reqwest` send error to a coarse, NON-sensitive reason string. The raw
@@ -815,6 +831,41 @@ mod tests {
         assert_eq!(hits.len(), 1, "registered token must fire exactly one hit");
         assert_eq!(hits[0].id, entry.id);
         assert_eq!(hits[0].kind, "aws-like");
+    }
+
+    #[test]
+    fn create_normalizes_blank_callback_url_to_none() {
+        // CodeRabbit R6 #8: a whitespace-only callback URL must persist as `None`,
+        // not `Some("   ")`. `fire_callback` trims and no-ops on a blank URL, so
+        // storing the raw blank would make the on-disk record claim a callback is
+        // configured while runtime treats the canary as local-only. `create_at`
+        // is the single normalization point for all callers.
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+
+        let entry = create_at(&store, CanaryKind::GithubLike, Some("   ".to_string())).unwrap();
+        assert!(
+            entry.callback_url.is_none(),
+            "a blank-after-trim callback URL must normalize to None, got {:?}",
+            entry.callback_url
+        );
+        // And it must be persisted as None too (read straight from disk, not the
+        // in-process cache).
+        let on_disk = parse_store(&store);
+        assert_eq!(on_disk.len(), 1);
+        assert!(on_disk[0].callback_url.is_none());
+
+        // A real URL with surrounding whitespace is trimmed (not dropped).
+        let entry2 = create_at(
+            &store,
+            CanaryKind::GithubLike,
+            Some("  https://example.com/cb  ".to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            entry2.callback_url.as_deref(),
+            Some("https://example.com/cb")
+        );
     }
 
     /// Durability regression (CodeRabbit/Greptile R4 #1): every store mutator

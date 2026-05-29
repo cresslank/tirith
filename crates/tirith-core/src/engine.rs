@@ -671,10 +671,13 @@ impl ScanSnapshot {
 /// literal leader (the common direct-invocation case); the richer wrapper
 /// unwrapping lives in `tirith exec check`. Tokens that resolve nowhere (a
 /// bare name not on `$PATH`) produce no finding.
-fn check_exec_provenance_hot(ctx: &AnalysisContext) -> Vec<Finding> {
+fn check_exec_provenance_hot(ctx: &AnalysisContext, command: &str) -> Vec<Finding> {
     use crate::tokenize;
 
-    let segs = tokenize::tokenize(&ctx.input, ctx.shell);
+    // `command` is the prelude-STRIPPED command (a leading `# tirith-card:`
+    // marker removed) so the resolved leader is the real command, not the marker
+    // line. Card detection still runs on the ORIGINAL `ctx.input` elsewhere.
+    let segs = tokenize::tokenize(command, ctx.shell);
     let Some(leader) = segs.first().and_then(|s| s.command.as_deref()) else {
         return Vec::new();
     };
@@ -719,9 +722,12 @@ fn check_exec_provenance_hot(ctx: &AnalysisContext) -> Vec<Finding> {
 /// segment only and defers the actual recognition to
 /// [`crate::repo_hooks::is_hook_triggering_leader`]. Keeps an arbitrary command
 /// under a hooks-guard-on repo fast-exiting at tier-1.
-fn leader_is_hook_triggering(ctx: &AnalysisContext) -> bool {
+fn leader_is_hook_triggering(ctx: &AnalysisContext, command: &str) -> bool {
     use crate::tokenize;
-    let segs = tokenize::tokenize(&ctx.input, ctx.shell);
+    // `command` is the prelude-STRIPPED command so a leading `# tirith-card:`
+    // marker can't make the leader look like a comment instead of the real
+    // `git commit` / `npm install` / etc.
+    let segs = tokenize::tokenize(command, ctx.shell);
     let Some(first) = segs.first() else {
         return false;
     };
@@ -747,10 +753,13 @@ fn leader_is_hook_triggering(ctx: &AnalysisContext) -> bool {
 /// (`git commit …`, `npm install …`, `direnv allow`). A non-hook-triggering
 /// leader (or no repo root) yields no findings. The per-leader hook-type
 /// targeting + the 60s mtime cache live in `repo_hooks::scan_triggered_by_leader`.
-fn check_repo_hooks_hot(ctx: &AnalysisContext) -> Vec<Finding> {
+fn check_repo_hooks_hot(ctx: &AnalysisContext, command: &str) -> Vec<Finding> {
     use crate::tokenize;
 
-    let segs = tokenize::tokenize(&ctx.input, ctx.shell);
+    // `command` is the prelude-STRIPPED command so the leader + subcommand are
+    // read off the real `git commit …` / `npm install …`, not a `# tirith-card:`
+    // marker line.
+    let segs = tokenize::tokenize(command, ctx.shell);
     let Some(first) = segs.first() else {
         return Vec::new();
     };
@@ -1076,22 +1085,28 @@ fn taint_leader_is_pathlike(leader: &str) -> bool {
 /// (the `taint_triggered` tier-1 force-past). The per-leader lookup itself is a
 /// path-key match against the per-process-cached store
 /// ([`crate::taint::is_tainted`]).
-fn check_taint_hot(ctx: &AnalysisContext) -> Vec<Finding> {
+fn check_taint_hot(ctx: &AnalysisContext, command: &str) -> Vec<Finding> {
     let Some(store) = crate::taint::store_path() else {
         return Vec::new();
     };
-    check_taint_hot_with_store(ctx, &store)
+    check_taint_hot_with_store(ctx, command, &store)
 }
 
 /// Store-parameterized core of [`check_taint_hot`]. Split out so the leader /
 /// interpreter / `source` parsing is unit-testable against a
 /// `tempfile::tempdir()` store WITHOUT touching the real `state_dir()` or
 /// mutating `XDG_STATE_HOME` (the libc setenv race, PR #125).
-fn check_taint_hot_with_store(ctx: &AnalysisContext, store: &std::path::Path) -> Vec<Finding> {
+fn check_taint_hot_with_store(
+    ctx: &AnalysisContext,
+    command: &str,
+    store: &std::path::Path,
+) -> Vec<Finding> {
     use crate::tokenize;
     use crate::verdict::{RuleId, Severity};
 
-    let segs = tokenize::tokenize(&ctx.input, ctx.shell);
+    // `command` is the prelude-STRIPPED command so a `# tirith-card:` marker
+    // can't shift the leader/interpreter/source parsing off the real command.
+    let segs = tokenize::tokenize(command, ctx.shell);
     let Some(first) = segs.first() else {
         return Vec::new();
     };
@@ -1779,7 +1794,15 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     // `exec_bidi_triggered`.
     let (exec_guard_triggered, hooks_guard_triggered) = if ctx.scan_context == ScanContext::Exec {
         let partial = Policy::discover_partial(ctx.cwd.as_deref());
-        let hooks = partial.hooks_guard_enabled && leader_is_hook_triggering(ctx);
+        // The hook-leader predicate keys off the real command, so strip any
+        // leading `# tirith-card:` prelude first (consistent with the rule path's
+        // `analyzed_input`). `strip_card_comment_lines_cow` borrows unchanged when
+        // there is no marker, so the common no-card path stays zero-alloc.
+        let hooks = partial.hooks_guard_enabled
+            && leader_is_hook_triggering(
+                ctx,
+                &crate::command_card::strip_card_comment_lines_cow(&ctx.input),
+            );
         (partial.exec_guard_enabled, hooks)
     } else {
         (false, false)
@@ -2244,7 +2267,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             // 7 cold rules under `tirith exec`/`path`. See the `analyze`
             // doc-comment for the full split.
             if policy.exec_guard_enabled {
-                findings.extend(check_exec_provenance_hot(ctx));
+                findings.extend(check_exec_provenance_hot(ctx, &analyzed_input));
             }
 
             // M9 ch6 — repo-hook / automation guard HOT subset. Behind the
@@ -2259,7 +2282,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             // The scan is per-repo mtime-cached for 60s. Makefile/justfile/
             // Taskfile are NOT triggered here (the user did not run make).
             if policy.hooks_guard_enabled {
-                findings.extend(check_repo_hooks_hot(ctx));
+                findings.extend(check_repo_hooks_hot(ctx, &analyzed_input));
             }
 
             // M10 ch1 — blast-radius CHEAP subset. Always-on (no policy flag),
@@ -2293,7 +2316,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             // path, this fires ExecOfTaintedFile (High) /
             // CommandSourcedFromTaintedFile (Medium). The store is path-keyed
             // and cached per-process (5s TTL) — see `crate::taint`.
-            findings.extend(check_taint_hot(ctx));
+            findings.extend(check_taint_hot(ctx, &analyzed_input));
 
             // M11 ch1 - command-card attestation. ATTESTATION-ONLY in v1: a
             // verified card emits an Info CommandCardVerified and does NOT
@@ -3944,7 +3967,7 @@ mod tests {
         .unwrap();
 
         let ctx = exec_ctx_in("./install.sh --yes", cwd);
-        let findings = check_taint_hot_with_store(&ctx, &store);
+        let findings = check_taint_hot_with_store(&ctx, &ctx.input, &store);
         assert_eq!(findings.len(), 1, "tainted leader should fire one finding");
         assert_eq!(
             findings[0].rule_id,
@@ -3970,7 +3993,7 @@ mod tests {
 
         // `bash ./install.sh` runs the tainted file even though the leader is bash.
         let ctx = exec_ctx_in("bash ./install.sh", cwd);
-        let findings = check_taint_hot_with_store(&ctx, &store);
+        let findings = check_taint_hot_with_store(&ctx, &ctx.input, &store);
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].rule_id,
@@ -3995,7 +4018,7 @@ mod tests {
         .unwrap();
 
         let ctx = exec_ctx_in("source ./env.sh", cwd);
-        let findings = check_taint_hot_with_store(&ctx, &store);
+        let findings = check_taint_hot_with_store(&ctx, &ctx.input, &store);
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].rule_id,
@@ -4005,7 +4028,7 @@ mod tests {
 
         // The `.` builtin form fires the same Medium rule.
         let ctx_dot = exec_ctx_in(". ./env.sh", cwd);
-        let findings_dot = check_taint_hot_with_store(&ctx_dot, &store);
+        let findings_dot = check_taint_hot_with_store(&ctx_dot, &ctx_dot.input, &store);
         assert_eq!(findings_dot.len(), 1);
         assert_eq!(
             findings_dot[0].rule_id,
@@ -4030,11 +4053,11 @@ mod tests {
 
         // A different, untainted file produces nothing.
         let ctx = exec_ctx_in("bash ./other.sh", cwd);
-        assert!(check_taint_hot_with_store(&ctx, &store).is_empty());
+        assert!(check_taint_hot_with_store(&ctx, &ctx.input, &store).is_empty());
 
         // A PATH-resolved bare command (no path separator) is not a leader path.
         let ctx_bare = exec_ctx_in("ls -la", cwd);
-        assert!(check_taint_hot_with_store(&ctx_bare, &store).is_empty());
+        assert!(check_taint_hot_with_store(&ctx_bare, &ctx_bare.input, &store).is_empty());
     }
 
     #[test]
@@ -4043,7 +4066,68 @@ mod tests {
         let store = taint_store(dir.path());
         // No marks written.
         let ctx = exec_ctx_in("bash ./install.sh", dir.path());
-        assert!(check_taint_hot_with_store(&ctx, &store).is_empty());
+        assert!(check_taint_hot_with_store(&ctx, &ctx.input, &store).is_empty());
+    }
+
+    #[test]
+    fn taint_hot_keys_off_prelude_stripped_command_not_marker_line() {
+        // CodeRabbit R6 #2: the leader-based hot checks must operate on the
+        // prelude-STRIPPED command, not the raw `# tirith-card:` marker line.
+        // The engine threads `analyzed_input` (the stripped command) into
+        // `check_taint_hot_with_store`; this test pins both directions of that
+        // contract at the helper level.
+        let dir = tempfile::tempdir().unwrap();
+        let store = taint_store(dir.path());
+        let cwd = dir.path();
+        crate::taint::mark_tainted_at(
+            &store,
+            std::path::Path::new("./install.sh"),
+            Some(cwd),
+            "fetch --save",
+            None,
+            None,
+        )
+        .unwrap();
+
+        // A real `bash ./install.sh` carried behind a card-comment prelude.
+        let ctx = exec_ctx_in("# tirith-card: ./card.json\nbash ./install.sh", cwd);
+        let stripped = crate::command_card::strip_card_comment_lines_cow(&ctx.input);
+
+        // The STRIPPED command (what the engine now passes) fires the taint rule
+        // against the real tainted file.
+        let fired = check_taint_hot_with_store(&ctx, &stripped, &store);
+        assert_eq!(
+            fired.len(),
+            1,
+            "the prelude-stripped command must fire the taint rule"
+        );
+        assert_eq!(fired[0].rule_id, crate::verdict::RuleId::ExecOfTaintedFile);
+
+        // Passing the RAW marker-prefixed input instead keys off the `#` comment
+        // line (leader is `#`, not the interpreter), so NOTHING fires — exactly
+        // the bug this finding fixes. (Demonstrates why the stripping matters.)
+        let raw = check_taint_hot_with_store(&ctx, &ctx.input, &store);
+        assert!(
+            raw.is_empty(),
+            "raw marker-line input must NOT resolve the real leader (pre-fix behavior)"
+        );
+    }
+
+    #[test]
+    fn hook_leader_predicate_keys_off_prelude_stripped_command() {
+        // CodeRabbit R6 #2 (hook side): `leader_is_hook_triggering` must see the
+        // real `git commit` even when carried behind a `# tirith-card:` prelude.
+        let ctx = exec_ctx("# tirith-card: ./card.json\ngit commit -m wip");
+        let stripped = crate::command_card::strip_card_comment_lines_cow(&ctx.input);
+        assert!(
+            leader_is_hook_triggering(&ctx, &stripped),
+            "the stripped command's leader (git commit) must be hook-triggering"
+        );
+        // The raw marker line is not a hook-triggering leader.
+        assert!(
+            !leader_is_hook_triggering(&ctx, &ctx.input),
+            "the raw `# tirith-card:` line must not be seen as a hook-triggering leader"
+        );
     }
 
     // ---- M11 ch3 — canary / honeytoken wiring tests ------------------------

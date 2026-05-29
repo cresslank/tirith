@@ -2215,7 +2215,7 @@ Subcommands:
   create  build an unsigned card from flags (or prompts) and print JSON
   sign    sign a card in place with an ed25519 private key
   verify  verify a card against your trusted-keys directory
-  fetch   download a card from a URL into ~/.cache/tirith/cards/<sha256>.json
+  fetch   download a card from a URL into tirith's cache dir (cards/<sha256>.json)
 
 Examples:
   tirith command-card create --command 'curl -fsSL https://example.com/install.sh | sh' \\
@@ -2824,9 +2824,10 @@ Examples:
     /// Download a card from a URL into the local cache (the ONLY fetch path)
     #[command(after_help = "\
 Downloads the card from <url> (30s timeout, 10 MiB cap, redirect-limited),
-validates it parses as a card, and caches it at
-`~/.cache/tirith/cards/<sha256>.json`. Prints the cached path on stdout so you
-can pass it to `tirith check --card`.
+validates it parses as a card, and caches it under tirith's cache directory at
+`cards/<sha256>.json` (the platform cache dir — e.g. ~/.cache on Linux,
+~/Library/Caches on macOS). Prints the cached path on stdout so you can pass it
+to `tirith check --card`.
 
 This is the ONLY place tirith fetches a card over the network. `tirith check`
 never fetches — it reads cards from disk only.

@@ -583,6 +583,14 @@ pub fn strip_card_comment_lines(input: &str) -> String {
 /// returned offset is always a line boundary, hence a valid `str` boundary.
 fn prelude_end_offset(input: &str) -> usize {
     let mut offset = 0usize;
+    // Only a prelude that ACTUALLY contains a `# tirith-card:` marker is
+    // stripped. Leading blank lines are transport padding around a marker — they
+    // are not, on their own, a reason to mutate the command. Without this guard
+    // `"\n\necho hi"` (no marker) would return offset 2 and `strip_card_comment_lines`
+    // would drop the blanks, diverging from `strip_card_comment_lines_cow`
+    // (which borrows unchanged because `has_card_comment_prelude` is false) and
+    // silently rewriting command text for direct callers.
+    let mut marker_seen = false;
     // `split_inclusive('\n')` keeps each line's trailing separator (`\r\n` or
     // `\n`) attached, so summing the chunk lengths walks real byte offsets and
     // never drops a `\r`. The line content we classify is the chunk with its
@@ -592,14 +600,15 @@ fn prelude_end_offset(input: &str) -> usize {
         let line = line.strip_suffix('\r').unwrap_or(line);
         if card_comment_value(line).is_some() {
             // A prelude marker line: drop it (transport metadata).
+            marker_seen = true;
             offset += chunk.len();
             continue;
         }
         if line.trim().is_empty() {
-            // Blank prelude line: also part of the leading prelude, drop it. The
-            // command's own leading whitespace (if any) is handled by
-            // `command_matches`'s trim; transport blanks are never part of the
-            // signed command body.
+            // Blank prelude line: provisionally part of the leading prelude. Kept
+            // ONLY if a marker is present somewhere in the prelude (checked below);
+            // otherwise the offset is reset to 0 so a marker-less blank prefix
+            // leaves the command unchanged.
             offset += chunk.len();
             continue;
         }
@@ -607,7 +616,13 @@ fn prelude_end_offset(input: &str) -> usize {
         // from this byte on is returned verbatim.
         break;
     }
-    offset
+    // No marker anywhere in the leading prelude → nothing to strip; the blanks we
+    // walked are part of the command, not transport metadata.
+    if marker_seen {
+        offset
+    } else {
+        0
+    }
 }
 
 /// `true` when `input`'s LEADING prelude contains at least one
@@ -1065,6 +1080,37 @@ mod tests {
         // A `#` comment that is NOT a tirith-card marker is preserved.
         let other = "# just a note\necho hi";
         assert_eq!(strip_card_comment_lines(other), other);
+    }
+
+    #[test]
+    fn strip_leaves_marker_less_leading_blank_lines_intact() {
+        // CodeRabbit R6 #6: leading blank lines with NO `# tirith-card:` marker
+        // are part of the command, not transport metadata. `strip_card_comment_lines`
+        // must NOT drop them (it previously returned "echo hi" for "\n\necho hi",
+        // diverging from `strip_card_comment_lines_cow`, which borrows the input
+        // unchanged because `has_card_comment_prelude` is false).
+        assert_eq!(strip_card_comment_lines("\n\necho hi"), "\n\necho hi");
+        assert_eq!(prelude_end_offset("\n\necho hi"), 0);
+        // The two strip variants must agree on a marker-less input.
+        assert_eq!(
+            strip_card_comment_lines("\n\necho hi"),
+            strip_card_comment_lines_cow("\n\necho hi").as_ref()
+        );
+        // A single leading blank with no marker is likewise untouched.
+        assert_eq!(strip_card_comment_lines("\necho hi"), "\necho hi");
+
+        // But a marker FOLLOWED by blank lines strips the marker AND the
+        // transport blanks between it and the command.
+        assert_eq!(
+            strip_card_comment_lines("# tirith-card: ./c\n\necho hi"),
+            "echo hi"
+        );
+        // A blank line BEFORE the marker is also transport padding (a marker is
+        // present in the prelude), so the whole prelude is stripped.
+        assert_eq!(
+            strip_card_comment_lines("\n# tirith-card: ./c\necho hi"),
+            "echo hi"
+        );
     }
 
     #[test]

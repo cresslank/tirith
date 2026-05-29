@@ -64,7 +64,7 @@
 //! real `state_dir()` and NO env mutation. The production wrappers resolve
 //! `state_dir()` and delegate.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -433,27 +433,14 @@ pub fn hash_cwd_at(salt_file: &Path, cwd: Option<&str>) -> Option<String> {
 
 /// Parse the JSONL store, skipping blank / unparseable lines (fail-open).
 fn parse_store(path: &Path) -> Vec<Observation> {
-    let Ok(file) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
-    let reader = BufReader::new(file);
-    let mut out = Vec::new();
-    // Skip blank / unparseable lines AND continue past reader I/O errors
-    // (invalid UTF-8 mid-file). A previous `map_while(Result::ok)` stopped at
-    // the first reader Err, silently dropping every observation after it.
-    for line in reader.lines() {
-        let Ok(line) = line else {
-            continue;
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(obs) = serde_json::from_str::<Observation>(trimmed) {
-            out.push(obs);
-        }
-    }
-    out
+    // `read_store_lines` skips blank lines, skips a single recoverable
+    // invalid-UTF-8 line, and BREAKS on any other (persistent) read error so a
+    // corrupt store cannot spin the reader forever. We then drop lines that fail
+    // to parse as an `Observation` (fail-open).
+    crate::util::read_store_lines(path)
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Observation>(line).ok())
+        .collect()
 }
 
 /// Parse `seen_at` to a UTC timestamp; `None` when unparseable.
@@ -542,24 +529,11 @@ fn rewrite_store(store: &Path, obs: &[Observation]) -> std::io::Result<()> {
 /// first error, so a single bad byte cannot make the count short and starve the
 /// compaction trigger (unbounded growth).
 fn line_count(store: &Path) -> usize {
-    let Ok(file) = std::fs::File::open(store) else {
-        return 0;
-    };
-    // Explicit loop (not `map_while`/`filter_map`): a reader error on one line
-    // must skip THAT line and continue, never stop the count short (which would
-    // starve the compaction trigger). `map_while(Result::ok)` would stop at the
-    // first Err; clippy's `filter_map`->`map_while` suggestion is exactly the
-    // truncation we are avoiding here.
-    let mut count = 0usize;
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else {
-            continue;
-        };
-        if !line.trim().is_empty() {
-            count += 1;
-        }
-    }
-    count
+    // Same bounded-read contract as `parse_store`: a recoverable invalid-UTF-8
+    // line is skipped, a persistent read error breaks the loop (never stops the
+    // count short in a way that would starve the compaction trigger, and never
+    // spins). `read_store_lines` already drops blank lines.
+    crate::util::read_store_lines(store).len()
 }
 
 // ─── public API (test entry points) ──────────────────────────────────────────

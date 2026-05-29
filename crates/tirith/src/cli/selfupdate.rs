@@ -1559,13 +1559,6 @@ fn atomic_self_replace(dest: &Path, new_binary: &Path) -> Result<SwapResult, Str
         .map_err(|e| format!("could not write the new binary: {e}"))?;
     tmp.flush()
         .map_err(|e| format!("could not flush the new binary: {e}"))?;
-    // Durability: fsync the new binary's bytes to stable storage BEFORE the
-    // rename makes it the live `tirith`. `flush()` only drains the userspace
-    // buffer; a crash after the rename could otherwise leave a zero/partial
-    // (un-runnable) binary at `dest`.
-    tmp.as_file()
-        .sync_all()
-        .map_err(|e| format!("could not sync the new binary: {e}"))?;
 
     // 3. Make the temp file executable BEFORE it becomes the live binary, so
     //    there is never an instant where `tirith` exists but is not runnable.
@@ -1577,6 +1570,16 @@ fn atomic_self_replace(dest: &Path, new_binary: &Path) -> Result<SwapResult, Str
             .map_err(|e| format!("could not set executable permissions: {e}"))?;
     }
 
+    // Durability: fsync the new binary's bytes AND its mode to stable storage
+    // BEFORE the rename makes it the live `tirith`. `flush()` only drains the
+    // userspace buffer; a crash after the rename could otherwise leave a
+    // zero/partial binary at `dest`. The sync MUST follow `set_permissions`:
+    // fsyncing before the chmod can leave the file durable WITHOUT the exec bit
+    // (a durable-but-un-runnable `tirith`).
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("could not sync the new binary: {e}"))?;
+
     // 4. Atomic rename over the live binary.
     tmp.persist(dest).map_err(|e| {
         // The rename failed. The old binary is still in place (rename does not
@@ -1587,6 +1590,10 @@ fn atomic_self_replace(dest: &Path, new_binary: &Path) -> Result<SwapResult, Str
             e.error
         )
     })?;
+    // Durability of the rename itself: fsync the parent directory so the new
+    // name→inode entry survives a crash (the file data is synced above, the
+    // directory metadata is not). Best-effort; no-op on non-Unix.
+    fsync_parent_dir(dest);
 
     Ok(SwapResult {
         previous_backup: backup,
@@ -1630,11 +1637,6 @@ fn atomic_restore_from(dest: &Path, source: &Path) -> Result<(), String> {
         .map_err(|e| format!("could not write the rollback binary: {e}"))?;
     tmp.flush()
         .map_err(|e| format!("could not flush the rollback binary: {e}"))?;
-    // Durability: fsync before the rename makes this the live binary, so a crash
-    // after the rename cannot leave a zero/partial (un-runnable) binary at `dest`.
-    tmp.as_file()
-        .sync_all()
-        .map_err(|e| format!("could not sync the rollback binary: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1642,6 +1644,14 @@ fn atomic_restore_from(dest: &Path, source: &Path) -> Result<(), String> {
             .set_permissions(std::fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("could not set executable permissions: {e}"))?;
     }
+    // Durability: fsync AFTER `set_permissions`, before the rename makes this the
+    // live binary. fsyncing before the chmod could leave the restored binary
+    // durable WITHOUT the exec bit (a durable-but-un-runnable `tirith`); a crash
+    // after the rename must never leave a zero/partial or non-executable binary
+    // at `dest`.
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("could not sync the rollback binary: {e}"))?;
     tmp.persist(dest).map_err(|e| {
         format!(
             "could not atomically restore {}: {} (the current binary is intact)",
@@ -1649,8 +1659,29 @@ fn atomic_restore_from(dest: &Path, source: &Path) -> Result<(), String> {
             e.error
         )
     })?;
+    // Durability of the rename itself (see `atomic_self_replace`): fsync the
+    // parent directory so the new name→inode entry survives a crash.
+    fsync_parent_dir(dest);
     Ok(())
 }
+
+/// Best-effort fsync of `path`'s parent directory after a rename, so the new
+/// directory entry (name→inode) is durable. A bare file fsync persists the
+/// file's data but NOT the directory metadata recording its name, so a crash
+/// right after a rename can lose the entry. No-op on non-Unix (Windows exposes
+/// no directory-fsync); a parent that cannot be opened/synced is ignored —
+/// durability is best-effort and must never fail an otherwise-successful swap.
+#[cfg(unix)]
+fn fsync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn fsync_parent_dir(_path: &Path) {}
 
 /// Best-effort writability probe for a directory: try to create and delete a
 /// temp file in it. A `false` here lets `atomic_self_replace` fail with a

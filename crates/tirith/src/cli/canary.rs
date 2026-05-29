@@ -21,13 +21,31 @@ use tirith_core::canary::{self, CanaryEntry, CanaryKind};
 
 use super::{confirm, write_json_stdout};
 
+/// Emit an operator error as a machine-readable `{"error": ...}` JSON object on
+/// stdout when `--json`, or a human line on stderr otherwise. Keeps `--json`
+/// surfaces parseable on the validation-failure paths (unknown kind, bad
+/// callback URL, missing `--yes`) instead of emitting plain stderr that a JSON
+/// consumer cannot parse. Mirrors `cli::command_card::emit_error`.
+fn emit_error(json: bool, ctx: &str, msg: &str) {
+    if json {
+        let v = serde_json::json!({ "error": msg });
+        write_json_stdout(&v, &format!("{ctx}: failed to write JSON output"));
+    } else {
+        eprintln!("{ctx}: {msg}");
+    }
+}
+
 /// `tirith canary create <kind> [--callback-url <url>]` — generate and store a
 /// fresh synthetic canary token, printing the token + metadata.
 pub fn create(kind: &str, callback_url: Option<String>, json: bool) -> i32 {
     let Some(kind) = CanaryKind::parse(kind) else {
-        eprintln!(
-            "tirith canary create: unknown kind '{kind}' — supported: {}",
-            CanaryKind::all().join(", ")
+        emit_error(
+            json,
+            "tirith canary create",
+            &format!(
+                "unknown kind '{kind}' — supported: {}",
+                CanaryKind::all().join(", ")
+            ),
         );
         return 2;
     };
@@ -42,8 +60,10 @@ pub fn create(kind: &str, callback_url: Option<String>, json: bool) -> i32 {
         Some(url) => {
             let trimmed = url.trim();
             if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-                eprintln!(
-                    "tirith canary create: --callback-url must be an http(s) URL (got '{url}')"
+                emit_error(
+                    json,
+                    "tirith canary create",
+                    &format!("--callback-url must be an http(s) URL (got '{url}')"),
                 );
                 return 2;
             }
@@ -169,7 +189,11 @@ pub fn prune(id: &str, yes: bool, json: bool) -> i32 {
     // In JSON mode, require --yes to proceed non-interactively (no prompt on a
     // machine-readable surface). Without it, refuse rather than silently prune.
     if json && !yes {
-        eprintln!("tirith canary prune: --yes required in JSON mode to confirm removal");
+        emit_error(
+            json,
+            "tirith canary prune",
+            "--yes required in JSON mode to confirm removal",
+        );
         return 2;
     }
 
