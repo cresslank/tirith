@@ -199,8 +199,10 @@ const BASE64ISH: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0
 /// largest multiple of `len` that fits in a `u8` are accepted, so every
 /// alphabet character is equally likely. The token's unguessability comes from
 /// the OS CSPRNG; on the (astronomically unlikely) event `getrandom` fails we
-/// fall back to a deterministic-but-namespaced suffix so token generation never
-/// panics — a generated token is still clearly synthetic regardless.
+/// fall back to a per-call-VARYING pseudo-random suffix (see
+/// [`fill_fallback_bytes`]) so token generation never panics AND two calls in
+/// the same process don't collide — a generated token is still clearly
+/// synthetic regardless (CodeRabbit R9 #H).
 fn random_chars(alphabet: &[u8], n: usize) -> String {
     let len = alphabet.len();
     debug_assert!((1..=256).contains(&len), "alphabet must be 1..=256 bytes");
@@ -212,13 +214,25 @@ fn random_chars(alphabet: &[u8], n: usize) -> String {
     let mut buf = [0u8; 64];
     while out.len() < n {
         if getrandom::fill(&mut buf).is_err() {
-            // Entropy unavailable — extremely rare. Pad with a fixed marker so
-            // the caller still gets a clearly-synthetic, well-formed token
-            // rather than a panic or an empty suffix.
-            while out.len() < n {
-                out.push(alphabet[out.len() % len] as char);
+            // Entropy unavailable — extremely rare. Fill a fresh buffer from a
+            // per-CALL-varying source (process-lifetime counter + time) so the
+            // remaining bytes differ on every call rather than cycling the same
+            // alphabet head deterministically (which made `new_id` repeat IDs).
+            let mut fb = [0u8; 64];
+            fill_fallback_bytes(&mut fb);
+            for &b in fb.iter() {
+                if out.len() >= n {
+                    break;
+                }
+                if (b as usize) < limit {
+                    out.push(alphabet[(b as usize) % len] as char);
+                }
             }
-            break;
+            // `fill_fallback_bytes` advances its counter each call, so the loop
+            // makes progress and terminates; but guard against an alphabet whose
+            // `limit` rejects this particular buffer entirely by drawing again on
+            // the next `while` iteration (getrandom will be retried first).
+            continue;
         }
         for &b in buf.iter() {
             if out.len() >= n {
@@ -230,6 +244,42 @@ fn random_chars(alphabet: &[u8], n: usize) -> String {
         }
     }
     out
+}
+
+/// Fill `buf` with pseudo-random bytes from a per-call-VARYING seed, used ONLY
+/// when the OS CSPRNG (`getrandom`) is unavailable (CodeRabbit R9 #H). The seed
+/// mixes a process-lifetime monotonic counter (so two calls in the same process
+/// differ even at the same instant) with the wall-clock nanos (so it also
+/// differs across processes/restarts), expanded with SplitMix64.
+///
+/// This is NOT a cryptographic RNG and makes no unguessability claim — the
+/// fallback only needs to produce DISTINCT, well-formed synthetic tokens so
+/// repeated `new_id()` calls cannot collide. The CSPRNG path above is the one
+/// that carries the security property; this branch is the panic-free degradation.
+fn fill_fallback_bytes(buf: &mut [u8; 64]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    // Distinct per call (counter) and per wall-clock instant (nanos).
+    let mut state = counter
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(nanos)
+        .wrapping_add(1);
+    for chunk in buf.chunks_mut(8) {
+        // SplitMix64 step.
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let bytes = z.to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
 }
 
 /// A 12-hex-char random id.
@@ -444,6 +494,12 @@ fn rewrite_store(store: &Path, entries: &[CanaryEntry]) -> std::io::Result<()> {
     tmp.flush()?;
     tmp.as_file().sync_all()?;
     tmp.persist(store).map_err(|e| e.error)?;
+    // Durability of the RENAME itself (CodeRabbit R9 #B): the body is fsync'd
+    // above, but the new directory entry is not crash-durable until the parent
+    // dir is fsync'd. A lost rewrite could resurrect a stale store (e.g. an
+    // un-pruned canary that no longer exists, or drop a still-live one). fsync
+    // the parent so the published store survives a crash. Best-effort, unix-only.
+    crate::util::fsync_parent_dir(store);
     Ok(())
 }
 
@@ -801,6 +857,43 @@ mod tests {
         let pem = generate_token(CanaryKind::PrivateKeyShaped);
         assert!(pem.contains("BEGIN TIRITH CANARY PRIVATE KEY"));
         assert!(pem.contains("TIRITHCANARY"));
+    }
+
+    #[test]
+    fn getrandom_fallback_bytes_vary_per_call() {
+        // CodeRabbit R9 #H: the getrandom-failure fallback must NOT be
+        // deterministic — the old code cycled the same alphabet head every call,
+        // so `new_id()` could repeat IDs. `fill_fallback_bytes` advances a
+        // process-lifetime counter (+ time), so two consecutive fills differ.
+        let mut a = [0u8; 64];
+        let mut b = [0u8; 64];
+        fill_fallback_bytes(&mut a);
+        fill_fallback_bytes(&mut b);
+        assert_ne!(
+            a, b,
+            "two fallback fills in the same process must differ (counter advances)"
+        );
+
+        // And the alphabet-mapped IDs derived from successive fallback buffers
+        // differ too — i.e. the collision `new_id` would have produced is gone.
+        let id_from = |buf: &[u8; 64]| -> String {
+            let len = HEX.len();
+            let limit = (256 / len) * len;
+            buf.iter()
+                .filter(|&&x| (x as usize) < limit)
+                .take(12)
+                .map(|&x| HEX[(x as usize) % len] as char)
+                .collect()
+        };
+        let mut c = [0u8; 64];
+        let mut d = [0u8; 64];
+        fill_fallback_bytes(&mut c);
+        fill_fallback_bytes(&mut d);
+        assert_ne!(
+            id_from(&c),
+            id_from(&d),
+            "successive fallback-derived ids must not collide"
+        );
     }
 
     #[test]

@@ -211,20 +211,33 @@ impl CommandsManifest {
     /// True when `command` exactly matches an `allowed[*].command` (after
     /// trimming surrounding ASCII whitespace on both sides). Returns the
     /// matching entry's `name` for audit context.
+    ///
+    /// ASCII-ONLY trim (CodeRabbit R9 #A), in lockstep with the ASCII-only
+    /// [`crate::command_card::Card::command_matches`] gate. `str::trim` strips
+    /// the full Unicode `White_Space` set; a manifest entry padded with a
+    /// Unicode-whitespace char (e.g. a U+00A0 NO-BREAK SPACE) would then trim
+    /// equal to an ASCII-space command, disagreeing with the command-card gate
+    /// (which would treat it as a mismatch). Both comparators MUST agree on
+    /// exactly which bytes are whitespace, so manifest matching trims ASCII only.
     pub fn match_allowed(&self, command: &str) -> Option<&str> {
-        let needle = command.trim();
+        let needle = trim_ascii_ws(command);
         self.allowed
             .iter()
-            .find(|e| e.command.trim() == needle)
+            .find(|e| trim_ascii_ws(&e.command) == needle)
             .map(|e| e.name.as_str())
     }
 
     /// All `dangerous[*]` entries whose glob pattern matches `command`.
+    ///
+    /// ASCII-ONLY trim on both the command and each pattern (CodeRabbit R9 #A),
+    /// matching [`Self::match_allowed`] and the command-card gate — see that
+    /// method's note. A Unicode-whitespace-padded `dangerous[*].pattern` must
+    /// not silently trim to a bare glob.
     pub fn match_dangerous(&self, command: &str) -> Vec<&DangerousEntry> {
-        let needle = command.trim();
+        let needle = trim_ascii_ws(command);
         self.dangerous
             .iter()
-            .filter(|e| glob_match(e.pattern.trim(), needle))
+            .filter(|e| glob_match(trim_ascii_ws(&e.pattern), needle))
             .collect()
     }
 
@@ -491,6 +504,18 @@ dangerous:
     action: block
 "#;
 
+/// Trim ONLY ASCII whitespace from both ends, never the full Unicode
+/// `White_Space` set. Load-bearing for the manifest command/pattern comparison
+/// (CodeRabbit R9 #A): it MUST agree, byte-for-byte, with the ASCII-only
+/// [`crate::command_card::Card::command_matches`] mismatch gate on which bytes
+/// count as surrounding whitespace. `str::trim` would additionally strip
+/// U+00A0 / U+2007 / etc., letting a Unicode-whitespace-padded manifest entry
+/// match a command the command-card gate would reject — the two must not
+/// disagree on whitespace.
+fn trim_ascii_ws(s: &str) -> &str {
+    s.trim_matches(|c: char| c.is_ascii_whitespace())
+}
+
 /// Minimal glob matcher supporting only the `*` wildcard (matches any run of
 /// characters, including the empty string). No `?`, no character classes, no
 /// regex. Anchored at both ends (the whole `text` must be consumed).
@@ -605,6 +630,64 @@ mod tests {
         // No trailing ` | bash`, so no match.
         assert!(m.match_dangerous("curl https://x/i.sh").is_empty());
         assert!(m.match_dangerous("npm test").is_empty());
+    }
+
+    #[test]
+    fn match_uses_ascii_only_whitespace_trim() {
+        // CodeRabbit R9 #A: manifest matching must trim ONLY ASCII whitespace,
+        // in lockstep with the ASCII-only command-card `command_matches` gate. A
+        // U+00A0 NO-BREAK SPACE is Unicode whitespace but NOT ASCII whitespace.
+        let nbsp = '\u{00A0}';
+
+        // (a) A manifest `allowed[]` entry padded with a NO-BREAK SPACE must NOT
+        // match an ASCII-space command — `str::trim` would have wrongly equated
+        // them, disagreeing with the command-card gate.
+        let padded_entry = CommandsManifest::from_yaml(&format!(
+            "allowed:\n  - name: build\n    command: \"npm run build{nbsp}\"\n"
+        ))
+        .expect("parses");
+        assert_eq!(
+            padded_entry.match_allowed("npm run build"),
+            None,
+            "a U+00A0-padded allowed entry must not match an ASCII-space command"
+        );
+        // And the reverse: a NBSP-padded command must not match a clean entry.
+        let clean_entry = CommandsManifest::from_yaml(
+            "allowed:\n  - name: build\n    command: \"npm run build\"\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            clean_entry.match_allowed(&format!("npm run build{nbsp}")),
+            None,
+            "a U+00A0-padded command must not match a clean allowed entry"
+        );
+        // ASCII-space padding on EITHER side still trims equal (the legitimate case).
+        assert_eq!(
+            clean_entry.match_allowed("  npm run build  "),
+            Some("build"),
+            "ASCII whitespace must still trim equal"
+        );
+
+        // (b) Same contract for `dangerous[]` patterns: a NBSP-padded pattern
+        // must not silently trim to a bare glob that matches an ASCII command.
+        let padded_pattern = CommandsManifest::from_yaml(&format!(
+            "dangerous:\n  - pattern: \"rm -rf /{nbsp}\"\n    action: block\n"
+        ))
+        .expect("parses");
+        assert!(
+            padded_pattern.match_dangerous("rm -rf /").is_empty(),
+            "a U+00A0-padded dangerous pattern must not match an ASCII-space command"
+        );
+        // The same pattern WITHOUT the NBSP matches (proves the padding is the
+        // sole reason for the miss above, not an unrelated glob failure).
+        let clean_pattern = CommandsManifest::from_yaml(
+            "dangerous:\n  - pattern: \"rm -rf /\"\n    action: block\n",
+        )
+        .expect("parses");
+        assert!(
+            !clean_pattern.match_dangerous("rm -rf /").is_empty(),
+            "the equivalent un-padded pattern must still match"
+        );
     }
 
     #[test]

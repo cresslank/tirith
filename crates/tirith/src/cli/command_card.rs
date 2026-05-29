@@ -60,7 +60,14 @@ pub fn create(
     // time (which does not trim) — a card that creates but never verifies.
     let expires = expires.trim().to_string();
     if chrono::NaiveDate::parse_from_str(&expires, "%Y-%m-%d").is_err() {
-        eprintln!("tirith command-card create: --expires must be YYYY-MM-DD (got '{expires}')");
+        // CodeRabbit R9 #J: route through the JSON-aware error emitter so a
+        // `--json` caller gets a parseable `{"error": …}` object, not a bare
+        // stderr line.
+        emit_error(
+            json,
+            "tirith command-card create",
+            &format!("--expires must be YYYY-MM-DD (got '{expires}')"),
+        );
         return 2;
     }
 
@@ -83,7 +90,9 @@ pub fn create(
             0
         }
         Err(e) => {
-            eprintln!("tirith command-card create: {e}");
+            // Same JSON-aware path as the --expires error (CodeRabbit R9 #J):
+            // a serialization failure under --json must be a parseable object.
+            emit_error(json, "tirith command-card create", &e.to_string());
             1
         }
     }
@@ -366,6 +375,11 @@ pub fn fetch(url: &str, json: bool) -> i32 {
         // Cache hit: identical bytes already at `dest`. Fall through to report
         // the cached path as success.
     }
+    // Durability of the RENAME (CodeRabbit R9 #B): fsync the parent dir so the
+    // newly cached card's directory entry survives a crash — the verify hot path
+    // reads this file back. Best-effort, unix-only (matches the card-SIGN path's
+    // parent fsync in `write_card_atomic`).
+    tirith_core::util::fsync_parent_dir(&dest);
 
     if json {
         let v = serde_json::json!({

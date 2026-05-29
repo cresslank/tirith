@@ -263,14 +263,29 @@ fn salt_state(salt_file: &Path) -> std::sync::Arc<SaltState> {
 /// hash and fire `AnomalyFirstTimeInThisRepo` forever (F4).
 fn load_salt_state(salt_file: &Path) -> SaltState {
     let mut existing_is_corrupt = false;
-    if let Ok(bytes) = std::fs::read(salt_file) {
-        if bytes.len() == SALT_LEN {
-            return SaltState::Ready(bytes);
+    // CodeRabbit R9 #C: guard the salt read against a non-regular file. A FIFO/
+    // device at the salt path would block a plain `std::fs::read` forever. Stat
+    // first: a present non-regular file is treated as corrupt (overwrite path,
+    // same as a wrong-length salt) rather than read; an absent file falls through
+    // to fresh-salt generation. The salt is exactly `SALT_LEN` bytes, so a
+    // regular file is read directly (no unbounded alloc concern).
+    match std::fs::metadata(salt_file) {
+        Ok(meta) if meta.is_file() => {
+            if let Ok(bytes) = std::fs::read(salt_file) {
+                if bytes.len() == SALT_LEN {
+                    return SaltState::Ready(bytes);
+                }
+                // A short/oversized salt file is corrupt — must be OVERWRITTEN,
+                // not adopted (I2). Remember this so persist replaces it
+                // atomically rather than treating `AlreadyExists` as "another
+                // process won the race".
+                existing_is_corrupt = true;
+            }
         }
-        // A short/oversized salt file is corrupt — must be OVERWRITTEN, not
-        // adopted (I2). Remember this so persist replaces it atomically rather
-        // than treating an `AlreadyExists` as "another process won the race".
-        existing_is_corrupt = true;
+        // Present but NOT a regular file → corrupt (overwrite), never block on it.
+        Ok(_) => existing_is_corrupt = true,
+        // Absent (or unstattable) → fall through to fresh-salt generation.
+        Err(_) => {}
     }
 
     // Generate a fresh 32-byte salt from the OS RNG. On the (extremely unlikely)
@@ -333,7 +348,14 @@ fn persist_salt(salt_file: &Path, salt: &[u8], replace_corrupt: bool) -> std::io
                 .set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
         tmp.write_all(salt)?;
+        // Durability (CodeRabbit R9 #B): fsync the new salt to stable storage
+        // BEFORE the rename publishes it, then fsync the parent dir so the
+        // rename's directory entry is durable too. A lost overwrite would leave
+        // the corrupt salt in place; a body synced but entry lost would lose the
+        // new salt. Best-effort parent fsync (unix-only).
+        tmp.as_file().sync_all()?;
         tmp.persist(salt_file).map_err(|e| e.error)?;
+        crate::util::fsync_parent_dir(salt_file);
         return Ok(salt.to_vec());
     }
 
@@ -520,7 +542,15 @@ fn rewrite_store(store: &Path, obs: &[Observation]) -> std::io::Result<()> {
         let line = serde_json::to_string(o).map_err(std::io::Error::other)?;
         writeln!(tmp, "{line}")?;
     }
+    // Durability (CodeRabbit R9 #B): fsync the compacted body to stable storage
+    // BEFORE the rename, then fsync the parent dir so the rename's directory
+    // entry is durable too — otherwise a crash could leave the store renamed
+    // into place over zero/partial bytes, or lose the new entry entirely.
+    // Best-effort parent fsync (unix-only).
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
     tmp.persist(store).map_err(|e| e.error)?;
+    crate::util::fsync_parent_dir(store);
     Ok(())
 }
 

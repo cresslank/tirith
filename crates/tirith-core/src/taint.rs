@@ -370,7 +370,15 @@ fn rewrite_store(store: &Path, entries: &[TaintEntry]) -> std::io::Result<()> {
         let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
         writeln!(tmp, "{line}")?;
     }
+    // Durability (CodeRabbit R9 #B): fsync the rewritten body to stable storage
+    // BEFORE the rename, then fsync the parent dir so the rename's directory
+    // entry is durable too. A lost rewrite could drop a still-live taint marker
+    // (a security miss) or resurrect a cleared one. Best-effort parent fsync
+    // (unix-only).
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
     tmp.persist(store).map_err(|e| e.error)?;
+    crate::util::fsync_parent_dir(store);
     Ok(())
 }
 

@@ -365,7 +365,7 @@ pub fn run(name: &str, json: bool) -> i32 {
         eprintln!("Running allowed command '{name}': {command}");
     }
 
-    match run_shell_command(&command) {
+    match run_shell_command(&command, json) {
         Ok(code) => code,
         Err(e) => {
             // The combined object (running:true) was already written to stdout;
@@ -537,8 +537,8 @@ fn analyze_command(command: &str, cwd: Option<&str>) -> tirith_core::verdict::Ve
     engine::analyze(&ctx)
 }
 
-/// Run `command` through the platform shell, inheriting stdio. Returns the
-/// child's exit code (128 if killed by a signal with no code).
+/// Run `command` through the platform shell. Returns the child's exit code (128
+/// if killed by a signal with no code).
 ///
 /// The shell family here MUST match what [`analyze_command`] tokenized with
 /// (see [`RUN_SHELL`]): the safety re-check is only sound if the engine parsed
@@ -548,7 +548,17 @@ fn analyze_command(command: &str, cwd: Option<&str>) -> tirith_core::verdict::Ve
 /// semantics differ from POSIX, which would let the re-check parse a DIFFERENT
 /// command than the one actually executed. Windows uses `cmd /C` (matching
 /// `ShellType::Cmd`).
-fn run_shell_command(command: &str) -> std::io::Result<i32> {
+///
+/// STDOUT ROUTING (CodeRabbit R9 #E): in `--json` mode tirith's stdout is exactly
+/// ONE JSON document (already written before this call). If the child inherited
+/// stdout, its output would append to that document and corrupt it. So in JSON
+/// mode the child's stdout is REDIRECTED to tirith's stderr — the operator still
+/// sees the command's output, but tirith's stdout stays pure JSON. The child's
+/// own stderr is inherited in both modes. In human mode the child inherits stdout
+/// normally (output goes straight to the terminal, unchanged).
+fn run_shell_command(command: &str, json: bool) -> std::io::Result<i32> {
+    use std::process::Stdio;
+
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(command);
@@ -560,7 +570,32 @@ fn run_shell_command(command: &str) -> std::io::Result<i32> {
         c.arg("-c").arg(command);
         c
     };
-    let status = cmd.status()?;
+
+    if !json {
+        // Human mode: child inherits stdout/stderr; behavior unchanged.
+        return Ok(cmd.status()?.code().unwrap_or(128));
+    }
+
+    // JSON mode: pipe the child's stdout and copy it to OUR stderr on a helper
+    // thread (so a large output cannot deadlock by filling the pipe), keeping
+    // tirith's stdout a single JSON document. The child's stderr is inherited.
+    cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
+    let mut child = cmd.spawn()?;
+    let pump = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            // Stream child stdout → tirith's stderr. Best-effort: a copy error
+            // (e.g. closed stderr) must not abort the child wait below.
+            let mut err = std::io::stderr();
+            let _ = std::io::copy(&mut out, &mut err);
+        })
+    });
+    let status = child.wait()?;
+    if let Some(h) = pump {
+        // Join the pump so all child output is flushed to stderr before we return
+        // (and the thread never outlives the process). The child has exited, so
+        // its stdout pipe is at EOF and the copy completes promptly.
+        let _ = h.join();
+    }
     Ok(status.code().unwrap_or(128))
 }
 

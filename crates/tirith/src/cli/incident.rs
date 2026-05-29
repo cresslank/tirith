@@ -535,16 +535,32 @@ fn append_timeline(s: &mut String, since: Option<u64>) {
     rows.reverse();
 
     if rows.is_empty() {
-        s.push_str("_No audit entries in the incident window._\n\n");
+        // CodeRabbit R9 #K: only call it an "incident window" when there IS one.
+        if since.is_some() {
+            s.push_str("_No audit entries in the incident window._\n\n");
+        } else {
+            s.push_str("_No recent audit entries._\n\n");
+        }
         return;
     }
 
     let shown = rows.len().min(REPORT_TIMELINE_ROWS);
-    s.push_str(&format!(
-        "{} entr{} since incident start (showing {shown}):\n\n",
-        rows.len(),
-        if rows.len() == 1 { "y" } else { "ies" }
-    ));
+    // CodeRabbit R9 #K: when there is NO active incident (`since` is None) the
+    // rows are simply the most recent entries, not entries "since incident
+    // start" — use a no-incident-appropriate label so the report doesn't claim a
+    // window that doesn't exist.
+    let plural = if rows.len() == 1 { "y" } else { "ies" };
+    if since.is_some() {
+        s.push_str(&format!(
+            "{} entr{plural} since incident start (showing {shown}):\n\n",
+            rows.len(),
+        ));
+    } else {
+        s.push_str(&format!(
+            "{} recent entr{plural} (showing {shown}):\n\n",
+            rows.len(),
+        ));
+    }
     s.push_str("| time | action | rules | command (redacted) |\n");
     s.push_str("| --- | --- | --- | --- |\n");
     for r in rows.into_iter().take(REPORT_TIMELINE_ROWS) {
@@ -613,7 +629,12 @@ fn append_top_findings(s: &mut String, since: Option<u64>) {
         }
     }
     if counts.is_empty() {
-        s.push_str("_No findings recorded in the incident window._\n\n");
+        // CodeRabbit R9 #K: match the timeline's no-incident wording.
+        if since.is_some() {
+            s.push_str("_No findings recorded in the incident window._\n\n");
+        } else {
+            s.push_str("_No findings recorded recently._\n\n");
+        }
         return;
     }
     let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();

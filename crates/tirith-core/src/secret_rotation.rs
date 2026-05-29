@@ -211,7 +211,11 @@ pub static PROVIDERS: &[Provider] = &[
             "Update env files, CI secrets, and any SDK configuration.",
             "Review usage in the dashboard for unexpected spend.",
         ],
-        key_prefix_shapes: &["sk-proj-", "sk-svcacct-", "sk-"],
+        // Env-var NAME marker (CodeRabbit R9 #I): a redacted audit record masks the
+        // `sk-…` value (`OPENAI_API_KEY=[REDACTED]` / `[REDACTED:OpenAI API Key]`),
+        // so the `sk-` shape is gone post-mask — but the var name survives and is
+        // enough to attribute. Mirrors aws's `aws_secret_access_key` marker.
+        key_prefix_shapes: &["sk-proj-", "sk-svcacct-", "sk-", "OPENAI_API_KEY"],
         last_verified: LAST_VERIFIED,
     },
     Provider {
@@ -225,7 +229,12 @@ pub static PROVIDERS: &[Provider] = &[
             "Update env files, CI secrets, and any SDK configuration.",
             "Review usage for unexpected activity.",
         ],
-        key_prefix_shapes: &["sk-ant-api", "sk-ant-"],
+        // Env-var NAME marker (CodeRabbit R9 #I): same rationale as openai — the
+        // masked record keeps `ANTHROPIC_API_KEY` even after the `sk-ant-…` value
+        // is redacted. `ANTHROPIC_API_KEY` (17 bytes) is longer than openai's
+        // `OPENAI_API_KEY` (14) and shares no substring, so the longest-match
+        // tie-break still routes each var name to the right provider.
+        key_prefix_shapes: &["sk-ant-api", "sk-ant-", "ANTHROPIC_API_KEY"],
         last_verified: LAST_VERIFIED,
     },
     Provider {
@@ -509,6 +518,59 @@ mod tests {
             Some("anthropic")
         );
         assert!(match_provider("nothing credential-shaped here").is_none());
+    }
+
+    #[test]
+    fn redacted_env_var_names_still_attribute_openai_and_anthropic() {
+        // CodeRabbit R9 #I: triage matches the POST-mask `command_redacted`. Once
+        // the engine masks the value, the `sk-…` shape is gone — but the env-var
+        // NAME survives and must still attribute. (Mirrors aws's
+        // `aws_secret_access_key` marker.)
+        assert_eq!(
+            match_provider("OPENAI_API_KEY=[REDACTED]").map(|p| p.provider),
+            Some("openai"),
+            "a masked OPENAI_API_KEY record must still route to openai"
+        );
+        assert_eq!(
+            match_provider("OPENAI_API_KEY=[REDACTED:OpenAI API Key]").map(|p| p.provider),
+            Some("openai"),
+            "the builtin-redactor label form must also route to openai"
+        );
+        assert_eq!(
+            match_provider("ANTHROPIC_API_KEY=[REDACTED]").map(|p| p.provider),
+            Some("anthropic"),
+            "a masked ANTHROPIC_API_KEY record must still route to anthropic"
+        );
+        // Case-insensitive: an upper/lower-cased var name still attributes.
+        assert_eq!(
+            match_provider("export openai_api_key=[REDACTED]").map(|p| p.provider),
+            Some("openai")
+        );
+        // The two var names must not cross-attribute (no shared substring).
+        assert_eq!(
+            match_provider("ANTHROPIC_API_KEY=[REDACTED:Anthropic API Key]").map(|p| p.provider),
+            Some("anthropic"),
+            "ANTHROPIC_API_KEY must not be mis-routed to openai"
+        );
+    }
+
+    #[test]
+    fn triage_attributes_masked_openai_env_record() {
+        // End-to-end through `triage_records`: a verdict record whose
+        // `command_redacted` is a MASKED `OPENAI_API_KEY=…` assignment triages to
+        // openai (the rotation next-step points at OpenAI's revocation URL).
+        let rec = verdict(
+            "2026-05-01T00:00:00Z",
+            &["credential_in_text"],
+            "export OPENAI_API_KEY=[REDACTED:OpenAI API Key]",
+        );
+        let items = triage_records(&[rec], 0);
+        assert_eq!(items.len(), 1, "one credential rule → one triage item");
+        assert_eq!(
+            items[0].provider.map(|p| p.provider),
+            Some("openai"),
+            "the masked OPENAI_API_KEY record must triage to openai"
+        );
     }
 
     #[test]

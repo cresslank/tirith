@@ -1385,10 +1385,20 @@ fn baseline_ecosystem_for_leader(leader: &str) -> Option<&'static str> {
 /// `rule_id` + per-finding host hash. Returns the components plus the bare,
 /// de-sudo'd leader (so the per-finding host derivation and ecosystem agree on
 /// the same parse).
-fn baseline_shared_components(ctx: &AnalysisContext) -> (Option<String>, bool, Option<String>) {
+///
+/// Tokenizes `command` — which in Exec context is the prelude-STRIPPED command
+/// (`analyzed_input`), NOT the raw `ctx.input` (CodeRabbit R9 #D). A leading
+/// `# tirith-card:` prelude is transport metadata, not part of the command the
+/// operator ran; tokenizing it would make the first segment a `#` comment and
+/// skew the leader/ecosystem/sudo classification of the baseline tuple. In
+/// Paste / FileScan the caller passes `ctx.input` verbatim (no stripping there).
+fn baseline_shared_components(
+    ctx: &AnalysisContext,
+    command: &str,
+) -> (Option<String>, bool, Option<String>) {
     use crate::tokenize;
 
-    let segs = tokenize::tokenize(&ctx.input, ctx.shell);
+    let segs = tokenize::tokenize(command, ctx.shell);
     let (sudo_flag, ecosystem) = match segs.first().and_then(|s| s.command.as_deref()) {
         Some(raw) => {
             let leader = raw
@@ -1466,6 +1476,7 @@ fn baseline_host_hash_for_finding(
 fn apply_baseline(
     ctx: &AnalysisContext,
     policy: &Policy,
+    analyzed_input: &str,
     extracted: &[crate::extract::ExtractedUrl],
     findings: &mut Vec<Finding>,
 ) {
@@ -1498,7 +1509,7 @@ fn apply_baseline(
         return;
     }
 
-    let (ecosystem, sudo_flag, cwd_repo_hash) = baseline_shared_components(ctx);
+    let (ecosystem, sudo_flag, cwd_repo_hash) = baseline_shared_components(ctx, analyzed_input);
 
     // De-duplicate tuples within this single analysis: record each unique tuple
     // once, and track the strongest novelty seen so we surface at most one
@@ -2546,7 +2557,10 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     // anomaly finding for a first-time / rare pattern; record the observation
     // regardless. A no-op (zero baseline I/O) when the flag is off — the common
     // case. Runs before enrichment so the anomaly finding is enriched too.
-    apply_baseline(ctx, &policy, &extracted, &mut findings);
+    // Pass `analyzed_input` (the prelude-stripped command in Exec) so the
+    // baseline tuple is derived from the real command, not a `# tirith-card:`
+    // wrapper line (CodeRabbit R9 #D).
+    apply_baseline(ctx, &policy, &analyzed_input, &extracted, &mut findings);
 
     enrich_pro(&mut findings);
     enrich_team(&mut findings);
@@ -4462,7 +4476,7 @@ mod tests {
         assert!(!policy.baseline_enabled, "default must be OFF");
         let mut findings = vec![synthetic_finding(crate::verdict::RuleId::CurlPipeShell)];
         let before = findings.len();
-        apply_baseline(&ctx, &policy, &[], &mut findings);
+        apply_baseline(&ctx, &policy, &ctx.input, &[], &mut findings);
         assert_eq!(
             findings.len(),
             before,
@@ -4488,7 +4502,7 @@ mod tests {
             ..Policy::default()
         };
         let mut findings: Vec<Finding> = vec![];
-        apply_baseline(&ctx, &policy, &[], &mut findings);
+        apply_baseline(&ctx, &policy, &ctx.input, &[], &mut findings);
         assert!(findings.is_empty(), "no findings in, no findings out");
     }
 
@@ -4497,21 +4511,48 @@ mod tests {
         // `sudo npm install …` → sudo_flag true, ecosystem npm (the wrapped
         // command's ecosystem, not sudo's).
         let ctx = exec_ctx("sudo npm install left-pad");
-        let (eco, sudo, _cwd) = baseline_shared_components(&ctx);
+        let (eco, sudo, _cwd) = baseline_shared_components(&ctx, &ctx.input);
         assert!(sudo, "sudo leader → sudo_flag true");
         assert_eq!(eco.as_deref(), Some("npm"), "wrapped ecosystem classified");
 
         // Plain `pip3 install x` → not sudo, ecosystem pypi.
         let ctx2 = exec_ctx("pip3 install requests");
-        let (eco2, sudo2, _) = baseline_shared_components(&ctx2);
+        let (eco2, sudo2, _) = baseline_shared_components(&ctx2, &ctx2.input);
         assert!(!sudo2);
         assert_eq!(eco2.as_deref(), Some("pypi"));
 
         // A non-ecosystem command → no ecosystem label, not sudo.
         let ctx3 = exec_ctx("echo hello");
-        let (eco3, sudo3, _) = baseline_shared_components(&ctx3);
+        let (eco3, sudo3, _) = baseline_shared_components(&ctx3, &ctx3.input);
         assert!(!sudo3);
         assert_eq!(eco3, None);
+    }
+
+    #[test]
+    fn baseline_shared_components_strips_card_prelude() {
+        // CodeRabbit R9 #D: in Exec context the baseline tuple must be derived
+        // from the prelude-STRIPPED command, not the raw `# tirith-card:` marker
+        // line. A clean command carried behind a card prelude must classify
+        // IDENTICALLY to the same command without the prelude — otherwise the
+        // first segment is the `#` comment and the leader/ecosystem/sudo are
+        // skewed (e.g. ecosystem reads None instead of npm).
+        let with_prelude = exec_ctx("# tirith-card: ./c.json\nsudo npm install left-pad");
+        let stripped = crate::command_card::strip_card_comment_lines_cow(&with_prelude.input);
+        let (eco_p, sudo_p, _) = baseline_shared_components(&with_prelude, &stripped);
+
+        let plain = exec_ctx("sudo npm install left-pad");
+        let (eco_b, sudo_b, _) = baseline_shared_components(&plain, &plain.input);
+
+        assert_eq!(
+            eco_p, eco_b,
+            "prelude-stripped command must classify the same ecosystem"
+        );
+        assert_eq!(
+            sudo_p, sudo_b,
+            "sudo flag must match the un-prelude'd command"
+        );
+        assert_eq!(eco_p.as_deref(), Some("npm"));
+        assert!(sudo_p, "the real leader is `sudo`, not the `#` comment");
     }
 
     #[test]

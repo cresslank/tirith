@@ -8842,6 +8842,63 @@ fn command_card_create_rejects_whitespace_only_command() {
     );
 }
 
+/// CodeRabbit R9 #J: an invalid `--expires` under `--json` must emit a parseable
+/// `{"error": ...}` object on stdout, not a bare stderr line.
+#[test]
+fn command_card_create_invalid_expires_json_is_parseable_error() {
+    let json = tirith()
+        .args([
+            "command-card",
+            "create",
+            "--json",
+            "--command",
+            "echo hi",
+            "--expires",
+            "bad",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("create --json --expires bad");
+    assert_eq!(
+        json.status.code(),
+        Some(2),
+        "invalid --expires must exit 2 in JSON mode too"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout)
+        .expect("invalid --expires under --json must yield a parseable JSON error on stdout");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("--expires must be YYYY-MM-DD"),
+        "JSON error must carry the --expires validation message, got: {v}"
+    );
+
+    // Human mode (no --json) still writes the message to stderr and emits no card.
+    let human = tirith()
+        .args([
+            "command-card",
+            "create",
+            "--command",
+            "echo hi",
+            "--expires",
+            "bad",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("create --expires bad (human)");
+    assert_eq!(human.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&human.stderr).contains("--expires must be YYYY-MM-DD"),
+        "human stderr must explain the --expires failure, got: {}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert!(
+        human.stdout.is_empty(),
+        "no card JSON should be emitted on the --expires rejection path"
+    );
+}
+
 /// Regression (CRITICAL): a card carried via a `# tirith-card: <path>` COMMENT
 /// (not the `--card` sidecar) must VERIFY when its signed `command` matches the
 /// real command on the following line. The marker line is transport metadata
@@ -10338,7 +10395,14 @@ fn commands_run_interactive_warn_decline_refuses() {
 // parses as a single object for an allowed-clean, a warn, and a blocked command.
 // The allowed/warn commands write nothing to stdout (`true`, redirect to
 // /dev/null) so stdout is exactly tirith's one object.
+//
+// CodeRabbit R9 #F: these three pin POSIX-shell behavior (`true`, `echo … >
+// /dev/null`, `curl … | bash`) and `commands run` executes via `cmd /C` on
+// Windows, so they are `#[cfg(unix)]`-gated — `cmd` does not understand these
+// payloads. The child-stdout→stderr redirect (R9 #E) is covered by
+// `commands_run_json_child_stdout_stays_off_json_stdout` below.
 
+#[cfg(unix)]
 #[test]
 fn commands_run_json_emits_single_object_when_allowed_clean() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -10371,6 +10435,7 @@ fn commands_run_json_emits_single_object_when_allowed_clean() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn commands_run_json_emits_single_object_when_warn() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -10418,6 +10483,7 @@ fn commands_run_json_emits_single_object_when_warn() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn commands_run_json_emits_single_object_when_blocked() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -10464,6 +10530,59 @@ fn commands_run_json_emits_single_object_when_blocked() {
     assert!(
         ids.iter().any(|id| id == "curl_pipe_shell"),
         "the blocking finding must be embedded in the single object, got ids: {ids:?}"
+    );
+}
+
+/// CodeRabbit R9 #E: a `commands run --json` whose child WRITES to stdout must
+/// keep tirith's stdout a SINGLE JSON document — the child's stdout is
+/// redirected to stderr so the operator still sees it, but it never appends to
+/// (and corrupts) the JSON. POSIX-shell only (`echo`/`$(…)` semantics; Windows
+/// `commands run` uses `cmd /C`), so `#[cfg(unix)]`.
+#[cfg(unix)]
+#[test]
+fn commands_run_json_child_stdout_stays_off_json_stdout() {
+    let root = tempfile::tempdir().expect("tempdir");
+    // The command is clean (Allow). Its OUTPUT is the CONTIGUOUS token
+    // `aaaCHILDccc`, assembled at runtime via `$(printf CHILD)` — that exact
+    // contiguous string does NOT appear in the command TEXT (which is split by
+    // `$(printf …)`), so finding it on stdout would mean the child's real
+    // stdout leaked into the JSON document, not merely the echoed-back command.
+    write_root_manifest(
+        root.path(),
+        "allowed:\n  - name: say\n    command: \"echo aaa$(printf CHILD)ccc\"\n",
+    );
+
+    let out = commands_tirith(root.path())
+        .args(["commands", "run", "say", "--json"])
+        .output()
+        .expect("commands run say --json");
+
+    // tirith's stdout must be EXACTLY one JSON object — the child's output must
+    // NOT be concatenated onto it.
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be exactly ONE JSON object even when the child prints to \
+             stdout, parse failed ({e}); stdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(v["name"], "say");
+    assert_eq!(v["action"], "allow");
+    assert_eq!(v["running"], true);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Sanity: the command STRING is present in the JSON (it is the `command`
+    // field) but the assembled CHILD OUTPUT token is the discriminator.
+    assert!(
+        !stdout.contains("aaaCHILDccc"),
+        "the child's assembled stdout token must NOT appear on tirith's JSON \
+         stdout, got:\n{stdout}"
+    );
+    // … and the child output IS present on stderr (operator still sees it).
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("aaaCHILDccc"),
+        "child stdout must be redirected to stderr in --json mode, stderr:\n{stderr}"
     );
 }
 

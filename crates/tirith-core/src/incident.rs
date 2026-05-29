@@ -219,18 +219,61 @@ pub fn read_flag() -> FlagRead {
     }
 }
 
+/// The hot-path read cap for the incident flag. The flag is a tiny JSON object
+/// (`started_at` / `started_by` / `reason`); 64 KiB is far more than a genuine
+/// flag needs, so anything larger is treated as corrupt rather than buffered.
+const FLAG_READ_CAP: u64 = 64 * 1024;
+
 /// [`read_flag`] against an explicit path (test seam). Distinguishes
 /// file-absent (→ [`FlagRead::Absent`]) from present-but-unparseable
 /// (→ [`FlagRead::Corrupt`]) — a corrupt flag must NOT downgrade to "no
 /// incident".
+///
+/// HOT-PATH HARDENING (CodeRabbit R9 #C): the flag path is read on every exec
+/// through [`active_cached`], and an attacker who can write the state dir could
+/// point it at a FIFO/device (a plain `std::fs::read` would BLOCK forever
+/// waiting for a writer) or a huge regular file (unbounded allocation). We
+/// mirror the command-card read guard: `stat` first and reject any non-regular
+/// file as `Corrupt` (fail-SAFE: an incident is still considered active, so the
+/// posture is never silently dropped), and cap the read at [`FLAG_READ_CAP`].
+/// Neither case blocks the hot path.
 pub fn read_flag_at(path: &Path) -> FlagRead {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        // Truly absent (ENOENT) → no incident. Any OTHER read error on an
+    use std::io::Read as _;
+    // `metadata` follows symlinks: a symlink to a real regular flag is fine; a
+    // symlink to a FIFO/device/dir is correctly rejected by `is_file()`.
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        // Truly absent (ENOENT) → no incident. Any OTHER stat error on an
         // existing path is treated as corrupt (fail-safe).
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FlagRead::Absent,
         Err(_) => return FlagRead::Corrupt,
     };
+    // A non-regular flag (FIFO/device/socket/dir) must NEVER be `read`-blocked.
+    // It is also not a thing a real `start` ever creates → treat as corrupt
+    // (fail-safe active). `stop_at` clears a directory sentinel separately.
+    if !meta.is_file() {
+        return FlagRead::Corrupt;
+    }
+    // Gate on the stat size before reading; an oversized flag is corrupt.
+    if meta.len() > FLAG_READ_CAP {
+        return FlagRead::Corrupt;
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FlagRead::Absent,
+        Err(_) => return FlagRead::Corrupt,
+    };
+    // Defense in depth against a TOCTOU grow between stat and read: cap the
+    // reader at CAP + 1 and reject if it actually delivered more than the cap.
+    let mut bytes = Vec::new();
+    if file
+        .take(FLAG_READ_CAP + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > FLAG_READ_CAP
+    {
+        return FlagRead::Corrupt;
+    }
     match serde_json::from_slice(&bytes) {
         Ok(state) => FlagRead::Valid(state),
         Err(_) => FlagRead::Corrupt,
@@ -414,7 +457,17 @@ fn finish_excl_write(mut file: std::fs::File, body: &[u8], path: &Path) -> Resul
         // flag. A failure to remove is swallowed — the original write error is
         // the one worth surfacing.
         drop(file);
-        let _ = std::fs::remove_file(path);
+        let removed = std::fs::remove_file(path).is_ok();
+        // Durability of the ROLLBACK unlink (CodeRabbit R9 #B): the unlink mutates
+        // the parent directory's entries, and `read_flag_at` treats ANY present
+        // flag as fail-safe ACTIVE. If a crash/power-loss strikes after this unlink
+        // but before the directory entry is durable, the partial flag could be
+        // resurrected — turning incident mode wrongly ON after a FAILED `start`.
+        // fsync the parent so the removal is crash-durable too. Best-effort,
+        // unix-only, and only when something was actually removed.
+        if removed {
+            fsync_parent_dir(path);
+        }
         return Err(StartError::Io(e));
     }
     Ok(())
@@ -880,6 +933,70 @@ mod tests {
             FlagRead::Valid(s) => assert_eq!(s.reason, "real incident"),
             other => panic!("expected Valid, got {other:?}"),
         }
+    }
+
+    /// CodeRabbit R9 #C: the flag is `read` on every exec via `active_cached`. A
+    /// FIFO at the flag path would BLOCK a plain `std::fs::read` forever waiting
+    /// for a writer. The `is_file()` guard rejects it BEFORE any open/read, so it
+    /// reads as `Corrupt` (fail-SAFE: incident still considered active) and the
+    /// call returns PROMPTLY. If the guard regressed to a blocking read this test
+    /// would HANG (caught by the suite timeout). Unix-only (FIFO + `mkfifo`).
+    #[cfg(unix)]
+    #[test]
+    fn fifo_flag_is_corrupt_and_does_not_hang() {
+        use std::ffi::CString;
+        let dir = tempdir().unwrap();
+        let flag = flag_in(dir.path());
+        let c_path = CString::new(flag.as_os_str().to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        if rc != 0 {
+            eprintln!("skipping: mkfifo unsupported here");
+            return;
+        }
+        // The whole read must complete promptly; a blocking `read` on the FIFO
+        // would hang here. Fail-safe: a non-regular flag reads as active.
+        assert_eq!(read_flag_at(&flag), FlagRead::Corrupt);
+        assert!(
+            read_state_at(&flag).is_some(),
+            "a FIFO at the flag path must read as active (fail-safe), not hang"
+        );
+    }
+
+    /// CodeRabbit R9 #C (symlink to a non-regular file): a symlink pointing at a
+    /// FIFO must also be rejected (metadata FOLLOWS the symlink, then `is_file()`
+    /// rejects the FIFO target) — Corrupt, fail-safe, no hang. Unix-only.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_flag_to_fifo_is_corrupt_and_does_not_hang() {
+        use std::ffi::CString;
+        let dir = tempdir().unwrap();
+        let real_fifo = dir.path().join("real.fifo");
+        let c_path = CString::new(real_fifo.as_os_str().to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        if rc != 0 {
+            eprintln!("skipping: mkfifo unsupported here");
+            return;
+        }
+        let flag = flag_in(dir.path());
+        std::os::unix::fs::symlink(&real_fifo, &flag).unwrap();
+        assert_eq!(read_flag_at(&flag), FlagRead::Corrupt);
+        assert!(read_state_at(&flag).is_some());
+    }
+
+    #[test]
+    fn oversized_flag_is_corrupt() {
+        // CodeRabbit R9 #C: an oversized flag file must be treated as corrupt
+        // (fail-safe active) rather than buffered into memory unbounded. One byte
+        // over the cap is enough to trip the guard. Cross-platform (plain file).
+        let dir = tempdir().unwrap();
+        let flag = flag_in(dir.path());
+        let big = vec![b' '; (FLAG_READ_CAP as usize) + 1];
+        std::fs::write(&flag, &big).unwrap();
+        assert_eq!(read_flag_at(&flag), FlagRead::Corrupt);
+        assert!(
+            read_state_at(&flag).is_some(),
+            "an oversized flag must read as active (fail-safe), not be buffered"
+        );
     }
 
     #[test]
