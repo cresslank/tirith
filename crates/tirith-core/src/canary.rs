@@ -372,7 +372,7 @@ pub fn invalidate_cache() {
 /// appending while a `prune` rewrites the store from a now-stale snapshot would
 /// otherwise silently drop the freshly-created entry. Reads (`list`/`detect`)
 /// are deliberately NOT locked — they tolerate a torn view because
-/// [`rewrite_store`] swaps the file in atomically (rename), so a reader always
+/// [`rewrite_store_lines`] swaps the file in atomically (rename), so a reader always
 /// sees a whole prior or whole next file, never a partial one.
 ///
 /// Uses the same `fs2::FileExt` advisory locking as `audit.rs` /
@@ -388,7 +388,7 @@ impl StoreLock {
     /// sibling lock file as needed, then blocks until the lock is held. If
     /// advisory locking is unsupported on the platform/filesystem we proceed
     /// WITHOUT it (best-effort — never worse than the pre-lock behavior, and the
-    /// atomic rename in [`rewrite_store`] still prevents torn files).
+    /// atomic rename in [`rewrite_store_lines`] still prevents torn files).
     fn acquire(store: &Path) -> std::io::Result<Self> {
         if let Some(parent) = store.parent() {
             std::fs::create_dir_all(parent)?;
@@ -405,7 +405,7 @@ impl StoreLock {
         use fs2::FileExt;
         // Blocking exclusive lock. Only an `Unsupported` error (advisory locking
         // not available on this platform/filesystem) is treated as best-effort:
-        // we proceed UNLOCKED, relying on the atomic rename in [`rewrite_store`]
+        // we proceed UNLOCKED, relying on the atomic rename in [`rewrite_store_lines`]
         // to still prevent torn files. ANY OTHER lock error (EINTR-after-retry,
         // EDEADLK, ENOLCK, …) must fail loudly so the mutation aborts rather than
         // racing without the serialization guarantee — mirroring how `audit.rs`
@@ -466,10 +466,36 @@ fn append_entry(store: &Path, entry: &CanaryEntry) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Atomically rewrite the store to exactly `entries` (used by `prune`/`rotate`).
-/// Writes a sibling temp file then renames over the target so a crash mid-write
-/// never truncates the store.
-fn rewrite_store(store: &Path, entries: &[CanaryEntry]) -> std::io::Result<()> {
+/// One physical line of the canary store: either a successfully-parsed
+/// [`CanaryEntry`] or a raw line that did NOT parse as one.
+///
+/// `prune`/`rotate` read the store through [`read_store_partitioned`] so an
+/// unparseable line (a future schema field, a transient hiccup) is carried
+/// THROUGH the rewrite VERBATIM rather than silently dropped (CodeRabbit R12
+/// #F): the fail-open reader skipping a line for a hot-path lookup is correct,
+/// but dropping it on a compaction rewrite would be permanent data loss.
+enum StoreLine {
+    Parsed(CanaryEntry),
+    Unparseable(String),
+}
+
+/// Read the store as an ordered list of [`StoreLine`]s, preserving lines that
+/// do not parse as a [`CanaryEntry`] so a rewrite can write them back verbatim.
+fn read_store_partitioned(path: &Path) -> Vec<StoreLine> {
+    crate::util::read_store_lines(path)
+        .into_iter()
+        .map(|line| match serde_json::from_str::<CanaryEntry>(&line) {
+            Ok(entry) => StoreLine::Parsed(entry),
+            Err(_) => StoreLine::Unparseable(line),
+        })
+        .collect()
+}
+
+/// Atomically rewrite the store to exactly the given pre-serialized JSONL
+/// `lines`. Writes a sibling temp file then renames over the target so a crash
+/// mid-write never truncates the store. This is the line-preserving primitive
+/// `prune`/`rotate` use so unparseable lines survive the rewrite verbatim.
+fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
     if let Some(parent) = store.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -481,8 +507,7 @@ fn rewrite_store(store: &Path, entries: &[CanaryEntry]) -> std::io::Result<()> {
         tmp.as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    for entry in entries {
-        let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
+    for line in lines {
         writeln!(tmp, "{line}")?;
     }
     // Durability: fsync the temp file's contents to stable storage BEFORE the
@@ -573,14 +598,24 @@ pub fn prune_at(store: &Path, id: &str) -> std::io::Result<usize> {
     // Lock across the whole read-modify-write so a concurrent create/rotate
     // cannot slip an update in between our snapshot and our rewrite.
     let _lock = StoreLock::acquire(store)?;
-    let entries = parse_store(store);
-    let before = entries.len();
-    let kept: Vec<CanaryEntry> = entries.into_iter().filter(|e| e.id != id).collect();
-    let removed = before - kept.len();
+    // Read RAW lines (CodeRabbit R12 #F): drop ONLY a parsed entry whose id
+    // matches; carry every other line — including ones that don't parse as a
+    // CanaryEntry — through the rewrite VERBATIM so prune never loses data.
+    let mut removed = 0usize;
+    let mut kept_lines: Vec<String> = Vec::new();
+    for sl in read_store_partitioned(store) {
+        match sl {
+            StoreLine::Parsed(entry) if entry.id == id => removed += 1,
+            StoreLine::Parsed(entry) => {
+                kept_lines.push(serde_json::to_string(&entry).map_err(std::io::Error::other)?);
+            }
+            StoreLine::Unparseable(line) => kept_lines.push(line),
+        }
+    }
     if removed == 0 {
         return Ok(0);
     }
-    rewrite_store(store, &kept)?;
+    rewrite_store_lines(store, &kept_lines)?;
     invalidate_cache();
     Ok(removed)
 }
@@ -603,19 +638,41 @@ pub fn rotate_at(store: &Path, id: &str) -> std::io::Result<Option<CanaryEntry>>
     // Lock across the whole read-modify-write (see `prune_at`): a concurrent
     // create appending mid-rotate must not be lost by our rewrite.
     let _lock = StoreLock::acquire(store)?;
-    let mut entries = parse_store(store);
-    let Some(idx) = entries.iter().position(|e| e.id == id) else {
+    // Read RAW lines (CodeRabbit R12 #F): mutate ONLY the parsed entry whose id
+    // matches; preserve every other line — parsed or not — so rotate never drops
+    // an unparseable (future-schema / transient) line on the rewrite.
+    let lines = read_store_partitioned(store);
+    if !lines
+        .iter()
+        .any(|sl| matches!(sl, StoreLine::Parsed(e) if e.id == id))
+    {
         return Ok(None);
-    };
-    // Default to AwsLike only if a corrupt entry has an unknown kind string;
-    // for any well-formed entry the parse round-trips the original kind.
-    let kind = CanaryKind::parse(&entries[idx].kind).unwrap_or(CanaryKind::AwsLike);
-    entries[idx].token = generate_token(kind);
-    entries[idx].created_at = chrono::Utc::now().to_rfc3339();
-    let updated = entries[idx].clone();
-    rewrite_store(store, &entries)?;
+    }
+    let mut updated: Option<CanaryEntry> = None;
+    let mut out_lines: Vec<String> = Vec::with_capacity(lines.len());
+    for sl in lines {
+        match sl {
+            // Rotate only the FIRST matching entry; any later id-duplicate is
+            // preserved unchanged (ids are unique in practice — a create rejects
+            // a dup — but never silently drop one if the invariant is violated).
+            StoreLine::Parsed(mut entry) if entry.id == id && updated.is_none() => {
+                // Default to AwsLike only if a corrupt entry has an unknown kind
+                // string; a well-formed entry round-trips its original kind.
+                let kind = CanaryKind::parse(&entry.kind).unwrap_or(CanaryKind::AwsLike);
+                entry.token = generate_token(kind);
+                entry.created_at = chrono::Utc::now().to_rfc3339();
+                updated = Some(entry.clone());
+                out_lines.push(serde_json::to_string(&entry).map_err(std::io::Error::other)?);
+            }
+            StoreLine::Parsed(entry) => {
+                out_lines.push(serde_json::to_string(&entry).map_err(std::io::Error::other)?);
+            }
+            StoreLine::Unparseable(line) => out_lines.push(line),
+        }
+    }
+    rewrite_store_lines(store, &out_lines)?;
     invalidate_cache();
-    Ok(Some(updated))
+    Ok(updated)
 }
 
 /// Production entry point: rotate the canary with `id` in the default store.
@@ -970,7 +1027,8 @@ mod tests {
     /// straight from the file on disk (via `parse_store`, NOT the in-process
     /// cache). If a mutator regressed to dropping the synced write, the bytes
     /// would not be on disk for `parse_store` to read back. The actual fsync
-    /// calls live in `append_entry` (create) and `rewrite_store` (prune/rotate).
+    /// calls live in `append_entry` (create) and `rewrite_store_lines`
+    /// (prune/rotate).
     #[test]
     fn mutators_persist_durably_to_disk() {
         let dir = tempdir().unwrap();
@@ -1108,6 +1166,68 @@ mod tests {
         let store = store_in(dir.path());
         create_at(&store, CanaryKind::AwsLike, None).unwrap();
         assert!(rotate_at(&store, "nope").unwrap().is_none());
+    }
+
+    /// Append a valid-but-unparseable line (a future-schema JSON object) to the
+    /// store so the lenient reader skips it. Returns the literal line.
+    fn append_unparseable_line(store: &Path) -> String {
+        let unknown = r#"{"schema":"v2","id":"future","token":"x","kind":"brand-new-kind"}"#;
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(store)
+            .unwrap();
+        writeln!(f, "{unknown}").unwrap();
+        invalidate_cache();
+        unknown.to_string()
+    }
+
+    #[test]
+    fn prune_preserves_unparseable_lines_on_rewrite() {
+        // CodeRabbit R12 #F: prune's REWRITE must not silently drop a line the
+        // lenient reader skips. Create two canaries + an unknown line, prune one,
+        // and assert the unknown line survives on disk.
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let a = create_at(&store, CanaryKind::AwsLike, None).unwrap();
+        let b = create_at(&store, CanaryKind::GithubLike, None).unwrap();
+        let unknown = append_unparseable_line(&store);
+        assert_eq!(
+            parse_store(&store).len(),
+            2,
+            "reader skips the unknown line"
+        );
+
+        assert_eq!(prune_at(&store, &a.id).unwrap(), 1);
+        // The surviving canary is still present, the unknown line preserved.
+        assert_eq!(list_at(&store).len(), 1);
+        assert_eq!(list_at(&store)[0].id, b.id);
+        let on_disk = std::fs::read_to_string(&store).unwrap();
+        assert!(
+            on_disk.contains(&unknown),
+            "prune must preserve the unparseable line, got:\n{on_disk}"
+        );
+    }
+
+    #[test]
+    fn rotate_preserves_unparseable_lines_on_rewrite() {
+        // CodeRabbit R12 #F: rotate's REWRITE must not silently drop a line the
+        // lenient reader skips.
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let original = create_at(&store, CanaryKind::GithubLike, None).unwrap();
+        let unknown = append_unparseable_line(&store);
+
+        let rotated = rotate_at(&store, &original.id).unwrap().expect("known id");
+        assert_ne!(rotated.token, original.token, "token rotated");
+        let on_disk = std::fs::read_to_string(&store).unwrap();
+        assert!(
+            on_disk.contains(&unknown),
+            "rotate must preserve the unparseable line, got:\n{on_disk}"
+        );
+        // The rotated entry is still readable and the new token fires.
+        assert_eq!(list_at(&store).len(), 1);
+        assert_eq!(detect_at(&store, &rotated.token).len(), 1);
     }
 
     #[test]

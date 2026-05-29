@@ -322,20 +322,35 @@ pub fn list_taints() -> Vec<TaintEntry> {
 /// Remove every entry for `path` from the store at `store` by rewriting the file
 /// without the matching lines. `cwd` controls relative-path normalization.
 /// Returns the number of entries removed.
+///
+/// REWRITE DATA-SAFETY (CodeRabbit R12 #F): the reader (`parse_store`) is
+/// fail-open — it SKIPS lines it cannot parse as a `TaintEntry` so a lookup never
+/// aborts. Reusing that for the rewrite would PERMANENTLY DROP any
+/// valid-but-momentarily-unparseable line (a future schema field, a transient
+/// hiccup) on the next `clear`. So compaction operates on RAW lines here: a line
+/// is removed ONLY when it parses as a `TaintEntry` matching the key; every
+/// other line — including ones the reader would skip — is PRESERVED VERBATIM.
 pub fn clear_taint_at(store: &Path, path: &Path, cwd: Option<&Path>) -> std::io::Result<usize> {
     let key = normalize_key(path, cwd);
     let key_str = key.to_string_lossy().into_owned();
 
-    let entries = parse_store(store);
-    let before = entries.len();
-    let kept: Vec<TaintEntry> = entries.into_iter().filter(|e| e.path != key_str).collect();
-    let removed = before - kept.len();
+    let mut removed = 0usize;
+    let mut kept_lines: Vec<String> = Vec::new();
+    for line in crate::util::read_store_lines(store) {
+        // Drop ONLY a line that parses as a TaintEntry whose path matches the
+        // key. A line that does not parse (unknown/future schema) is kept
+        // verbatim so the rewrite never loses it.
+        match serde_json::from_str::<TaintEntry>(&line) {
+            Ok(entry) if entry.path == key_str => removed += 1,
+            _ => kept_lines.push(line),
+        }
+    }
 
     if removed == 0 {
         return Ok(0);
     }
 
-    rewrite_store(store, &kept)?;
+    rewrite_store_lines(store, &kept_lines)?;
     invalidate_cache();
     Ok(removed)
 }
@@ -351,10 +366,13 @@ pub fn clear_taint(path: &Path, cwd: Option<&Path>) -> std::io::Result<usize> {
     clear_taint_at(&store, path, cwd)
 }
 
-/// Atomically rewrite the store to exactly `entries` (used by `clear`). Writes a
+/// Atomically rewrite the store to exactly the given pre-serialized JSONL
+/// `lines` (one entry per line, no trailing newlines in the elements). Writes a
 /// sibling temp file then renames over the target so a crash mid-write never
-/// truncates the store.
-fn rewrite_store(store: &Path, entries: &[TaintEntry]) -> std::io::Result<()> {
+/// truncates the store. This is the line-preserving primitive `clear_taint_at`
+/// uses so it can write back RAW lines (parseable entries + verbatim unknown
+/// lines) without round-tripping every line through `serde` (CodeRabbit R12 #F).
+fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
     if let Some(parent) = store.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -366,8 +384,7 @@ fn rewrite_store(store: &Path, entries: &[TaintEntry]) -> std::io::Result<()> {
         tmp.as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    for entry in entries {
-        let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
+    for line in lines {
         writeln!(tmp, "{line}")?;
     }
     // Durability (CodeRabbit R9 #B): fsync the rewritten body to stable storage
@@ -568,6 +585,55 @@ mod tests {
         let store = store_in(dir.path());
         let removed = clear_taint_at(&store, Path::new("/nope.sh"), None).unwrap();
         assert_eq!(removed, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_preserves_unparseable_lines_on_rewrite() {
+        // CodeRabbit R12 #F: the lenient reader SKIPS a line it can't parse as a
+        // TaintEntry (correct for a hot-path lookup), but the `clear` REWRITE must
+        // NOT permanently drop it. Hand-write a store with a real entry + a
+        // valid-but-unparseable line (a future-schema JSON object), clear the real
+        // entry, and assert the unknown line SURVIVES on disk.
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let cwd = Path::new("/work/repo");
+
+        // One real entry we will clear.
+        mark_tainted_at(&store, Path::new("./a.sh"), Some(cwd), "x", None, None).unwrap();
+        // Append a line the reader cannot parse as a TaintEntry but that we must
+        // not lose (e.g. an entry from a newer tirith with an extra required
+        // field, here modeled as an object with an unknown shape).
+        let unknown = r#"{"schema":"v2","path":"/work/repo/future.sh","kind":"something-new"}"#;
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&store)
+                .unwrap();
+            writeln!(f, "{unknown}").unwrap();
+        }
+        invalidate_cache();
+
+        // Sanity: the lenient reader skips the unknown line (only the real entry
+        // is visible), proving it is genuinely unparseable-as-TaintEntry.
+        assert_eq!(
+            parse_store(&store).len(),
+            1,
+            "reader skips the unknown line"
+        );
+
+        let removed = clear_taint_at(&store, Path::new("./a.sh"), Some(cwd)).unwrap();
+        assert_eq!(removed, 1, "the real entry is cleared");
+
+        // The unknown line MUST still be on disk verbatim after the rewrite.
+        let on_disk = std::fs::read_to_string(&store).unwrap();
+        assert!(
+            on_disk.contains(unknown),
+            "the unparseable line must survive the clear rewrite, got:\n{on_disk}"
+        );
+        // And the cleared entry's key is gone.
+        assert!(!on_disk.contains("/work/repo/a.sh"));
     }
 
     #[test]

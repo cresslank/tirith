@@ -136,6 +136,73 @@ mod write_json_tests {
         assert!(s.contains("\"ok\""));
         assert!(s.ends_with('\n'), "a trailing newline must be written");
     }
+
+    /// CodeRabbit R12 #B: `write_file_atomic` lands content exactly, an overwrite
+    /// FULLY replaces the prior content (no truncate-in-place), and no temp file
+    /// is left behind. fsync is not directly observable in a unit test; the
+    /// content-integrity + no-leftover-temp assertions cover the userspace-visible
+    /// post-condition and the sync is exercised on every call (a sync error would
+    /// surface as `Err` and fail the `.unwrap()`).
+    #[test]
+    fn write_file_atomic_writes_replaces_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commands.yaml");
+
+        super::write_file_atomic(&path, b"first: true\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first: true\n");
+
+        // Overwrite with SHORTER content: a non-atomic truncate-in-place could
+        // leave trailing bytes of the old content; the rename fully replaces it.
+        super::write_file_atomic(&path, b"x\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "x\n");
+
+        // The only entry in the directory is the target file — the temp file was
+        // renamed (consumed), not left dangling.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(entries.len(), 1, "no temp file left behind: {entries:?}");
+        assert_eq!(entries[0], path);
+    }
+}
+
+/// Write `contents` to `path` atomically: a sibling temp file in the same
+/// directory is written, flushed, fsync'd, then renamed over `path`. The rename
+/// is atomic on the same filesystem, so a concurrent reader (or a crash
+/// mid-write) never observes a truncated or half-written file — it sees either
+/// the previous contents or the complete new ones.
+///
+/// Durability mirrors `command_card::write_card_atomic` and the core
+/// `canary`/`baseline` rewrite paths (CodeRabbit R12 #B): the body is
+/// `sync_all()`'d BEFORE the rename so a crash after the rename cannot leave a
+/// zero/partial file, and the parent directory is fsync'd AFTER the rename so
+/// the new directory entry is itself crash-durable. Used by the operator-facing
+/// config writers (`commands init`, `policy init`, `output wrap` shell-profile
+/// edits) — files the operator relies on, NOT regenerable caches.
+pub(crate) fn write_file_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::PathBuf::from)
+        // No parent component (a bare filename): keep the temp file in the
+        // current directory so the rename stays on the same filesystem.
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
+    tmp.write_all(contents)?;
+    // `flush()` only drains the userspace buffer into the kernel; `sync_all()`
+    // forces the file's data + metadata to stable storage BEFORE the rename
+    // publishes it, so a reader after a crash sees the old or the complete new
+    // contents, never a truncated file.
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    // `persist()` renames the temp over `path` but does not fsync the containing
+    // directory. fsync the parent so the new name→inode entry survives a crash.
+    // Best-effort, no-op on non-Unix (Windows has no directory fsync).
+    tirith_core::util::fsync_parent_dir(path);
+    Ok(())
 }
 
 /// Suggest the closest match from a list of candidates using Levenshtein distance.

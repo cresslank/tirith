@@ -15,7 +15,12 @@ pub fn save(url: &str, save_path: &str, sha256: Option<String>, json: bool) -> i
         Err(e) => {
             if json {
                 let err = serde_json::json!({ "error": e });
-                super::write_json_stdout(&err, "tirith fetch --save: failed to write JSON output");
+                // Always exits 1 below (guaranteed non-zero), so a failed JSON
+                // write needs no distinct code; drop the status explicitly.
+                let _ = super::write_json_stdout(
+                    &err,
+                    "tirith fetch --save: failed to write JSON output",
+                );
             } else {
                 eprintln!("tirith fetch --save: {e}");
             }

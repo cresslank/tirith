@@ -494,12 +494,21 @@ pub fn score_findings(findings: &[Finding]) -> ScoreBreakdown {
     });
 
     // Factor 3 — threat-intel corroboration (context-aware, additive). Only
-    // fires when a threat-DB finding sits alongside at least one other finding.
+    // fires when a threat-DB finding sits alongside at least one other
+    // SUBSTANTIVE finding. Note-only annotations (verified/unverified card,
+    // uncatalogued-command note) must NOT corroborate a threat-intel hit
+    // (CodeRabbit R12 #D): they are metadata about the command, not an
+    // independent known-bad signal, so a `findings.len() > 1` test would let a
+    // single card note falsely "confirm" a threat hit and inflate the score.
+    // Threat-intel rules are themselves substantive (never note-only), so the
+    // shared `substantive` count already includes the threat hit; `> 1`
+    // therefore means "the threat hit AND at least one other substantive
+    // finding" — mirroring the additional-findings factor above.
     let threat_hits: Vec<&Finding> = findings
         .iter()
         .filter(|f| is_threat_intel_rule(f.rule_id))
         .collect();
-    let corroborates = !threat_hits.is_empty() && findings.len() > 1;
+    let corroborates = !threat_hits.is_empty() && substantive > 1;
     if corroborates {
         let rule_list = threat_hits
             .iter()
@@ -746,6 +755,54 @@ mod tests {
             .iter()
             .all(|f| f.id != "threat_intel_corroboration"));
         assert!(b.verify());
+    }
+
+    #[test]
+    fn note_only_finding_does_not_corroborate_threat_intel() {
+        // CodeRabbit R12 #D: a note-only Info annotation must NOT corroborate a
+        // threat-intel hit. Before the fix, `findings.len() > 1` let a single
+        // card/manifest note falsely "confirm" the threat and add +5. Now
+        // corroboration requires another SUBSTANTIVE finding.
+        for note in [
+            RuleId::CommandCardVerified,
+            RuleId::CommandCardUnverified,
+            RuleId::RepoCommandUnknown,
+        ] {
+            let with_note = score_findings(&[
+                finding(RuleId::ThreatMaliciousIp, Severity::High),
+                finding(note, Severity::Info),
+            ]);
+            assert!(
+                with_note
+                    .factors
+                    .iter()
+                    .all(|f| f.id != "threat_intel_corroboration"),
+                "{note:?} must NOT corroborate a threat-intel hit"
+            );
+            // Identical to the lone threat hit: 70 base, no corroboration, no
+            // additional-finding points (the note is excluded everywhere).
+            let lone = score_findings(&[finding(RuleId::ThreatMaliciousIp, Severity::High)]);
+            assert_eq!(
+                with_note.score, lone.score,
+                "a note alongside a lone threat hit must not change the score (note={note:?})"
+            );
+            assert_eq!(with_note.score, 70);
+            assert!(with_note.verify());
+        }
+
+        // Sanity: a SUBSTANTIVE second finding DOES still corroborate (+5), so
+        // the fix did not over-suppress the factor.
+        let real_pair = score_findings(&[
+            finding(RuleId::ThreatMaliciousIp, Severity::High),
+            finding(RuleId::PlainHttpToSink, Severity::High),
+        ]);
+        assert!(
+            real_pair
+                .factors
+                .iter()
+                .any(|f| f.id == "threat_intel_corroboration"),
+            "a substantive second finding must still corroborate"
+        );
     }
 
     #[test]

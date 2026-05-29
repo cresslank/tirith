@@ -8899,6 +8899,67 @@ fn command_card_create_invalid_expires_json_is_parseable_error() {
     );
 }
 
+/// CodeRabbit R12 #A: `command-card sign` fatal errors under `--json` must emit a
+/// parseable `{"error": ...}` object on stdout (NOT a bare stderr line) and exit
+/// non-zero. `emit_error` now PROPAGATES the JSON-write status so callers exit
+/// 2 (distinct write-failure) when stdout is truncated; the parseable-shape +
+/// non-zero-exit contract is what this end-to-end test pins. (A real broken-pipe
+/// write failure is SIGPIPE-killed before the write returns on Unix — per
+/// `main::run`'s SIG_DFL reset — so the `return 2` path is proven at the
+/// `cli::write_json_to` unit seam, not here.)
+#[test]
+fn command_card_sign_json_fatal_error_is_parseable_nonzero() {
+    let work = tempfile::tempdir().unwrap();
+    // A key path that does not exist → `read_secret_key` fails → emit_error.
+    let missing_key = work.path().join("nope.key");
+    let some_card = work.path().join("card.json");
+    // The card path content is irrelevant: the key read fails first.
+    fs::write(&some_card, "{}").unwrap();
+
+    let json = tirith()
+        .args(["command-card", "sign", "--json", "--key"])
+        .arg(&missing_key)
+        .arg(&some_card)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("sign --json with missing key");
+    assert_eq!(
+        json.status.code(),
+        Some(1),
+        "a sign fatal error must exit non-zero (1 semantic; 2 only on a JSON-write failure)"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout)
+        .expect("sign fatal error under --json must yield a parseable JSON error on stdout");
+    assert!(
+        v["error"].as_str().is_some(),
+        "JSON fatal error must carry an `error` string, got: {v}"
+    );
+    assert!(
+        json.stderr.is_empty() || !json.stdout.is_empty(),
+        "the error must be delivered as JSON on stdout in --json mode"
+    );
+
+    // Human mode (no --json) writes to stderr and emits nothing on stdout.
+    let human = tirith()
+        .args(["command-card", "sign", "--key"])
+        .arg(&missing_key)
+        .arg(&some_card)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("sign with missing key (human)");
+    assert_eq!(human.status.code(), Some(1));
+    assert!(
+        human.stdout.is_empty(),
+        "no JSON on stdout in human mode, got: {}",
+        String::from_utf8_lossy(&human.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&human.stderr).contains("tirith command-card sign"),
+        "human stderr must carry the error context, got: {}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+}
+
 /// Regression (CRITICAL): a card carried via a `# tirith-card: <path>` COMMENT
 /// (not the `--card` sidecar) must VERIFY when its signed `command` matches the
 /// real command on the following line. The marker line is transport metadata
@@ -9220,8 +9281,11 @@ fn command_card_fetch_is_idempotent_for_identical_bytes() {
 
     // Signal the cancellable accept loop to exit, THEN join — without this the
     // `while !stop` server thread loops forever and `join()` hangs the test.
+    // ASSERT the join result (CodeRabbit R12 #I): a panic inside the server
+    // thread must FAIL the test loudly rather than being silently swallowed by
+    // `let _ =` (which would mask a broken fixture as a pass).
     stop.store(true, Ordering::Relaxed);
-    let _ = server.join();
+    server.join().expect("card-server thread must not panic");
 }
 
 // ---------------------------------------------------------------------------
@@ -10417,6 +10481,17 @@ fn commands_run_json_emits_single_object_when_allowed_clean() {
         .output()
         .expect("commands run ok --json");
 
+    // Pin the exit code (CodeRabbit R12 #J): a clean allowed run of `true`
+    // exits 0 — the run executed and the child succeeded. Without this, a
+    // regression that aborted before spawning (or returned a non-zero harness
+    // code) could still satisfy the JSON-shape assertions below.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "clean allowed run exits 0; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
     // The WHOLE stdout must be a single parseable JSON object.
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
         panic!(
@@ -10452,6 +10527,16 @@ fn commands_run_json_emits_single_object_when_warn() {
         .args(["commands", "run", "warn", "--json"])
         .output()
         .expect("commands run warn --json");
+
+    // Pin the exit code (CodeRabbit R12 #J, sibling of the allowed-clean test): a
+    // non-interactively-proceeded warn returns the CHILD's exit code, and the
+    // child here (`echo … > /dev/null`) succeeds → 0.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "warn-proceed run returns the child exit code (0 here); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
         panic!(

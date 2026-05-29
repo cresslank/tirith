@@ -28,8 +28,13 @@ const TRIAGE_RECENT: usize = 25;
 /// `tirith secret triage [--json] [--verbose]` — scan recent audit findings for
 /// credential leaks and print a one-line rotation next-step for each.
 ///
-/// Exit codes: `0` always on a successful read (whether or not findings exist);
-/// `1` only when the audit-log path cannot be resolved or read.
+/// Exit codes:
+///   `0`  successful read (whether or not findings exist).
+///   `1`  the audit-log path cannot be resolved or read (a `triage` fatal error).
+///   `2`  ONLY in `--json` mode, when the JSON itself fails to write (broken pipe
+///        / truncated stdout) — so a piped consumer never pairs truncated/absent
+///        JSON with a success code (CodeRabbit R12 #H). The `1` fatal-error path
+///        keeps exit `1` even if its `{"error":…}` JSON write fails.
 pub fn triage(json: bool, verbose: bool) -> i32 {
     let Some(log_path) = tirith_core::audit::audit_log_path() else {
         return triage_fatal(json, "cannot determine the audit log path");

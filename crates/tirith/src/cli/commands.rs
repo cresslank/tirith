@@ -72,7 +72,13 @@ pub fn init(force: bool, json: bool) -> i32 {
         }
     }
 
-    if let Err(e) = std::fs::write(&path, tirith_core::commands_manifest::STARTER_MANIFEST) {
+    // Write the manifest ATOMICALLY (temp-in-same-dir → fsync → rename → parent
+    // fsync) rather than truncating in place: a crash mid-write must never lose
+    // an existing manifest or leave a half-written one the loader then rejects.
+    if let Err(e) = super::write_file_atomic(
+        &path,
+        tirith_core::commands_manifest::STARTER_MANIFEST.as_bytes(),
+    ) {
         if !emit_error(
             json,
             "tirith commands init",

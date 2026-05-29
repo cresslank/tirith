@@ -527,7 +527,10 @@ fn init_with_template(force: bool, minimal: bool, template: Option<PolicyTemplat
         (None, false) => FULL_TEMPLATE,
     };
 
-    if let Err(e) = std::fs::write(&policy_path, template_body) {
+    // Write the policy ATOMICALLY (temp-in-same-dir → fsync → rename → parent
+    // fsync): with `--force` this overwrites an existing policy, and a crash
+    // mid-write must never lose the prior policy or leave a half-written one.
+    if let Err(e) = super::write_file_atomic(&policy_path, template_body.as_bytes()) {
         eprintln!(
             "tirith policy init: cannot write {}: {e}",
             policy_path.display()

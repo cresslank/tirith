@@ -77,7 +77,10 @@ fn enable() -> i32 {
         "\n"
     };
     let new_content = format!("{current}{separator}{snippet}");
-    if let Err(e) = fs::write(&profile, &new_content) {
+    // Write the shell profile ATOMICALLY (temp-in-same-dir → fsync → rename →
+    // parent fsync): this is a read-modify-write of the user's ENTIRE rc file, so
+    // a crash mid-write must never truncate or corrupt their shell config.
+    if let Err(e) = super::write_file_atomic(&profile, new_content.as_bytes()) {
         eprintln!(
             "tirith output wrap: failed to write {}: {e}",
             profile.display()
@@ -124,7 +127,9 @@ fn disable() -> i32 {
     }
 
     let new_content = strip_block(&current);
-    if let Err(e) = fs::write(&profile, new_content) {
+    // Atomic write (see `enable`): removing the tirith block is also a full
+    // rewrite of the user's rc file and must never truncate it on a crash.
+    if let Err(e) = super::write_file_atomic(&profile, new_content.as_bytes()) {
         eprintln!(
             "tirith output wrap: failed to write {}: {e}",
             profile.display()

@@ -38,7 +38,10 @@ pub fn create(
         None => prompt("command the card attests to").unwrap_or_default(),
     };
     if command.trim().is_empty() {
-        emit_error(
+        // A broken-pipe JSON write returns 2 anyway (the error never reached the
+        // consumer); the validation failure is also exit 2 here, so the code is
+        // unchanged either way.
+        let _ = emit_error(
             json,
             "tirith command-card create",
             "a non-empty --command is required",
@@ -62,8 +65,9 @@ pub fn create(
     if chrono::NaiveDate::parse_from_str(&expires, "%Y-%m-%d").is_err() {
         // CodeRabbit R9 #J: route through the JSON-aware error emitter so a
         // `--json` caller gets a parseable `{"error": …}` object, not a bare
-        // stderr line.
-        emit_error(
+        // stderr line. The validation failure is exit 2; a broken-pipe JSON
+        // write is also 2, so the code is non-zero either way.
+        let _ = emit_error(
             json,
             "tirith command-card create",
             &format!("--expires must be YYYY-MM-DD (got '{expires}')"),
@@ -92,7 +96,11 @@ pub fn create(
         Err(e) => {
             // Same JSON-aware path as the --expires error (CodeRabbit R9 #J):
             // a serialization failure under --json must be a parseable object.
-            emit_error(json, "tirith command-card create", &e.to_string());
+            // A broken-pipe JSON write returns 2 (the error never reached the
+            // consumer); otherwise the semantic 1.
+            if !emit_error(json, "tirith command-card create", &e.to_string()) {
+                return 2;
+            }
             1
         }
     }
@@ -101,10 +109,14 @@ pub fn create(
 /// `tirith command-card sign --key <ed25519-priv.bin> <card.json>` — sign a
 /// card in place (rewrites the file with the `signature` block populated).
 pub fn sign(key_path: &str, card_path: &str, json: bool) -> i32 {
+    // For every fatal-error branch below: a broken-pipe JSON write returns 2
+    // (the `{"error": …}` never reached the consumer); otherwise the semantic 1.
     let secret = match read_secret_key(Path::new(key_path)) {
         Ok(k) => k,
         Err(e) => {
-            emit_error(json, "tirith command-card sign", &e.to_string());
+            if !emit_error(json, "tirith command-card sign", &e.to_string()) {
+                return 2;
+            }
             return 1;
         }
     };
@@ -112,35 +124,43 @@ pub fn sign(key_path: &str, card_path: &str, json: bool) -> i32 {
     let bytes = match std::fs::read(card_path) {
         Ok(b) => b,
         Err(e) => {
-            emit_error(
+            if !emit_error(
                 json,
                 "tirith command-card sign",
                 &format!("read {card_path}: {e}"),
-            );
+            ) {
+                return 2;
+            }
             return 1;
         }
     };
     let mut card = match Card::from_json(&bytes) {
         Ok(c) => c,
         Err(e) => {
-            emit_error(
+            if !emit_error(
                 json,
                 "tirith command-card sign",
                 &format!("parse {card_path}: {e}"),
-            );
+            ) {
+                return 2;
+            }
             return 1;
         }
     };
 
     if let Err(e) = card.sign(&secret) {
-        emit_error(json, "tirith command-card sign", &e.to_string());
+        if !emit_error(json, "tirith command-card sign", &e.to_string()) {
+            return 2;
+        }
         return 1;
     }
 
     let out = match card.to_json_pretty() {
         Ok(s) => s,
         Err(e) => {
-            emit_error(json, "tirith command-card sign", &e.to_string());
+            if !emit_error(json, "tirith command-card sign", &e.to_string()) {
+                return 2;
+            }
             return 1;
         }
     };
@@ -150,11 +170,13 @@ pub fn sign(key_path: &str, card_path: &str, json: bool) -> i32 {
     // rename is atomic on the same filesystem, so a reader sees either the old
     // card or the fully-signed one, never a partial.
     if let Err(e) = write_card_atomic(Path::new(card_path), &format!("{out}\n")) {
-        emit_error(
+        if !emit_error(
             json,
             "tirith command-card sign",
             &format!("write {card_path}: {e}"),
-        );
+        ) {
+            return 2;
+        }
         return 1;
     }
 
@@ -188,25 +210,31 @@ pub fn sign(key_path: &str, card_path: &str, json: bool) -> i32 {
 ///   0  verified (trusted key, good signature, not expired)
 ///   1  NOT verified (untrusted key / bad signature / expired / unsigned)
 pub fn verify(card_path: &str, json: bool) -> i32 {
+    // For every fatal-error branch below: a broken-pipe JSON write returns 2
+    // (the `{"error": …}` never reached the consumer); otherwise the semantic 1.
     let bytes = match std::fs::read(card_path) {
         Ok(b) => b,
         Err(e) => {
-            emit_error(
+            if !emit_error(
                 json,
                 "tirith command-card verify",
                 &format!("read {card_path}: {e}"),
-            );
+            ) {
+                return 2;
+            }
             return 1;
         }
     };
     let card = match Card::from_json(&bytes) {
         Ok(c) => c,
         Err(e) => {
-            emit_error(
+            if !emit_error(
                 json,
                 "tirith command-card verify",
                 &format!("parse {card_path}: {e}"),
-            );
+            ) {
+                return 2;
+            }
             return 1;
         }
     };
@@ -214,11 +242,13 @@ pub fn verify(card_path: &str, json: bool) -> i32 {
     let trusted_dir = match command_card::trusted_card_keys_dir() {
         Some(d) => d,
         None => {
-            emit_error(
+            if !emit_error(
                 json,
                 "tirith command-card verify",
                 "could not resolve trusted-keys directory",
-            );
+            ) {
+                return 2;
+            }
             return 1;
         }
     };
@@ -285,23 +315,29 @@ pub fn verify(card_path: &str, json: bool) -> i32 {
 /// cross-platform `download_to_path`.
 #[cfg(unix)]
 pub fn fetch(url: &str, json: bool) -> i32 {
+    // For every fatal-error branch below: a broken-pipe JSON write returns 2
+    // (the `{"error": …}` never reached the consumer); otherwise the semantic 1.
     let cache_dir = match command_card::cards_cache_dir() {
         Some(d) => d,
         None => {
-            emit_error(
+            if !emit_error(
                 json,
                 "tirith command-card fetch",
                 "could not resolve cache directory",
-            );
+            ) {
+                return 2;
+            }
             return 1;
         }
     };
     if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-        emit_error(
+        if !emit_error(
             json,
             "tirith command-card fetch",
             &format!("create {}: {e}", cache_dir.display()),
-        );
+        ) {
+            return 2;
+        }
         return 1;
     }
 
@@ -312,18 +348,22 @@ pub fn fetch(url: &str, json: bool) -> i32 {
     let tmp = match tempfile::NamedTempFile::new_in(&cache_dir) {
         Ok(t) => t,
         Err(e) => {
-            emit_error(
+            if !emit_error(
                 json,
                 "tirith command-card fetch",
                 &format!("temp file: {e}"),
-            );
+            ) {
+                return 2;
+            }
             return 1;
         }
     };
     let dl = match tirith_core::runner::download_to_path(url, tmp.path(), None) {
         Ok(r) => r,
         Err(e) => {
-            emit_error(json, "tirith command-card fetch", &e);
+            if !emit_error(json, "tirith command-card fetch", &e) {
+                return 2;
+            }
             return 1;
         }
     };
@@ -331,21 +371,25 @@ pub fn fetch(url: &str, json: bool) -> i32 {
     let bytes = match std::fs::read(tmp.path()) {
         Ok(b) => b,
         Err(e) => {
-            emit_error(
+            if !emit_error(
                 json,
                 "tirith command-card fetch",
                 &format!("read download: {e}"),
-            );
+            ) {
+                return 2;
+            }
             return 1;
         }
     };
     // Validate it is a card before caching — refuse to cache arbitrary content.
     if Card::from_json(&bytes).is_err() {
-        emit_error(
+        if !emit_error(
             json,
             "tirith command-card fetch",
             "downloaded content is not a valid command card (JSON parse failed)",
-        );
+        ) {
+            return 2;
+        }
         return 1;
     }
 
@@ -365,11 +409,13 @@ pub fn fetch(url: &str, json: bool) -> i32 {
                 .map(|existing| existing == bytes)
                 .unwrap_or(false);
         if !already_cached {
-            emit_error(
+            if !emit_error(
                 json,
                 "tirith command-card fetch",
                 &format!("persist {}: {}", dest.display(), e.error),
-            );
+            ) {
+                return 2;
+            }
             return 1;
         }
         // Cache hit: identical bytes already at `dest`. Fall through to report
@@ -492,18 +538,54 @@ fn prompt(label: &str) -> Option<String> {
 }
 
 /// Emit an error to stderr (human) or as a JSON `{"error": ...}` object.
-fn emit_error(json: bool, ctx: &str, msg: &str) {
+///
+/// Returns `false` when the JSON write itself failed (broken pipe / truncated
+/// output) so a `--json` caller can surface that as a distinct write-failure
+/// exit (2) instead of pairing a semantic exit code with no JSON delivered
+/// (CodeRabbit R12 #A). Human mode always returns `true` — the stderr line is
+/// best-effort. Mirrors `cli::canary::emit_error` / `cli::incident::emit_error`.
+fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
     if json {
         let v = serde_json::json!({ "error": msg });
-        super::write_json_stdout(&v, &format!("{ctx}: failed to write JSON output"));
+        super::write_json_stdout(&v, &format!("{ctx}: failed to write JSON output"))
     } else {
         eprintln!("{ctx}: {msg}");
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::write_card_atomic;
+    use super::{emit_error, write_card_atomic};
+
+    /// CodeRabbit R12 #A: `emit_error` must PROPAGATE the JSON-write status so a
+    /// `--json` caller can return a distinct write-failure exit (2) instead of
+    /// pairing a semantic code with no JSON delivered. Human mode is best-effort
+    /// (stderr) and always reports success. The JSON-mode write-FAILURE → `false`
+    /// path is the `cli::write_json_to` seam, unit-tested there with a
+    /// deliberately-failing writer (real stdout cannot be made to fail
+    /// deterministically across platforms — and on Unix a real broken pipe is
+    /// SIGPIPE-killed before the write returns, per `main::run`'s SIG_DFL reset).
+    #[test]
+    fn emit_error_human_mode_reports_success() {
+        assert!(
+            emit_error(false, "tirith command-card sign", "boom"),
+            "human-mode emit_error is best-effort and must report success"
+        );
+    }
+
+    /// JSON mode with a working stdout writes a parseable object and reports
+    /// success. (The buffer is the process stdout here; we only assert the
+    /// return contract — the parseable-shape + non-zero-exit end-to-end is
+    /// covered by `command_card_sign_json_fatal_error_is_parseable_nonzero` in
+    /// the CLI integration suite.)
+    #[test]
+    fn emit_error_json_mode_reports_success_when_stdout_ok() {
+        assert!(
+            emit_error(true, "tirith command-card sign", "boom"),
+            "json-mode emit_error to a healthy stdout must report success"
+        );
+    }
 
     #[test]
     fn write_card_atomic_writes_and_replaces_without_leaving_temp() {

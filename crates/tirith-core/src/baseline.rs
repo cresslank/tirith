@@ -332,10 +332,11 @@ fn load_salt_state(salt_file: &Path) -> SaltState {
 ///     overwrite it atomically via a sibling temp file + rename (I2), so a
 ///     short/truncated salt is regenerated rather than adopted.
 ///
-/// In both cases a crash mid-write never leaves a half-written salt. The absent
-/// path's exclusive `create_new` followed by one `write_all` is the only writer
-/// of a fresh file, and the replace path renames a fully-written temp file into
-/// place.
+/// In both cases a crash mid-write never leaves a half-written salt, and BOTH
+/// paths fsync the salt body AND the parent directory so the salt (and its
+/// directory entry) are crash-durable. The absent path's exclusive `create_new`
+/// followed by one `write_all` is the only writer of a fresh file, and the
+/// replace path renames a fully-written temp file into place.
 fn persist_salt(salt_file: &Path, salt: &[u8], replace_corrupt: bool) -> std::io::Result<Vec<u8>> {
     if let Some(parent) = salt_file.parent() {
         std::fs::create_dir_all(parent)?;
@@ -375,7 +376,15 @@ fn persist_salt(salt_file: &Path, salt: &[u8], replace_corrupt: bool) -> std::io
     match opts.open(salt_file) {
         Ok(mut f) => {
             f.write_all(salt)?;
-            f.sync_all().ok();
+            // Durability (CodeRabbit R12 #C): fsync the salt BODY to stable
+            // storage, then fsync the PARENT directory so the freshly-created
+            // file's directory entry survives a crash too — exactly like the
+            // `replace_corrupt` rename path above. Without the parent fsync, a
+            // crash right after `create_new` + write could lose the new
+            // file→inode entry entirely, so the next run sees no salt and
+            // regenerates a DIFFERENT one (every baseline hash then mismatches).
+            f.sync_all()?;
+            crate::util::fsync_parent_dir(salt_file);
             Ok(salt.to_vec())
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -536,8 +545,12 @@ fn append_observation(store: &Path, obs: &Observation) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Atomically rewrite the store to exactly `obs` (used by compaction + reset).
-fn rewrite_store(store: &Path, obs: &[Observation]) -> std::io::Result<()> {
+/// Atomically rewrite the store to exactly the given pre-serialized JSONL
+/// `lines`. Writes a sibling temp file then renames over the target so a crash
+/// mid-write never truncates the store. This is the line-preserving primitive
+/// `record_at` compaction uses so a valid-but-unparseable line survives the
+/// rewrite VERBATIM rather than being silently dropped (CodeRabbit R12 #F).
+fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
     if let Some(parent) = store.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -549,8 +562,7 @@ fn rewrite_store(store: &Path, obs: &[Observation]) -> std::io::Result<()> {
         tmp.as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    for o in obs {
-        let line = serde_json::to_string(o).map_err(std::io::Error::other)?;
+    for line in lines {
         writeln!(tmp, "{line}")?;
     }
     // Durability (CodeRabbit R9 #B): fsync the compacted body to stable storage
@@ -597,11 +609,39 @@ pub fn record_at(store: &Path, key: PatternKey) -> std::io::Result<()> {
     let obs = key.into_observation();
     append_observation(store, &obs)?;
     if line_count(store) > COMPACT_TRIGGER {
-        let now = chrono::Utc::now();
-        let compacted = compact(parse_store(store), now);
-        rewrite_store(store, &compacted)?;
+        compact_store_at(store, chrono::Utc::now())?;
     }
     Ok(())
+}
+
+/// Compact the store in place: window-prune + LRU-cap the PARSED observations
+/// and atomically rewrite. Factored out of [`record_at`] (which only calls it
+/// past the line-count trigger) so the data-preservation contract is unit-
+/// testable on a small store without writing >100k lines.
+///
+/// Compaction is intentionally lossy for PARSED rows (out-of-window prune + LRU
+/// cap), but it must NEVER silently drop a valid-but-momentarily-unparseable
+/// line — a future schema field, a transient hiccup (CodeRabbit R12 #F). Such
+/// lines are carried THROUGH the rewrite VERBATIM: they are rare, the line-count
+/// trigger still bounds total growth, and preserving an inert line the reader
+/// skips anyway is strictly safer than deleting a real observation that merely
+/// failed to parse this once.
+fn compact_store_at(store: &Path, now: chrono::DateTime<chrono::Utc>) -> std::io::Result<()> {
+    let mut parsed: Vec<Observation> = Vec::new();
+    let mut preserved: Vec<String> = Vec::new();
+    for line in crate::util::read_store_lines(store) {
+        match serde_json::from_str::<Observation>(&line) {
+            Ok(o) => parsed.push(o),
+            Err(_) => preserved.push(line),
+        }
+    }
+    let compacted = compact(parsed, now);
+    let mut out_lines: Vec<String> = Vec::with_capacity(compacted.len() + preserved.len());
+    for o in &compacted {
+        out_lines.push(serde_json::to_string(o).map_err(std::io::Error::other)?);
+    }
+    out_lines.extend(preserved);
+    rewrite_store_lines(store, &out_lines)
 }
 
 /// Top `limit` patterns by in-window count, descending. Ties broken by rule_id
@@ -831,7 +871,7 @@ mod tests {
             cwd_repo_hash: Some("deadbeef".to_string()),
             seen_at: (chrono::Utc::now() - chrono::Duration::days(WINDOW_DAYS + 5)).to_rfc3339(),
         };
-        rewrite_store(&store, &[old]).unwrap();
+        rewrite_store_lines(&store, &[serde_json::to_string(&old).unwrap()]).unwrap();
         // The old one is out of window → first time again.
         let seen = lookup_at(&store, &key("curl_pipe_shell"));
         assert_eq!(seen.count, 0);
@@ -887,6 +927,71 @@ mod tests {
     }
 
     #[test]
+    fn compaction_preserves_unparseable_lines_and_prunes_parsed() {
+        // CodeRabbit R12 #F: compaction's REWRITE must window-prune PARSED rows
+        // (intentionally lossy) WITHOUT silently dropping a line the lenient
+        // reader skips. Hand-build a store with: one in-window observation, one
+        // out-of-window observation (must be pruned), and one unparseable line
+        // (must be PRESERVED verbatim). Drive `compact_store_at` directly so the
+        // contract is testable without writing >100k lines to hit the trigger.
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let now = chrono::Utc::now();
+
+        let in_window_obs = Observation {
+            rule_id: "rule_keep".to_string(),
+            host_hash: None,
+            ecosystem: None,
+            sudo_flag: false,
+            cwd_repo_hash: None,
+            seen_at: now.to_rfc3339(),
+        };
+        let old_obs = Observation {
+            rule_id: "rule_old".to_string(),
+            host_hash: None,
+            ecosystem: None,
+            sudo_flag: false,
+            cwd_repo_hash: None,
+            seen_at: (now - chrono::Duration::days(WINDOW_DAYS + 5)).to_rfc3339(),
+        };
+        let unknown =
+            r#"{"schema":"v2","rule_id":"future","seen_at":"2026-01-01T00:00:00Z","extra":true}"#;
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&store).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&in_window_obs).unwrap()).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&old_obs).unwrap()).unwrap();
+            writeln!(f, "{unknown}").unwrap();
+        }
+        // The unknown line is NOT a parseable Observation (it parses if it happens
+        // to match; assert it does not so the test is meaningful).
+        assert_eq!(
+            parse_store(&store).len(),
+            2,
+            "only the two real observations parse; the v2 line is skipped"
+        );
+
+        compact_store_at(&store, now).unwrap();
+
+        let on_disk = std::fs::read_to_string(&store).unwrap();
+        // Out-of-window parsed row pruned…
+        assert!(
+            !on_disk.contains("rule_old"),
+            "out-of-window observation must be pruned, got:\n{on_disk}"
+        );
+        // …in-window parsed row kept…
+        assert!(
+            on_disk.contains("rule_keep"),
+            "in-window observation must be kept, got:\n{on_disk}"
+        );
+        // …and the unparseable line PRESERVED verbatim.
+        assert!(
+            on_disk.contains(unknown),
+            "compaction must preserve the unparseable line, got:\n{on_disk}"
+        );
+    }
+
+    #[test]
     fn salt_is_persisted_and_stable() {
         let dir = tempdir().unwrap();
         let salt_file = salt_in(dir.path());
@@ -898,6 +1003,39 @@ mod tests {
         // Host hash is 16 hex chars; never the raw host.
         assert_eq!(h1.len(), 16);
         assert!(!h1.contains("github"));
+    }
+
+    /// CodeRabbit R12 #C: the FIRST-CREATE (absent-file) `persist_salt` path is
+    /// now crash-durable like the overwrite path — it fsyncs the body AND the
+    /// parent directory. fsync is not directly observable in a unit test, but
+    /// this exercises the absent path's full success contract on every run (a
+    /// `sync_all()` error now propagates via `?` and fails the `.unwrap()`),
+    /// and proves the salt persists exactly and is returned unchanged. A nested
+    /// dir forces the parent-dir creation + fsync path too.
+    #[test]
+    fn persist_salt_first_create_persists_exactly_and_is_durable() {
+        let dir = tempdir().unwrap();
+        // Nested, not-yet-existing parent → create_dir_all + parent fsync run.
+        let salt_file = dir.path().join("nested").join("salt.bin");
+        let salt = [7u8; SALT_LEN];
+
+        let written = persist_salt(&salt_file, &salt, /* replace_corrupt */ false).unwrap();
+        assert_eq!(
+            written,
+            salt.to_vec(),
+            "first create returns the salt it wrote"
+        );
+
+        let on_disk = std::fs::read(&salt_file).unwrap();
+        assert_eq!(on_disk, salt.to_vec(), "salt is persisted byte-for-byte");
+        assert_eq!(on_disk.len(), SALT_LEN);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&salt_file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "fresh salt must be created mode 0600");
+        }
     }
 
     #[test]

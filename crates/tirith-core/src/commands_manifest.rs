@@ -362,7 +362,12 @@ fn unknown_finding(command: &str) -> Finding {
             .to_string(),
         evidence: vec![Evidence::CommandPattern {
             pattern: "allowed[*].command (exact match)".to_string(),
-            matched: command.trim().to_string(),
+            // ASCII-only trim (CodeRabbit R12 #G): the reported `matched` value
+            // MUST be exactly what the ASCII-only `match_allowed`/`trim_ascii_ws`
+            // matcher saw. A Unicode `str::trim` here would strip non-ASCII
+            // whitespace (e.g. U+00A0) that the matcher KEPT, so the evidence
+            // would not reflect the bytes that actually (mis)matched.
+            matched: trim_ascii_ws(command).to_string(),
         }],
         human_view: None,
         agent_view: None,
@@ -389,11 +394,16 @@ fn dangerous_finding(pattern: &str, command: &str, action: DangerousAction) -> F
             "The command matches the dangerous pattern '{}' declared under \
              `dangerous[]` in this repo's `.tirith/commands.yaml`. The repo has \
              explicitly flagged this shape to {action_word}.",
-            pattern.trim()
+            trim_ascii_ws(pattern)
         ),
+        // ASCII-only trim (CodeRabbit R12 #G): both the `pattern` and the
+        // `matched` command in the evidence MUST be exactly the strings the
+        // ASCII-only `match_dangerous`/`glob_match` matcher compared, so the
+        // reported evidence reflects what actually matched (a Unicode `str::trim`
+        // would diverge on non-ASCII whitespace the matcher preserved).
         evidence: vec![Evidence::CommandPattern {
-            pattern: pattern.trim().to_string(),
-            matched: command.trim().to_string(),
+            pattern: trim_ascii_ws(pattern).to_string(),
+            matched: trim_ascii_ws(command).to_string(),
         }],
         human_view: None,
         agent_view: None,
@@ -804,6 +814,54 @@ mod tests {
         assert_eq!(out.matched_allowed_name.as_deref(), Some("test"));
         // Sole suppression: nothing emitted, and crucially no RepoCommandUnknown.
         assert!(out.findings.is_empty());
+    }
+
+    #[test]
+    fn finding_evidence_uses_ascii_only_trim() {
+        // CodeRabbit R12 #G: the finding evidence `matched`/`pattern` strings must
+        // be ASCII-trimmed, in lockstep with the ASCII-only matcher — so the
+        // reported evidence is exactly what (mis)matched. A U+00A0 NO-BREAK SPACE
+        // is Unicode whitespace but NOT ASCII whitespace: it must SURVIVE in the
+        // evidence (a Unicode `str::trim` would have stripped it, diverging from
+        // the matcher which kept it).
+        let nbsp = '\u{a0}';
+
+        // (a) Uncatalogued-command Info note: the command keeps its NBSP padding.
+        let m = manifest();
+        let padded_cmd = format!("ls -la{nbsp}");
+        let out = m.evaluate(&padded_cmd, &[]);
+        assert_eq!(out.findings.len(), 1);
+        match &out.findings[0].evidence[0] {
+            Evidence::CommandPattern { matched, .. } => {
+                assert!(
+                    matched.ends_with(nbsp),
+                    "ASCII trim must preserve the trailing U+00A0 in evidence, got {matched:?}"
+                );
+            }
+            other => panic!("expected CommandPattern evidence, got {other:?}"),
+        }
+
+        // (b) Dangerous-pattern finding: both the pattern and the matched command
+        // keep their NBSP padding in the evidence.
+        let dm = CommandsManifest::from_yaml(&format!(
+            "dangerous:\n  - pattern: \"rm -rf *{nbsp}\"\n    action: block\n"
+        ))
+        .expect("parses");
+        let dout = dm.evaluate(&format!("rm -rf /tmp/x{nbsp}"), &[]);
+        assert_eq!(dout.findings.len(), 1);
+        match &dout.findings[0].evidence[0] {
+            Evidence::CommandPattern { pattern, matched } => {
+                assert!(
+                    pattern.ends_with(nbsp),
+                    "ASCII trim must preserve the trailing U+00A0 in the pattern, got {pattern:?}"
+                );
+                assert!(
+                    matched.ends_with(nbsp),
+                    "ASCII trim must preserve the trailing U+00A0 in matched, got {matched:?}"
+                );
+            }
+            other => panic!("expected CommandPattern evidence, got {other:?}"),
+        }
     }
 
     #[test]

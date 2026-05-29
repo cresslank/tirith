@@ -60,13 +60,25 @@ pub const CREDENTIAL_RULE_IDS: &[&str] = &[
     "credential_in_text",
     "high_entropy_secret",
     "private_key_exposed",
-    "canary_token_touched",
+    CANARY_RULE_ID,
 ];
 
 /// `true` when `rule_id` is one of the credential-type rules
 /// [`tirith secret triage`](crate::cli) acts on.
 pub fn is_credential_rule(rule_id: &str) -> bool {
     CREDENTIAL_RULE_IDS.contains(&rule_id)
+}
+
+/// The audit `rule_id` for a touched canary (tirith's own synthetic honeytoken).
+/// Kept as a named constant so the triage attribution-suppression and the
+/// canary-specific advice in [`TriageItem::next_step`] stay in lockstep.
+pub const CANARY_RULE_ID: &str = "canary_token_touched";
+
+/// `true` when `rule_id` is the canary-touched rule. A canary is tirith's OWN
+/// bait token, not a leaked third-party credential, so triage must not attribute
+/// it to a provider — it gets its own "investigate the bait" next-step instead.
+pub fn is_canary_rule(rule_id: &str) -> bool {
+    rule_id == CANARY_RULE_ID
 }
 
 /// A single provider's rotation guidance. Pure data — no behavior, no I/O.
@@ -353,10 +365,25 @@ pub struct TriageItem {
 }
 
 impl TriageItem {
-    /// The one-line next-step shown by `tirith secret triage`. When a provider
-    /// was attributed, points at its revocation URL; otherwise gives generic
-    /// guidance (the user names the provider for `tirith secret rotate <p>`).
+    /// The one-line next-step shown by `tirith secret triage`.
+    ///
+    /// * A touched canary (tirith's own bait token) gets its OWN investigate-the-
+    ///   bait advice — NOT third-party-provider rotation (CodeRabbit R12 #E).
+    ///   Its `provider` is always `None` (suppressed in [`triage_records`]), but
+    ///   we branch on the rule id so a canary never falls through to the generic
+    ///   "name a provider to rotate" line either.
+    /// * Otherwise, when a provider was attributed, point at its revocation URL;
+    ///   else give generic guidance (the user names the provider for
+    ///   `tirith secret rotate <p>`).
     pub fn next_step(&self) -> String {
+        if is_canary_rule(&self.rule_id) {
+            return format!(
+                "{} ({}) → a tirith canary (bait) token was READ — this is NOT a \
+                 third-party credential to rotate. Investigate WHO/WHAT touched it: \
+                 `tirith canary status`, then consider `tirith incident start`.",
+                self.rule_id, self.timestamp
+            );
+        }
         match self.provider {
             Some(p) => format!(
                 "{} ({}) → rotate the {} credential at {}",
@@ -399,11 +426,26 @@ pub fn triage_records(
         }
         for rid in &r.rule_ids {
             if is_credential_rule(rid) {
+                // A touched canary is tirith's OWN synthetic honeytoken, not a
+                // real leaked third-party credential — so it must NEVER be
+                // attributed to a provider (CodeRabbit R12 #E). Routing it to
+                // "rotate your AWS/GitHub token at <url>" is the wrong playbook:
+                // there is no third-party secret to rotate. The redacted command
+                // text around a canary touch can coincidentally contain a
+                // provider key-shape, so we suppress attribution explicitly
+                // rather than relying on `match_provider` returning `None`. A
+                // canary item carries its own "investigate the bait" next-step
+                // (see [`TriageItem::next_step`]).
+                let provider = if is_canary_rule(rid) {
+                    None
+                } else {
+                    match_provider(&r.command_redacted)
+                };
                 items.push(TriageItem {
                     rule_id: rid.clone(),
                     timestamp: r.timestamp.clone(),
                     redacted: r.command_redacted.clone(),
-                    provider: match_provider(&r.command_redacted),
+                    provider,
                 });
             }
         }
@@ -775,6 +817,62 @@ mod tests {
         );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].rule_id, "canary_token_touched");
+    }
+
+    #[test]
+    fn canary_touch_is_not_attributed_to_a_third_party_provider() {
+        // CodeRabbit R12 #E: a touched canary is tirith's OWN bait token, not a
+        // leaked third-party credential. Even when the redacted command text
+        // contains a real provider key-shape (here an AWS `AKIA…` id AND a
+        // GitHub `ghp_…` token), triage must NOT attribute the canary to a
+        // provider, and its next-step must point at canary investigation — never
+        // "rotate your AWS/GitHub credential".
+        let items = triage_records(
+            &[verdict(
+                "2026-05-28T10:00:00Z",
+                &["canary_token_touched"],
+                // Deliberately laden with provider shapes match_provider WOULD hit.
+                "cat ~/.aws/credentials # AKIA... ghp_xxx",
+            )],
+            0,
+        );
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.rule_id, "canary_token_touched");
+        assert!(
+            item.provider.is_none(),
+            "a canary touch must NOT be attributed to a provider, got {:?}",
+            item.provider.map(|p| p.provider)
+        );
+        let step = item.next_step();
+        assert!(
+            step.contains("canary") && step.contains("bait"),
+            "canary next-step must describe the bait investigation, got: {step}"
+        );
+        assert!(
+            !step.to_ascii_lowercase().contains("rotate the aws")
+                && !step.contains("rotate your")
+                && !step.contains("secret rotate <provider>"),
+            "canary next-step must NOT offer third-party-provider rotation, got: {step}"
+        );
+
+        // Contrast: a REAL credential rule carrying the same AWS shape IS
+        // attributed to aws (proves the suppression is canary-specific, not a
+        // blanket disable of attribution).
+        let real = triage_records(
+            &[verdict(
+                "2026-05-28T10:01:00Z",
+                &["credential_in_text"],
+                "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+            )],
+            0,
+        );
+        assert_eq!(real.len(), 1);
+        assert_eq!(
+            real[0].provider.map(|p| p.provider),
+            Some("aws"),
+            "a real credential finding with an AKIA shape must still attribute to aws"
+        );
     }
 
     #[test]
