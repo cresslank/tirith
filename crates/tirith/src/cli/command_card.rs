@@ -46,8 +46,12 @@ pub fn create(
     });
 
     // Validate the expiry parses now so `create` fails fast rather than
-    // producing a card that never verifies.
-    if chrono::NaiveDate::parse_from_str(expires.trim(), "%Y-%m-%d").is_err() {
+    // producing a card that never verifies. Store the TRIMMED value: a padded
+    // `--expires "2026-12-01 "` passes this `.trim()` check but, if stored raw,
+    // would later fail the STRICT `NaiveDate::parse_from_str` at verify/parse
+    // time (which does not trim) — a card that creates but never verifies.
+    let expires = expires.trim().to_string();
+    if chrono::NaiveDate::parse_from_str(&expires, "%Y-%m-%d").is_err() {
         eprintln!("tirith command-card create: --expires must be YYYY-MM-DD (got '{expires}')");
         return 2;
     }

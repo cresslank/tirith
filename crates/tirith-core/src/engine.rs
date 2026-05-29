@@ -891,6 +891,73 @@ fn check_command_manifest_hot(
     (outcome.findings, outcome.matched_allowed_name)
 }
 
+/// Upper bound on the bytes we read from a command-card path. A card is a tiny
+/// JSON object (a few hundred bytes in practice); 64 KiB is generous. A
+/// repo-carried `# tirith-card:` could point the hot path at a huge file or an
+/// endless device — capping the read keeps a single `tirith check` from
+/// exhausting memory before producing any verdict.
+const CARD_READ_CAP: u64 = 64 * 1024;
+
+/// Why a command-card path could not be turned into card bytes on the hot path.
+/// Each variant maps to a short human detail that is surfaced in the
+/// `CommandCardUnverified` Info note (verification is never *blocked* by these —
+/// the command is treated as if no card were present).
+enum CardReadError {
+    /// The path did not resolve to a regular file (FIFO, device, socket,
+    /// directory, …). We refuse to `read` it: a FIFO/`/dev/zero` would hang or
+    /// stream forever.
+    NotRegularFile,
+    /// The file exists and is regular but is larger than [`CARD_READ_CAP`].
+    TooLarge,
+    /// `stat`/`open`/`read` failed (missing file, permission denied, I/O error).
+    Unreadable,
+}
+
+impl CardReadError {
+    fn detail(&self) -> &'static str {
+        match self {
+            CardReadError::NotRegularFile => "card path is not a regular file",
+            CardReadError::TooLarge => "card file exceeds the 64 KiB read cap",
+            CardReadError::Unreadable => "card file not found or unreadable",
+        }
+    }
+}
+
+/// Read a command-card file with hard guards against the two repo-carried-ref
+/// abuse cases (M11 / CodeRabbit R7 #2):
+///
+/// 1. **Non-regular files.** A `# tirith-card:` pointing at a FIFO, character
+///    device (`/dev/zero`), socket, or directory would hang or stream forever
+///    under a plain `std::fs::read`. We `stat` first and reject anything that is
+///    not a regular file.
+/// 2. **Oversized payloads.** A huge regular file would exhaust memory. We read
+///    at most [`CARD_READ_CAP`] + 1 bytes via `Read::take`; if the file yielded
+///    more than the cap, we treat it as unverifiable rather than buffering it.
+fn read_card_bytes_guarded(path: &std::path::Path) -> Result<Vec<u8>, CardReadError> {
+    use std::io::Read as _;
+    // `metadata` follows symlinks (so a symlink *to* a regular file is fine, and
+    // a symlink to a FIFO/device is correctly rejected by `is_file()`).
+    let meta = std::fs::metadata(path).map_err(|_| CardReadError::Unreadable)?;
+    if !meta.is_file() {
+        return Err(CardReadError::NotRegularFile);
+    }
+    // Even for a regular file, gate on the stat size before reading.
+    if meta.len() > CARD_READ_CAP {
+        return Err(CardReadError::TooLarge);
+    }
+    let file = std::fs::File::open(path).map_err(|_| CardReadError::Unreadable)?;
+    // Defense in depth against a TOCTOU grow between stat and read: cap the
+    // reader itself at CAP + 1 and reject if it actually delivered more than CAP.
+    let mut buf = Vec::new();
+    file.take(CARD_READ_CAP + 1)
+        .read_to_end(&mut buf)
+        .map_err(|_| CardReadError::Unreadable)?;
+    if buf.len() as u64 > CARD_READ_CAP {
+        return Err(CardReadError::TooLarge);
+    }
+    Ok(buf)
+}
+
 /// M11 ch1 — the command-card hot check. Resolves a card reference from the
 /// `--card <path>` sidecar flag (`ctx.card_ref`) OR a leading
 /// `# tirith-card: <local-path>` shell comment, reads the card FROM DISK, and
@@ -978,20 +1045,21 @@ fn check_command_card_hot_with_trusted_dir(
         }
     };
 
-    let bytes = match std::fs::read(&card_path) {
+    let bytes = match read_card_bytes_guarded(&card_path) {
         Ok(b) => b,
-        Err(_) => {
+        Err(reason) => {
+            let detail = reason.detail();
             return vec![Finding {
                 rule_id: crate::verdict::RuleId::CommandCardUnverified,
                 severity: crate::verdict::Severity::Info,
                 title: "Command card could not be read".to_string(),
                 description: format!(
-                    "The referenced command card '{}' could not be read from disk. \
+                    "The referenced command card '{}' could not be read from disk ({detail}). \
                      Treating the command as if no card were present.",
                     card_path.display()
                 ),
                 evidence: vec![crate::verdict::Evidence::Text {
-                    detail: "card file not found".to_string(),
+                    detail: detail.to_string(),
                 }],
                 human_view: None,
                 agent_view: None,
@@ -3203,6 +3271,88 @@ mod tests {
             detail.contains("trust store unavailable")
                 && detail.contains("verification attempted but could not complete"),
             "evidence must explain the trust store was unavailable, got: {detail}"
+        );
+    }
+
+    /// CodeRabbit R7 #2: a `# tirith-card:`/`--card` ref pointing at a FIFO must
+    /// NOT hang the hot path. `std::fs::read` on a FIFO blocks forever waiting
+    /// for a writer; the `is_file()` guard rejects it BEFORE any open/read, so we
+    /// surface a `CommandCardUnverified` ("card path is not a regular file") and
+    /// never block the verdict. Unix-only (FIFO + `mkfifo`).
+    #[cfg(unix)]
+    #[test]
+    fn command_card_fifo_ref_does_not_hang_and_is_unverified() {
+        use std::ffi::CString;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo_path = dir.path().join("card.fifo");
+        // Create the FIFO. If the platform/filesystem refuses mkfifo, skip.
+        let c_path = CString::new(fifo_path.as_os_str().to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        if rc != 0 {
+            eprintln!("skipping: mkfifo unsupported here");
+            return;
+        }
+        assert!(
+            std::fs::metadata(&fifo_path).is_ok(),
+            "fifo should exist after mkfifo"
+        );
+
+        let mut ctx = exec_ctx("echo hi");
+        ctx.card_ref = Some(fifo_path.display().to_string());
+
+        // Trust store available (a temp dir): we want to prove we reject at the
+        // READ stage, before any signature/trust logic — and without blocking.
+        let trusted = tempfile::tempdir().unwrap();
+        // The whole call must complete promptly; if the FIFO guard regressed to a
+        // blocking `std::fs::read`, this would hang the test (caught by the suite
+        // timeout). No findings may BLOCK — they are all Info attestation notes.
+        let findings =
+            check_command_card_hot_with_trusted_dir(&ctx, Some(trusted.path().to_path_buf()));
+        assert_eq!(findings.len(), 1, "exactly one unverified note expected");
+        assert_eq!(
+            findings[0].rule_id,
+            crate::verdict::RuleId::CommandCardUnverified
+        );
+        assert_eq!(findings[0].severity, crate::verdict::Severity::Info);
+        let detail = match &findings[0].evidence[0] {
+            crate::verdict::Evidence::Text { detail } => detail.clone(),
+            other => panic!("expected Text evidence, got {other:?}"),
+        };
+        assert!(
+            detail.contains("not a regular file"),
+            "evidence must explain the card path is not a regular file, got: {detail}"
+        );
+    }
+
+    /// CodeRabbit R7 #2 (size cap): a card ref pointing at a file larger than the
+    /// 64 KiB read cap is treated as unverifiable (Info `CommandCardUnverified`)
+    /// rather than buffered into memory. Cross-platform (a plain large file).
+    #[test]
+    fn command_card_oversized_file_is_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let big_path = dir.path().join("big-card.json");
+        // One byte over the cap is enough to trip the guard.
+        let big = vec![b'{'; (super::CARD_READ_CAP as usize) + 1];
+        std::fs::write(&big_path, &big).unwrap();
+
+        let mut ctx = exec_ctx("echo hi");
+        ctx.card_ref = Some(big_path.display().to_string());
+
+        let trusted = tempfile::tempdir().unwrap();
+        let findings =
+            check_command_card_hot_with_trusted_dir(&ctx, Some(trusted.path().to_path_buf()));
+        assert_eq!(findings.len(), 1, "exactly one unverified note expected");
+        assert_eq!(
+            findings[0].rule_id,
+            crate::verdict::RuleId::CommandCardUnverified
+        );
+        let detail = match &findings[0].evidence[0] {
+            crate::verdict::Evidence::Text { detail } => detail.clone(),
+            other => panic!("expected Text evidence, got {other:?}"),
+        };
+        assert!(
+            detail.contains("exceeds") && detail.contains("cap"),
+            "evidence must explain the file exceeded the read cap, got: {detail}"
         );
     }
 

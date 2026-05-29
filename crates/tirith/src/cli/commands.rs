@@ -646,8 +646,10 @@ mod tests {
         // built-in-matching GitHub PAT to prove built-in patterns apply too.
         let custom = vec![r"ACME-[A-Z0-9]{6}".to_string()];
         let secret_token = "ACME-AB12CD";
-        // 40 chars after `ghp_` to satisfy the built-in `ghp_[A-Za-z0-9]{36,}`.
-        let pat = "ghp_0123456789abcdefghij0123456789abcdefgh";
+        // Build the GitHub PAT at runtime (CodeRabbit R7 #7): a contiguous
+        // `ghp_<36+>` LITERAL in the source trips secret scanners. 40 body chars
+        // (`[A-Za-z0-9]`) still satisfy the built-in `ghp_[A-Za-z0-9]{36,}`.
+        let pat = format!("ghp_{}", "a1B2c3D4".repeat(5)); // 40 alphanumeric chars
         let command = format!("deploy --token {secret_token} --pat {pat}");
 
         let verdict = Verdict::allow_fast(1, Timings::default());
@@ -672,7 +674,7 @@ mod tests {
         );
         // The built-in GitHub-PAT pattern is also applied (the raw PAT is gone).
         assert!(
-            !emitted.contains(pat),
+            !emitted.contains(pat.as_str()),
             "built-in DLP (GitHub PAT) leaked into the JSON command field: {emitted}"
         );
         // The non-secret parts of the command survive so the record stays useful.

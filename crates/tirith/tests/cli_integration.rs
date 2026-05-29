@@ -8706,6 +8706,89 @@ fn command_card_create_sign_verify_check_roundtrip() {
     assert_eq!(cjson["action"], "block");
 }
 
+/// CodeRabbit R7 #4: `command-card create --expires` must STORE the trimmed
+/// date. The validation used `.trim()` but the card stored the raw value, so a
+/// padded `--expires "2026-12-01 "` would pass `create` yet later fail the
+/// STRICT (non-trimming) parse at verify time — a card that creates but never
+/// verifies. This pins that a padded expiry persists trimmed AND still verifies.
+#[test]
+fn command_card_create_trims_padded_expires_and_verifies() {
+    use tirith_core::command_card;
+
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+
+    // A benign command (no pipe-to-shell), with a padded --expires.
+    let create = tirith()
+        .args([
+            "command-card",
+            "create",
+            "--command",
+            "echo hi",
+            "--expires",
+            "2099-12-01 ", // trailing space — must be stored trimmed
+        ])
+        .env("HOME", home.path())
+        .output()
+        .expect("create");
+    assert_eq!(create.status.code(), Some(0), "create exits 0");
+
+    // The persisted card's `expires` field must be the TRIMMED date.
+    let card_json: serde_json::Value = serde_json::from_slice(&create.stdout).unwrap();
+    assert_eq!(
+        card_json["expires"], "2099-12-01",
+        "stored expires must be trimmed (no trailing space)"
+    );
+
+    // And it must round-trip through sign + verify (strict parse) → verified.
+    let card_path = work.path().join("card.json");
+    fs::write(&card_path, &create.stdout).unwrap();
+    let (secret, pubkey) = command_card::generate_keypair().unwrap();
+    let key_path = work.path().join("ed25519-priv.bin");
+    fs::write(&key_path, secret).unwrap();
+    let sign = tirith()
+        .args([
+            "command-card",
+            "sign",
+            "--key",
+            key_path.to_str().unwrap(),
+            card_path.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .output()
+        .expect("sign");
+    assert_eq!(sign.status.code(), Some(0), "sign exits 0");
+
+    let key_id = command_card::key_id_for_pubkey(&pubkey);
+    for sub in [
+        ".config/tirith/trusted-card-keys",
+        "Library/Application Support/tirith/trusted-card-keys",
+    ] {
+        let dir = home.path().join(sub);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{key_id}.pub")), pubkey).unwrap();
+    }
+
+    let verify = tirith()
+        .args([
+            "command-card",
+            "verify",
+            "--json",
+            card_path.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .expect("verify");
+    assert_eq!(
+        verify.status.code(),
+        Some(0),
+        "padded-expiry card must still verify (exit 0)"
+    );
+    let vjson: serde_json::Value = serde_json::from_slice(&verify.stdout).unwrap();
+    assert_eq!(vjson["verified"], true, "verified must be true");
+}
+
 /// Regression (CRITICAL): a card carried via a `# tirith-card: <path>` COMMENT
 /// (not the `--card` sidecar) must VERIFY when its signed `command` matches the
 /// real command on the following line. The marker line is transport metadata
@@ -8883,9 +8966,16 @@ fn command_card_mismatch_is_high_and_other_findings_fire() {
     );
 }
 
-/// `command-card fetch` against an unreachable URL must fail (non-zero) rather
-/// than caching junk. We cannot hit a real server in CI; this covers the
-/// connection-refused path.
+/// `command-card fetch` against an unreachable URL must fail on the CONNECTION
+/// path (not a usage error) rather than caching junk. We cannot hit a real
+/// server in CI; port 9 (discard) on loopback reliably refuses/black-holes.
+///
+/// CodeRabbit R7 #9: the `fetch` subcommand is `#[cfg(unix)]`, so unix-gate this
+/// (on non-unix it is a no-op/usage error, not the path under test). And assert
+/// the SPECIFIC failure — exit 1 (the fetch-failure code, distinct from clap's
+/// usage exit 2) plus the `download failed:` error surfaced from the download
+/// path — instead of accepting any non-zero exit.
+#[cfg(unix)]
 #[test]
 fn command_card_fetch_rejects_unreachable_url() {
     let home = tempfile::tempdir().unwrap();
@@ -8894,7 +8984,17 @@ fn command_card_fetch_rejects_unreachable_url() {
         .env("HOME", home.path())
         .output()
         .expect("fetch");
-    assert_ne!(out.status.code(), Some(0), "unreachable fetch must fail");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unreachable fetch must exit 1 (a download failure, NOT a usage error); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("download failed"),
+        "stderr must report the connection/download failure, got:\n{stderr}"
+    );
 }
 
 /// F6 (Minor): the card cache is content-addressed (`<sha256>.json`), so
@@ -9318,6 +9418,50 @@ fn incident_start_status_shows_reason_and_started_at() {
     assert!(
         stdout.contains("started_at:"),
         "status must show started_at, got:\n{stdout}"
+    );
+}
+
+/// CodeRabbit R7 #5: a FATAL `incident start --json` (here: an unwritable state
+/// dir, forced by pointing `XDG_STATE_HOME` at a regular FILE so `create_dir_all`
+/// of the flag's parent fails) must emit PARSEABLE JSON on stdout — not plain
+/// stderr that a `--json` consumer cannot parse. Exit code stays 1. Unix-gated:
+/// the failure is forced via POSIX file-vs-directory path semantics.
+#[cfg(unix)]
+#[test]
+fn incident_start_json_fatal_emits_parseable_json() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // A regular FILE where the state dir is expected: state_dir() becomes
+    // `<blocker>/tirith`, and create_dir_all of that parent fails (a component
+    // is a file, not a directory).
+    let blocker = tmp.path().join("not-a-dir");
+    fs::write(&blocker, b"x").unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tirith"));
+    cmd.env_remove("TIRITH");
+    cmd.env("XDG_STATE_HOME", &blocker);
+    cmd.env("XDG_DATA_HOME", tmp.path());
+    let out = cmd
+        .args(["incident", "start", "--reason", "drill", "--json"])
+        .output()
+        .expect("failed to run tirith incident start --json");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a fatal start keeps exit 1; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // stdout must be a parseable JSON object carrying an `error` field.
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "--json fatal start must emit parseable JSON on stdout, got err {e}; stdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert!(
+        v.get("error").and_then(|e| e.as_str()).is_some(),
+        "fatal JSON must carry a string `error` field, got: {v}"
     );
 }
 
@@ -9883,6 +10027,48 @@ fn canary_json_validation_errors_are_machine_readable() {
             .and_then(|e| e.as_str())
             .is_some_and(|s| s.contains("--yes")),
         "JSON error must mention the required --yes flag, got: {v}"
+    );
+}
+
+/// CodeRabbit R7 #6: the OPERATIONAL store-error branch of `canary create --json`
+/// (distinct from the validation branches above) must also route through the
+/// JSON error path. Forced by pointing `XDG_STATE_HOME` at a regular FILE so the
+/// canary store (`state_dir()/canaries.jsonl`) can't be created. Exit stays 1.
+/// Unix-gated: the failure relies on POSIX file-vs-directory path semantics.
+#[cfg(unix)]
+#[test]
+fn canary_create_json_store_error_is_machine_readable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Regular file where the state dir is expected → store_path() becomes
+    // `<blocker>/tirith/canaries.jsonl` and the create_dir_all fails.
+    let blocker = tmp.path().join("not-a-dir");
+    fs::write(&blocker, b"x").unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tirith"));
+    cmd.env_remove("TIRITH");
+    cmd.env("XDG_STATE_HOME", &blocker);
+    cmd.env("XDG_DATA_HOME", tmp.path());
+    let out = cmd
+        .args(["canary", "create", "aws-like", "--json"])
+        .output()
+        .expect("canary create --json with unwritable store");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an operational store failure keeps exit 1; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "--json store error must emit parseable JSON on stdout, got err {e}; stdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert!(
+        v.get("error").and_then(|e| e.as_str()).is_some(),
+        "operational JSON error must carry a string `error` field, got: {v}"
     );
 }
 

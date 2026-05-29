@@ -84,7 +84,7 @@ pub fn create(kind: &str, callback_url: Option<String>, json: bool) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("tirith canary create: {e}");
+            emit_error(json, "tirith canary create", &e.to_string());
             1
         }
     }
@@ -216,7 +216,7 @@ pub fn prune(id: &str, yes: bool, json: bool) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("tirith canary prune: {e}");
+            emit_error(json, "tirith canary prune", &e.to_string());
             2
         }
     }
@@ -265,7 +265,7 @@ pub fn rotate(id: &str, json: bool) -> i32 {
             1
         }
         Err(e) => {
-            eprintln!("tirith canary rotate: {e}");
+            emit_error(json, "tirith canary rotate", &e.to_string());
             2
         }
     }

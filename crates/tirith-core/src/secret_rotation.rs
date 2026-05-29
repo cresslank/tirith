@@ -513,15 +513,22 @@ mod tests {
 
     #[test]
     fn bare_pem_header_does_not_attribute_to_gcp() {
-        // F4 (Minor): the generic `-----BEGIN PRIVATE KEY-----` PEM header is not
-        // GCP-specific and must NOT misroute an unrelated private key to gcp.
+        // F4 (Minor): the generic PEM private-key header is not GCP-specific and
+        // must NOT misroute an unrelated private key to gcp.
+        //
+        // CodeRabbit R7 #8: assemble the `-----BEGIN ... PRIVATE KEY-----` header
+        // from fragments at runtime so a contiguous private-key header LITERAL is
+        // not committed (it trips private-key scanners). The reconstructed string
+        // is byte-identical to the header `match_provider` sees in real input.
+        let dashes = "-".repeat(5);
+        let pem_header = format!("{dashes}BEGIN PRIVATE KEY{dashes}");
         assert!(
-            match_provider("-----BEGIN PRIVATE KEY-----").is_none(),
+            match_provider(&pem_header).is_none(),
             "a bare PEM private-key header must not attribute to gcp"
         );
+        let pem_block = format!("cat key.pem\n{pem_header}\nMIIE...");
         assert!(
-            match_provider("cat key.pem\n-----BEGIN PRIVATE KEY-----\nMIIE...").map(|p| p.provider)
-                != Some("gcp"),
+            match_provider(&pem_block).map(|p| p.provider) != Some("gcp"),
             "a generic PEM block must not route to gcp"
         );
         // GCP-distinctive shapes still attribute correctly.

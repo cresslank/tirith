@@ -27,6 +27,21 @@ use tirith_core::incident::{self, IncidentState, StartError};
 
 use super::{confirm, write_json_stdout};
 
+/// Emit a fatal operator error as a machine-readable `{"error": ...}` JSON
+/// object on stdout when `--json`, or a human line on stderr otherwise. Keeps
+/// the `--json` surface parseable on the FATAL branches of start/stop/report
+/// (e.g. an unwritable state dir) instead of leaking plain stderr a JSON
+/// consumer cannot parse (CodeRabbit R7 #5). Mirrors `cli::canary::emit_error`.
+/// Callers keep their existing exit codes — this only changes the rendering.
+fn emit_error(json: bool, ctx: &str, msg: &str) {
+    if json {
+        let v = serde_json::json!({ "error": msg });
+        write_json_stdout(&v, &format!("{ctx}: failed to write JSON output"));
+    } else {
+        eprintln!("{ctx}: {msg}");
+    }
+}
+
 /// `tirith incident start [--reason "…"]` — declare an incident: flip the
 /// runtime policy fail-closed and disable the `TIRITH=0` bypass.
 ///
@@ -110,7 +125,7 @@ pub fn start(reason: Option<String>, json: bool) -> i32 {
             1
         }
         Err(e) => {
-            eprintln!("tirith incident start: {e}");
+            emit_error(json, "tirith incident start", &e.to_string());
             1
         }
     }
@@ -199,7 +214,7 @@ pub fn stop(yes: bool, json: bool) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("tirith incident stop: {e}");
+            emit_error(json, "tirith incident stop", &e);
             1
         }
     }
@@ -321,7 +336,7 @@ pub fn report(out: Option<PathBuf>, json: bool) -> i32 {
                 0
             }
             Err(e) => {
-                eprintln!("tirith incident report: {e}");
+                emit_error(json, "tirith incident report", &e);
                 1
             }
         },

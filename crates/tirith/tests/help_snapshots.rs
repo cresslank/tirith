@@ -269,13 +269,18 @@ fn help_secret_states_assistant_only_and_no_network() {
         // current contract phrase is "ZERO network calls") — a bare
         // `contains("network")` would also pass on a "may perform network calls"
         // regression, so demand one of the explicit no-network phrasings.
+        //
+        // CodeRabbit R7 #10: every accepted phrasing must contain the literal
+        // token "network". The previous `"never fetched"` alternative did NOT,
+        // so the assertion could pass with no mention of "network" at all —
+        // directly contradicting the assert message. Dropped it; the remaining
+        // alternatives all carry "network".
         assert!(
             collapsed.contains("zero network")
                 || collapsed.contains("no network")
                 || collapsed.contains("never makes network")
                 || collapsed.contains("makes no network")
-                || collapsed.contains("does not make network")
-                || collapsed.contains("never fetched"),
+                || collapsed.contains("does not make network"),
             "{args:?} --help must state it makes NO network calls (a negation adjacent to \
              'network'), got:\n{stdout}"
         );
@@ -295,9 +300,19 @@ fn help_incident_states_no_new_rules_and_lockout_safety() {
         .output()
         .expect("failed to run tirith");
     let top_out = String::from_utf8_lossy(&top.stdout);
+    // CodeRabbit R7 #11: the contract is "NO new rule IDs" — a bare "no new
+    // rule" (without the "ID"/"IDs" qualifier) weakens it. Require the "id"
+    // qualifier too. Normalize whitespace first (lowercased) so a clap line-wrap
+    // between "rule" and "IDs" can't split the phrase and fail spuriously; the
+    // "no new rule id" prefix matches both "ID" and "IDs".
+    let top_collapsed: String = top_out
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
-        top_out.contains("NO new rule IDs") || top_out.to_ascii_lowercase().contains("no new rule"),
-        "incident --help must state it adds no new rule IDs, got:\n{top_out}"
+        top_collapsed.contains("no new rule id"),
+        "incident --help must state it adds no new rule IDs (with the ID qualifier), got:\n{top_out}"
     );
     assert!(
         top_out.contains("FAIL-CLOSED") || top_out.to_ascii_lowercase().contains("fail-closed"),

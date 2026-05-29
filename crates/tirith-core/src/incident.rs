@@ -320,6 +320,9 @@ pub fn start_at(path: &Path, reason: impl Into<String>) -> Result<IncidentState,
                     // written content. Drop `tmp` to unlink the temp name (the
                     // linked final path keeps the inode/content).
                     drop(tmp);
+                    // Make the new directory entry crash-durable (the body was
+                    // already fsync'd above; the LINK itself needs a dir fsync).
+                    fsync_parent_dir(path);
                     invalidate_cache();
                     return Ok(state);
                 }
@@ -359,6 +362,10 @@ pub fn start_at(path: &Path, reason: impl Into<String>) -> Result<IncidentState,
     match opts.open(path) {
         Ok(f) => {
             finish_excl_write(f, &body, path)?;
+            // The O_EXCL create added a new directory entry; fsync the parent so
+            // that entry survives a crash (the body was fsync'd in
+            // `finish_excl_write`).
+            fsync_parent_dir(path);
             invalidate_cache();
             Ok(state)
         }
@@ -377,6 +384,25 @@ pub fn start_at(path: &Path, reason: impl Into<String>) -> Result<IncidentState,
 /// Split out so the failure-path cleanup is unit-testable: a caller can pass a
 /// read-only-opened handle to force `write_all` to fail deterministically and
 /// assert the flag file is removed.
+/// fsync the directory that CONTAINS the incident flag, so the new directory
+/// entry (created by `hard_link` or O_EXCL `create_new`) is itself crash-durable
+/// — not just the file body (CodeRabbit R7 #3). Without this, a crash right after
+/// the atomic claim could lose the directory entry even though the inode's data
+/// was synced, leaving incident mode silently un-armed after a power loss.
+/// Best-effort + unix-only: directory fsync is not portable, and a failure here
+/// must never make `start` report an error after the flag is already published.
+#[cfg(unix)]
+fn fsync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn fsync_parent_dir(_path: &Path) {}
+
 fn finish_excl_write(mut file: std::fs::File, body: &[u8], path: &Path) -> Result<(), StartError> {
     use std::io::Write as _;
     let write_result = file

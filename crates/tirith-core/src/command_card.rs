@@ -378,8 +378,16 @@ impl Card {
 
     /// Does the card's `command` match `cmd` byte-for-byte (after trimming
     /// surrounding ASCII whitespace)? This is the mismatch gate.
+    ///
+    /// We trim only ASCII whitespace (not `str::trim`, which strips the whole
+    /// Unicode `White_Space` set). A command tampered to differ solely by a
+    /// Unicode-whitespace character — e.g. a U+00A0 NO-BREAK SPACE substituted
+    /// for an ASCII space — MUST be treated as a mismatch, not silently
+    /// equated to the signed text. Allowing `str::trim` to collapse those would
+    /// be a signed-card verification bypass.
     pub fn command_matches(&self, cmd: &str) -> bool {
-        self.command.trim() == cmd.trim()
+        let ascii_ws = |c: char| c.is_ascii_whitespace();
+        self.command.trim_matches(ascii_ws) == cmd.trim_matches(ascii_ws)
     }
 }
 
@@ -848,6 +856,38 @@ mod tests {
             card.verify_signature(&pubkey),
             Err(VerifyFailure::BadSignature)
         );
+    }
+
+    /// CodeRabbit R7 #1: the mismatch gate must trim ONLY ASCII whitespace.
+    /// `str::trim` strips the full Unicode `White_Space` set, so a command
+    /// tampered to differ solely by a Unicode-whitespace char (U+00A0 NO-BREAK
+    /// SPACE vs an ASCII space) would be wrongly considered EQUAL and slip past
+    /// the gate — a signed-card verification bypass.
+    #[test]
+    fn command_matches_does_not_trim_unicode_whitespace() {
+        let card = sample_card();
+        // The signed command (from `sample_card`) uses ASCII spaces. A command
+        // with a U+00A0 NO-BREAK SPACE swapped in for one of those spaces is a
+        // DIFFERENT command and must NOT match.
+        let tampered = card.command.replacen(' ', "\u{00A0}", 1);
+        assert_ne!(
+            tampered, card.command,
+            "sanity: the tampered string actually differs"
+        );
+        assert!(
+            !card.command_matches(&tampered),
+            "a command differing only by a Unicode (U+00A0) whitespace must NOT match the signed text"
+        );
+
+        // Plain ASCII leading/trailing whitespace (spaces, tabs, newlines, CR)
+        // still trims equal — the gate stays tolerant of surrounding ASCII WS.
+        let padded = format!(" \t\r\n{}\n  ", card.command);
+        assert!(
+            card.command_matches(&padded),
+            "surrounding ASCII whitespace must still trim equal"
+        );
+        // And the exact command (no padding) matches.
+        assert!(card.command_matches(&card.command));
     }
 
     #[test]
