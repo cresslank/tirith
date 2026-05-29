@@ -403,24 +403,21 @@ pub fn start_at(path: &Path, reason: impl Into<String>) -> Result<IncidentState,
 /// Split out so the failure-path cleanup is unit-testable: a caller can pass a
 /// read-only-opened handle to force `write_all` to fail deterministically and
 /// assert the flag file is removed.
+///
 /// fsync the directory that CONTAINS the incident flag, so the new directory
 /// entry (created by `hard_link` or O_EXCL `create_new`) is itself crash-durable
 /// — not just the file body (CodeRabbit R7 #3). Without this, a crash right after
 /// the atomic claim could lose the directory entry even though the inode's data
 /// was synced, leaving incident mode silently un-armed after a power loss.
-/// Best-effort + unix-only: directory fsync is not portable, and a failure here
-/// must never make `start` report an error after the flag is already published.
-#[cfg(unix)]
+///
+/// Routes through the shared [`crate::util::fsync_parent_dir_logged`]
+/// (CodeRabbit R13 #5, consolidating the former per-module copy): a failure of
+/// the trailing dir fsync must never make `start`/`stop` report an error after
+/// the flag is already published/removed — but it is now LOGGED rather than
+/// silently dropped. Best-effort + unix-only (the inner call no-ops on non-Unix).
 fn fsync_parent_dir(path: &Path) {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
+    crate::util::fsync_parent_dir_logged(path, "incident flag");
 }
-
-#[cfg(not(unix))]
-fn fsync_parent_dir(_path: &Path) {}
 
 fn finish_excl_write(mut file: std::fs::File, body: &[u8], path: &Path) -> Result<(), StartError> {
     use std::io::Write as _;

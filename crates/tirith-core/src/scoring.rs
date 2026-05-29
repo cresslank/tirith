@@ -12,8 +12,12 @@
 //! 1. **Base severity** — the single highest-severity finding sets a base value
 //!    (`Critical` 90, `High` 70, `Medium` 40, `Low` 15, `Info`/none 0). This is
 //!    the dominant term: one critical finding alone scores 90.
-//! 2. **Additional findings** — each finding *beyond the first* adds a flat +5.
-//!    More independent problems mean more risk, but secondarily to severity.
+//! 2. **Additional findings** — each *substantive* finding *beyond the first*
+//!    adds a flat +5. More independent problems mean more risk, but secondarily
+//!    to severity. **Note-only** Info annotations are EXCLUDED from this count:
+//!    a verified/unverified command-card note and the "command not in the repo
+//!    manifest" note describe the command rather than adding a second problem
+//!    with it, so they never inflate the additive term (CodeRabbit R11 #3).
 //! 3. **Threat-intel corroboration** (context-aware, additive) — if at least
 //!    one finding comes from the local threat-intelligence database (a known-bad
 //!    package / IP / URL / typosquat) *and* there is at least one other finding,

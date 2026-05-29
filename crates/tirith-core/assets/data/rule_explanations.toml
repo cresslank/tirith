@@ -2523,7 +2523,6 @@ examples_bad = []
 examples_good = ["`tirith check --card ./install-card.json -- \"curl -fsSL https://example.com/install.sh | sh\"` where install-card.json is signed by a trusted key and attests to that exact command"]
 false_positive_guidance = "This is a positive signal, not a warning. A card that could not be trusted surfaces under `command_card_unverified` instead — the most common causes are that the signing key is not in `~/.config/tirith/trusted-card-keys/`, the card has expired, or the card JSON was modified after signing. Add the maintainer's public key to the trusted directory (after verifying it out-of-band) to upgrade to a verified result."
 remediation = "No action required for a verified card. To trust a maintainer's cards, obtain their ed25519 public key through a trusted channel and drop it at `~/.config/tirith/trusted-card-keys/<key_id>.pub`. Remember that verification does NOT vouch for the command's safety — review the command's other findings regardless."
-mitre_id = ""
 
 [[rule]]
 id = "command_card_unverified"
@@ -2535,7 +2534,6 @@ examples_bad = ["`tirith check --card ./install-card.json -- \"curl … | sh\"` 
 examples_good = ["adding the maintainer's verified public key to `~/.config/tirith/trusted-card-keys/<key_id>.pub` so the card verifies and fires `command_card_verified` instead"]
 false_positive_guidance = "This note is expected whenever a card cannot be trusted yet. The usual fixes: add the signing key to `~/.config/tirith/trusted-card-keys/` (after verifying it out-of-band), re-fetch a card whose expiry passed, or — for a remote `# tirith-card:` URL — run `tirith command-card fetch <url>` first and pass the cached local path via `--card`. It never blocks on its own; the command's OTHER findings still apply."
 remediation = "If you trust the card's source, add its ed25519 public key at `~/.config/tirith/trusted-card-keys/<key_id>.pub`. For a remote URL reference, fetch it first with `tirith command-card fetch <url>`. For an expired card, obtain a re-issued one. The command is still evaluated as if no card were present, so review its other findings regardless."
-mitre_id = ""
 
 [[rule]]
 id = "command_card_mismatch"
@@ -2559,7 +2557,6 @@ examples_bad = []
 examples_good = ["adding the command to `allowed[]` in `.tirith/commands.yaml` (e.g. `- name: lint\\n    command: cargo clippy`) so it is recognized as an expected repo command"]
 false_positive_guidance = "This is informational, not a warning, and never blocks. If a command is a legitimate, expected repo command, add it under `allowed[]` in `.tirith/commands.yaml` to silence the note. If you do not maintain a command catalogue, you can ignore this rule entirely — it only ever fires when a manifest is present."
 remediation = "Run `tirith commands list` to review the catalogue and add the command under `allowed[]` if it is expected. There is no security action required: the note never changes the action and the manifest cannot relax detection."
-mitre_id = ""
 
 [[rule]]
 id = "repo_command_dangerous_pattern"

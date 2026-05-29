@@ -200,8 +200,9 @@ pub(crate) fn write_file_atomic(path: &std::path::Path, contents: &[u8]) -> std:
     tmp.persist(path).map_err(|e| e.error)?;
     // `persist()` renames the temp over `path` but does not fsync the containing
     // directory. fsync the parent so the new name→inode entry survives a crash.
-    // Best-effort, no-op on non-Unix (Windows has no directory fsync).
-    tirith_core::util::fsync_parent_dir(path);
+    // The persist already succeeded, so a dir-fsync failure is LOGGED, not
+    // propagated (R13 #5). Best-effort, no-op on non-Unix (no directory fsync).
+    tirith_core::util::fsync_parent_dir_logged(path, "atomic file write");
     Ok(())
 }
 

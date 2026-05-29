@@ -1665,23 +1665,18 @@ fn atomic_restore_from(dest: &Path, source: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Best-effort fsync of `path`'s parent directory after a rename, so the new
-/// directory entry (name→inode) is durable. A bare file fsync persists the
-/// file's data but NOT the directory metadata recording its name, so a crash
-/// right after a rename can lose the entry. No-op on non-Unix (Windows exposes
-/// no directory-fsync); a parent that cannot be opened/synced is ignored —
-/// durability is best-effort and must never fail an otherwise-successful swap.
-#[cfg(unix)]
+/// fsync of `path`'s parent directory after a rename, so the new directory entry
+/// (name→inode) is durable. A bare file fsync persists the file's data but NOT
+/// the directory metadata recording its name, so a crash right after a rename can
+/// lose the entry.
+///
+/// Routes through the shared [`tirith_core::util::fsync_parent_dir_logged`]
+/// (CodeRabbit R13 #5, consolidating the former local copy): the binary swap has
+/// already succeeded, so a dir-fsync failure must never fail it — but it is now
+/// LOGGED rather than silently ignored. No-op success path on non-Unix.
 fn fsync_parent_dir(path: &Path) {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
+    tirith_core::util::fsync_parent_dir_logged(path, "binary swap");
 }
-
-#[cfg(not(unix))]
-fn fsync_parent_dir(_path: &Path) {}
 
 /// Best-effort writability probe for a directory: try to create and delete a
 /// temp file in it. A `false` here lets `atomic_self_replace` fail with a

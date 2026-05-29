@@ -555,16 +555,18 @@ dangerous:
     action: block
 "#;
 
-/// Trim ONLY ASCII whitespace from both ends, never the full Unicode
-/// `White_Space` set. Load-bearing for the manifest command/pattern comparison
-/// (CodeRabbit R9 #A): it MUST agree, byte-for-byte, with the ASCII-only
+/// Trim ONLY the ASCII whitespace a shell treats as a TOKEN SEPARATOR (space,
+/// tab, newline, CR), never the full Unicode `White_Space` set and never `\x0C`
+/// FORM FEED. Load-bearing for the manifest command/pattern comparison
+/// (CodeRabbit R9 #A, narrowed R13 #3): it MUST agree, byte-for-byte, with the
 /// [`crate::command_card::Card::command_matches`] mismatch gate on which bytes
-/// count as surrounding whitespace. `str::trim` would additionally strip
-/// U+00A0 / U+2007 / etc., letting a Unicode-whitespace-padded manifest entry
-/// match a command the command-card gate would reject — the two must not
-/// disagree on whitespace.
+/// count as surrounding whitespace, so it shares the SAME predicate
+/// (`command_card::is_shell_significant_ws`). `str::trim` would strip
+/// U+00A0 / U+2007 / etc., and `char::is_ascii_whitespace` would strip a form
+/// feed — either would let a padded manifest entry match a command the
+/// command-card gate would reject; the two must not disagree on whitespace.
 fn trim_ascii_ws(s: &str) -> &str {
-    s.trim_matches(|c: char| c.is_ascii_whitespace())
+    s.trim_matches(crate::command_card::is_shell_significant_ws)
 }
 
 /// Minimal glob matcher supporting only the `*` wildcard (matches any run of

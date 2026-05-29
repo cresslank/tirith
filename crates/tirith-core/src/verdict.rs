@@ -856,11 +856,12 @@ pub enum RuleId {
     CommandCardVerified,
     /// M11 ch1 — a command card was supplied (sidecar `--card` or a
     /// `# tirith-card:` comment) but could NOT be verified: an untrusted key,
-    /// a bad signature, an expired card, a malformed/unreadable card file, or a
-    /// remote URL that v1 will not fetch on the hot path. Info severity — a
-    /// diagnostic note that does NOT claim trust and does NOT change the
-    /// verdict. An entirely card-less command (or an unsigned card) emits
-    /// nothing on this axis.
+    /// a bad signature, an UNSIGNED card, an expired card, a malformed/unreadable
+    /// card file, or a remote URL that v1 will not fetch on the hot path. Info
+    /// severity — a diagnostic note that does NOT claim trust and does NOT change
+    /// the verdict. A SUPPLIED unsigned card DOES surface this note (the card ref
+    /// resolved, so the unsigned outcome belongs in audit/JSON); only an entirely
+    /// card-LESS command is silent on this axis.
     CommandCardUnverified,
     /// M11 ch1 — a trusted command card was found, but the command being run
     /// differs from the command the card attests to (tampering after the card

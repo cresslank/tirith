@@ -334,9 +334,22 @@ pub fn clear_taint_at(store: &Path, path: &Path, cwd: Option<&Path>) -> std::io:
     let key = normalize_key(path, cwd);
     let key_str = key.to_string_lossy().into_owned();
 
+    // PARTIAL-READ GUARD (CodeRabbit R13 #1): `clear` REWRITES the store from the
+    // lines it just read. A read that broke early on a real mid-file I/O fault
+    // (not a recoverable skipped-UTF-8 line) yields a truncated prefix; rewriting
+    // from it would PERMANENTLY DROP the unread tail — including still-live taint
+    // markers for OTHER paths (a security miss: a tainted path silently reads as
+    // clean). When the read is incomplete, ABORT the clear (report it as an I/O
+    // error so the caller knows nothing was removed) rather than truncating.
+    let (lines, complete) = crate::util::read_store_lines_complete(store);
+    if !complete {
+        return Err(std::io::Error::other(
+            "taint store could not be read completely; clear aborted to avoid truncating it",
+        ));
+    }
     let mut removed = 0usize;
     let mut kept_lines: Vec<String> = Vec::new();
-    for line in crate::util::read_store_lines(store) {
+    for line in lines {
         // Drop ONLY a line that parses as a TaintEntry whose path matches the
         // key. A line that does not parse (unknown/future schema) is kept
         // verbatim so the rewrite never loses it.
@@ -395,7 +408,7 @@ fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
     tmp.flush()?;
     tmp.as_file().sync_all()?;
     tmp.persist(store).map_err(|e| e.error)?;
-    crate::util::fsync_parent_dir(store);
+    crate::util::fsync_parent_dir_logged(store, "taint store");
     Ok(())
 }
 
@@ -406,6 +419,39 @@ mod tests {
 
     fn store_in(dir: &Path) -> PathBuf {
         dir.join("taint.jsonl")
+    }
+
+    /// CodeRabbit R13 #1: `clear_taint_at` REWRITES the store from the lines it
+    /// reads, so it must NOT do so when the read is incomplete (a real I/O fault
+    /// leaves the tail unread). A FIFO store is reported incomplete by
+    /// `read_store_lines_complete` (not a readable regular file), so the clear
+    /// aborts with an error and leaves the FIFO intact — never replaced by a
+    /// truncated regular file that would drop still-live taint markers. Unix-only
+    /// (needs mkfifo); cannot hang (O_NONBLOCK open returns immediately).
+    #[cfg(unix)]
+    #[test]
+    fn clear_aborts_on_incomplete_read_no_truncation() {
+        use std::ffi::CString;
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let c_path = CString::new(store.as_os_str().to_str().unwrap()).unwrap();
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+            eprintln!("skipping: mkfifo unsupported here");
+            return;
+        }
+        let res = clear_taint_at(&store, Path::new("/tmp/install.sh"), None);
+        assert!(
+            res.is_err(),
+            "clear on an unreadable store must abort, not silently rewrite"
+        );
+        assert!(
+            std::fs::symlink_metadata(&store)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the store must NOT be replaced by a regular file (no truncating rewrite)"
+        );
     }
 
     // The Unix-path-shape assertions below are gated `#[cfg(unix)]` because

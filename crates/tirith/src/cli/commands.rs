@@ -254,16 +254,22 @@ pub fn run(name: &str, json: bool) -> i32 {
             None,
             &policy.dlp_custom_patterns,
         );
-        let refusal = format!(
-            "refusing to run '{name}' ({command}): tirith blocked it. \
-             Inspect with `tirith commands check -- \"{command}\"`."
-        );
         if json {
             // ONE combined JSON object: the verdict (action + findings) AND the
             // refusal, never two concatenated documents. (Previously
             // `render_findings` wrote a verdict JSON and `emit_error` wrote a
             // second `{"error":...}` JSON.)
             //
+            // REDACT the command embedded in the refusal message (CodeRabbit R13
+            // #6): this string lands in the JSON `error` field, which (like the
+            // top-level `command` and the `findings`) goes to machine-readable
+            // stdout and any log collector consuming it. Leaving the raw command
+            // here would leak credentials / custom-DLP matches even though the
+            // sibling `command`/`findings` fields are scrubbed. Use the SAME
+            // built-in + custom DLP redaction as `build_run_json`.
+            let redacted_command =
+                tirith_core::redact::redact_command_text(&command, &policy.dlp_custom_patterns);
+            let refusal = block_refusal_message(name, &redacted_command);
             // If the single-object write fails (e.g. broken pipe), the `--json`
             // contract that a machine consumer reads exactly one parseable object
             // is broken — returning the block exit code would falsely signal a
@@ -282,7 +288,10 @@ pub fn run(name: &str, json: bool) -> i32 {
             return json_refusal_exit_code(wrote, verdict.action.exit_code());
         } else {
             // Human: surface WHY it was blocked (findings to stderr), then the
-            // refusal line (also stderr) — mirroring `tirith check`.
+            // refusal line (also stderr) — mirroring `tirith check`. This is the
+            // operator's OWN terminal (not a machine/log sink), so the refusal
+            // shows the command verbatim — same as the `Running …`/abort lines.
+            let refusal = block_refusal_message(name, &command);
             render_findings(&verdict, &policy.dlp_custom_patterns, json);
             emit_error(json, "tirith commands run", &refusal);
         }
@@ -404,6 +413,21 @@ fn json_refusal_exit_code(wrote_ok: bool, refusal_code: i32) -> i32 {
     } else {
         2
     }
+}
+
+/// Format the block-refusal message for manifest entry `name` running
+/// `command_for_display`.
+///
+/// `command_for_display` is whatever the CALLER decided is safe to surface: the
+/// JSON path passes the DLP-REDACTED command (the message lands in the
+/// machine-readable `error` field — CodeRabbit R13 #6), the human path passes the
+/// raw command (the operator's own terminal). Pure so the redaction contract on
+/// the JSON path is unit-testable without spawning a process.
+fn block_refusal_message(name: &str, command_for_display: &str) -> String {
+    format!(
+        "refusing to run '{name}' ({command_for_display}): tirith blocked it. \
+         Inspect with `tirith commands check -- \"{command_for_display}\"`."
+    )
 }
 
 /// Emit the single combined `commands run --json` object and return whether the
@@ -744,5 +768,45 @@ mod tests {
         );
         // The non-secret parts of the command survive so the record stays useful.
         assert!(emitted.contains("deploy --token"), "got: {emitted}");
+    }
+
+    /// CodeRabbit R13 #6: the block-refusal message on the `commands run --json`
+    /// path embeds the command, and that message lands in the JSON `error` field
+    /// (machine-readable stdout / log sink). It MUST be DLP-redacted the same way
+    /// the `command`/`findings` fields are — a raw secret-shaped token in the
+    /// refusal would leak even though the sibling fields are scrubbed. This pins
+    /// the pure construction the JSON branch uses (redact → `block_refusal_message`).
+    #[test]
+    fn json_block_refusal_message_redacts_command() {
+        use super::block_refusal_message;
+
+        let custom = vec![r"ACME-[A-Z0-9]{6}".to_string()];
+        let secret_token = "ACME-AB12CD";
+        // Built at runtime so a `ghp_<36+>` LITERAL doesn't trip secret scanners.
+        let pat = format!("ghp_{}", "a1B2c3D4".repeat(5)); // 40 alphanumeric chars
+        let command = format!("deploy --token {secret_token} --pat {pat}");
+
+        // Exactly what the JSON branch does: redact, then format the refusal.
+        let redacted = tirith_core::redact::redact_command_text(&command, &custom);
+        let refusal = block_refusal_message("deploy", &redacted);
+
+        assert!(
+            !refusal.contains(secret_token),
+            "custom-DLP token leaked into the JSON refusal message: {refusal}"
+        );
+        assert!(
+            !refusal.contains(pat.as_str()),
+            "built-in DLP (GitHub PAT) leaked into the JSON refusal message: {refusal}"
+        );
+        assert!(
+            refusal.contains("[REDACTED:custom]"),
+            "custom-DLP match should be replaced with the redaction placeholder: {refusal}"
+        );
+        // The refusal still names the manifest entry and the non-secret command head.
+        assert!(
+            refusal.contains("refusing to run 'deploy'"),
+            "got: {refusal}"
+        );
+        assert!(refusal.contains("deploy --token"), "got: {refusal}");
     }
 }

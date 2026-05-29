@@ -481,14 +481,21 @@ enum StoreLine {
 
 /// Read the store as an ordered list of [`StoreLine`]s, preserving lines that
 /// do not parse as a [`CanaryEntry`] so a rewrite can write them back verbatim.
-fn read_store_partitioned(path: &Path) -> Vec<StoreLine> {
-    crate::util::read_store_lines(path)
+///
+/// Returns `(lines, complete)`. `complete == false` (CodeRabbit R13 #1) means the
+/// underlying read broke early on a real mid-file I/O fault, so `lines` is a
+/// truncated prefix — `prune`/`rotate` must NOT rewrite the store from it (that
+/// would permanently drop the unread tail) and abort instead.
+fn read_store_partitioned(path: &Path) -> (Vec<StoreLine>, bool) {
+    let (lines, complete) = crate::util::read_store_lines_complete(path);
+    let parsed = lines
         .into_iter()
         .map(|line| match serde_json::from_str::<CanaryEntry>(&line) {
             Ok(entry) => StoreLine::Parsed(entry),
             Err(_) => StoreLine::Unparseable(line),
         })
-        .collect()
+        .collect();
+    (parsed, complete)
 }
 
 /// Atomically rewrite the store to exactly the given pre-serialized JSONL
@@ -523,8 +530,10 @@ fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
     // above, but the new directory entry is not crash-durable until the parent
     // dir is fsync'd. A lost rewrite could resurrect a stale store (e.g. an
     // un-pruned canary that no longer exists, or drop a still-live one). fsync
-    // the parent so the published store survives a crash. Best-effort, unix-only.
-    crate::util::fsync_parent_dir(store);
+    // the parent so the published store survives a crash. The body+rename already
+    // succeeded, so a dir-fsync failure is LOGGED, not propagated (R13 #5).
+    // Best-effort, unix-only.
+    crate::util::fsync_parent_dir_logged(store, "canary store");
     Ok(())
 }
 
@@ -601,9 +610,18 @@ pub fn prune_at(store: &Path, id: &str) -> std::io::Result<usize> {
     // Read RAW lines (CodeRabbit R12 #F): drop ONLY a parsed entry whose id
     // matches; carry every other line — including ones that don't parse as a
     // CanaryEntry — through the rewrite VERBATIM so prune never loses data.
+    // PARTIAL-READ GUARD (CodeRabbit R13 #1): if the read broke early on a real
+    // I/O fault the lines are a truncated prefix; rewriting from them would drop
+    // the unread tail (still-live canaries). Abort rather than truncate.
+    let (lines, complete) = read_store_partitioned(store);
+    if !complete {
+        return Err(std::io::Error::other(
+            "canary store could not be read completely; prune aborted to avoid truncating it",
+        ));
+    }
     let mut removed = 0usize;
     let mut kept_lines: Vec<String> = Vec::new();
-    for sl in read_store_partitioned(store) {
+    for sl in lines {
         match sl {
             StoreLine::Parsed(entry) if entry.id == id => removed += 1,
             StoreLine::Parsed(entry) => {
@@ -641,7 +659,14 @@ pub fn rotate_at(store: &Path, id: &str) -> std::io::Result<Option<CanaryEntry>>
     // Read RAW lines (CodeRabbit R12 #F): mutate ONLY the parsed entry whose id
     // matches; preserve every other line — parsed or not — so rotate never drops
     // an unparseable (future-schema / transient) line on the rewrite.
-    let lines = read_store_partitioned(store);
+    // PARTIAL-READ GUARD (CodeRabbit R13 #1): a truncated prefix from a broken
+    // read must not drive a rewrite (it would drop the unread tail). Abort first.
+    let (lines, complete) = read_store_partitioned(store);
+    if !complete {
+        return Err(std::io::Error::other(
+            "canary store could not be read completely; rotate aborted to avoid truncating it",
+        ));
+    }
     if !lines
         .iter()
         .any(|sl| matches!(sl, StoreLine::Parsed(e) if e.id == id))
@@ -888,6 +913,59 @@ mod tests {
 
     fn store_in(dir: &Path) -> PathBuf {
         dir.join("canaries.jsonl")
+    }
+
+    /// Make a FIFO at `path` (unix). Returns false if mkfifo is unsupported here.
+    #[cfg(unix)]
+    fn mkfifo_at(path: &Path) -> bool {
+        use std::ffi::CString;
+        let c_path = CString::new(path.as_os_str().to_str().unwrap()).unwrap();
+        unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) == 0 }
+    }
+
+    /// CodeRabbit R13 #1: a store whose read does NOT complete (here a FIFO, which
+    /// `read_store_lines_complete` reports as incomplete because it is not a
+    /// readable regular file) must ABORT prune/rotate — NOT rewrite the store from
+    /// the empty/partial image, which would truncate it. The mutator returns an
+    /// error and the store path is left exactly as-is (still a FIFO, never
+    /// replaced by a regular file). Unix-only (needs mkfifo); cannot hang (the
+    /// O_NONBLOCK open in `open_regular_capped` returns immediately).
+    #[cfg(unix)]
+    #[test]
+    fn prune_and_rotate_abort_on_incomplete_read_no_truncation() {
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        if !mkfifo_at(&store) {
+            eprintln!("skipping: mkfifo unsupported here");
+            return;
+        }
+        // prune must abort with an error and leave the FIFO intact.
+        let pruned = prune_at(&store, "deadbeef0000");
+        assert!(
+            pruned.is_err(),
+            "prune on an unreadable store must abort, not silently rewrite"
+        );
+        assert!(
+            std::fs::symlink_metadata(&store)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the store must NOT be replaced by a regular file (no truncating rewrite)"
+        );
+        // rotate must likewise abort and leave the FIFO intact.
+        let rotated = rotate_at(&store, "deadbeef0000");
+        assert!(
+            rotated.is_err(),
+            "rotate on an unreadable store must abort, not silently rewrite"
+        );
+        assert!(
+            std::fs::symlink_metadata(&store)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the store must NOT be replaced by a regular file (no truncating rewrite)"
+        );
     }
 
     #[test]

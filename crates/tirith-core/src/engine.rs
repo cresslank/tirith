@@ -1097,9 +1097,9 @@ fn check_command_card_hot_with_trusted_dir(
                 severity: crate::verdict::Severity::Info,
                 title: "Command card could not be verified (trust store unavailable)".to_string(),
                 description: "A command card was supplied, but tirith could not resolve the \
-                              trusted-keys directory (`~/.config/tirith/trusted-card-keys/`). \
-                              Verification was attempted but could not complete; treating the \
-                              command as if no card were present."
+                              trusted-keys directory (the `trusted-card-keys/` directory under \
+                              tirith's config dir). Verification was attempted but could not \
+                              complete; treating the command as if no card were present."
                     .to_string(),
                 evidence: vec![crate::verdict::Evidence::Text {
                     detail:

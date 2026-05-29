@@ -166,8 +166,10 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         // Durability of the RENAME itself (CodeRabbit R9 #B): the body is fsync'd
         // above, but the new directory entry is not crash-durable until the parent
         // dir is fsync'd. A downloaded-and-cached script is execution-sensitive, so
-        // make the published entry durable too. Best-effort, unix-only.
-        crate::util::fsync_parent_dir(&cached_path);
+        // make the published entry durable too. The persist already succeeded, so
+        // a dir-fsync failure is LOGGED, not propagated (R13 #5). Best-effort,
+        // unix-only.
+        crate::util::fsync_parent_dir_logged(&cached_path, "run cache");
     }
 
     let content_str = match String::from_utf8(content.clone()) {
@@ -398,8 +400,9 @@ pub fn download_to_path(
             .map_err(|e| format!("persist download: {e}"))?;
         // Durability of the RENAME itself (CodeRabbit R9 #B): fsync the parent dir
         // so the new name→inode entry survives a crash, not just the synced body.
-        // Best-effort, unix-only.
-        crate::util::fsync_parent_dir(dest);
+        // The persist already succeeded, so a dir-fsync failure is LOGGED, not
+        // propagated (R13 #5). Best-effort, unix-only.
+        crate::util::fsync_parent_dir_logged(dest, "downloaded script");
     }
 
     let content_str = String::from_utf8_lossy(&content);

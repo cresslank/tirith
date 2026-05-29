@@ -3,9 +3,10 @@
 //! This module is a **presenter over existing audit data plus a static provider
 //! table**. It tells the user *where* and *how* to rotate a leaked credential —
 //! it does NOT rotate or revoke anything, and it makes **zero network calls**.
-//! There is no HTTP client constructed anywhere in this module or in
-//! [`crate::cli::secret`] (the CLI front-end); the only "URLs" here are inert
-//! string literals printed for the human to open in their own browser.
+//! There is no HTTP client constructed anywhere in this module or in the
+//! `tirith secret` CLI front-end (which lives in the `tirith` binary crate, not
+//! here); the only "URLs" here are inert string literals printed for the human
+//! to open in their own browser.
 //!
 //! # Honesty contract
 //!
@@ -63,8 +64,8 @@ pub const CREDENTIAL_RULE_IDS: &[&str] = &[
     CANARY_RULE_ID,
 ];
 
-/// `true` when `rule_id` is one of the credential-type rules
-/// [`tirith secret triage`](crate::cli) acts on.
+/// `true` when `rule_id` is one of the credential-type rules the
+/// `tirith secret triage` command acts on.
 pub fn is_credential_rule(rule_id: &str) -> bool {
     CREDENTIAL_RULE_IDS.contains(&rule_id)
 }

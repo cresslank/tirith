@@ -360,7 +360,7 @@ fn persist_salt(salt_file: &Path, salt: &[u8], replace_corrupt: bool) -> std::io
         // new salt. Best-effort parent fsync (unix-only).
         tmp.as_file().sync_all()?;
         tmp.persist(salt_file).map_err(|e| e.error)?;
-        crate::util::fsync_parent_dir(salt_file);
+        crate::util::fsync_parent_dir_logged(salt_file, "baseline salt");
         return Ok(salt.to_vec());
     }
 
@@ -384,7 +384,7 @@ fn persist_salt(salt_file: &Path, salt: &[u8], replace_corrupt: bool) -> std::io
             // file→inode entry entirely, so the next run sees no salt and
             // regenerates a DIFFERENT one (every baseline hash then mismatches).
             f.sync_all()?;
-            crate::util::fsync_parent_dir(salt_file);
+            crate::util::fsync_parent_dir_logged(salt_file, "baseline salt");
             Ok(salt.to_vec())
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -573,7 +573,7 @@ fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
     tmp.flush()?;
     tmp.as_file().sync_all()?;
     tmp.persist(store).map_err(|e| e.error)?;
-    crate::util::fsync_parent_dir(store);
+    crate::util::fsync_parent_dir_logged(store, "baseline store");
     Ok(())
 }
 
@@ -627,9 +627,19 @@ pub fn record_at(store: &Path, key: PatternKey) -> std::io::Result<()> {
 /// skips anyway is strictly safer than deleting a real observation that merely
 /// failed to parse this once.
 fn compact_store_at(store: &Path, now: chrono::DateTime<chrono::Utc>) -> std::io::Result<()> {
+    // PARTIAL-READ GUARD (CodeRabbit R13 #1): compaction REWRITES the store from
+    // the lines it just read. If the read broke early on a real mid-file I/O fault
+    // (not a recoverable skipped-UTF-8 line), those lines are a truncated prefix —
+    // rewriting from them would PERMANENTLY DROP the unread tail. When the read is
+    // incomplete, SKIP compaction this cycle and leave the store intact; the
+    // append already succeeded and the next `record_at` past the trigger retries.
+    let (lines, complete) = crate::util::read_store_lines_complete(store);
+    if !complete {
+        return Ok(());
+    }
     let mut parsed: Vec<Observation> = Vec::new();
     let mut preserved: Vec<String> = Vec::new();
-    for line in crate::util::read_store_lines(store) {
+    for line in lines {
         match serde_json::from_str::<Observation>(&line) {
             Ok(o) => parsed.push(o),
             Err(_) => preserved.push(line),
@@ -802,6 +812,37 @@ mod tests {
             sudo_flag: false,
             cwd_repo_hash: Some("deadbeef".to_string()),
         }
+    }
+
+    /// CodeRabbit R13 #1: `compact_store_at` REWRITES the store from the lines it
+    /// reads, so an incomplete read (a real I/O fault leaving the tail unread)
+    /// must SKIP compaction rather than truncate the store. A FIFO store is
+    /// reported incomplete by `read_store_lines_complete` (not a readable regular
+    /// file), so compaction is skipped (returns Ok, no rewrite) and the FIFO is
+    /// left intact — never replaced by a truncated regular file. Unix-only (needs
+    /// mkfifo); cannot hang (O_NONBLOCK open returns immediately).
+    #[cfg(unix)]
+    #[test]
+    fn compact_skips_on_incomplete_read_no_truncation() {
+        use std::ffi::CString;
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let c_path = CString::new(store.as_os_str().to_str().unwrap()).unwrap();
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+            eprintln!("skipping: mkfifo unsupported here");
+            return;
+        }
+        // Compaction must be a no-op (Ok) and must NOT rewrite the FIFO into a
+        // regular file.
+        compact_store_at(&store, chrono::Utc::now()).expect("incomplete read skips, returns Ok");
+        assert!(
+            std::fs::symlink_metadata(&store)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the store must NOT be replaced by a regular file (no truncating rewrite)"
+        );
     }
 
     #[test]

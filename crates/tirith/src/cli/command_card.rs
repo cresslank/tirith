@@ -423,9 +423,10 @@ pub fn fetch(url: &str, json: bool) -> i32 {
     }
     // Durability of the RENAME (CodeRabbit R9 #B): fsync the parent dir so the
     // newly cached card's directory entry survives a crash — the verify hot path
-    // reads this file back. Best-effort, unix-only (matches the card-SIGN path's
-    // parent fsync in `write_card_atomic`).
-    tirith_core::util::fsync_parent_dir(&dest);
+    // reads this file back. The persist already succeeded, so a dir-fsync failure
+    // is LOGGED, not propagated (R13 #5). Best-effort, unix-only (matches the
+    // card-SIGN path's parent fsync in `write_card_atomic`).
+    tirith_core::util::fsync_parent_dir_logged(&dest, "cached card");
 
     if json {
         let v = serde_json::json!({
@@ -513,15 +514,10 @@ fn write_card_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     // `path` but does NOT fsync the containing directory. On Unix a crash right
     // after the rename can lose the new name→inode directory entry (the file's
     // data is synced above, but the directory metadata recording the new name is
-    // not). fsync the parent directory so the rename is durable too. Best-effort:
-    // a directory that cannot be opened/synced (rare) must not fail an otherwise-
-    // successful sign. No-op on non-Unix (Windows has no directory-fsync).
-    #[cfg(unix)]
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
+    // not). fsync the parent so the rename is durable too. The persist already
+    // succeeded, so a dir-fsync failure must not fail the sign — but it is LOGGED,
+    // not silently dropped (CodeRabbit R13 #5). No-op on non-Unix.
+    tirith_core::util::fsync_parent_dir_logged(path, "signed card");
     Ok(())
 }
 

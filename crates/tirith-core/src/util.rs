@@ -154,23 +154,47 @@ pub fn read_store_lines(path: &Path) -> Vec<String> {
     //   Io             → present-but-unreadable (permissions, etc.): warn + empty.
     // `cap == u64::MAX` so the size gate never trips for a legitimately large
     // store; `TooLarge` is therefore unreachable here but handled for totality.
+    read_store_lines_complete(path).0
+}
+
+/// Like [`read_store_lines`] but also reports whether the store was read to
+/// completion. Returns `(lines, complete)`.
+///
+/// `complete == false` means the lines are NOT a faithful image of the whole
+/// store and MUST NOT be used to rewrite it (CodeRabbit R13 #1). Two cases set
+/// it false:
+///
+/// * The line loop BROKE on a real mid-file I/O fault (the tail is unread) — see
+///   [`collect_store_lines_complete`].
+/// * The store is PRESENT but could not be opened/stat'd as a readable regular
+///   file (FIFO/device/oversized/permission/I/O). Those already yield an empty
+///   vec + a diagnostic for the fail-open reader; for a rewrite path, an empty
+///   "image" here is NOT proof the store is empty, so `complete` is false to
+///   forbid a truncating rewrite.
+///
+/// An ABSENT store (`NotFound`) is genuinely empty and returns `(vec![], true)`:
+/// a rewrite from "no lines" is correct (the store does not exist yet).
+pub fn read_store_lines_complete(path: &Path) -> (Vec<String>, bool) {
     let file = match open_regular_capped(path, u64::MAX) {
         Ok(f) => f,
-        Err(OpenRegularError::NotFound) => return Vec::new(),
+        // Truly absent: an empty, COMPLETE image — rewriting from it is correct.
+        Err(OpenRegularError::NotFound) => return (Vec::new(), true),
+        // Present-but-unreadable: empty image is NOT a proven-empty store, so
+        // mark it incomplete to forbid a truncating rewrite.
         Err(OpenRegularError::NotRegularFile) => {
             warn_store_unreadable(path, "not a regular file");
-            return Vec::new();
+            return (Vec::new(), false);
         }
         Err(OpenRegularError::TooLarge) => {
             warn_store_unreadable(path, "exceeds read cap");
-            return Vec::new();
+            return (Vec::new(), false);
         }
         Err(OpenRegularError::Io(e)) => {
             warn_store_unreadable(path, &e.to_string());
-            return Vec::new();
+            return (Vec::new(), false);
         }
     };
-    collect_store_lines(std::io::BufReader::new(file))
+    collect_store_lines_complete(std::io::BufReader::new(file))
 }
 
 /// One-line stderr diagnostic when a PRESENT security store cannot be read (vs a
@@ -190,19 +214,47 @@ fn warn_store_unreadable(path: &Path, reason: &str) {
 /// testable against a custom `BufRead` (a real `File` cannot be made to yield a
 /// deterministic non-`InvalidData` error across platforms).
 pub fn collect_store_lines<R: BufRead>(reader: R) -> Vec<String> {
+    collect_store_lines_complete(reader).0
+}
+
+/// Like [`collect_store_lines`] but also reports whether the read reached EOF
+/// CLEANLY. Returns `(lines, complete)` where `complete == false` means the loop
+/// BROKE early on a non-`InvalidData` I/O fault — so `lines` is a PARTIAL prefix
+/// of the file, missing its unread tail.
+///
+/// ## Why a REWRITE path must check this (CodeRabbit R13 #1 — data loss)
+///
+/// A skipped [`std::io::ErrorKind::InvalidData`] line (one bad byte) is fully
+/// recoverable: the file is read to completion, just minus that one line, and
+/// `complete` stays `true`. But a REAL mid-file I/O fault (a `break`) leaves the
+/// tail UNREAD. The fail-open hot-path reader ([`read_store_lines`]) is fine with
+/// that — it returns what it has and the worst case is one missed lookup. A
+/// COMPACTION/CLEAR rewrite is NOT: rewriting the store from a truncated prefix
+/// would PERMANENTLY DROP every unread tail entry (data loss). Such callers use
+/// [`read_store_lines_complete`] and ABORT the rewrite when `complete == false`,
+/// leaving the store intact for a future attempt.
+pub fn collect_store_lines_complete<R: BufRead>(reader: R) -> (Vec<String>, bool) {
     let mut out = Vec::new();
+    // Optimistically complete; flipped to false only if we BREAK on a real fault.
+    // A clean EOF or a sequence of skipped InvalidData lines both leave this true.
+    let mut complete = true;
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
-            Err(_) => break,
+            Err(_) => {
+                // Real I/O fault: the tail is unread. Stop (a persistent fault
+                // would otherwise spin) and signal the partial read.
+                complete = false;
+                break;
+            }
         };
         let trimmed = line.trim();
         if !trimmed.is_empty() {
             out.push(trimmed.to_string());
         }
     }
-    out
+    (out, complete)
 }
 
 /// Outcome of [`run_shell_with_timeout`]. Callers map this onto their own
@@ -316,24 +368,52 @@ pub fn run_shell_with_timeout(
 /// just-removed one). Callers fsync the file body BEFORE the rename; this makes
 /// the directory entry durable AFTER it.
 ///
-/// Best-effort and **unix-only**: directory fsync is not portable (Windows has
-/// no directory-fsync), and a failure here must never turn an otherwise-
-/// successful publish into an error — the body is already on stable storage.
-/// No-op on non-Unix. (Consolidates the per-module copies in `incident.rs` /
-/// `selfupdate.rs` / the card-sign path; CodeRabbit R9 #B.)
+/// **Unix-only** real work; **no-op `Ok(())` on non-Unix** (directory fsync is
+/// not portable — Windows has no directory-fsync). Returns the fsync result
+/// (CodeRabbit R13 #5) so a durability-critical caller can LOG or propagate a
+/// dir-fsync failure instead of silently dropping it — see
+/// [`fsync_parent_dir_logged`] for the common "the body is already durable, so
+/// don't fail the publish but don't be silent" wrapper.
+///
+/// `#[must_use]`: the whole point of returning the error is that it not be
+/// dropped on the floor. A caller that genuinely wants best-effort with no log
+/// must say so explicitly (`let _ = …`).
+///
+/// (Consolidates the per-module copies in `incident.rs` / `selfupdate.rs` / the
+/// card-sign path; CodeRabbit R9 #B.)
 #[cfg(unix)]
-pub fn fsync_parent_dir(path: &Path) {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
+#[must_use = "a dir-fsync failure should be logged or propagated, not silently dropped"]
+pub fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
+    match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => std::fs::File::open(parent)?.sync_all(),
+        // No parent (or empty parent): nothing to fsync — vacuously durable.
+        None => Ok(()),
     }
 }
 
 /// No-op stand-in on non-Unix (directory fsync is not portable). See the unix
 /// form for the durability rationale.
 #[cfg(not(unix))]
-pub fn fsync_parent_dir(_path: &Path) {}
+#[must_use = "a dir-fsync failure should be logged or propagated, not silently dropped"]
+pub fn fsync_parent_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// [`fsync_parent_dir`] for the common durability-path shape: the file BODY is
+/// already fsync'd and the atomic publish (rename/hard_link) has SUCCEEDED, so a
+/// failure of the trailing PARENT-DIR fsync must NOT turn the successful publish
+/// into an error — but it should also not be silent (CodeRabbit R13 #5). Logs a
+/// one-line stderr diagnostic on failure and returns nothing. No-op success path
+/// on non-Unix (the inner call returns `Ok`).
+pub fn fsync_parent_dir_logged(path: &Path, context: &str) {
+    if let Err(e) = fsync_parent_dir(path) {
+        eprintln!(
+            "tirith: warning: could not fsync parent directory of {} ({context}): {e}; \
+             the write succeeded but its directory entry may not be crash-durable",
+            path.display()
+        );
+    }
+}
 
 /// Truncate a string to a maximum number of bytes without breaking UTF-8.
 /// Returns the original string if it is already within the limit.
@@ -506,7 +586,7 @@ mod open_regular_tests {
 
 #[cfg(test)]
 mod store_line_tests {
-    use super::collect_store_lines;
+    use super::{collect_store_lines, collect_store_lines_complete};
     use std::io::{self, BufRead, Read};
 
     /// A `BufRead` whose `read_line` first yields some good lines, then returns
@@ -574,5 +654,35 @@ mod store_line_tests {
         let bytes: Vec<u8> = [b"good1\n".as_ref(), &[0xff, 0xfe, b'\n'], b"good2\n"].concat();
         let lines = collect_store_lines(std::io::BufReader::new(&bytes[..]));
         assert_eq!(lines, vec!["good1".to_string(), "good2".to_string()]);
+    }
+
+    #[test]
+    fn complete_flag_false_on_mid_file_io_fault() {
+        // CodeRabbit R13 #1: a REAL mid-file I/O fault leaves the tail unread, so
+        // the lines are a PARTIAL prefix. `collect_store_lines_complete` must
+        // report `complete == false` so a rewrite path knows NOT to truncate the
+        // store from this partial image. The lines read before the fault are still
+        // returned (for the fail-open reader), but the flag forbids a rewrite.
+        let reader = PersistentErrorReader {
+            good: vec!["one".to_string(), "two".to_string()],
+            idx: 0,
+        };
+        let (lines, complete) = collect_store_lines_complete(reader);
+        assert_eq!(lines, vec!["one".to_string(), "two".to_string()]);
+        assert!(!complete, "a broken mid-file read must report incomplete");
+    }
+
+    #[test]
+    fn complete_flag_true_on_clean_eof_and_skipped_invalid_utf8() {
+        // A clean read — including one where a single invalid-UTF-8 line is
+        // skipped — reaches EOF, so the image is COMPLETE and a rewrite from it is
+        // safe (the skipped line is genuinely undecodable, not an unread tail).
+        let bytes: Vec<u8> = [b"good1\n".as_ref(), &[0xff, 0xfe, b'\n'], b"good2\n"].concat();
+        let (lines, complete) = collect_store_lines_complete(std::io::BufReader::new(&bytes[..]));
+        assert_eq!(lines, vec!["good1".to_string(), "good2".to_string()]);
+        assert!(
+            complete,
+            "a clean EOF (even skipping bad UTF-8) is complete"
+        );
     }
 }

@@ -59,6 +59,29 @@ pub const PUBLIC_KEY_LEN: usize = 32;
 /// Length of an ed25519 signature in bytes.
 pub const SIGNATURE_LEN: usize = 64;
 
+/// Read cap for a trusted public-key file (`<key_id>.pub`). A real key is 32 raw
+/// bytes, a 64-char hex string, or ~44-char base64 — all far below this. The cap
+/// only exists to bound a malicious/oversized file (CodeRabbit R13 #2); 4 KiB is
+/// generous slack for trailing whitespace/newlines while still refusing anything
+/// that is plainly not a key.
+const TRUSTED_PUBKEY_READ_CAP: u64 = 4096;
+
+/// `true` for the ASCII whitespace a POSIX/PowerShell shell treats as a TOKEN
+/// SEPARATOR: space, tab, newline, carriage-return (CodeRabbit R13 #3).
+///
+/// Deliberately NARROWER than [`char::is_ascii_whitespace`], which also returns
+/// `true` for `\x0C` FORM FEED — a control character that is NOT a shell token
+/// separator. Trimming a trailing form feed (or, by the same token, a vertical
+/// tab `\x0B`, which `is_ascii_whitespace` already excludes) when comparing two
+/// commands could equate a command a shell would treat as DIFFERENT (`echo hi`
+/// vs `echo hi\x0C`), which for a signed-card / manifest gate is a verification
+/// bypass. Used by the command-equality comparisons ([`CommandCard::command_matches`]
+/// and the manifest matcher) so the trim is exactly the surrounding run a shell
+/// would itself ignore.
+pub(crate) fn is_shell_significant_ws(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r')
+}
+
 /// The signature algorithm a card is signed with. v1 supports ONLY ed25519.
 ///
 /// Modeled as a closed enum (not a free `String`) so the "only ed25519"
@@ -377,17 +400,20 @@ impl Card {
     }
 
     /// Does the card's `command` match `cmd` byte-for-byte (after trimming
-    /// surrounding ASCII whitespace)? This is the mismatch gate.
+    /// surrounding shell-significant whitespace)? This is the mismatch gate.
     ///
-    /// We trim only ASCII whitespace (not `str::trim`, which strips the whole
-    /// Unicode `White_Space` set). A command tampered to differ solely by a
-    /// Unicode-whitespace character — e.g. a U+00A0 NO-BREAK SPACE substituted
-    /// for an ASCII space — MUST be treated as a mismatch, not silently
-    /// equated to the signed text. Allowing `str::trim` to collapse those would
-    /// be a signed-card verification bypass.
+    /// We trim only the ASCII whitespace a shell treats as a TOKEN SEPARATOR
+    /// (space, tab, newline, CR — see `is_shell_significant_ws`), NOT
+    /// `str::trim` (the whole Unicode `White_Space` set) and NOT even
+    /// [`char::is_ascii_whitespace`] (which includes `\x0C` FORM FEED). A command
+    /// tampered to differ solely by a Unicode-whitespace character — e.g. a
+    /// U+00A0 NO-BREAK SPACE for an ASCII space — or by a trailing form feed MUST
+    /// be treated as a MISMATCH, not silently equated to the signed text:
+    /// collapsing characters a shell would NOT ignore is a signed-card
+    /// verification bypass.
     pub fn command_matches(&self, cmd: &str) -> bool {
-        let ascii_ws = |c: char| c.is_ascii_whitespace();
-        self.command.trim_matches(ascii_ws) == cmd.trim_matches(ascii_ws)
+        self.command.trim_matches(is_shell_significant_ws)
+            == cmd.trim_matches(is_shell_significant_ws)
     }
 }
 
@@ -403,7 +429,13 @@ pub fn load_trusted_pubkey(dir: &Path, key_id: &str) -> Option<[u8; PUBLIC_KEY_L
         return None;
     }
     let path = dir.join(format!("{key_id}.pub"));
-    let raw = std::fs::read(&path).ok()?;
+    // Hardened read (CodeRabbit R13 #2): route through `read_regular_capped` so a
+    // FIFO/device at the key path cannot block (O_NONBLOCK open + fstat) and an
+    // oversized `.pub` cannot exhaust memory. A real pubkey file is tiny (32 raw
+    // bytes, 64-char hex, or ~44-char base64) so a small cap is ample; anything
+    // larger is not a key. Any open/stat/read failure (absent, non-regular, too
+    // large, I/O) maps to `None` — the same "no usable key" surface as before.
+    let raw = crate::util::read_regular_capped(&path, TRUSTED_PUBKEY_READ_CAP).ok()?;
     let key = decode_pubkey_bytes(&raw)?;
     // Defense in depth: the file's content must actually be the key it claims.
     if key_id_for_pubkey(&key) != key_id {
@@ -910,15 +942,32 @@ mod tests {
             "a command differing only by a Unicode (U+00A0) whitespace must NOT match the signed text"
         );
 
-        // Plain ASCII leading/trailing whitespace (spaces, tabs, newlines, CR)
-        // still trims equal — the gate stays tolerant of surrounding ASCII WS.
+        // Plain shell-significant leading/trailing whitespace (spaces, tabs,
+        // newlines, CR) still trims equal — the gate stays tolerant of the
+        // surrounding run a shell would itself ignore.
         let padded = format!(" \t\r\n{}\n  ", card.command);
         assert!(
             card.command_matches(&padded),
-            "surrounding ASCII whitespace must still trim equal"
+            "surrounding shell-significant whitespace must still trim equal"
         );
         // And the exact command (no padding) matches.
         assert!(card.command_matches(&card.command));
+
+        // CodeRabbit R13 #3: a FORM FEED (`\x0C`) is NOT a shell token separator,
+        // so a command differing only by a trailing form feed is a DIFFERENT
+        // command and must NOT match — even though `char::is_ascii_whitespace`
+        // would have trimmed it. (Vertical tab `\x0B` is likewise not trimmed.)
+        let ff_padded = format!("{}\u{000C}", card.command);
+        assert_ne!(ff_padded, card.command, "sanity: the FF actually differs");
+        assert!(
+            !card.command_matches(&ff_padded),
+            "a trailing form feed (`\\x0C`) is not shell whitespace and must NOT trim away"
+        );
+        let vt_padded = format!("{}\u{000B}", card.command);
+        assert!(
+            !card.command_matches(&vt_padded),
+            "a trailing vertical tab (`\\x0B`) is not shell whitespace and must NOT trim away"
+        );
     }
 
     #[test]
@@ -1481,5 +1530,48 @@ mod tests {
         let id_a = key_id_for_pubkey(&key_a);
         std::fs::write(dir.path().join(format!("{id_a}.pub")), key_b).unwrap();
         assert!(load_trusted_pubkey(dir.path(), &id_a).is_none());
+    }
+
+    /// CodeRabbit R13 #2: a FIFO at the `<key_id>.pub` path must NOT hang
+    /// `load_trusted_pubkey` and must yield no key. The hardened
+    /// `read_regular_capped` opens with O_NONBLOCK and rejects the FIFO via the
+    /// post-open fstat, so the lookup returns `None` promptly (a blocking read
+    /// would hang here, caught by the suite timeout). Unix-only (needs mkfifo).
+    #[cfg(unix)]
+    #[test]
+    fn load_trusted_pubkey_fifo_does_not_hang_and_yields_none() {
+        use std::ffi::CString;
+        let dir = tempfile::tempdir().unwrap();
+        let (_secret, pubkey) = generate_keypair().unwrap();
+        let key_id = key_id_for_pubkey(&pubkey);
+        let key_path = dir.path().join(format!("{key_id}.pub"));
+        let c_path = CString::new(key_path.as_os_str().to_str().unwrap()).unwrap();
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+            eprintln!("skipping: mkfifo unsupported here");
+            return;
+        }
+        // Must complete promptly and return no key (a blocking read would hang).
+        assert!(
+            load_trusted_pubkey(dir.path(), &key_id).is_none(),
+            "a FIFO key file must yield no key, not block"
+        );
+    }
+
+    /// CodeRabbit R13 #2: an oversized `.pub` file is refused (by the read cap)
+    /// rather than buffered into memory — even one that, after the cap, might
+    /// otherwise have decoded. The lookup yields `None`.
+    #[test]
+    fn load_trusted_pubkey_oversized_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_secret, pubkey) = generate_keypair().unwrap();
+        let key_id = key_id_for_pubkey(&pubkey);
+        // Write a file far larger than TRUSTED_PUBKEY_READ_CAP (valid hex bytes,
+        // so size — not content — is what rejects it).
+        let oversized = "a".repeat((TRUSTED_PUBKEY_READ_CAP as usize) + 1);
+        std::fs::write(dir.path().join(format!("{key_id}.pub")), oversized).unwrap();
+        assert!(
+            load_trusted_pubkey(dir.path(), &key_id).is_none(),
+            "an oversized key file must be refused by the cap, not read"
+        );
     }
 }
