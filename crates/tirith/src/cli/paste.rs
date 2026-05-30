@@ -245,10 +245,10 @@ fn resolve_source_attribution(
     let Some(record) = record else {
         return serde_json::Value::Null;
     };
-    // Same shared hash the engine's rule uses, so the displayed attribution and
-    // the PasteSourceMismatch finding can never disagree (Greptile R1 #6).
-    let actual = tirith_core::clipboard::content_sha256_hex(raw);
-    if !actual.eq_ignore_ascii_case(record.content_sha256.trim()) {
+    // Same shared comparison the engine's rule uses (`matches_bytes`), so the
+    // displayed attribution and the PasteSourceMismatch finding can never disagree
+    // (Greptile R1 #6). `raw` is the original pasted bytes, not a lossy String.
+    if !record.matches_bytes(raw) {
         // A recorded source exists, but it does NOT describe this paste (stale
         // record / clipboard replaced). No attribution.
         return serde_json::Value::Null;

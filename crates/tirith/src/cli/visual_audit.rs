@@ -244,15 +244,31 @@ pub struct PairResult {
     pub name: String,
     /// The pair's human-readable codepoint description.
     pub codepoints: String,
-    /// `"distinguishable"`, `"indistinguishable"`, or `"skipped"`.
-    pub verdict: String,
+    /// The operator's answer for this pair.
+    pub verdict: Verdict,
 }
 
-/// Verdict tokens. Kept as constants so the prompt parser, the recorder, and the
-/// tests cannot drift.
-const VERDICT_DISTINGUISHABLE: &str = "distinguishable";
-const VERDICT_INDISTINGUISHABLE: &str = "indistinguishable";
-const VERDICT_SKIPPED: &str = "skipped";
+/// One operator answer, as a closed set rather than a free `String`. A
+/// stringly-typed field constrained only by convention let a typo'd or
+/// out-of-set value silently count as none of the three buckets and break the
+/// `distinguishable + indistinguishable + skipped == pairs_total` partition that
+/// `tally` and `doctor --compat` rely on. The enum makes the set total at the
+/// type level.
+///
+/// `#[serde(rename_all = "snake_case")]` serializes the variants to exactly the
+/// previous JSON tokens (`"distinguishable"` / `"indistinguishable"` /
+/// `"skipped"`), so the on-disk `visual-audit-result.json` and the `doctor`
+/// read path are byte-for-byte backward/forward compatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// The operator could tell the two glyphs apart.
+    Distinguishable,
+    /// The two glyphs looked identical — a local rendering risk.
+    Indistinguishable,
+    /// No judgment given (operator chose skip, EOF, or `--non-interactive`).
+    Skipped,
+}
 
 /// Resolve the `--pairs` selector into the slice of pairs to present. Unknown
 /// values fall back to `critical` (and the caller prints a note). `None` (flag
@@ -361,7 +377,7 @@ fn build_skipped_result(term: &str, selected: &[&'static ConfusablePair]) -> Vis
         .map(|p| PairResult {
             name: p.name.to_string(),
             codepoints: p.codepoints.to_string(),
-            verdict: VERDICT_SKIPPED.to_string(),
+            verdict: Verdict::Skipped,
         })
         .collect();
     tally(term, results)
@@ -371,15 +387,15 @@ fn build_skipped_result(term: &str, selected: &[&'static ConfusablePair]) -> Vis
 fn tally(term: &str, results: Vec<PairResult>) -> VisualAuditResult {
     let distinguishable = results
         .iter()
-        .filter(|r| r.verdict == VERDICT_DISTINGUISHABLE)
+        .filter(|r| r.verdict == Verdict::Distinguishable)
         .count();
     let indistinguishable = results
         .iter()
-        .filter(|r| r.verdict == VERDICT_INDISTINGUISHABLE)
+        .filter(|r| r.verdict == Verdict::Indistinguishable)
         .count();
     let skipped = results
         .iter()
-        .filter(|r| r.verdict == VERDICT_SKIPPED)
+        .filter(|r| r.verdict == Verdict::Skipped)
         .count();
     VisualAuditResult {
         audited_at: chrono::Utc::now().to_rfc3339(),
@@ -479,14 +495,14 @@ fn print_human_summary(result: &VisualAuditResult) {
 /// exercised in a unit test without driving real stdin.
 fn collect_verdicts<F>(selected: &[&'static ConfusablePair], mut prompt: F) -> Vec<PairResult>
 where
-    F: FnMut(usize, &ConfusablePair) -> Option<String>,
+    F: FnMut(usize, &ConfusablePair) -> Option<Verdict>,
 {
     let mut results: Vec<PairResult> = Vec::with_capacity(selected.len());
     let mut input_closed = false;
     for (idx, pair) in selected.iter().enumerate() {
         let verdict = if input_closed {
             // stdin already closed earlier this run — do not prompt again.
-            VERDICT_SKIPPED.to_string()
+            Verdict::Skipped
         } else {
             match prompt(idx, pair) {
                 Some(v) => v,
@@ -498,7 +514,7 @@ where
                     eprintln!(
                         "tirith visual-audit: input closed; recording remaining pairs as skipped."
                     );
-                    VERDICT_SKIPPED.to_string()
+                    Verdict::Skipped
                 }
             }
         };
@@ -511,11 +527,11 @@ where
     results
 }
 
-/// Prompt on stderr, read one line from stdin, and map the answer to a verdict
-/// token. `y`/`yes` → distinguishable, `n`/`no` → indistinguishable, anything
-/// else (`s`, `skip`, blank) → skipped. Returns `None` on EOF / read error so
-/// the caller can stop the loop cleanly.
-fn prompt_verdict(label: &str) -> Option<String> {
+/// Prompt on stderr, read one line from stdin, and map the answer to a verdict.
+/// `y`/`yes` → distinguishable, `n`/`no` → indistinguishable, anything else
+/// (`s`, `skip`, blank) → skipped. Returns `None` on EOF / read error so the
+/// caller can stop the loop cleanly.
+fn prompt_verdict(label: &str) -> Option<Verdict> {
     eprint!("{label}: ");
     let _ = std::io::stderr().flush();
     let mut line = String::new();
@@ -525,15 +541,15 @@ fn prompt_verdict(label: &str) -> Option<String> {
     }
 }
 
-/// Map a raw answer line to a verdict token. Factored out so the mapping is
+/// Map a raw answer line to a [`Verdict`]. Factored out so the mapping is
 /// unit-testable without stdin. Case-insensitive, trimmed.
-fn verdict_from_answer(answer: &str) -> String {
+fn verdict_from_answer(answer: &str) -> Verdict {
     match answer.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" => VERDICT_DISTINGUISHABLE.to_string(),
-        "n" | "no" => VERDICT_INDISTINGUISHABLE.to_string(),
+        "y" | "yes" => Verdict::Distinguishable,
+        "n" | "no" => Verdict::Indistinguishable,
         // `s`, `skip`, empty, or anything else → skipped (the safe default —
         // we never infer a judgment the operator did not give).
-        _ => VERDICT_SKIPPED.to_string(),
+        _ => Verdict::Skipped,
     }
 }
 
@@ -661,8 +677,8 @@ mod tests {
         let results = collect_verdicts(&selected, |idx, _pair| {
             calls += 1;
             match idx {
-                0 => Some(VERDICT_DISTINGUISHABLE.to_string()),
-                1 => Some(VERDICT_INDISTINGUISHABLE.to_string()),
+                0 => Some(Verdict::Distinguishable),
+                1 => Some(Verdict::Indistinguishable),
                 // From the third pair on, stdin is "closed": return None. The
                 // loop must NOT call us again after this.
                 _ => None,
@@ -677,11 +693,12 @@ mod tests {
         );
         // The result is well-formed: one entry per selected pair, in order.
         assert_eq!(results.len(), selected.len());
-        assert_eq!(results[0].verdict, VERDICT_DISTINGUISHABLE);
-        assert_eq!(results[1].verdict, VERDICT_INDISTINGUISHABLE);
+        assert_eq!(results[0].verdict, Verdict::Distinguishable);
+        assert_eq!(results[1].verdict, Verdict::Indistinguishable);
         for r in &results[2..] {
             assert_eq!(
-                r.verdict, VERDICT_SKIPPED,
+                r.verdict,
+                Verdict::Skipped,
                 "every pair after EOF must be skipped"
             );
         }
@@ -702,23 +719,25 @@ mod tests {
         let mut calls = 0usize;
         let results = collect_verdicts(&selected, |_idx, _pair| {
             calls += 1;
-            Some(VERDICT_DISTINGUISHABLE.to_string())
+            Some(Verdict::Distinguishable)
         });
         assert_eq!(calls, selected.len(), "every pair must be prompted");
-        assert!(results.iter().all(|r| r.verdict == VERDICT_DISTINGUISHABLE));
+        assert!(results
+            .iter()
+            .all(|r| r.verdict == Verdict::Distinguishable));
     }
 
     /// The answer→verdict mapping is the parser the interactive loop relies on.
     #[test]
     fn verdict_from_answer_maps_yes_no_skip() {
-        assert_eq!(verdict_from_answer("y"), VERDICT_DISTINGUISHABLE);
-        assert_eq!(verdict_from_answer("YES\n"), VERDICT_DISTINGUISHABLE);
-        assert_eq!(verdict_from_answer(" n "), VERDICT_INDISTINGUISHABLE);
-        assert_eq!(verdict_from_answer("No"), VERDICT_INDISTINGUISHABLE);
-        assert_eq!(verdict_from_answer("s"), VERDICT_SKIPPED);
-        assert_eq!(verdict_from_answer("skip"), VERDICT_SKIPPED);
-        assert_eq!(verdict_from_answer(""), VERDICT_SKIPPED);
-        assert_eq!(verdict_from_answer("garbage"), VERDICT_SKIPPED);
+        assert_eq!(verdict_from_answer("y"), Verdict::Distinguishable);
+        assert_eq!(verdict_from_answer("YES\n"), Verdict::Distinguishable);
+        assert_eq!(verdict_from_answer(" n "), Verdict::Indistinguishable);
+        assert_eq!(verdict_from_answer("No"), Verdict::Indistinguishable);
+        assert_eq!(verdict_from_answer("s"), Verdict::Skipped);
+        assert_eq!(verdict_from_answer("skip"), Verdict::Skipped);
+        assert_eq!(verdict_from_answer(""), Verdict::Skipped);
+        assert_eq!(verdict_from_answer("garbage"), Verdict::Skipped);
     }
 
     /// `tally` partitions verdicts into the three counts correctly.
@@ -728,22 +747,22 @@ mod tests {
             PairResult {
                 name: "a".into(),
                 codepoints: "x".into(),
-                verdict: VERDICT_DISTINGUISHABLE.into(),
+                verdict: Verdict::Distinguishable,
             },
             PairResult {
                 name: "b".into(),
                 codepoints: "y".into(),
-                verdict: VERDICT_INDISTINGUISHABLE.into(),
+                verdict: Verdict::Indistinguishable,
             },
             PairResult {
                 name: "c".into(),
                 codepoints: "z".into(),
-                verdict: VERDICT_SKIPPED.into(),
+                verdict: Verdict::Skipped,
             },
             PairResult {
                 name: "d".into(),
                 codepoints: "w".into(),
-                verdict: VERDICT_INDISTINGUISHABLE.into(),
+                verdict: Verdict::Indistinguishable,
             },
         ];
         let r = tally("dumb", results);
@@ -764,5 +783,40 @@ mod tests {
         assert_eq!(back.skipped, r.skipped);
         assert_eq!(back.terminal, "screen");
         assert_eq!(back.results.len(), selected.len());
+        assert!(back.results.iter().all(|p| p.verdict == Verdict::Skipped));
+    }
+
+    /// The [`Verdict`] enum serializes to EXACTLY the three legacy JSON tokens, so
+    /// the on-disk `visual-audit-result.json` and the `doctor --compat` read path
+    /// stay byte-for-byte backward/forward compatible after the String → enum
+    /// migration. Asserts both directions on the wire form (not just a Rust
+    /// round-trip) — the contract that lets `doctor` deserialize an existing file.
+    #[test]
+    fn verdict_serializes_to_legacy_tokens() {
+        assert_eq!(
+            serde_json::to_string(&Verdict::Distinguishable).unwrap(),
+            r#""distinguishable""#
+        );
+        assert_eq!(
+            serde_json::to_string(&Verdict::Indistinguishable).unwrap(),
+            r#""indistinguishable""#
+        );
+        assert_eq!(
+            serde_json::to_string(&Verdict::Skipped).unwrap(),
+            r#""skipped""#
+        );
+        // And an existing on-disk token deserializes back into the enum — the
+        // forward-compat direction `doctor --compat` exercises.
+        assert_eq!(
+            serde_json::from_str::<Verdict>(r#""indistinguishable""#).unwrap(),
+            Verdict::Indistinguishable
+        );
+
+        // A whole record deserialized from the LEGACY wire shape (verdict as the
+        // bare string) parses identically — the precise bytes a pre-migration
+        // tirith wrote to `visual-audit-result.json`.
+        let legacy = r#"{"name":"latin-a-vs-cyrillic-a","codepoints":"U+0061 vs U+0430","verdict":"indistinguishable"}"#;
+        let pr: PairResult = serde_json::from_str(legacy).unwrap();
+        assert_eq!(pr.verdict, Verdict::Indistinguishable);
     }
 }

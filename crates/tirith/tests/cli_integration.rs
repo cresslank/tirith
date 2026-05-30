@@ -12504,3 +12504,183 @@ fn browser_host_drops_invalid_frame_without_writing() {
         "an invalid frame must not write clipboard_source.json"
     );
 }
+
+/// Decode a native-messaging ack frame from the host's captured stdout: a 4-byte
+/// native-order u32 length prefix followed by that many UTF-8 JSON bytes. Returns
+/// the body bytes (e.g. `{"ok":false}`). Panics on a malformed/short buffer so a
+/// regression surfaces loudly. Test helper for the browser_host integration tests.
+fn decode_ack_frame(stdout: &[u8]) -> Vec<u8> {
+    assert!(
+        stdout.len() >= 4,
+        "ack stdout must have at least a 4-byte length prefix, got {} bytes",
+        stdout.len()
+    );
+    let len = u32::from_ne_bytes([stdout[0], stdout[1], stdout[2], stdout[3]]) as usize;
+    let body = &stdout[4..];
+    assert!(
+        body.len() >= len,
+        "ack frame promised {len} body bytes but only {} are present",
+        body.len()
+    );
+    body[..len].to_vec()
+}
+
+/// `tirith browser host` fed a SCHEMA-VALID record whose re-serialized form
+/// exceeds the FILE-side read cap (`SOURCE_READ_CAP`, 64 KiB) but is well under
+/// the wire-frame cap (`MAX_FRAME_BYTES`, 256 KiB) must REFUSE to persist it:
+/// such a record would pass the frame check, land on disk, then be silently
+/// unreadable by the paste-provenance path. The host must (a) exit 0 on EOF,
+/// (b) NOT write `clipboard_source.json`, and (c) ack `{"ok":false}`. This is the
+/// end-to-end counterpart to the `serialized_fits_read_cap` unit test.
+#[test]
+fn browser_host_rejects_record_over_read_cap_but_under_frame_cap() {
+    use std::io::Write;
+
+    // SOURCE_READ_CAP is 64 KiB; MAX_FRAME_BYTES (host-internal) is 256 KiB. Pad
+    // `source_title` to SOURCE_READ_CAP + 1 bytes so the serialized record clears
+    // the read cap while the whole wire frame stays comfortably under 256 KiB.
+    let read_cap = tirith_core::clipboard::SOURCE_READ_CAP as usize;
+    let big_title = "A".repeat(read_cap + 1);
+    let record = tirith_core::clipboard::ClipboardSourceRecord {
+        updated_at: "2026-05-30T00:00:00Z".to_string(),
+        content_sha256: "deadbeefcafe".to_string(),
+        source_url: "https://docs.example.com/install".to_string(),
+        source_title: big_title,
+        hidden_text_detected: false,
+    };
+    let body = serde_json::to_vec(&record).expect("serialize oversized record");
+
+    // Confirm the record lands in the reject band: > read cap, < wire-frame cap.
+    const WIRE_FRAME_CAP: usize = 256 * 1024; // mirrors host's MAX_FRAME_BYTES
+    assert!(
+        body.len() > read_cap,
+        "test setup: record body ({} bytes) must exceed SOURCE_READ_CAP ({read_cap})",
+        body.len()
+    );
+    assert!(
+        body.len() < WIRE_FRAME_CAP,
+        "test setup: record body ({} bytes) must stay under the wire-frame cap ({WIRE_FRAME_CAP})",
+        body.len()
+    );
+
+    let state = tempfile::tempdir().expect("state tempdir");
+
+    // Native-order u32 length prefix, matching `u32::from_ne_bytes` in the host.
+    let mut frame = (body.len() as u32).to_ne_bytes().to_vec();
+    frame.extend_from_slice(&body);
+
+    let mut child = tirith()
+        .args(["browser", "host"])
+        .env("XDG_STATE_HOME", state.path())
+        .env("APPDATA", state.path())
+        .env("LOCALAPPDATA", state.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn tirith browser host");
+
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(&frame)
+        .expect("write oversized-serialized frame to host stdin");
+
+    let out = child.wait_with_output().expect("host wait");
+    // (a) Clean EOF → exit 0 (an over-read-cap record is dropped, not fatal).
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "host must exit 0 on EOF even after dropping an over-read-cap record; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // (b) Nothing persisted: a record the reader can't read back never lands on disk.
+    let unix_path = state.path().join("tirith").join("clipboard_source.json");
+    assert!(
+        !unix_path.exists(),
+        "a record over the read cap must not write clipboard_source.json"
+    );
+    // (c) The ack body is {"ok":false}.
+    assert_eq!(
+        decode_ack_frame(&out.stdout),
+        b"{\"ok\":false}",
+        "an over-read-cap record must be ack'd false"
+    );
+}
+
+/// `tirith browser host` whose persist target cannot be created (the resolved
+/// state dir's parent is a regular FILE, so `create_dir_all`/atomic-write fails)
+/// must ack `{"ok":false}` and KEEP SERVING — a transient/persistent disk error
+/// must not kill the session mid-stream. We feed TWO valid frames and assert BOTH
+/// acks are `{"ok":false}` and the host still reaches EOF with exit 0 (proving it
+/// did NOT abort after the first persist failure).
+#[test]
+fn browser_host_persist_failure_acks_false_and_keeps_serving() {
+    use std::io::Write;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Create a regular FILE named `notadir`. We point XDG_STATE_HOME at it, so
+    // state_dir() resolves to `<notadir>/tirith`; `create_dir_all` on a path whose
+    // parent component is a file fails → persist() errors on every frame.
+    let notadir = tmp.path().join("notadir");
+    std::fs::write(&notadir, b"i am a file, not a directory").expect("create blocking file");
+
+    let body = br#"{"updated_at":"2026-05-30T00:00:00Z","content_sha256":"deadbeefcafe","source_url":"https://docs.example.com/install","source_title":"Install Guide","hidden_text_detected":false}"#;
+    // Two identical valid frames back-to-back.
+    let mut stream = (body.len() as u32).to_ne_bytes().to_vec();
+    stream.extend_from_slice(body);
+    let second = stream.clone();
+    stream.extend_from_slice(&second);
+
+    let mut child = tirith()
+        .args(["browser", "host"])
+        .env("XDG_STATE_HOME", &notadir)
+        .env("APPDATA", &notadir)
+        .env("LOCALAPPDATA", &notadir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn tirith browser host");
+
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(&stream)
+        .expect("write two frames to host stdin");
+
+    let out = child.wait_with_output().expect("host wait");
+    // The host did NOT abort after the first persist failure: it consumed both
+    // frames and exited 0 on EOF.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a persist failure must not kill the host; it should keep serving and exit 0 on EOF; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // BOTH acks must be {"ok":false}. The stdout holds two back-to-back ack frames;
+    // decode the first, then the second from the remaining bytes.
+    let first = decode_ack_frame(&out.stdout);
+    assert_eq!(
+        first, b"{\"ok\":false}",
+        "the first persist failure must ack false"
+    );
+    // Advance past the first frame (4-byte prefix + body) to decode the second.
+    let consumed = 4 + first.len();
+    let rest = &out.stdout[consumed..];
+    let second_ack = decode_ack_frame(rest);
+    assert_eq!(
+        second_ack, b"{\"ok\":false}",
+        "the SECOND frame must also ack false — proving the host kept serving after the first failure"
+    );
+
+    // Nothing was persisted (the dir could never be created).
+    let blocked_path = notadir.join("tirith").join("clipboard_source.json");
+    assert!(
+        !blocked_path.exists(),
+        "no record should be persisted when the state dir cannot be created"
+    );
+}

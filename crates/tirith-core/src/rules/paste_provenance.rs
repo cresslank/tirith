@@ -113,7 +113,7 @@ pub fn check_with_record(
     // paste, so this guard is load-bearing. Hash the ORIGINAL `raw` bytes (what
     // the extension hashed), NOT the lossy `input` &str — for a non-UTF-8 paste
     // the lossy conversion would diverge and the match would be missed.
-    if !content_matches(raw, &record.content_sha256) {
+    if !record.matches_bytes(raw) {
         return Vec::new();
     }
 
@@ -158,15 +158,6 @@ pub fn check_with_record(
     };
 
     vec![build_finding(&source_host, &mismatched, &signals, severity)]
-}
-
-/// `true` when `sha256(raw)` (lowercase hex) equals `expected` (compared
-/// case-insensitively so a record written with uppercase hex still matches).
-/// Hashes the ORIGINAL clipboard `raw` bytes — NOT a lossy-decoded &str — so the
-/// digest matches what the browser extension computed over the same bytes even
-/// when the paste is not valid UTF-8.
-fn content_matches(raw: &[u8], expected: &str) -> bool {
-    crate::clipboard::content_sha256_hex(raw).eq_ignore_ascii_case(expected.trim())
 }
 
 /// Parse a URL string and return its lowercase host, or `None` if it has no

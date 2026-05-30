@@ -81,6 +81,17 @@ pub struct ClipboardSourceRecord {
     pub hidden_text_detected: bool,
 }
 
+impl ClipboardSourceRecord {
+    /// True when `raw` (the exact pasted bytes) hashes to this record's
+    /// `content_sha256`. The single comparison both the `paste_source_mismatch`
+    /// rule and the CLI attribution display use, so the finding and the displayed
+    /// source can never disagree on what "matches" means. Case-insensitive and
+    /// trims the stored hash (tolerant of a producer that pads/uppercases).
+    pub fn matches_bytes(&self, raw: &[u8]) -> bool {
+        content_sha256_hex(raw).eq_ignore_ascii_case(self.content_sha256.trim())
+    }
+}
+
 /// Tri-state describing what a caller knows about the companion clipboard-source
 /// record, threaded through [`crate::engine::AnalysisContext::clipboard_source`].
 ///
@@ -114,7 +125,7 @@ pub enum ClipboardSourceState {
 }
 
 /// Default on-disk path of the companion record: `state_dir()/clipboard_source.json`.
-/// `None` when the state dir cannot be resolved (no `$HOME`, no `$XDG_STATE_HOME`).
+/// `None` when the tirith state directory cannot be resolved.
 pub fn source_file_path() -> Option<PathBuf> {
     crate::policy::state_dir().map(|d| d.join("clipboard_source.json"))
 }

@@ -162,9 +162,11 @@ pub fn parse_record(payload: &[u8]) -> Option<tirith_core::clipboard::ClipboardS
 }
 
 /// Write a single native-messaging ack frame (`{"ok":<ok>}`) back to `writer`:
-/// a 4-byte native-order length prefix followed by the JSON body. Best-effort —
-/// a write failure is reported to the caller but does not abort the host (the
-/// record was already persisted).
+/// a 4-byte native-order length prefix followed by the JSON body. The returned
+/// `Result` IS observed by the caller ([`run`]): an `Err` means the peer closed
+/// the read end of our stdout, so the ack channel is one-way and `run` stops
+/// serving. (A failed PERSIST is the separate, non-fatal case — there the caller
+/// acks `{"ok":false}` and keeps serving.)
 fn write_ack<W: Write>(writer: &mut W, ok: bool) -> std::io::Result<()> {
     let body = if ok {
         b"{\"ok\":true}".to_vec()
@@ -196,8 +198,13 @@ pub fn run() -> i32 {
     let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
 
+    // Each iteration computes whether the frame should ack ok/false (or is fatal,
+    // handled inline with an early `return`), then writes the ack ONCE at the
+    // bottom. The ack result is OBSERVED: a write failure means Chrome's read end
+    // of our stdout is gone, so the channel is one-way and we stop serving.
     loop {
-        match read_frame(&mut stdin) {
+        // `false` = ack {"ok":false} (record dropped, keep serving); `true` = ok.
+        let ack_ok: bool = match read_frame(&mut stdin) {
             FrameRead::Eof => {
                 // Normal shutdown: Chrome closed the pipe.
                 return 0;
@@ -232,7 +239,7 @@ pub fn run() -> i32 {
                                     "tirith browser host: dropped a record whose serialized form ({} bytes) exceeds the {SOURCE_READ_CAP}-byte read cap",
                                     bytes.len()
                                 );
-                                let _ = write_ack(&mut stdout, false);
+                                false
                             }
                             Ok(bytes) => {
                                 if let Err(e) = persist(&out_path, &bytes) {
@@ -242,15 +249,14 @@ pub fn run() -> i32 {
                                     );
                                     // Persist failure: ack false, keep serving —
                                     // a transient disk error should not kill the
-                                    // host mid-session.
-                                    let _ = write_ack(&mut stdout, false);
+                                    // host mid-session. (This is a failed PERSIST,
+                                    // NOT a failed ack-write; the loop continues.)
+                                    false
                                 } else {
-                                    let _ = write_ack(&mut stdout, true);
+                                    true
                                 }
                             }
-                            Err(_) => {
-                                let _ = write_ack(&mut stdout, false);
-                            }
+                            Err(_) => false,
                         }
                     }
                     None => {
@@ -259,12 +265,29 @@ pub fn run() -> i32 {
                         eprintln!(
                             "tirith browser host: dropped a frame that did not match the clipboard-source schema"
                         );
-                        let _ = write_ack(&mut stdout, false);
+                        false
                     }
                 }
             }
+        };
+
+        // Observe the ack-write result. Unlike a failed PERSIST (transient, keep
+        // serving), a failed ACK-WRITE means the peer closed the read end of our
+        // stdout: the channel is now one-way (it could still feed us stdin while
+        // never seeing a reply). Continuing would let us read + persist records
+        // the peer can never confirm, so we stop serving.
+        if let Err(e) = write_ack(&mut stdout, ack_ok) {
+            eprintln!(
+                "tirith browser host: failed to write ack frame ({e}); the peer's read end is gone, stopping"
+            );
+            break;
         }
     }
+
+    // Reached only via `break` above (broken ack channel). A clean EOF returns 0
+    // inline; an oversized/truncated frame returns 1 inline. Treat a dead ack
+    // channel as a normal-ish shutdown (the peer initiated the close) → exit 0.
+    0
 }
 
 /// Persist `bytes` to `path` atomically (overwrite). Creates the parent
@@ -520,5 +543,39 @@ mod tests {
             panic!("ack must be a complete frame");
         };
         assert_eq!(payload, b"{\"ok\":false}");
+    }
+
+    /// `write_ack` surfaces a writer error as `Err` (rather than swallowing it).
+    /// This is the signal `run()` now relies on: when the peer's read end of our
+    /// stdout is gone, the ack write fails and `run()` stops serving. A writer
+    /// that always errors on `write` proves the error reaches the caller.
+    #[test]
+    fn write_ack_propagates_writer_error() {
+        /// A `Write` that fails every `write` with `BrokenPipe` — models Chrome
+        /// closing the read end of the host's stdout.
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "peer closed stdout",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut failing = FailingWriter;
+        let err = write_ack(&mut failing, true)
+            .expect_err("write_ack must return Err when the underlying writer fails");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+
+        // The `ok=false` path must propagate the error too (both branches write).
+        let mut failing = FailingWriter;
+        assert!(
+            write_ack(&mut failing, false).is_err(),
+            "write_ack(false) must also surface a writer error"
+        );
     }
 }

