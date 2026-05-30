@@ -189,9 +189,7 @@ fn write_ack<W: Write>(writer: &mut W, ok: bool) -> std::io::Result<()> {
 ///     state directory could not be resolved.
 pub fn run() -> i32 {
     let Some(out_path) = tirith_core::clipboard::source_file_path() else {
-        eprintln!(
-            "tirith browser host: cannot resolve the tirith state directory (no $HOME / $XDG_STATE_HOME)"
-        );
+        eprintln!("tirith browser host: cannot resolve the tirith state directory");
         return 1;
     };
 

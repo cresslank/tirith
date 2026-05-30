@@ -541,13 +541,14 @@ fn verdict_from_answer(answer: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The pair table must cover the classes the task specifies and be at least
-    /// ~20 pairs. A regression that drops a class would silently narrow the audit.
+    /// The pair table is a FIXED set. Pin the exact count (CodeRabbit R4) so a
+    /// dropped class is caught, not silently tolerated by a `>=` floor.
     #[test]
     fn pair_table_has_expected_breadth() {
-        assert!(
-            PAIRS.len() >= 20,
-            "expected at least 20 confusable pairs, got {}",
+        assert_eq!(
+            PAIRS.len(),
+            20,
+            "the visual-audit pair set is fixed at 20; got {}",
             PAIRS.len()
         );
         // Names are unique (so per-pair results never collide).

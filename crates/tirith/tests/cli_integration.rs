@@ -12037,6 +12037,16 @@ fn paste_with_source_attributes_and_flags_high_mismatch_with_pipe() {
         .unwrap();
     let out = child.wait_with_output().unwrap();
 
+    // Pin the CLI outcome, not just the finding severity (CodeRabbit R4): a
+    // High-severity provenance mismatch must BLOCK (exit 1), so a regression in
+    // action→exit-code mapping is caught here too.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "high-severity provenance mismatch should block (exit 1); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("paste --json must be parseable: {e}\nstdout:\n{stdout}"));
@@ -12195,12 +12205,15 @@ fn clipboard_watch_exits_when_stdout_pipe_closed() {
     match rx.recv_timeout(std::time::Duration::from_secs(20)) {
         Ok(status) => {
             let status = status.expect("wait");
-            // SIGPIPE-terminated (no code) OR a clean exit via the broken-pipe
-            // `return 0` branch — both are acceptable "it stopped" outcomes. What
-            // matters is that it EXITED.
+            // Exactly two acceptable "it stopped" outcomes (CodeRabbit R4): a
+            // clean exit 0 via the broken-pipe `return 0` branch, or
+            // SIGPIPE-termination (no exit code). The previous
+            // `!success() || code()==Some(0)` was true for ANY exit (it failed to
+            // exclude an unexpected non-zero crash).
             assert!(
-                !status.success() || status.code() == Some(0),
-                "watch must stop on a closed stdout pipe; status: {status:?}"
+                status.code() == Some(0) || status.code().is_none(),
+                "watch must stop cleanly (exit 0) or be signal-terminated on a \
+                 closed stdout pipe; status: {status:?}"
             );
         }
         Err(_) => panic!(

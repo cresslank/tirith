@@ -103,9 +103,12 @@ On a valid frame the host writes the validated record to:
   <state-dir>/clipboard_source.json
 ```
 
-where `<state-dir>` is `$XDG_STATE_HOME/tirith` or `~/.local/state/tirith`. The
-write is **atomic** (a sibling temp file is fsync'd and renamed over the
-destination), so the engine's paste hot-path never observes a torn or
+where `<state-dir>` is tirith's platform-specific state directory
+(`$XDG_STATE_HOME/tirith` or `~/.local/state/tirith` on Linux, with the OS
+equivalents on macOS and Windows — `tirith browser host` resolves it the same way
+the engine does). The write is **atomic** (a sibling temp file is fsync'd and
+renamed over the destination), so the engine's paste hot-path never observes a
+torn or
 half-written record.
 
 ## Security model — input is UNTRUSTED

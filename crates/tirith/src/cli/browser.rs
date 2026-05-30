@@ -219,11 +219,16 @@ pub fn install_extension(
             return 0;
         }
 
-        // Non-Windows: a `None` path means HOME could not be resolved — a real
-        // failure. Report it and exit non-zero rather than masquerading as the
-        // Windows success path.
-        let msg = "cannot resolve the manifest path: no home directory \
-                   ($HOME) could be resolved";
+        // Non-Windows: a `None` path is a real failure. Distinguish the two causes
+        // so the operator is pointed at the right problem — an unsupported target
+        // (no per-OS NMH dir for this build) vs. a resolvable platform whose HOME
+        // could not be found. Report it and exit non-zero rather than masquerading
+        // as the Windows success path.
+        let msg = if platform == "unsupported" {
+            "native messaging host installation is not supported on this platform"
+        } else {
+            "cannot resolve the manifest path: no home directory ($HOME) could be resolved"
+        };
         if json {
             let env = serde_json::json!({
                 "platform": platform,
