@@ -21,7 +21,7 @@
 //! callback is the single exception to tirith's no-network rule, and it is
 //! gated entirely behind an explicit user-supplied `--callback-url`. A callback
 //! failure is non-blocking: it is logged to the audit log and never changes the
-//! verdict. See [`Canary::fire_callback`].
+//! verdict. See [`fire_callback`].
 //!
 //! # Clearly-synthetic token shapes
 //!

@@ -263,10 +263,14 @@ pub fn prune(id: &str, yes: bool, json: bool) -> i32 {
             0
         }
         Err(e) => {
-            // Write-failure exit (2) already matches this error's exit code; the
-            // bool is routed through for an explicit broken-pipe path.
-            let _ = emit_error(json, "tirith canary prune", &e.to_string());
-            2
+            // Mirror `create` / command-card sign (CodeRabbit R13c): a normal
+            // operation failure (store read-modify-write error) is the semantic
+            // exit 1; only a broken-pipe JSON write — where the error never reached
+            // the consumer — is the write-failure exit 2.
+            if !emit_error(json, "tirith canary prune", &e.to_string()) {
+                return 2;
+            }
+            1
         }
     }
 }
@@ -314,10 +318,14 @@ pub fn rotate(id: &str, json: bool) -> i32 {
             1
         }
         Err(e) => {
-            // Write-failure exit (2) already matches this error's exit code; the
-            // bool is routed through for an explicit broken-pipe path.
-            let _ = emit_error(json, "tirith canary rotate", &e.to_string());
-            2
+            // Mirror `create` / command-card sign (CodeRabbit R13c): a normal
+            // operation failure (store read-modify-write error) is the semantic
+            // exit 1; only a broken-pipe JSON write — where the error never reached
+            // the consumer — is the write-failure exit 2.
+            if !emit_error(json, "tirith canary rotate", &e.to_string()) {
+                return 2;
+            }
+            1
         }
     }
 }

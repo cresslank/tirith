@@ -1895,7 +1895,20 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     // carved out because they're inspection targets — only the eight Unicode-
     // style rule classes filtered at tier 3 are affected by this carveout.
     let inert_range = if ctx.scan_context == ScanContext::Exec {
-        extract::tirith_inert_arg_range(&ctx.input, ctx.shell)
+        // Compute the inspection carve-out from the prelude-STRIPPED command
+        // (CodeRabbit R13c). A leading `# tirith-card:` line would otherwise be
+        // `segments.first()` for `tirith_inert_arg_range`, which then never sees
+        // the `tirith <subcommand>` leader, returns `None`, and lets
+        // ConfusableText/BidiControls fire on a `tirith diff/score/why/...`
+        // command's inspection args. The byte scan below still runs on the
+        // ORIGINAL `ctx.input` (so a control char smuggled into a prelude line is
+        // still caught), so translate the stripped-view range back onto the
+        // original buffer by the stripped prelude length. No prelude → `stripped`
+        // borrows `ctx.input`, `prelude_off == 0`, and the range is unchanged.
+        let stripped = crate::command_card::strip_card_comment_lines_cow(&ctx.input);
+        let prelude_off = ctx.input.len() - stripped.len();
+        extract::tirith_inert_arg_range(&stripped, ctx.shell)
+            .map(|r| (r.start + prelude_off)..(r.end + prelude_off))
     } else {
         None
     };
@@ -3873,6 +3886,29 @@ mod tests {
                     crate::verdict::RuleId::ConfusableText | crate::verdict::RuleId::BidiControls
                 ),
                 "tirith score arg span must not surface {:?}",
+                f.rule_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_tirith_inspection_carveout_survives_card_prelude() {
+        // CodeRabbit R13c: a leading `# tirith-card:` prelude must NOT hide the
+        // `tirith <subcommand>` leader from the inert-range carve-out. The range is
+        // computed on the STRIPPED command and translated back onto the original
+        // buffer, so a card-prelude'd `tirith score <confusable/bidi arg>` still
+        // does NOT fire ConfusableText/BidiControls on the inspection arg (which the
+        // command exists to display). Pre-fix, the prelude was `segments.first()`,
+        // `tirith_inert_arg_range` returned None, and these rules fired.
+        let input = "# tirith-card: ./c.json\ntirith score https://ex\u{0430}mple.com/\u{202E}bar";
+        let verdict = analyze(&exec_ctx(input));
+        for f in &verdict.findings {
+            assert!(
+                !matches!(
+                    f.rule_id,
+                    crate::verdict::RuleId::ConfusableText | crate::verdict::RuleId::BidiControls
+                ),
+                "a card-prelude'd tirith inspection arg span must still be carved out, got {:?}",
                 f.rule_id
             );
         }

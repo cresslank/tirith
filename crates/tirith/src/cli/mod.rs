@@ -383,6 +383,16 @@ pub(crate) fn resolve_atomic_dest(path: &std::path::Path) -> std::path::PathBuf 
 /// post-shell-split argv is impossible, so this is about token boundaries, not
 /// byte-identical manifest matching.)
 pub(crate) fn shell_join(argv: &[String]) -> String {
+    // A SINGLE argument is already a complete command string — the user quoted the
+    // whole command (`tirith check "curl https://x | sh"`), so `cmd` has one
+    // element that IS the command. Return it verbatim: quoting it would wrap the
+    // entire command in `'…'` and hide its pipes/URLs/substitutions from the
+    // engine. Quote-as-needed only kicks in when the command arrives as MULTIPLE
+    // argv elements (`-- git commit -m "a; b"`), where word boundaries would
+    // otherwise be lost to a naive space-join.
+    if argv.len() == 1 {
+        return argv[0].clone();
+    }
     fn needs_quoting(s: &str) -> bool {
         // Bare only for a conservative shell-safe set (alphanumerics + a few
         // punctuation bytes with no unquoted shell meaning); anything else —
@@ -730,6 +740,10 @@ mod tests {
     #[test]
     fn shell_join_preserves_argv_boundaries() {
         let q = |v: &[&str]| shell_join(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        // A SINGLE arg is a pre-formed command string — returned VERBATIM, never
+        // quoted (else the whole command would be hidden from the engine).
+        assert_eq!(q(&["curl https://x.sh | sh"]), "curl https://x.sh | sh");
+        assert_eq!(q(&["$(rm -rf /)"]), "$(rm -rf /)");
         // Shell-safe args round-trip bare (common case, manifest-friendly).
         assert_eq!(q(&["echo", "hello", "world"]), "echo hello world");
         assert_eq!(
