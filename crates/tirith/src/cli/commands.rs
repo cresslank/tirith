@@ -60,6 +60,11 @@ pub fn init(force: bool, json: bool) -> i32 {
     }
 
     if let Some(parent) = path.parent() {
+        // If `.tirith` is created fresh here, its new directory entry in the repo
+        // root must be fsync'd too — `write_file_atomic` below only fsyncs `.tirith`
+        // (commands.yaml's parent), not `.tirith`'s parent. A crash could otherwise
+        // lose the whole `.tirith` dir despite init succeeding. CodeRabbit R13b.
+        let parent_existed = parent.exists();
         if let Err(e) = std::fs::create_dir_all(parent) {
             if !emit_error(
                 json,
@@ -69,6 +74,9 @@ pub fn init(force: bool, json: bool) -> i32 {
                 return 2;
             }
             return 1;
+        }
+        if !parent_existed {
+            tirith_core::util::fsync_parent_dir_logged(parent, "commands .tirith directory");
         }
     }
 

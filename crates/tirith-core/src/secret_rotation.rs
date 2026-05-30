@@ -170,8 +170,12 @@ pub static PROVIDERS: &[Provider] = &[
             "Update ~/.npmrc, CI publish secrets, and any automation.",
             "Audit recently published package versions for unexpected releases.",
         ],
-        key_prefix_shapes: &["npm_", "//registry.npmjs.org/:_authToken"],
-        env_name_markers: &[],
+        // `npm_` is a real token VALUE prefix (tier 1). The `.npmrc` line
+        // `//registry.npmjs.org/:_authToken=` is a config-KEY name, not a value
+        // shape, so it belongs in tier 2 (CodeRabbit R13b) — otherwise it could
+        // out-rank another provider's real prefix in a mixed redacted command.
+        key_prefix_shapes: &["npm_"],
+        env_name_markers: &["//registry.npmjs.org/:_authToken"],
         last_verified: LAST_VERIFIED,
     },
     Provider {
@@ -202,10 +206,12 @@ pub static PROVIDERS: &[Provider] = &[
         ],
         // NB: crates.io tokens are `cio…`, but the bare 3-char substring "cio"
         // false-matches common words ("suspicious", "precious", …) and would
-        // mis-route an unrelated leak to crates.io. Match cargo only via the
-        // explicit `cargo-registry-token` config key — no short-prefix shape.
-        key_prefix_shapes: &["cargo-registry-token"],
-        env_name_markers: &[],
+        // mis-route an unrelated leak to crates.io — so there is no value-shape
+        // prefix. cargo is matched only via the explicit `cargo-registry-token`
+        // config KEY, which is a NAME marker → tier 2 (CodeRabbit R13b), not a
+        // value shape, so a real prefix elsewhere in a mixed command wins.
+        key_prefix_shapes: &[],
+        env_name_markers: &["cargo-registry-token"],
         last_verified: LAST_VERIFIED,
     },
     Provider {
@@ -858,6 +864,32 @@ mod tests {
         assert_eq!(
             match_provider("cargo-registry-token = redacted").map(|p| p.provider),
             Some("cargo")
+        );
+    }
+
+    #[test]
+    fn real_value_prefix_outranks_npm_cargo_config_markers() {
+        // CodeRabbit R13b: `//registry.npmjs.org/:_authToken` (npm) and
+        // `cargo-registry-token` (cargo) are config-KEY NAME markers, now in tier 2.
+        // In a mixed redacted command that ALSO carries another provider's real
+        // value prefix, the real prefix (tier 1) must win — previously the long
+        // npm/cargo name marker sat in tier 1 and out-ranked it by length.
+        assert_eq!(
+            match_provider("npmrc //registry.npmjs.org/:_authToken=x and ghp_realleakedtoken")
+                .map(|p| p.provider),
+            Some("github"),
+            "a real ghp_ prefix (tier 1) must beat npm's tier-2 config-key marker"
+        );
+        assert_eq!(
+            match_provider("cargo-registry-token = x ; also AKIAEXAMPLEREALKEY")
+                .map(|p| p.provider),
+            Some("aws"),
+            "a real AKIA prefix (tier 1) must beat cargo's tier-2 config-key marker"
+        );
+        // And with NO competing real prefix, the tier-2 markers still attribute.
+        assert_eq!(
+            match_provider("//registry.npmjs.org/:_authToken=redacted").map(|p| p.provider),
+            Some("npm")
         );
     }
 

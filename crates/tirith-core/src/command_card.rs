@@ -108,6 +108,7 @@ impl std::fmt::Display for SignatureAlgo {
 
 /// The signature block attached to a card.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CardSignature {
     /// Signature algorithm. v1 only supports [`SignatureAlgo::Ed25519`]; an
     /// unknown value fails at deserialize time.
@@ -124,7 +125,16 @@ pub struct CardSignature {
 /// The signature covers the [`Card::signing_payload`] — every field *except*
 /// the signature block itself. Serializing/deserializing is plain JSON with
 /// the field names the spec pins.
+///
+/// `deny_unknown_fields` (CodeRabbit R13b): a signed card is a security
+/// attestation, so `from_json` must reject any field not represented here.
+/// Without it, an unknown on-disk field would be silently dropped before
+/// `signing_payload` re-serializes the typed struct — i.e. it would ride along
+/// outside the attested boundary. Rejecting unknown fields keeps the verified
+/// document byte-equivalent to what was signed. (Compatible: no `#[serde(flatten)]`
+/// here; `#[serde(default)]` on optional fields still tolerates MISSING ones.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Card {
     /// The exact command the card attests to.
     pub command: String,
@@ -1496,6 +1506,36 @@ mod tests {
         let json = card.to_json_pretty().unwrap();
         let parsed = Card::from_json(json.as_bytes()).unwrap();
         assert_eq!(parsed, card);
+    }
+
+    #[test]
+    fn unknown_json_fields_are_rejected() {
+        // CodeRabbit R13b: a signed card is an attestation, so `from_json` must
+        // REJECT any field not in the struct. Otherwise an unknown on-disk field
+        // would be silently dropped before `signing_payload` re-serializes the
+        // typed struct — i.e. it would ride outside the attested boundary.
+        let extra_top = r#"{
+            "command": "echo hi",
+            "expires": "2026-08-01",
+            "evil_extra": "smuggled"
+        }"#;
+        assert!(
+            Card::from_json(extra_top.as_bytes()).is_err(),
+            "an unknown top-level field must fail to deserialize"
+        );
+        // Unknown field inside the signature block is rejected too.
+        let extra_sig = r#"{
+            "command": "echo hi",
+            "expires": "2026-08-01",
+            "signature": { "algo": "ed25519", "key_id": "00", "value": "00", "x": 1 }
+        }"#;
+        assert!(
+            Card::from_json(extra_sig.as_bytes()).is_err(),
+            "an unknown field in the signature block must fail to deserialize"
+        );
+        // The same card WITHOUT the extra fields still parses (no false rejection).
+        let clean = r#"{ "command": "echo hi", "expires": "2026-08-01" }"#;
+        assert!(Card::from_json(clean.as_bytes()).is_ok());
     }
 
     #[test]

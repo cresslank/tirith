@@ -467,6 +467,16 @@ fn append_entry(store: &Path, entry: &CanaryEntry) -> std::io::Result<()> {
         opts.mode(0o600);
     }
     let mut file = opts.open(store)?;
+    // `OpenOptionsExt::mode` above applies ONLY when the file is freshly created.
+    // If `canaries.jsonl` already exists with wider permissions (created under a
+    // looser umask, or by an older build), narrow it to 0600 BEFORE appending the
+    // token + callback data, which are sensitive (CodeRabbit R13b). Best-effort on
+    // the open handle; failure to chmod is surfaced like any other write error.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
     writeln!(file, "{line}")?;
     // Durability: a buffered append that returns Ok before the bytes reach
@@ -529,10 +539,13 @@ fn read_store_partitioned(path: &Path) -> (Vec<StoreLine>, bool) {
 /// mid-write never truncates the store. This is the line-preserving primitive
 /// `prune`/`rotate` use so unparseable lines survive the rewrite verbatim.
 fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
-    if let Some(parent) = store.parent() {
+    // Resolve a symlinked store to its real target so the rewrite writes THROUGH
+    // the link rather than replacing it with a regular file (CodeRabbit R13b).
+    let dest = crate::util::resolve_symlink_target(store);
+    if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let dir = store.parent().unwrap_or_else(|| Path::new("."));
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     #[cfg(unix)]
     {
@@ -551,7 +564,7 @@ fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
     // correct regardless), then `sync_all()` the underlying file.
     tmp.flush()?;
     tmp.as_file().sync_all()?;
-    tmp.persist(store).map_err(|e| e.error)?;
+    tmp.persist(&dest).map_err(|e| e.error)?;
     // Durability of the RENAME itself (CodeRabbit R9 #B): the body is fsync'd
     // above, but the new directory entry is not crash-durable until the parent
     // dir is fsync'd. A lost rewrite could resurrect a stale store (e.g. an
@@ -559,7 +572,7 @@ fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
     // the parent so the published store survives a crash. The body+rename already
     // succeeded, so a dir-fsync failure is LOGGED, not propagated (R13 #5).
     // Best-effort, unix-only.
-    crate::util::fsync_parent_dir_logged(store, "canary store");
+    crate::util::fsync_parent_dir_logged(&dest, "canary store");
     Ok(())
 }
 

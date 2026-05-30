@@ -343,8 +343,12 @@ fn persist_salt(salt_file: &Path, salt: &[u8], replace_corrupt: bool) -> std::io
     }
 
     if replace_corrupt {
-        // Atomic overwrite of a corrupt (wrong-length) salt.
-        let dir = salt_file.parent().unwrap_or_else(|| Path::new("."));
+        // Atomic overwrite of a corrupt (wrong-length) salt. Resolve a symlinked
+        // salt path to its real target so the rewrite writes THROUGH the link
+        // rather than replacing it with a regular file (CodeRabbit R13b); the temp
+        // must live in the resolved target's dir for the rename to stay atomic.
+        let dest = crate::util::resolve_symlink_target(salt_file);
+        let dir = dest.parent().unwrap_or_else(|| Path::new("."));
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         #[cfg(unix)]
         {
@@ -359,8 +363,8 @@ fn persist_salt(salt_file: &Path, salt: &[u8], replace_corrupt: bool) -> std::io
         // the corrupt salt in place; a body synced but entry lost would lose the
         // new salt. Best-effort parent fsync (unix-only).
         tmp.as_file().sync_all()?;
-        tmp.persist(salt_file).map_err(|e| e.error)?;
-        crate::util::fsync_parent_dir_logged(salt_file, "baseline salt");
+        tmp.persist(&dest).map_err(|e| e.error)?;
+        crate::util::fsync_parent_dir_logged(&dest, "baseline salt");
         return Ok(salt.to_vec());
     }
 
@@ -591,10 +595,13 @@ fn append_observation(store: &Path, obs: &Observation) -> std::io::Result<()> {
 /// `record_at` compaction uses so a valid-but-unparseable line survives the
 /// rewrite VERBATIM rather than being silently dropped (CodeRabbit R12 #F).
 fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
-    if let Some(parent) = store.parent() {
+    // Resolve a symlinked store to its real target so the rewrite writes THROUGH
+    // the link rather than replacing it with a regular file (CodeRabbit R13b).
+    let dest = crate::util::resolve_symlink_target(store);
+    if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let dir = store.parent().unwrap_or_else(|| Path::new("."));
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     #[cfg(unix)]
     {
@@ -612,8 +619,8 @@ fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
     // Best-effort parent fsync (unix-only).
     tmp.flush()?;
     tmp.as_file().sync_all()?;
-    tmp.persist(store).map_err(|e| e.error)?;
-    crate::util::fsync_parent_dir_logged(store, "baseline store");
+    tmp.persist(&dest).map_err(|e| e.error)?;
+    crate::util::fsync_parent_dir_logged(&dest, "baseline store");
     Ok(())
 }
 
@@ -1225,6 +1232,41 @@ mod tests {
             std::fs::read(&salt_file).unwrap().len(),
             SALT_LEN,
             "an oversized salt must be regenerated to exactly SALT_LEN bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corrupt_salt_regen_through_symlink_updates_target_not_link() {
+        // CodeRabbit R13b: the corrupt-salt rewrite (persist_salt replace path)
+        // must write THROUGH a symlinked salt path to the real target, not replace
+        // the symlink with a regular file. Seed a SHORT (corrupt) salt at the
+        // target, point a symlink at it, then trigger regeneration via hashing.
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let target_dir = dir.path().join("real");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target = target_dir.join("baseline.salt");
+        std::fs::write(&target, [0u8; 16]).unwrap(); // wrong length → corrupt → regen
+
+        let link = dir.path().join("baseline.salt");
+        symlink(&target, &link).unwrap();
+
+        let h = hash_host_at(&link, "github.com").expect("hash succeeds after regen");
+        assert_eq!(h.len(), 16);
+        // The symlink is intact (still a symlink to the target)...
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the salt symlink must be preserved, not replaced by a regular file"
+        );
+        // ...and the regenerated 32-byte salt landed in the TARGET, through the link.
+        assert_eq!(
+            std::fs::read(&target).unwrap().len(),
+            SALT_LEN,
+            "the fresh salt must be written through the link into the real target"
         );
     }
 

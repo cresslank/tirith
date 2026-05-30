@@ -365,18 +365,47 @@ pub(crate) fn write_file_atomic(
 /// regular path, a missing path, or a dangling/unresolvable symlink) returns
 /// `path` unchanged so the caller renames onto it as before.
 pub(crate) fn resolve_atomic_dest(path: &std::path::Path) -> std::path::PathBuf {
-    match std::fs::symlink_metadata(path) {
-        // A symlink whose target resolves: write through to the real file.
-        // `canonicalize` follows every link in the chain and requires the final
-        // target to exist — a dangling symlink errors here and falls back to
-        // `path` (replacing the dangling link with a regular file, which is the
-        // pre-existing behavior).
-        Ok(meta) if meta.file_type().is_symlink() => {
-            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-        }
-        // Not a symlink (regular file/dir/absent): rename onto `path` directly.
-        _ => path.to_path_buf(),
+    // Single source of truth shared with the core state-store rewrites.
+    tirith_core::util::resolve_symlink_target(path)
+}
+
+/// Reconstruct a shell command STRING from already-split argv, PRESERVING word
+/// boundaries (CodeRabbit R13b). Each arg containing a shell-significant byte is
+/// single-quoted (embedded `'` escaped as `'\''`); shell-safe args are emitted
+/// bare so the common case round-trips unchanged (`["echo","hi"]` → `echo hi`).
+///
+/// Used where the reconstructed string is fed to the analysis engine
+/// (`commands check`): a naive `argv.join(" ")` lets a multi-word arg be re-split
+/// into separate tokens/commands and skew the verdict — e.g.
+/// `git commit -m "fix; rm -rf /"` would look like a `;`-separated `rm` command.
+/// Quoting the dangerous arg keeps the engine's tokenization faithful to the argv
+/// the user actually invoked. (Reconstructing a human's ORIGINAL quoting from
+/// post-shell-split argv is impossible, so this is about token boundaries, not
+/// byte-identical manifest matching.)
+pub(crate) fn shell_join(argv: &[String]) -> String {
+    fn needs_quoting(s: &str) -> bool {
+        // Bare only for a conservative shell-safe set (alphanumerics + a few
+        // punctuation bytes with no unquoted shell meaning); anything else —
+        // space, `;`, `|`, `&`, `$`, quotes, `\`, glob chars, newline — is quoted.
+        s.is_empty()
+            || !s.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(
+                        b,
+                        b'-' | b'_' | b'.' | b'/' | b':' | b'=' | b'@' | b',' | b'+' | b'%'
+                    )
+            })
     }
+    argv.iter()
+        .map(|a| {
+            if needs_quoting(a) {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Suggest the closest match from a list of candidates using Levenshtein distance.
@@ -694,9 +723,30 @@ pub fn find_shadow_binaries() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_shim_target, resolve_shim_target};
+    use super::{parse_shim_target, resolve_shim_target, shell_join};
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn shell_join_preserves_argv_boundaries() {
+        let q = |v: &[&str]| shell_join(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        // Shell-safe args round-trip bare (common case, manifest-friendly).
+        assert_eq!(q(&["echo", "hello", "world"]), "echo hello world");
+        assert_eq!(
+            q(&["curl", "https://example.com/x.sh"]),
+            "curl https://example.com/x.sh"
+        );
+        // An arg with shell-significant bytes is single-quoted so the engine does
+        // NOT re-split it: `;`, spaces, and `/` inside one arg stay one token.
+        assert_eq!(
+            q(&["git", "commit", "-m", "fix; rm -rf /"]),
+            "git commit -m 'fix; rm -rf /'"
+        );
+        // Embedded single quotes are escaped as '\''.
+        assert_eq!(q(&["echo", "it's"]), "echo 'it'\\''s'");
+        // An empty arg must be represented (not vanish) as '' .
+        assert_eq!(q(&["x", ""]), "x ''");
+    }
 
     #[test]
     fn parse_shim_target_accepts_unquoted_values() {

@@ -133,7 +133,10 @@ struct CacheState {
     /// it is NOT a definitive "not tainted" (CodeRabbit R16 #3, fail-safe).
     complete: bool,
     loaded_at: Instant,
-    /// Store-file mtime at load time (nanos since epoch), for invalidation.
+    /// `(present, mtime_nanos)` of the store file at load time, for invalidation.
+    /// `present` is tracked separately from `mtime_nanos` so an absent store and a
+    /// present-but-unstattable one are never conflated (see [`stat_signature`]).
+    existed: bool,
     mtime_nanos: u128,
 }
 
@@ -141,14 +144,31 @@ static CACHE: Mutex<Option<CacheState>> = Mutex::new(None);
 
 const CACHE_TTL: Duration = Duration::from_secs(5);
 
-/// File mtime as nanos since UNIX epoch; 0 when the file is absent/unstattable.
-fn mtime_nanos(path: &Path) -> u128 {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
+/// Cache-invalidation stat for the store path: `(present, mtime_nanos)`.
+///
+/// FAIL-SAFE + symlink-aware (CodeRabbit R13b), mirroring `incident::mtime_nanos`.
+/// Uses `symlink_metadata` (lstat) so a symlink planted at the path is seen as a
+/// present entry rather than followed, and maps ONLY a genuine `NotFound` to
+/// absent `(false, 0)`. Every OTHER stat error (permission, I/O, unstattable
+/// parent) maps to present `(true, 0)` so it cannot be confused with the cached
+/// "absent" snapshot and silently reused: it busts the cache, forcing a re-read
+/// that [`read_store_lines_complete`](crate::util::read_store_lines_complete)
+/// reports as incomplete for a present-but-unreadable file → [`is_tainted_at`]
+/// fails safe (UNKNOWN), per the absent-vs-unreadable contract on `complete`.
+fn stat_signature(path: &Path) -> (bool, u128) {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => {
+            let nanos = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            (true, nanos)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, 0),
+        Err(_) => (true, 0),
+    }
 }
 
 /// Parse the JSONL store, skipping blank and unparseable lines (fail-open: a
@@ -182,11 +202,12 @@ fn parse_store(path: &Path) -> (Vec<TaintEntry>, bool) {
 fn cached_entries(path: &Path) -> (Vec<TaintEntry>, bool) {
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
-    let cur_mtime = mtime_nanos(path);
+    let (existed, cur_mtime) = stat_signature(path);
 
     if let Some(state) = guard.as_ref() {
         let fresh = state.path == path
             && now.duration_since(state.loaded_at) < CACHE_TTL
+            && state.existed == existed
             && state.mtime_nanos == cur_mtime;
         if fresh {
             return (state.entries.clone(), state.complete);
@@ -199,6 +220,7 @@ fn cached_entries(path: &Path) -> (Vec<TaintEntry>, bool) {
         entries: entries.clone(),
         complete,
         loaded_at: now,
+        existed,
         mtime_nanos: cur_mtime,
     });
     (entries, complete)
@@ -337,7 +359,7 @@ fn unknown_taint_entry(path: &str) -> TaintEntry {
 /// operator why an unmarked path is being treated as tainted.
 fn warn_incomplete_store_once(store: &Path) {
     static LAST_WARNED: Mutex<Option<(PathBuf, u128)>> = Mutex::new(None);
-    let mtime = mtime_nanos(store);
+    let mtime = stat_signature(store).1;
     let mut guard = LAST_WARNED.lock().unwrap_or_else(|e| e.into_inner());
     let key = (store.to_path_buf(), mtime);
     if guard.as_ref() == Some(&key) {
@@ -365,7 +387,7 @@ fn warn_incomplete_store_once(store: &Path) {
 /// prior lookup warning never suppresses this display warning (and vice versa).
 fn warn_incomplete_list_once(store: &Path) {
     static LAST_WARNED: Mutex<Option<(PathBuf, u128)>> = Mutex::new(None);
-    let mtime = mtime_nanos(store);
+    let mtime = stat_signature(store).1;
     let mut guard = LAST_WARNED.lock().unwrap_or_else(|e| e.into_inner());
     let key = (store.to_path_buf(), mtime);
     if guard.as_ref() == Some(&key) {
@@ -513,10 +535,13 @@ pub fn clear_taint(path: &Path, cwd: Option<&Path>) -> std::io::Result<usize> {
 /// uses so it can write back RAW lines (parseable entries + verbatim unknown
 /// lines) without round-tripping every line through `serde` (CodeRabbit R12 #F).
 fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
-    if let Some(parent) = store.parent() {
+    // Resolve a symlinked store to its real target so the rewrite writes THROUGH
+    // the link rather than replacing it with a regular file (CodeRabbit R13b).
+    let dest = crate::util::resolve_symlink_target(store);
+    if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let dir = store.parent().unwrap_or_else(|| Path::new("."));
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     #[cfg(unix)]
     {
@@ -534,8 +559,8 @@ fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
     // (unix-only).
     tmp.flush()?;
     tmp.as_file().sync_all()?;
-    tmp.persist(store).map_err(|e| e.error)?;
-    crate::util::fsync_parent_dir_logged(store, "taint store");
+    tmp.persist(&dest).map_err(|e| e.error)?;
+    crate::util::fsync_parent_dir_logged(&dest, "taint store");
     Ok(())
 }
 
@@ -546,6 +571,31 @@ mod tests {
 
     fn store_in(dir: &Path) -> PathBuf {
         dir.join("taint.jsonl")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stat_signature_distinguishes_absent_from_present_unreadable() {
+        // CodeRabbit R13b: the cache must not conflate "absent" with "present but
+        // unstattable". A genuinely missing path is the only `(false, _)`; a
+        // dangling symlink (and any non-NotFound stat error) is present, so a store
+        // that was absent when cached and becomes one of those busts the cache and
+        // forces a re-read that fails safe instead of reusing a stale clean snapshot.
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("nope.jsonl");
+        assert_eq!(stat_signature(&missing), (false, 0), "absent → (false, 0)");
+
+        let link = dir.path().join("dangling.jsonl");
+        symlink(&missing, &link).unwrap();
+        assert!(
+            stat_signature(&link).0,
+            "a dangling symlink must read as PRESENT, not absent"
+        );
+
+        let real = store_in(dir.path());
+        std::fs::write(&real, b"{}\n").unwrap();
+        assert!(stat_signature(&real).0, "a real store reads as present");
     }
 
     /// CodeRabbit R13 #1: `clear_taint_at` REWRITES the store from the lines it

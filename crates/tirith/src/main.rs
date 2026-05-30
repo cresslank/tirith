@@ -7013,7 +7013,10 @@ fn run() {
                 cmd,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::commands::check(&cmd.join(" "), &shell, json)
+                // `shell_join` (not `cmd.join(" ")`): preserve argv word
+                // boundaries so a multi-word arg cannot be re-split into separate
+                // tokens/commands and skew the engine verdict (CodeRabbit R13b).
+                cli::commands::check(&cli::shell_join(&cmd), &shell, json)
             }
         },
 

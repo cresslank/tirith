@@ -1554,7 +1554,15 @@ fn atomic_self_replace(dest: &Path, new_binary: &Path) -> Result<SwapResult, Str
     // advertised `--rollback` target is missing or truncated. fsync the backup's
     // CONTENTS here; its directory entry is covered by the parent fsync at step 4
     // (same directory, after both the backup and the renamed binary exist).
-    std::fs::File::open(&backup)
+    //
+    // The handle MUST be opened for WRITE: on Windows `sync_all` calls
+    // `FlushFileBuffers`, which requires a writable handle (a read-only
+    // `File::open` fails there with access-denied, even though POSIX `fsync`
+    // accepts a read-only fd). `write(true)` opens the existing copy without
+    // truncating it.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&backup)
         .and_then(|f| f.sync_all())
         .map_err(|e| {
             format!(

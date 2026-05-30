@@ -513,12 +513,21 @@ fn init_with_template(force: bool, minimal: bool, template: Option<PolicyTemplat
         return 1;
     }
 
+    // Note whether `.tirith` already existed: if we create it on a fresh repo, the
+    // new directory entry in `repo_root` must itself be fsync'd, or a crash could
+    // lose `.tirith` (and the `policy.yaml` inside it) even though init returned
+    // success. `write_file_atomic` below only fsyncs `.tirith` (policy.yaml's
+    // parent), not `repo_root` (.tirith's parent). CodeRabbit R13b.
+    let tirith_dir_existed = tirith_dir.exists();
     if let Err(e) = std::fs::create_dir_all(&tirith_dir) {
         eprintln!(
             "tirith policy init: cannot create {}: {e}",
             tirith_dir.display()
         );
         return 1;
+    }
+    if !tirith_dir_existed {
+        tirith_core::util::fsync_parent_dir_logged(&tirith_dir, "policy .tirith directory");
     }
 
     let template_body = match (template, minimal) {

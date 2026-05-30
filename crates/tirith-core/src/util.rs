@@ -483,6 +483,31 @@ pub fn fsync_parent_dir_logged(path: &Path, context: &str) {
     }
 }
 
+/// Resolve the EFFECTIVE atomic-rewrite target for `path` (CodeRabbit R13b).
+///
+/// When `path` is a symlink to an existing target, returns the canonicalized
+/// target so an atomic `temp → rename` writes THROUGH the link (preserving the
+/// symlink itself) instead of replacing it with a regular file. For a regular
+/// path, a missing path, or a dangling/unresolvable symlink, returns `path`
+/// unchanged so the caller renames onto it as before (a dangling link is replaced
+/// by a regular file — the pre-existing behaviour).
+///
+/// Callers must create their temp file in `dest.parent()` (so the rename stays on
+/// the same filesystem) and fsync `dest`'s parent. Shared by the state-store
+/// rewrites (`baseline`, `canary`, `taint`) and the CLI's `write_file_atomic`.
+pub fn resolve_symlink_target(path: &Path) -> std::path::PathBuf {
+    match std::fs::symlink_metadata(path) {
+        // A symlink whose target resolves: write through to the real file.
+        // `canonicalize` follows the whole chain and requires the final target to
+        // exist — a dangling symlink errors and falls back to `path`.
+        Ok(meta) if meta.file_type().is_symlink() => {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        }
+        // Not a symlink (regular file/dir/absent): rename onto `path` directly.
+        _ => path.to_path_buf(),
+    }
+}
+
 /// Truncate a string to a maximum number of bytes without breaking UTF-8.
 /// Returns the original string if it is already within the limit.
 pub fn truncate_bytes(s: &str, max_bytes: usize) -> String {
