@@ -141,13 +141,19 @@ pub fn read_source_record() -> Option<ClipboardSourceRecord> {
     source_file_path().and_then(|p| read_source_record_at(&p))
 }
 
-/// `true` when the companion record at `path` exists and has at least one byte.
-/// A cheap `metadata()` stat — no parse. Used by the engine's tier-1 force-past
+/// `true` when the companion record at `path` is a non-empty REGULAR file. A
+/// cheap `metadata()` stat — no parse. Used by the engine's tier-1 force-past
 /// decision so a no-extension machine pays a single stat. Mirrors
 /// [`crate::canary::store_nonempty_at`].
+///
+/// Requires `is_file()` (CodeRabbit R7) so the fast-path probe matches the reader
+/// contract: [`read_source_record_at`] only accepts a regular file, so a stray
+/// directory (e.g. `clipboard_source.json/`, whose `len()` is non-zero on some
+/// filesystems) must NOT keep forcing the paste slow-path for a record the reader
+/// would always reject.
 pub fn source_file_nonempty_at(path: &Path) -> bool {
     std::fs::metadata(path)
-        .map(|m| m.len() > 0)
+        .map(|m| m.is_file() && m.len() > 0)
         .unwrap_or(false)
 }
 
@@ -327,6 +333,20 @@ mod tests {
         assert!(!source_file_nonempty_at(&path));
         std::fs::write(&path, b"{}").unwrap();
         assert!(source_file_nonempty_at(&path));
+    }
+
+    #[test]
+    fn source_file_nonempty_rejects_a_directory() {
+        // CodeRabbit R7: a directory at the path (non-zero len() on some
+        // filesystems) must NOT count as a non-empty record — the reader only
+        // accepts a regular file, so the fast-path probe must too.
+        let dir = tempdir().unwrap();
+        let as_dir = dir.path().join("clipboard_source.json");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert!(
+            !source_file_nonempty_at(&as_dir),
+            "a directory must not be treated as a non-empty source record"
+        );
     }
 
     /// The tri-state defaults to `Unread` — the safe "caller never looked"
