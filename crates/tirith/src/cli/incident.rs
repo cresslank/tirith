@@ -195,28 +195,31 @@ pub fn stop(yes: bool, json: bool) -> i32 {
 
     match incident::stop() {
         Ok(removed) => {
+            // RACE HANDLING (CodeRabbit R18 #3): `read_state()` above saw an active
+            // incident, but `stop()` returns `removed == false` when the flag was
+            // ALREADY GONE by the time we deleted it — i.e. another process (a
+            // concurrent `incident stop`) cleared it in between. In that case THIS
+            // invocation did not stop anything; the end state is still "inactive",
+            // but we must not claim this call restored the policy (a false audit /
+            // operator message). Exit stays 0 (the posture IS inactive), but the
+            // audit event and message report the already-cleared outcome honestly.
+            let (audit_event, detail) =
+                stop_outcome(removed, existing.as_ref().map(|s| s.started_at_display()));
             // Best-effort audit trail of the stop (non-blocking; never gates).
-            let detail = existing
-                .as_ref()
-                .map(|s| {
-                    format!(
-                        "incident stopped (was active since {})",
-                        s.started_at_display()
-                    )
-                })
-                .unwrap_or_else(|| "incident stopped".to_string());
             tirith_core::audit::log_hook_event(
                 "incident",
                 "stop",
-                "incident_stopped",
+                audit_event,
                 None,
                 Some(&detail),
             );
 
             if json {
                 // Surface a failed JSON write as non-zero (see the no-incident
-                // branch above): the incident WAS stopped on disk, but a piped
-                // consumer must not read success with truncated/absent JSON.
+                // branch above): a piped consumer must not read success with
+                // truncated/absent JSON. `stopped` reflects whether THIS call did
+                // the removal (false on the race), so the consumer can tell an
+                // actual stop from an already-cleared no-op.
                 if !write_json_stdout(
                     &StoppedOut {
                         stopped: removed,
@@ -228,8 +231,16 @@ pub fn stop(yes: bool, json: bool) -> i32 {
                 }
                 return 0;
             }
-            println!("Incident ended — normal policy restored.");
-            println!("The TIRITH=0 bypass and your configured fail_mode are in effect again.");
+            if removed {
+                println!("Incident ended — normal policy restored.");
+                println!("The TIRITH=0 bypass and your configured fail_mode are in effect again.");
+            } else {
+                // The flag was cleared by a racing process between our status read
+                // and our delete — do NOT claim this call restored the policy.
+                println!(
+                    "Incident was already inactive — cleared by another process; nothing to stop."
+                );
+            }
             0
         }
         Err(e) => {
@@ -240,6 +251,32 @@ pub fn stop(yes: bool, json: bool) -> i32 {
             }
             1
         }
+    }
+}
+
+/// Select the audit `(event, detail)` for an `incident stop` whose `read_state()`
+/// saw an active incident, given whether `incident::stop()` actually `removed`
+/// the flag.
+///
+/// `removed == true` → THIS call cleared the flag (the normal case). `removed ==
+/// false` → the flag was ALREADY gone when `stop()` ran, i.e. a racing process
+/// cleared it between our status read and our delete (CodeRabbit R18 #3); we must
+/// NOT record a false `incident_stopped` claiming this call restored the policy.
+/// Pure so the race-vs-normal audit selection is unit-testable without forcing
+/// the (single-process) TOCTOU window (mirrors the `commands::json_refusal_exit_code`
+/// seam). `started_at_display` is the prior state's start time, used only in the
+/// normal-case detail line.
+fn stop_outcome(removed: bool, started_at_display: Option<String>) -> (&'static str, String) {
+    if removed {
+        let detail = started_at_display
+            .map(|d| format!("incident stopped (was active since {d})"))
+            .unwrap_or_else(|| "incident stopped".to_string());
+        ("incident_stopped", detail)
+    } else {
+        (
+            "incident_already_inactive",
+            "incident already cleared by another process before this stop".to_string(),
+        )
     }
 }
 
@@ -880,8 +917,42 @@ struct StoppedOut {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_report, md_inline_escape};
+    use super::{build_report, md_inline_escape, stop_outcome};
     use tirith_core::incident::IncidentState;
+
+    /// CodeRabbit R18 #3: when `incident stop`'s `read_state()` saw an active
+    /// incident but `incident::stop()` reports `removed == false` (a racing
+    /// process cleared the flag first), the audit/message must report the
+    /// already-cleared outcome — NOT a false "this call stopped it". A genuine
+    /// removal keeps the normal `incident_stopped` event with the start-time
+    /// detail.
+    #[test]
+    fn stop_outcome_distinguishes_real_stop_from_race() {
+        // Real stop: this call removed the flag → `incident_stopped` + a detail
+        // naming the prior start time.
+        let (event, detail) = stop_outcome(true, Some("2026-05-30T00:00:00+00:00".to_string()));
+        assert_eq!(event, "incident_stopped");
+        assert!(
+            detail.contains("incident stopped") && detail.contains("2026-05-30T00:00:00+00:00"),
+            "a real stop must record the stopped event with the start time, got: {detail}"
+        );
+
+        // Race: the flag was already gone → a distinct already-inactive event,
+        // and the detail must NOT claim this call stopped/restored anything.
+        let (event, detail) = stop_outcome(false, Some("2026-05-30T00:00:00+00:00".to_string()));
+        assert_eq!(
+            event, "incident_already_inactive",
+            "a racing already-cleared stop must not be logged as incident_stopped"
+        );
+        assert!(
+            detail.contains("already cleared by another process"),
+            "the race detail must report the already-cleared outcome, got: {detail}"
+        );
+        assert!(
+            !detail.contains("incident stopped"),
+            "the race detail must NOT falsely claim this call stopped the incident, got: {detail}"
+        );
+    }
 
     #[test]
     fn md_inline_escape_neutralizes_newlines_and_markdown() {

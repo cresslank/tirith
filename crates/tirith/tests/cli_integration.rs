@@ -10567,6 +10567,62 @@ fn canary_prune_does_not_falsely_succeed_on_unreadable_store() {
     );
 }
 
+/// CodeRabbit R18 #5: `tirith taint list` builds its output from `parse_store`,
+/// which returns a partial prefix when the store cannot be read to EOF. A SILENT
+/// truncation would hide taints from the listing with no operator signal, so an
+/// incomplete read must emit a one-line "the listing may be truncated" stderr
+/// diagnostic (rate-limited, list-specific wording — distinct from the lookup
+/// path's "treated as tainted" message).
+///
+/// The store path is a FIFO (reported incomplete by the hardened O_NONBLOCK
+/// reader), so `taint list` must surface the truncation warning. Unix-only (needs
+/// `mkfifo`); cannot hang — the reader's `O_NONBLOCK` open returns immediately on
+/// a FIFO with no writer, and the wait is bounded defensively.
+#[cfg(unix)]
+#[test]
+fn taint_list_warns_on_incomplete_store_read() {
+    use std::ffi::CString;
+    use std::sync::mpsc;
+
+    let state = tempfile::tempdir().expect("tempdir");
+    // The taint store lives at `<XDG_STATE_HOME>/tirith/taint.jsonl`
+    // (`policy::state_dir()` appends `tirith`).
+    let store_dir = state.path().join("tirith");
+    fs::create_dir_all(&store_dir).unwrap();
+    let store = store_dir.join("taint.jsonl");
+    let c_path = CString::new(store.as_os_str().to_str().unwrap()).unwrap();
+    // SAFETY: a single libc mkfifo with a valid C string and a standard mode.
+    if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+        eprintln!("skipping: mkfifo unsupported here");
+        return;
+    }
+
+    // Bound the wait so a regression to a blocking read can't hang the suite.
+    let mut cmd = tirith();
+    cmd.args(["taint", "list"])
+        .env("XDG_STATE_HOME", state.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd.spawn().expect("spawn tirith taint list");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let out = match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+        Ok(r) => r.expect("wait_with_output"),
+        Err(_) => {
+            panic!("tirith taint list hung on a FIFO store — incomplete-read read guard regressed")
+        }
+    };
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("could not be read completely") && stderr.contains("may be truncated"),
+        "taint list on an incomplete (FIFO) store must warn the listing may be truncated, got stderr:\n{stderr}"
+    );
+}
+
 // ── M11 ch2: `tirith commands` CLI (PR #130 review batch B) ──────────────
 //
 // These drive the `tirith commands list|run` CLI. The manifest is discovered
@@ -10770,6 +10826,95 @@ fn commands_run_interactive_warn_decline_refuses() {
     assert!(
         !dstdout.contains("https://bit.ly/x"),
         "a DECLINED command must NOT execute (no echo on stdout), got stdout:\n{dstdout}"
+    );
+}
+
+/// CodeRabbit R18 #1: the "command ran" audit must be DEFERRED until the command
+/// actually executes. Declining the interactive Warn ack must NOT write a run
+/// entry to the audit log (previously the audit was emitted BEFORE the prompt, so
+/// a decline still recorded the command as having run). A non-interactive
+/// PROCEED, which does execute, MUST write the entry.
+///
+/// `commands_tirith` pins `XDG_DATA_HOME` (and the Windows AppData vars) at
+/// `root`, so the audit log lands at `<root>/tirith/log.jsonl` (`data_dir()`),
+/// fully isolated from the real home. We assert on the presence of a record
+/// referencing the run command in that file.
+fn read_audit_log_for(root: &std::path::Path) -> String {
+    // `data_dir()` resolves to `XDG_DATA_HOME/tirith` on Unix and
+    // `%APPDATA%/tirith` on Windows; both are pinned to `root` by
+    // `commands_tirith`, so the log is at `<root>/tirith/log.jsonl`.
+    let log = root.join("tirith").join("log.jsonl");
+    fs::read_to_string(&log).unwrap_or_default()
+}
+
+#[test]
+fn commands_run_interactive_warn_decline_writes_no_run_audit() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    write_root_manifest(
+        root.path(),
+        "allowed:\n  - name: greet\n    command: \"echo https://bit.ly/x\"\n",
+    );
+
+    // Decline the interactive Warn ack ("n"): the command must NOT run...
+    let mut cmd = commands_tirith(root.path());
+    cmd.env("TIRITH_INTERACTIVE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(["commands", "run", "greet"]);
+    let mut child = cmd.spawn().expect("spawn (decline)");
+    child.stdin.take().unwrap().write_all(b"n\n").unwrap();
+    let declined = child.wait_with_output().expect("wait (decline)");
+    assert_eq!(
+        declined.status.code(),
+        Some(1),
+        "declining the Warn ack must exit 1"
+    );
+
+    // ...so NO audit record for the run command may exist. (The decline path
+    // emits no `log_verdict` at all now; the Block path is the only pre-exec
+    // audit and this command is a Warn, not a Block.)
+    let log = read_audit_log_for(root.path());
+    assert!(
+        !log.contains("bit.ly"),
+        "a DECLINED warn must NOT write a run audit entry, but the log contains it:\n{log}"
+    );
+}
+
+#[test]
+fn commands_run_noninteractive_proceed_writes_run_audit() {
+    // The inverse of the decline case: a non-interactive proceed
+    // (`TIRITH_INTERACTIVE=0`, set by `commands_tirith`) DOES execute the command,
+    // so the deferred audit DOES fire and the run is recorded.
+    let root = tempfile::tempdir().expect("tempdir");
+    write_root_manifest(
+        root.path(),
+        "allowed:\n  - name: greet\n    command: \"echo https://bit.ly/x\"\n",
+    );
+
+    let out = commands_tirith(root.path())
+        .args(["commands", "run", "greet"])
+        .output()
+        .expect("commands run greet");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a non-interactive proceed must exit 0, stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Proof it executed (echoed marker reached stdout)...
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("https://bit.ly/x"),
+        "the command should have executed"
+    );
+    // ...AND the run was audited.
+    let log = read_audit_log_for(root.path());
+    assert!(
+        log.contains("bit.ly"),
+        "a command that actually ran must be audited, but the log lacks it:\n{log}"
     );
 }
 

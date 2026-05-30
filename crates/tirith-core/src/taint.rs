@@ -351,6 +351,31 @@ fn warn_incomplete_store_once(store: &Path) {
     );
 }
 
+/// One-line stderr diagnostic when `list_taints_at` builds its output from an
+/// INCOMPLETELY read store (CodeRabbit R18 #5), de-duplicated per `(path, mtime)`
+/// so a repeated `tirith taint list` against the same broken store does not spam.
+///
+/// The wording is LIST-specific (the list may be truncated) — distinct from the
+/// lookup path's "treated as tainted (fail-safe)" message, which would be
+/// misleading here (`list` synthesizes nothing; it just shows the partial
+/// prefix). A separate rate-limit static from [`warn_incomplete_store_once`] so a
+/// prior lookup warning never suppresses this display warning (and vice versa).
+fn warn_incomplete_list_once(store: &Path) {
+    static LAST_WARNED: Mutex<Option<(PathBuf, u128)>> = Mutex::new(None);
+    let mtime = mtime_nanos(store);
+    let mut guard = LAST_WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (store.to_path_buf(), mtime);
+    if guard.as_ref() == Some(&key) {
+        return;
+    }
+    *guard = Some(key);
+    eprintln!(
+        "tirith: warning: taint store {} could not be read completely; \
+         the listing below may be truncated (some taints may be missing)",
+        store.display()
+    );
+}
+
 /// Production entry point: look up `path` in the default store, normalizing
 /// relative paths against `cwd` (or the process cwd when `cwd` is `None`).
 pub fn is_tainted(path: &Path, cwd: Option<&Path>) -> Option<TaintEntry> {
@@ -376,11 +401,19 @@ pub fn store_nonempty() -> bool {
 /// recorded entry per path wins, mirroring [`is_tainted_at`]). Order is by
 /// first appearance.
 pub fn list_taints_at(store: &Path) -> Vec<TaintEntry> {
-    // `list` is a display path: an incomplete read yields a partial prefix
-    // (already diagnosed on stderr by the reader) — we list what we could read
-    // rather than synthesizing entries. The lookup hot path (`is_tainted_at`) is
-    // the one that fails safe on `complete == false` (CodeRabbit R16 #3).
-    let (entries, _complete) = parse_store(store);
+    // `list` is a display path: an incomplete read yields a partial prefix — we
+    // list what we could read rather than synthesizing entries (the lookup hot
+    // path `is_tainted_at` is the one that fails safe on `complete == false`,
+    // CodeRabbit R16 #3). But a SILENT truncation here would let a mid-file I/O
+    // fault hide taints from the displayed list with no signal to the operator,
+    // so when the read is incomplete we emit the SAME rate-limited one-line stderr
+    // diagnostic the lookup path uses (CodeRabbit R18 #5). The returned list is
+    // still the partial prefix; the warning just tells the operator it may be
+    // truncated.
+    let (entries, complete) = parse_store(store);
+    if !complete {
+        warn_incomplete_list_once(store);
+    }
     let mut order: Vec<String> = Vec::new();
     let mut latest: std::collections::HashMap<String, TaintEntry> =
         std::collections::HashMap::new();

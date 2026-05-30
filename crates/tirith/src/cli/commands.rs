@@ -236,15 +236,16 @@ pub fn run(name: &str, json: bool) -> i32 {
     };
     let command = entry.command.clone();
 
-    // Discover the repo policy once so the audit log redacts the command text
-    // with the operator's custom DLP patterns (same as `tirith check`), and the
-    // findings render below sees the same policy-derived view.
-    let policy = tirith_core::policy::Policy::discover(cwd.as_deref());
-
     // Re-check the resolved command through the engine. The manifest CANNOT
     // bypass detection: if the engine blocks (dangerous match, High/Critical
     // finding), we refuse to run it.
-    let verdict = analyze_command(&command, cwd.as_deref());
+    //
+    // The engine ALSO returns the repo policy it resolved while analyzing
+    // (CodeRabbit R18 #2): reuse it for the audit-log / findings redaction below
+    // instead of a SECOND `Policy::discover` (a duplicate `.git`-boundary walk
+    // and, for a remote policy, a duplicate fetch). Same single-discovery pattern
+    // `check.rs` uses.
+    let (verdict, policy) = analyze_command(&command, cwd.as_deref());
     if verdict.action == tirith_core::verdict::Action::Block {
         // Audit the refusal so the blocked attempt is traceable.
         let _ = tirith_core::audit::log_verdict(
@@ -298,14 +299,12 @@ pub fn run(name: &str, json: bool) -> i32 {
         return verdict.action.exit_code();
     }
 
-    // Audit the (allowed, non-blocked) run before executing it.
-    let _ = tirith_core::audit::log_verdict(
-        &verdict,
-        &command,
-        None,
-        None,
-        &policy.dlp_custom_patterns,
-    );
+    // NOTE: the "command ran" audit is DEFERRED past this point (CodeRabbit R18
+    // #1). It is written only AFTER the interactive warn acknowledgement passes
+    // AND the shell spawn SUCCEEDS (see `audit_run` below), so declining the warn
+    // or a failed spawn never records a command as having run. The BLOCK refusal
+    // above is still audited where it is (a refused command must remain
+    // traceable).
 
     // A Warn/WarnAck verdict on an allowed command must NEVER be silently
     // swallowed: render its findings just like `tirith check` does. In an
@@ -388,8 +387,14 @@ pub fn run(name: &str, json: bool) -> i32 {
             }
         };
 
-        // The spawn succeeded — the command IS running. Emit the single
-        // `running:true` object. The round-9/15 abort-on-write-failure contract
+        // The spawn SUCCEEDED — the command is now running, so this is the
+        // moment to audit the actual execution (CodeRabbit R18 #1). A declined
+        // warn or a spawn failure returned above WITHOUT reaching here, so the
+        // audit log never records a command that did not run.
+        audit_run(&verdict, &command, &policy.dlp_custom_patterns);
+
+        // Emit the single `running:true` object. The round-9/15
+        // abort-on-write-failure contract
         // is preserved: if THIS write fails, a `--json` consumer saw a truncated
         // record and must not have the command silently run to completion, so we
         // KILL + reap the (already-spawned) child and report the write failure
@@ -419,8 +424,20 @@ pub fn run(name: &str, json: bool) -> i32 {
         }
     } else {
         eprintln!("Running allowed command '{name}': {command}");
-        match run_shell_command_human(&command) {
-            Ok(code) => code,
+        // SPAWN first so the "command ran" audit fires only AFTER a successful
+        // spawn (CodeRabbit R18 #1): a spawn failure must not record a run. A
+        // declined warn already returned above without reaching here.
+        match build_shell_command(&command).spawn() {
+            Ok(mut child) => {
+                audit_run(&verdict, &command, &policy.dlp_custom_patterns);
+                match child.wait() {
+                    Ok(status) => status.code().unwrap_or(128),
+                    Err(e) => {
+                        eprintln!("tirith commands run: failed to wait on command: {e}");
+                        1
+                    }
+                }
+            }
             Err(e) => {
                 emit_error(
                     json,
@@ -431,6 +448,19 @@ pub fn run(name: &str, json: bool) -> i32 {
             }
         }
     }
+}
+
+/// Audit a (now-actually-executing) allowed command run. Called only AFTER the
+/// shell spawn SUCCEEDS (and any interactive warn was acknowledged), so the audit
+/// log records the command as run ONLY when it really did — never on a declined
+/// warn or a failed spawn (CodeRabbit R18 #1). Best-effort: a write failure must
+/// not change the run's exit code.
+fn audit_run(
+    verdict: &tirith_core::verdict::Verdict,
+    command: &str,
+    dlp_custom_patterns: &[String],
+) {
+    let _ = tirith_core::audit::log_verdict(verdict, command, None, None, dlp_custom_patterns);
 }
 
 /// Map a refusal-path JSON write result to the process exit code. On a clean
@@ -579,8 +609,19 @@ const RUN_SHELL: tirith_core::tokenize::ShellType = tirith_core::tokenize::Shell
 #[cfg(not(windows))]
 const RUN_SHELL: tirith_core::tokenize::ShellType = tirith_core::tokenize::ShellType::Posix;
 
-/// Analyze `command` through the engine for `commands run`'s safety re-check.
-fn analyze_command(command: &str, cwd: Option<&str>) -> tirith_core::verdict::Verdict {
+/// Analyze `command` through the engine for `commands run`'s safety re-check,
+/// returning BOTH the verdict AND the policy the engine resolved.
+///
+/// Reusing the engine-resolved policy (CodeRabbit R18 #2) lets `run()` avoid a
+/// SECOND `Policy::discover` (a duplicate filesystem walk and, for a remote
+/// policy, a duplicate fetch) just to drive audit-log / findings redaction — the
+/// engine already discovered exactly that policy while analyzing. Mirrors
+/// `check.rs`, which threads `engine::analyze_returning_policy`'s policy through
+/// for the same reason.
+fn analyze_command(
+    command: &str,
+    cwd: Option<&str>,
+) -> (tirith_core::verdict::Verdict, tirith_core::policy::Policy) {
     use tirith_core::engine::{self, AnalysisContext};
     use tirith_core::extract::ScanContext;
 
@@ -598,7 +639,7 @@ fn analyze_command(command: &str, cwd: Option<&str>) -> tirith_core::verdict::Ve
         clipboard_html: None,
         card_ref: None,
     };
-    engine::analyze(&ctx)
+    engine::analyze_returning_policy(&ctx)
 }
 
 /// Run `command` through the platform shell. Returns the child's exit code (128
@@ -694,12 +735,6 @@ fn spawn_shell_command_json(command: &str) -> std::io::Result<SpawnedJsonChild> 
         })
     });
     Ok(SpawnedJsonChild { child, pump })
-}
-
-/// Human-mode run: the child inherits stdout/stderr; spawn+wait combined.
-/// Returns the child's exit code (128 if killed by a signal with no code).
-fn run_shell_command_human(command: &str) -> std::io::Result<i32> {
-    Ok(build_shell_command(command).status()?.code().unwrap_or(128))
 }
 
 /// Forward everything `reader` (the child's stdout) produces to `writer`
