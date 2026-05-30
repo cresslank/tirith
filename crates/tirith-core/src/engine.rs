@@ -1346,6 +1346,15 @@ fn taint_finding(
 /// ([`crate::canary::detect`]). `context` is a short label (`"exec"`,
 /// `"paste"`, `"output"`) recorded only in the callback body / finding text —
 /// never any token value.
+///
+/// SANCTIONED EXCEPTION to the no-network-on-exec/hot-path invariant: when a
+/// matched canary carries an opt-in `--callback-url`, this path CAN POST. It is
+/// the single deliberate exception, and it is tightly bounded — the POST is
+/// opt-in (a canary created without `--callback-url` never fires it), runs on a
+/// DETACHED, timeout-capped thread that the verdict NEVER awaits, carries only
+/// `{kind, detected_at, context}` (never the token value), and audit-logs every
+/// failure. A future auditor of the no-network invariant should not flag this
+/// call site. See [`crate::canary::fire_callback`].
 fn check_canary_hot(text: &str, context: &str) -> Vec<Finding> {
     // Detection is anchored in `redact::detect_canaries` (the content-scanning
     // module) so the analyze + analyze_output paths share one entry point; it
@@ -1364,6 +1373,11 @@ fn canary_findings_from_hits(hits: &[crate::canary::CanaryHit], context: &str) -
         // Best-effort, opt-in, non-blocking. A canary created WITHOUT a
         // `--callback-url` has `callback_url: None` and this is a no-op (no
         // network). The POST never carries the token value.
+        //
+        // This is the SINGLE sanctioned exception to the no-network-on-exec/
+        // hot-path invariant (reachable from exec): detached + timeout-capped,
+        // the verdict never awaits it, opt-in only, and every failure is
+        // audit-logged. See `fire_callback` and `check_canary_hot`'s doc.
         crate::canary::fire_callback(hit, context);
         findings.push(canary_finding(hit));
     }

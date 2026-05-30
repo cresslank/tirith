@@ -967,10 +967,13 @@ mod tests {
 
     /// CodeRabbit R9 #C: the flag is `read` on every exec via `active_cached`. A
     /// FIFO at the flag path would BLOCK a plain `std::fs::read` forever waiting
-    /// for a writer. The `is_file()` guard rejects it BEFORE any open/read, so it
-    /// reads as `Corrupt` (fail-SAFE: incident still considered active) and the
-    /// call returns PROMPTLY. If the guard regressed to a blocking read this test
-    /// would HANG (caught by the suite timeout). Unix-only (FIFO + `mkfifo`).
+    /// for a writer. `read_flag_at` routes through `util::read_regular_capped`,
+    /// which opens with `O_NONBLOCK` (so the open of a writer-less FIFO returns
+    /// immediately instead of blocking) and then `fstat`s the OPEN fd and refuses
+    /// any non-regular file — so the FIFO reads as `Corrupt` (fail-SAFE: incident
+    /// still considered active) and the call returns PROMPTLY. If that guard
+    /// regressed to a blocking read this test would HANG (caught by the suite
+    /// timeout). Unix-only (FIFO + `mkfifo`).
     #[cfg(unix)]
     #[test]
     fn fifo_flag_is_corrupt_and_does_not_hang() {
@@ -993,8 +996,10 @@ mod tests {
     }
 
     /// CodeRabbit R9 #C (symlink to a non-regular file): a symlink pointing at a
-    /// FIFO must also be rejected (metadata FOLLOWS the symlink, then `is_file()`
-    /// rejects the FIFO target) — Corrupt, fail-safe, no hang. Unix-only.
+    /// FIFO must also be rejected. `read_regular_capped` opens the path with
+    /// `O_NONBLOCK` (following the symlink to the FIFO target without blocking),
+    /// then `fstat`s the open fd and refuses the non-regular target — Corrupt,
+    /// fail-safe, no hang. Unix-only.
     #[cfg(unix)]
     #[test]
     fn symlink_flag_to_fifo_is_corrupt_and_does_not_hang() {

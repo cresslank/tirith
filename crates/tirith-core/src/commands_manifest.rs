@@ -39,8 +39,9 @@
 //! `dangerous[*].pattern` supports glob `*` ONLY (matches any run of
 //! characters, including none). There is no `?`, no character classes, no
 //! regex. `allowed[*].command` is an EXACT string match (after trimming
-//! surrounding ASCII whitespace on both sides). This is documented in the
-//! starter file written by `tirith commands init`.
+//! surrounding shell-significant whitespace — space/tab/newline/CR, see
+//! [`crate::command_card::is_shell_significant_ws`] — on both sides). This is
+//! documented in the starter file written by `tirith commands init`.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -194,17 +195,20 @@ impl CommandsManifest {
     }
 
     /// Error on duplicate `allowed[].name` or duplicate `dangerous[].pattern`.
-    /// Names/patterns are compared VERBATIM (no trimming): two entries that
-    /// differ only by surrounding whitespace are still distinct keys on disk, and
-    /// surfacing the literal collision is clearer than silently normalizing.
+    /// Names/patterns are deduped after trimming surrounding shell-significant
+    /// whitespace (space/tab/newline/CR — the same `is_shell_significant_ws`
+    /// predicate the matchers use), so two entries that differ ONLY by such
+    /// surrounding whitespace are rejected as the duplicates they effectively
+    /// are at match time (they would resolve to the same first-match key).
     fn validate_no_duplicates(&self) -> Result<(), ManifestError> {
-        // Dedup on the SAME ASCII-trimmed key the matchers compare with
-        // (`match_allowed`/`match_dangerous` use `trim_ascii_ws`), so two entries
-        // that differ only by surrounding ASCII whitespace are caught as the
-        // duplicates they effectively are at match time.
+        // Dedup on the SAME shell-significant-whitespace-trimmed key the matchers
+        // compare with (`match_allowed`/`match_dangerous` use `trim_shell_ws`),
+        // so two entries that differ only by surrounding shell-significant
+        // whitespace are caught as the duplicates they effectively are at match
+        // time.
         let mut seen_names = std::collections::HashSet::with_capacity(self.allowed.len());
         for entry in &self.allowed {
-            if !seen_names.insert(trim_ascii_ws(&entry.name)) {
+            if !seen_names.insert(trim_shell_ws(&entry.name)) {
                 return Err(ManifestError::Parse(format!(
                     "duplicate allowed[].name {:?}: each catalogued command name must be unique \
                      (first-match lookup makes a duplicate name ambiguous)",
@@ -214,7 +218,7 @@ impl CommandsManifest {
         }
         let mut seen_patterns = std::collections::HashSet::with_capacity(self.dangerous.len());
         for entry in &self.dangerous {
-            if !seen_patterns.insert(trim_ascii_ws(&entry.pattern)) {
+            if !seen_patterns.insert(trim_shell_ws(&entry.pattern)) {
                 return Err(ManifestError::Parse(format!(
                     "duplicate dangerous[].pattern {:?}: a dangerous pattern is redundant if \
                      listed twice",
@@ -298,35 +302,38 @@ impl CommandsManifest {
     }
 
     /// True when `command` exactly matches an `allowed[*].command` (after
-    /// trimming surrounding ASCII whitespace on both sides). Returns the
-    /// matching entry's `name` for audit context.
+    /// trimming surrounding shell-significant whitespace — space/tab/newline/CR,
+    /// see [`crate::command_card::is_shell_significant_ws`] — on both sides).
+    /// Returns the matching entry's `name` for audit context.
     ///
-    /// ASCII-ONLY trim (CodeRabbit R9 #A), in lockstep with the ASCII-only
-    /// [`crate::command_card::Card::command_matches`] gate. `str::trim` strips
-    /// the full Unicode `White_Space` set; a manifest entry padded with a
-    /// Unicode-whitespace char (e.g. a U+00A0 NO-BREAK SPACE) would then trim
-    /// equal to an ASCII-space command, disagreeing with the command-card gate
-    /// (which would treat it as a mismatch). Both comparators MUST agree on
-    /// exactly which bytes are whitespace, so manifest matching trims ASCII only.
+    /// SHELL-SIGNIFICANT-WHITESPACE trim (CodeRabbit R9 #A), in lockstep with
+    /// the [`crate::command_card::Card::command_matches`] gate (which trims the
+    /// same narrower set — NOT `str::trim`, NOT even
+    /// [`char::is_ascii_whitespace`]). `str::trim` strips the full Unicode
+    /// `White_Space` set; a manifest entry padded with a Unicode-whitespace char
+    /// (e.g. a U+00A0 NO-BREAK SPACE) would then trim equal to an ASCII-space
+    /// command, disagreeing with the command-card gate (which would treat it as
+    /// a mismatch). Both comparators MUST agree on exactly which bytes are
+    /// whitespace, so manifest matching trims via `trim_shell_ws`.
     pub fn match_allowed(&self, command: &str) -> Option<&str> {
-        let needle = trim_ascii_ws(command);
+        let needle = trim_shell_ws(command);
         self.allowed
             .iter()
-            .find(|e| trim_ascii_ws(&e.command) == needle)
+            .find(|e| trim_shell_ws(&e.command) == needle)
             .map(|e| e.name.as_str())
     }
 
     /// All `dangerous[*]` entries whose glob pattern matches `command`.
     ///
-    /// ASCII-ONLY trim on both the command and each pattern (CodeRabbit R9 #A),
-    /// matching [`Self::match_allowed`] and the command-card gate — see that
-    /// method's note. A Unicode-whitespace-padded `dangerous[*].pattern` must
-    /// not silently trim to a bare glob.
+    /// SHELL-SIGNIFICANT-WHITESPACE trim on both the command and each pattern
+    /// (CodeRabbit R9 #A), matching [`Self::match_allowed`] and the command-card
+    /// gate — see that method's note. A Unicode-whitespace-padded
+    /// `dangerous[*].pattern` must not silently trim to a bare glob.
     pub fn match_dangerous(&self, command: &str) -> Vec<&DangerousEntry> {
-        let needle = trim_ascii_ws(command);
+        let needle = trim_shell_ws(command);
         self.dangerous
             .iter()
-            .filter(|e| glob_match(trim_ascii_ws(&e.pattern), needle))
+            .filter(|e| glob_match(trim_shell_ws(&e.pattern), needle))
             .collect()
     }
 
@@ -410,12 +417,13 @@ fn unknown_finding(command: &str) -> Finding {
             .to_string(),
         evidence: vec![Evidence::CommandPattern {
             pattern: "allowed[*].command (exact match)".to_string(),
-            // ASCII-only trim (CodeRabbit R12 #G): the reported `matched` value
-            // MUST be exactly what the ASCII-only `match_allowed`/`trim_ascii_ws`
-            // matcher saw. A Unicode `str::trim` here would strip non-ASCII
-            // whitespace (e.g. U+00A0) that the matcher KEPT, so the evidence
-            // would not reflect the bytes that actually (mis)matched.
-            matched: trim_ascii_ws(command).to_string(),
+            // Shell-significant-whitespace trim (CodeRabbit R12 #G): the reported
+            // `matched` value MUST be exactly what the `match_allowed`/
+            // `trim_shell_ws` matcher saw. A Unicode `str::trim` here would strip
+            // non-shell-significant whitespace (e.g. U+00A0) that the matcher
+            // KEPT, so the evidence would not reflect the bytes that actually
+            // (mis)matched.
+            matched: trim_shell_ws(command).to_string(),
         }],
         human_view: None,
         agent_view: None,
@@ -474,16 +482,17 @@ fn dangerous_finding(pattern: &str, command: &str, action: DangerousAction) -> F
             "The command matches the dangerous pattern '{}' declared under \
              `dangerous[]` in this repo's `.tirith/commands.yaml`. The repo has \
              explicitly flagged this shape to {action_word}.",
-            trim_ascii_ws(pattern)
+            trim_shell_ws(pattern)
         ),
-        // ASCII-only trim (CodeRabbit R12 #G): both the `pattern` and the
-        // `matched` command in the evidence MUST be exactly the strings the
-        // ASCII-only `match_dangerous`/`glob_match` matcher compared, so the
+        // Shell-significant-whitespace trim (CodeRabbit R12 #G): both the
+        // `pattern` and the `matched` command in the evidence MUST be exactly the
+        // strings the `match_dangerous`/`glob_match` matcher compared, so the
         // reported evidence reflects what actually matched (a Unicode `str::trim`
-        // would diverge on non-ASCII whitespace the matcher preserved).
+        // would diverge on the non-shell-significant whitespace the matcher
+        // preserved).
         evidence: vec![Evidence::CommandPattern {
-            pattern: trim_ascii_ws(pattern).to_string(),
-            matched: trim_ascii_ws(command).to_string(),
+            pattern: trim_shell_ws(pattern).to_string(),
+            matched: trim_shell_ws(command).to_string(),
         }],
         human_view: None,
         agent_view: None,
@@ -655,17 +664,21 @@ dangerous:
     action: block
 "#;
 
-/// Trim ONLY the ASCII whitespace a shell treats as a TOKEN SEPARATOR (space,
-/// tab, newline, CR), never the full Unicode `White_Space` set and never `\x0C`
-/// FORM FEED. Load-bearing for the manifest command/pattern comparison
-/// (CodeRabbit R9 #A, narrowed R13 #3): it MUST agree, byte-for-byte, with the
+/// Trim ONLY the shell-significant whitespace a shell treats as a TOKEN
+/// SEPARATOR (space, tab, newline, CR), never the full Unicode `White_Space`
+/// set and never `\x0C` FORM FEED. Load-bearing for the manifest
+/// command/pattern comparison (CodeRabbit R9 #A, narrowed R13 #3): it MUST
+/// agree, byte-for-byte, with the
 /// [`crate::command_card::Card::command_matches`] mismatch gate on which bytes
 /// count as surrounding whitespace, so it shares the SAME predicate
 /// (`command_card::is_shell_significant_ws`). `str::trim` would strip
-/// U+00A0 / U+2007 / etc., and `char::is_ascii_whitespace` would strip a form
-/// feed — either would let a padded manifest entry match a command the
-/// command-card gate would reject; the two must not disagree on whitespace.
-fn trim_ascii_ws(s: &str) -> &str {
+/// U+00A0 / U+2007 / etc., and `str::trim_ascii` / `char::is_ascii_whitespace`
+/// would strip a form feed — either would let a padded manifest entry match a
+/// command the command-card gate would reject; the two must not disagree on
+/// whitespace. The name deliberately does NOT say "ascii": this is the narrower
+/// shell-significant set, and a maintainer must not "simplify" it to
+/// `str::trim_ascii()` (which would reintroduce a form-feed match bypass).
+fn trim_shell_ws(s: &str) -> &str {
     s.trim_matches(crate::command_card::is_shell_significant_ws)
 }
 
@@ -770,14 +783,16 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_names_differing_only_by_ascii_whitespace_are_rejected() {
-        // CodeRabbit R20: the matchers compare ASCII-trimmed, so `"build"` and
-        // `"build "` are the SAME command at match time — dedup must use the same
-        // normalization and reject them as duplicates.
+    fn duplicate_names_differing_only_by_shell_whitespace_are_rejected() {
+        // CodeRabbit R20: the matchers compare shell-significant-whitespace-
+        // trimmed, so `"build"` and `"build "` are the SAME command at match
+        // time — dedup must use the same normalization and reject them as
+        // duplicates.
         let dup =
             "allowed:\n  - name: \"build\"\n    command: a\n  - name: \"build \"\n    command: b\n";
-        let err = CommandsManifest::from_yaml(dup)
-            .expect_err("names differing only by trailing ASCII whitespace must be duplicates");
+        let err = CommandsManifest::from_yaml(dup).expect_err(
+            "names differing only by trailing shell-significant whitespace must be duplicates",
+        );
         assert!(matches!(err, ManifestError::Parse(_)));
         // Same for dangerous[].pattern.
         let dup_pat =
@@ -842,10 +857,12 @@ mod tests {
     }
 
     #[test]
-    fn match_uses_ascii_only_whitespace_trim() {
-        // CodeRabbit R9 #A: manifest matching must trim ONLY ASCII whitespace,
-        // in lockstep with the ASCII-only command-card `command_matches` gate. A
-        // U+00A0 NO-BREAK SPACE is Unicode whitespace but NOT ASCII whitespace.
+    fn match_uses_shell_significant_whitespace_trim() {
+        // CodeRabbit R9 #A: manifest matching must trim ONLY shell-significant
+        // whitespace (space/tab/newline/CR — see `is_shell_significant_ws`), in
+        // lockstep with the command-card `command_matches` gate. A U+00A0
+        // NO-BREAK SPACE is Unicode whitespace but NOT shell-significant
+        // whitespace.
         let nbsp = '\u{00A0}';
 
         // (a) A manifest `allowed[]` entry padded with a NO-BREAK SPACE must NOT
@@ -858,7 +875,7 @@ mod tests {
         assert_eq!(
             padded_entry.match_allowed("npm run build"),
             None,
-            "a U+00A0-padded allowed entry must not match an ASCII-space command"
+            "a U+00A0-padded allowed entry must not match a space-padded command"
         );
         // And the reverse: a NBSP-padded command must not match a clean entry.
         let clean_entry = CommandsManifest::from_yaml(
@@ -870,11 +887,11 @@ mod tests {
             None,
             "a U+00A0-padded command must not match a clean allowed entry"
         );
-        // ASCII-space padding on EITHER side still trims equal (the legitimate case).
+        // Space padding on EITHER side still trims equal (the legitimate case).
         assert_eq!(
             clean_entry.match_allowed("  npm run build  "),
             Some("build"),
-            "ASCII whitespace must still trim equal"
+            "shell-significant whitespace must still trim equal"
         );
 
         // (b) Same contract for `dangerous[]` patterns: a NBSP-padded pattern
@@ -885,7 +902,7 @@ mod tests {
         .expect("parses");
         assert!(
             padded_pattern.match_dangerous("rm -rf /").is_empty(),
-            "a U+00A0-padded dangerous pattern must not match an ASCII-space command"
+            "a U+00A0-padded dangerous pattern must not match a space-padded command"
         );
         // The same pattern WITHOUT the NBSP matches (proves the padding is the
         // sole reason for the miss above, not an unrelated glob failure).
@@ -935,13 +952,13 @@ mod tests {
     }
 
     #[test]
-    fn finding_evidence_uses_ascii_only_trim() {
+    fn finding_evidence_uses_shell_significant_whitespace_trim() {
         // CodeRabbit R12 #G: the finding evidence `matched`/`pattern` strings must
-        // be ASCII-trimmed, in lockstep with the ASCII-only matcher — so the
-        // reported evidence is exactly what (mis)matched. A U+00A0 NO-BREAK SPACE
-        // is Unicode whitespace but NOT ASCII whitespace: it must SURVIVE in the
-        // evidence (a Unicode `str::trim` would have stripped it, diverging from
-        // the matcher which kept it).
+        // be trimmed of shell-significant whitespace, in lockstep with the
+        // matcher — so the reported evidence is exactly what (mis)matched. A
+        // U+00A0 NO-BREAK SPACE is Unicode whitespace but NOT shell-significant
+        // whitespace: it must SURVIVE in the evidence (a Unicode `str::trim`
+        // would have stripped it, diverging from the matcher which kept it).
         let nbsp = '\u{a0}';
 
         // (a) Uncatalogued-command Info note: the command keeps its NBSP padding.
@@ -953,7 +970,7 @@ mod tests {
             Evidence::CommandPattern { matched, .. } => {
                 assert!(
                     matched.ends_with(nbsp),
-                    "ASCII trim must preserve the trailing U+00A0 in evidence, got {matched:?}"
+                    "shell-significant-whitespace trim must preserve the trailing U+00A0 in evidence, got {matched:?}"
                 );
             }
             other => panic!("expected CommandPattern evidence, got {other:?}"),
@@ -971,11 +988,11 @@ mod tests {
             Evidence::CommandPattern { pattern, matched } => {
                 assert!(
                     pattern.ends_with(nbsp),
-                    "ASCII trim must preserve the trailing U+00A0 in the pattern, got {pattern:?}"
+                    "shell-significant-whitespace trim must preserve the trailing U+00A0 in the pattern, got {pattern:?}"
                 );
                 assert!(
                     matched.ends_with(nbsp),
-                    "ASCII trim must preserve the trailing U+00A0 in matched, got {matched:?}"
+                    "shell-significant-whitespace trim must preserve the trailing U+00A0 in matched, got {matched:?}"
                 );
             }
             other => panic!("expected CommandPattern evidence, got {other:?}"),

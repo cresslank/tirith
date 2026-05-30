@@ -332,7 +332,13 @@ pub fn run(name: &str, json: bool) -> i32 {
                 verdict.findings.len()
             );
             let mut input = String::new();
-            std::io::stdin().read_line(&mut input).ok();
+            // Surface (don't swallow) a stdin read error for diagnostic parity
+            // with the shared `confirm()` gate. The fail direction is SAFE: on
+            // error `input` stays empty, so the match below fails and we abort —
+            // an unreadable prompt must never be treated as a "yes".
+            if let Err(e) = std::io::stdin().read_line(&mut input) {
+                eprintln!("tirith commands run: could not read confirmation input: {e}");
+            }
             if !matches!(input.trim(), "y" | "Y" | "yes" | "Yes") {
                 if json {
                     // Declined: ONE object recording the warn verdict + that we

@@ -8848,6 +8848,246 @@ fn command_card_create_sign_verify_check_roundtrip() {
     assert_eq!(cjson["action"], "block");
 }
 
+/// Regression: a `--card` flag must be the SOLE reason analysis reaches tier-3.
+/// The `command_card_create_sign_verify_check_roundtrip` sibling uses a command
+/// (`curl … | sh`) that independently trips the tier-1 fast gate, so it does NOT
+/// prove the `card_triggered` force-past (engine.rs) in isolation. Here the
+/// signed card's `command` is tier-1-CLEAN (`./local-bin --flag` — no URL, no
+/// pipe, no secret, no invisible/bidi bytes), so WITHOUT the force-past the
+/// engine would fast-exit and never run the card check. Observing
+/// `command_card_verified` proves `--card` alone pulled analysis past tier-1.
+/// This is the dotfile-overwrite tier-1-gating bug class (see CLAUDE.md).
+#[cfg(unix)]
+#[test]
+fn check_card_flag_alone_forces_past_tier1_on_clean_command() {
+    use tirith_core::command_card;
+
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+
+    // A tier-1-clean command: no URL/pipe/secret/invisible bytes. On its own it
+    // fast-exits at the tier-1 gate (asserted by the no-card control below).
+    let command = "./local-bin --flag";
+
+    let create = tirith()
+        .args(["command-card", "create", "--command", command])
+        .env("HOME", home.path())
+        .output()
+        .expect("create");
+    assert_eq!(create.status.code(), Some(0), "create exits 0");
+    let card_path = work.path().join("clean-card.json");
+    fs::write(&card_path, &create.stdout).unwrap();
+
+    let (secret, pubkey) = command_card::generate_keypair().unwrap();
+    let key_path = work.path().join("ed25519-priv.bin");
+    fs::write(&key_path, secret).unwrap();
+
+    let sign = tirith()
+        .args([
+            "command-card",
+            "sign",
+            "--key",
+            key_path.to_str().unwrap(),
+            card_path.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .output()
+        .expect("sign");
+    assert_eq!(sign.status.code(), Some(0), "sign exits 0");
+
+    // Trust the signer: drop <key_id>.pub into BOTH possible config locations
+    // under the temp HOME (Linux XDG fallback and macOS Apple) for portability.
+    let key_id = command_card::key_id_for_pubkey(&pubkey);
+    for sub in [
+        ".config/tirith/trusted-card-keys",
+        "Library/Application Support/tirith/trusted-card-keys",
+    ] {
+        let dir = home.path().join(sub);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{key_id}.pub")), pubkey).unwrap();
+    }
+
+    // Run `check` inside a repo whose policy sets paranoia: 4, so the Info-level
+    // `command_card_verified` finding is surfaced in JSON output (Info findings
+    // are filtered at the default paranoia, like every other Info rule).
+    let project = work.path().join("project");
+    let policy_dir = project.join(".tirith");
+    fs::create_dir_all(&policy_dir).unwrap();
+    fs::create_dir_all(project.join(".git")).unwrap();
+    fs::write(policy_dir.join("policy.yaml"), "paranoia: 4\n").unwrap();
+
+    // CONTROL: the SAME clean command WITHOUT `--card` must fast-exit at tier-1 —
+    // allow, zero findings. This proves the command itself carries no tier-1
+    // signal, so the `command_card_verified` below can only come from the card.
+    let control = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--json",
+            "--",
+            command,
+        ])
+        .current_dir(&project)
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env("TIRITH_OFFLINE", "1")
+        .output()
+        .expect("check (no card)");
+    let control_json: serde_json::Value = serde_json::from_slice(&control.stdout).unwrap();
+    assert_eq!(
+        control_json["action"], "allow",
+        "the clean command alone must allow (tier-1 fast-exit); got {control_json}"
+    );
+    assert!(
+        control_json["findings"].as_array().unwrap().is_empty(),
+        "the clean command alone must produce NO findings; got {control_json}"
+    );
+
+    // WITH `--card`: the verified attestation surfaces, proving the flag alone
+    // forced analysis past the tier-1 fast gate.
+    let check = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--json",
+            "--card",
+            card_path.to_str().unwrap(),
+            "--",
+            command,
+        ])
+        .current_dir(&project)
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env("TIRITH_OFFLINE", "1")
+        .output()
+        .expect("check --card");
+    let cjson: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    let rule_ids: Vec<String> = cjson["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["rule_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        rule_ids.iter().any(|r| r == "command_card_verified"),
+        "`--card` alone must force past tier-1 and emit command_card_verified on \
+         a tier-1-clean command; got {rule_ids:?}"
+    );
+}
+
+/// Regression: a registered canary token in an otherwise-tier-1-CLEAN command
+/// must reach tier-3 and fire `CanaryTokenTouched` (High). This pins the
+/// `canary_triggered` tier-1 force-past (engine.rs, gated on a non-empty canary
+/// store) end-to-end through the CLI — the canary sibling of the card/manifest
+/// force-past tests, and the dotfile-overwrite tier-1-gating bug class (see
+/// CLAUDE.md). We use an `aws-like` canary (`AKIA00CANARY…`): the `00` after
+/// `AKIA` breaks the AWS-access-key regex (`[A-Z2-7]{16}`), so the token carries
+/// NO independent tier-1 credential signal — the ONLY thing that pulls analysis
+/// past the fast gate is the populated canary store. Asserts FINDINGS (not the
+/// audit log), so it is cross-platform: the canary store lives at
+/// `state_dir()/canaries.jsonl`, and `state_dir()` honors `XDG_STATE_HOME` on
+/// every platform.
+#[test]
+fn check_registered_canary_token_forces_past_tier1() {
+    // Isolate the canary store (XDG_STATE_HOME, used by `state_dir()` on every
+    // platform). Also isolate the data/config dirs so the audit-log write that a
+    // canary hit triggers never touches the real home (XDG_DATA_HOME on Unix,
+    // %APPDATA%/%LOCALAPPDATA% on Windows).
+    let state = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+
+    // Create an `aws-like` canary in the isolated store and capture its token.
+    let create = tirith()
+        .args(["canary", "create", "aws-like", "--json"])
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("APPDATA", data.path())
+        .env("LOCALAPPDATA", data.path())
+        .output()
+        .expect("canary create");
+    assert_eq!(create.status.code(), Some(0), "canary create exits 0");
+    let centry: serde_json::Value = serde_json::from_slice(&create.stdout).unwrap();
+    let token = centry["token"].as_str().expect("token in create --json");
+    assert!(
+        token.starts_with("AKIA00CANARY"),
+        "aws-like canary token shape changed; got {token}"
+    );
+
+    // A command that embeds the token but is otherwise tier-1-clean: no URL,
+    // pipe, or other credential. WITHOUT the populated store this fast-exits at
+    // tier-1 (the token alone carries no tier-1 signal — see the doc above).
+    let command = format!("echo planted {token}");
+
+    // CONTROL: the same command against a DIFFERENT, EMPTY store must fast-exit —
+    // allow, zero findings. This proves the token itself carries no tier-1
+    // signal, so the canary finding below can only come from the populated store.
+    let empty_state = tempfile::tempdir().unwrap();
+    let control = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--json",
+            "--",
+            &command,
+        ])
+        .env("XDG_STATE_HOME", empty_state.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("APPDATA", data.path())
+        .env("LOCALAPPDATA", data.path())
+        .output()
+        .expect("check (empty store)");
+    let control_json: serde_json::Value = serde_json::from_slice(&control.stdout).unwrap();
+    assert_eq!(
+        control_json["action"], "allow",
+        "the token in a clean command with an EMPTY store must allow (tier-1 \
+         fast-exit); got {control_json}"
+    );
+    assert!(
+        control_json["findings"].as_array().unwrap().is_empty(),
+        "the token alone must produce NO findings with an empty store; got {control_json}"
+    );
+
+    // WITH the populated store: the canary force-past fires and the token is
+    // detected at tier-3 → `canary_token_touched` (High).
+    let check = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--json",
+            "--",
+            &command,
+        ])
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("APPDATA", data.path())
+        .env("LOCALAPPDATA", data.path())
+        .output()
+        .expect("check (populated store)");
+    let cjson: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    let canary = cjson["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["rule_id"] == "canary_token_touched")
+        .unwrap_or_else(|| panic!("expected canary_token_touched finding; got {cjson}"));
+    assert_eq!(
+        canary["severity"], "HIGH",
+        "a touched canary must be High; got {canary}"
+    );
+}
+
 /// CodeRabbit R7 #4: `command-card create --expires` must STORE the trimmed
 /// date. The validation used `.trim()` but the card stored the raw value, so a
 /// padded `--expires "2026-12-01 "` would pass `create` yet later fail the
