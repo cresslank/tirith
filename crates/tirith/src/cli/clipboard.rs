@@ -662,9 +662,7 @@ pub fn watch(json: bool) -> i32 {
     use std::time::SystemTime;
 
     let Some(source_path) = tirith_core::clipboard::source_file_path() else {
-        eprintln!(
-            "tirith clipboard watch: cannot resolve the tirith state directory (no $HOME / $XDG_STATE_HOME)"
-        );
+        eprintln!("tirith clipboard watch: cannot resolve the tirith state directory");
         return 1;
     };
 
