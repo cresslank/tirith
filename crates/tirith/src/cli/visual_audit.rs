@@ -446,7 +446,7 @@ fn finish(result: VisualAuditResult, json: bool, persist: bool) -> i32 {
 /// re-run replaces the prior result cleanly.
 fn persist_result(result: &VisualAuditResult) -> Result<std::path::PathBuf, String> {
     let config = tirith_core::policy::config_dir()
-        .ok_or_else(|| "no config directory ($HOME / $XDG_CONFIG_HOME unset)".to_string())?;
+        .ok_or_else(|| "could not resolve the tirith config directory".to_string())?;
     std::fs::create_dir_all(&config).map_err(|e| format!("create {}: {e}", config.display()))?;
     let path = config.join("visual-audit-result.json");
     let bytes = serde_json::to_vec_pretty(result).map_err(|e| format!("serialize: {e}"))?;

@@ -253,10 +253,72 @@ fn resolve_source_attribution(
         // record / clipboard replaced). No attribution.
         return serde_json::Value::Null;
     }
+    // The provenance fields originate from an arbitrary web page via the
+    // (untrusted) browser extension, so they are sanitized before being
+    // surfaced into `--json` or printed to the terminal: the URL's
+    // query/fragment/userinfo (which can carry signed-URL tokens, session ids,
+    // or email identifiers) are dropped, terminal control sequences are
+    // stripped (tirith must not itself emit the injection it detects), and both
+    // fields are length-capped. Both the human stderr path and the JSON path
+    // read these sanitized values, so no raw `source_url`/`source_title` leaks.
     serde_json::json!({
-        "source_url": record.source_url,
-        "source_title": record.source_title,
+        "source_url": sanitize_source_url(&record.source_url),
+        "source_title": sanitize_provenance_text(&record.source_title),
     })
+}
+
+/// Max characters of provenance text surfaced into output. Bounds how much of a
+/// (potentially sensitive) page title or path can leak into logs / JSON.
+const PROVENANCE_MAX_CHARS: usize = 256;
+
+/// Neutralize one untrusted provenance string before display/logging. The
+/// `source_url` / `source_title` originate from an arbitrary web page (via the
+/// browser extension), so they run through tirith's own output sanitizer — the
+/// same `output_filter` the MCP gateway applies to error fields — which strips
+/// ANSI/OSC/APC/DCS escape sequences, bare CR, other C0 controls, DEL, and
+/// zero-width characters (tirith must never itself emit the terminal injection
+/// it exists to detect). The tabs/newlines that sanitizer legitimately keeps
+/// are then flattened to spaces for a tidy single line, and the result is
+/// length-capped.
+fn sanitize_provenance_text(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    tirith_core::mcp::output_filter::sanitize_text_into(s.as_bytes(), &mut out);
+    let cleaned = String::from_utf8(out).unwrap_or_default();
+    let flattened: String = cleaned
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    cap_chars(flattened.trim(), PROVENANCE_MAX_CHARS)
+}
+
+/// Redact the high-risk parts of a source URL — the query string, fragment, and
+/// any embedded `user:pass@` userinfo can carry signed-URL tokens, session ids,
+/// or email identifiers — while keeping the meaningful `scheme://host/path`
+/// provenance, then sanitize + cap it like any other provenance text. A value
+/// that does not parse as a URL is still sanitized verbatim (we never emit raw
+/// untrusted bytes) but is not structurally redacted.
+fn sanitize_source_url(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut parsed) => {
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            sanitize_provenance_text(parsed.as_str())
+        }
+        Err(_) => sanitize_provenance_text(url),
+    }
+}
+
+/// Truncate to at most `max` characters (not bytes), appending `…` when cut.
+fn cap_chars(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let mut t: String = s.chars().take(max).collect();
+        t.push('…');
+        t
+    } else {
+        s.to_string()
+    }
 }
 
 /// Write the paste verdict as JSON, optionally splicing a top-level
@@ -298,4 +360,96 @@ fn write_paste_json(
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer(&mut stdout, &value)?;
     writeln!(stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tirith_core::clipboard::{content_sha256_hex, ClipboardSourceRecord};
+
+    fn record_for(payload: &[u8], source_url: &str, source_title: &str) -> ClipboardSourceRecord {
+        ClipboardSourceRecord {
+            updated_at: "2026-05-30T00:00:00Z".to_string(),
+            // matching hash so attribution proceeds (matches_bytes == true)
+            content_sha256: content_sha256_hex(payload),
+            source_url: source_url.to_string(),
+            source_title: source_title.to_string(),
+            hidden_text_detected: false,
+        }
+    }
+
+    // A recorded source whose hash does NOT match the paste yields no attribution
+    // (the displayed source must stay in lockstep with the rule's verdict).
+    #[test]
+    fn no_attribution_when_hash_mismatches() {
+        let rec = record_for(b"the-real-bytes", "https://docs.example.com/x", "X");
+        let v = resolve_source_attribution(b"DIFFERENT-bytes", Some(&rec));
+        assert_eq!(v, serde_json::Value::Null);
+    }
+
+    // Major (CodeRabbit): provenance comes from an untrusted page, so the URL's
+    // token-bearing query/fragment/userinfo must be stripped and any terminal
+    // control sequence in the title neutralized before either output path emits it.
+    #[test]
+    fn provenance_is_sanitized_before_emission() {
+        let payload = b"install-me";
+        let rec = record_for(
+            payload,
+            "https://user:pw@docs.example.com/install?token=SECRET123&sig=ABC#section",
+            // ANSI color escape + BEL + an embedded newline, injected via the page title
+            "Install\u{1b}[31mGuide\u{07}\nline2",
+        );
+        let v = resolve_source_attribution(payload, Some(&rec));
+        let url = v.get("source_url").and_then(|u| u.as_str()).unwrap();
+        let title = v.get("source_title").and_then(|t| t.as_str()).unwrap();
+
+        // URL: query, fragment, and userinfo dropped; meaningful path kept.
+        assert_eq!(url, "https://docs.example.com/install");
+        assert!(
+            !url.contains("SECRET123"),
+            "signed token must not leak: {url:?}"
+        );
+        assert!(!url.contains("token=") && !url.contains("sig="));
+        assert!(!url.contains('#') && !url.contains("user:pw"));
+
+        // Title: ANSI/BEL control sequences stripped, newline flattened, text kept.
+        assert!(
+            !title.contains('\u{1b}'),
+            "ANSI escape must be stripped: {title:?}"
+        );
+        assert!(!title.contains('\u{07}'), "BEL must be stripped: {title:?}");
+        assert!(
+            !title.contains('\n'),
+            "newline must be flattened: {title:?}"
+        );
+        assert!(title.contains("Install") && title.contains("Guide"));
+    }
+
+    // Long titles are length-capped so a sensitive page title can't dump
+    // unbounded text into logs/JSON.
+    #[test]
+    fn provenance_title_is_length_capped() {
+        let payload = b"x";
+        let rec = record_for(
+            payload,
+            "https://example.com/",
+            &"A".repeat(PROVENANCE_MAX_CHARS + 50),
+        );
+        let v = resolve_source_attribution(payload, Some(&rec));
+        let title = v.get("source_title").and_then(|t| t.as_str()).unwrap();
+        // capped to PROVENANCE_MAX_CHARS plus the single ellipsis marker
+        assert!(title.chars().count() <= PROVENANCE_MAX_CHARS + 1);
+        assert!(
+            title.ends_with('…'),
+            "truncation marker expected: {title:?}"
+        );
+    }
+
+    // A non-URL provenance value is still sanitized (never emitted raw) even
+    // though it can't be structurally redacted.
+    #[test]
+    fn non_url_source_is_still_sanitized() {
+        let got = sanitize_source_url("not a url\u{1b}[2J\u{07}");
+        assert!(!got.contains('\u{1b}') && !got.contains('\u{07}'));
+    }
 }
