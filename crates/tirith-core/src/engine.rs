@@ -2012,7 +2012,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     // tri-state closes). Paste context only — the rule is paste-specific. Mirrors
     // `canary_triggered`.
     let paste_source_triggered = ctx.scan_context == ScanContext::Paste
-        && match ctx.clipboard_source {
+        && match &ctx.clipboard_source {
             crate::clipboard::ClipboardSourceState::Loaded(_) => true,
             crate::clipboard::ClipboardSourceState::Unread => {
                 crate::clipboard::source_file_nonempty()

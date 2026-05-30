@@ -659,7 +659,6 @@ pub fn daemon_foreground(json: bool) -> i32 {
 /// Never returns under normal operation (Ctrl-C terminates). In `--json` mode
 /// each attribution is one line of JSON on stdout.
 pub fn watch(json: bool) -> i32 {
-    use sha2::{Digest, Sha256};
     use std::time::SystemTime;
 
     let Some(source_path) = tirith_core::clipboard::source_file_path() else {
@@ -735,12 +734,7 @@ pub fn watch(json: bool) -> i32 {
         };
 
         // Attribute only when the clipboard content matches the recorded hash.
-        let digest = Sha256::digest(clip.as_bytes());
-        let mut actual = String::with_capacity(digest.len() * 2);
-        for b in digest {
-            use std::fmt::Write as _;
-            let _ = write!(actual, "{b:02x}");
-        }
+        let actual = sha256_hex(clip.as_bytes());
         last_mtime = Some(mtime);
         if !actual.eq_ignore_ascii_case(record.content_sha256.trim()) {
             // The record describes a different clipboard payload (a race, or the

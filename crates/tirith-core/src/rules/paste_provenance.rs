@@ -251,9 +251,14 @@ fn hosts_match(a: &str, b: &str) -> bool {
 /// covers `objects.github.com`, but NOT a lookalike `evilgithub.com`). Public so
 /// the policy doc-comment can point readers here.
 pub fn host_in_allowed_domains(host: &str, allowed: &[String]) -> bool {
-    let host = host.trim().trim_start_matches("www.").to_ascii_lowercase();
+    // Lowercase BEFORE stripping `www.` (CodeRabbit R5): an uppercase `WWW.`
+    // (in the host OR an allowlist entry) would otherwise escape the
+    // case-sensitive strip and spuriously fail to match.
+    let host = host.trim().to_ascii_lowercase();
+    let host = host.trim_start_matches("www.");
     allowed.iter().any(|d| {
-        let d = d.trim().trim_start_matches("www.").to_ascii_lowercase();
+        let d = d.trim().to_ascii_lowercase();
+        let d = d.trim_start_matches("www.");
         if d.is_empty() {
             return false;
         }
@@ -757,6 +762,13 @@ mod tests {
             "github.com.evil.example",
             &allowed
         ));
+        // CodeRabbit R5: normalize case BEFORE stripping `www.` — an uppercase
+        // `WWW.` in the host OR an allowlist entry must still match.
+        assert!(host_in_allowed_domains("WWW.GITHUB.COM", &allowed));
+        assert!(host_in_allowed_domains("GitHub.com", &allowed));
+        let allowed_www = vec!["WWW.GitHub.com".to_string()];
+        assert!(host_in_allowed_domains("github.com", &allowed_www));
+        assert!(host_in_allowed_domains("objects.github.com", &allowed_www));
     }
 
     #[test]
