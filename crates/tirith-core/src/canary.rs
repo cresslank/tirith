@@ -477,6 +477,14 @@ fn append_entry(store: &Path, entry: &CanaryEntry) -> std::io::Result<()> {
     // ever changes; `sync_all()` is the load-bearing barrier.
     file.flush()?;
     file.sync_all()?;
+    // `sync_all` persists the file's contents + inode, but NOT the parent
+    // directory entry that names it. On a FIRST-TIME create a crash could
+    // otherwise lose the link to `canaries.jsonl` even though `create_at`
+    // returned Ok — the same "registered canary that never fires" failure the
+    // content fsync above guards against. Fsync the parent dir too (best-effort,
+    // logged; a no-op-ish cost on the rare subsequent appends). Mirrors the
+    // durable-publish pattern used by the card/incident writers.
+    crate::util::fsync_parent_dir_logged(store, "canary store");
     Ok(())
 }
 
@@ -727,9 +735,21 @@ pub fn rotate_at(store: &Path, id: &str) -> std::io::Result<Option<CanaryEntry>>
             // preserved unchanged (ids are unique in practice — a create rejects
             // a dup — but never silently drop one if the invariant is violated).
             StoreLine::Parsed(mut entry) if entry.id == id && updated.is_none() => {
-                // Default to AwsLike only if a corrupt entry has an unknown kind
-                // string; a well-formed entry round-trips its original kind.
-                let kind = CanaryKind::parse(&entry.kind).unwrap_or(CanaryKind::AwsLike);
+                // FAIL SAFE on an unknown `kind` (CodeRabbit R13 #A). `kind` is
+                // stored as a raw string for forward-compatible round-tripping, so
+                // an entry written by a NEWER binary (a future kind this build does
+                // not know) parses as valid JSON but `CanaryKind::parse` returns
+                // None. Defaulting to AwsLike would mint an AWS-shaped token while
+                // leaving the original `kind` string in place — corrupting the
+                // newer entry. Abort the rotate instead (the store is not rewritten
+                // because we return before `rewrite_store_lines`), mirroring the
+                // forward-compat preservation of `StoreLine::Unparseable`.
+                let kind = CanaryKind::parse(&entry.kind).ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "cannot rotate canary `{}`: unknown kind `{}` (written by a newer tirith?)",
+                        entry.id, entry.kind
+                    ))
+                })?;
                 entry.token = generate_token(kind);
                 entry.created_at = chrono::Utc::now().to_rfc3339();
                 updated = Some(entry.clone());
@@ -1422,6 +1442,45 @@ mod tests {
         // The rotated entry is still readable and the new token fires.
         assert_eq!(list_at(&store).len(), 1);
         assert_eq!(detect_at(&store, &rotated.token).len(), 1);
+    }
+
+    #[test]
+    fn rotate_unknown_kind_fails_safe_without_corrupting() {
+        // CodeRabbit R13 #A: an entry written by a NEWER tirith with a `kind` this
+        // build doesn't know still deserializes as a valid `CanaryEntry`
+        // (StoreLine::Parsed) — it is NOT an unparseable line. Rotating it must
+        // NOT silently mint an AWS-shaped token while leaving the unknown `kind`
+        // in place (corruption). It must fail safe and leave the store untouched.
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        // A fully-valid CanaryEntry whose `kind` is a future/unknown string.
+        let future = r#"{"id":"future1","token":"sk_canary_future_abc","kind":"slack-like","created_at":"2026-01-01T00:00:00Z","callback_url":null}"#;
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&store).unwrap();
+            writeln!(f, "{future}").unwrap();
+            invalidate_cache();
+        }
+        // It parses (so rotate reaches the kind check), confirming the precondition.
+        assert_eq!(
+            list_at(&store).len(),
+            1,
+            "future-kind entry parses as valid"
+        );
+
+        let before = std::fs::read_to_string(&store).unwrap();
+        let err = rotate_at(&store, "future1").expect_err("unknown kind must fail safe");
+        assert!(
+            err.to_string().contains("unknown kind"),
+            "error should name the unknown kind, got: {err}"
+        );
+        // The store is byte-for-byte unchanged: no token rewrite, no corruption.
+        let after = std::fs::read_to_string(&store).unwrap();
+        assert_eq!(before, after, "a failed rotate must not rewrite the store");
+        assert!(
+            after.contains("sk_canary_future_abc") && after.contains("slack-like"),
+            "the original future-kind entry survives verbatim, got:\n{after}"
+        );
     }
 
     #[test]

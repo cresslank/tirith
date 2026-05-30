@@ -530,7 +530,10 @@ fn init_with_template(force: bool, minimal: bool, template: Option<PolicyTemplat
     // Write the policy ATOMICALLY (temp-in-same-dir → fsync → rename → parent
     // fsync): with `--force` this overwrites an existing policy, and a crash
     // mid-write must never lose the prior policy or leave a half-written one.
-    if let Err(e) = super::write_file_atomic(&policy_path, template_body.as_bytes()) {
+    // Without `--force`, `overwrite=false` makes the publish no-clobber, so a
+    // policy created in the race window after the `exists()` check above is NOT
+    // silently clobbered (it surfaces as a write error instead).
+    if let Err(e) = super::write_file_atomic(&policy_path, template_body.as_bytes(), force) {
         eprintln!(
             "tirith policy init: cannot write {}: {e}",
             policy_path.display()

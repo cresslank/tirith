@@ -148,12 +148,12 @@ mod write_json_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("commands.yaml");
 
-        super::write_file_atomic(&path, b"first: true\n").unwrap();
+        super::write_file_atomic(&path, b"first: true\n", true).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "first: true\n");
 
         // Overwrite with SHORTER content: a non-atomic truncate-in-place could
         // leave trailing bytes of the old content; the rename fully replaces it.
-        super::write_file_atomic(&path, b"x\n").unwrap();
+        super::write_file_atomic(&path, b"x\n", true).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "x\n");
 
         // The only entry in the directory is the target file — the temp file was
@@ -190,7 +190,7 @@ mod write_json_tests {
         symlink(&target, &link).unwrap();
 
         // Write through the symlink.
-        super::write_file_atomic(&link, b"new: true\n").unwrap();
+        super::write_file_atomic(&link, b"new: true\n", true).unwrap();
 
         // The TARGET now holds the new content...
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new: true\n");
@@ -240,7 +240,7 @@ mod write_json_tests {
         let link = dir.path().join("config.yaml");
         symlink(&missing_target, &link).unwrap();
 
-        super::write_file_atomic(&link, b"data: 1\n").unwrap();
+        super::write_file_atomic(&link, b"data: 1\n", true).unwrap();
 
         // The link path now holds the content as a REGULAR file (fallback path).
         assert_eq!(std::fs::read_to_string(&link).unwrap(), "data: 1\n");
@@ -251,6 +251,41 @@ mod write_json_tests {
                 .is_file(),
             "a dangling symlink falls back to a regular-file write at the link path"
         );
+    }
+
+    /// CodeRabbit R13 #K: `overwrite=false` must NOT clobber an existing file —
+    /// it closes the TOCTOU between an `init` caller's `exists()` pre-check and the
+    /// publish. A file created in that window survives untouched and the write
+    /// reports `AlreadyExists`; `overwrite=true` still replaces it.
+    #[test]
+    fn write_file_atomic_no_clobber_preserves_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commands.yaml");
+
+        // No-clobber create when absent: succeeds.
+        super::write_file_atomic(&path, b"original\n", false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original\n");
+
+        // No-clobber write when the file now EXISTS: fails AlreadyExists, content
+        // untouched (simulates the racing-create the exists() check cannot prevent).
+        let err = super::write_file_atomic(&path, b"clobbered\n", false)
+            .expect_err("no-clobber write over an existing file must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "original\n",
+            "a failed no-clobber write must leave the existing file untouched"
+        );
+
+        // overwrite=true still replaces it, and leaves no temp file behind.
+        super::write_file_atomic(&path, b"forced\n", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "forced\n");
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(entries.len(), 1, "no temp file left behind: {entries:?}");
     }
 }
 
@@ -276,7 +311,20 @@ mod write_json_tests {
 /// file is created in the RESOLVED target's directory so the rename stays atomic
 /// (same filesystem). A non-symlink, a dangling symlink, or an unresolvable
 /// target falls back to renaming onto `path` as before.
-pub(crate) fn write_file_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+///
+/// `overwrite` (CodeRabbit R13 #K): `true` publishes with `persist` (replaces an
+/// existing `dest` — for full-file rewrites like `output wrap` and `--force`
+/// inits). `false` publishes with `persist_noclobber`, which fails atomically
+/// with `AlreadyExists` if `dest` already exists. The no-clobber mode closes the
+/// TOCTOU between an `init` caller's `exists()` pre-check and this publish: a file
+/// created in that window is no longer silently clobbered when `--force` was not
+/// passed (the operator's "don't overwrite" intent is enforced atomically, not
+/// just advisorily).
+pub(crate) fn write_file_atomic(
+    path: &std::path::Path,
+    contents: &[u8],
+    overwrite: bool,
+) -> std::io::Result<()> {
     // Resolve a symlinked destination to its real target so we write THROUGH the
     // link rather than replacing it; non-symlinks resolve to themselves.
     let dest = resolve_atomic_dest(path);
@@ -295,8 +343,15 @@ pub(crate) fn write_file_atomic(path: &std::path::Path, contents: &[u8]) -> std:
     // contents, never a truncated file.
     tmp.flush()?;
     tmp.as_file().sync_all()?;
-    tmp.persist(&dest).map_err(|e| e.error)?;
-    // `persist()` renames the temp over `dest` but does not fsync the containing
+    // Publish atomically. `overwrite` renames over an existing `dest`; no-clobber
+    // uses `persist_noclobber`, which fails with `AlreadyExists` rather than
+    // replacing a file that appeared after the caller's `exists()` check.
+    if overwrite {
+        tmp.persist(&dest).map_err(|e| e.error)?;
+    } else {
+        tmp.persist_noclobber(&dest).map_err(|e| e.error)?;
+    }
+    // The persist renames the temp over `dest` but does not fsync the containing
     // directory. fsync the parent so the new name→inode entry survives a crash.
     // The persist already succeeded, so a dir-fsync failure is LOGGED, not
     // propagated (R13 #5). Best-effort, no-op on non-Unix (no directory fsync).

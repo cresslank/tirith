@@ -162,11 +162,13 @@ fn cap_reason(reason: String) -> String {
 }
 
 impl IncidentState {
-    /// Construct fresh incident state anchored at `SystemTime::now()`. The
-    /// `reason` is capped to [`MAX_REASON_BYTES`] (CodeRabbit R16 #1) so the
-    /// serialized flag body can never exceed [`FLAG_READ_CAP`] — i.e. a flag
-    /// written by [`start_at`] always reads back as [`FlagRead::Valid`], never
-    /// `Corrupt`.
+    /// Construct fresh incident state anchored at `SystemTime::now()`. BOTH
+    /// env-influenced fields are bounded — `reason` to [`MAX_REASON_BYTES`]
+    /// (CodeRabbit R16 #1) and `started_by` to [`MAX_STARTED_BY_BYTES`] (R13 #D,
+    /// capped inside [`current_user`]) — so the serialized flag body can never
+    /// exceed [`FLAG_READ_CAP`]. A flag written by [`start_at`] therefore always
+    /// reads back as [`FlagRead::Valid`], never `Corrupt`, regardless of how large
+    /// `$USER`/`$LOGNAME` or the `--reason` argument were.
     pub fn now(reason: impl Into<String>) -> Self {
         Self {
             started_at: unix_now(),
@@ -592,8 +594,20 @@ static CACHE: Mutex<Option<CacheState>> = Mutex::new(None);
 
 const CACHE_TTL: Duration = Duration::from_secs(5);
 
+/// Cache-invalidation stat for the flag path. Returns `(present, mtime_nanos)`.
+///
+/// FAIL-SAFE + symlink-aware (CodeRabbit R13 #E). Two deliberate choices keep the
+/// 5s cache from masking the Corrupt→active path:
+///   * `symlink_metadata` (lstat) — does NOT follow symlinks, so a dangling
+///     symlink planted at the flag path lstat-succeeds as a present (link) entry
+///     rather than erroring like `metadata` would. read_flag_at then rejects the
+///     non-regular file as `Corrupt` → fail-safe active.
+///   * Only a genuine `NotFound` maps to "absent" `(false, 0)`. Every OTHER error
+///     (permission, ELOOP, I/O) maps to present `(true, 0)`, so it cannot be
+///     mistaken for the cached "absent" state and silently keep returning `None`;
+///     it forces a re-read, which surfaces the file as Corrupt → active.
 fn mtime_nanos(path: &Path) -> (bool, u128) {
-    match std::fs::metadata(path) {
+    match std::fs::symlink_metadata(path) {
         Ok(m) => {
             let nanos = m
                 .modified()
@@ -603,7 +617,10 @@ fn mtime_nanos(path: &Path) -> (bool, u128) {
                 .unwrap_or(0);
             (true, nanos)
         }
-        Err(_) => (false, 0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, 0),
+        // Present but unstattable (dangling symlink target, permission, I/O): treat
+        // as present-and-changed so the cache re-reads and fails safe.
+        Err(_) => (true, 0),
     }
 }
 
@@ -691,15 +708,39 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Upper bound on the `started_by` label (CodeRabbit R13 #D). Real usernames are
+/// short; this is a generous cap that keeps the env-derived label from inflating
+/// the serialized flag body past [`FLAG_READ_CAP`] (which would make the flag read
+/// back as `Corrupt`). It is the `started_by` analogue of [`MAX_REASON_BYTES`], so
+/// the body-size invariant in [`IncidentState::now`] holds for EVERY field, not
+/// just `reason`.
+const MAX_STARTED_BY_BYTES: usize = 256;
+
+/// Cap `label` to at most [`MAX_STARTED_BY_BYTES`] bytes on a UTF-8 char boundary
+/// — the `started_by` analogue of [`cap_reason`]. Unlike `reason` there is no
+/// truncation marker: `started_by` is advisory metadata, and a label this long is
+/// already pathological. Keeping it bounded is what lets [`IncidentState::now`]
+/// promise the serialized body never exceeds [`FLAG_READ_CAP`].
+fn cap_started_by(label: String) -> String {
+    if label.len() <= MAX_STARTED_BY_BYTES {
+        label
+    } else {
+        crate::util::truncate_bytes(&label, MAX_STARTED_BY_BYTES)
+    }
+}
+
 /// Best-effort current-user label for `started_by`. Never fails — falls back to
-/// `"unknown"`. Advisory metadata only.
+/// `"unknown"`. Advisory metadata only. Capped via [`cap_started_by`]:
+/// `$USER`/`$LOGNAME`/`$USERNAME` come straight from the environment and an
+/// oversized one must not be able to push the flag body past [`FLAG_READ_CAP`].
 fn current_user() -> String {
-    std::env::var("USER")
+    let raw = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .or_else(|_| std::env::var("USERNAME")) // Windows
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    cap_started_by(raw)
 }
 
 #[cfg(test)]
@@ -1113,6 +1154,49 @@ mod tests {
     }
 
     #[test]
+    fn started_by_is_capped_so_body_stays_within_read_cap() {
+        // CodeRabbit R13 #D: `reason` was capped, but `started_by` came straight
+        // from `$USER`/`$LOGNAME` uncapped. A multi-KiB env value could push the
+        // serialized body past FLAG_READ_CAP, so `start_at` would return Ok yet the
+        // flag would immediately read back Corrupt. `cap_started_by` now bounds it.
+        let huge = "U".repeat((FLAG_READ_CAP as usize) * 4);
+        let capped = cap_started_by(huge);
+        assert!(
+            capped.len() <= MAX_STARTED_BY_BYTES,
+            "started_by must be capped, got {} bytes",
+            capped.len()
+        );
+
+        // Worst case: BOTH env-influenced fields at their caps. The serialized
+        // body must still fit under the read cap and round-trip as Valid.
+        let dir = tempdir().unwrap();
+        let flag = flag_in(dir.path());
+        let state = IncidentState {
+            started_at: 1_700_000_000,
+            started_by: cap_started_by("L".repeat(10_000)),
+            reason: cap_reason("R".repeat((FLAG_READ_CAP as usize) * 4)),
+        };
+        let body = serde_json::to_vec_pretty(&state).unwrap();
+        assert!(
+            (body.len() as u64) <= FLAG_READ_CAP,
+            "worst-case body must be <= FLAG_READ_CAP, got {} bytes",
+            body.len()
+        );
+        std::fs::write(&flag, &body).unwrap();
+        match read_flag_at(&flag) {
+            FlagRead::Valid(_) => {}
+            other => panic!("a capped-field flag must read back Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normal_started_by_is_not_truncated() {
+        // A genuine username is returned verbatim — the cap only bites pathological
+        // env values, never a real `$USER`.
+        assert_eq!(cap_started_by("alice".to_string()), "alice");
+    }
+
+    #[test]
     fn normal_reason_is_not_truncated() {
         // A genuine human reason is stored verbatim — the cap only affects
         // pathologically long inputs.
@@ -1133,5 +1217,31 @@ mod tests {
         };
         let disp = s.started_at_display();
         assert!(disp.contains("2023"), "got {disp}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mtime_nanos_treats_dangling_symlink_as_present_not_absent() {
+        // CodeRabbit R13 #E: the cache stat must distinguish "genuinely absent"
+        // from "present but unstattable". A dangling symlink planted at the flag
+        // path used to make `metadata()` (which follows the link) error → the old
+        // code returned (false, 0) = absent, identical to the cached no-incident
+        // state, so the 5s cache kept returning a stale `None` and masked the
+        // Corrupt→active fail-safe. `symlink_metadata` now lstat-sees the link.
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let link = dir.path().join("flag-link");
+        symlink(&missing, &link).unwrap();
+        assert!(
+            mtime_nanos(&link).0,
+            "a dangling symlink must read as PRESENT (forces re-read → Corrupt → active)"
+        );
+        // A genuinely missing path is still the only thing reported absent.
+        assert_eq!(mtime_nanos(&missing), (false, 0));
+        // A real regular file is present.
+        let real = dir.path().join("real");
+        std::fs::write(&real, b"{}").unwrap();
+        assert!(mtime_nanos(&real).0);
     }
 }

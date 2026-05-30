@@ -1175,7 +1175,7 @@ pub struct Verdict {
     /// AUDIT-CONTEXT ONLY. This records *why* an otherwise-clean command was
     /// not annotated with `RepoCommandUnknown` (it was catalogued), so an
     /// operator reading the audit log / JSON can see the manifest match. It is
-    /// NEVER read by [`action_from_findings`] / [`recalculate_action`] — those
+    /// NEVER read by [`action_from_findings`] / `recalculate_action` — those
     /// take `&[Finding]`, not `&Verdict`. A repo cannot weaken a verdict by
     /// populating this field; the most a matching `allowed[*]` entry does is
     /// suppress the single Info `RepoCommandUnknown` finding. Old JSON without

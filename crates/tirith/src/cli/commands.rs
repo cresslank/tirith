@@ -75,9 +75,12 @@ pub fn init(force: bool, json: bool) -> i32 {
     // Write the manifest ATOMICALLY (temp-in-same-dir → fsync → rename → parent
     // fsync) rather than truncating in place: a crash mid-write must never lose
     // an existing manifest or leave a half-written one the loader then rejects.
+    // No-clobber unless `--force` (`overwrite=force`): a manifest created in the
+    // race window after the `exists()` check is not silently clobbered.
     if let Err(e) = super::write_file_atomic(
         &path,
         tirith_core::commands_manifest::STARTER_MANIFEST.as_bytes(),
+        force,
     ) {
         if !emit_error(
             json,

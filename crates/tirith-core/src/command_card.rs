@@ -534,13 +534,13 @@ pub enum CardRef {
 /// `# tirith-card:`. If they didn't, such a line would force past the tier-1
 /// fast-exit yet be silently dropped here.
 pub fn find_card_comment(input: &str) -> Option<CardRef> {
-    let ascii_ws = |c: char| c.is_ascii_whitespace();
     for line in input.lines() {
         match card_comment_value(line) {
             Some(rest) => {
-                // ASCII-only trim of the reference value, consistent with the
-                // ASCII-only marker detection in `card_comment_value`.
-                let value = rest.trim_matches(ascii_ws);
+                // Trim the reference value on the SAME shell-significant
+                // whitespace set as the marker detection in `card_comment_value`
+                // (and `Card::command_matches`) — never `\x0C`/`\x0B`/Unicode.
+                let value = rest.trim_matches(is_shell_significant_ws);
                 if value.is_empty() {
                     // A bare `# tirith-card:` with no ref: keep scanning the
                     // prelude (a later marker line may carry the ref).
@@ -549,11 +549,12 @@ pub fn find_card_comment(input: &str) -> Option<CardRef> {
                 return Some(classify_card_ref(value));
             }
             None => {
-                // An ASCII-blank line stays inside the leading prelude; a
+                // A blank prelude line stays inside the leading prelude; a
                 // non-blank non-marker line is the start of the real command —
-                // stop. (ASCII-only so a pure-Unicode-whitespace line ends the
-                // prelude, matching `card_comment_value`'s ASCII-only gate.)
-                if is_ascii_blank_line(line) {
+                // stop. (Shell-significant blankness, so a line containing a form
+                // feed `\x0C` or pure Unicode whitespace ends the prelude,
+                // matching `card_comment_value` and the command compare.)
+                if is_blank_prelude_line(line) {
                     continue;
                 }
                 return None;
@@ -569,35 +570,45 @@ pub fn find_card_comment(input: &str) -> Option<CardRef> {
 /// [`find_card_comment`] and [`strip_card_comment_lines`] so the resolver and
 /// the strip-before-compare step treat exactly the same lines as card markers.
 ///
-/// ASCII-ONLY whitespace (CodeRabbit R8 #1, sibling of the R7 `command_matches`
-/// fix). Both trims strip ONLY ASCII whitespace, never the full Unicode
-/// `White_Space` set. A line whose leading indentation or `#`-to-keyword gap is a
-/// Unicode-whitespace character — e.g. a U+00A0 NO-BREAK SPACE — is NOT treated as
-/// an ASCII-whitespace-prefixed marker. This keeps the marker/prelude parsers in
-/// lockstep with the ASCII-only [`Card::command_matches`] mismatch gate: a marker
-/// the resolver recognizes is stripped before the byte-for-byte command compare,
-/// so the two must agree on EXACTLY which lines are markers. (Stripping a Unicode-
-/// whitespace-padded line the gate would not have trimmed could mutate the command
-/// out from under a signed card.)
+/// SHELL-SIGNIFICANT whitespace only (CodeRabbit R8 #1 + R12; sibling of the R7
+/// [`Card::command_matches`] fix). Both trims strip ONLY the shell-significant
+/// set — space, tab, `\n`, `\r` (see [`is_shell_significant_ws`]) — never the
+/// form feed `\x0C`, the vertical tab `\x0B`, nor the full Unicode `White_Space`
+/// set. A line whose leading indentation or `#`-to-keyword gap is a form feed or
+/// a Unicode-whitespace character (e.g. U+00A0 NO-BREAK SPACE) is NOT treated as a
+/// whitespace-prefixed marker. This keeps the marker/prelude parsers in EXACT
+/// lockstep with the [`Card::command_matches`] mismatch gate (which also trims on
+/// [`is_shell_significant_ws`]): a marker the resolver recognizes is stripped
+/// before the byte-for-byte command compare, so the two must agree on EXACTLY
+/// which lines are markers. (Stripping a line the gate would not have trimmed
+/// equal — e.g. an `\x0C`-padded one — could mutate the command out from under a
+/// signed card. `char::is_ascii_whitespace`, which counts `\x0C`, would re-open
+/// exactly that desync.)
 fn card_comment_value(line: &str) -> Option<&str> {
-    let ascii_ws = |c: char| c.is_ascii_whitespace();
-    let after_hash = line.trim_start_matches(ascii_ws).strip_prefix('#')?;
-    // `#\s*tirith-card:` — zero-or-more ASCII spaces between `#` and the keyword.
+    let after_hash = line
+        .trim_start_matches(is_shell_significant_ws)
+        .strip_prefix('#')?;
+    // `#\s*tirith-card:` — zero-or-more shell-significant spaces between `#` and
+    // the keyword (NOT `\x0C`, to match the command compare).
     after_hash
-        .trim_start_matches(ascii_ws)
+        .trim_start_matches(is_shell_significant_ws)
         .strip_prefix("tirith-card:")
 }
 
-/// `true` when `line` is blank (empty or only ASCII whitespace). Used by the
-/// prelude scanners to decide whether a line is transport padding inside the
-/// leading prelude. ASCII-only to stay in lockstep with [`card_comment_value`]
-/// and the ASCII-only [`Card::command_matches`] gate: a line of pure Unicode
-/// whitespace (e.g. a lone U+00A0) is NOT a blank prelude line — it ends the
-/// prelude, exactly as it would be the start of the command for the mismatch
-/// gate. (Treating it as blank could let the prelude scan walk past a line the
-/// command compare considers content.)
-fn is_ascii_blank_line(line: &str) -> bool {
-    line.bytes().all(|b| b.is_ascii_whitespace())
+/// `true` when `line` is blank — empty or only SHELL-SIGNIFICANT whitespace
+/// (space, tab, `\n`, `\r`). Used by the prelude scanners to decide whether a
+/// line is transport padding inside the leading prelude. Restricted to the
+/// shell-significant set to stay in lockstep with [`card_comment_value`] and the
+/// [`Card::command_matches`] gate: a line of pure Unicode whitespace (e.g. a lone
+/// U+00A0) OR one containing a form feed `\x0C` is NOT a blank prelude line — it
+/// ends the prelude, exactly as it would be the start of the command for the
+/// mismatch gate. (Treating it as blank — as `u8::is_ascii_whitespace`, which
+/// counts `\x0C`, would — could let the prelude scan walk past a line the command
+/// compare considers content, mutating a signed command.)
+fn is_blank_prelude_line(line: &str) -> bool {
+    // Byte form of `is_shell_significant_ws`: space, tab, LF, CR — NOT `\x0C`/`\x0B`.
+    line.bytes()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
 }
 
 /// Classify a card reference value as a local path or a remote URL.
@@ -675,7 +686,7 @@ fn prelude_end_offset(input: &str) -> usize {
             offset += chunk.len();
             continue;
         }
-        if is_ascii_blank_line(line) {
+        if is_blank_prelude_line(line) {
             // Blank prelude line: provisionally part of the leading prelude. Kept
             // ONLY if a marker is present somewhere in the prelude (checked below);
             // otherwise the offset is reset to 0 so a marker-less blank prefix
@@ -707,7 +718,7 @@ pub fn has_card_comment_prelude(input: &str) -> bool {
         if card_comment_value(line).is_some() {
             return true;
         }
-        if is_ascii_blank_line(line) {
+        if is_blank_prelude_line(line) {
             // Blank line stays inside the leading prelude.
             continue;
         }
@@ -1185,14 +1196,15 @@ mod tests {
     }
 
     #[test]
-    fn card_marker_whitespace_handling_is_ascii_only() {
-        // CodeRabbit R8 #1 (sibling of the R7 `command_matches` Critical): the
-        // marker/prelude parsers must restrict whitespace handling to ASCII, so
-        // they stay in lockstep with the ASCII-only `command_matches` gate. A
-        // U+00A0 NO-BREAK SPACE is Unicode whitespace but NOT ASCII whitespace,
-        // so a marker padded with it must NOT be recognized as an ASCII-WS-
-        // prefixed marker (otherwise the strip step could mutate a command the
-        // mismatch gate would never have trimmed equal).
+    fn card_marker_whitespace_handling_is_shell_significant() {
+        // CodeRabbit R8 #1 + R12 (sibling of the R7 `command_matches` Critical):
+        // the marker/prelude parsers must restrict whitespace handling to the
+        // SHELL-SIGNIFICANT set (space, tab, `\n`, `\r`), so they stay in lockstep
+        // with the `command_matches` gate, which trims on the same set. A U+00A0
+        // NO-BREAK SPACE is Unicode whitespace but not shell-significant, so a
+        // marker padded with it must NOT be recognized as a whitespace-prefixed
+        // marker (otherwise the strip step could mutate a command the mismatch
+        // gate would never have trimmed equal).
         let nbsp = '\u{A0}';
 
         // Leading U+00A0 before `#`: NOT a marker (a real ASCII-space-indented
@@ -1216,7 +1228,7 @@ mod tests {
         assert!(!has_card_comment_prelude(&gap_nbsp));
 
         // A line of ONLY Unicode whitespace ends the prelude (it is not a blank
-        // ASCII line), so a marker that follows it is command content, not a
+        // prelude line), so a marker that follows it is command content, not a
         // prelude marker.
         let unicode_blank_then_marker = format!("{nbsp}\n# tirith-card: ./c.json\necho hi");
         assert_eq!(find_card_comment(&unicode_blank_then_marker), None);
@@ -1224,6 +1236,39 @@ mod tests {
         assert_eq!(
             strip_card_comment_lines(&unicode_blank_then_marker),
             unicode_blank_then_marker
+        );
+
+        // FORM FEED `\x0C` is the byte where `char::is_ascii_whitespace` (counts
+        // it) and `is_shell_significant_ws` (does NOT) diverge. Because
+        // `command_matches` trims on the shell-significant set, `\x0C` is COMMAND
+        // CONTENT — so the marker/prelude parsers must NOT treat an `\x0C`-padded
+        // line as a whitespace-prefixed marker or as a blank prelude line. (Under
+        // the pre-fix `is_ascii_whitespace` helpers every assertion below was the
+        // opposite — the line was stripped — which let a `\x0C`-padded prelude
+        // mutate the command out from under a signed card.)
+        let ff = '\u{0C}';
+        // Leading `\x0C` before `#`: NOT a marker; input left verbatim.
+        let lead_ff = format!("{ff}# tirith-card: ./c.json\necho hi");
+        assert_eq!(
+            find_card_comment(&lead_ff),
+            None,
+            "a form feed before `#` must not be treated as strippable indentation"
+        );
+        assert!(!has_card_comment_prelude(&lead_ff));
+        assert_eq!(strip_card_comment_lines(&lead_ff), lead_ff);
+        assert_eq!(prelude_end_offset(&lead_ff), 0);
+        // `\x0C` between `#` and the keyword: also NOT a marker.
+        let gap_ff = format!("#{ff}tirith-card: ./c.json\necho hi");
+        assert_eq!(find_card_comment(&gap_ff), None);
+        assert!(!has_card_comment_prelude(&gap_ff));
+        // A line of ONLY `\x0C` ends the prelude (it is not blank), so a marker
+        // that follows it is command content, not a prelude marker.
+        let ff_blank_then_marker = format!("{ff}\n# tirith-card: ./c.json\necho hi");
+        assert_eq!(find_card_comment(&ff_blank_then_marker), None);
+        assert!(!has_card_comment_prelude(&ff_blank_then_marker));
+        assert_eq!(
+            strip_card_comment_lines(&ff_blank_then_marker),
+            ff_blank_then_marker
         );
 
         // Regression guard: ASCII-space/tab-indented markers STILL parse and

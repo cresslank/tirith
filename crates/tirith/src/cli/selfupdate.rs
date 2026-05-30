@@ -1547,6 +1547,21 @@ fn atomic_self_replace(dest: &Path, new_binary: &Path) -> Result<SwapResult, Str
             backup.display()
         )
     })?;
+    // Durability (CodeRabbit R13 #L): `std::fs::copy` leaves the backup's bytes in
+    // the page cache. The new binary and the rename below are made crash-durable
+    // (sync_all + parent fsync), so without syncing the backup too a crash right
+    // after a successful swap could leave the live binary replaced while the
+    // advertised `--rollback` target is missing or truncated. fsync the backup's
+    // CONTENTS here; its directory entry is covered by the parent fsync at step 4
+    // (same directory, after both the backup and the renamed binary exist).
+    std::fs::File::open(&backup)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| {
+            format!(
+                "could not sync the rollback backup {}: {e}",
+                backup.display()
+            )
+        })?;
 
     // 2. Copy the new binary into a temp file in the destination directory.
     let mut tmp = tempfile::Builder::new()

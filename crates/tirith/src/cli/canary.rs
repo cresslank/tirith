@@ -253,6 +253,10 @@ pub fn prune(id: &str, yes: bool, json: bool) -> i32 {
                 ) {
                     return 2;
                 }
+            } else if removed == 0 {
+                // Mirror the JSON `pruned: false`: a concurrent prune (or an
+                // unknown id) between the pre-check and `prune` removed nothing.
+                println!("No canary with id '{id}' — nothing to prune.");
             } else {
                 println!("Pruned canary {id} ({removed} entr{}).", plural(removed));
             }

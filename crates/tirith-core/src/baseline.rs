@@ -388,26 +388,63 @@ fn persist_salt(salt_file: &Path, salt: &[u8], replace_corrupt: bool) -> std::io
             Ok(salt.to_vec())
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Lost the race — adopt the on-disk salt when it is the right length;
-            // otherwise propagate so the caller disables baseline. Read through
-            // the race-free capped helper (R11 #1) so a FIFO/device that won the
-            // `create_new` race cannot block this read-back, and an oversized
-            // file cannot be buffered whole.
-            match crate::util::read_regular_capped(salt_file, SALT_READ_CAP) {
-                Ok(bytes) if bytes.len() == SALT_LEN => Ok(bytes),
-                Ok(_) => Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "concurrent salt file is corrupt",
-                )),
-                Err(crate::util::OpenRegularError::Io(e)) => Err(e),
-                Err(_) => Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "concurrent salt file is not a usable regular file",
-                )),
-            }
+            // Lost the race — adopt the salt the winner is writing.
+            adopt_concurrent_salt(salt_file)
         }
         Err(e) => Err(e),
     }
+}
+
+/// Bounded re-read budget for adopting a concurrently-created salt. The winner of
+/// the `create_new` race creates a 0-byte file and only THEN `write_all`s the 32
+/// salt bytes; a loser that reads in the gap between those two syscalls sees a
+/// short/empty file. Retrying briefly (rather than declaring the salt corrupt on
+/// the first short read) keeps a transient race from disabling baseline for the
+/// whole session. ~100 ms worst case, only on the rare losing side of a race.
+const SALT_ADOPT_ATTEMPTS: usize = 10;
+const SALT_ADOPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Read the salt written by the process that won the `create_new` race, tolerating
+/// the brief window where it has created but not yet written the file (CodeRabbit
+/// R13 #J). Reads through the race-free capped helper (R11 #1) so a FIFO/device
+/// that won the race cannot block this read-back and an oversized file cannot be
+/// buffered whole. A short read is treated as "not written yet" and retried; a
+/// wrong-but-stable length, a non-regular file, or exhausting the retries is
+/// surfaced as an error so the caller disables baseline (fail toward less
+/// functionality, never a wrong salt).
+fn adopt_concurrent_salt(salt_file: &Path) -> std::io::Result<Vec<u8>> {
+    for attempt in 0..SALT_ADOPT_ATTEMPTS {
+        match crate::util::read_regular_capped(salt_file, SALT_READ_CAP) {
+            Ok(bytes) if bytes.len() == SALT_LEN => return Ok(bytes),
+            // Short/empty: the winner created the file but has not finished its
+            // `write_all` yet. Wait briefly and retry (but not after the last try).
+            Ok(bytes) if bytes.len() < SALT_LEN => {
+                if attempt + 1 < SALT_ADOPT_ATTEMPTS {
+                    std::thread::sleep(SALT_ADOPT_BACKOFF);
+                }
+            }
+            // Longer than a salt is a genuinely corrupt file, not a partial write.
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "concurrent salt file is corrupt",
+                ));
+            }
+            Err(crate::util::OpenRegularError::Io(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "concurrent salt file is not a usable regular file",
+                ));
+            }
+        }
+    }
+    // Only ever saw short reads: the winner never completed (e.g. crashed
+    // mid-write). Treat as corrupt so the caller disables baseline this session.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "concurrent salt file did not reach full length",
+    ))
 }
 
 fn warn_baseline_disabled_once(salt_file: &Path) {
@@ -1083,6 +1120,52 @@ mod tests {
             let mode = std::fs::metadata(&salt_file).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "fresh salt must be created mode 0600");
         }
+    }
+
+    #[test]
+    fn adopt_concurrent_salt_accepts_complete_file() {
+        // A salt the winner has fully written is adopted on the first read.
+        let dir = tempdir().unwrap();
+        let salt_file = salt_in(dir.path());
+        let full = [3u8; SALT_LEN];
+        std::fs::write(&salt_file, full).unwrap();
+        assert_eq!(adopt_concurrent_salt(&salt_file).unwrap(), full.to_vec());
+    }
+
+    #[test]
+    fn adopt_concurrent_salt_rejects_oversized_without_retrying() {
+        // A file LONGER than a salt is genuinely corrupt, not a partial write, so
+        // adopt fails immediately (no retry budget burned). The capped helper also
+        // refuses a file over SALT_READ_CAP before buffering it whole.
+        let dir = tempdir().unwrap();
+        let salt_file = salt_in(dir.path());
+        std::fs::write(&salt_file, vec![0u8; (SALT_READ_CAP as usize) + 4096]).unwrap();
+        let err = adopt_concurrent_salt(&salt_file).expect_err("oversized salt is corrupt");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn adopt_concurrent_salt_waits_for_in_progress_write() {
+        // CodeRabbit R13 #J: the loser of the `create_new` race must NOT declare
+        // the salt corrupt just because the winner has created but not yet finished
+        // writing it. A background writer completes the file to SALT_LEN well within
+        // adopt's ~100 ms retry budget; adopt must RETRY and return the completed
+        // salt rather than returning InvalidData and disabling baseline.
+        let dir = tempdir().unwrap();
+        let salt_file = salt_in(dir.path());
+        let full = [9u8; SALT_LEN];
+        // The winner created the file and wrote only a short prefix so far.
+        std::fs::write(&salt_file, &full[..8]).unwrap();
+
+        let writer_path = salt_file.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::fs::write(&writer_path, full).unwrap();
+        });
+        let adopted = adopt_concurrent_salt(&salt_file)
+            .expect("adopt must wait for the in-progress write, not fail");
+        handle.join().unwrap();
+        assert_eq!(adopted, full.to_vec(), "adopt returns the completed salt");
     }
 
     #[test]
