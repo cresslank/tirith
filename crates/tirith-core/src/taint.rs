@@ -344,7 +344,10 @@ fn warn_incomplete_store_once(store: &Path) {
         return;
     }
     *guard = Some(key);
-    eprintln!(
+    // Best-effort diagnostic: write fallibly so a closed/broken stderr cannot
+    // panic this helper (CodeRabbit R22 #4). `eprintln!` panics on a write error.
+    let _ = writeln!(
+        std::io::stderr(),
         "tirith: warning: taint store {} could not be read completely; \
          treating unresolved paths as tainted (fail-safe)",
         store.display()
@@ -369,7 +372,9 @@ fn warn_incomplete_list_once(store: &Path) {
         return;
     }
     *guard = Some(key);
-    eprintln!(
+    // Best-effort diagnostic: write fallibly (see `warn_incomplete_store_once`).
+    let _ = writeln!(
+        std::io::stderr(),
         "tirith: warning: taint store {} could not be read completely; \
          the listing below may be truncated (some taints may be missing)",
         store.display()

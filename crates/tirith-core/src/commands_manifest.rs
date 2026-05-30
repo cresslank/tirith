@@ -424,6 +424,38 @@ fn unknown_finding(command: &str) -> Finding {
     }
 }
 
+/// Build the Info finding surfaced when a `.tirith/commands.yaml` is PRESENT but
+/// could not be loaded (malformed YAML, a non-regular file, oversized, etc.).
+///
+/// Reuses [`RuleId::RepoCommandUnknown`] (Info) rather than minting a new id: a
+/// broken manifest is, from the verdict's perspective, the same "this command is
+/// not catalogued by the manifest" state — except the operator is also told WHY
+/// (their manifest is broken and its `allowed[]`/`dangerous[]` rules are not
+/// being applied), instead of the engine silently ignoring it. Info-only: this
+/// never raises the action and, like every manifest finding, never weakens an
+/// engine finding. `reason` is the [`ManifestError`] `Display` string.
+pub(crate) fn unloadable_finding(reason: &str) -> Finding {
+    Finding {
+        rule_id: RuleId::RepoCommandUnknown,
+        severity: Severity::Info,
+        title: "Repo command manifest present but could not be loaded".to_string(),
+        description: format!(
+            "This repo's `.tirith/commands.yaml` exists but could not be loaded \
+             ({reason}); its `allowed[]`/`dangerous[]` rules are NOT being \
+             applied. This is informational only and does not change the verdict. \
+             Fix the manifest (or remove it) so its rules take effect."
+        ),
+        evidence: vec![Evidence::CommandPattern {
+            pattern: ".tirith/commands.yaml (load failed)".to_string(),
+            matched: reason.to_string(),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    }
+}
+
 /// Build the `RepoCommandDangerousPattern` finding for a dangerous match. The
 /// entry's `action` selects the severity: `block` → High (→ Block action),
 /// `warn` → Medium (→ Warn action). Both ELEVATE; neither weakens an existing

@@ -914,10 +914,21 @@ fn check_command_manifest_hot(
         Ok(Some(m)) => m,
         // No manifest on disk: nothing to add, nothing matched.
         Ok(None) => return (Vec::new(), None),
-        // A present-but-malformed manifest: fail safe. We do NOT treat a
-        // broken repo-controlled file as permissive (it cannot suppress
-        // anything) and we do NOT crash. The engine's findings stand as-is.
-        Err(_) => return (Vec::new(), None),
+        // A present-but-unloadable manifest (malformed YAML, a non-regular file,
+        // oversized, …): fail safe AND SURFACE it. We still do NOT treat a broken
+        // repo-controlled file as permissive (it cannot suppress anything) and we
+        // do NOT crash — the engine's findings stand. But silently ignoring it
+        // would hide from the operator that their `allowed[]`/`dangerous[]`
+        // elevations are NOT being applied, so emit an Info diagnostic explaining
+        // the breakage. The force-past gate keys off `exists_for()`, so this path
+        // is reached whenever a present manifest fails to load. Info-only: never
+        // raises the action, never weakens an engine finding.
+        Err(e) => {
+            return (
+                vec![crate::commands_manifest::unloadable_finding(&e.to_string())],
+                None,
+            )
+        }
     };
 
     // Strip any leading `# tirith-card:` prelude before manifest matching, the
@@ -3694,6 +3705,48 @@ mod tests {
             )),
             "no manifest on disk → neither manifest rule fires"
         );
+        assert_eq!(verdict.manifest_allowed_match, None);
+    }
+
+    /// CodeRabbit R22 #1: a PRESENT but UNLOADABLE `.tirith/commands.yaml`
+    /// (malformed YAML) must be SURFACED, not silently ignored. The force-past
+    /// gate keys off `exists_for()`, so the analysis reaches tier-3; the manifest
+    /// load fails and we emit an Info `RepoCommandUnknown` note explaining the
+    /// breakage (so the operator knows their `allowed[]`/`dangerous[]` rules are
+    /// NOT being applied). The verdict is otherwise unaffected — Info never raises
+    /// the action, and a clean command still Allows.
+    #[test]
+    fn manifest_unloadable_surfaces_info_not_silence() {
+        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
+            return;
+        }
+        use crate::verdict::{Action, RuleId, Severity};
+
+        let dir = tempfile::tempdir().unwrap();
+        // Malformed YAML: a bare scalar where a mapping is expected → parse error.
+        write_commands_manifest(dir.path(), "allowed: [unterminated\n");
+
+        let verdict = analyze(&exec_ctx_in("echo hello-world", dir.path()));
+
+        // SURFACED, not silent: the unloadable-manifest Info note is present.
+        let note = verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == RuleId::RepoCommandUnknown)
+            .expect("a present-but-unloadable manifest must surface an Info note");
+        assert_eq!(note.severity, Severity::Info);
+        assert!(
+            note.title.contains("could not be loaded"),
+            "the surfaced note must explain the manifest was unloadable, got {:?}",
+            note.title
+        );
+        // Info never raises the action: a clean command still Allows.
+        assert_eq!(
+            verdict.action,
+            Action::Allow,
+            "the unloadable-manifest Info note must not change the verdict"
+        );
+        // A broken manifest matches nothing → no allowed-match audit context.
         assert_eq!(verdict.manifest_allowed_match, None);
     }
 

@@ -413,7 +413,10 @@ fn persist_salt(salt_file: &Path, salt: &[u8], replace_corrupt: bool) -> std::io
 fn warn_baseline_disabled_once(salt_file: &Path) {
     use std::sync::atomic::Ordering;
     if !SALT_WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!(
+        // Best-effort diagnostic: write fallibly so a closed/broken stderr cannot
+        // panic this helper (CodeRabbit R22 #4). `eprintln!` panics on a write error.
+        let _ = writeln!(
+            std::io::stderr(),
             "tirith: WARNING: baseline salt at {} is unreadable and could not be \
              written; anomaly baseline is disabled for this session (run \
              `tirith doctor` to diagnose the state directory).",

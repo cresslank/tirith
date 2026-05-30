@@ -309,7 +309,7 @@ pub(crate) fn write_file_atomic(path: &std::path::Path, contents: &[u8]) -> std:
 /// write goes THROUGH the link (the symlink itself is preserved); otherwise (a
 /// regular path, a missing path, or a dangling/unresolvable symlink) returns
 /// `path` unchanged so the caller renames onto it as before.
-fn resolve_atomic_dest(path: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn resolve_atomic_dest(path: &std::path::Path) -> std::path::PathBuf {
     match std::fs::symlink_metadata(path) {
         // A symlink whose target resolves: write through to the real file.
         // `canonicalize` follows every link in the chain and requires the final

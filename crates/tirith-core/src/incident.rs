@@ -661,7 +661,11 @@ fn warn_corrupt_flag_once(path: &Path, mtime: u128) {
         return;
     }
     *guard = Some(key);
-    eprintln!(
+    // Best-effort diagnostic: write fallibly so a closed/broken stderr cannot
+    // panic this helper (CodeRabbit R22 #4). `eprintln!` panics on a write error.
+    use std::io::Write as _;
+    let _ = writeln!(
+        std::io::stderr(),
         "tirith: incident flag corrupt — applying fail-closed posture; \
          run `tirith incident status`"
     );

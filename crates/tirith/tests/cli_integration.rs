@@ -9612,6 +9612,108 @@ fn command_card_fetch_is_idempotent_for_identical_bytes() {
     server.join().expect("card-server thread must not panic");
 }
 
+/// CodeRabbit R22 #2: `fetch` must reject a card larger than `CARD_READ_CAP`
+/// (64 KiB) BEFORE caching. Every card READ (engine hot path, sign, verify)
+/// refuses bodies above the cap, so a 64 KiB–10 MiB card would cache
+/// "successfully" yet never be readable back — a dead cache entry. Serve a VALID
+/// card whose body exceeds the cap and assert: exit 1, a clear cap error, and NO
+/// cache file written. UNIX-ONLY (the `fetch` subcommand is `#[cfg(unix)]`).
+#[cfg(unix)]
+#[test]
+fn command_card_fetch_rejects_card_over_read_cap() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let home = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    // A VALID card (parses as a Card) whose serialized body is just over the
+    // 64 KiB cap: a ~70 KiB `command` string pads it past the cap while keeping
+    // every required field present. It passes `Card::from_json`, then trips the
+    // size check.
+    let big_command = "echo ".to_string() + &"A".repeat(70 * 1024);
+    let card = serde_json::json!({
+        "command": big_command,
+        "expires": "2999-01-01",
+    });
+    let body = serde_json::to_vec(&card).expect("serialize big card");
+    assert!(
+        body.len() > 64 * 1024,
+        "fixture must exceed the 64 KiB cap, got {} bytes",
+        body.len()
+    );
+
+    // Same cancellable, non-blocking one-connection-at-a-time server as the
+    // idempotency test — cannot hang `join()` on any platform.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    listener
+        .set_nonblocking(true)
+        .expect("listener non-blocking");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_srv = Arc::clone(&stop);
+    let server = std::thread::spawn(move || {
+        while !stop_srv.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(&body);
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let url = format!("http://127.0.0.1:{port}/big.json");
+    let out = tirith()
+        .args(["command-card", "fetch", &url])
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", cache.path())
+        .output()
+        .expect("fetch");
+
+    // Stop + join the server BEFORE asserting so a failed assertion never leaks
+    // the thread.
+    stop.store(true, Ordering::Relaxed);
+    server.join().expect("card-server thread must not panic");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an over-cap card must exit 1 (a fetch failure, not a usage error); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("read cap") && stderr.contains("not caching"),
+        "stderr must explain the card exceeds the read cap and is not cached, got:\n{stderr}"
+    );
+
+    // NO cache file written: the cards cache dir is absent or empty.
+    let cards_dir = cache.path().join("tirith").join("cards");
+    let cached: Vec<_> = std::fs::read_dir(&cards_dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(
+        cached.is_empty(),
+        "an over-cap card must NOT be cached; found {cached:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // M11 ch4 — `tirith secret triage|rotate|revoke` (guidance-only assistant).
 // 0 network calls, no new RuleIds; presents over existing audit data + a

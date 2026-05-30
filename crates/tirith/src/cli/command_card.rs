@@ -449,6 +449,26 @@ pub fn fetch(url: &str, json: bool) -> i32 {
         }
         return 1;
     }
+    // Reject anything larger than the read cap BEFORE caching (CodeRabbit R22 #2).
+    // The downloader's 10 MiB limit is far above `CARD_READ_CAP` (64 KiB), and
+    // every card READ (engine hot path, sign, verify) refuses bodies above the
+    // cap — so a 64 KiB–10 MiB card would cache "successfully" yet never be
+    // readable back: a confusing dead cache entry. Refuse it here so the temp is
+    // dropped (no cache file written) and the operator gets a clear error.
+    if bytes.len() as u64 > CARD_READ_CAP {
+        if !emit_error(
+            json,
+            "tirith command-card fetch",
+            &format!(
+                "downloaded card is {} bytes, exceeding the {CARD_READ_CAP}-byte read cap; \
+                 not caching (it could never be read back)",
+                bytes.len()
+            ),
+        ) {
+            return 2;
+        }
+        return 1;
+    }
 
     let sha = command_card::sha256_hex(&bytes);
     let dest = cache_dir.join(format!("{sha}.json"));
@@ -579,7 +599,14 @@ fn read_secret_key(path: &Path) -> Result<[u8; SECRET_KEY_LEN], CardError> {
 /// filesystem, so a concurrent reader (or a crash) never observes a truncated
 /// or half-written card — it sees either the previous file or the new one.
 fn write_card_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    // Resolve a symlinked destination to its real target so signing a symlinked
+    // card updates the link's TARGET rather than clobbering the symlink with a
+    // regular file (CodeRabbit R22 #3). Non-symlinks (and dangling/unresolvable
+    // links) resolve to `path` unchanged — the prior behavior. Reuses the
+    // round-17 `cli::mod::resolve_atomic_dest` so both atomic writers canonicalize
+    // identically.
+    let dest = super::resolve_atomic_dest(path);
+    let dir = dest.parent().filter(|p| !p.as_os_str().is_empty());
     let mut tmp = match dir {
         Some(d) => tempfile::NamedTempFile::new_in(d)?,
         // No parent component (e.g. a bare filename): place the temp file in the
@@ -595,15 +622,15 @@ fn write_card_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     // after a crash sees either the old card or the complete new one — never a
     // truncated one.
     tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
+    tmp.persist(&dest).map_err(|e| e.error)?;
     // Durability of the RENAME itself: `persist()` renames the temp file over
-    // `path` but does NOT fsync the containing directory. On Unix a crash right
+    // `dest` but does NOT fsync the containing directory. On Unix a crash right
     // after the rename can lose the new name→inode directory entry (the file's
     // data is synced above, but the directory metadata recording the new name is
     // not). fsync the parent so the rename is durable too. The persist already
     // succeeded, so a dir-fsync failure must not fail the sign — but it is LOGGED,
     // not silently dropped (CodeRabbit R13 #5). No-op on non-Unix.
-    tirith_core::util::fsync_parent_dir_logged(path, "signed card");
+    tirith_core::util::fsync_parent_dir_logged(&dest, "signed card");
     Ok(())
 }
 
@@ -709,5 +736,65 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1, "no temp file left behind: {entries:?}");
         assert_eq!(entries[0], path);
+    }
+
+    /// CodeRabbit R22 #3: signing a SYMLINKED card must update the link's TARGET,
+    /// not clobber the symlink with a regular file. `write_card_atomic` resolves a
+    /// symlink destination (via `cli::mod::resolve_atomic_dest`) and writes through
+    /// to the target. Unix-only (`std::os::unix::fs::symlink`).
+    #[cfg(unix)]
+    #[test]
+    fn write_card_atomic_through_symlink_updates_target_not_link() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        // The real card lives in a SEPARATE subdir to prove the temp file is
+        // placed next to the RESOLVED target (same filesystem), not next to the
+        // link — a cross-directory symlink would otherwise break atomicity.
+        let target_dir = dir.path().join("real");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target = target_dir.join("card.json");
+        std::fs::write(&target, "{\"old\":true}\n").unwrap();
+
+        let link = dir.path().join("card.json");
+        symlink(&target, &link).unwrap();
+
+        // Sign/write through the symlink.
+        write_card_atomic(&link, "{\"new\":true}\n").unwrap();
+
+        // The TARGET now holds the new content...
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "{\"new\":true}\n"
+        );
+        // ...and the symlink is INTACT (still a symlink pointing at the target),
+        // not replaced by a regular file.
+        let link_meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            link_meta.file_type().is_symlink(),
+            "the card path must remain a symlink, not be clobbered by a regular file"
+        );
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            target,
+            "the symlink must still point at the original target"
+        );
+        // Reading through the link yields the updated content.
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "{\"new\":true}\n");
+
+        // No temp file left dangling in EITHER directory (it was renamed into the
+        // target dir, consuming it).
+        for d in [dir.path(), target_dir.as_path()] {
+            let extra: Vec<_> = std::fs::read_dir(d)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p != &link && p != &target && p != &target_dir)
+                .collect();
+            assert!(
+                extra.is_empty(),
+                "no temp file left behind in {d:?}: {extra:?}"
+            );
+        }
     }
 }
