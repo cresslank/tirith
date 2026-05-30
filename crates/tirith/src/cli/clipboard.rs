@@ -675,7 +675,13 @@ pub fn watch(json: bool) -> i32 {
             "source_file": source_path.display().to_string(),
             "poll_interval_ms": POLL_INTERVAL.as_millis() as u64,
         });
-        let _ = println_json(&env);
+        // A write failure here means stdout is gone (e.g. a downstream `head`
+        // closed the pipe). Exit cleanly rather than entering the poll loop — a
+        // watcher with no reader has nothing to report to. See the per-event emit
+        // below for the same handling.
+        if println_json(&env).is_err() {
+            return 0;
+        }
     } else {
         eprintln!(
             "tirith clipboard watch: watching {} (polling every {}s); attributes the clipboard to its browser source",
@@ -749,12 +755,24 @@ pub fn watch(json: bool) -> i32 {
                 "source_title": record.source_title,
                 "hidden_text_detected": record.hidden_text_detected,
             });
-            let _ = println_json(&env);
+            // Stop watching when the JSON write fails: a broken pipe (the reader
+            // closed stdout) means nobody is consuming events, so polling forever
+            // would just spin. Exit cleanly. Mirrors the watch_start handling.
+            if println_json(&env).is_err() {
+                return 0;
+            }
         } else {
-            println!(
+            // Human mode: a broken pipe on stdout likewise means the reader is
+            // gone; stop rather than polling forever.
+            if writeln!(
+                std::io::stdout(),
                 "tirith clipboard watch: clipboard source: {}",
                 record.source_url
-            );
+            )
+            .is_err()
+            {
+                return 0;
+            }
         }
     }
 }

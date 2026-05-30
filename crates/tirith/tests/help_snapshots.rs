@@ -104,6 +104,9 @@ help_example_tests! {
     help_clipboard_copy  => (["clipboard", "copy", "--help"], "tirith clipboard copy ./snippet.sh");
     help_clipboard_scan  => (["clipboard", "scan", "--help"], "tirith clipboard scan");
     help_clipboard_guard => (["clipboard", "guard", "--help"], "tirith clipboard guard install-service");
+    // M12 ch1 — `clipboard watch` must be advertised in the PARENT clipboard help.
+    help_clipboard_watch_in_parent => (["clipboard", "--help"], "tirith clipboard watch");
+    help_clipboard_watch => (["clipboard", "watch", "--help"], "tirith clipboard watch --json");
     // M7 ch5 — `tirith logs scan|summarize|redact`.
     help_logs            => (["logs", "--help"], "tirith logs scan ./error.log");
     help_logs_scan       => (["logs", "scan", "--help"], "tirith logs scan ./error.log");

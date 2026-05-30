@@ -1347,6 +1347,10 @@ Subcommands:
   tirith clipboard guard uninstall-service     — remove the unit.
   tirith clipboard guard status                — report whether the service
                                                   is installed + loaded.
+  tirith clipboard watch                       — poll the clipboard and report
+                                                  the browser source of each new
+                                                  copy (needs the companion
+                                                  extension; M12).
 
 Why a service unit, not a shell-profile `&` background:
   Spawning the daemon from ~/.zshrc via `&` orphans processes on
@@ -1367,7 +1371,9 @@ Examples:
   tirith clipboard guard install-service
   tirith clipboard guard install-service --apply
   tirith clipboard guard uninstall-service
-  tirith clipboard guard status")]
+  tirith clipboard guard status
+  tirith clipboard watch
+  tirith clipboard watch --json")]
     Clipboard {
         #[command(subcommand)]
         action: ClipboardAction,

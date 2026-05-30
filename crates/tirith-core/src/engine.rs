@@ -2580,8 +2580,14 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
                 crate::clipboard::ClipboardSourceState::AbsentOrInvalid => None,
             };
             if let Some(rec) = rec {
+                // Hash the ORIGINAL clipboard bytes (what the browser extension
+                // hashed), falling back to the &str bytes when no raw buffer was
+                // threaded. This keeps the rule's content match in lockstep with
+                // the `--with-source` display in `paste.rs`, so a non-UTF-8 paste
+                // never has the finding and the displayed source disagree.
+                let raw = ctx.raw_bytes.as_deref().unwrap_or(ctx.input.as_bytes());
                 findings.extend(crate::rules::paste_provenance::check_with_record(
-                    &ctx.input, ctx.shell, &findings, &policy, &rec,
+                    &ctx.input, raw, ctx.shell, &findings, &policy, &rec,
                 ));
             }
         }

@@ -181,10 +181,12 @@ pub fn run(
         // a `clipboard_source: null` so a scripted caller can tell "no source
         // recorded" apart from a missing flag.
         let source_attribution = if with_source {
-            Some(resolve_source_attribution(
-                &ctx.input,
-                display_record.as_ref(),
-            ))
+            // Hash the ORIGINAL clipboard bytes, in lockstep with the engine's
+            // `paste_source_mismatch` rule (see `resolve_source_attribution`), so
+            // the displayed source and the finding never disagree for a non-UTF-8
+            // paste.
+            let raw = ctx.raw_bytes.as_deref().unwrap_or(ctx.input.as_bytes());
+            Some(resolve_source_attribution(raw, display_record.as_ref()))
         } else {
             None
         };
@@ -199,7 +201,8 @@ pub fn run(
         // note to stderr (the structured keys live in `--json`). Graceful when no
         // source was recorded for this paste.
         if with_source {
-            match resolve_source_attribution(&ctx.input, display_record.as_ref()) {
+            let raw = ctx.raw_bytes.as_deref().unwrap_or(ctx.input.as_bytes());
+            match resolve_source_attribution(raw, display_record.as_ref()) {
                 serde_json::Value::Null => {
                     eprintln!("tirith paste: no clipboard source recorded for this paste");
                 }
@@ -218,25 +221,32 @@ pub fn run(
 }
 
 /// Resolve the attributed clipboard source for this paste, if the companion
-/// extension recorded one whose `content_sha256` matches `input`. Returns a JSON
-/// object (`{source_url, source_title}`) on a match, or `null` when there is no
-/// recorded source / the hash does not match / the extension isn't installed —
-/// so `--with-source` always emits a `clipboard_source` key and a scripted
-/// caller can distinguish "matched source" from "no source recorded".
+/// extension recorded one whose `content_sha256` matches the pasted bytes.
+/// Returns a JSON object (`{source_url, source_title}`) on a match, or `null`
+/// when there is no recorded source / the hash does not match / the extension
+/// isn't installed — so `--with-source` always emits a `clipboard_source` key and
+/// a scripted caller can distinguish "matched source" from "no source recorded".
+///
+/// `raw` is the ORIGINAL clipboard bytes (the caller passes
+/// `ctx.raw_bytes.as_deref().unwrap_or(ctx.input.as_bytes())`). We hash THESE,
+/// not the lossy `ctx.input` &str, so this display stays in LOCKSTEP with
+/// the `paste_source_mismatch` rule (which also hashes the raw bytes): a non-UTF-8
+/// paste must never make the displayed `clipboard_source` and the finding
+/// disagree.
 ///
 /// G1 TOCTOU fix: the `record` is the SAME one already read once at the top of
 /// `run` and handed to the engine, so the displayed attribution and the
 /// `paste_source_mismatch` finding can never disagree. We do NOT re-read
 /// `clipboard_source.json` here.
 fn resolve_source_attribution(
-    input: &str,
+    raw: &[u8],
     record: Option<&tirith_core::clipboard::ClipboardSourceRecord>,
 ) -> serde_json::Value {
     use sha2::{Digest, Sha256};
     let Some(record) = record else {
         return serde_json::Value::Null;
     };
-    let digest = Sha256::digest(input.as_bytes());
+    let digest = Sha256::digest(raw);
     let mut actual = String::with_capacity(digest.len() * 2);
     for b in digest {
         use std::fmt::Write as _;

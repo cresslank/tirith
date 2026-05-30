@@ -278,9 +278,11 @@ pub fn select_pairs(selector: Option<&str>) -> (Vec<&'static ConfusablePair>, bo
 /// * `pairs` — `critical` (default) or `all`.
 /// * `json` — also emit the [`VisualAuditResult`] as JSON on stdout.
 ///
-/// Returns the process exit code. Always 0 on the happy path (including the
-/// non-interactive and non-TTY-degrade paths); 1 only on a stdout JSON write
-/// failure (broken pipe).
+/// Returns the process exit code. 0 on the happy path (including the
+/// non-interactive and non-TTY-degrade paths); 1 on a stdout JSON write failure
+/// (broken pipe) OR when a persist was requested (the `--non-interactive` and
+/// interactive paths persist) but failed to write the result file — so a caller
+/// is never told the audit was recorded when it was not.
 pub fn run(non_interactive: bool, pairs: Option<String>, json: bool) -> i32 {
     let (selected, recognized) = select_pairs(pairs.as_deref());
     if !recognized {
@@ -391,12 +393,19 @@ fn tally(term: &str, results: Vec<PairResult>) -> VisualAuditResult {
 }
 
 /// Persist (when `persist`), then print the human summary and/or JSON. Returns
-/// the exit code (0 on success, 1 only on a JSON write failure).
+/// the exit code: 1 when a persist was REQUESTED but failed (so CI /
+/// `tirith doctor --compat` are not told the audit was recorded when it wasn't),
+/// 1 on a JSON write failure, else 0. The JSON / human output is still emitted on
+/// a persist failure so a caller can see the (unsaved) result.
 fn finish(result: VisualAuditResult, json: bool, persist: bool) -> i32 {
+    let mut persist_failed = false;
     if persist {
         match persist_result(&result) {
             Ok(path) => eprintln!("tirith visual-audit: recorded result to {}", path.display()),
-            Err(e) => eprintln!("tirith visual-audit: warning — could not save result: {e}"),
+            Err(e) => {
+                eprintln!("tirith visual-audit: error — could not save result: {e}");
+                persist_failed = true;
+            }
         }
     }
 
@@ -407,7 +416,13 @@ fn finish(result: VisualAuditResult, json: bool, persist: bool) -> i32 {
     } else {
         print_human_summary(&result);
     }
-    0
+    // A requested-but-failed persist is a failure: the result was NOT recorded,
+    // so exiting 0 would falsely signal success to CI / `tirith doctor --compat`.
+    if persist_failed {
+        1
+    } else {
+        0
+    }
 }
 
 /// Write the result to `config_dir()/visual-audit-result.json` atomically,

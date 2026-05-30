@@ -389,15 +389,20 @@ pub fn render_manifest(exe: &str, extension_id: &str) -> String {
     serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// Short platform tag for JSON envelopes / human messages.
+/// Short OS-only platform tag for JSON envelopes / human messages. The selected
+/// browser is reported SEPARATELY in the `browser` envelope field, so this tag is
+/// the OS alone — it previously hardcoded `macos-chrome` / `linux-chrome` for ALL
+/// `--browser` values, which was misleading for a `--browser brave` / `edge` run.
+/// `windows-registry` keeps its registry-vs-file-drop distinction (it describes
+/// the install MECHANISM, not the browser).
 fn manifest_platform() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        "macos-chrome"
+        "macos"
     }
     #[cfg(target_os = "linux")]
     {
-        "linux-chrome"
+        "linux"
     }
     #[cfg(target_os = "windows")]
     {
@@ -677,6 +682,25 @@ mod tests {
         assert!(!is_valid_extension_id("ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP"));
         // The placeholder is deliberately NOT a valid id.
         assert!(!is_valid_extension_id(PLACEHOLDER_EXTENSION_ID));
+    }
+
+    /// The platform tag is OS-only and carries NO browser suffix (the selected
+    /// browser is reported in the separate `browser` envelope field). Regression
+    /// for the round-3 finding: a `--browser brave` run no longer reports
+    /// `macos-chrome`. Windows keeps `windows-registry` (the install mechanism).
+    #[test]
+    fn manifest_platform_is_os_only_no_browser_suffix() {
+        let p = manifest_platform();
+        assert!(
+            !p.contains("chrome"),
+            "platform tag must not hardcode a browser; got '{p}'"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(p, "macos");
+        #[cfg(target_os = "linux")]
+        assert_eq!(p, "linux");
+        #[cfg(target_os = "windows")]
+        assert_eq!(p, "windows-registry");
     }
 
     /// `--browser` parses the four documented values (case-insensitively) and
