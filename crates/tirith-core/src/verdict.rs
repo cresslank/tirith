@@ -915,6 +915,33 @@ pub enum RuleId {
     /// decoy" signal. ONLY the user's own registered tokens fire this — the
     /// store scopes detection, so a genuine third-party credential does not.
     CanaryTokenTouched,
+
+    // Paste-provenance rule (M12 ch1). A companion browser extension (separate
+    // repo) writes a JSON record at `state_dir()/clipboard_source.json` whenever
+    // it sets the system clipboard (`{updated_at, content_sha256, source_url,
+    // source_title, hidden_text_detected}`). This fires from `engine::analyze`
+    // in `ScanContext::Paste` ONLY: when `sha256(pasted_input)` matches the
+    // record's `content_sha256` (so the paste genuinely came from the recorded
+    // source) AND a URL host in the pasted command differs from the recorded
+    // `source_url` host. Because the trigger is runtime companion-file state plus
+    // a content-hash match — not a regex / byte signal on the input — it carries
+    // no PATTERN_TABLE entry and lives in `EXTERNALLY_TRIGGERED_RULES`, covered by
+    // unit tests in `crates/tirith-core/src/rules/paste_provenance.rs` against a
+    // `tempfile::tempdir()` record plus a CLI integration test. See
+    // `crate::clipboard::ClipboardSourceRecord` and `docs/paste-provenance.md`.
+    /// M12 ch1 — the pasted content matched a recorded clipboard source, but a
+    /// destination host in the paste differs from the source page's host.
+    ///
+    /// **Info** when the host mismatch stands alone (docs pages on
+    /// `docs.example.com` legitimately link install URLs on `github.com` /
+    /// `npmjs.com` / `docker.io`, so a bare host mismatch is common and benign).
+    /// **High** when the mismatch is corroborated by at least one risk signal:
+    /// the source record flagged hidden text, a `ClipboardHidden` finding is
+    /// already present, the destination is a URL shortener, the paste pipes to a
+    /// shell interpreter (`PipeToInterpreter` already present), the destination
+    /// host is NOT in `policy.allowed_install_domains`, or an OSC 8 hyperlink in
+    /// the paste renders a visible URL whose host differs from its actual target.
+    PasteSourceMismatch,
 }
 
 impl fmt::Display for RuleId {

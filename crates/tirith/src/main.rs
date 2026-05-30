@@ -212,6 +212,13 @@ Examples:
         /// Path to clipboard HTML for rich-text paste analysis
         #[arg(long)]
         html: Option<String>,
+
+        /// Attribute the paste to its clipboard source (M12 ch1). When the
+        /// companion browser extension recorded a matching source, the --json
+        /// output gains a top-level `clipboard_source` key with the source URL
+        /// and title. Without the extension this is a graceful no-op.
+        #[arg(long)]
+        with_source: bool,
     },
 
     /// Safely download and execute a script
@@ -4287,6 +4294,27 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+
+    /// Watch the clipboard and report the browser source of each new copy (M12 ch1)
+    #[command(after_help = "\
+Polls the system clipboard. When the companion browser extension records
+a new clipboard source (at state-dir/clipboard_source.json) whose content
+SHA-256 matches the current clipboard, prints the attributed source URL.
+
+A no-op on a machine without the companion extension (the source file
+never appears). Runs until interrupted (Ctrl-C).
+
+Examples:
+  tirith clipboard watch
+  tirith clipboard watch --json")]
+    Watch {
+        /// Output format (default: human).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -5752,9 +5780,17 @@ fn run() {
             non_interactive,
             interactive,
             html,
+            with_source,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::paste::run(&shell, json, non_interactive, interactive, html.as_deref())
+            cli::paste::run(
+                &shell,
+                json,
+                non_interactive,
+                interactive,
+                html.as_deref(),
+                with_source,
+            )
         }
 
         #[cfg(unix)]
@@ -6546,6 +6582,10 @@ fn run() {
                     std::process::exit(2);
                 }
                 cli::clipboard::daemon_foreground(json)
+            }
+            ClipboardAction::Watch { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::clipboard::watch(json)
             }
         },
 

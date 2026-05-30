@@ -15,6 +15,7 @@ pub mod iac;
 pub mod install;
 pub mod mcpdrift;
 pub mod output;
+pub mod paste_provenance;
 pub mod path;
 pub mod powershell;
 pub mod prompt_injection;

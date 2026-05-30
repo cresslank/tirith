@@ -12,6 +12,30 @@ pub const SENSITIVE_KEY_VARS: &[&str] = &[
     "GITHUB_TOKEN",
 ];
 
+/// Known URL-shortener hosts whose target is hidden behind a redirect. Used by
+/// `transport.rs` (the `ShortenedUrl` rule) and `paste_provenance.rs` (a
+/// shortened destination host is a risk signal that escalates a host mismatch).
+/// Centralised here so the two consumers cannot drift (M12 ch1).
+///
+/// Matching is exact (case-insensitive at the call site): a host equals one of
+/// these entries.
+pub const URL_SHORTENER_HOSTS: &[&str] = &[
+    "bit.ly",
+    "t.co",
+    "tinyurl.com",
+    "is.gd",
+    "v.gd",
+    "goo.gl",
+    "ow.ly",
+];
+
+/// `true` when `host` (any case) is a known URL shortener from
+/// [`URL_SHORTENER_HOSTS`].
+pub fn is_url_shortener(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    URL_SHORTENER_HOSTS.iter().any(|s| lower == *s)
+}
+
 /// The canonical set of "critical" criticality labels recognised by the
 /// M8 context / SSH / IaC / container rules. A label outside this set is
 /// recorded for operator inventory but never causes the rule to fire.
@@ -32,6 +56,15 @@ pub fn is_critical_label(label: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_url_shortener_basic() {
+        assert!(is_url_shortener("bit.ly"));
+        assert!(is_url_shortener("T.CO"), "case-insensitive");
+        assert!(is_url_shortener("tinyurl.com"));
+        assert!(!is_url_shortener("github.com"));
+        assert!(!is_url_shortener("bit.ly.evil.com"));
+    }
 
     #[test]
     fn is_critical_label_basic() {

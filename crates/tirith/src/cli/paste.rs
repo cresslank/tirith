@@ -12,6 +12,7 @@ pub fn run(
     non_interactive: bool,
     interactive_flag: bool,
     html_path: Option<&str>,
+    with_source: bool,
 ) -> i32 {
     const MAX_PASTE: u64 = 1024 * 1024;
 
@@ -138,18 +139,105 @@ pub fn run(
     }
 
     if json {
-        if output::write_json(
-            &verdict,
-            &policy.dlp_custom_patterns,
-            std::io::stdout().lock(),
-        )
-        .is_err()
-        {
+        // M12 ch1 — `--with-source`: enrich the JSON envelope with the attributed
+        // clipboard source (the page the paste was copied from), as EXTRA
+        // top-level keys, NOT as a Finding. Attribution only happens when the
+        // companion extension's recorded `content_sha256` matches this paste's
+        // hash; otherwise (no extension / stale record / hash mismatch) we report
+        // a `clipboard_source: null` so a scripted caller can tell "no source
+        // recorded" apart from a missing flag.
+        let source_attribution = if with_source {
+            Some(resolve_source_attribution(&ctx.input))
+        } else {
+            None
+        };
+        if write_paste_json(&verdict, &policy.dlp_custom_patterns, source_attribution).is_err() {
             eprintln!("tirith: failed to write JSON output");
         }
-    } else if output::write_human_auto(&verdict, false).is_err() {
-        eprintln!("tirith: failed to write output");
+    } else {
+        if output::write_human_auto(&verdict, false).is_err() {
+            eprintln!("tirith: failed to write output");
+        }
+        // M12 ch1 — `--with-source` in human mode: print a one-line attribution
+        // note to stderr (the structured keys live in `--json`). Graceful when no
+        // source was recorded for this paste.
+        if with_source {
+            match resolve_source_attribution(&ctx.input) {
+                serde_json::Value::Null => {
+                    eprintln!("tirith paste: no clipboard source recorded for this paste");
+                }
+                v => {
+                    let url = v
+                        .get("source_url")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("(unknown)");
+                    eprintln!("tirith paste: clipboard source: {url}");
+                }
+            }
+        }
     }
 
     verdict.action.exit_code()
+}
+
+/// Resolve the attributed clipboard source for this paste, if the companion
+/// extension recorded one whose `content_sha256` matches `input`. Returns a JSON
+/// object (`{source_url, source_title}`) on a match, or `null` when there is no
+/// recorded source / the hash does not match / the extension isn't installed —
+/// so `--with-source` always emits a `clipboard_source` key and a scripted
+/// caller can distinguish "matched source" from "no source recorded".
+fn resolve_source_attribution(input: &str) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    let Some(record) = tirith_core::clipboard::read_source_record() else {
+        return serde_json::Value::Null;
+    };
+    let digest = Sha256::digest(input.as_bytes());
+    let mut actual = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(actual, "{b:02x}");
+    }
+    if !actual.eq_ignore_ascii_case(record.content_sha256.trim()) {
+        // A recorded source exists, but it does NOT describe this paste (stale
+        // record / clipboard replaced). No attribution.
+        return serde_json::Value::Null;
+    }
+    serde_json::json!({
+        "source_url": record.source_url,
+        "source_title": record.source_title,
+    })
+}
+
+/// Write the paste verdict as JSON, optionally splicing a top-level
+/// `clipboard_source` key (`--with-source`). We render the verdict through the
+/// shared `output::write_json` (so the envelope shape is identical to every
+/// other JSON surface), then, only when source attribution was requested, parse
+/// it back into a `serde_json::Value` to add the extra key. Without
+/// `--with-source` this is byte-identical to `output::write_json`.
+fn write_paste_json(
+    verdict: &tirith_core::verdict::Verdict,
+    custom_patterns: &[String],
+    source_attribution: Option<serde_json::Value>,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let Some(source) = source_attribution else {
+        return output::write_json(verdict, custom_patterns, std::io::stdout().lock());
+    };
+    // Render the canonical envelope to a buffer, then add the extra key. A parse
+    // failure here is impossible for our own serializer, but handle it by falling
+    // back to the plain envelope rather than dropping output.
+    let mut buf = Vec::new();
+    output::write_json(verdict, custom_patterns, &mut buf)?;
+    let mut value: serde_json::Value = match serde_json::from_slice(&buf) {
+        Ok(v) => v,
+        Err(_) => {
+            return std::io::stdout().lock().write_all(&buf);
+        }
+    };
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("clipboard_source".to_string(), source);
+    }
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &value)?;
+    writeln!(stdout)
 }

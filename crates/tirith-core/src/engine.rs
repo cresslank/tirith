@@ -1978,6 +1978,17 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     let canary_triggered = matches!(ctx.scan_context, ScanContext::Exec | ScanContext::Paste)
         && crate::canary::store_nonempty();
 
+    // M12 ch1 — the paste-provenance check is a runtime-state lookup (does a
+    // companion `clipboard_source.json` exist whose recorded content hash matches
+    // this paste?), not a regex/byte signal. A pasted install command that is
+    // otherwise tier-1-clean would fast-exit before the provenance scan ran (the
+    // tier-1 gating bug class — see CLAUDE.md). Force past the fast-exit ONLY when
+    // the companion file is non-empty: a single `metadata()` stat, so a machine
+    // without the companion browser extension pays nothing. Paste context only —
+    // the rule is paste-specific. Mirrors `canary_triggered`.
+    let paste_source_triggered =
+        ctx.scan_context == ScanContext::Paste && crate::clipboard::source_file_nonempty();
+
     // M11 ch1 — a `--card <path>` sidecar flag is not a regex/byte signal, so a
     // clean-looking command (`curl … | sh` already trips tier-1, but a bare
     // `./install.sh --card …` may not) would fast-exit before the card check
@@ -2009,6 +2020,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         && !canary_triggered
         && !card_triggered
         && !manifest_triggered
+        && !paste_source_triggered
     {
         let total_ms = start.elapsed().as_secs_f64() * 1000.0;
         return (
@@ -2505,6 +2517,25 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         // not the command the operator ran — consistent with the other
         // exec-scoped rules above.
         findings.extend(check_canary_hot(&analyzed_input, canary_context));
+
+        // M12 ch1 — paste provenance. Paste context ONLY, and called LAST in the
+        // paste branch so the findings it inspects for risk signals
+        // (`ClipboardHidden` from the rich-text path, `PipeToInterpreter` from the
+        // command rules, plus the URL findings) are already assembled in
+        // `findings`. Near-noop when no companion `clipboard_source.json` exists
+        // (and the tier-1 force-past `paste_source_triggered` only fires when that
+        // file is non-empty, so a no-extension machine never even reaches here
+        // unless some OTHER signal pulled us past the fast-exit). When the paste's
+        // content hash matches the recorded source AND a destination host differs
+        // from the source host, this fires PasteSourceMismatch — Info for a bare
+        // mismatch, High when a risk signal corroborates it. The pasted content is
+        // scanned, not `analyzed_input` (which is the prelude-stripped command for
+        // Exec; in Paste the `Cow` borrows unchanged, so they are equal here).
+        if ctx.scan_context == ScanContext::Paste {
+            findings.extend(crate::rules::paste_provenance::check(
+                &ctx.input, &findings, &policy,
+            ));
+        }
 
         let env_findings = crate::rules::environment::check(&crate::rules::environment::RealEnv);
         findings.extend(env_findings);

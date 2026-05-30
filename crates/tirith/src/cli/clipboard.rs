@@ -642,6 +642,121 @@ pub fn daemon_foreground(json: bool) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// `tirith clipboard watch` (M12 ch1)
+// ---------------------------------------------------------------------------
+
+/// Poll the clipboard and report the attributed source URL each time the
+/// companion browser extension records a NEW clipboard source whose content
+/// hash matches the current clipboard.
+///
+/// The companion extension (a separate repo) writes
+/// `state_dir()/clipboard_source.json` whenever it sets the clipboard. We watch
+/// that file's mtime: when it advances AND `sha256(clipboard) ==
+/// record.content_sha256`, we print the attributed source so an operator can see
+/// "this clipboard content came from <url>" in real time. A no-op on a machine
+/// without the extension (the file never appears).
+///
+/// Never returns under normal operation (Ctrl-C terminates). In `--json` mode
+/// each attribution is one line of JSON on stdout.
+pub fn watch(json: bool) -> i32 {
+    use sha2::{Digest, Sha256};
+    use std::time::SystemTime;
+
+    let Some(source_path) = tirith_core::clipboard::source_file_path() else {
+        eprintln!(
+            "tirith clipboard watch: cannot resolve the tirith state directory (no $HOME / $XDG_STATE_HOME)"
+        );
+        return 1;
+    };
+
+    if json {
+        let env = serde_json::json!({
+            "event": "watch_start",
+            "source_file": source_path.display().to_string(),
+            "poll_interval_ms": POLL_INTERVAL.as_millis() as u64,
+        });
+        let _ = println_json(&env);
+    } else {
+        eprintln!(
+            "tirith clipboard watch: watching {} (polling every {}s); attributes the clipboard to its browser source",
+            source_path.display(),
+            POLL_INTERVAL.as_secs()
+        );
+    }
+
+    // The last companion-record mtime we acted on, so we only report a source
+    // once per extension write rather than every poll.
+    let mut last_mtime: Option<SystemTime> = None;
+
+    loop {
+        std::thread::sleep(POLL_INTERVAL);
+
+        // The companion record's current mtime. Absent file → nothing to do.
+        let mtime = match std::fs::metadata(&source_path).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        // Only act when the record is NEWER than the one we last reported.
+        if last_mtime == Some(mtime) {
+            continue;
+        }
+
+        // Read the record (fail-safe to None) and the current clipboard.
+        let Some(record) = tirith_core::clipboard::read_source_record_at(&source_path) else {
+            // Present but unreadable/malformed — advance the marker so we don't
+            // re-read the same broken file every poll.
+            last_mtime = Some(mtime);
+            continue;
+        };
+        let clip = match read_clipboard_text() {
+            Ok(Some(t)) if !t.is_empty() => t,
+            Ok(_) => {
+                last_mtime = Some(mtime);
+                continue;
+            }
+            Err(ClipboardError::NoBackend) => {
+                // Headless: back off and keep waiting.
+                std::thread::sleep(POLL_INTERVAL * 30);
+                continue;
+            }
+            Err(_) => {
+                last_mtime = Some(mtime);
+                continue;
+            }
+        };
+
+        // Attribute only when the clipboard content matches the recorded hash.
+        let digest = Sha256::digest(clip.as_bytes());
+        let mut actual = String::with_capacity(digest.len() * 2);
+        for b in digest {
+            use std::fmt::Write as _;
+            let _ = write!(actual, "{b:02x}");
+        }
+        last_mtime = Some(mtime);
+        if !actual.eq_ignore_ascii_case(record.content_sha256.trim()) {
+            // The record describes a different clipboard payload (a race, or the
+            // clipboard was replaced by another app). Don't claim attribution.
+            continue;
+        }
+
+        if json {
+            let env = serde_json::json!({
+                "event": "clipboard_source",
+                "source_url": record.source_url,
+                "source_title": record.source_title,
+                "hidden_text_detected": record.hidden_text_detected,
+            });
+            let _ = println_json(&env);
+        } else {
+            println!(
+                "tirith clipboard watch: clipboard source: {}",
+                record.source_url
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // helpers — analysis & I/O
 // ---------------------------------------------------------------------------
 

@@ -1300,6 +1300,10 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ),
     // Honeytoken / canary rule (M11 ch3, D3).
     ("canary_token_touched", "CanaryTokenTouched"),
+    // Paste-provenance rule (M12 ch1). Runtime companion-file state +
+    // content-hash match; no PATTERN_TABLE entry (the trigger is not a regex on
+    // the input), category "clipboard".
+    ("paste_source_mismatch", "PasteSourceMismatch"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[

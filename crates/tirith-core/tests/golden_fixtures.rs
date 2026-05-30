@@ -762,6 +762,8 @@ const ALL_RULE_IDS: &[&str] = &[
     "repo_command_dangerous_pattern",
     // Honeytoken / canary rule (M11 ch3, D3)
     "canary_token_touched",
+    // Paste-provenance rule (M12 ch1)
+    "paste_source_mismatch",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -1101,6 +1103,19 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // lookup at a temp store, following the M10 taint/anomaly runtime-state
     // pattern.
     "canary_token_touched",
+    // M12 ch1 — the paste-provenance rule fires from `engine::analyze` in
+    // `ScanContext::Paste` ONLY when a companion browser extension has written a
+    // record at `state_dir()/clipboard_source.json` AND the pasted content's
+    // SHA-256 matches the record's `content_sha256` AND a URL host in the paste
+    // differs from the recorded source host. The static golden-fixture runner
+    // writes no companion record (and never touches the real `state_dir()`), so a
+    // text fixture cannot drive the rule — the trigger is runtime companion-file
+    // state plus a content-hash match, not input content alone. Covered by unit
+    // tests in `crates/tirith-core/src/rules/paste_provenance.rs` (against a
+    // `tempfile::tempdir()` record via the `check_at` seam) plus a CLI
+    // integration test that writes a `clipboard_source.json` into an isolated
+    // `XDG_STATE_HOME`, following the M11 canary runtime-state pattern.
+    "paste_source_mismatch",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1364,6 +1379,8 @@ rule_id_variant_registry! {
     RepoCommandUnknown, RepoCommandDangerousPattern,
     // Honeytoken / canary rule (M11 ch3, D3)
     CanaryTokenTouched,
+    // Paste-provenance rule (M12 ch1)
+    PasteSourceMismatch,
 }
 
 /// Verify ALL_RULE_IDS stays in sync with the actual RuleId enum.

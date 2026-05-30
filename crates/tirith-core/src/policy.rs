@@ -410,6 +410,26 @@ pub struct Policy {
     /// same single-line append-or-rewrite the M8/M9 guard flags use.
     #[serde(default)]
     pub baseline_enabled: bool,
+
+    /// **M12 ch1 — trusted install-source hosts for paste provenance.**
+    ///
+    /// Hosts the operator trusts as legitimate places a pasted install command
+    /// may download from (e.g. `github.com`, `objects.githubusercontent.com`,
+    /// `registry.npmjs.org`). Consulted ONLY by the `paste_provenance` rule
+    /// ([`crate::verdict::RuleId::PasteSourceMismatch`]): when a paste's content
+    /// matches a recorded clipboard source but a destination host differs from
+    /// the source page's host, a destination host that is NOT in this list is one
+    /// of the risk signals that escalates the (otherwise advisory Info) mismatch
+    /// to High. A destination host that IS listed keeps the bare mismatch at Info.
+    ///
+    /// Empty by default — with no list configured, a not-in-list destination host
+    /// does NOT by itself escalate (the other risk signals still apply); this is
+    /// backward-compatible (`#[serde(default)]`). Matching is case-insensitive and
+    /// covers an exact host match OR a dot-suffix subdomain match: a configured
+    /// `github.com` also allows `objects.github.com`, but NOT a lookalike like
+    /// `evilgithub.com`. See `paste_provenance::host_in_allowed_domains`.
+    #[serde(default)]
+    pub allowed_install_domains: Vec<String>,
 }
 
 /// **M7 ch2** — `tirith share` policy configuration.
@@ -898,6 +918,7 @@ impl Default for Policy {
             exec_guard_enabled: false,
             hooks_guard_enabled: false,
             baseline_enabled: false,
+            allowed_install_domains: Vec::new(),
         }
     }
 }

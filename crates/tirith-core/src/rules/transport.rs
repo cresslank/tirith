@@ -63,19 +63,8 @@ fn check_plain_http_to_sink(url: &UrlLike, in_sink: bool, findings: &mut Vec<Fin
 }
 
 fn check_shortened_url(url: &UrlLike, findings: &mut Vec<Finding>) {
-    let shorteners = [
-        "bit.ly",
-        "t.co",
-        "tinyurl.com",
-        "is.gd",
-        "v.gd",
-        "goo.gl",
-        "ow.ly",
-    ];
-
     if let Some(host) = url.host() {
-        let host_lower = host.to_lowercase();
-        if shorteners.iter().any(|s| host_lower == *s) {
+        if crate::rules::shared::is_url_shortener(host) {
             findings.push(Finding {
                 rule_id: RuleId::ShortenedUrl,
                 severity: Severity::Medium,

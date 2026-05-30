@@ -70,6 +70,13 @@ const ADDITIONAL_FINDING_WEIGHT: u32 = 5;
 ///     be verified" (remote URL / bad sig / unreadable). Info note, not a claim.
 ///   * [`RuleId::RepoCommandUnknown`] — "not listed in `.tirith/commands.yaml`".
 ///     Info annotation; the suppressible "you ran something uncatalogued" note.
+///   * [`RuleId::PasteSourceMismatch`] — at its Info severity (a BARE host
+///     mismatch with no corroborating risk signal) this is an advisory "the
+///     paste came from a different host than where it runs" note: docs pages
+///     legitimately link install URLs on other hosts, so the lone-mismatch case
+///     must not inflate the score. The severity gate in [`is_excluded_note`]
+///     means the **High** case (mismatch + a risk signal) is STILL counted — it
+///     is a real signal, not an annotation, so the exemption never suppresses it.
 ///
 /// Deliberately NOT note-only (these ARE real signals and stay counted):
 ///   * `CommandCardMismatch` (High) — the command differs from a trusted card.
@@ -82,7 +89,10 @@ const ADDITIONAL_FINDING_WEIGHT: u32 = 5;
 fn is_note_only_rule(rule: RuleId) -> bool {
     matches!(
         rule,
-        RuleId::CommandCardVerified | RuleId::CommandCardUnverified | RuleId::RepoCommandUnknown
+        RuleId::CommandCardVerified
+            | RuleId::CommandCardUnverified
+            | RuleId::RepoCommandUnknown
+            | RuleId::PasteSourceMismatch
     )
 }
 
@@ -385,7 +395,10 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::RepoCommandDangerousPattern
         // M11 ch3 — honeytoken / canary. A local store lookup against the
         // user's own planted tokens; not a threat-DB indicator match.
-        | RuleId::CanaryTokenTouched => false,
+        | RuleId::CanaryTokenTouched
+        // M12 ch1 — paste provenance. A companion-file content-hash match plus a
+        // URL-host comparison; not a threat-DB indicator match.
+        | RuleId::PasteSourceMismatch => false,
     }
 }
 
@@ -678,6 +691,38 @@ mod tests {
             assert_eq!(with.score, 70, "High alone is 70; the note adds nothing");
             assert!(with.verify());
         }
+    }
+
+    #[test]
+    fn paste_source_mismatch_info_is_note_only_but_high_is_counted() {
+        // M12 ch1: the BARE-host-mismatch Info case is advisory metadata — a lone
+        // such note scores 0, and alongside a real High finding it adds nothing.
+        let lone = score_findings(&[finding(RuleId::PasteSourceMismatch, Severity::Info)]);
+        assert_eq!(lone.score, 0, "a lone Info paste-source mismatch scores 0");
+        assert!(lone.verify());
+
+        let with_info = score_findings(&[
+            finding(RuleId::PlainHttpToSink, Severity::High),
+            finding(RuleId::PasteSourceMismatch, Severity::Info),
+        ]);
+        assert_eq!(
+            with_info.score, 70,
+            "an Info paste-source mismatch must not add an additional-finding point"
+        );
+
+        // The HIGH case (mismatch + a risk signal) IS a real signal and must be
+        // counted: alongside another High finding it adds the +5 (70 → 75). The
+        // severity gate in `is_excluded_note` keeps it counted even though the
+        // rule_id is in the note-only set.
+        let with_high = score_findings(&[
+            finding(RuleId::PlainHttpToSink, Severity::High),
+            finding(RuleId::PasteSourceMismatch, Severity::High),
+        ]);
+        assert_eq!(
+            with_high.score, 75,
+            "a High paste-source mismatch must count as an additional finding"
+        );
+        assert!(with_high.verify());
     }
 
     #[test]

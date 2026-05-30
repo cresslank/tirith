@@ -36,7 +36,92 @@
 //! }
 //! ```
 
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Upper bound on the bytes we read from the companion `clipboard_source.json`.
+/// The record is a tiny JSON object (a timestamp, a sha256 hex, a URL, a title,
+/// a bool); 64 KiB is far more than a genuine record needs, so anything larger
+/// is treated as unreadable (→ `None`) rather than buffered. Mirrors the
+/// incident-flag / command-card read caps.
+const SOURCE_READ_CAP: u64 = 64 * 1024;
+
+/// One record written by the companion browser extension (M12 ch1) each time it
+/// sets the system clipboard. tirith reads (never writes) this file to attribute
+/// a paste to the page it was copied from. See [`read_source_record_at`] and the
+/// `paste_provenance` rule.
+///
+/// The extension lives in a SEPARATE repo; this struct is the on-disk contract.
+/// Unknown fields are ignored (serde default) so a newer extension that adds
+/// fields does not break an older tirith.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardSourceRecord {
+    /// RFC-3339 timestamp the extension set the clipboard.
+    pub updated_at: String,
+    /// Lowercase-hex SHA-256 of the clipboard content the extension wrote. The
+    /// `paste_provenance` rule compares this against `sha256(pasted_input)`; a
+    /// mismatch means the paste did NOT come from this recorded source, so no
+    /// attribution is made.
+    pub content_sha256: String,
+    /// The page URL the content was copied from.
+    pub source_url: String,
+    /// The page title the content was copied from (best-effort, may be empty).
+    #[serde(default)]
+    pub source_title: String,
+    /// Whether the extension detected hidden / invisible text in the copied
+    /// selection (a risk signal the rule escalates on).
+    #[serde(default)]
+    pub hidden_text_detected: bool,
+}
+
+/// Default on-disk path of the companion record: `state_dir()/clipboard_source.json`.
+/// `None` when the state dir cannot be resolved (no `$HOME`, no `$XDG_STATE_HOME`).
+pub fn source_file_path() -> Option<PathBuf> {
+    crate::policy::state_dir().map(|d| d.join("clipboard_source.json"))
+}
+
+/// Read + parse the companion record at `path` (test seam). FAIL-SAFE: a
+/// missing, non-regular, oversized, unreadable, or unparseable file yields
+/// `None` — never a panic. The paste-provenance rule treats `None` as "no
+/// source recorded" and emits no finding.
+///
+/// Goes through the shared, race-free [`crate::util::read_regular_capped`]
+/// helper (the same one the command-card / incident-flag reads use): it opens
+/// with `O_NONBLOCK` and `fstat`s the OPEN fd, so a `clipboard_source.json`
+/// swapped for a FIFO / device cannot hang the paste path, and the read is
+/// capped at [`SOURCE_READ_CAP`].
+pub fn read_source_record_at(path: &Path) -> Option<ClipboardSourceRecord> {
+    let bytes = crate::util::read_regular_capped(path, SOURCE_READ_CAP).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Production entry point: read the companion record from the default path
+/// (`state_dir()/clipboard_source.json`). `None` when the state dir cannot be
+/// resolved, the file is absent, or it is unreadable / malformed.
+pub fn read_source_record() -> Option<ClipboardSourceRecord> {
+    source_file_path().and_then(|p| read_source_record_at(&p))
+}
+
+/// `true` when the companion record at `path` exists and has at least one byte.
+/// A cheap `metadata()` stat — no parse. Used by the engine's tier-1 force-past
+/// decision so a no-extension machine pays a single stat. Mirrors
+/// [`crate::canary::store_nonempty_at`].
+pub fn source_file_nonempty_at(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
+}
+
+/// Production entry point for the engine's tier-1 force-past decision: `true`
+/// when `state_dir()/clipboard_source.json` exists and is non-empty. A single
+/// stat, free when the companion extension was never installed.
+pub fn source_file_nonempty() -> bool {
+    source_file_path()
+        .map(|p| source_file_nonempty_at(&p))
+        .unwrap_or(false)
+}
 
 /// Failure modes for clipboard access.
 ///
@@ -140,5 +225,70 @@ mod tests {
     fn other_passes_through_upstream_message() {
         let e = ClipboardError::Other("permissions denied".into());
         assert!(e.to_string().contains("permissions denied"));
+    }
+
+    // ---- companion clipboard-source record (M12 ch1) ----------------------
+
+    use tempfile::tempdir;
+
+    #[test]
+    fn source_record_roundtrips_from_disk() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("clipboard_source.json");
+        std::fs::write(
+            &path,
+            r#"{"updated_at":"2026-05-30T00:00:00Z","content_sha256":"abc123","source_url":"https://docs.example.com/install","source_title":"Install","hidden_text_detected":false}"#,
+        )
+        .unwrap();
+        let rec = read_source_record_at(&path).expect("record parses");
+        assert_eq!(rec.content_sha256, "abc123");
+        assert_eq!(rec.source_url, "https://docs.example.com/install");
+        assert_eq!(rec.source_title, "Install");
+        assert!(!rec.hidden_text_detected);
+    }
+
+    #[test]
+    fn source_record_optional_fields_default() {
+        // `source_title` and `hidden_text_detected` are `#[serde(default)]` so an
+        // older / minimal extension record without them still parses.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("clipboard_source.json");
+        std::fs::write(
+            &path,
+            r#"{"updated_at":"t","content_sha256":"deadbeef","source_url":"https://x.example"}"#,
+        )
+        .unwrap();
+        let rec = read_source_record_at(&path).expect("record parses with defaults");
+        assert_eq!(rec.source_title, "");
+        assert!(!rec.hidden_text_detected);
+    }
+
+    #[test]
+    fn source_record_absent_is_none_not_panic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("clipboard_source.json");
+        // File never created — fail-safe to None.
+        assert!(read_source_record_at(&path).is_none());
+        assert!(!source_file_nonempty_at(&path));
+    }
+
+    #[test]
+    fn source_record_malformed_is_none() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("clipboard_source.json");
+        std::fs::write(&path, b"this is not json").unwrap();
+        // Present-but-unparseable → None (and nonempty stat is true, but the
+        // parse failing is what makes the rule treat it as "no source").
+        assert!(read_source_record_at(&path).is_none());
+        assert!(source_file_nonempty_at(&path));
+    }
+
+    #[test]
+    fn source_file_nonempty_reflects_write() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("clipboard_source.json");
+        assert!(!source_file_nonempty_at(&path));
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(source_file_nonempty_at(&path));
     }
 }
