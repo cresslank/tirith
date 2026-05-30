@@ -854,19 +854,11 @@ fn emit_no_backend(json: bool, verb: &str) {
     }
 }
 
-/// Hex-encode the SHA-256 of `bytes`. Plain hex to avoid base64 deps;
-/// the debounce key is internal and never logged.
+/// Hex-encode the SHA-256 of `bytes` — delegates to the shared core helper
+/// (Greptile R1 #6) so the watch/scan debounce key, the paste-provenance rule,
+/// and the `--with-source` display all hash clipboard content the same way.
 fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(bytes);
-    let digest = h.finalize();
-    let mut s = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+    tirith_core::clipboard::content_sha256_hex(bytes)
 }
 
 /// Serialize `value` as a single line of JSON to stdout, followed by `\n`.

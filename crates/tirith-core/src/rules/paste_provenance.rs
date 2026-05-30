@@ -50,8 +50,6 @@
 //! and which risk signals fired — never the pasted content, the source title, or
 //! the full URLs beyond the hosts being compared.
 
-use sha2::{Digest, Sha256};
-
 use crate::clipboard::ClipboardSourceRecord;
 use crate::policy::Policy;
 use crate::tokenize::ShellType;
@@ -120,8 +118,11 @@ pub fn check_with_record(
     }
 
     // Step 3 — the source host. A record whose `source_url` has no host (e.g. a
-    // `file:` URL, a `chrome://` page, or an unparseable value) cannot be
-    // compared, so there is nothing to mismatch against — emit nothing.
+    // `file:///path` URL, or an unparseable / non-dotted value) cannot be
+    // compared, so there is nothing to mismatch against — emit nothing. (A
+    // `chrome://` page is NOT host-less — `url::Url` yields its page name as the
+    // host — but a browser extension never records an internal page as a copy
+    // source, so it is not called out here.)
     let Some(source_host) = url_host(&record.source_url) else {
         return Vec::new();
     };
@@ -165,13 +166,7 @@ pub fn check_with_record(
 /// digest matches what the browser extension computed over the same bytes even
 /// when the paste is not valid UTF-8.
 fn content_matches(raw: &[u8], expected: &str) -> bool {
-    let digest = Sha256::digest(raw);
-    let mut actual = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        use std::fmt::Write as _;
-        let _ = write!(actual, "{b:02x}");
-    }
-    actual.eq_ignore_ascii_case(expected.trim())
+    crate::clipboard::content_sha256_hex(raw).eq_ignore_ascii_case(expected.trim())
 }
 
 /// Parse a URL string and return its lowercase host, or `None` if it has no
@@ -416,15 +411,9 @@ mod tests {
     /// Build a `ClipboardSourceRecord` whose `content_sha256` matches `content`,
     /// so the attribution guard passes. `source_url` / `hidden` are explicit.
     fn record_for(content: &str, source_url: &str, hidden: bool) -> ClipboardSourceRecord {
-        let digest = Sha256::digest(content.as_bytes());
-        let mut hex = String::new();
-        for b in digest {
-            use std::fmt::Write as _;
-            let _ = write!(hex, "{b:02x}");
-        }
         ClipboardSourceRecord {
             updated_at: "2026-05-30T00:00:00Z".to_string(),
-            content_sha256: hex,
+            content_sha256: crate::clipboard::content_sha256_hex(content.as_bytes()),
             source_url: source_url.to_string(),
             source_title: "Test Page".to_string(),
             hidden_text_detected: hidden,
@@ -435,15 +424,9 @@ mod tests {
     /// may be invalid UTF-8). Mirrors what the browser extension does: it hashes
     /// the original clipboard bytes, not a lossy &str.
     fn record_for_bytes(raw: &[u8], source_url: &str) -> ClipboardSourceRecord {
-        let digest = Sha256::digest(raw);
-        let mut hex = String::new();
-        for b in digest {
-            use std::fmt::Write as _;
-            let _ = write!(hex, "{b:02x}");
-        }
         ClipboardSourceRecord {
             updated_at: "2026-05-30T00:00:00Z".to_string(),
-            content_sha256: hex,
+            content_sha256: crate::clipboard::content_sha256_hex(raw),
             source_url: source_url.to_string(),
             source_title: "Test Page".to_string(),
             hidden_text_detected: false,

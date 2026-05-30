@@ -166,6 +166,22 @@ pub fn source_file_nonempty() -> bool {
         .unwrap_or(false)
 }
 
+/// Lowercase-hex SHA-256 of `bytes` — the single source of truth for the
+/// clipboard-content hash (Greptile R1 #6). The companion record's
+/// `content_sha256`, the paste-provenance rule's attribution check, the
+/// `tirith paste --with-source` display, and `tirith clipboard watch`/`scan` all
+/// hash the SAME way through this helper, so they can never drift apart.
+pub fn content_sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
 /// Failure modes for clipboard access.
 ///
 /// `NoBackend` is the soft-fail path: callers should report it as a

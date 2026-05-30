@@ -242,16 +242,12 @@ fn resolve_source_attribution(
     raw: &[u8],
     record: Option<&tirith_core::clipboard::ClipboardSourceRecord>,
 ) -> serde_json::Value {
-    use sha2::{Digest, Sha256};
     let Some(record) = record else {
         return serde_json::Value::Null;
     };
-    let digest = Sha256::digest(raw);
-    let mut actual = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        use std::fmt::Write as _;
-        let _ = write!(actual, "{b:02x}");
-    }
+    // Same shared hash the engine's rule uses, so the displayed attribution and
+    // the PasteSourceMismatch finding can never disagree (Greptile R1 #6).
+    let actual = tirith_core::clipboard::content_sha256_hex(raw);
     if !actual.eq_ignore_ascii_case(record.content_sha256.trim()) {
         // A recorded source exists, but it does NOT describe this paste (stale
         // record / clipboard replaced). No attribution.
