@@ -107,7 +107,17 @@ pub fn create(kind: &str, callback_url: Option<String>, json: bool) -> i32 {
 /// callback). The token VALUE is shown so the user can plant it; it lives in a
 /// local 0600 store either way.
 pub fn list(json: bool) -> i32 {
-    let entries = canary::list();
+    // Use the completeness-aware list: a present-but-unreadable/incomplete store
+    // (FIFO/device, or a persistent mid-file read fault) degrades to a partial
+    // view, which `canary::list()` would hide. Warn so a truncated listing is
+    // never shown as if it were the whole store.
+    let (entries, complete) = canary::list_complete();
+    if !complete {
+        eprintln!(
+            "tirith canary list: warning: the canary store could not be read \
+             completely; the list below may be partial."
+        );
+    }
 
     if json {
         if !write_json_stdout(&entries, "tirith canary list: failed to write JSON output") {
@@ -135,7 +145,15 @@ pub fn list(json: bool) -> i32 {
 /// `tirith canary status` — a compact summary: how many canaries, how many have
 /// a callback URL, and where the store lives. Does NOT print token values.
 pub fn status(json: bool) -> i32 {
-    let entries = canary::list();
+    // Completeness-aware (see `list`): never report a partial store as the
+    // authoritative status.
+    let (entries, complete) = canary::list_complete();
+    if !complete {
+        eprintln!(
+            "tirith canary status: warning: the canary store could not be read \
+             completely; the counts below may be partial."
+        );
+    }
     let with_callback = entries.iter().filter(|e| e.callback_url.is_some()).count();
     let store = canary::store_path()
         .map(|p| p.display().to_string())

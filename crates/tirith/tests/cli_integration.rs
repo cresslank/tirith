@@ -10645,6 +10645,36 @@ fn canary_prune_does_not_falsely_succeed_on_unreadable_store() {
     );
 }
 
+/// CodeRabbit R20: `canary list` / `canary status` must not silently present an
+/// incomplete/unreadable store as the whole truth — they warn on stderr.
+#[cfg(unix)]
+#[test]
+fn canary_list_and_status_warn_on_unreadable_store() {
+    use std::ffi::CString;
+
+    for sub in ["list", "status"] {
+        let state = tempfile::tempdir().expect("tempdir");
+        let store_dir = state.path().join("tirith");
+        fs::create_dir_all(&store_dir).unwrap();
+        let store = store_dir.join("canaries.jsonl");
+        let c_path = CString::new(store.as_os_str().to_str().unwrap()).unwrap();
+        // SAFETY: single libc mkfifo with a valid C string + standard mode.
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+            eprintln!("skipping: mkfifo unsupported here");
+            return;
+        }
+        let out = canary_tirith(state.path())
+            .args(["canary", sub])
+            .output()
+            .unwrap_or_else(|e| panic!("canary {sub} on a FIFO store: {e}"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("could not be read completely"),
+            "`canary {sub}` against an unreadable store must warn (got stderr:\n{stderr})"
+        );
+    }
+}
+
 /// CodeRabbit R18 #5: `tirith taint list` builds its output from `parse_store`,
 /// which returns a partial prefix when the store cannot be read to EOF. A SILENT
 /// truncation would hide taints from the listing with no operator signal, so an

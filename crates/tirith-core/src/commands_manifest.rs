@@ -198,9 +198,13 @@ impl CommandsManifest {
     /// differ only by surrounding whitespace are still distinct keys on disk, and
     /// surfacing the literal collision is clearer than silently normalizing.
     fn validate_no_duplicates(&self) -> Result<(), ManifestError> {
+        // Dedup on the SAME ASCII-trimmed key the matchers compare with
+        // (`match_allowed`/`match_dangerous` use `trim_ascii_ws`), so two entries
+        // that differ only by surrounding ASCII whitespace are caught as the
+        // duplicates they effectively are at match time.
         let mut seen_names = std::collections::HashSet::with_capacity(self.allowed.len());
         for entry in &self.allowed {
-            if !seen_names.insert(entry.name.as_str()) {
+            if !seen_names.insert(trim_ascii_ws(&entry.name)) {
                 return Err(ManifestError::Parse(format!(
                     "duplicate allowed[].name {:?}: each catalogued command name must be unique \
                      (first-match lookup makes a duplicate name ambiguous)",
@@ -210,7 +214,7 @@ impl CommandsManifest {
         }
         let mut seen_patterns = std::collections::HashSet::with_capacity(self.dangerous.len());
         for entry in &self.dangerous {
-            if !seen_patterns.insert(entry.pattern.as_str()) {
+            if !seen_patterns.insert(trim_ascii_ws(&entry.pattern)) {
                 return Err(ManifestError::Parse(format!(
                     "duplicate dangerous[].pattern {:?}: a dangerous pattern is redundant if \
                      listed twice",
@@ -731,6 +735,22 @@ mod tests {
         let ok = "allowed:\n  - name: build\n    command: npm run build\n  - name: test\n    command: npm test\n";
         let m = CommandsManifest::from_yaml(ok).expect("distinct names parse");
         assert_eq!(m.allowed.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_names_differing_only_by_ascii_whitespace_are_rejected() {
+        // CodeRabbit R20: the matchers compare ASCII-trimmed, so `"build"` and
+        // `"build "` are the SAME command at match time — dedup must use the same
+        // normalization and reject them as duplicates.
+        let dup =
+            "allowed:\n  - name: \"build\"\n    command: a\n  - name: \"build \"\n    command: b\n";
+        let err = CommandsManifest::from_yaml(dup)
+            .expect_err("names differing only by trailing ASCII whitespace must be duplicates");
+        assert!(matches!(err, ManifestError::Parse(_)));
+        // Same for dangerous[].pattern.
+        let dup_pat =
+            "dangerous:\n  - pattern: \"rm -rf *\"\n  - pattern: \" rm -rf *\"\n    action: warn\n";
+        assert!(CommandsManifest::from_yaml(dup_pat).is_err());
     }
 
     #[test]

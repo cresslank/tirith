@@ -2214,7 +2214,7 @@ inherent to an explicit fetch.
 Subcommands:
   create  build an unsigned card from flags (or prompts) and print JSON
   sign    sign a card in place with an ed25519 private key
-  verify  verify a card against your trusted-keys directory
+  verify  verify a card against your trusted-card-keys directory
   fetch   download a card from a URL into tirith's cache dir (cards/<sha256>.json)
 
 Examples:
@@ -2258,7 +2258,7 @@ available on this platform.
 Subcommands:
   create  build an unsigned card from flags (or prompts) and print JSON
   sign    sign a card in place with an ed25519 private key
-  verify  verify a card against your trusted-keys directory
+  verify  verify a card against your trusted-card-keys directory
 
 Examples:
   tirith command-card create --command 'curl -fsSL https://example.com/install.sh | sh' \\
@@ -2795,7 +2795,7 @@ Examples:
         json: bool,
     },
 
-    /// Verify a command card against your trusted-keys directory
+    /// Verify a command card against your trusted-card-keys directory
     #[command(after_help = "\
 Verifies the card's ed25519 signature against a public key under
 `trusted-card-keys/<key_id>.pub` in tirith's config dir (`~/.config/tirith/` on
