@@ -422,10 +422,15 @@ fn emit_not_found(cmd: &str, rule_id: &str, policy: &Policy, json: bool) -> i32 
             "error": format!("no custom rule named '{rule_id}'"),
             "available": policy.custom_rules.iter().map(|r| &r.id).collect::<Vec<_>>(),
         });
-        let _ = write_json_stdout(
+        // A broken pipe must surface as a write failure (exit 2), consistent with
+        // the success paths — not be misreported as "rule missing" (exit 1).
+        // CodeRabbit M13 round-5 D5-5.
+        if !write_json_stdout(
             &v,
             &format!("tirith rule {cmd}: failed to write JSON output"),
-        );
+        ) {
+            return 2;
+        }
         return 1;
     }
     eprintln!("tirith rule {cmd}: no custom rule named '{rule_id}'");
@@ -457,10 +462,15 @@ fn emit_invalid_rule(cmd: &str, rule_id: &str, json: bool) -> i32 {
             "fires": false,
             "error": msg,
         });
-        let _ = write_json_stdout(
+        // A broken pipe must surface as a write failure (exit 2), consistent with
+        // the success paths — not be misreported as "rule invalid" (exit 1).
+        // CodeRabbit M13 round-5 D5-5.
+        if !write_json_stdout(
             &v,
             &format!("tirith rule {cmd}: failed to write JSON output"),
-        );
+        ) {
+            return 2;
+        }
         return 1;
     }
     eprintln!("tirith rule {cmd}: {msg}");

@@ -25,6 +25,7 @@
 //! presenter + the quarantine filesystem op.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -429,16 +430,26 @@ fn truncate_line(s: &str) -> String {
 
 /// Read a file as UTF-8 (lossy), with a size cap matching the scan engine's
 /// per-file cap so a pathological file cannot exhaust memory.
+///
+/// The cap is enforced by reading through a `take`-bounded handle rather than
+/// stat-then-read: a `metadata().len()` check is a TOCTOU race — the file can
+/// grow between the stat and the read, so a stat-gated `std::fs::read` could
+/// still slurp an arbitrarily large file. Reading at most `MAX_BYTES + 1` bytes
+/// and rejecting when the buffer exceeds `MAX_BYTES` bounds memory regardless of
+/// concurrent growth.
 fn read_text(path: &Path) -> std::io::Result<String> {
-    const MAX_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
-    let meta = std::fs::metadata(path)?;
-    if meta.len() > MAX_BYTES {
+    const MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    // Read one byte past the cap so an exactly-`MAX_BYTES` file is accepted while
+    // anything larger is detectable.
+    file.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("{} is larger than 10 MiB; skipping", path.display()),
         ));
     }
-    let bytes = std::fs::read(path)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -1114,5 +1125,45 @@ mod tests {
         let (added, removed) = added_removed("a\nb", "a  \nb\n");
         assert!(added.is_empty());
         assert!(removed.is_empty());
+    }
+
+    // CodeRabbit M13 round-5 D5-3: `read_text` must enforce its 10 MiB cap
+    // through a `take`-bounded read, not a TOCTOU stat-then-read. The cap is the
+    // load-bearing security property, so assert the boundary directly: a file
+    // exactly at the cap reads, a file one byte over is rejected as InvalidData
+    // with the documented message, and the buffer can never exceed the cap.
+    const READ_TEXT_MAX_BYTES: usize = 10 * 1024 * 1024;
+
+    #[test]
+    fn read_text_accepts_file_at_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("at_cap.txt");
+        std::fs::write(&path, vec![b'a'; READ_TEXT_MAX_BYTES]).expect("write");
+        let s = read_text(&path).expect("a file exactly at the cap must be accepted");
+        assert_eq!(s.len(), READ_TEXT_MAX_BYTES);
+    }
+
+    #[test]
+    fn read_text_rejects_file_over_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("over_cap.txt");
+        // One byte past the cap must be rejected — and crucially, only
+        // MAX_BYTES + 1 bytes are ever read into memory regardless of how large
+        // the file actually is.
+        std::fs::write(&path, vec![b'a'; READ_TEXT_MAX_BYTES + 1]).expect("write");
+        let err = read_text(&path).expect_err("a file over the cap must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("larger than 10 MiB"),
+            "error must keep the documented message; got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_text_reads_small_file_verbatim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("small.txt");
+        std::fs::write(&path, "hello\nworld\n").expect("write");
+        assert_eq!(read_text(&path).expect("read"), "hello\nworld\n");
     }
 }

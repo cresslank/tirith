@@ -65,6 +65,10 @@ const LOCKFILES: &[(&str, &str)] = &[
     ("go.sum", "go.sum"),
 ];
 
+/// Schema version of the `onboard --json` envelope (both the success report and
+/// the error envelope carry it). Stable; bump on breaking changes.
+const ONBOARD_SCHEMA_VERSION: u32 = 1;
+
 /// The detection report `onboard` builds and (optionally) serializes to JSON.
 ///
 /// Field naming and casing mirror the other `--json` surfaces (snake_case,
@@ -132,11 +136,21 @@ pub fn run(mode: Option<&str>, apply: bool, json: bool) -> i32 {
     // interactive prompts and may invoke `tirith init`, whose output would
     // corrupt the JSON document. Reject the combination up front (M13 PR #132
     // finding L) rather than emitting valid JSON followed by non-JSON noise.
+    //
+    // The caller asked for `--json`, so the rejection itself must be
+    // machine-readable: emit the same `{schema_version, error}` envelope the
+    // other `--json` surfaces use (CodeRabbit M13 round-5 D5-4) rather than raw
+    // stderr text automation can't parse. A failed write exits non-zero (2),
+    // matching the success path's broken-pipe contract.
     if json && apply {
-        eprintln!(
-            "tirith onboard: --json and --apply cannot be combined \
-             (--apply prints interactive prompts that would corrupt the JSON output)."
-        );
+        let err = serde_json::json!({
+            "schema_version": ONBOARD_SCHEMA_VERSION,
+            "error": "--json and --apply cannot be combined \
+                      (--apply prints interactive prompts that would corrupt the JSON output)",
+        });
+        if !crate::cli::write_json_stdout(&err, "tirith onboard: failed to write JSON output") {
+            return 2;
+        }
         return 1;
     }
 
@@ -200,7 +214,7 @@ fn gather_report(
     let next_actions = build_next_actions(&tirith, recommended_template);
 
     OnboardReport {
-        schema_version: 1,
+        schema_version: ONBOARD_SCHEMA_VERSION,
         cwd: cwd.display().to_string(),
         repo_root: repo_root.map(|p| p.display().to_string()),
         requested_mode,
