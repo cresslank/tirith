@@ -172,9 +172,10 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
                 });
             }
             // Reject a clause that uses a predicate no scan context can satisfy
-            // (today: `mcp.tool` — no MCP-tool signal is wired in yet, so the
-            // rule would validate+load yet never match). CodeRabbit M13 round-3
-            // R3-3. `agent.kind` is NOT rejected (it stays valid — R3-9).
+            // (`mcp.tool` and `agent.kind` — neither signal is wired into the
+            // scan context, so the rule would validate+load yet never match).
+            // CodeRabbit M13 round-3 R3-3 (`mcp.tool`) + round-8 R8-1
+            // (`agent.kind`; use `agent_rules` for per-agent control instead).
             if let Some(reason) = crate::custom_rule_dsl::clause_uses_unsupported_predicate(when) {
                 issues.push(PolicyIssue {
                     level: IssueLevel::Error,
@@ -1090,24 +1091,33 @@ custom_rules:
     }
 
     #[test]
-    fn test_dsl_rule_agent_kind_empty_context_allowed() {
-        // A context-agnostic clause (only `agent.kind`) has NO required trigger
-        // groups, so an empty context is vacuously satisfied and must NOT be
-        // rejected by the always-on coverage check.
-        let yaml = r#"
-custom_rules:
-  - id: agent-only
-    when:
-      agent.kind: claude-code
-    title: "agent-only rule"
-    context: []
-"#;
-        let issues = validate(yaml);
-        assert!(
-            !issues.iter().any(|i| i.message.contains("agent-only")
-                && i.message.contains("not covered by declared context")),
-            "context-agnostic DSL rule must not be rejected for empty context: {issues:?}"
-        );
+    fn test_dsl_rule_agent_kind_rejected_as_unsupported() {
+        // CodeRabbit M13 round-8 R8-1: an `agent.kind` clause reads a
+        // `DslEvalContext` field the engine hard-codes to `None`, so it can never
+        // match — `policy validate` must REJECT it (like `mcp.tool`), with a
+        // clear message that points at `agent_rules`. (Round-3 R3-9 had kept it
+        // valid; that is reversed here.) Cover both a bare clause and one nested
+        // in an `all:`.
+        for (id, when_block) in [
+            ("agent-bare", "      agent.kind: claude-code"),
+            (
+                "agent-nested",
+                "      all:\n        - command.uses_sudo: true\n        - agent.kind: claude-code",
+            ),
+        ] {
+            let yaml = format!(
+                "custom_rules:\n  - id: {id}\n    when:\n{when_block}\n    title: \"agent rule\"\n    context: [exec]\n"
+            );
+            let issues = validate(&yaml);
+            assert!(
+                issues.iter().any(|i| i.level == IssueLevel::Error
+                    && i.message.contains(id)
+                    && i.message.contains("agent.kind")
+                    && i.message.contains("not supported")
+                    && i.message.contains("agent_rules")),
+                "agent.kind rule '{id}' must be rejected with a clear message: {issues:?}"
+            );
+        }
     }
 
     #[test]

@@ -70,7 +70,8 @@ fn ordered_eval_contexts(contexts: &[ScanContext]) -> Vec<ScanContext> {
 /// Mirrors the engine: the named rule is run through the SAME
 /// [`compile_rules`] step the engine uses, then evaluated only from the
 /// COMPILED rule. A rule the engine would skip at compile time (invalid shape /
-/// regex, no valid context, or a DSL clause whose required trigger groups the
+/// regex, no valid context, a DSL clause using an unsupported predicate —
+/// `agent.kind`/`mcp.tool` — or a DSL clause whose required trigger groups the
 /// declared `context:` doesn't cover) is reported as not-firing/invalid here
 /// too — never FIRES — so `rule test` and `rule validate` agree. (CodeRabbit
 /// M13 round-2 R9.) Loads the policy strictly so a broken
@@ -275,8 +276,10 @@ pub fn validate(path: Option<&str>, json: bool) -> i32 {
                 });
             }
             // Reject a clause using a predicate no scan context can satisfy
-            // (today: `mcp.tool`). Same rejection `policy validate` applies —
-            // CodeRabbit M13 round-3 R3-3. `agent.kind` stays valid (R3-9).
+            // (`mcp.tool` and `agent.kind` — neither signal is wired into the
+            // scan context). Same rejection `policy validate` applies —
+            // CodeRabbit M13 round-3 R3-3 (`mcp.tool`) + round-8 R8-1
+            // (`agent.kind`; use `agent_rules` for per-agent control).
             if let Some(reason) = custom_rule_dsl::clause_uses_unsupported_predicate(when) {
                 errors.push(RuleError {
                     rule: rule.id.clone(),
@@ -285,12 +288,12 @@ pub fn validate(path: Option<&str>, json: bool) -> i32 {
             }
             // Tier-1 invariant: the declared context must cover the clause's
             // required trigger groups. Only emit this when the declared context
-            // tokens are VALID — a context-agnostic clause (e.g. only
-            // `agent.kind`) has no required groups and is vacuously satisfied,
-            // even with `context: []`, so it must NOT be rejected. This matches
+            // tokens are VALID. This matches
             // `policy_validate::validate_custom_rules` (R3-9): we no longer
             // special-case the empty declared set, and we skip the check on an
             // invalid context (already reported above) to avoid double-reporting.
+            // (Unsupported predicates like `agent.kind`/`mcp.tool` are already
+            // rejected just above — R8-1/R3-3.)
             let declared = declared_contexts(rule);
             let required = custom_rule_dsl::required_triggers(when);
             if !has_invalid_context && !required.is_satisfied_by(&declared) {

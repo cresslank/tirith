@@ -73,17 +73,24 @@ impl DslBacking {
                 })
                 .collect(),
             file_path,
-            // v1: the exec/paste hot path has no structured agent/MCP signal in
-            // scope (see `custom_rule_dsl` module docs). These stay `None` here;
-            // `tirith rule test` can set them.
+            // `agent_kind` is `None` on every engine path — no scan context
+            // wires up a current-agent-kind signal (per-agent control lives in
+            // the separate `agent_rules` / `AgentMatcher` flow). Like `mcp.tool`,
+            // any `when:` clause using `agent.kind` is rejected by both
+            // validators AND skipped by `compile_rules` (see
+            // `custom_rule_dsl::clause_uses_unsupported_predicate`, CodeRabbit
+            // M13 round-8 R8-1), so a loaded/compiled DSL rule never reaches here
+            // with an `agent.kind` predicate. This field is intentionally never
+            // populated.
             agent_kind: None,
             // `mcp_tool` is `None` on every engine path — no scan context wires
-            // up a current-MCP-tool signal. Rather than silently accept a rule
-            // that can never match, both validators reject any `when:` clause
-            // using `mcp.tool` up front (see
+            // up a current-MCP-tool signal. Like `agent.kind`, any `when:` clause
+            // using `mcp.tool` is rejected by both validators AND skipped by
+            // `compile_rules` (see
             // `custom_rule_dsl::clause_uses_unsupported_predicate`, CodeRabbit
-            // M13 round-3 R3-3), so a loaded DSL rule never reaches here with an
-            // `mcp.tool` predicate.
+            // M13 round-3 R3-3), so a loaded/compiled DSL rule never reaches here
+            // with an `mcp.tool` predicate. This field is intentionally never
+            // populated.
             mcp_tool: None,
         }
     }

@@ -20,7 +20,14 @@ fn tirith() -> Command {
 /// discovery anchored at the project dir.
 fn tirith_in_proj(proj: &std::path::Path) -> Command {
     let mut c = tirith();
-    c.current_dir(proj).env_remove("TIRITH_POLICY_ROOT");
+    c.current_dir(proj)
+        .env_remove("TIRITH_POLICY_ROOT")
+        // This file uses `TIRITH_INTERACTIVE` as a TTY-detection override seam.
+        // A runner that exports `TIRITH_INTERACTIVE=1` would otherwise flip the
+        // `.output()`-based non-interactive `ai quarantine` tests into
+        // interactive behavior (CodeRabbit M13 PR #132 R8-4); clear it so these
+        // builders always present as non-interactive under `.output()`.
+        .env_remove("TIRITH_INTERACTIVE");
     c
 }
 
@@ -35,11 +42,16 @@ fn tirith_in_proj(proj: &std::path::Path) -> Command {
 /// `APPDATA`/`LOCALAPPDATA` (the Windows base dirs `home`/`etcetera` honor;
 /// `home::home_dir()` reads `USERPROFILE` on Windows — round-4 DUP).
 /// `TIRITH_POLICY_ROOT` is cleared so an inherited value cannot redirect
-/// discovery away from `proj`.
+/// discovery away from `proj`. `TIRITH_INTERACTIVE` is cleared too: this file
+/// uses it as a TTY-detection override seam, so an inherited
+/// `TIRITH_INTERACTIVE=1` would flip the `.output()`-based non-interactive
+/// `onboard`/`apply` tests into interactive behavior (CodeRabbit M13 PR #132
+/// R8-4).
 fn tirith_onboard_isolated(proj: &std::path::Path, home: &std::path::Path) -> Command {
     let mut c = tirith();
     c.current_dir(proj)
         .env_remove("TIRITH_POLICY_ROOT")
+        .env_remove("TIRITH_INTERACTIVE")
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
@@ -13135,18 +13147,20 @@ fn rule_validate_paste_command_predicate_exits_zero() {
 }
 
 #[test]
-fn rule_validate_agent_kind_empty_context_exits_zero() {
-    // Round-3 R3-9: `rule validate` must mirror `policy validate` — a
-    // context-agnostic clause (only `agent.kind`) with `context: []` has no
-    // required trigger groups and is vacuously satisfied, so it must be ACCEPTED
-    // (the old code rejected EVERY when-rule with an empty parsed context set).
+fn rule_validate_agent_kind_is_rejected_as_unsupported() {
+    // CodeRabbit M13 round-8 R8-1: `agent.kind` reads a `DslEvalContext` field
+    // the engine hard-codes to `None`, so it can never match — `rule validate`
+    // must REJECT it (exit 1), like `mcp.tool`, with a clear message that points
+    // at `agent_rules`. (Round-3 R3-9 had accepted an `agent.kind`-only rule;
+    // that is reversed here.) A declared `context: [exec]` makes clear the
+    // rejection is about the predicate, not a coverage gap.
     let policy = r#"custom_rules:
   - id: agent-only
     when:
       agent.kind: claude-code
     severity: low
     title: "agent-only rule"
-    context: []
+    context: [exec]
 "#;
     let (_tmp, proj) = rule_project(policy);
     let out = tirith_in_proj(&proj)
@@ -13155,9 +13169,49 @@ fn rule_validate_agent_kind_empty_context_exits_zero() {
         .expect("run tirith");
     assert_eq!(
         out.status.code(),
-        Some(0),
-        "agent.kind-only rule with empty context must validate (round-3 R3-9); stderr: {}",
+        Some(1),
+        "agent.kind rule must be rejected (R8-1); stderr: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("agent-only")
+            && stderr.contains("agent.kind")
+            && stderr.contains("not supported")
+            && stderr.contains("agent_rules"),
+        "must reject agent.kind with a clear message pointing at agent_rules; got: {stderr}"
+    );
+}
+
+#[test]
+fn rule_validate_agent_kind_nested_in_all_is_rejected() {
+    // R8-1: the rejection must reach an `agent.kind` predicate buried inside an
+    // `all:` combinator too — not just a bare top-level clause.
+    let policy = r#"custom_rules:
+  - id: agent-nested
+    when:
+      all:
+        - command.uses_sudo: true
+        - agent.kind: claude-code
+    severity: high
+    title: "agent nested rule"
+    context: [exec]
+"#;
+    let (_tmp, proj) = rule_project(policy);
+    let out = tirith_in_proj(&proj)
+        .args(["rule", "validate"])
+        .output()
+        .expect("run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "agent.kind nested in all: must be rejected (R8-1); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("agent-nested") && stderr.contains("agent.kind"),
+        "must name the rule + agent.kind; got: {stderr}"
     );
 }
 

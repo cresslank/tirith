@@ -42,20 +42,24 @@
 //! | `package.name_matches`     | an extracted package whose name matches the regex                       |
 //! | `package.reputation`       | `malicious` = threat-DB package hit; `known` = known-popular package the DB vouches for; `unknown` = no DB, or a DB that lists the package in neither index |
 //! | `file.path_matches`        | `ctx.file_path` matches the regex                                       |
-//! | `agent.kind`               | `ctx.agent_kind` equals (see v1 limitation)                             |
-//! | `mcp.tool`                 | `ctx.mcp_tool` equals (see v1 limitation)                               |
+//! | `agent.kind`               | parsed but REJECTED at validate (see v1 limitation)                     |
+//! | `mcp.tool`                 | parsed but REJECTED at validate (see v1 limitation)                     |
 //!
-//! ## v1 limitations (documented, still parsed + validated)
+//! ## v1 limitations (parsed, but REJECTED by the validators)
 //!
 //! * **`agent.kind` / `mcp.tool`** — the exec/paste hot path
 //!   ([`crate::engine::analyze`]) has NO structured "current agent kind" or
 //!   "current MCP tool" in scope (agent/MCP signals live in separate flows:
-//!   `mcpdrift` runs over lockfiles in FileScan, and agent annotations are
-//!   rich-text `agent_view` enrichment). `DslEvalContext::agent_kind` /
-//!   `mcp_tool` are therefore `None` on that path, so these predicates evaluate
-//!   `false` there. They DO evaluate when a caller (e.g. `tirith rule test`)
-//!   sets them explicitly. The predicates are fully parsed, validated, and
-//!   contribute to [`required_triggers`].
+//!   `mcpdrift` runs over lockfiles in FileScan, agent governance lives in the
+//!   `agent_rules` / `AgentMatcher` flow, and agent annotations are rich-text
+//!   `agent_view` enrichment). `DslEvalContext::agent_kind` / `mcp_tool` are
+//!   hard-coded `None` on every engine path, so a DSL clause using either
+//!   predicate would validate and load yet NEVER match — a dead rule. Both
+//!   predicates are therefore REJECTED up front by `policy validate` and `rule
+//!   validate` (see [`clause_uses_unsupported_predicate`]); they are still
+//!   parsed so the error is precise. For per-agent control, use `agent_rules`
+//!   (CodeRabbit M13 round-3 R3-3 for `mcp.tool`, round-8 R8-1 for
+//!   `agent.kind`).
 //! * **`url.reputation` / `package.reputation`** — bound to the LOCAL signed
 //!   threat-DB + built-in known-domains table reachable on the hot path; NO
 //!   network lookup happens at eval time (matching the rest of the engine's
@@ -135,8 +139,8 @@ pub enum WhenClause {
     FilePathMatches(String),
 
     // ---- agent.* / mcp.* leaves ----
-    /// `agent.kind: <k>` — the current agent kind equals `<k>` (v1: only when a
-    /// caller sets it; see module docs).
+    /// `agent.kind: <k>` — parsed but REJECTED at validate (no agent-kind signal
+    /// is wired into the scan context; use `agent_rules`). See module docs.
     AgentKind(String),
     /// `mcp.tool: <t>` — the current MCP tool equals `<t>` (v1: only when a
     /// caller sets it; see module docs).
@@ -366,16 +370,18 @@ pub struct DslEvalContext<'a> {
 /// pipeline/sudo/cwd and package facts for every non-`FileScan` context, so a
 /// `[paste]` command/package rule sees its data at runtime (CodeRabbit M13
 /// round-3 R3-1). FileScan never populates those, so it is excluded.
-/// `file.path_matches` needs FileScan. `mcp.tool` is rejected by the validators
-/// (no MCP-tool signal is wired in yet — round-3 R3-3); its FileScan group here
-/// is the placeholder for when that signal lands. `agent.kind` is
-/// context-agnostic and contributes nothing (it never constrains the trigger
-/// group).
+/// `file.path_matches` needs FileScan. `mcp.tool` and `agent.kind` are both
+/// rejected by the validators (no MCP-tool / agent-kind signal is wired in —
+/// round-3 R3-3, round-8 R8-1), so their requirement here is never consulted for
+/// a loaded rule: `mcp.tool`'s FileScan group is the placeholder for when that
+/// signal lands, and `agent.kind` contributes nothing (it would never constrain
+/// the trigger group).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RequiredTriggerSet {
     /// Each inner group is a DISJUNCTION: the rule's contexts must intersect it.
     /// The outer Vec is a CONJUNCTION across predicate families. An empty outer
-    /// Vec means "no context constraint" (e.g. a rule with only `agent.kind`).
+    /// Vec means "no context constraint" (only reachable for an `agent.kind`
+    /// clause, which the validators reject before it can load).
     /// Inner groups are deduped and kept small (<= 3 contexts) — a `Vec` rather
     /// than a `BTreeSet` because `ScanContext` is intentionally not `Ord`.
     pub groups: Vec<Vec<ScanContext>>,
@@ -489,7 +495,8 @@ fn collect_required(clause: &WhenClause, set: &mut RequiredTriggerSet) {
         // when the signal lands and the rejection is lifted.
         WhenClause::McpTool(_) => set.push(&[FileScan]),
 
-        // Context-agnostic: never constrains the trigger group.
+        // `agent.kind` is rejected by the validators (round-8 R8-1), so this is
+        // never consulted for a loaded rule; it contributes no trigger group.
         WhenClause::AgentKind(_) => {}
     }
 }
@@ -499,16 +506,22 @@ fn collect_required(clause: &WhenClause, set: &mut RequiredTriggerSet) {
 /// clear, user-facing reason for the FIRST such predicate found, or `None` when
 /// every predicate is satisfiable.
 ///
-/// Today the only such predicate is `mcp.tool`: [`DslEvalContext::mcp_tool`] is
-/// hard-coded `None` on every engine path (the exec/paste hot path has no
-/// current-MCP-tool in scope, and the FileScan path scans file content, not a
-/// live tool invocation), so `when: { mcp.tool: ... }` would validate and load
-/// yet be a permanent no-op. Both validators (`policy validate` and `rule
-/// validate`) call this and REJECT such a rule rather than silently accept a
-/// dead rule (CodeRabbit M13 round-3 R3-3). `agent.kind` is intentionally NOT
-/// rejected — it is a legitimate context-agnostic predicate a caller (e.g.
-/// `tirith rule test`) can set, and the engine path documents it as `None` by
-/// design (round-3 R3-9 keeps it valid).
+/// Two predicates are unsupported today, both because their backing field in
+/// [`DslEvalContext`] is hard-coded `None` on every engine path:
+///
+/// * **`mcp.tool`** — [`DslEvalContext::mcp_tool`] is always `None` (the
+///   exec/paste hot path has no current-MCP-tool in scope, and the FileScan path
+///   scans file content, not a live tool invocation).
+/// * **`agent.kind`** — [`DslEvalContext::agent_kind`] is always `None` (the
+///   exec/paste hot path has no structured "current agent kind"; agent control
+///   lives in the separate `agent_rules` / `AgentMatcher` flow from M13 chunk 5,
+///   which is the supported way to gate per agent). A DSL `agent.kind` clause
+///   would validate and load yet be a permanent no-op, so it is rejected rather
+///   than left as a dead rule (CodeRabbit M13 round-8 R8-1).
+///
+/// Both validators (`policy validate` and `rule validate`) call this and REJECT
+/// such a rule rather than silently accept a dead rule (CodeRabbit M13 round-3
+/// R3-3 for `mcp.tool`; round-8 R8-1 for `agent.kind`).
 pub fn clause_uses_unsupported_predicate(clause: &WhenClause) -> Option<&'static str> {
     match clause {
         WhenClause::All(cs) | WhenClause::Any(cs) => {
@@ -518,6 +531,11 @@ pub fn clause_uses_unsupported_predicate(clause: &WhenClause) -> Option<&'static
         WhenClause::McpTool(_) => Some(
             "mcp.tool is not supported yet (no MCP-tool signal is wired into any \
              scan context, so the predicate can never match)",
+        ),
+        WhenClause::AgentKind(_) => Some(
+            "agent.kind is not supported in DSL `when:` clauses yet (no agent-kind \
+             signal is wired into the scan context; use `agent_rules` for per-agent \
+             control)",
         ),
         _ => None,
     }
@@ -1032,11 +1050,11 @@ any:
     }
 
     #[test]
-    fn test_unsupported_predicate_detects_mcp_tool() {
-        // CodeRabbit M13 round-3 R3-3: `mcp.tool` is parsed + type-checked but no
-        // scan context populates `mcp_tool`, so it can never match. The helper
-        // must flag it (nested inside combinators too), and NOT flag `agent.kind`
-        // (which stays valid — R3-9) or any satisfiable predicate.
+    fn test_unsupported_predicate_detects_mcp_tool_and_agent_kind() {
+        // CodeRabbit M13 round-3 R3-3 + round-8 R8-1: `mcp.tool` AND `agent.kind`
+        // are parsed + type-checked but no scan context populates `mcp_tool` /
+        // `agent_kind`, so they can never match. The helper must flag BOTH (nested
+        // inside combinators too) and NOT flag any satisfiable predicate.
         let bare = WhenClause::McpTool("read_file".to_string());
         let reason = clause_uses_unsupported_predicate(&bare).expect("mcp.tool must be flagged");
         assert!(
@@ -1044,7 +1062,19 @@ any:
             "reason must name mcp.tool clearly: {reason}"
         );
 
-        // Buried under all/any/not — still detected.
+        // `agent.kind` is now also rejected (round-8 R8-1), with a message that
+        // names the predicate and points at `agent_rules`.
+        let agent = WhenClause::AgentKind("claude-code".to_string());
+        let agent_reason =
+            clause_uses_unsupported_predicate(&agent).expect("agent.kind must be flagged (R8-1)");
+        assert!(
+            agent_reason.contains("agent.kind")
+                && agent_reason.contains("not supported")
+                && agent_reason.contains("agent_rules"),
+            "reason must name agent.kind + point at agent_rules: {agent_reason}"
+        );
+
+        // Buried under all/any/not — still detected (mcp.tool).
         let nested = WhenClause::All(vec![
             WhenClause::CommandUsesSudo(true),
             WhenClause::Any(vec![
@@ -1054,13 +1084,17 @@ any:
         ]);
         assert!(clause_uses_unsupported_predicate(&nested).is_some());
 
-        // `agent.kind` and ordinary predicates are NOT flagged.
-        assert!(clause_uses_unsupported_predicate(&WhenClause::AgentKind(
-            "claude-code".to_string()
-        ))
-        .is_none());
-        assert!(clause_uses_unsupported_predicate(&WhenClause::All(vec![
+        // Buried under all/any/not — still detected (agent.kind).
+        let nested_agent = WhenClause::All(vec![
+            WhenClause::CommandUsesSudo(true),
             WhenClause::AgentKind("claude-code".to_string()),
+        ]);
+        assert!(clause_uses_unsupported_predicate(&nested_agent).is_some());
+
+        // Ordinary, satisfiable predicates are NOT flagged.
+        assert!(clause_uses_unsupported_predicate(&WhenClause::CommandUsesSudo(true)).is_none());
+        assert!(clause_uses_unsupported_predicate(&WhenClause::All(vec![
+            WhenClause::UrlScheme("https".to_string()),
             WhenClause::CommandUsesSudo(true),
         ]))
         .is_none());

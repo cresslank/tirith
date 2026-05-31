@@ -29,18 +29,6 @@ impl CompiledCustomRule {
     }
 }
 
-/// Every [`ScanContext`] the engine actually evaluates custom rules in. The
-/// engine only runs [`check`]/[`check_dsl`] in `analyze_inner` for Exec / Paste
-/// / FileScan (the output-analysis path never touches custom rules). A
-/// context-agnostic DSL rule (one whose [`custom_rule_dsl::required_triggers`]
-/// is empty — e.g. an `agent.kind`-only clause) declared with `context: []` is
-/// given THIS set so [`check_dsl`]'s `rule.contexts.contains(&context)` gate
-/// lets it run in whichever context the engine reaches it (CodeRabbit M13
-/// round-7 R7-2). Keep this in sync with the contexts `analyze_inner` dispatches
-/// custom rules under.
-const EXECUTABLE_CONTEXTS: [ScanContext; 3] =
-    [ScanContext::Exec, ScanContext::Paste, ScanContext::FileScan];
-
 /// Parse a rule's declared `context:` strings into [`ScanContext`]s, warning on
 /// unknown tokens. Shared by both the regex and DSL compile paths.
 fn parse_contexts(rule: &CustomRule) -> Vec<ScanContext> {
@@ -62,19 +50,25 @@ fn parse_contexts(rule: &CustomRule) -> Vec<ScanContext> {
 }
 
 /// Compile custom rules from policy. Invalid rules (bad shape, invalid regex,
-/// pattern longer than the 1024-char cap, no valid contexts, or — for DSL rules
-/// — predicates whose required trigger groups aren't covered by the declared
-/// `context:`) are logged and skipped. This keeps the hot path fail-open: a
-/// malformed rule never blocks the user. Strict validation with non-zero exit
-/// lives in `tirith rule validate`, which mirrors EXACTLY the drops below.
+/// pattern longer than the 1024-char cap, no valid contexts, a DSL clause using
+/// an unsupported predicate, or — for DSL rules — predicates whose required
+/// trigger groups aren't covered by the declared `context:`) are logged and
+/// skipped. This keeps the hot path fail-open: a malformed rule never blocks the
+/// user. Strict validation with non-zero exit lives in `tirith rule validate`,
+/// which mirrors EXACTLY the drops below.
 ///
-/// Context handling (CodeRabbit M13 round-7 R7-2): a context-agnostic DSL rule
-/// — one whose [`custom_rule_dsl::required_triggers`] is empty (e.g. an
-/// `agent.kind`-only clause) — is VALID even with `context: []`. Rather than
-/// drop it as "no valid contexts" (which left it un-runnable), it is assigned
-/// the full [`EXECUTABLE_CONTEXTS`] set so [`check_dsl`] will run it in whatever
-/// context the engine reaches. A regex rule, or a DSL rule with NON-empty
-/// required triggers, still needs a declared context that covers its data.
+/// Unsupported-predicate handling (CodeRabbit M13 round-8 R8-1): a DSL clause
+/// using `agent.kind` or `mcp.tool` is SKIPPED here — those predicates read a
+/// [`custom_rule_dsl::DslEvalContext`] field the engine hard-codes to `None`, so
+/// the rule could never match. Both validators reject such a rule outright, and
+/// skipping here keeps the engine from pretending to run a dead rule. This
+/// removed round-7's "context-agnostic clause → assign an executable context
+/// set" branch: the ONLY clauses with empty required triggers were
+/// `agent.kind`-only ones (`mcp.tool` requires FileScan), and those are now
+/// skipped before context resolution, so the branch was unreachable. A regex
+/// rule, or a DSL rule with required triggers, still needs a declared context
+/// that covers its data; a DSL rule that resolves to no usable context is
+/// dropped as a dead rule (matching the regex path and `tirith rule validate`).
 pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
     let mut compiled = Vec::new();
     for rule in rules {
@@ -86,10 +80,10 @@ pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
 
         let declared = parse_contexts(rule);
 
-        // `contexts` is the EFFECTIVE executable set for this rule and `matcher`
-        // its compiled matcher. They are resolved together because a
-        // context-agnostic DSL rule with `context: []` gets a synthesized
-        // context set rather than the declared (empty) one.
+        // `contexts` is the executable context set for this rule and `matcher`
+        // its compiled matcher, resolved together. Both the regex and DSL arms
+        // use the rule's declared contexts directly (a rule that resolves to no
+        // usable context is dropped as a dead rule in each arm).
         let (contexts, matcher) = if let Some(pattern) = &rule.pattern {
             // Regex rule: needs a declared context (it has no required-trigger
             // notion). Empty declared contexts -> dead rule, skip.
@@ -128,33 +122,45 @@ pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
                 );
                 continue;
             }
-            let required = custom_rule_dsl::required_triggers(when);
-            // A context-agnostic clause (no required trigger groups, e.g.
-            // `agent.kind` only) is valid even with `context: []`: give it the
-            // full executable set so it runs in every context the engine
-            // evaluates (R7-2). A clause WITH required triggers but an empty
-            // declared context is a dead rule — fall through to the
-            // coverage check below, which rejects it.
-            let effective = if declared.is_empty() && required.groups.is_empty() {
-                EXECUTABLE_CONTEXTS.to_vec()
-            } else {
-                declared
-            };
-            // Tier-1 invariant: the (effective) context must cover the clause's
-            // required trigger groups, or the predicates can never see their
-            // data. Skip (fail-open) on the hot path; `tirith rule validate`
-            // reports this as a hard error. Vacuously satisfied for a
-            // context-agnostic clause (no groups), so the synthesized set above
-            // always passes.
-            if !required.is_satisfied_by(&effective) {
+            // Skip a clause that uses an unsupported predicate (`agent.kind` /
+            // `mcp.tool`): the engine hard-codes their backing field to `None`,
+            // so the rule could never match. Don't pretend to run a dead rule
+            // (CodeRabbit M13 round-8 R8-1). Both validators reject it outright.
+            if let Some(reason) = custom_rule_dsl::clause_uses_unsupported_predicate(when) {
                 eprintln!(
-                    "tirith: warning: custom rule '{}' when-clause needs context [{}] not covered by its declared context, skipping",
-                    rule.id,
-                    required.describe_unmet(&effective)
+                    "tirith: warning: custom rule '{}' {reason}, skipping",
+                    rule.id
                 );
                 continue;
             }
-            (effective, CompiledMatcher::When(Box::new(when.clone())))
+            // A regex-free DSL rule still needs a declared context that covers
+            // its predicates' required trigger groups. With `agent.kind` now
+            // skipped above, no remaining supported predicate is context-agnostic
+            // (`mcp.tool` is also skipped), so the round-7 "synthesize an
+            // executable set for an empty-required clause" branch is gone: an
+            // empty declared context here is a dead rule. Drop it (matching the
+            // regex path and `tirith rule validate`).
+            if declared.is_empty() {
+                eprintln!(
+                    "tirith: warning: custom rule '{}' has no valid contexts, skipping",
+                    rule.id
+                );
+                continue;
+            }
+            // Tier-1 invariant: the declared context must cover the clause's
+            // required trigger groups, or the predicates can never see their
+            // data. Skip (fail-open) on the hot path; `tirith rule validate`
+            // reports this as a hard error.
+            let required = custom_rule_dsl::required_triggers(when);
+            if !required.is_satisfied_by(&declared) {
+                eprintln!(
+                    "tirith: warning: custom rule '{}' when-clause needs context [{}] not covered by its declared context, skipping",
+                    rule.id,
+                    required.describe_unmet(&declared)
+                );
+                continue;
+            }
+            (declared, CompiledMatcher::When(Box::new(when.clone())))
         } else {
             // validate_shape already guaranteed one of the two arms above.
             unreachable!("validate_shape guarantees exactly one of pattern/when");
@@ -403,35 +409,66 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_context_agnostic_dsl_rule_empty_context_gets_executable_set() {
-        // CodeRabbit M13 round-7 R7-2: a context-agnostic `when:` rule (only
-        // `agent.kind`, so `required_triggers` is empty) declared `context: []`
-        // must NOT be dropped as "no valid contexts" — it must compile with an
-        // executable context set so `check_dsl`'s context gate can run it.
-        let rule = make_dsl_rule(
-            "agent-only",
+    fn test_compile_agent_kind_dsl_rule_is_skipped() {
+        // CodeRabbit M13 round-8 R8-1: an `agent.kind` clause reads
+        // `DslEvalContext::agent_kind`, which the engine hard-codes to `None`, so
+        // the rule could never match. `compile_rules` must SKIP it (not pretend
+        // to run a dead rule) — this replaced round-7's "context-agnostic clause
+        // gets an executable set" behavior, since `agent.kind` was the only
+        // empty-required predicate and it is now unsupported. Both an explicit
+        // context and `context: []` are dropped alike.
+        let with_ctx = make_dsl_rule(
+            "agent-only-ctx",
+            WhenClause::AgentKind("claude-code".into()),
+            &["exec"],
+        );
+        let empty_ctx = make_dsl_rule(
+            "agent-only-empty",
             WhenClause::AgentKind("claude-code".into()),
             &[],
         );
-        let compiled = compile_rules(&[rule]);
         assert_eq!(
-            compiled.len(),
-            1,
-            "context-agnostic DSL rule with context:[] must compile, not be dropped"
+            compile_rules(&[with_ctx]).len(),
+            0,
+            "agent.kind rule (with context) must be skipped — it can never match"
         );
-        assert!(compiled[0].is_dsl());
-        assert!(
-            !compiled[0].contexts.is_empty(),
-            "compiled rule must carry a non-empty executable context set"
+        assert_eq!(
+            compile_rules(&[empty_ctx]).len(),
+            0,
+            "agent.kind rule (empty context) must be skipped — it can never match"
         );
-        // It is given EVERY context the engine evaluates custom rules in, so it
-        // runs wherever the engine reaches it.
-        for c in [ScanContext::Exec, ScanContext::Paste, ScanContext::FileScan] {
-            assert!(
-                compiled[0].contexts.contains(&c),
-                "executable set must include {c:?} so check_dsl runs the rule there"
-            );
-        }
+        // Buried inside an `all:` it must STILL be skipped.
+        let nested = make_dsl_rule(
+            "agent-nested",
+            WhenClause::All(vec![
+                WhenClause::CommandUsesSudo(true),
+                WhenClause::AgentKind("claude-code".into()),
+            ]),
+            &["exec"],
+        );
+        assert_eq!(
+            compile_rules(&[nested]).len(),
+            0,
+            "a clause containing agent.kind (even nested) must be skipped"
+        );
+    }
+
+    #[test]
+    fn test_compile_mcp_tool_dsl_rule_is_skipped() {
+        // Companion to the agent.kind skip (R8-1) and the long-standing
+        // `mcp.tool` rejection (round-3 R3-3): an `mcp.tool` clause is also an
+        // unsupported predicate, so `compile_rules` must skip it rather than
+        // compile a rule the engine can never fire.
+        let rule = make_dsl_rule(
+            "mcp-tool",
+            WhenClause::McpTool("read_file".into()),
+            &["file"],
+        );
+        assert_eq!(
+            compile_rules(&[rule]).len(),
+            0,
+            "mcp.tool rule must be skipped — no scan context wires up the signal"
+        );
     }
 
     #[test]

