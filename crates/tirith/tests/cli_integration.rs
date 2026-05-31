@@ -3057,10 +3057,18 @@ fn onboard_conflicting_mode_flags_error() {
         .args(["onboard", "--repo", "--team"])
         .output()
         .expect("failed to run tirith onboard");
-    assert_ne!(
+    // clap rejects mutually-exclusive flags at PARSE time with usage exit code 2
+    // — pin that rather than a generic non-zero, so a regression into a runtime
+    // error (which would also be non-zero) is caught.
+    assert_eq!(
         out.status.code(),
-        Some(0),
-        "--repo and --team are mutually exclusive and must error"
+        Some(2),
+        "--repo and --team must be rejected by clap at parse time (usage error)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot be used with") || stderr.to_lowercase().contains("usage"),
+        "clap conflict error expected on stderr, got: {stderr}"
     );
 }
 
@@ -14482,11 +14490,8 @@ fn ai_snapshot_is_per_repo_and_does_not_collide() {
 // M13 PR #132 finding J — `ai diff` surfaces unreadable files, never fakes a diff
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
 #[test]
-fn ai_diff_unreadable_file_errors_instead_of_faking_removal() {
-    use std::os::unix::fs::PermissionsExt;
-
+fn ai_diff_unloadable_file_errors_instead_of_faking_removal() {
     let repo = ai_repo(&[("CLAUDE.md", "# Rules\n\nBe concise.\n")]);
     let state = tempfile::tempdir().expect("state");
 
@@ -14500,9 +14505,16 @@ fn ai_diff_unreadable_file_errors_instead_of_faking_removal() {
         .expect("run tirith");
     assert!(snap.status.success());
 
-    // Make the file unreadable (mode 000). `read_text` will fail with EACCES.
+    // Make the file UNLOADABLE deterministically on every runner (including
+    // root): overwrite it with content past `read_text`'s 10 MiB cap, so the
+    // read returns an `InvalidData` error instead of succeeding. A perms-based
+    // `chmod 000` is still readable as root (privileged CI/containers), and a
+    // directory wouldn't be collected as an AI-config file at all (it would look
+    // "removed" rather than erroring) — the size cap reaches `read_text`'s error
+    // branch the same way an EACCES would, for every runner.
     let file = repo.path().join("CLAUDE.md");
-    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+    let oversized = "a\n".repeat(6 * 1024 * 1024); // ~12 MiB > the 10 MiB read cap
+    fs::write(&file, oversized).unwrap();
 
     let out = tirith_in_proj(repo.path())
         .args(["ai", "diff", "--json"])
@@ -14511,9 +14523,6 @@ fn ai_diff_unreadable_file_errors_instead_of_faking_removal() {
         .env("LOCALAPPDATA", state.path())
         .output()
         .expect("run tirith");
-
-    // Restore perms so the tempdir can be cleaned up.
-    let _ = fs::set_permissions(&file, fs::Permissions::from_mode(0o644));
 
     // An unreadable file must surface an error and exit non-zero, NOT be treated
     // as empty (which would fabricate a removed/modified diff).
