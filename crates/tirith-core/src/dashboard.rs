@@ -1244,10 +1244,15 @@ mod tests {
             std::env::remove_var("TIRITH_POLICY_ROOT");
             std::env::remove_var("TIRITH_SERVER_URL");
             std::env::remove_var("TIRITH_API_KEY");
-            // `config_dir()` (etcetera) resolves to `<XDG_CONFIG_HOME>/tirith`;
-            // point it at an isolated dir we populate, so the developer's real
-            // user config is never read AND our user-overlay files are seen.
+            // `config_dir()` (etcetera) resolves to `<XDG_CONFIG_HOME>/tirith`
+            // on Linux/macOS but to `%APPDATA%\tirith` on Windows. Point ALL of
+            // them at an isolated dir so the developer's real user config is
+            // never read AND our user-overlay files are seen on every platform.
             std::env::set_var("XDG_CONFIG_HOME", isolated_config.path());
+            std::env::set_var("APPDATA", isolated_config.path());
+            std::env::set_var("LOCALAPPDATA", isolated_config.path());
+            std::env::set_var("HOME", isolated_config.path());
+            std::env::set_var("USERPROFILE", isolated_config.path());
         }
 
         // A valid local policy with exactly one (flat) allowlist entry.
@@ -1260,8 +1265,12 @@ mod tests {
         )
         .unwrap();
 
-        // User-scope overlay: a flat allowlist line (`load_user_lists`).
-        let user_tirith = isolated_config.path().join("tirith");
+        // User-scope overlay: a flat allowlist line (`load_user_lists`). Plant
+        // it at the SAME path `config_dir()` resolves to under the isolated env
+        // (etcetera's base differs by OS — XDG dir vs %APPDATA%), so the file is
+        // exactly where `load_user_lists`/`load_trust_entries` will look.
+        let user_tirith =
+            crate::policy::config_dir().expect("config_dir resolves under the isolated env");
         std::fs::create_dir_all(&user_tirith).unwrap();
         std::fs::write(user_tirith.join("allowlist"), "https://user.example.com\n").unwrap();
         // User-scope trust store: one flat entry (→ allowlist) + one rule-scoped
