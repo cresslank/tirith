@@ -145,8 +145,10 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
 
         // Validate contexts (shared by both rule shapes).
         let valid_contexts = ["exec", "paste", "file"];
+        let mut has_invalid_context = false;
         for ctx in &rule.context {
             if !valid_contexts.contains(&ctx.as_str()) {
+                has_invalid_context = true;
                 issues.push(PolicyIssue {
                     level: IssueLevel::Error,
                     message: format!(
@@ -169,9 +171,19 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
                     field: Some(format!("custom_rules.{}.when", rule.id)),
                 });
             }
+            // Trigger-coverage is ALWAYS validated against the declared
+            // contexts (CodeRabbit M13 finding D): an empty declared set cannot
+            // satisfy a non-empty required set, so a rule with `context: []` and
+            // a `command.*`/`url.*`/`package.*`/`file.*` predicate is a silent
+            // no-op and must be rejected — the previous `!declared.is_empty()`
+            // guard let it through. We DO skip this check when a context value
+            // was invalid: that's already reported above as its own issue, and
+            // emitting a coverage error too would double-report the same typo
+            // (the unknown token is dropped by `parse_declared_contexts`, which
+            // would otherwise look like an unmet requirement).
             let declared = parse_declared_contexts(&rule.context);
             let required = crate::custom_rule_dsl::required_triggers(when);
-            if !declared.is_empty() && !required.is_satisfied_by(&declared) {
+            if !has_invalid_context && !required.is_satisfied_by(&declared) {
                 issues.push(PolicyIssue {
                     level: IssueLevel::Error,
                     message: format!(
@@ -944,6 +956,147 @@ custom_rules:
         let yaml = "not_a_real_field: true\n";
         let issues = validate(yaml);
         assert!(issues.iter().any(|i| i.message.contains("unknown field")));
+    }
+
+    #[test]
+    fn test_dsl_rule_empty_context_rejected() {
+        // Regression (CodeRabbit M13 finding D): a DSL rule with an explicitly
+        // empty `context: []` and a `command.*` predicate is a silent no-op —
+        // its predicates can never see the data they reference — and must be
+        // rejected. The previous `!declared.is_empty()` guard let it pass.
+        let yaml = r#"
+custom_rules:
+  - id: empty-context-noop
+    when:
+      command.uses_sudo: true
+    title: "empty-context no-op"
+    context: []
+"#;
+        let issues = validate(yaml);
+        assert!(
+            issues.iter().any(|i| i.level == IssueLevel::Error
+                && i.message.contains("empty-context-noop")
+                && i.message.contains("not covered by declared context")),
+            "DSL rule with empty context must be rejected: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_dsl_rule_empty_context_file_predicate_rejected() {
+        // The always-on coverage check must also reject an empty context for a
+        // file-family predicate (a different required group than command/url).
+        let yaml = r#"
+custom_rules:
+  - id: empty-context-file
+    when:
+      file.path_matches: '\.env$'
+    title: "empty-context file rule"
+    context: []
+"#;
+        let issues = validate(yaml);
+        assert!(
+            issues.iter().any(|i| i.level == IssueLevel::Error
+                && i.message.contains("empty-context-file")
+                && i.message.contains("not covered by declared context")),
+            "DSL file rule with empty context must be rejected: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_dsl_rule_omitted_context_defaults_and_is_accepted() {
+        // When `context:` is OMITTED it defaults to [exec, paste] (NOT empty),
+        // so a url-family rule is covered and accepted. This is the
+        // counterpoint to the explicit `context: []` no-op above — finding D is
+        // about the EXPLICIT empty list, not the defaulted one.
+        let yaml = r#"
+custom_rules:
+  - id: defaulted-context
+    when:
+      url.reputation: unknown
+    title: "defaulted-context rule"
+"#;
+        let issues = validate(yaml);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.message.contains("defaulted-context")
+                    && i.message.contains("not covered by declared context")),
+            "DSL rule with omitted context (defaults to exec/paste) must be accepted: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_dsl_rule_invalid_context_not_double_reported() {
+        // An invalid context value is reported as its own issue; we must NOT
+        // also emit a trigger-coverage error for the same typo (the unknown
+        // token is dropped, which would otherwise look like an unmet
+        // requirement). Exactly one error mentions the rule, and it is the
+        // invalid-context one.
+        let yaml = r#"
+custom_rules:
+  - id: bogus-ctx
+    when:
+      command.uses_sudo: true
+    title: "bogus context"
+    context: [bogus]
+"#;
+        let issues = validate(yaml);
+        let rule_errors: Vec<&PolicyIssue> = issues
+            .iter()
+            .filter(|i| i.level == IssueLevel::Error && i.message.contains("bogus-ctx"))
+            .collect();
+        assert!(
+            rule_errors
+                .iter()
+                .any(|i| i.message.contains("invalid context")),
+            "invalid context must be reported: {issues:?}"
+        );
+        assert!(
+            !rule_errors
+                .iter()
+                .any(|i| i.message.contains("not covered by declared context")),
+            "must NOT double-report a coverage error for the dropped token: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_dsl_rule_valid_context_accepted() {
+        // Sanity: a DSL rule whose declared context covers its predicates passes.
+        let yaml = r#"
+custom_rules:
+  - id: ok-rule
+    when:
+      command.uses_sudo: true
+    title: "ok rule"
+    context: [exec]
+"#;
+        let issues = validate(yaml);
+        assert!(
+            !issues.iter().any(|i| i.message.contains("ok-rule")
+                && i.message.contains("not covered by declared context")),
+            "valid DSL rule must not produce a coverage error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_dsl_rule_agent_kind_empty_context_allowed() {
+        // A context-agnostic clause (only `agent.kind`) has NO required trigger
+        // groups, so an empty context is vacuously satisfied and must NOT be
+        // rejected by the always-on coverage check.
+        let yaml = r#"
+custom_rules:
+  - id: agent-only
+    when:
+      agent.kind: claude-code
+    title: "agent-only rule"
+    context: []
+"#;
+        let issues = validate(yaml);
+        assert!(
+            !issues.iter().any(|i| i.message.contains("agent-only")
+                && i.message.contains("not covered by declared context")),
+            "context-agnostic DSL rule must not be rejected for empty context: {issues:?}"
+        );
     }
 
     #[test]

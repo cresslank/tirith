@@ -40,7 +40,7 @@
 //! | `url.domain_not_in`        | at least one extracted URL whose host is NOT at/under any listed domain |
 //! | `package.ecosystem`        | an extracted install package in that ecosystem                          |
 //! | `package.name_matches`     | an extracted package whose name matches the regex                       |
-//! | `package.reputation`       | `malicious` = threat-DB package hit; `known`/`unknown` heuristic on the same DB |
+//! | `package.reputation`       | `malicious` = threat-DB package hit; `known` = known-popular package the DB vouches for; `unknown` = no DB, or a DB that lists the package in neither index |
 //! | `file.path_matches`        | `ctx.file_path` matches the regex                                       |
 //! | `agent.kind`               | `ctx.agent_kind` equals (see v1 limitation)                             |
 //! | `mcp.tool`                 | `ctx.mcp_tool` equals (see v1 limitation)                               |
@@ -61,6 +61,10 @@
 //!   network lookup happens at eval time (matching the rest of the engine's
 //!   local-first hot path). When no threat-DB is loaded, `malicious` is `false`
 //!   and every host/package is `unknown` (fail-open, never blocks the user).
+//!   When a DB IS loaded, `package.reputation` is a real tri-state (see
+//!   [`PkgReputation`]): `malicious` for a threat-DB hit, `known` for a
+//!   known-popular package the DB vouches for, and `unknown` for a package the
+//!   DB lists in neither index — so `unknown` stays reachable with a DB loaded.
 //! * **`package.*`** — packages come from [`crate::rules::threatintel::extract_packages`]
 //!   (install/add commands: pip/npm/yarn/pnpm/bun/npx/cargo/gem/go/composer/dotnet),
 //!   plus Docker image refs surfaced as the `docker` ecosystem. A command with
@@ -264,6 +268,42 @@ pub enum Reputation {
     Malicious,
 }
 
+/// Tri-state-plus package reputation, derived once by the engine from the LOCAL
+/// signed threat-DB.
+///
+/// The earlier `Option<bool>` collapsed two genuinely different states — "DB
+/// loaded but this package is absent" and "no DB loaded" — onto `Some(false)` /
+/// `None` in a way that made `package.reputation: unknown` unreachable once a DB
+/// was loaded and mislabeled every unseen package as `known` (CodeRabbit M13
+/// finding C). The four states are now distinct so the predicate maps them
+/// correctly:
+///
+/// * [`NoDb`](PkgReputation::NoDb) — no threat-DB was loaded; nothing can be
+///   classified (fail-open). The `unknown` predicate matches here.
+/// * [`Unknown`](PkgReputation::Unknown) — a DB IS loaded but this package
+///   appears in neither the malicious index nor the known-popular index. The
+///   `unknown` predicate matches.
+/// * [`Known`](PkgReputation::Known) — a DB is loaded and this package is in the
+///   known-popular (good) index and NOT flagged malicious. The `known`
+///   predicate matches.
+/// * [`Malicious`](PkgReputation::Malicious) — the threat-DB flags this package
+///   (a `check_package` hit). The `malicious` predicate matches.
+///
+/// `NoDb` and `Unknown` are kept separate (rather than collapsed) so callers /
+/// future predicates can tell "we have no data source" from "we looked and it
+/// isn't notable"; both currently satisfy the `unknown` predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PkgReputation {
+    /// No threat-DB loaded — cannot classify (fail-open).
+    NoDb,
+    /// DB loaded; package in neither the malicious nor the known-popular index.
+    Unknown,
+    /// DB loaded; package is a known-popular package and not malicious.
+    Known,
+    /// DB loaded; package is flagged malicious.
+    Malicious,
+}
+
 /// A package reference as seen by the DSL evaluator (ecosystem + name).
 ///
 /// Mirrors the fields of [`crate::rules::threatintel::PackageRef`] the
@@ -274,9 +314,8 @@ pub struct DslPackage<'a> {
     pub ecosystem: String,
     /// Package / image name.
     pub name: &'a str,
-    /// `Some(true)` = the threat-DB flags this package malicious;
-    /// `Some(false)` = looked up, not malicious; `None` = not looked up.
-    pub malicious: Option<bool>,
+    /// Reputation classification computed once by the engine from the local DB.
+    pub reputation: PkgReputation,
 }
 
 /// A URL reference as seen by the DSL evaluator (host + scheme + reputation).
@@ -322,7 +361,8 @@ pub struct DslEvalContext<'a> {
 ///
 /// `url.*` needs Exec OR Paste (URLs are extracted in both), so it contributes
 /// BOTH and a rule declaring either one satisfies it. `command.*` and
-/// `package.*` need Exec. `file.path_matches` needs FileScan. `mcp.tool` is a
+/// `package.*` need Exec (FileScan never populates `packages`).
+/// `file.path_matches` needs FileScan. `mcp.tool` is a
 /// FileScan signal (MCP lockfile drift). `agent.kind` is context-agnostic and
 /// contributes nothing (it never constrains the trigger group).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -414,9 +454,15 @@ fn collect_required(clause: &WhenClause, set: &mut RequiredTriggerSet) {
         | WhenClause::UrlReputation(_)
         | WhenClause::UrlDomainNotIn(_) => set.push(&[Exec, Paste]),
 
+        // `package.*` needs Exec ONLY. Although packages *could* in principle be
+        // extracted from file content, `ScanContext::FileScan` never populates
+        // `DslEvalContext::packages` (the engine's `build_dsl_backing` extracts
+        // package facts only off a typed/pasted command line — see engine.rs),
+        // so a `context: [file]` package rule would pass validation yet be dead
+        // at runtime. Require Exec so that mismatch is rejected at validate time.
         WhenClause::PackageEcosystem(_)
         | WhenClause::PackageNameMatches(_)
-        | WhenClause::PackageReputation(_) => set.push(&[Exec, FileScan]),
+        | WhenClause::PackageReputation(_) => set.push(&[Exec]),
 
         WhenClause::FilePathMatches(_) => set.push(&[FileScan]),
 
@@ -504,10 +550,16 @@ pub fn evaluate(clause: &WhenClause, ctx: &DslEvalContext) -> bool {
             Err(_) => false,
         },
         WhenClause::PackageReputation(rep) => ctx.packages.iter().any(|p| match rep {
-            Reputation::Malicious => p.malicious == Some(true),
-            Reputation::Known => p.malicious == Some(false),
-            // `unknown` = not looked up (no DB) — the v1 default for packages.
-            Reputation::Unknown => p.malicious.is_none(),
+            Reputation::Malicious => p.reputation == PkgReputation::Malicious,
+            // `known` = a known-popular package the DB vouches for (and which is
+            // not flagged malicious).
+            Reputation::Known => p.reputation == PkgReputation::Known,
+            // `unknown` = either no DB loaded, OR a DB is loaded but the package
+            // is in neither the malicious nor the known-popular index. Both are
+            // "we can't vouch for this", which is what `unknown` means.
+            Reputation::Unknown => {
+                matches!(p.reputation, PkgReputation::NoDb | PkgReputation::Unknown)
+            }
         }),
 
         WhenClause::FilePathMatches(pat) => match (&ctx.file_path, Regex::new(pat)) {
@@ -533,7 +585,13 @@ fn normalize_ecosystem(s: &str) -> String {
 /// `true` when `path` is `base` or a descendant of it. Both are compared as
 /// `/`-separated component sequences (purely lexical — no filesystem access),
 /// so `/home/x` is under `/home` but `/home-other` is not.
+///
+/// Windows back-slashes are normalized to `/` first, so `cwd_in: ["C:\\repo"]`
+/// matches `C:\\repo\\sub` (CodeRabbit M13 finding B). The comparison is
+/// otherwise unchanged.
 fn path_is_under(path: &str, base: &str) -> bool {
+    let path = path.replace('\\', "/");
+    let base = base.replace('\\', "/");
     let path = path.trim_end_matches('/');
     let base = base.trim_end_matches('/');
     if base.is_empty() {
@@ -761,6 +819,33 @@ any:
     }
 
     #[test]
+    fn test_required_triggers_package_needs_exec_only() {
+        // Regression (CodeRabbit M13 finding A): `package.*` must require Exec
+        // and NOT FileScan — the engine's FileScan path never extracts package
+        // facts, so a `context: [file]` package rule would validate yet be dead
+        // at runtime. Cover all three package predicates.
+        for clause in [
+            WhenClause::PackageEcosystem("npm".to_string()),
+            WhenClause::PackageNameMatches("^left-pad$".to_string()),
+            WhenClause::PackageReputation(Reputation::Malicious),
+        ] {
+            let req = required_triggers(&clause);
+            assert!(
+                req.is_satisfied_by(&[ScanContext::Exec]),
+                "package predicate must be satisfied by exec: {clause:?}"
+            );
+            assert!(
+                !req.is_satisfied_by(&[ScanContext::FileScan]),
+                "package predicate must NOT be satisfied by file (no package facts there): {clause:?}"
+            );
+            assert!(
+                !req.is_satisfied_by(&[ScanContext::Paste]),
+                "package predicate must NOT be satisfied by paste alone: {clause:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_required_triggers_file_needs_filescan() {
         let clause = WhenClause::FilePathMatches(r"\.env$".to_string());
         let req = required_triggers(&clause);
@@ -809,6 +894,22 @@ any:
     }
 
     #[test]
+    fn test_path_is_under_windows_separators() {
+        // Regression (CodeRabbit M13 finding B): Windows back-slashed paths must
+        // be normalized so `cwd_in: ["C:\\repo"]` matches a descendant.
+        assert!(path_is_under(r"C:\repo\sub", r"C:\repo"));
+        assert!(path_is_under(r"C:\repo", r"C:\repo"));
+        assert!(path_is_under(r"C:\repo\deep\nested", r"C:\repo"));
+        // Mixed separators still match (a `/`-form base, back-slashed path).
+        assert!(path_is_under(r"C:\repo\sub", "C:/repo"));
+        // A sibling that merely shares a prefix is NOT under the base.
+        assert!(!path_is_under(r"C:\repo-other\sub", r"C:\repo"));
+        // POSIX behavior is unchanged.
+        assert!(path_is_under("/home/x/y", "/home/x"));
+        assert!(!path_is_under("/home-other", "/home"));
+    }
+
+    #[test]
     fn test_host_is_under_domain() {
         assert!(host_is_under_domain("api.github.com", "github.com"));
         assert!(host_is_under_domain("github.com", "github.com"));
@@ -830,7 +931,7 @@ all:
         ctx.packages.push(DslPackage {
             ecosystem: "npm".to_string(),
             name: "left-pad",
-            malicious: Some(true),
+            reputation: PkgReputation::Malicious,
         });
         assert!(evaluate(&clause, &ctx));
 
@@ -839,9 +940,53 @@ all:
         ctx2.packages.push(DslPackage {
             ecosystem: "npm".to_string(),
             name: "left-pad",
-            malicious: Some(false),
+            reputation: PkgReputation::Known,
         });
         assert!(!evaluate(&clause, &ctx2));
+    }
+
+    #[test]
+    fn test_package_reputation_tristate() {
+        // Regression (CodeRabbit M13 finding C): `unknown`, `known`, and
+        // `malicious` must all be independently matchable, including `unknown`
+        // when a DB is loaded but the package is absent from both indices.
+        let unknown_clause = WhenClause::PackageReputation(Reputation::Unknown);
+        let known_clause = WhenClause::PackageReputation(Reputation::Known);
+        let malicious_clause = WhenClause::PackageReputation(Reputation::Malicious);
+
+        let cases = [
+            // No DB loaded -> unknown only.
+            (PkgReputation::NoDb, true, false, false),
+            // DB loaded but package absent from both indices -> unknown only.
+            (PkgReputation::Unknown, true, false, false),
+            // Known-popular package -> known only.
+            (PkgReputation::Known, false, true, false),
+            // Malicious hit -> malicious only.
+            (PkgReputation::Malicious, false, false, true),
+        ];
+        for (rep, want_unknown, want_known, want_malicious) in cases {
+            let mut ctx = DslEvalContext::default();
+            ctx.packages.push(DslPackage {
+                ecosystem: "npm".to_string(),
+                name: "some-pkg",
+                reputation: rep,
+            });
+            assert_eq!(
+                evaluate(&unknown_clause, &ctx),
+                want_unknown,
+                "unknown predicate for {rep:?}"
+            );
+            assert_eq!(
+                evaluate(&known_clause, &ctx),
+                want_known,
+                "known predicate for {rep:?}"
+            );
+            assert_eq!(
+                evaluate(&malicious_clause, &ctx),
+                want_malicious,
+                "malicious predicate for {rep:?}"
+            );
+        }
     }
 
     #[test]
@@ -852,7 +997,7 @@ all:
         ctx.packages.push(DslPackage {
             ecosystem: "crates.io".to_string(),
             name: "serde",
-            malicious: None,
+            reputation: PkgReputation::Unknown,
         });
         assert!(evaluate(&clause, &ctx));
     }

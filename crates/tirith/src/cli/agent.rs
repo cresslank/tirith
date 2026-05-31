@@ -1034,7 +1034,8 @@ pub fn block(
                     json,
                     "tirith agent block",
                     &format!(
-                        "unknown --filesystem-write {v:?} (valid: repo_only, home, everywhere)"
+                        "unknown --filesystem-write {v:?} \
+                         (valid: repo_only, repo-only, repo, home, everywhere, all)"
                     ),
                 );
                 return 1;

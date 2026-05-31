@@ -433,12 +433,13 @@ fn serve_loop(server: &tiny_http::Server, token: &str, issued_at: DateTime<Utc>)
 
 /// Authorize + respond to one request. Pulls the `Host` header and `token` query
 /// param, calls [`authorize`], and emits 200 (HTML) / 401 / 403 accordingly.
+///
+/// Authorization is decided BEFORE the request body is touched (M13 PR #132
+/// finding K): the decision derives only from the `Host` header + the `token`
+/// query parameter, so an unauthenticated client can never make us read (and
+/// buffer) an unbounded body pre-auth. Only after a successful authorize do we
+/// drain a BOUNDED amount of the body so the connection can be reused cleanly.
 fn handle_request(mut request: tiny_http::Request, token: &str, issued_at: DateTime<Utc>) {
-    // Drain any request body so the connection can be reused cleanly; we ignore
-    // its contents entirely (this is a read-only GET surface).
-    let mut sink = Vec::new();
-    let _ = request.as_reader().read_to_end(&mut sink);
-
     let host_header = request
         .headers()
         .iter()
@@ -454,39 +455,69 @@ fn handle_request(mut request: tiny_http::Request, token: &str, issued_at: DateT
         issued_at,
     );
 
-    let _ = match decision {
-        Decision::Ok => {
-            // Re-render fresh each request so a long-lived tab reflects new
-            // activity. The render escapes every value (see core).
-            let snapshot = build_snapshot();
-            let html = dashboard::render_html(&snapshot);
-            let mut response = tiny_http::Response::from_string(html);
-            // Best-effort content-type + hardening headers. `from_bytes` only
-            // fails on a non-ASCII header name/value, which these are not.
-            for (name, value) in [
-                ("Content-Type", "text/html; charset=utf-8"),
-                // Defense in depth for the report itself — it has no scripts, but
-                // a strict CSP makes that explicit and blocks any injected one.
-                (
-                    "Content-Security-Policy",
-                    "default-src 'none'; style-src 'unsafe-inline'",
-                ),
-                ("X-Content-Type-Options", "nosniff"),
-                ("Referrer-Policy", "no-referrer"),
-                ("Cache-Control", "no-store"),
-            ] {
-                if let Ok(h) = tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()) {
-                    response = response.with_header(h);
-                }
+    // Reject unauthorized / forbidden requests immediately, WITHOUT reading the
+    // body — a pre-auth client cannot grow our memory or keep the handler busy.
+    if decision != Decision::Ok {
+        let _ = match decision {
+            Decision::Unauthorized => request.respond(
+                tiny_http::Response::from_string("401 Unauthorized").with_status_code(401),
+            ),
+            Decision::Forbidden => request
+                .respond(tiny_http::Response::from_string("403 Forbidden").with_status_code(403)),
+            Decision::Ok => unreachable!("handled above"),
+        };
+        return;
+    }
+
+    // Authorized: drain a BOUNDED slice of the body so the connection can be
+    // reused cleanly. We ignore the contents entirely (this is a read-only GET
+    // surface); the cap means even an authorized client cannot stream us an
+    // unbounded body. Anything beyond the cap is left unread (the response is
+    // sent regardless).
+    const MAX_DRAIN: usize = 64 * 1024; // 64 KiB — generous for any legit GET body
+    {
+        // `as_reader()` yields `&mut dyn Read` (a trait object), so the `Sized`
+        // combinators (`take`/`by_ref`) don't apply. Drain manually with a fixed
+        // buffer, stopping at the cap, so even an authorized client can't stream
+        // us an unbounded body. Anything past the cap is left unread; the
+        // response is sent regardless.
+        let reader = request.as_reader();
+        let mut buf = [0u8; 8 * 1024];
+        let mut drained = 0usize;
+        while drained < MAX_DRAIN {
+            match reader.read(&mut buf) {
+                Ok(0) => break,        // EOF
+                Ok(n) => drained += n, // discard the bytes; we only need to drain
+                Err(_) => break,       // best-effort drain
             }
-            request.respond(response)
         }
-        Decision::Unauthorized => request
-            .respond(tiny_http::Response::from_string("401 Unauthorized").with_status_code(401)),
-        Decision::Forbidden => {
-            request.respond(tiny_http::Response::from_string("403 Forbidden").with_status_code(403))
+    }
+
+    // Authorized (Decision::Ok) — the only path that reaches here. Re-render
+    // fresh each request so a long-lived tab reflects new activity. The render
+    // escapes every value (see core).
+    let snapshot = build_snapshot();
+    let html = dashboard::render_html(&snapshot);
+    let mut response = tiny_http::Response::from_string(html);
+    // Best-effort content-type + hardening headers. `from_bytes` only
+    // fails on a non-ASCII header name/value, which these are not.
+    for (name, value) in [
+        ("Content-Type", "text/html; charset=utf-8"),
+        // Defense in depth for the report itself — it has no scripts, but
+        // a strict CSP makes that explicit and blocks any injected one.
+        (
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'",
+        ),
+        ("X-Content-Type-Options", "nosniff"),
+        ("Referrer-Policy", "no-referrer"),
+        ("Cache-Control", "no-store"),
+    ] {
+        if let Ok(h) = tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+            response = response.with_header(h);
         }
-    };
+    }
+    let _ = request.respond(response);
 }
 
 #[cfg(test)]
@@ -777,6 +808,80 @@ mod tests {
             raw_get_status(port, "/?token=wrong", &format!("127.0.0.1:{port}")),
             401,
             "a wrong token must be rejected 401"
+        );
+
+        handle.join().expect("server thread");
+    }
+
+    // -----------------------------------------------------------------------
+    // M13 PR #132 finding K — authorization happens BEFORE we read the body.
+    //
+    // `handle_request` now decides `authorize()` from the Host header + the
+    // `token` query param and EARLY-RETURNS 401/403 before entering the body
+    // drain. We can't reliably observe "didn't read the body" over a real
+    // socket because `tiny_http::Request::respond()` itself drains any unread
+    // body to keep HTTP framing intact. Instead we assert the observable
+    // contract that the reordering guarantees: a POST carrying a non-trivial
+    // body, sent with a FORBIDDEN (foreign) Host, is rejected 403 — the auth
+    // verdict never depends on the request body. (The pure `authorize` tests
+    // above pin the decision order; this end-to-end test pins that the bound
+    // server reaches that verdict for a body-bearing request.)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn unauthorized_body_bearing_request_is_rejected_by_auth() {
+        use std::time::Duration as StdDuration;
+
+        let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
+        let issued = Utc::now();
+
+        let server = tiny_http::Server::http(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("bind 127.0.0.1:0");
+        let port = server.server_addr().to_ip().expect("ip addr").port();
+
+        let tok = token.to_string();
+        let handle = std::thread::spawn(move || {
+            if let Ok(req) = server.recv() {
+                handle_request(req, &tok, issued);
+            }
+        });
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        // Foreign Host + a COMPLETE (Content-Length-matching) body. The body is
+        // present so the auth verdict provably does not require its absence; the
+        // verdict must still be 403 (Host fails the rebinding guard).
+        let body = "x".repeat(2048);
+        let req = format!(
+            "POST /?token=wrong HTTP/1.1\r\n\
+             Host: evil.example.com\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).expect("write request");
+        stream.flush().expect("flush");
+        // Bounded read timeout so a regression can't hang the suite indefinitely.
+        stream
+            .set_read_timeout(Some(StdDuration::from_secs(10)))
+            .expect("set read timeout");
+
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf);
+        let text = String::from_utf8_lossy(&buf);
+        let status: u16 = text
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+
+        assert_eq!(
+            status, 403,
+            "a foreign-Host request must be refused 403 regardless of its body; \
+             got status {status} (response: {text:?})"
         );
 
         handle.join().expect("server thread");

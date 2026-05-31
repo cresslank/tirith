@@ -53,21 +53,43 @@ struct SnapshotEntry {
 struct Snapshot {
     /// RFC3339 timestamp the snapshot was recorded.
     updated_at: String,
-    /// The repository root the snapshot was taken against (display path).
+    /// The repository root the snapshot was taken against (canonical display
+    /// path). `ai diff` / `ai snapshot` refuse to reuse a snapshot whose
+    /// recorded root does not match the current repo root, so a stale snapshot
+    /// from a DIFFERENT repo can never be silently compared against this one
+    /// (M13 PR #132 finding I).
     root: String,
     /// Map of `root`-relative file path → recorded entry. A `BTreeMap` so the
     /// on-disk JSON is deterministic (stable key order).
     files: BTreeMap<String, SnapshotEntry>,
 }
 
-/// Default snapshot path: `state_dir()/ai_config_snapshot.json`.
-fn snapshot_path() -> Option<PathBuf> {
-    state_dir().map(|d| d.join("ai_config_snapshot.json"))
+/// Per-repo snapshot path: `state_dir()/ai_config_snapshot-<hash>.json`, where
+/// `<hash>` is derived from the canonical repo root. Making the path
+/// repo-specific stops `tirith ai snapshot --update` in repo B from overwriting
+/// repo A's baseline, and stops `ai diff` from comparing against an unrelated
+/// snapshot (M13 PR #132 finding I).
+fn snapshot_path(root: &Path) -> Option<PathBuf> {
+    let hash = root_hash(root);
+    state_dir().map(|d| d.join(format!("ai_config_snapshot-{hash}.json")))
 }
 
-/// Load the snapshot, returning `Ok(None)` when no snapshot file exists yet.
-fn load_snapshot() -> std::io::Result<Option<Snapshot>> {
-    let Some(path) = snapshot_path() else {
+/// A short, filesystem-safe hex digest of the canonical repo root, used only to
+/// disambiguate per-repo snapshot files (not a security boundary — the recorded
+/// `root` inside the snapshot is the authoritative match check).
+fn root_hash(root: &Path) -> String {
+    let sha = tirith_core::clipboard::content_sha256_hex(root.to_string_lossy().as_bytes());
+    sha[..sha.len().min(16)].to_string()
+}
+
+/// Load the snapshot for `root`, returning `Ok(None)` when no snapshot file
+/// exists yet. A snapshot whose recorded `root` differs from `root` is treated
+/// as absent (`Ok(None)`): it belongs to a different repo (e.g. a hash collision
+/// or a relocated tree) and must not be reused — the caller will report "no
+/// snapshot" and prompt a fresh `--update` rather than diffing against a
+/// foreign baseline (M13 PR #132 finding I).
+fn load_snapshot(root: &Path) -> std::io::Result<Option<Snapshot>> {
+    let Some(path) = snapshot_path(root) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "cannot determine tirith state directory",
@@ -81,6 +103,11 @@ fn load_snapshot() -> std::io::Result<Option<Snapshot>> {
                     format!("snapshot at {} is corrupt: {e}", path.display()),
                 )
             })?;
+            // Defense in depth against a hash collision / a stale file whose
+            // recorded root no longer matches: refuse to reuse it.
+            if snap.root != root.display().to_string() {
+                return Ok(None);
+            }
             Ok(Some(snap))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -101,11 +128,18 @@ fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
     }
 }
 
-/// Resolve the repo root to scan / snapshot. `tirith ai` is repo-scoped; absent
-/// an override we use the current directory (the snapshot records the root it
-/// was taken against, and `diff` re-derives relative paths the same way).
+/// Resolve the CANONICAL repo root to scan / snapshot. `tirith ai` is
+/// repo-scoped: we walk up to the `.git` boundary (the same discovery
+/// `tirith onboard` / `policy` use) and fall back to the current directory
+/// outside a git repo. The result is canonicalized so the per-repo snapshot
+/// path and the recorded `root` are stable regardless of how the user `cd`'d in
+/// (symlinks, `..`, `/var` → `/private/var` on macOS). Canonicalization is
+/// best-effort: if it fails (e.g. the dir was removed), the un-canonicalized
+/// path is used.
 fn repo_root() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = tirith_core::policy::find_repo_root(Some(&cwd.to_string_lossy())).unwrap_or(cwd);
+    std::fs::canonicalize(&root).unwrap_or(root)
 }
 
 /// `root`-relative display key for a file, falling back to the file's own
@@ -166,7 +200,8 @@ struct FileDiff {
 /// findings. With no snapshot, says so and suggests `tirith ai snapshot
 /// --update`.
 pub fn diff(json: bool) -> i32 {
-    let snapshot = match load_snapshot() {
+    let root = repo_root();
+    let snapshot = match load_snapshot(&root) {
         Ok(Some(s)) => s,
         Ok(None) => {
             if json {
@@ -193,7 +228,6 @@ pub fn diff(json: bool) -> i32 {
         }
     };
 
-    let root = repo_root();
     let current_files = tirith_core::scan::collect_ai_config_files(&root);
 
     // Build the union of file keys: those in the snapshot and those on disk now.
@@ -219,7 +253,23 @@ pub fn diff(json: bool) -> i32 {
             .map(|e| e.content.clone())
             .unwrap_or_default();
         let new = match current_by_key.get(key) {
-            Some(path) => read_text(path).unwrap_or_default(),
+            // A file present on disk that we cannot read (I/O error or over the
+            // size cap) must NOT be treated as empty — that would fabricate a
+            // "removed"/"modified" diff for a file that is simply unreadable.
+            // Surface the error and exit non-zero instead (M13 PR #132 finding J).
+            Some(path) => match read_text(path) {
+                Ok(content) => content,
+                Err(e) => {
+                    if !emit_error(
+                        json,
+                        "tirith ai diff",
+                        &format!("cannot read {}: {e}", path.display()),
+                    ) {
+                        return 2;
+                    }
+                    return 1;
+                }
+            },
             None => String::new(), // present in snapshot, gone on disk
         };
 
@@ -649,11 +699,12 @@ pub fn snapshot(update: bool, force: bool, json: bool) -> i32 {
 
 /// Show the current snapshot's metadata without modifying it.
 fn snapshot_status(json: bool) -> i32 {
-    let path_str = snapshot_path()
+    let root = repo_root();
+    let path_str = snapshot_path(&root)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<unresolved>".to_string());
 
-    let snap = match load_snapshot() {
+    let snap = match load_snapshot(&root) {
         Ok(s) => s,
         Err(e) => {
             if !emit_error(json, "tirith ai snapshot", &e.to_string()) {
@@ -790,7 +841,7 @@ fn snapshot_update(force: bool, json: bool) -> i32 {
         files: entries,
     };
 
-    let Some(path) = snapshot_path() else {
+    let Some(path) = snapshot_path(&root) else {
         if !emit_error(
             json,
             "tirith ai snapshot",

@@ -128,6 +128,18 @@ struct TirithState {
 ///   SAFE actions with per-step stdin confirmation (refuses non-interactively).
 /// * `json` — emit the detection + recommendation as a JSON object.
 pub fn run(mode: Option<&str>, apply: bool, json: bool) -> i32 {
+    // `--json` and `--apply` are mutually exclusive: `apply_actions` prints
+    // interactive prompts and may invoke `tirith init`, whose output would
+    // corrupt the JSON document. Reject the combination up front (M13 PR #132
+    // finding L) rather than emitting valid JSON followed by non-JSON noise.
+    if json && apply {
+        eprintln!(
+            "tirith onboard: --json and --apply cannot be combined \
+             (--apply prints interactive prompts that would corrupt the JSON output)."
+        );
+        return 1;
+    }
+
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cwd_str = cwd.display().to_string();
 
@@ -145,11 +157,8 @@ pub fn run(mode: Option<&str>, apply: bool, json: bool) -> i32 {
         if !crate::cli::write_json_stdout(&report, "tirith onboard: failed to write JSON output") {
             return 2;
         }
-        // Even under --json, --apply still performs actions (with confirmation)
-        // after emitting the report, so JSON consumers can script the apply.
-        if apply {
-            return apply_actions(&report);
-        }
+        // `--json` is never combined with `--apply` (rejected up front), so the
+        // JSON document is the entire output — no interactive apply follows.
         return 0;
     }
 
@@ -345,8 +354,8 @@ fn recommend_template(signals: &RecommendationSignals) -> (PolicyTemplate, Strin
         }
         Some("team") => {
             return (
-                PolicyTemplate::CiStrict,
-                "requested --team (locked-down shared defaults)".to_string(),
+                PolicyTemplate::Startup,
+                "requested --team (balanced shared defaults for a human team)".to_string(),
             );
         }
         Some("repo") => {
@@ -487,16 +496,21 @@ fn fmt_list(items: &[String]) -> String {
 fn apply_actions(report: &OnboardReport) -> i32 {
     println!();
     if !is_tty_pair() {
-        // Non-interactive: do NOT silently perform destructive actions.
+        // Non-interactive: do NOT silently perform destructive actions. This is a
+        // refusal to do the requested work, so it exits NON-ZERO (M13 PR #132
+        // finding N) — a CI / piped `--apply` should not look like a success.
         eprintln!("tirith onboard --apply: not an interactive terminal — refusing to act.");
         eprintln!("  Re-run interactively to apply, or perform these steps yourself:");
         for action in &report.next_actions {
             eprintln!("    - {action}");
         }
-        return 0;
+        return 1;
     }
 
     let mut performed = 0;
+    // Set when any attempted step failed, so the overall exit code propagates the
+    // failure instead of masking it as a success (finding N).
+    let mut failed = false;
 
     // 1. Install the shell hook (idempotent; `init` only prints the eval line
     //    and materializes hook assets — it does not edit the profile).
@@ -511,6 +525,7 @@ fn apply_actions(report: &OnboardReport) -> i32 {
             performed += 1;
         } else {
             eprintln!("  `tirith init` failed (exit code {rc}).");
+            failed = true;
         }
     }
 
@@ -531,6 +546,7 @@ fn apply_actions(report: &OnboardReport) -> i32 {
             performed += 1;
         } else {
             eprintln!("  `tirith policy init` failed (exit code {rc}).");
+            failed = true;
         }
     }
 
@@ -539,7 +555,12 @@ fn apply_actions(report: &OnboardReport) -> i32 {
     } else {
         println!("tirith onboard: applied {performed} action(s).");
     }
-    0
+    // Propagate any step failure as a non-zero exit.
+    if failed {
+        1
+    } else {
+        0
+    }
 }
 
 /// Interactive `[y/N]` prompt that reads a line from stdin. The prompt goes to
@@ -580,13 +601,15 @@ mod tests {
         });
         assert_eq!(ai.0, PolicyTemplate::AiAgentHeavy);
 
+        // `--team` maps to the balanced human-team preset (`startup`), not the CI
+        // profile. (M13 PR #132 finding M.)
         let team = recommend_template(&RecommendationSignals {
             mode: Some("team"),
             ai_config_count: 0,
             mcp_config_count: 0,
             ci_detected: false,
         });
-        assert_eq!(team.0, PolicyTemplate::CiStrict);
+        assert_eq!(team.0, PolicyTemplate::Startup);
 
         // `--repo` respects a CI signal but otherwise picks individual.
         let repo_ci = recommend_template(&RecommendationSignals {

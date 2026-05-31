@@ -35,8 +35,11 @@ pub struct DslBacking {
     uses_sudo: bool,
     /// `(host, scheme, reputation)` per extracted URL.
     urls: Vec<(String, String, crate::custom_rule_dsl::Reputation)>,
-    /// `(ecosystem, name, malicious)` per extracted package.
-    packages: Vec<(String, String, Option<bool>)>,
+    /// `(ecosystem, name, reputation)` per extracted package. The reputation is
+    /// a real tri-state (see [`crate::custom_rule_dsl::PkgReputation`]) so
+    /// `package.reputation: unknown` stays reachable with a DB loaded and an
+    /// unseen package is NOT misreported as `known` (CodeRabbit M13 finding C).
+    packages: Vec<(String, String, crate::custom_rule_dsl::PkgReputation)>,
 }
 
 impl DslBacking {
@@ -63,10 +66,10 @@ impl DslBacking {
             packages: self
                 .packages
                 .iter()
-                .map(|(e, n, m)| crate::custom_rule_dsl::DslPackage {
+                .map(|(e, n, rep)| crate::custom_rule_dsl::DslPackage {
                     ecosystem: e.clone(),
                     name: n.as_str(),
-                    malicious: *m,
+                    reputation: *rep,
                 })
                 .collect(),
             file_path,
@@ -92,6 +95,38 @@ fn host_reputation(
         Reputation::Known
     } else {
         Reputation::Unknown
+    }
+}
+
+/// Classify a package's reputation against the LOCAL signed threat-DB as a real
+/// tri-state (CodeRabbit M13 finding C). The threat-DB is a malicious-package
+/// index plus a known-popular (good) index, so:
+///
+/// * no DB loaded → [`PkgReputation::NoDb`] (fail-open; cannot classify);
+/// * `check_package` hit → [`PkgReputation::Malicious`];
+/// * else a known-popular package → [`PkgReputation::Known`];
+/// * else → [`PkgReputation::Unknown`] (DB loaded, package in neither index).
+///
+/// `check_package` returns `Some` ONLY for a malicious hit and `None` when the
+/// package is absent — so a `None` does NOT mean "known", it means "not in the
+/// malicious index"; we consult the popular index separately for the `known`
+/// state. Malicious wins over known.
+fn package_reputation(
+    eco: crate::threatdb::Ecosystem,
+    name: &str,
+    version: Option<&str>,
+    threat_db: Option<&crate::threatdb::ThreatDb>,
+) -> crate::custom_rule_dsl::PkgReputation {
+    use crate::custom_rule_dsl::PkgReputation;
+    let Some(db) = threat_db else {
+        return PkgReputation::NoDb;
+    };
+    if db.check_package(eco, name, version).is_some() {
+        PkgReputation::Malicious
+    } else if db.is_popular_package(eco, name) {
+        PkgReputation::Known
+    } else {
+        PkgReputation::Unknown
     }
 }
 
@@ -133,25 +168,22 @@ pub fn build_dsl_backing(
     }
 
     // Packages: install/add commands (pip/npm/cargo/...) via the shared
-    // extractor, plus Docker image refs from the extracted URLs.
-    let mut packages: Vec<(String, String, Option<bool>)> = Vec::new();
+    // extractor, plus Docker image refs from the extracted URLs. Reputation is a
+    // real tri-state — see [`package_reputation`] (CodeRabbit M13 finding C).
+    let mut packages: Vec<(String, String, crate::custom_rule_dsl::PkgReputation)> = Vec::new();
     if scan_context != ScanContext::FileScan {
         let segments = crate::tokenize::tokenize(analyzed_input, shell);
         for pkg in crate::rules::threatintel::extract_packages(&segments) {
-            let malicious = threat_db.map(|db| {
-                db.check_package(pkg.ecosystem, &pkg.name, pkg.version.as_deref())
-                    .is_some()
-            });
-            packages.push((pkg.ecosystem.to_string(), pkg.name, malicious));
+            let reputation =
+                package_reputation(pkg.ecosystem, &pkg.name, pkg.version.as_deref(), threat_db);
+            packages.push((pkg.ecosystem.to_string(), pkg.name, reputation));
         }
     }
     for u in extracted {
         if let crate::parse::UrlLike::DockerRef { image, .. } = &u.parsed {
-            let malicious = threat_db.map(|db| {
-                db.check_package(crate::threatdb::Ecosystem::Docker, image, None)
-                    .is_some()
-            });
-            packages.push(("docker".to_string(), image.clone(), malicious));
+            let reputation =
+                package_reputation(crate::threatdb::Ecosystem::Docker, image, None, threat_db);
+            packages.push(("docker".to_string(), image.clone(), reputation));
         }
     }
 
@@ -3102,6 +3134,86 @@ fn enrich_team(findings: &mut [Finding]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CodeRabbit M13 finding C: package reputation must be a real tri-state
+    /// through the engine's `build_dsl_backing`, not a collapsed boolean. With a
+    /// DB LOADED we must be able to distinguish a malicious hit, a known-popular
+    /// package, and a package absent from both indices (→ `unknown`). The old
+    /// `Option<bool>` made `unknown` unreachable once a DB was loaded and marked
+    /// every unseen package `known`.
+    #[test]
+    fn test_build_dsl_backing_package_reputation_tristate() {
+        use crate::custom_rule_dsl::{evaluate, Reputation, WhenClause};
+        use crate::threatdb::{Confidence, Ecosystem, ThreatDb, ThreatDbWriter, ThreatSource};
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+
+        // Build a tiny signed DB: one malicious npm package + one known-popular
+        // npm package. A third installed package is in NEITHER index.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 1);
+        writer.add_package(
+            Ecosystem::Npm,
+            "evil-pkg",
+            &[],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            true, // all versions malicious
+            None,
+        );
+        writer.add_popular(Ecosystem::Npm, "react");
+        let bytes = writer.build(&key).expect("build threat db");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load threat db");
+
+        let cmd = "npm install evil-pkg react totally-unseen-pkg";
+        let extracted = extract::extract_urls(cmd, ShellType::Posix);
+        let backing = build_dsl_backing(
+            cmd,
+            ShellType::Posix,
+            ScanContext::Exec,
+            &extracted,
+            Some(&db),
+        );
+        let ctx = backing.as_eval_context(None, None);
+
+        // All three predicates must be independently reachable with a DB loaded.
+        assert!(
+            evaluate(&WhenClause::PackageReputation(Reputation::Malicious), &ctx),
+            "malicious must match the evil-pkg hit"
+        );
+        assert!(
+            evaluate(&WhenClause::PackageReputation(Reputation::Known), &ctx),
+            "known must match the popular react package"
+        );
+        assert!(
+            evaluate(&WhenClause::PackageReputation(Reputation::Unknown), &ctx),
+            "unknown MUST be reachable with a DB loaded (the absent package)"
+        );
+
+        // And with NO DB, everything is `unknown` (fail-open), never `known`.
+        let backing_nodb =
+            build_dsl_backing(cmd, ShellType::Posix, ScanContext::Exec, &extracted, None);
+        let ctx_nodb = backing_nodb.as_eval_context(None, None);
+        assert!(
+            evaluate(
+                &WhenClause::PackageReputation(Reputation::Unknown),
+                &ctx_nodb
+            ),
+            "no-DB: every package is unknown"
+        );
+        assert!(
+            !evaluate(&WhenClause::PackageReputation(Reputation::Known), &ctx_nodb),
+            "no-DB: no package may be reported as known"
+        );
+        assert!(
+            !evaluate(
+                &WhenClause::PackageReputation(Reputation::Malicious),
+                &ctx_nodb
+            ),
+            "no-DB: no package may be reported as malicious"
+        );
+    }
+
     #[test]
     fn test_exec_bidi_without_url() {
         // Bidi control alone (no URL) must reach tier 3; else the exec path

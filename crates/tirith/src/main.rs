@@ -3014,7 +3014,9 @@ Examples:
         #[arg(long = "move")]
         r#move: bool,
         /// Confirm the destructive --move without an interactive prompt.
-        #[arg(long)]
+        /// Meaningless without --move, so clap requires it (M13 PR #132
+        /// finding O).
+        #[arg(long, requires = "move")]
         yes: bool,
         /// Output format (default: human)
         #[arg(long, value_enum)]
@@ -3065,7 +3067,9 @@ Examples:
         update: bool,
         /// With --update, record the snapshot even when High+ issues are found
         /// (otherwise --update refuses to bless a compromised state).
-        #[arg(long)]
+        /// Meaningless without --update, so clap requires it (M13 PR #132
+        /// finding O).
+        #[arg(long, requires = "update")]
         force: bool,
         /// Output format (default: human)
         #[arg(long, value_enum)]
