@@ -70,7 +70,8 @@
 //!   plus Docker image refs surfaced as the `docker` ecosystem. A command with
 //!   no recognized install leader yields no packages, so `package.*` is `false`.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 
 use regex::Regex;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
@@ -552,6 +553,35 @@ fn check_regex(field: &str, pattern: &str) -> Result<(), String> {
         .map_err(|e| format!("{field}: invalid regex: {e}"))
 }
 
+thread_local! {
+    /// Per-thread compiled-regex cache for the DSL `*_matches` predicates.
+    /// Patterns are already validated at load (`validate_regexes`), so this only
+    /// avoids recompiling the SAME pattern on every `evaluate()` (which the hot
+    /// path calls once per command / file when a DSL rule runs). Cloning a
+    /// compiled `Regex` is cheap (it is `Arc`-backed), so the cache hands back a
+    /// clone and never lends a borrow across the match.
+    static REGEX_CACHE: RefCell<HashMap<String, Regex>> = RefCell::new(HashMap::new());
+}
+
+/// Compile `pat` once per thread and return a (cheap) clone of the cached
+/// `Regex`. Returns `None` if the pattern fails to compile — identical
+/// behavior to the previous inline `Regex::new(pat)` (a bad pattern yields no
+/// match), and validated patterns never hit that path.
+fn cached_regex(pat: &str) -> Option<Regex> {
+    REGEX_CACHE.with(|cache| {
+        if let Some(re) = cache.borrow().get(pat) {
+            return Some(re.clone());
+        }
+        match Regex::new(pat) {
+            Ok(re) => {
+                cache.borrow_mut().insert(pat.to_string(), re.clone());
+                Some(re)
+            }
+            Err(_) => None,
+        }
+    })
+}
+
 /// Evaluate a `when:` clause against the extracted analysis data.
 pub fn evaluate(clause: &WhenClause, ctx: &DslEvalContext) -> bool {
     match clause {
@@ -573,9 +603,9 @@ pub fn evaluate(clause: &WhenClause, ctx: &DslEvalContext) -> bool {
             let h = h.to_lowercase();
             ctx.urls.iter().any(|u| u.host.eq_ignore_ascii_case(&h))
         }
-        WhenClause::UrlHostMatches(pat) => match Regex::new(pat) {
-            Ok(re) => ctx.urls.iter().any(|u| re.is_match(u.host)),
-            Err(_) => false,
+        WhenClause::UrlHostMatches(pat) => match cached_regex(pat) {
+            Some(re) => ctx.urls.iter().any(|u| re.is_match(u.host)),
+            None => false,
         },
         WhenClause::UrlScheme(s) => ctx.urls.iter().any(|u| u.scheme.eq_ignore_ascii_case(s)),
         WhenClause::UrlReputation(rep) => ctx.urls.iter().any(|u| u.reputation == *rep),
@@ -594,9 +624,9 @@ pub fn evaluate(clause: &WhenClause, ctx: &DslEvalContext) -> bool {
                 .iter()
                 .any(|p| normalize_ecosystem(&p.ecosystem) == e)
         }
-        WhenClause::PackageNameMatches(pat) => match Regex::new(pat) {
-            Ok(re) => ctx.packages.iter().any(|p| re.is_match(p.name)),
-            Err(_) => false,
+        WhenClause::PackageNameMatches(pat) => match cached_regex(pat) {
+            Some(re) => ctx.packages.iter().any(|p| re.is_match(p.name)),
+            None => false,
         },
         WhenClause::PackageReputation(rep) => ctx.packages.iter().any(|p| match rep {
             Reputation::Malicious => p.reputation == PkgReputation::Malicious,
@@ -611,8 +641,8 @@ pub fn evaluate(clause: &WhenClause, ctx: &DslEvalContext) -> bool {
             }
         }),
 
-        WhenClause::FilePathMatches(pat) => match (&ctx.file_path, Regex::new(pat)) {
-            (Some(path), Ok(re)) => re.is_match(path),
+        WhenClause::FilePathMatches(pat) => match (&ctx.file_path, cached_regex(pat)) {
+            (Some(path), Some(re)) => re.is_match(path),
             _ => false,
         },
 
@@ -875,6 +905,38 @@ any:
             reputation: Reputation::Known,
         });
         assert!(evaluate(&clause, &ctx3));
+    }
+
+    // CodeRabbit M13 round-4 N5: `*_matches` predicates compile their regex
+    // through a per-thread cache instead of recompiling on every `evaluate()`.
+    // Repeated evaluation of the SAME `url.host_matches` rule must keep identical
+    // match / non-match semantics across calls (the cache is transparent).
+    #[test]
+    fn test_host_matches_regex_cache_preserves_semantics() {
+        let clause = WhenClause::UrlHostMatches(r"\.evil\.com$".to_string());
+
+        let mut hit = DslEvalContext::default();
+        hit.urls.push(DslUrl {
+            host: "a.evil.com",
+            scheme: "https",
+            reputation: Reputation::Unknown,
+        });
+        let mut miss = DslEvalContext::default();
+        miss.urls.push(DslUrl {
+            host: "good.com",
+            scheme: "https",
+            reputation: Reputation::Known,
+        });
+
+        // Evaluate repeatedly to exercise the cache hit path; the verdict is
+        // stable and the cache never flips a match into a non-match.
+        for _ in 0..3 {
+            assert!(evaluate(&clause, &hit), "matching host should fire");
+            assert!(
+                !evaluate(&clause, &miss),
+                "non-matching host should not fire"
+            );
+        }
     }
 
     #[test]

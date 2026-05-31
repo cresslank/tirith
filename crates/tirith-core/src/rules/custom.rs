@@ -25,7 +25,7 @@ pub struct CompiledCustomRule {
 impl CompiledCustomRule {
     /// `true` when this rule's matcher is a `when:` clause (DSL rule).
     pub fn is_dsl(&self) -> bool {
-        matches!(self.matcher, CompiledMatcher::When(_))
+        matches!(&self.matcher, CompiledMatcher::When(_))
     }
 }
 

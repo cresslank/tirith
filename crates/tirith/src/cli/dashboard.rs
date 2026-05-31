@@ -91,10 +91,12 @@ pub fn authorize(
     //    age is treated as "not expired" (fail toward the live window — the hard
     //    upper bound is what matters for the leave-a-tab-open threat).
     let age = now.signed_duration_since(issued_at);
-    if let Ok(ttl) = chrono::Duration::from_std(TOKEN_TTL) {
-        if age >= ttl {
-            return Decision::Unauthorized;
-        }
+    // `from_std` only errors on an out-of-range duration; `TOKEN_TTL` is a fixed
+    // 1h so it never does, but fall back to 1h rather than SKIPPING the expiry
+    // check (a silent skip would let a stale token live forever).
+    let ttl = chrono::Duration::from_std(TOKEN_TTL).unwrap_or_else(|_| chrono::Duration::hours(1));
+    if age >= ttl {
+        return Decision::Unauthorized;
     }
 
     // 3. Token value — constant-time compare to avoid a timing oracle.

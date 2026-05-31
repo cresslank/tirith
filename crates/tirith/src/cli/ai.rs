@@ -362,7 +362,7 @@ pub fn diff(json: bool) -> i32 {
 /// (via a public re-derivation): a line present in one side's normalized set but
 /// not the other. Whitespace-only churn is invisible. Returns `(added, removed)`.
 fn added_removed(old: &str, new: &str) -> (Vec<String>, Vec<String>) {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
     let norm = |s: &str| -> Vec<String> {
         s.lines()
             .map(|l| l.trim_end().to_string())
@@ -371,18 +371,49 @@ fn added_removed(old: &str, new: &str) -> (Vec<String>, Vec<String>) {
     };
     let old_lines = norm(old);
     let new_lines = norm(new);
-    let old_set: HashSet<&str> = old_lines.iter().map(|s| s.as_str()).collect();
-    let new_set: HashSet<&str> = new_lines.iter().map(|s| s.as_str()).collect();
-    let added: Vec<String> = new_lines
-        .iter()
-        .filter(|l| !old_set.contains(l.as_str()))
-        .map(|l| truncate_line(l))
-        .collect();
-    let removed: Vec<String> = old_lines
-        .iter()
-        .filter(|l| !new_set.contains(l.as_str()))
-        .map(|l| truncate_line(l))
-        .collect();
+    // Count-based diff: a line appearing more often on one side than the other
+    // contributes that many added/removed entries. A pure HashSet under-reports
+    // a line duplicated on one side but single on the other.
+    let mut old_counts: HashMap<&str, usize> = HashMap::new();
+    for l in &old_lines {
+        *old_counts.entry(l.as_str()).or_insert(0) += 1;
+    }
+    let mut new_counts: HashMap<&str, usize> = HashMap::new();
+    for l in &new_lines {
+        *new_counts.entry(l.as_str()).or_insert(0) += 1;
+    }
+    // Added: for each new line, emit (new_count - old_count) copies, in first-seen
+    // order. Tracking how many of each line we have already emitted keeps the
+    // output stable and avoids re-emitting on later occurrences of the same line.
+    let mut emitted_added: HashMap<&str, usize> = HashMap::new();
+    let mut added: Vec<String> = Vec::new();
+    for l in &new_lines {
+        let surplus = new_counts
+            .get(l.as_str())
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(old_counts.get(l.as_str()).copied().unwrap_or(0));
+        let already = emitted_added.entry(l.as_str()).or_insert(0);
+        if *already < surplus {
+            *already += 1;
+            added.push(truncate_line(l));
+        }
+    }
+    // Removed: symmetric — for each old line, emit (old_count - new_count) copies.
+    let mut emitted_removed: HashMap<&str, usize> = HashMap::new();
+    let mut removed: Vec<String> = Vec::new();
+    for l in &old_lines {
+        let surplus = old_counts
+            .get(l.as_str())
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(new_counts.get(l.as_str()).copied().unwrap_or(0));
+        let already = emitted_removed.entry(l.as_str()).or_insert(0);
+        if *already < surplus {
+            *already += 1;
+            removed.push(truncate_line(l));
+        }
+    }
     (added, removed)
 }
 
@@ -600,8 +631,7 @@ fn cache_dir() -> Option<PathBuf> {
             return Some(PathBuf::from(xdg));
         }
     }
-    #[allow(deprecated)]
-    std::env::home_dir().map(|h| h.join(".cache"))
+    home::home_dir().map(|h| h.join(".cache"))
 }
 
 /// Create the quarantine directory with restrictive permissions (0700 on Unix).
@@ -1062,5 +1092,27 @@ mod tests {
             cmd,
             r"Copy-Item -LiteralPath 'C:\q\it''s.txt' -Destination 'C:\orig\x.txt'"
         );
+    }
+
+    // CodeRabbit M13 round-4 N2: the display diff is count-based, so a line that
+    // appears more often on one side than the other is reported by the surplus,
+    // not collapsed to one (or dropped) the way a HashSet diff would.
+    #[test]
+    fn added_removed_reports_count_surplus() {
+        // A single `a` becomes two `a`s → exactly one added `a`, nothing removed.
+        let (added, removed) = added_removed("a", "a\na");
+        assert_eq!(added, vec!["a".to_string()]);
+        assert!(removed.is_empty());
+
+        // Symmetric: two `a`s become one → exactly one removed `a`.
+        let (added, removed) = added_removed("a\na", "a");
+        assert!(added.is_empty());
+        assert_eq!(removed, vec!["a".to_string()]);
+
+        // No churn when the multiset is unchanged (whitespace-only differs are
+        // normalized away by trim_end + empty-line filtering).
+        let (added, removed) = added_removed("a\nb", "a  \nb\n");
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
     }
 }

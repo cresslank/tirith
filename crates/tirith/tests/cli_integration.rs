@@ -30,9 +30,10 @@ fn tirith_in_proj(proj: &std::path::Path) -> Command {
 /// the shell rc) and XDG/`APPDATA` base dirs (for `discover_local_policy_path`'s
 /// config fallback), so without these overrides a test could read the runner's
 /// real `~/.codeium/...`, shell rc, or config policy and flake
-/// (CodeRabbit M13 PR #132 R3-10). All five env vars point at temp dirs:
-/// `HOME` (+ `XDG_CONFIG_HOME`/`XDG_STATE_HOME` on Unix) and
-/// `APPDATA`/`LOCALAPPDATA` (the Windows base dirs `home`/`etcetera` honor).
+/// (CodeRabbit M13 PR #132 R3-10). All env vars point at temp dirs:
+/// `HOME` (+ `XDG_CONFIG_HOME`/`XDG_STATE_HOME` on Unix) and `USERPROFILE` /
+/// `APPDATA`/`LOCALAPPDATA` (the Windows base dirs `home`/`etcetera` honor;
+/// `home::home_dir()` reads `USERPROFILE` on Windows — round-4 DUP).
 /// `TIRITH_POLICY_ROOT` is cleared so an inherited value cannot redirect
 /// discovery away from `proj`.
 fn tirith_onboard_isolated(proj: &std::path::Path, home: &std::path::Path) -> Command {
@@ -40,6 +41,7 @@ fn tirith_onboard_isolated(proj: &std::path::Path, home: &std::path::Path) -> Co
     c.current_dir(proj)
         .env_remove("TIRITH_POLICY_ROOT")
         .env("HOME", home)
+        .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
         .env("APPDATA", home.join("appdata"))
