@@ -1,0 +1,93 @@
+# Tirith security policy — "startup" template
+# For a small team moving fast — balanced, a little stricter than "individual".
+# Documentation: https://tirith.dev/docs/policy
+
+# Fail mode: "open" (allow on error) so a tirith hiccup never wedges a teammate
+# mid-task. The risk is managed below by raising paranoia and escalating the
+# noisiest remote-execution rules, not by failing closed.
+fail_mode: open
+
+# Paranoia level (1-4): 2 — one notch above the solo default. A growing team
+# pastes and runs more shared, half-trusted snippets than a single developer.
+paranoia: 2
+
+# Allow the per-command `TIRITH=0` bypass in interactive terminals so a teammate
+# can knowingly run something tirith flags.
+allow_bypass_env: true
+
+# Do NOT allow the bypass in non-interactive shells (scripts, local CI runs).
+# A checked-in script must not be able to silently skip analysis.
+allow_bypass_env_noninteractive: false
+
+# Require explicit acknowledgement for warn findings — a light guardrail that
+# keeps a warn from scrolling past unread while still letting the team move.
+strict_warn: true
+
+# Severity overrides per rule. The patterns most likely to bite a fast-moving
+# team are remote pipe-to-shell installs and link-shortened URLs in a shared
+# runbook; these are escalated so nobody runs them on autopilot.
+severity_overrides:
+  shortened_url: HIGH
+  curl_pipe_shell: HIGH
+  wget_pipe_shell: HIGH
+  pipe_to_interpreter: HIGH
+  docker_untrusted_registry: HIGH
+
+# URL / host patterns that always pass analysis. Add the install sources your
+# team trusts here instead of reaching for `TIRITH=0`. Examples:
+#   - "sh.rustup.rs"
+#   - "get.docker.com"
+allowlist: []
+
+# URL / host patterns that are always blocked (overrides allowlist).
+blocklist: []
+
+# Per-rule allowlist scoping — trust a source for ONE rule only.
+# allowlist_rules:
+#   - rule_id: curl_pipe_shell
+#     patterns:
+#       - "get.docker.com"
+
+# Scan configuration.
+scan:
+  ignore_patterns:
+    - "node_modules"
+    - "target"
+    - ".git"
+
+  # MCP server names the team trusts — suppresses per-server MCP config
+  # findings and drift detection for those names. See `tirith mcp policy init`.
+  # trusted_mcp_servers: []
+
+  # Per-server allowed tools — see `tirith mcp policy init` to scaffold.
+  # mcp_allowed_tools: {}
+
+# Per-agent governance — M4 item 8 (enforcement).
+# `tirith agent sessions` shows which AgentOrigin variants you see in
+# practice; `tirith agent policy init` scaffolds this block. A `deny`
+# match forces the verdict to Block and appends an
+# `agent_denied_by_policy` finding; `deny` beats any matching `allow`.
+# agent_rules:
+#   allow:
+#     - kind: human
+#     - kind: agent
+#       name: claude-code
+
+# Package-policy section — M6 ch7. A startup pulling dependencies quickly
+# benefits from a light dep-reputation gate: warn on brand-new / low-download
+# packages, block obvious typosquats. Tighten further as the team matures.
+# package_policy:
+#   block_not_found: false                    # block on registry HTTP 404 (--online only)
+#   block_newer_than_days:                    # block when first publication is <= N days
+#   warn_newer_than_days: 7                   # warn when a dep is <= 7 days old
+#   warn_low_downloads_below: 500             # warn on rarely-used packages
+#   block_install_scripts_for_unknown_packages: true   # block Unknown + script signal
+#   block_typosquat_distance: 1               # block one-character typosquats
+#   block_aggregate_score: 76                 # baseline; lower to tighten
+#   warn_aggregate_score: 51                  # baseline; lower to surface earlier
+#   block_osv_min_cvss: 7.0                   # any OSV >= this CVSS escalates to Block
+#   block_repo_mismatch: false                # elevate `package_repo_mismatch` to Block
+#   warn_install_script_network_call: true    # disable to silence install-script signal
+#   block_dependency_confusion: true          # disable to demote dep-confusion to Warn
+#   internal_package_names: []                # [{ ecosystem: npm, name: "@my-co/*" }]
+#   repo_mismatch_check_max_packages: 50      # cap on packages checked under --online

@@ -1,0 +1,104 @@
+# Tirith security policy — "mcp-strict" template
+# A locked-down posture for environments that lean heavily on MCP servers.
+# Documentation: https://tirith.dev/docs/policy
+
+# Fail mode: "closed" — if tirith cannot evaluate a command it blocks. An
+# environment that loads MCP servers (and therefore arbitrary tools) should not
+# let an unanalysed command through.
+fail_mode: closed
+
+# Paranoia level (1-4): 3 — MCP-driven workflows pull in untrusted tool
+# definitions and arguments, so detection is turned up.
+paranoia: 3
+
+# A human may bypass interactively; a tool / agent running non-interactively
+# must never be able to set TIRITH=0 to skip analysis.
+allow_bypass_env: true
+allow_bypass_env_noninteractive: false
+
+# Require explicit acknowledgement for warn findings.
+strict_warn: true
+
+# Severity overrides per rule. The threat model here is the MCP surface itself:
+# an insecure or untrusted server, a server that exposes a dangerous tool set,
+# suspicious server arguments, and drift away from the recorded lockfile. Each
+# of the MCP config rules is escalated so an MCP change cannot pass quietly.
+severity_overrides:
+  mcp_insecure_server: HIGH
+  mcp_untrusted_server: HIGH
+  mcp_overly_permissive: HIGH
+  mcp_suspicious_args: HIGH
+  mcp_server_drift: HIGH
+  shortened_url: HIGH
+  curl_pipe_shell: CRITICAL
+  pipe_to_interpreter: HIGH
+
+# Force specific rules to always block, regardless of their default action.
+# Only "block" is supported (escalation can upgrade, never downgrade).
+action_overrides:
+  mcp_untrusted_server: block
+  mcp_overly_permissive: block
+
+# URL / host patterns that always pass analysis. Keep this list tight.
+allowlist: []
+
+# URL / host patterns that are always blocked (overrides allowlist).
+blocklist: []
+
+# `tirith scan` configuration. The MCP-specific knobs below are the heart of
+# this template — declare exactly which servers and tools you accept.
+scan:
+  fail_on: high
+  ignore_patterns:
+    - "node_modules"
+    - "target"
+    - ".git"
+
+  # MCP server names you trust. Listing a name here suppresses the per-server
+  # MCP config findings AND exempts it from drift detection — so keep it as
+  # short as you can justify. Run `tirith mcp policy init` to scaffold this
+  # from `.tirith/mcp.lock`, then prune it to only the servers you vouch for.
+  # trusted_mcp_servers:
+  #   - my-trusted-server
+
+  # Per-server allowed tools. Keys are MCP server names; values are the EXACT
+  # tool names that server may expose. A tool the lockfile records that is NOT
+  # in this set raises a High-severity `mcp_server_drift` finding, and an empty
+  # list (`[]`) forbids ANY tool on that server. This is the tightest MCP gate
+  # tirith offers — pin it for every server an agent in this environment uses.
+  # mcp_allowed_tools:
+  #   my-trusted-server:
+  #     - read_only
+
+# Per-agent governance — M4 item 8 (enforcement).
+# An MCP-heavy environment benefits from per-origin policy: declare the MCP
+# clients you expect and deny the rest by review. A `deny` match forces the
+# verdict to Block and appends an `agent_denied_by_policy` finding; `deny`
+# beats any matching `allow`, and `allow` is NOT a bypass. `tirith agent
+# sessions` shows the AgentOrigins (including `mcp` clients) you actually see.
+# agent_rules:
+#   allow:
+#     - kind: mcp
+#       name: claude-code
+#   deny:
+#     - kind: mcp
+#       name: untrusted-client
+
+# Package-policy section — M6 ch7. An MCP-driven workflow that also installs
+# packages benefits from the same supply-chain gates the enterprise template
+# enables. Uncomment to opt in.
+# package_policy:
+#   block_not_found: true                     # block on registry HTTP 404 (--online only)
+#   block_newer_than_days: 7
+#   warn_newer_than_days: 30
+#   warn_low_downloads_below: 1000
+#   block_install_scripts_for_unknown_packages: true
+#   block_typosquat_distance: 1
+#   block_aggregate_score: 76
+#   warn_aggregate_score: 51
+#   block_osv_min_cvss: 7.0
+#   block_repo_mismatch: true
+#   warn_install_script_network_call: true
+#   block_dependency_confusion: true
+#   internal_package_names: []                # [{ ecosystem: npm, name: "@my-co/*" }]
+#   repo_mismatch_check_max_packages: 50

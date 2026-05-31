@@ -1,0 +1,93 @@
+# Tirith security policy — "ci-strict" template
+# Locked-down settings for an automated CI environment.
+# Documentation: https://tirith.dev/docs/policy
+
+# Fail mode: "closed" — if tirith cannot evaluate a command it blocks rather
+# than allowing it. CI should never silently let an unanalysed command run.
+fail_mode: closed
+
+# Paranoia level (1-4): 2 enables stricter detection than the daily default.
+paranoia: 2
+
+# Disable the `TIRITH=0` bypass entirely — interactive AND non-interactive.
+# A bypass in CI is a permanent hole, so neither form is permitted.
+allow_bypass_env: false
+allow_bypass_env_noninteractive: false
+
+# Require explicit acknowledgement for warn findings. In non-interactive CI
+# this means a warn cannot be silently passed through.
+strict_warn: true
+
+# Escalate the most common remote-execution rules to CRITICAL so they are
+# unmistakable in CI logs.
+severity_overrides:
+  shortened_url: HIGH
+  plain_http_to_sink: CRITICAL
+  curl_pipe_shell: CRITICAL
+  wget_pipe_shell: CRITICAL
+  pipe_to_interpreter: HIGH
+
+# Force specific rules to always block, regardless of their default action.
+# Only "block" is supported (escalation can upgrade, never downgrade).
+action_overrides:
+  shortened_url: block
+
+# URL / host patterns that always pass analysis. Keep this list short and
+# reviewed — every entry is a trusted hole in CI.
+allowlist: []
+
+# URL / host patterns that are always blocked (overrides allowlist).
+blocklist: []
+
+# `tirith scan` configuration. fail_on sets the severity threshold at which
+# a scan exits non-zero and fails the CI job.
+scan:
+  fail_on: high
+  ignore_patterns:
+    - "node_modules"
+    - "target"
+    - ".git"
+
+  # MCP server names CI considers trusted. Keep this tight — a trusted name
+  # silences every per-server MCP config finding and exempts the server
+  # from drift detection in CI. Generate from `tirith mcp policy init`.
+  # trusted_mcp_servers: []
+
+  # Per-server allowed tools — a CI guardrail against an agent or merge
+  # smuggling a new MCP tool past the lockfile. See `tirith mcp policy init`.
+  # mcp_allowed_tools: {}
+
+# Per-agent governance — M4 item 8 (enforcement).
+# A CI policy that wants to declare which callers are expected can list
+# them here. A `deny` match forces the verdict to Block and appends an
+# `agent_denied_by_policy` finding; `deny` beats any matching `allow`.
+# Enforcement runs via `apply_agent_rules` on every analysis path:
+# `tirith check` (the surface CI most often calls), `install`, `ecosystem
+# scan`, `paste`, and all MCP `tools/call_check_*` handlers. The
+# interactive `TIRITH=0` bypass currently skips `agent_rules`; in CI
+# this combines with `allow_bypass_env: false` below to close that
+# path. `tirith agent sessions` shows the AgentOrigins your CI actually
+# sees.
+# agent_rules:
+#   allow:
+#     - kind: ci
+#       name: github-actions
+
+# Package-policy section — M6 ch7. CI baseline tightens several knobs:
+# strict environments typically want the block-on-not-found / install-script
+# / aggregate-score elevations on by default. Uncomment to opt in.
+# package_policy:
+#   block_not_found: true                     # block on registry HTTP 404 (--online only)
+#   block_newer_than_days: 3                  # CI rejects brand-new packages
+#   warn_newer_than_days: 14
+#   warn_low_downloads_below: 100
+#   block_install_scripts_for_unknown_packages: true
+#   block_typosquat_distance: 1
+#   block_aggregate_score: 76
+#   warn_aggregate_score: 51
+#   block_osv_min_cvss: 7.0
+#   block_repo_mismatch: true
+#   warn_install_script_network_call: true
+#   block_dependency_confusion: true
+#   internal_package_names: []
+#   repo_mismatch_check_max_packages: 50

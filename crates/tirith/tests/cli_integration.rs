@@ -2590,7 +2590,17 @@ fn check_offline_composes_with_approval_check() {
 /// pass on it. Exercises the real binary end-to-end (init → validate).
 #[test]
 fn policy_init_templates_generate_and_validate() {
-    for template in ["individual", "ci-strict", "ai-agent-heavy"] {
+    for template in [
+        "individual",
+        "ci-strict",
+        "ai-agent-heavy",
+        "oss-maintainer",
+        "startup",
+        "enterprise",
+        "mcp-strict",
+        // `personal` is an alias of `individual` — it must init+validate too.
+        "personal",
+    ] {
         let dir = tempfile::tempdir().expect("tempdir");
 
         let init = tirith()
@@ -2653,12 +2663,64 @@ fn policy_init_rejects_unknown_template() {
     assert!(
         stderr.contains("individual")
             && stderr.contains("ci-strict")
-            && stderr.contains("ai-agent-heavy"),
-        "error should list valid templates: {stderr}"
+            && stderr.contains("ai-agent-heavy")
+            && stderr.contains("oss-maintainer")
+            && stderr.contains("startup")
+            && stderr.contains("enterprise")
+            && stderr.contains("mcp-strict"),
+        "error should list all 7 valid templates: {stderr}"
+    );
+    assert!(
+        stderr.contains("personal"),
+        "error should mention the 'personal' alias: {stderr}"
     );
     assert!(
         !dir.path().join(".tirith/policy.yaml").exists(),
         "a rejected template must not write a policy file"
+    );
+}
+
+/// M13 ch2: `tirith policy init --template personal` must write a policy
+/// byte-for-byte identical to `--template individual` (alias semantics), and
+/// the active `enterprise` template's `package_policy` block must survive the
+/// init → validate round-trip. Exercises the real binary end-to-end.
+#[test]
+fn policy_init_personal_is_byte_identical_to_individual() {
+    fn init_body(template: &str) -> String {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let init = tirith()
+            .args(["policy", "init", "--template", template])
+            .current_dir(dir.path())
+            .env_remove("TIRITH_POLICY_ROOT")
+            .output()
+            .expect("failed to run tirith policy init");
+        assert_eq!(
+            init.status.code(),
+            Some(0),
+            "policy init --template {template} should exit 0: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        fs::read_to_string(dir.path().join(".tirith/policy.yaml"))
+            .unwrap_or_else(|e| panic!("init --template {template} should write policy.yaml: {e}"))
+    }
+
+    let individual = init_body("individual");
+    let personal = init_body("personal");
+    assert_eq!(
+        personal, individual,
+        "`--template personal` must be byte-for-byte identical to `--template individual`"
+    );
+
+    // The enterprise template ships an ACTIVE (uncommented) package_policy
+    // block — assert the written file contains it as real YAML, not a comment.
+    let enterprise = init_body("enterprise");
+    assert!(
+        enterprise.contains("\npackage_policy:\n"),
+        "enterprise template must write an uncommented package_policy block"
+    );
+    assert!(
+        enterprise.contains("block_not_found: true"),
+        "enterprise package_policy must be active with strict defaults"
     );
 }
 

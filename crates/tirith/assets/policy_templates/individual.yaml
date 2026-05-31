@@ -1,0 +1,88 @@
+# Tirith security policy — "individual" template
+# Sensible defaults for a single developer on their own machine.
+# Documentation: https://tirith.dev/docs/policy
+
+# Fail mode: "open" (allow on error) keeps tirith out of your way if it
+# ever fails internally. A solo machine does not need fail-closed.
+fail_mode: open
+
+# Paranoia level (1-4): 1 is the recommended default for daily use.
+paranoia: 1
+
+# Allow the per-command `TIRITH=0` bypass in interactive terminals — handy
+# when you knowingly run something tirith flags.
+allow_bypass_env: true
+
+# Do NOT allow the bypass in non-interactive shells (scripts, CI-like runs).
+allow_bypass_env_noninteractive: false
+
+# Warn findings are shown but do not require an explicit acknowledgement.
+strict_warn: false
+
+# Severity overrides per rule. shortened_url is upgraded so link-shortened
+# install URLs stand out; everything else keeps its built-in severity.
+severity_overrides:
+  shortened_url: HIGH
+
+# URL / host patterns that always pass analysis. Add the install sources you
+# trust here instead of reaching for `TIRITH=0`. Examples:
+#   - "sh.rustup.rs"
+#   - "get.docker.com"
+allowlist: []
+
+# URL / host patterns that are always blocked (overrides allowlist).
+blocklist: []
+
+# Per-rule allowlist scoping — trust a source for ONE rule only.
+# allowlist_rules:
+#   - rule_id: curl_pipe_shell
+#     patterns:
+#       - "get.docker.com"
+
+# Scan configuration.
+scan:
+  ignore_patterns:
+    - "node_modules"
+    - "target"
+    - ".git"
+
+  # MCP server names you trust — suppresses per-server MCP config findings
+  # and drift detection for those names. See `tirith mcp policy init`.
+  # trusted_mcp_servers: []
+
+  # Per-server allowed tools — see `tirith mcp policy init` to scaffold.
+  # mcp_allowed_tools: {}
+
+# Per-agent governance — M4 item 8 (enforcement).
+# `tirith agent sessions` shows which AgentOrigin variants you see in
+# practice; `tirith agent policy init` scaffolds this block. A `deny`
+# match forces the verdict to Block and appends an
+# `agent_denied_by_policy` finding; `deny` beats any matching `allow`.
+# Enforcement is active on every analysis path: `tirith check`, `paste`,
+# `install`, `ecosystem scan`, and all MCP `tools/call_check_*` handlers.
+# The interactive `TIRITH=0` bypass currently skips `agent_rules`;
+# revisit in M5.
+# agent_rules:
+#   allow:
+#     - kind: agent
+#       name: claude-code
+
+# Package-policy section — M6 ch7. Thresholds and actions for the
+# package-reputation signals (newer-than-days, low downloads, OSV CVSS,
+# typosquat distance, repo-mismatch cap). Defaults preserve the M6 ch6
+# behavior; uncomment a knob to tighten one signal.
+# package_policy:
+#   block_not_found: false                    # block on registry HTTP 404 (--online only)
+#   block_newer_than_days:                    # block when first publication is <= N days
+#   warn_newer_than_days:                     # warn when first publication is <= N days
+#   warn_low_downloads_below:                 # warn when recent_downloads <= N
+#   block_install_scripts_for_unknown_packages: false   # block Unknown + script signal
+#   block_typosquat_distance:                 # block when edit-distance to popular <= N
+#   block_aggregate_score: 76                 # baseline; lower to tighten
+#   warn_aggregate_score: 51                  # baseline; lower to surface earlier
+#   block_osv_min_cvss: 7.0                   # any OSV >= this CVSS escalates to Block
+#   block_repo_mismatch: false                # elevate `package_repo_mismatch` to Block
+#   warn_install_script_network_call: true    # disable to silence install-script signal
+#   block_dependency_confusion: true          # disable to demote dep-confusion to Warn
+#   internal_package_names: []                # [{ ecosystem: npm, name: "@my-co/*" }]
+#   repo_mismatch_check_max_packages: 50      # cap on packages checked under --online

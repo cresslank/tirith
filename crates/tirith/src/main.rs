@@ -4842,11 +4842,20 @@ Examples:
   tirith policy init --template individual
   tirith policy init --template ci-strict
   tirith policy init --template ai-agent-heavy
+  tirith policy init --template oss-maintainer
+  tirith policy init --template startup
+  tirith policy init --template enterprise
+  tirith policy init --template mcp-strict
 
 Templates:
   individual      sensible defaults for a single developer
+  personal        alias of individual
   ci-strict       strict CI settings (fail-closed, no bypass, scan fail-on)
-  ai-agent-heavy  tuned for environments where AI agents run many commands")]
+  ai-agent-heavy  tuned for environments where AI agents run many commands
+  oss-maintainer  public-repo maintainer; typosquat / install-script focus
+  startup         small team moving fast; balanced, a notch stricter
+  enterprise      strict org defaults; ships an active package_policy block
+  mcp-strict      locked-down posture for MCP-heavy environments")]
     Init {
         /// Overwrite existing policy file
         #[arg(long)]
@@ -4854,7 +4863,8 @@ Templates:
         /// Generate minimal template (default: full)
         #[arg(long, conflicts_with = "template")]
         minimal: bool,
-        /// Use a curated starter policy: individual, ci-strict, or ai-agent-heavy
+        /// Curated starter policy: individual (alias: personal), ci-strict,
+        /// ai-agent-heavy, oss-maintainer, startup, enterprise, or mcp-strict
         #[arg(long, value_name = "NAME")]
         template: Option<String>,
     },
