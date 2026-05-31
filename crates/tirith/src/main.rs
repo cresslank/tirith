@@ -567,6 +567,42 @@ Examples:
         json: bool,
     },
 
+    /// Local security dashboard: export an HTML report or serve it on loopback (M13 ch3)
+    #[command(after_help = "\
+Builds a LOCAL-ONLY security snapshot from your audit log (7-day window), policy,
+threat DB, trust store, canaries, and shell-hook state, then either writes it as a
+self-contained HTML file or serves it over a loopback-only HTTP server.
+
+The report is built from user-controlled audit bytes, so EVERY interpolated value
+is HTML-escaped — opening it can never execute pasted content. It makes NO network
+calls and embeds NO external resources or tracking.
+
+Subcommands:
+  export [--out <path>]   write the HTML report.
+                          default: ~/Documents/tirith-dashboard-<date>.html
+                          --out .          -> ./dashboard.html
+                          --out <dir>      -> <dir>/dashboard.html
+                          --out <file>     -> exactly that file
+  serve  [--port <p>]     serve the report on http://127.0.0.1:<port>/ (an OS
+                          ephemeral port when --port is omitted), guarded by a
+                          fresh in-memory token printed in the URL.
+
+SECURITY: `serve` binds 127.0.0.1 ONLY (never 0.0.0.0). The token is random,
+lives only in process memory (never written to disk/policy), and expires after
+1 hour. Requests with a non-loopback Host header are refused 403 (DNS-rebinding
+guard); a missing/wrong/expired token gets 401.
+
+Examples:
+  tirith dashboard export
+  tirith dashboard export --out .
+  tirith dashboard export --out /tmp/sec.html --json
+  tirith dashboard serve
+  tirith dashboard serve --port 8765")]
+    Dashboard {
+        #[command(subcommand)]
+        action: DashboardAction,
+    },
+
     /// Print a one-line shell-prompt status (M8 ch6).
     ///
     /// Designed to be invoked from `$PS1` / `$PROMPT` / `fish_prompt` on every
@@ -2567,6 +2603,53 @@ Examples:
     Browser {
         #[command(subcommand)]
         action: BrowserAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DashboardAction {
+    /// Write the HTML security report to a file
+    #[command(after_help = "\
+Default output is ~/Documents/tirith-dashboard-<date>.html. `--out .` writes
+./dashboard.html; `--out <dir>` writes <dir>/dashboard.html; any other `--out`
+value is the exact file path. On Unix the file is created 0600. `--json` prints a
+small machine-readable result (path written, byte count, and the snapshot).
+
+Examples:
+  tirith dashboard export
+  tirith dashboard export --out .
+  tirith dashboard export --out /tmp/sec.html
+  tirith dashboard export --json")]
+    Export {
+        /// Output path. Omit for ~/Documents/tirith-dashboard-<date>.html; `.`
+        /// or a directory writes dashboard.html there; else the exact file.
+        #[arg(long)]
+        out: Option<String>,
+        /// Emit a machine-readable result (path, bytes, snapshot) as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Serve the report on a loopback-only HTTP server with an ephemeral token
+    #[command(after_help = "\
+Binds 127.0.0.1 ONLY (never 0.0.0.0). With no --port an OS ephemeral port is
+chosen and read back. Prints http://127.0.0.1:<port>/?token=<token>; the token is
+random, in-memory only (never written to disk), and expires after 1 hour.
+
+A request whose Host header is not a loopback host is refused 403 (DNS-rebinding
+guard); a missing, wrong, or expired token gets 401. Serves until Ctrl-C.
+
+Examples:
+  tirith dashboard serve
+  tirith dashboard serve --port 8765
+  tirith dashboard serve --json")]
+    Serve {
+        /// TCP port to bind on 127.0.0.1. Omit for an OS-assigned ephemeral port.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Emit the loopback URL + token as JSON instead of human text.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -6524,6 +6607,13 @@ fn run() {
             };
             cli::onboard::run(mode, apply, json)
         }
+
+        // M13 ch3 — local security dashboard. `export` writes a self-contained
+        // HTML report; `serve` runs a loopback-only token-guarded HTTP server.
+        Commands::Dashboard { action } => match action {
+            DashboardAction::Export { out, json } => cli::dashboard::export(out.as_deref(), json),
+            DashboardAction::Serve { port, json } => cli::dashboard::serve(port, json),
+        },
 
         Commands::PromptStatus {
             short,

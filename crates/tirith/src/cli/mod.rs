@@ -478,6 +478,7 @@ pub mod commands;
 pub mod completions;
 pub mod context;
 pub mod daemon;
+pub mod dashboard;
 pub mod devcontainer;
 pub mod diff;
 pub mod doctor;
