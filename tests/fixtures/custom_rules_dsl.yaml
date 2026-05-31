@@ -59,7 +59,7 @@ custom_rules:
     when:
       package.name_matches: '^@acme/'
     severity: medium
-    title: "Install of an @acme/* scoped package from a public registry"
+    title: "Install of an `@acme/`* scoped package"
     context: [exec]
 
   # 6. A secret-shaped file being scanned (file family, file context).

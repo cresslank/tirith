@@ -48,10 +48,6 @@ blocklist: []
 # scan exits non-zero — wire this into your build / pre-merge gate.
 scan:
   fail_on: high
-  ignore_patterns:
-    - "node_modules"
-    - "target"
-    - ".git"
 
   # MCP server names the organization trusts. Keep this tight — a trusted name
   # silences every per-server MCP config finding and exempts the server from

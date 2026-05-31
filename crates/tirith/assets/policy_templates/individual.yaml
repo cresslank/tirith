@@ -41,11 +41,6 @@ blocklist: []
 
 # Scan configuration.
 scan:
-  ignore_patterns:
-    - "node_modules"
-    - "target"
-    - ".git"
-
   # MCP server names you trust — suppresses per-server MCP config findings
   # and drift detection for those names. See `tirith mcp policy init`.
   # trusted_mcp_servers: []

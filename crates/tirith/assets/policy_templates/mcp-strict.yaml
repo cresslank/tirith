@@ -49,10 +49,6 @@ blocklist: []
 # this template — declare exactly which servers and tools you accept.
 scan:
   fail_on: high
-  ignore_patterns:
-    - "node_modules"
-    - "target"
-    - ".git"
 
   # MCP server names you trust. Listing a name here suppresses the per-server
   # MCP config findings AND exempts it from drift detection — so keep it as

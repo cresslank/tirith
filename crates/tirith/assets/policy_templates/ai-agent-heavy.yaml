@@ -96,11 +96,6 @@ blocklist: []
 
 # `tirith scan` configuration.
 scan:
-  ignore_patterns:
-    - "node_modules"
-    - "target"
-    - ".git"
-
   # MCP server names you trust. Agents that load arbitrary MCP servers from
   # their environment make a tight `trusted_mcp_servers` list especially
   # valuable — every untrusted server raises findings, and drift on a

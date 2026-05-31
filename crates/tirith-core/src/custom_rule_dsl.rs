@@ -567,7 +567,29 @@ pub fn satisfiable_contexts(clause: &WhenClause) -> ContextSet {
             .iter()
             .map(satisfiable_contexts)
             .fold(ContextSet::EMPTY, ContextSet::union),
-        WhenClause::Not(c) => satisfiable_contexts(c),
+        // `not(child)` is evaluable wherever `child` is, so it returns the
+        // child's set UNCHANGED for any normal (non-degenerate) child. This is
+        // what makes the round-15 clamp work: `not(file.path_matches)` yields
+        // `{FileScan}` only, NOT the complement — so it never fires in exec where
+        // `file_path` is unset (a `not(file)` false-positive). We deliberately do
+        // NOT apply CodeRabbit's blanket "complement" suggestion, which would
+        // reintroduce exactly that bug.
+        //
+        // The ONLY divergence from `evaluate` is the two DEGENERATE
+        // directly-nested EMPTY combinators, whose set identity and truth value
+        // disagree:
+        //   * `not(any: [])` == `not(false)` == constant-TRUE in `evaluate`, but
+        //     `any:[]`→EMPTY would make the child-set look UNSATISFIABLE. A
+        //     constant-true clause runs EVERYWHERE → `ContextSet::ALL`.
+        //   * `not(all: [])` == `not(true)` == constant-FALSE in `evaluate`, but
+        //     `all:[]`→ALL would make the child-set look RUNNABLE. A constant-false
+        //     clause can NEVER match → `ContextSet::EMPTY` (unsatisfiable)
+        //     (CodeRabbit M13 PR #132 R17-1).
+        WhenClause::Not(c) => match c.as_ref() {
+            WhenClause::Any(cs) if cs.is_empty() => ContextSet::ALL,
+            WhenClause::All(cs) if cs.is_empty() => ContextSet::EMPTY,
+            other => satisfiable_contexts(other),
+        },
 
         // `command.*` is evaluable in Exec OR Paste. `build_dsl_backing`
         // populates `pipeline_targets`, `uses_sudo`, AND `cwd` for EVERY
@@ -1267,11 +1289,73 @@ any:
     #[test]
     fn test_satisfiable_not_preserves_child_set() {
         // `not(child)` keeps the child's evaluability — negation only flips the
-        // verdict, it doesn't change which context has the facts.
+        // verdict, it doesn't change which context has the facts. This is the
+        // round-15 clamp: `not(file.path_matches)` is evaluable ONLY in FileScan,
+        // NOT the complement {Exec, Paste} (which would reintroduce a `not(file)`
+        // false-positive in exec, where `file_path` is unset).
         let clause = WhenClause::Not(Box::new(WhenClause::FilePathMatches(r"x".to_string())));
         let sat = satisfiable_contexts(&clause);
+        assert_eq!(
+            sat,
+            ContextSet::from_contexts(&[ScanContext::FileScan]),
+            "not(file.path_matches) must yield {{FileScan}} only (round-15 clamp preserved)"
+        );
         assert!(sat.intersects_declared(&[ScanContext::FileScan]));
         assert!(!sat.intersects_declared(&[ScanContext::Exec]));
+    }
+
+    #[test]
+    fn test_satisfiable_not_of_degenerate_empty_combinators_follow_truth_value() {
+        // CodeRabbit M13 PR #132 R17-1: the ONLY place `satisfiable_contexts` may
+        // diverge from `satisfiable_contexts(child)` for a `Not` is the two
+        // DEGENERATE directly-nested EMPTY combinators, whose set identity and
+        // `evaluate` truth value disagree:
+        //
+        //   * `not(any: [])` == `not(false)` == constant-TRUE → runs everywhere →
+        //     ContextSet::ALL. (Naively returning the child's set would give EMPTY,
+        //     mislabeling a constant-true clause as unsatisfiable.)
+        //   * `not(all: [])` == `not(true)` == constant-FALSE → never matches →
+        //     ContextSet::EMPTY (unsatisfiable). (The child's set is ALL, which
+        //     would mislabel a dead clause as runnable.)
+        //
+        // We did NOT apply CodeRabbit's blanket "complement" suggestion: a
+        // complement would flip `not(file.path_matches)` from {FileScan} to
+        // {Exec, Paste} and reintroduce the round-15 `not(file)` exec
+        // false-positive (asserted in `test_satisfiable_not_preserves_child_set`).
+        let not_empty_any = WhenClause::Not(Box::new(WhenClause::Any(vec![])));
+        assert_eq!(
+            satisfiable_contexts(&not_empty_any),
+            ContextSet::ALL,
+            "not(any: []) is constant-true -> ALL"
+        );
+        // The set verdict agrees with `evaluate`: constant-true on any context.
+        assert!(
+            evaluate(&not_empty_any, &DslEvalContext::default()),
+            "not(any: []) must evaluate to true"
+        );
+
+        let not_empty_all = WhenClause::Not(Box::new(WhenClause::All(vec![])));
+        assert_eq!(
+            satisfiable_contexts(&not_empty_all),
+            ContextSet::EMPTY,
+            "not(all: []) is constant-false -> EMPTY (unsatisfiable)"
+        );
+        // The set verdict agrees with `evaluate`: constant-false on any context.
+        assert!(
+            !evaluate(&not_empty_all, &DslEvalContext::default()),
+            "not(all: []) must evaluate to false"
+        );
+
+        // A NON-degenerate `not(any: [...])` is unaffected — it still returns the
+        // child's (union) set, not ALL. `any(command.*)` is {Exec, Paste}.
+        let not_nonempty_any = WhenClause::Not(Box::new(WhenClause::Any(vec![
+            WhenClause::CommandUsesSudo(true),
+        ])));
+        assert_eq!(
+            satisfiable_contexts(&not_nonempty_any),
+            ContextSet::from_contexts(&[ScanContext::Exec, ScanContext::Paste]),
+            "not(any: [command.*]) keeps the child's {{Exec, Paste}} set (non-degenerate)"
+        );
     }
 
     #[test]

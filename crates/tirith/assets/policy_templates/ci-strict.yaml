@@ -43,10 +43,6 @@ blocklist: []
 # a scan exits non-zero and fails the CI job.
 scan:
   fail_on: high
-  ignore_patterns:
-    - "node_modules"
-    - "target"
-    - ".git"
 
   # MCP server names CI considers trusted. Keep this tight — a trusted name
   # silences every per-server MCP config finding and exempts the server

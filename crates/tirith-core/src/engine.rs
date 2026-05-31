@@ -202,11 +202,28 @@ pub fn build_dsl_backing(
         }
     }
     for u in extracted {
-        if let crate::parse::UrlLike::DockerRef { image, .. } = &u.parsed {
+        if let crate::parse::UrlLike::DockerRef {
+            image, tag, digest, ..
+        } = &u.parsed
+        {
             // Same lowercased-name contract as the install-package branch above.
             let image = image.to_lowercase();
-            let reputation =
-                package_reputation(crate::threatdb::Ecosystem::Docker, &image, None, threat_db);
+            // Thread the ref's VERSION pin into the reputation lookup, mirroring
+            // the install-package branch (which passes `pkg.version`). A Docker
+            // ref's version is its `tag` (`image:1.2.3`); a digest pin
+            // (`image@sha256:…`) is the alternative when no tag is given. Passing
+            // `None` (the old behavior) made `check_package` match ONLY
+            // `all_versions_malicious` records, so a threat-DB entry keyed to a
+            // specific tag/digest could never surface via `package.reputation`
+            // (CodeRabbit M13 PR #132 R17-4). Tags are case-sensitive, so they are
+            // threaded verbatim (unlike the lowercased image name).
+            let version = tag.as_deref().or(digest.as_deref());
+            let reputation = package_reputation(
+                crate::threatdb::Ecosystem::Docker,
+                &image,
+                version,
+                threat_db,
+            );
             packages.push(("docker".to_string(), image, reputation));
         }
     }
@@ -3277,6 +3294,72 @@ mod tests {
                 &dctx
             ),
             "a lowercase `^myorg/app$` pattern must match the uppercased `MyOrg/App` image"
+        );
+    }
+
+    /// CodeRabbit M13 PR #132 R17-4: the Docker-ref reputation lookup must thread
+    /// the ref's VERSION (its tag/digest) into `package_reputation`, mirroring the
+    /// install-package branch. Before the fix the Docker branch passed `None`, so
+    /// `check_package` matched ONLY `all_versions_malicious` records — a threat-DB
+    /// entry keyed to a SPECIFIC tag could never surface via `package.reputation`.
+    /// Here a DB entry for `evil/img` keyed to version `1.0` (NOT
+    /// all-versions-malicious) must flag `docker pull evil/img:1.0` as malicious,
+    /// while the same image at tag `2.0` (and untagged) must NOT — proving the tag
+    /// is threaded, not ignored.
+    #[test]
+    fn test_build_dsl_backing_threads_docker_ref_version() {
+        use crate::custom_rule_dsl::{evaluate, Reputation, WhenClause};
+        use crate::threatdb::{Confidence, Ecosystem, ThreatDb, ThreatDbWriter, ThreatSource};
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 1);
+        // Docker image `evil/img`, malicious ONLY at tag `1.0` (version-specific,
+        // not all-versions-malicious). The engine lowercases the image name before
+        // lookup, so store the lowercase form.
+        writer.add_package(
+            Ecosystem::Docker,
+            "evil/img",
+            &["1.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false, // NOT all-versions: only the listed version is malicious
+            None,
+        );
+        let bytes = writer.build(&key).expect("build threat db");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load threat db");
+
+        let is_malicious = |cmd: &str| {
+            let extracted = extract::extract_urls(cmd, ShellType::Posix);
+            let backing = build_dsl_backing(
+                cmd,
+                ShellType::Posix,
+                ScanContext::Exec,
+                &extracted,
+                Some(&db),
+            );
+            let ctx = backing.as_eval_context(None, None);
+            evaluate(&WhenClause::PackageReputation(Reputation::Malicious), &ctx)
+        };
+
+        // The matching tag surfaces as malicious — only reachable if the version
+        // was threaded into the lookup (the bug passed `None`).
+        assert!(
+            is_malicious("docker pull evil/img:1.0"),
+            "evil/img:1.0 must surface as malicious for the tag-keyed DB entry"
+        );
+        // A different tag must NOT match — confirms the version is honored, not
+        // ignored (and that we are not matching as all-versions-malicious).
+        assert!(
+            !is_malicious("docker pull evil/img:2.0"),
+            "evil/img:2.0 must NOT match a DB entry keyed to version 1.0"
+        );
+        // An untagged ref (version None) also must NOT match a version-specific,
+        // non-all-versions entry — matching the install path's None semantics.
+        assert!(
+            !is_malicious("docker pull evil/img"),
+            "untagged evil/img must NOT match a version-specific DB entry"
         );
     }
 

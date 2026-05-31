@@ -490,20 +490,32 @@ struct TrustEntryFile {
 /// Count non-expired entries in a `trust.json` at `path`. A missing or
 /// unparseable file counts as zero (degrade gracefully — never panic).
 fn count_trust_entries(path: &Path) -> usize {
+    count_trust_entries_at(path, chrono::Utc::now())
+}
+
+/// Inner of [`count_trust_entries`] with the comparison instant injected, so the
+/// `>= now` boundary is deterministically testable (a literal `Utc::now()`
+/// entry advances past `now` before the check runs, hiding the `>` vs `>=`
+/// distinction).
+fn count_trust_entries_at(path: &Path, now: chrono::DateTime<chrono::Utc>) -> usize {
     let Ok(content) = std::fs::read_to_string(path) else {
         return 0;
     };
     let Ok(store) = serde_json::from_str::<TrustStoreFile>(&content) else {
         return 0;
     };
-    let now = chrono::Utc::now();
     store
         .entries
         .iter()
         .filter(|e| match &e.ttl_expires {
             None => true, // permanent
             Some(ts) => match chrono::DateTime::parse_from_rfc3339(ts) {
-                Ok(expiry) => expiry > now,
+                // `>= now`, not `> now`: `Policy::merge_trust_store` only expires
+                // an entry when `expiry < now`, so an entry whose `ttl_expires`
+                // is EXACTLY `now` is still ACTIVE at runtime. Match that boundary
+                // so the snapshot's live-trust count agrees with what the engine
+                // enforces (CodeRabbit M13 PR #132 R17-2).
+                Ok(expiry) => expiry >= now,
                 // An unparseable expiry is treated as EXPIRED (inactive), matching
                 // runtime trust enforcement, which skips entries whose `ttl_expires`
                 // cannot be parsed rather than honoring them. Counting a malformed
@@ -1184,17 +1196,43 @@ mod tests {
     #[test]
     fn build_snapshot_degrades_when_no_audit_log() {
         // Pointing at a nonexistent log path must yield audit = None, not panic.
+        //
+        // CodeRabbit M13 PR #132 R17-3: isolate from the developer's real
+        // environment. Previously this passed `cwd = None`, so `build_snapshot`
+        // resolved policy/trust from the PROCESS cwd + user config — a broken
+        // `~/.config/tirith/policy.yaml` or a set `TIRITH_POLICY_ROOT` would flake
+        // the `policy.error.is_none()` assertion. Serialize env mutation via
+        // TEST_ENV_LOCK, pin the config-resolving env (XDG + %APPDATA%/
+        // %LOCALAPPDATA% + HOME/USERPROFILE) at an isolated temp dir, and pass a
+        // temp cwd containing a `.git` dir (so `find_repo_root` stops there) with
+        // NO `.tirith/policy.yaml` — i.e. genuine built-in defaults.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let isolated_config = tempfile::tempdir().unwrap();
+        let cfg = isolated_config.path().as_os_str();
+        let _env = DashboardEnvGuard::apply(&[
+            ("XDG_CONFIG_HOME", Some(cfg)),
+            ("APPDATA", Some(cfg)),
+            ("LOCALAPPDATA", Some(cfg)),
+            ("HOME", Some(cfg)),
+            ("USERPROFILE", Some(cfg)),
+            // TIRITH_POLICY_ROOT unnamed → removed by the guard.
+        ]);
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cwd.path().join(".git")).unwrap();
+
         let missing = std::path::Path::new("/nonexistent/tirith/log.jsonl");
         let snap = build_snapshot(
             Some(missing),
-            None,
+            Some(cwd.path().to_str().unwrap()),
             HookSummary {
                 shell: "bash".into(),
                 installed: false,
             },
         );
         assert!(snap.audit.is_none());
-        // Policy / threatdb / trust are always populated. The process cwd has no
+        // Policy / threatdb / trust are always populated. The isolated cwd has no
         // broken policy file, so fail_mode is a real value (and no error is set).
         assert!(snap.policy.error.is_none());
         assert!(matches!(
@@ -1606,6 +1644,34 @@ mod tests {
             count_trust_entries(&path),
             1,
             "a permanent entry counts; an entry with an unparseable ttl_expires must NOT"
+        );
+    }
+
+    #[test]
+    fn count_trust_entries_counts_ttl_equal_to_now_as_active() {
+        // CodeRabbit M13 PR #132 R17-2: the dashboard boundary must match runtime
+        // enforcement. `Policy::merge_trust_store` only expires an entry when
+        // `expiry < now`, so `ttl_expires == now` is still ACTIVE. Pin the
+        // comparison instant so the `>= now` (not `> now`) boundary is exercised
+        // deterministically: an entry timestamped EXACTLY at `now` must count, and
+        // one a microsecond earlier must NOT.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let now = chrono::Utc::now();
+        let at_now = now.to_rfc3339();
+        let just_past = (now - chrono::Duration::microseconds(1)).to_rfc3339();
+        let store = serde_json::json!({
+            "version": 1,
+            "entries": [
+                {"pattern": "now", "added": "x", "source": "s", "ttl_expires": at_now},
+                {"pattern": "past", "added": "x", "source": "s", "ttl_expires": just_past}
+            ]
+        });
+        std::fs::write(&path, serde_json::to_string(&store).unwrap()).unwrap();
+        assert_eq!(
+            count_trust_entries_at(&path, now),
+            1,
+            "ttl_expires == now is active (>= now); ttl_expires just before now is expired"
         );
     }
 }
