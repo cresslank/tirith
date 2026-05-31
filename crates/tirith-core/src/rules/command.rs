@@ -38,6 +38,18 @@ pub const INTERPRETERS: &[&str] = &[
     "cmd",
 ];
 
+/// Maximum wrapper-chain recursion depth for the `uses_sudo` walk
+/// (`segment_chain_contains_sudo` and friends). tirith scans untrusted command
+/// strings, so a hostile input like `env env env … sudo bash` (or a nested
+/// `env -S "env -S \"…\""` payload) must not recurse without bound and overflow
+/// the stack. Real wrapper chains are 1-3 deep; 32 is far beyond any legitimate
+/// command, so the round-3/8/9 wrapped-sudo cases are unaffected. Exhausting the
+/// budget returns `false` (give up the sudo-leader search) — the safe,
+/// conservative answer (`uses_sudo` may be false for an absurdly-nested command,
+/// which is acceptable vs. a crash). Mirrors the iterative token budget in
+/// [`resolve_with_parser`].
+const MAX_WRAPPER_DEPTH: usize = 32;
+
 /// Parse up to `max_digits` from `chars[*i..]` matching `predicate`, interpret as
 /// base-`radix`, and return the corresponding char. Advances `*i` past consumed digits.
 /// Zero heap allocations — uses a fixed stack buffer.
@@ -411,7 +423,7 @@ pub fn extract_command_facts(input: &str, shell: ShellType) -> CommandFacts {
     // returns true if `sudo` is any link in that chain.
     let uses_sudo = segments
         .iter()
-        .any(|seg| segment_chain_contains_sudo(seg, shell));
+        .any(|seg| segment_chain_contains_sudo(seg, shell, MAX_WRAPPER_DEPTH));
 
     CommandFacts {
         pipeline_targets,
@@ -425,12 +437,19 @@ pub fn extract_command_facts(input: &str, shell: ShellType) -> CommandFacts {
 /// [`resolve_base_through_wrappers`] but reports presence rather than the final
 /// base, so a `sudo` sandwiched between a wrapper and the real command is still
 /// detected (CodeRabbit M13 finding R6).
-fn segment_chain_contains_sudo(seg: &tokenize::Segment, shell: ShellType) -> bool {
+fn segment_chain_contains_sudo(seg: &tokenize::Segment, shell: ShellType, depth: usize) -> bool {
+    // Bound the wrapper-chain recursion: a hostile, absurdly-nested input
+    // (`env env … sudo bash`, nested `env -S "env -S \"…\""`) must not overflow
+    // the stack. Exhausting the budget gives up the search (returns `false`),
+    // the safe/conservative answer.
+    if depth == 0 {
+        return false;
+    }
     // `env -S "sudo bash"` / `env --split-string=...`: the wrapped command
     // lives inside a single string token. Unwrap it into a fresh segment first,
     // then fall through to the normal leader/wrapper walk.
     if let Some(inner) = unwrap_env_split_string_segment(seg, shell) {
-        if segment_chain_contains_sudo(&inner, shell) {
+        if segment_chain_contains_sudo(&inner, shell, depth - 1) {
             return true;
         }
     }
@@ -443,9 +462,9 @@ fn segment_chain_contains_sudo(seg: &tokenize::Segment, shell: ShellType) -> boo
         return true;
     }
     match cmd_base.as_str() {
-        "env" => args_chain_contains_sudo_env(&seg.args, shell),
+        "env" => args_chain_contains_sudo_env(&seg.args, shell, depth - 1),
         "command" | "exec" | "nohup" => {
-            args_chain_contains_sudo_wrapper(&seg.args, &cmd_base, shell)
+            args_chain_contains_sudo_wrapper(&seg.args, &cmd_base, shell, depth - 1)
         }
         _ => false,
     }
@@ -459,7 +478,10 @@ fn segment_chain_contains_sudo(seg: &tokenize::Segment, shell: ShellType) -> boo
 /// (`command -- env sudo bash`, `env -- command sudo bash`) still resolve —
 /// not just a bare `sudo` immediately after the separator (CodeRabbit M13
 /// finding R6 round 3).
-fn positional_chain_contains_sudo(args: &[String], shell: ShellType) -> bool {
+fn positional_chain_contains_sudo(args: &[String], shell: ShellType, depth: usize) -> bool {
+    if depth == 0 {
+        return false;
+    }
     let Some(first) = args.first() else {
         return false;
     };
@@ -468,15 +490,20 @@ fn positional_chain_contains_sudo(args: &[String], shell: ShellType) -> bool {
         return true;
     }
     match base.as_str() {
-        "env" => args_chain_contains_sudo_env(&args[1..], shell),
-        "command" | "exec" | "nohup" => args_chain_contains_sudo_wrapper(&args[1..], &base, shell),
+        "env" => args_chain_contains_sudo_env(&args[1..], shell, depth - 1),
+        "command" | "exec" | "nohup" => {
+            args_chain_contains_sudo_wrapper(&args[1..], &base, shell, depth - 1)
+        }
         _ => false,
     }
 }
 
 /// Walk an `env` wrapper's args (mirroring [`resolve_base_env`]'s flag/assign
 /// skipping) and report whether the wrapped command is/contains `sudo`.
-fn args_chain_contains_sudo_env(args: &[String], shell: ShellType) -> bool {
+fn args_chain_contains_sudo_env(args: &[String], shell: ShellType, depth: usize) -> bool {
+    if depth == 0 {
+        return false;
+    }
     let value_short_flags = ["-u", "-C"];
     let value_long_flags = [
         "--unset",
@@ -492,17 +519,17 @@ fn args_chain_contains_sudo_env(args: &[String], shell: ShellType) -> bool {
             // Everything after `--` is the wrapped command; recurse through the
             // wrapper chain (`env -- command sudo bash`), not just the immediate
             // next token (R6 round 3).
-            return positional_chain_contains_sudo(&args[idx + 1..], shell);
+            return positional_chain_contains_sudo(&args[idx + 1..], shell, depth - 1);
         }
         // `env -S "sudo …"` / `--split-string` carry the command as a string.
         if normalized == "-S" || normalized == "--split-string" {
             return args
                 .get(idx + 1)
-                .map(|c| command_string_chain_contains_sudo(c, shell))
+                .map(|c| command_string_chain_contains_sudo(c, shell, depth - 1))
                 .unwrap_or(false);
         }
         if let Some(val) = normalized.strip_prefix("--split-string=") {
-            return command_string_chain_contains_sudo(val, shell);
+            return command_string_chain_contains_sudo(val, shell, depth - 1);
         }
         if normalized.starts_with("--") {
             if value_long_flags.iter().any(|f| normalized == *f) {
@@ -527,7 +554,7 @@ fn args_chain_contains_sudo_env(args: &[String], shell: ShellType) -> bool {
         }
         // First positional is the wrapped command. Recurse so nested wrappers
         // (e.g. `env command sudo …`) still resolve.
-        return positional_chain_contains_sudo(&args[idx..], shell);
+        return positional_chain_contains_sudo(&args[idx..], shell, depth - 1);
     }
     false
 }
@@ -535,7 +562,15 @@ fn args_chain_contains_sudo_env(args: &[String], shell: ShellType) -> bool {
 /// Walk a `command`/`exec`/`nohup` wrapper's args (mirroring
 /// [`resolve_base_wrapper`]) and report whether the wrapped command
 /// is/contains `sudo`.
-fn args_chain_contains_sudo_wrapper(args: &[String], wrapper: &str, shell: ShellType) -> bool {
+fn args_chain_contains_sudo_wrapper(
+    args: &[String],
+    wrapper: &str,
+    shell: ShellType,
+    depth: usize,
+) -> bool {
+    if depth == 0 {
+        return false;
+    }
     let value_flags: &[&str] = match wrapper {
         "exec" => &["-a"],
         _ => &[],
@@ -547,7 +582,7 @@ fn args_chain_contains_sudo_wrapper(args: &[String], wrapper: &str, shell: Shell
             // Everything after `--` is the wrapped command; recurse through the
             // wrapper chain (`command -- env sudo bash`), not just the immediate
             // next token (R6 round 3).
-            return positional_chain_contains_sudo(&args[idx + 1..], shell);
+            return positional_chain_contains_sudo(&args[idx + 1..], shell, depth - 1);
         }
         if normalized.starts_with("--") || normalized.starts_with('-') {
             if value_flags.iter().any(|f| normalized == *f) {
@@ -557,20 +592,23 @@ fn args_chain_contains_sudo_wrapper(args: &[String], wrapper: &str, shell: Shell
             }
             continue;
         }
-        return positional_chain_contains_sudo(&args[idx..], shell);
+        return positional_chain_contains_sudo(&args[idx..], shell, depth - 1);
     }
     false
 }
 
 /// Tokenize a command-string argument (the body of `env -S "…"`) and report
 /// whether its leading segment's wrapper chain contains `sudo`.
-fn command_string_chain_contains_sudo(command: &str, shell: ShellType) -> bool {
+fn command_string_chain_contains_sudo(command: &str, shell: ShellType, depth: usize) -> bool {
+    if depth == 0 {
+        return false;
+    }
     let normalized = normalize_shell_token(command.trim(), shell);
     if normalized.is_empty() {
         return false;
     }
     match tokenize::tokenize(&normalized, shell).first() {
-        Some(seg) => segment_chain_contains_sudo(seg, shell),
+        Some(seg) => segment_chain_contains_sudo(seg, shell, depth - 1),
         None => false,
     }
 }
@@ -2736,6 +2774,68 @@ mod tests {
             assert!(
                 !facts.uses_sudo,
                 "uses_sudo must be false without sudo: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_facts_uses_sudo_deep_wrapper_chain_does_not_overflow() {
+        // CodeRabbit M13 round-13 finding R13-1: the wrapped-`sudo` detection
+        // helpers (`segment_chain_contains_sudo` & friends) recurse through
+        // env/command/exec/nohup wrappers and `env -S` payloads. tirith scans
+        // untrusted command strings, so an absurdly-deep wrapper chain must NOT
+        // recurse without bound and overflow the stack — `MAX_WRAPPER_DEPTH`
+        // (32) caps the walk. These inputs are FAR deeper than that bound; the
+        // assertion is simply that the `uses_sudo` computation COMPLETES without
+        // crashing. The value is unspecified — `false` at budget exhaustion is
+        // the safe/conservative answer and is acceptable here.
+
+        // (1) Deeply nested env wrappers ending in `sudo bash`:
+        // `env env env … sudo bash`. 5000 levels is orders of magnitude past
+        // MAX_WRAPPER_DEPTH (32), so the helper gives up after ~32 recursive
+        // descents rather than recursing 5000 frames deep.
+        let deep_env = "env ".repeat(5000) + "sudo bash";
+        let facts = extract_command_facts(&deep_env, ShellType::Posix);
+        // Past the depth budget the walk bails early, so `sudo` is not reached —
+        // but crucially the call RETURNED instead of overflowing the stack.
+        assert!(
+            !facts.uses_sudo,
+            "absurdly-nested `env … sudo` should exhaust the budget (false), not crash"
+        );
+
+        // (2) Deeply nested `env -S "env -S \"…\""` payload: each layer
+        // re-tokenizes its split-string body and recurses via
+        // `command_string_chain_contains_sudo`. Build a single, linearly-sized
+        // token whose body is `env -S env -S … sudo bash` (single-quoted whole
+        // so the parser keeps re-entering the split-string walk). The depth
+        // bound only ever re-tokenizes the first ~32 layers; the rest is inert
+        // payload, so 500 layers proves the bound without exponential blowup.
+        let inner = "env -S ".repeat(500) + "sudo bash";
+        let nested_split = format!("env -S '{inner}'");
+        let facts = extract_command_facts(&nested_split, ShellType::Posix);
+        // Value unspecified at exhaustion; the point is the call returned.
+        let _ = facts.uses_sudo;
+
+        // The bound must NOT change realistic, shallow wrapped-sudo behavior:
+        // these stay detected (well within MAX_WRAPPER_DEPTH).
+        for input in [
+            "sudo bash",
+            "env sudo bash",
+            "command sudo apt",
+            r#"env -S "sudo bash -c id""#,
+            "command -- env sudo bash",
+            "env -- command sudo bash",
+        ] {
+            assert!(
+                extract_command_facts(input, ShellType::Posix).uses_sudo,
+                "realistic wrapped-sudo must stay detected under the depth bound: {input:?}"
+            );
+        }
+        // And plain non-sudo stays false.
+        for input in ["bash", "env bash", "command apt"] {
+            assert!(
+                !extract_command_facts(input, ShellType::Posix).uses_sudo,
+                "non-sudo must stay false under the depth bound: {input:?}"
             );
         }
     }
