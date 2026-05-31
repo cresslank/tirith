@@ -77,6 +77,13 @@ impl DslBacking {
             // scope (see `custom_rule_dsl` module docs). These stay `None` here;
             // `tirith rule test` can set them.
             agent_kind: None,
+            // `mcp_tool` is `None` on every engine path — no scan context wires
+            // up a current-MCP-tool signal. Rather than silently accept a rule
+            // that can never match, both validators reject any `when:` clause
+            // using `mcp.tool` up front (see
+            // `custom_rule_dsl::clause_uses_unsupported_predicate`, CodeRabbit
+            // M13 round-3 R3-3), so a loaded DSL rule never reaches here with an
+            // `mcp.tool` predicate.
             mcp_tool: None,
         }
     }

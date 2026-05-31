@@ -384,10 +384,13 @@ fn count_trust_entries(path: &Path) -> usize {
             None => true, // permanent
             Some(ts) => match chrono::DateTime::parse_from_rfc3339(ts) {
                 Ok(expiry) => expiry > now,
-                // An unparseable expiry is treated as still-valid (matches the
-                // CLI's lenient handling — we never silently drop an entry we
-                // cannot interpret).
-                Err(_) => true,
+                // An unparseable expiry is treated as EXPIRED (inactive), matching
+                // runtime trust enforcement, which skips entries whose `ttl_expires`
+                // cannot be parsed rather than honoring them. Counting a malformed
+                // TTL as active would overstate the live trust surface in the
+                // snapshot relative to what the engine actually applies
+                // (CodeRabbit M13 PR #132 R3-2).
+                Err(_) => false,
             },
         })
         .count()
@@ -1011,5 +1014,29 @@ mod tests {
         // A corrupt file → 0 (degrade gracefully, never panic).
         std::fs::write(&path, "{ not json").unwrap();
         assert_eq!(count_trust_entries(&path), 0);
+    }
+
+    #[test]
+    fn count_trust_entries_treats_malformed_ttl_as_inactive() {
+        // CodeRabbit M13 PR #132 R3-2: an entry whose `ttl_expires` cannot be
+        // parsed must NOT be counted as active — that would overstate the live
+        // trust surface relative to runtime enforcement (which skips malformed
+        // timestamps). Here: one permanent (active) + one garbage-TTL (inactive)
+        // → exactly 1 counted.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let store = serde_json::json!({
+            "version": 1,
+            "entries": [
+                {"pattern": "ok", "added": "x", "source": "s"},
+                {"pattern": "bad", "added": "x", "source": "s", "ttl_expires": "not-a-timestamp"}
+            ]
+        });
+        std::fs::write(&path, serde_json::to_string(&store).unwrap()).unwrap();
+        assert_eq!(
+            count_trust_entries(&path),
+            1,
+            "a permanent entry counts; an entry with an unparseable ttl_expires must NOT"
+        );
     }
 }

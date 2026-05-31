@@ -171,6 +171,17 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
                     field: Some(format!("custom_rules.{}.when", rule.id)),
                 });
             }
+            // Reject a clause that uses a predicate no scan context can satisfy
+            // (today: `mcp.tool` — no MCP-tool signal is wired in yet, so the
+            // rule would validate+load yet never match). CodeRabbit M13 round-3
+            // R3-3. `agent.kind` is NOT rejected (it stays valid — R3-9).
+            if let Some(reason) = crate::custom_rule_dsl::clause_uses_unsupported_predicate(when) {
+                issues.push(PolicyIssue {
+                    level: IssueLevel::Error,
+                    message: format!("custom_rules.{}: {reason}", rule.id),
+                    field: Some(format!("custom_rules.{}.when", rule.id)),
+                });
+            }
             // Trigger-coverage is ALWAYS validated against the declared
             // contexts (CodeRabbit M13 finding D): an empty declared set cannot
             // satisfy a non-empty required set, so a rule with `context: []` and
@@ -1096,6 +1107,50 @@ custom_rules:
             !issues.iter().any(|i| i.message.contains("agent-only")
                 && i.message.contains("not covered by declared context")),
             "context-agnostic DSL rule must not be rejected for empty context: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_dsl_rule_mcp_tool_rejected() {
+        // CodeRabbit M13 round-3 R3-3: a `when:` clause using `mcp.tool` must be
+        // REJECTED — no scan context wires up an MCP-tool signal, so the rule
+        // would validate+load yet never match. The error must be clear.
+        let yaml = r#"
+custom_rules:
+  - id: mcp-tool-rule
+    when:
+      mcp.tool: read_file
+    title: "mcp tool rule"
+    context: [file]
+"#;
+        let issues = validate(yaml);
+        assert!(
+            issues.iter().any(|i| i.level == IssueLevel::Error
+                && i.message.contains("mcp-tool-rule")
+                && i.message.contains("mcp.tool")
+                && i.message.contains("not supported")),
+            "mcp.tool rule must be rejected with a clear message: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_dsl_rule_paste_command_predicate_accepted() {
+        // CodeRabbit M13 round-3 R3-1: a `command.*` predicate under `paste`
+        // context is now VALID (build_dsl_backing fills command facts for paste),
+        // so it must NOT produce a coverage error. Agrees with `rule validate`.
+        let yaml = r#"
+custom_rules:
+  - id: paste-cmd
+    when:
+      command.uses_sudo: true
+    title: "paste command rule"
+    context: [paste]
+"#;
+        let issues = validate(yaml);
+        assert!(
+            !issues.iter().any(|i| i.message.contains("paste-cmd")
+                && i.message.contains("not covered by declared context")),
+            "paste + command.* rule must be accepted (round-3 R3-1): {issues:?}"
         );
     }
 

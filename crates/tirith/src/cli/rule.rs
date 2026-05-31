@@ -184,9 +184,17 @@ pub fn validate(path: Option<&str>, json: bool) -> i32 {
             continue;
         }
 
-        // Contexts must be known tokens.
+        // Contexts must be known tokens. Track whether ANY was invalid so the
+        // coverage check below does not ALSO fire for a dropped token (the
+        // unknown token vanishes from the parsed set, which would otherwise look
+        // like an unmet requirement and double-report the same typo). This
+        // mirrors `policy_validate::validate_custom_rules` exactly so `rule
+        // validate` and `policy validate` classify the same rule identically
+        // (CodeRabbit M13 round-3 R3-9).
+        let mut has_invalid_context = false;
         for c in &rule.context {
             if !matches!(c.as_str(), "exec" | "paste" | "file") {
+                has_invalid_context = true;
                 errors.push(RuleError {
                     rule: rule.id.clone(),
                     message: format!("unknown context '{c}' (valid: exec, paste, file)"),
@@ -210,17 +218,26 @@ pub fn validate(path: Option<&str>, json: bool) -> i32 {
                     message: e,
                 });
             }
-            // Tier-1 invariant: the declared context must cover the clause's
-            // required trigger groups — reject a DSL rule whose predicates map
-            // to no declared trigger group.
-            let declared = declared_contexts(rule);
-            let required = custom_rule_dsl::required_triggers(when);
-            if declared.is_empty() {
+            // Reject a clause using a predicate no scan context can satisfy
+            // (today: `mcp.tool`). Same rejection `policy validate` applies —
+            // CodeRabbit M13 round-3 R3-3. `agent.kind` stays valid (R3-9).
+            if let Some(reason) = custom_rule_dsl::clause_uses_unsupported_predicate(when) {
                 errors.push(RuleError {
                     rule: rule.id.clone(),
-                    message: "no valid context declared".to_string(),
+                    message: reason.to_string(),
                 });
-            } else if !required.is_satisfied_by(&declared) {
+            }
+            // Tier-1 invariant: the declared context must cover the clause's
+            // required trigger groups. Only emit this when the declared context
+            // tokens are VALID — a context-agnostic clause (e.g. only
+            // `agent.kind`) has no required groups and is vacuously satisfied,
+            // even with `context: []`, so it must NOT be rejected. This matches
+            // `policy_validate::validate_custom_rules` (R3-9): we no longer
+            // special-case the empty declared set, and we skip the check on an
+            // invalid context (already reported above) to avoid double-reporting.
+            let declared = declared_contexts(rule);
+            let required = custom_rule_dsl::required_triggers(when);
+            if !has_invalid_context && !required.is_satisfied_by(&declared) {
                 errors.push(RuleError {
                     rule: rule.id.clone(),
                     message: format!(

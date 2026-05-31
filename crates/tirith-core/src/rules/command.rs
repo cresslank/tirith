@@ -445,6 +445,29 @@ fn segment_chain_contains_sudo(seg: &tokenize::Segment, shell: ShellType) -> boo
     }
 }
 
+/// Given a slice whose FIRST token is a wrapped command (the positional that
+/// follows a wrapper's flags, or the tail after a `--` separator), report
+/// whether that command's wrapper chain contains `sudo`. Dispatches the first
+/// token through the same env/command/exec/nohup peeling as
+/// [`segment_chain_contains_sudo`], so nested wrappers after a `--`
+/// (`command -- env sudo bash`, `env -- command sudo bash`) still resolve —
+/// not just a bare `sudo` immediately after the separator (CodeRabbit M13
+/// finding R6 round 3).
+fn positional_chain_contains_sudo(args: &[String], shell: ShellType) -> bool {
+    let Some(first) = args.first() else {
+        return false;
+    };
+    let base = normalize_cmd_base(first, shell);
+    if base == "sudo" {
+        return true;
+    }
+    match base.as_str() {
+        "env" => args_chain_contains_sudo_env(&args[1..], shell),
+        "command" | "exec" | "nohup" => args_chain_contains_sudo_wrapper(&args[1..], &base, shell),
+        _ => false,
+    }
+}
+
 /// Walk an `env` wrapper's args (mirroring [`resolve_base_env`]'s flag/assign
 /// skipping) and report whether the wrapped command is/contains `sudo`.
 fn args_chain_contains_sudo_env(args: &[String], shell: ShellType) -> bool {
@@ -460,10 +483,10 @@ fn args_chain_contains_sudo_env(args: &[String], shell: ShellType) -> bool {
     while idx < args.len() {
         let normalized = normalize_shell_token(args[idx].trim(), shell);
         if normalized == "--" {
-            return args
-                .get(idx + 1)
-                .map(|c| normalize_cmd_base(c, shell) == "sudo")
-                .unwrap_or(false);
+            // Everything after `--` is the wrapped command; recurse through the
+            // wrapper chain (`env -- command sudo bash`), not just the immediate
+            // next token (R6 round 3).
+            return positional_chain_contains_sudo(&args[idx + 1..], shell);
         }
         // `env -S "sudo …"` / `--split-string` carry the command as a string.
         if normalized == "-S" || normalized == "--split-string" {
@@ -498,17 +521,7 @@ fn args_chain_contains_sudo_env(args: &[String], shell: ShellType) -> bool {
         }
         // First positional is the wrapped command. Recurse so nested wrappers
         // (e.g. `env command sudo …`) still resolve.
-        let base = normalize_cmd_base(&args[idx], shell);
-        if base == "sudo" {
-            return true;
-        }
-        return match base.as_str() {
-            "env" => args_chain_contains_sudo_env(&args[idx + 1..], shell),
-            "command" | "exec" | "nohup" => {
-                args_chain_contains_sudo_wrapper(&args[idx + 1..], &base, shell)
-            }
-            _ => false,
-        };
+        return positional_chain_contains_sudo(&args[idx..], shell);
     }
     false
 }
@@ -525,10 +538,10 @@ fn args_chain_contains_sudo_wrapper(args: &[String], wrapper: &str, shell: Shell
     while idx < args.len() {
         let normalized = normalize_shell_token(args[idx].trim(), shell);
         if normalized == "--" {
-            return args
-                .get(idx + 1)
-                .map(|c| normalize_cmd_base(c, shell) == "sudo")
-                .unwrap_or(false);
+            // Everything after `--` is the wrapped command; recurse through the
+            // wrapper chain (`command -- env sudo bash`), not just the immediate
+            // next token (R6 round 3).
+            return positional_chain_contains_sudo(&args[idx + 1..], shell);
         }
         if normalized.starts_with("--") || normalized.starts_with('-') {
             if value_flags.iter().any(|f| normalized == *f) {
@@ -538,17 +551,7 @@ fn args_chain_contains_sudo_wrapper(args: &[String], wrapper: &str, shell: Shell
             }
             continue;
         }
-        let base = normalize_cmd_base(&args[idx], shell);
-        if base == "sudo" {
-            return true;
-        }
-        return match base.as_str() {
-            "env" => args_chain_contains_sudo_env(&args[idx + 1..], shell),
-            "command" | "exec" | "nohup" => {
-                args_chain_contains_sudo_wrapper(&args[idx + 1..], &base, shell)
-            }
-            _ => false,
-        };
+        return positional_chain_contains_sudo(&args[idx..], shell);
     }
     false
 }
@@ -2682,11 +2685,34 @@ mod tests {
             );
         }
 
+        // R6 round 3: a `--` separator must not stop the chain walk at the
+        // immediate next token — the post-`--` tail is recursed through the
+        // same wrapper logic, so `sudo` nested behind a wrapper after `--` is
+        // still detected.
+        let sudo_after_dashdash_cases = [
+            "command -- env sudo bash",   // command -- (env wraps sudo)
+            "env -- command sudo bash",   // env -- (command wraps sudo)
+            "command -- sudo bash",       // command -- sudo (immediate)
+            "env -- sudo bash",           // env -- sudo (immediate)
+            "exec -- nohup sudo bash",    // exec -- (nohup wraps sudo)
+            "env -- env -- command sudo", // chained `--` separators
+        ];
+        for input in sudo_after_dashdash_cases {
+            let facts = extract_command_facts(input, ShellType::Posix);
+            assert!(
+                facts.uses_sudo,
+                "uses_sudo must be true for sudo nested after `--`: {input:?}"
+            );
+        }
+
         let non_sudo_cases = [
             "bash -c 'echo hi'",     // plain interpreter, no sudo
             "env bash -c 'echo hi'", // env wraps bash (no sudo)
             "command apt install x", // command wraps apt (no sudo)
             "doas bash",             // doas is not sudo
+            "command -- bash",       // command -- bash (no sudo after `--`)
+            "env -- bash -c id",     // env -- bash (no sudo after `--`)
+            "command -- env bash",   // command -- env bash (no sudo, nested)
         ];
         for input in non_sudo_cases {
             let facts = extract_command_facts(input, ShellType::Posix);

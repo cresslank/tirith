@@ -24,6 +24,29 @@ fn tirith_in_proj(proj: &std::path::Path) -> Command {
     c
 }
 
+/// A `tirith onboard` command rooted at `proj` that is FULLY isolated from the
+/// real user environment. `onboard` detection reads home-relative paths
+/// (`home::home_dir()` for the Windsurf MCP config, `check_shell_profile` for
+/// the shell rc) and XDG/`APPDATA` base dirs (for `discover_local_policy_path`'s
+/// config fallback), so without these overrides a test could read the runner's
+/// real `~/.codeium/...`, shell rc, or config policy and flake
+/// (CodeRabbit M13 PR #132 R3-10). All five env vars point at temp dirs:
+/// `HOME` (+ `XDG_CONFIG_HOME`/`XDG_STATE_HOME` on Unix) and
+/// `APPDATA`/`LOCALAPPDATA` (the Windows base dirs `home`/`etcetera` honor).
+/// `TIRITH_POLICY_ROOT` is cleared so an inherited value cannot redirect
+/// discovery away from `proj`.
+fn tirith_onboard_isolated(proj: &std::path::Path, home: &std::path::Path) -> Command {
+    let mut c = tirith();
+    c.current_dir(proj)
+        .env_remove("TIRITH_POLICY_ROOT")
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("APPDATA", home.join("appdata"))
+        .env("LOCALAPPDATA", home.join("localappdata"));
+    c
+}
+
 #[test]
 fn check_clean_command_allows() {
     let out = tirith()
@@ -2785,10 +2808,9 @@ fn onboard_json_reports_planted_signals_and_recommends_template() {
     // An MCP config (also an ai-agent-heavy signal).
     fs::write(root.join(".mcp.json"), "{}\n").unwrap();
 
-    let out = tirith()
+    let home = tempfile::tempdir().expect("home");
+    let out = tirith_onboard_isolated(root, home.path())
         .args(["onboard", "--json"])
-        .current_dir(root)
-        .env_remove("TIRITH_POLICY_ROOT")
         .output()
         .expect("failed to run tirith onboard");
     assert_eq!(
@@ -2882,10 +2904,9 @@ fn onboard_json_ci_repo_recommends_ci_strict() {
     fs::create_dir_all(root.join(".github/workflows")).unwrap();
     fs::write(root.join(".github/workflows/test.yaml"), "name: test\n").unwrap();
 
-    let out = tirith()
+    let home = tempfile::tempdir().expect("home");
+    let out = tirith_onboard_isolated(root, home.path())
         .args(["onboard", "--json"])
-        .current_dir(root)
-        .env_remove("TIRITH_POLICY_ROOT")
         .output()
         .expect("failed to run tirith onboard");
     assert_eq!(out.status.code(), Some(0));
@@ -2906,10 +2927,9 @@ fn onboard_json_repo_mode_recommends_individual() {
     let root = dir.path();
     fs::create_dir_all(root.join(".git")).unwrap();
 
-    let out = tirith()
+    let home = tempfile::tempdir().expect("home");
+    let out = tirith_onboard_isolated(root, home.path())
         .args(["onboard", "--repo", "--json"])
-        .current_dir(root)
-        .env_remove("TIRITH_POLICY_ROOT")
         .output()
         .expect("failed to run tirith onboard");
     assert_eq!(out.status.code(), Some(0));
@@ -13052,15 +13072,17 @@ fn rule_test_unknown_rule_exits_one() {
 
 #[test]
 fn rule_validate_context_mismatch_exits_one() {
-    // A command.* predicate declared under `paste` context: predicates can
-    // never see exec data, so validate must reject it.
+    // A command.* predicate declared under `file` context: the FileScan path
+    // never extracts command facts, so the predicate can never see its data and
+    // validate must reject it. (Round-3 R3-1: `paste` is now COVERED for
+    // command.*, so the genuine mismatch is `file`.)
     let policy = r#"custom_rules:
   - id: bad-ctx
     when:
       command.uses_sudo: true
     severity: high
     title: "bad context"
-    context: [paste]
+    context: [file]
 "#;
     let (_tmp, proj) = rule_project(policy);
     let out = tirith_in_proj(&proj)
@@ -13076,6 +13098,117 @@ fn rule_validate_context_mismatch_exits_one() {
     assert!(
         stderr.contains("bad-ctx") && stderr.contains("context"),
         "error should name the rule + context issue; got: {stderr}"
+    );
+}
+
+#[test]
+fn rule_validate_paste_command_predicate_exits_zero() {
+    // Round-3 R3-1: a `command.*` predicate under `paste` is VALID — the engine
+    // fills command facts (pipeline/sudo/cwd) for paste input too — so `rule
+    // validate` must accept it (exit 0), agreeing with `policy validate`.
+    let policy = r#"custom_rules:
+  - id: paste-cmd
+    when:
+      command.uses_sudo: true
+    severity: high
+    title: "paste command rule"
+    context: [paste]
+"#;
+    let (_tmp, proj) = rule_project(policy);
+    let out = tirith_in_proj(&proj)
+        .args(["rule", "validate"])
+        .output()
+        .expect("run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "paste + command.* rule must validate (round-3 R3-1); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn rule_validate_agent_kind_empty_context_exits_zero() {
+    // Round-3 R3-9: `rule validate` must mirror `policy validate` — a
+    // context-agnostic clause (only `agent.kind`) with `context: []` has no
+    // required trigger groups and is vacuously satisfied, so it must be ACCEPTED
+    // (the old code rejected EVERY when-rule with an empty parsed context set).
+    let policy = r#"custom_rules:
+  - id: agent-only
+    when:
+      agent.kind: claude-code
+    severity: low
+    title: "agent-only rule"
+    context: []
+"#;
+    let (_tmp, proj) = rule_project(policy);
+    let out = tirith_in_proj(&proj)
+        .args(["rule", "validate"])
+        .output()
+        .expect("run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "agent.kind-only rule with empty context must validate (round-3 R3-9); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn rule_validate_bogus_context_not_double_reported() {
+    // Round-3 R3-9: a `context: [bogus]` rule must be reported ONCE as an unknown
+    // context, NOT also as "no valid context"/"not covered" (the dropped token
+    // would otherwise look like an unmet requirement). Mirrors `policy validate`.
+    let policy = r#"custom_rules:
+  - id: bogus-ctx
+    when:
+      command.uses_sudo: true
+    severity: high
+    title: "bogus context"
+    context: [bogus]
+"#;
+    let (_tmp, proj) = rule_project(policy);
+    let out = tirith_in_proj(&proj)
+        .args(["rule", "validate"])
+        .output()
+        .expect("run tirith");
+    assert_eq!(out.status.code(), Some(1), "bogus context should exit 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown context"),
+        "must report the unknown context; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not covered by declared context") && !stderr.contains("no valid context"),
+        "must NOT double-report a coverage/no-context error for the dropped token; got: {stderr}"
+    );
+}
+
+#[test]
+fn rule_validate_mcp_tool_exits_one() {
+    // Round-3 R3-3: a `when:` clause using `mcp.tool` must be REJECTED by `rule
+    // validate` (no MCP-tool signal is wired into any scan context yet), with a
+    // clear message. Agrees with `policy validate`.
+    let policy = r#"custom_rules:
+  - id: mcp-tool-rule
+    when:
+      mcp.tool: read_file
+    severity: medium
+    title: "mcp tool rule"
+    context: [file]
+"#;
+    let (_tmp, proj) = rule_project(policy);
+    let out = tirith_in_proj(&proj)
+        .args(["rule", "validate"])
+        .output()
+        .expect("run tirith");
+    assert_eq!(out.status.code(), Some(1), "mcp.tool rule should exit 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mcp-tool-rule")
+            && stderr.contains("mcp.tool")
+            && stderr.contains("not supported"),
+        "must reject mcp.tool with a clear message; got: {stderr}"
     );
 }
 
@@ -13871,6 +14004,150 @@ fn ai_diff_unreadable_file_errors_instead_of_faking_removal() {
 }
 
 // ---------------------------------------------------------------------------
+// CodeRabbit M13 PR #132 R3-6 — `ai diff` must surface added/removed EMPTY files
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ai_diff_reports_added_empty_file() {
+    // R3-6: creating an empty AI-config that was absent from the snapshot must
+    // show up as `added`. The old `old == new` fast-path collapsed "missing" and
+    // "empty" (both render as ""), silently hiding the new file.
+    let repo = ai_repo(&[("CLAUDE.md", "# Rules\n")]);
+    let state = tempfile::tempdir().expect("state");
+
+    // Snapshot the repo WITHOUT any `.cursorrules`.
+    let snap = tirith_in_proj(repo.path())
+        .args(["ai", "snapshot", "--update"])
+        .env("XDG_STATE_HOME", state.path())
+        .env("APPDATA", state.path())
+        .env("LOCALAPPDATA", state.path())
+        .output()
+        .expect("run tirith");
+    assert!(snap.status.success(), "snapshot --update should succeed");
+
+    // Now create an EMPTY `.cursorrules` (absent in snapshot, empty on disk).
+    fs::write(repo.path().join(".cursorrules"), "").unwrap();
+
+    let out = tirith_in_proj(repo.path())
+        .args(["ai", "diff", "--json"])
+        .env("XDG_STATE_HOME", state.path())
+        .env("APPDATA", state.path())
+        .env("LOCALAPPDATA", state.path())
+        .output()
+        .expect("run tirith");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let changed = v["changed_files"].as_array().expect("changed_files array");
+    let cursor = changed
+        .iter()
+        .find(|cf| cf["path"] == serde_json::json!(".cursorrules"))
+        .unwrap_or_else(|| panic!("an added empty .cursorrules must appear in the diff: {v}"));
+    assert_eq!(
+        cursor["status"],
+        serde_json::json!("added"),
+        "an empty file absent from the snapshot must be reported as `added`, not hidden: {v}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CodeRabbit M13 PR #132 R3-7 — non-interactive `ai quarantine --move` (no
+// --yes, no TTY, NON-JSON) must FAIL non-zero, not silently report success.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ai_quarantine_move_noninteractive_human_fails_and_keeps_original() {
+    // The old non-JSON path returned 0 for every refused confirm, so a
+    // non-interactive `--move` (no TTY) looked successful though nothing moved.
+    // Under `.output()` stderr is not a TTY, so this must exit non-zero and leave
+    // the original in place — mirroring the JSON branch (exit 2).
+    let repo = ai_repo(&[(".cursorrules", "Follow the style guide.\n")]);
+    let cache = tempfile::tempdir().expect("cache");
+    let out = tirith_in_proj(repo.path())
+        .args(["ai", "quarantine", ".cursorrules", "--move"])
+        .env("XDG_CACHE_HOME", cache.path())
+        .env("APPDATA", cache.path())
+        .env("LOCALAPPDATA", cache.path())
+        .output()
+        .expect("run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a non-interactive --move without --yes must fail non-zero, not return success; got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The original must be left in place (nothing was moved).
+    assert!(
+        repo.path().join(".cursorrules").exists(),
+        "a refused --move must leave the original in place"
+    );
+    // No quarantine copy should have been written either (refusal happens before
+    // the copy step).
+    let qdir = cache.path().join("tirith/quarantine");
+    let copies = fs::read_dir(&qdir).map(|rd| rd.count()).unwrap_or(0);
+    assert_eq!(
+        copies, 0,
+        "a refused --move must not leave a stray quarantine copy"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CodeRabbit M13 PR #132 R3-8 — `ai snapshot --update` records the SAME bytes it
+// scanned (single-read-safe). Normal path: the recorded sha256 must equal the
+// sha256 of the file's actual on-disk content.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ai_snapshot_records_bytes_that_were_scanned() {
+    let body = "# Rules\n\nBe concise.\n";
+    let repo = ai_repo(&[("CLAUDE.md", body)]);
+    let state = tempfile::tempdir().expect("state");
+
+    let out = tirith_in_proj(repo.path())
+        .args(["ai", "snapshot", "--update", "--json"])
+        .env("XDG_STATE_HOME", state.path())
+        .env("APPDATA", state.path())
+        .env("LOCALAPPDATA", state.path())
+        .output()
+        .expect("run tirith");
+    assert!(out.status.success(), "snapshot --update should succeed");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["updated"], serde_json::json!(true));
+
+    // Locate the single per-repo snapshot file and read back the recorded entry.
+    let dir = state.path().join("tirith");
+    let snap_file = fs::read_dir(&dir)
+        .expect("state/tirith dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().starts_with("ai_config_snapshot-"))
+                .unwrap_or(false)
+        })
+        .expect("a per-repo snapshot file must exist");
+    let snap_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&snap_file).unwrap()).expect("snapshot json");
+
+    // The recorded sha256 for CLAUDE.md must match the hash of the bytes still on
+    // disk — i.e. the recorded baseline is the validated content, not some other
+    // version (the single-read-safety guarantee of R3-8).
+    let recorded_sha = snap_json["files"]["CLAUDE.md"]["sha256"]
+        .as_str()
+        .expect("recorded sha256 for CLAUDE.md");
+    let on_disk = fs::read(repo.path().join("CLAUDE.md")).unwrap();
+    let expected_sha = tirith_core::clipboard::content_sha256_hex(&on_disk);
+    assert_eq!(
+        recorded_sha, expected_sha,
+        "the recorded snapshot sha256 must equal the sha256 of the on-disk content"
+    );
+    // And the recorded content round-trips to the same bytes.
+    assert_eq!(
+        snap_json["files"]["CLAUDE.md"]["content"],
+        serde_json::json!(body),
+        "the recorded content must be exactly what was on disk"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // M13 PR #132 finding L — `onboard --json --apply` is rejected (would corrupt JSON)
 // ---------------------------------------------------------------------------
 
@@ -13912,10 +14189,9 @@ fn onboard_json_and_apply_combo_is_rejected() {
 fn onboard_team_mode_recommends_startup() {
     let dir = tempfile::tempdir().expect("tempdir");
     fs::create_dir_all(dir.path().join(".git")).unwrap();
-    let out = tirith()
+    let home = tempfile::tempdir().expect("home");
+    let out = tirith_onboard_isolated(dir.path(), home.path())
         .args(["onboard", "--team", "--json"])
-        .current_dir(dir.path())
-        .env_remove("TIRITH_POLICY_ROOT")
         .output()
         .expect("run tirith");
     assert_eq!(out.status.code(), Some(0));
@@ -13935,12 +14211,11 @@ fn onboard_team_mode_recommends_startup() {
 fn onboard_apply_noninteractive_exits_nonzero() {
     let dir = tempfile::tempdir().expect("tempdir");
     fs::create_dir_all(dir.path().join(".git")).unwrap();
+    let home = tempfile::tempdir().expect("home");
     // `.output()` gives a non-TTY stdin/stderr, so --apply must refuse and, per
     // finding N, exit NON-ZERO rather than reporting success.
-    let out = tirith()
+    let out = tirith_onboard_isolated(dir.path(), home.path())
         .args(["onboard", "--apply"])
-        .current_dir(dir.path())
-        .env_remove("TIRITH_POLICY_ROOT")
         .output()
         .expect("run tirith");
     assert_eq!(

@@ -247,6 +247,14 @@ pub fn diff(json: bool) -> i32 {
     let mut any_finding = false;
 
     for key in &keys {
+        // Compute PRESENCE on each side first. "missing" and "empty" are
+        // DIFFERENT states: a file may be absent from the snapshot yet present
+        // (even empty) on disk, or vice-versa. Collapsing them — as a bare
+        // `old == new` check does, since both render as "" — would hide the
+        // creation/deletion of an empty AI-config (CodeRabbit M13 PR #132 R3-6).
+        let existed_before = snapshot.files.contains_key(key);
+        let exists_now = current_by_key.contains_key(key);
+
         let old = snapshot
             .files
             .get(key)
@@ -273,13 +281,17 @@ pub fn diff(json: bool) -> i32 {
             None => String::new(), // present in snapshot, gone on disk
         };
 
-        if old == new {
+        // Skip ONLY when the file exists on BOTH sides and its content is
+        // unchanged. An added file (absent before, present now) or a removed
+        // file (present before, absent now) is always reported — even when its
+        // content is empty on both notional sides.
+        if existed_before && exists_now && old == new {
             continue; // unchanged — skip
         }
 
-        let status = if snapshot.files.contains_key(key) && current_by_key.contains_key(key) {
+        let status = if existed_before && exists_now {
             "modified"
-        } else if current_by_key.contains_key(key) {
+        } else if exists_now {
             "added"
         } else {
             "removed"
@@ -472,8 +484,18 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
             yes,
         )
     {
-        if json {
-            // Non-interactive without --yes (or an explicit "no") → refuse.
+        // `confirm` returns false in TWO distinct situations and we must NOT
+        // conflate them (CodeRabbit M13 PR #132 R3-7):
+        //   1. We COULD prompt (stderr is a TTY) and the operator answered "no"
+        //      → an intentional abort; the original is kept and exit 0 is success.
+        //   2. We COULD NOT prompt (no TTY) and `--yes` was not given → nothing
+        //      was confirmed; returning 0 here would make a no-op look successful
+        //      to a non-interactive caller. Fail non-zero (exit 2), matching the
+        //      JSON branch.
+        // `--yes` short-circuits `confirm` to true, so reaching this block always
+        // means `--yes` was absent; the only question is whether a TTY existed.
+        let could_prompt = is_terminal::is_terminal(std::io::stderr());
+        if json || !could_prompt {
             let _ = emit_error(
                 json,
                 "tirith ai quarantine",
@@ -481,6 +503,7 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
             );
             return 2;
         }
+        // Interactive refusal: the operator deliberately declined.
         println!("Aborted — original left in place (nothing was moved).");
         return 0;
     }
@@ -800,6 +823,20 @@ fn snapshot_update(force: bool, json: bool) -> i32 {
     let mut blocking: Vec<(String, Severity, String)> = Vec::new();
     let mut entries: BTreeMap<String, SnapshotEntry> = BTreeMap::new();
     for f in &files {
+        // R3-8 (CodeRabbit M13 PR #132): make the read-scan-record sequence
+        // single-read-safe. `scan_single_file` does its OWN fresh disk read, so a
+        // concurrent edit between our `read_text` and the scan could validate one
+        // version of the file while we record a DIFFERENT version as the trusted
+        // baseline. `scan_single_file` doesn't accept already-read bytes, so we
+        // bracket the scan with a hash on each side and ABORT on any change:
+        //   1. read once  → `content` (the bytes we intend to record) + `pre_hash`
+        //   2. scan (its own read happens between the two hashes)
+        //   3. re-read    → `post_hash`
+        //   4. pre_hash != post_hash ⇒ the file changed during the validation
+        //      window; the scanned bytes and the about-to-be-recorded bytes may
+        //      diverge, so refuse to record an unvalidated baseline.
+        // A file stable across the whole window guarantees the scan saw the same
+        // bytes we record; any change aborts rather than risking a TOCTOU bless.
         let content = match read_text(f) {
             Ok(c) => c,
             Err(e) => {
@@ -814,6 +851,8 @@ fn snapshot_update(force: bool, json: bool) -> i32 {
                 return 1;
             }
         };
+        let pre_hash = tirith_core::clipboard::content_sha256_hex(content.as_bytes());
+
         if let Some(result) = tirith_core::scan::scan_single_file(f) {
             for finding in &result.findings {
                 if finding.severity >= Severity::High {
@@ -825,10 +864,42 @@ fn snapshot_update(force: bool, json: bool) -> i32 {
                 }
             }
         }
+
+        // Re-read and re-hash AFTER scanning. If the bytes changed, the scan we
+        // just trusted no longer describes what we would record — abort.
+        let post = match read_text(f) {
+            Ok(c) => c,
+            Err(e) => {
+                if !emit_error(
+                    json,
+                    "tirith ai snapshot",
+                    &format!("cannot re-read {}: {e}", f.display()),
+                ) {
+                    return 2;
+                }
+                return 1;
+            }
+        };
+        let post_hash = tirith_core::clipboard::content_sha256_hex(post.as_bytes());
+        if pre_hash != post_hash {
+            if !emit_error(
+                json,
+                "tirith ai snapshot",
+                &format!(
+                    "{} changed while it was being scanned; refusing to record a baseline that \
+                     was not validated. Re-run `tirith ai snapshot --update`.",
+                    f.display()
+                ),
+            ) {
+                return 2;
+            }
+            return 1;
+        }
+
         entries.insert(
             rel_key(&root, f),
             SnapshotEntry {
-                sha256: tirith_core::clipboard::content_sha256_hex(content.as_bytes()),
+                sha256: pre_hash,
                 content,
             },
         );

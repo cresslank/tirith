@@ -335,14 +335,32 @@ mod tests {
 
     #[test]
     fn test_compile_dsl_rule_context_mismatch_skipped() {
-        // command.* needs exec, but the rule declares only `paste`.
-        let rule = make_dsl_rule("mismatch", WhenClause::CommandUsesSudo(true), &["paste"]);
+        // command.* needs exec OR paste (round-3 R3-1), but the rule declares
+        // only `file` — the FileScan path never extracts command facts, so the
+        // predicate could never see its data and the rule is skipped.
+        let rule = make_dsl_rule("mismatch", WhenClause::CommandUsesSudo(true), &["file"]);
         let compiled = compile_rules(&[rule]);
         assert_eq!(
             compiled.len(),
             0,
-            "DSL rule needing exec but declaring paste is skipped"
+            "DSL rule needing exec/paste but declaring only file is skipped"
         );
+    }
+
+    #[test]
+    fn test_compile_dsl_command_rule_paste_context_compiles() {
+        // Regression (CodeRabbit M13 round-3 R3-1): a `command.*` rule declared
+        // under `paste` must now COMPILE — `build_dsl_backing` fills command
+        // facts for paste, so the predicate is live. The round-1/2 narrowing to
+        // exec-only wrongly dropped it.
+        let rule = make_dsl_rule("paste-cmd", WhenClause::CommandUsesSudo(true), &["paste"]);
+        let compiled = compile_rules(&[rule]);
+        assert_eq!(
+            compiled.len(),
+            1,
+            "DSL command rule under paste must compile (round-3 R3-1)"
+        );
+        assert!(compiled[0].is_dsl());
     }
 
     #[test]

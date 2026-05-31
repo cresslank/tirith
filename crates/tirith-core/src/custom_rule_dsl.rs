@@ -361,10 +361,15 @@ pub struct DslEvalContext<'a> {
 ///
 /// `url.*` needs Exec OR Paste (URLs are extracted in both), so it contributes
 /// BOTH and a rule declaring either one satisfies it. `command.*` and
-/// `package.*` need Exec (FileScan never populates `packages`).
-/// `file.path_matches` needs FileScan. `mcp.tool` is a
-/// FileScan signal (MCP lockfile drift). `agent.kind` is context-agnostic and
-/// contributes nothing (it never constrains the trigger group).
+/// `package.*` likewise need Exec OR Paste: `build_dsl_backing` populates the
+/// pipeline/sudo/cwd and package facts for every non-`FileScan` context, so a
+/// `[paste]` command/package rule sees its data at runtime (CodeRabbit M13
+/// round-3 R3-1). FileScan never populates those, so it is excluded.
+/// `file.path_matches` needs FileScan. `mcp.tool` is rejected by the validators
+/// (no MCP-tool signal is wired in yet — round-3 R3-3); its FileScan group here
+/// is the placeholder for when that signal lands. `agent.kind` is
+/// context-agnostic and contributes nothing (it never constrains the trigger
+/// group).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RequiredTriggerSet {
     /// Each inner group is a DISJUNCTION: the rule's contexts must intersect it.
@@ -444,9 +449,18 @@ fn collect_required(clause: &WhenClause, set: &mut RequiredTriggerSet) {
         }
         WhenClause::Not(c) => collect_required(c, set),
 
+        // `command.*` needs Exec OR Paste. The engine's `build_dsl_backing`
+        // populates `pipeline_targets`, `uses_sudo`, AND `cwd` for EVERY
+        // non-`FileScan` context — i.e. both Exec and Paste (FileScan is the only
+        // branch that genuinely lacks command facts). So a `context: [paste]`
+        // command rule DOES see its data at runtime and must validate; the
+        // round-1/2 narrowing to `[Exec]` wrongly rejected it (CodeRabbit M13
+        // round-3 R3-1). It still must NOT include FileScan — that branch never
+        // extracts command facts, so a `context: [file]` command rule stays a
+        // rejected dead rule.
         WhenClause::CommandHasPipelineTo(_)
         | WhenClause::CommandUsesSudo(_)
-        | WhenClause::CommandCwdIn(_) => set.push(&[Exec]),
+        | WhenClause::CommandCwdIn(_) => set.push(&[Exec, Paste]),
 
         WhenClause::UrlHost(_)
         | WhenClause::UrlHostMatches(_)
@@ -454,22 +468,57 @@ fn collect_required(clause: &WhenClause, set: &mut RequiredTriggerSet) {
         | WhenClause::UrlReputation(_)
         | WhenClause::UrlDomainNotIn(_) => set.push(&[Exec, Paste]),
 
-        // `package.*` needs Exec ONLY. Although packages *could* in principle be
-        // extracted from file content, `ScanContext::FileScan` never populates
-        // `DslEvalContext::packages` (the engine's `build_dsl_backing` extracts
-        // package facts only off a typed/pasted command line — see engine.rs),
-        // so a `context: [file]` package rule would pass validation yet be dead
-        // at runtime. Require Exec so that mismatch is rejected at validate time.
+        // `package.*` needs Exec OR Paste. `build_dsl_backing` extracts package
+        // facts off a typed/pasted command line for EVERY non-`FileScan` context
+        // (both Exec and Paste — see engine.rs), so a `context: [paste]` package
+        // rule sees its data and must validate (CodeRabbit M13 round-3 R3-1).
+        // FileScan is excluded: that branch never populates
+        // `DslEvalContext::packages`, so a `context: [file]` package rule would
+        // pass validation yet be dead at runtime — keep rejecting that mismatch.
         WhenClause::PackageEcosystem(_)
         | WhenClause::PackageNameMatches(_)
-        | WhenClause::PackageReputation(_) => set.push(&[Exec]),
+        | WhenClause::PackageReputation(_) => set.push(&[Exec, Paste]),
 
         WhenClause::FilePathMatches(_) => set.push(&[FileScan]),
 
+        // `mcp.tool` is rejected up-front by the validators (no MCP-tool signal
+        // is wired into any scan context yet — CodeRabbit M13 round-3 R3-3), so
+        // this trigger group is never actually consulted for a loaded rule. We
+        // keep a FileScan requirement here (the eventual MCP-lockfile home) for
+        // when the signal lands and the rejection is lifted.
         WhenClause::McpTool(_) => set.push(&[FileScan]),
 
         // Context-agnostic: never constrains the trigger group.
         WhenClause::AgentKind(_) => {}
+    }
+}
+
+/// Scan a clause tree for a predicate that is parsed and type-checked but can
+/// NEVER match because no scan context wires up the signal it reads. Returns a
+/// clear, user-facing reason for the FIRST such predicate found, or `None` when
+/// every predicate is satisfiable.
+///
+/// Today the only such predicate is `mcp.tool`: [`DslEvalContext::mcp_tool`] is
+/// hard-coded `None` on every engine path (the exec/paste hot path has no
+/// current-MCP-tool in scope, and the FileScan path scans file content, not a
+/// live tool invocation), so `when: { mcp.tool: ... }` would validate and load
+/// yet be a permanent no-op. Both validators (`policy validate` and `rule
+/// validate`) call this and REJECT such a rule rather than silently accept a
+/// dead rule (CodeRabbit M13 round-3 R3-3). `agent.kind` is intentionally NOT
+/// rejected — it is a legitimate context-agnostic predicate a caller (e.g.
+/// `tirith rule test`) can set, and the engine path documents it as `None` by
+/// design (round-3 R3-9 keeps it valid).
+pub fn clause_uses_unsupported_predicate(clause: &WhenClause) -> Option<&'static str> {
+    match clause {
+        WhenClause::All(cs) | WhenClause::Any(cs) => {
+            cs.iter().find_map(clause_uses_unsupported_predicate)
+        }
+        WhenClause::Not(c) => clause_uses_unsupported_predicate(c),
+        WhenClause::McpTool(_) => Some(
+            "mcp.tool is not supported yet (no MCP-tool signal is wired into any \
+             scan context, so the predicate can never match)",
+        ),
+        _ => None,
     }
 }
 
@@ -829,11 +878,15 @@ any:
     }
 
     #[test]
-    fn test_required_triggers_command_needs_exec() {
+    fn test_required_triggers_command_needs_exec_or_paste() {
+        // CodeRabbit M13 round-3 R3-1: `command.*` predicates evaluate on BOTH
+        // exec and paste input (`build_dsl_backing` fills pipeline/sudo/cwd for
+        // every non-FileScan context), so a `[paste]` command rule must validate.
+        // FileScan still does not (it never extracts command facts).
         let clause = WhenClause::CommandUsesSudo(true);
         let req = required_triggers(&clause);
         assert!(req.is_satisfied_by(&[ScanContext::Exec]));
-        assert!(!req.is_satisfied_by(&[ScanContext::Paste]));
+        assert!(req.is_satisfied_by(&[ScanContext::Paste]));
         assert!(!req.is_satisfied_by(&[ScanContext::FileScan]));
     }
 
@@ -847,11 +900,15 @@ any:
     }
 
     #[test]
-    fn test_required_triggers_package_needs_exec_only() {
-        // Regression (CodeRabbit M13 finding A): `package.*` must require Exec
-        // and NOT FileScan — the engine's FileScan path never extracts package
-        // facts, so a `context: [file]` package rule would validate yet be dead
-        // at runtime. Cover all three package predicates.
+    fn test_required_triggers_package_needs_exec_or_paste() {
+        // Regression (CodeRabbit M13 round-1 finding A + round-3 R3-1):
+        // `package.*` must be satisfied by Exec OR Paste — the engine's
+        // `build_dsl_backing` extracts package facts off the command line for
+        // every non-FileScan context (both exec and paste), so a `[paste]`
+        // package rule sees its data at runtime and must validate. FileScan is
+        // still rejected (it never populates `DslEvalContext::packages`, so a
+        // `context: [file]` package rule would be dead at runtime). Cover all
+        // three package predicates.
         for clause in [
             WhenClause::PackageEcosystem("npm".to_string()),
             WhenClause::PackageNameMatches("^left-pad$".to_string()),
@@ -863,12 +920,12 @@ any:
                 "package predicate must be satisfied by exec: {clause:?}"
             );
             assert!(
-                !req.is_satisfied_by(&[ScanContext::FileScan]),
-                "package predicate must NOT be satisfied by file (no package facts there): {clause:?}"
+                req.is_satisfied_by(&[ScanContext::Paste]),
+                "package predicate must be satisfied by paste (round-3 R3-1): {clause:?}"
             );
             assert!(
-                !req.is_satisfied_by(&[ScanContext::Paste]),
-                "package predicate must NOT be satisfied by paste alone: {clause:?}"
+                !req.is_satisfied_by(&[ScanContext::FileScan]),
+                "package predicate must NOT be satisfied by file (no package facts there): {clause:?}"
             );
         }
     }
@@ -910,6 +967,41 @@ any:
         assert!(validate_regexes(&bad).is_err());
         let good = WhenClause::UrlHostMatches(r"github\.com$".to_string());
         assert!(validate_regexes(&good).is_ok());
+    }
+
+    #[test]
+    fn test_unsupported_predicate_detects_mcp_tool() {
+        // CodeRabbit M13 round-3 R3-3: `mcp.tool` is parsed + type-checked but no
+        // scan context populates `mcp_tool`, so it can never match. The helper
+        // must flag it (nested inside combinators too), and NOT flag `agent.kind`
+        // (which stays valid — R3-9) or any satisfiable predicate.
+        let bare = WhenClause::McpTool("read_file".to_string());
+        let reason = clause_uses_unsupported_predicate(&bare).expect("mcp.tool must be flagged");
+        assert!(
+            reason.contains("mcp.tool") && reason.contains("not supported"),
+            "reason must name mcp.tool clearly: {reason}"
+        );
+
+        // Buried under all/any/not — still detected.
+        let nested = WhenClause::All(vec![
+            WhenClause::CommandUsesSudo(true),
+            WhenClause::Any(vec![
+                WhenClause::UrlScheme("https".to_string()),
+                WhenClause::Not(Box::new(WhenClause::McpTool("x".to_string()))),
+            ]),
+        ]);
+        assert!(clause_uses_unsupported_predicate(&nested).is_some());
+
+        // `agent.kind` and ordinary predicates are NOT flagged.
+        assert!(clause_uses_unsupported_predicate(&WhenClause::AgentKind(
+            "claude-code".to_string()
+        ))
+        .is_none());
+        assert!(clause_uses_unsupported_predicate(&WhenClause::All(vec![
+            WhenClause::AgentKind("claude-code".to_string()),
+            WhenClause::CommandUsesSudo(true),
+        ]))
+        .is_none());
     }
 
     #[test]
