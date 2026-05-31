@@ -502,6 +502,7 @@ pub mod logs;
 pub mod manpage;
 pub mod mcp;
 pub mod mcp_server;
+pub mod onboard;
 pub mod output_guard;
 pub mod package;
 pub mod paste;

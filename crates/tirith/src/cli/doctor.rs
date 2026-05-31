@@ -2431,7 +2431,11 @@ fn print_human(info: &DoctorInfo) {
 
 /// Check if the user's shell profile contains tirith init configuration.
 /// Returns (profile_path, is_configured).
-fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
+///
+/// `pub(crate)` so the read-only `tirith onboard` detector can reuse the exact
+/// same "is the shell hook wired into the profile?" check rather than
+/// reinventing profile discovery.
+pub(crate) fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
     let home = match home::home_dir() {
         Some(h) => h,
         None => return (None, false),

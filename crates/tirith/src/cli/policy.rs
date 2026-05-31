@@ -451,6 +451,18 @@ impl PolicyTemplate {
         }
     }
 
+    /// The canonical hyphenated name (`individual` / `ci-strict` /
+    /// `ai-agent-heavy`). Round-trips through [`PolicyTemplate::parse`], so a
+    /// recommender (`tirith onboard`) can pass it straight to
+    /// `tirith policy init --template <name>`.
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Individual => "individual",
+            Self::CiStrict => "ci-strict",
+            Self::AiAgentHeavy => "ai-agent-heavy",
+        }
+    }
+
     /// The YAML body this template writes.
     fn body(self) -> &'static str {
         match self {

@@ -230,6 +230,8 @@ help_example_tests! {
     help_incident_stop         => (["incident", "stop", "--help"], "tirith incident stop --yes");
     help_incident_status       => (["incident", "status", "--help"], "tirith incident status");
     help_incident_report       => (["incident", "report", "--help"], "tirith incident report --out");
+    // M13 ch1 — onboarding wizard.
+    help_onboard               => (["onboard", "--help"], "tirith onboard --json");
 }
 
 /// The dominant requirement for `tirith secret` is HONESTY: every surface must

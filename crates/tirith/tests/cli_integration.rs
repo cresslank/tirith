@@ -2685,6 +2685,181 @@ fn policy_init_default_unchanged_without_template() {
     );
 }
 
+/// M13 ch1: `tirith onboard --json` must report the planted, FILE-BASED signals
+/// and recommend a sensible template. We plant a `.git` so the repo-root walk
+/// resolves to the temp tree itself, and assert only on file-based detections
+/// (`CLAUDE.md`, the `.github/workflows` CI pipeline, `Cargo.lock`) — never on
+/// PATH-detected package managers, which vary by test machine. A heavy AI-config
+/// signal (CLAUDE.md + .claude/ + .cursorrules) drives the recommendation to
+/// `ai-agent-heavy`; the report stays read-only (no `.tirith/policy.yaml` is
+/// written without `--apply`).
+#[test]
+fn onboard_json_reports_planted_signals_and_recommends_template() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+
+    // A `.git` so find_repo_root anchors detection to this tree deterministically.
+    fs::create_dir_all(root.join(".git")).unwrap();
+    // AI-config signals (>=2 → ai-agent-heavy).
+    fs::write(root.join("CLAUDE.md"), "# project rules\n").unwrap();
+    fs::write(root.join(".cursorrules"), "be careful\n").unwrap();
+    fs::create_dir_all(root.join(".claude")).unwrap();
+    // CI pipeline.
+    fs::create_dir_all(root.join(".github/workflows")).unwrap();
+    fs::write(root.join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
+    // A Rust lockfile.
+    fs::write(root.join("Cargo.lock"), "# lockfile\n").unwrap();
+    // An MCP config (also an ai-agent-heavy signal).
+    fs::write(root.join(".mcp.json"), "{}\n").unwrap();
+
+    let out = tirith()
+        .args(["onboard", "--json"])
+        .current_dir(root)
+        .env_remove("TIRITH_POLICY_ROOT")
+        .output()
+        .expect("failed to run tirith onboard");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "onboard --json should exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("onboard --json should output valid JSON");
+
+    assert_eq!(json["schema_version"], 1);
+
+    // File-based detections must list the planted signals.
+    let ai: Vec<String> = json["ai_config_files"]
+        .as_array()
+        .expect("ai_config_files array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        ai.contains(&"CLAUDE.md".to_string()),
+        "ai_config_files: {ai:?}"
+    );
+    assert!(
+        ai.contains(&".cursorrules".to_string()),
+        "ai_config_files: {ai:?}"
+    );
+    assert!(
+        ai.contains(&".claude/".to_string()),
+        "ai_config_files: {ai:?}"
+    );
+
+    assert_eq!(
+        json["ci_detected"], true,
+        "the .github/workflows/ci.yml pipeline must be detected"
+    );
+
+    let lockfiles: Vec<String> = json["lockfiles"]
+        .as_array()
+        .expect("lockfiles array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        lockfiles.contains(&"Cargo.lock".to_string()),
+        "lockfiles: {lockfiles:?}"
+    );
+
+    let mcp: Vec<String> = json["mcp_configs"]
+        .as_array()
+        .expect("mcp_configs array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        mcp.contains(&".mcp.json".to_string()),
+        "mcp_configs: {mcp:?}"
+    );
+
+    // Heavy AI-config + MCP presence → ai-agent-heavy recommendation.
+    assert_eq!(
+        json["recommended_template"], "ai-agent-heavy",
+        "heavy AI-config/MCP presence should recommend ai-agent-heavy"
+    );
+
+    // Read-only without --apply: no policy file written.
+    assert!(
+        !root.join(".tirith/policy.yaml").exists(),
+        "onboard without --apply must not write a policy file"
+    );
+
+    // The repo root walked up to the planted .git (== the temp tree). Compare
+    // canonical paths: on macOS the process cwd resolves `/var` → `/private/var`,
+    // so the reported path and `root` differ textually but canonicalize equal.
+    let reported = std::path::PathBuf::from(json["repo_root"].as_str().expect("repo_root string"));
+    assert_eq!(
+        reported.canonicalize().ok(),
+        root.canonicalize().ok(),
+        "repo_root should resolve to the planted .git tree"
+    );
+}
+
+/// M13 ch1: a CI-only repo (no heavy AI surface) recommends `ci-strict`.
+#[test]
+fn onboard_json_ci_repo_recommends_ci_strict() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join(".github/workflows")).unwrap();
+    fs::write(root.join(".github/workflows/test.yaml"), "name: test\n").unwrap();
+
+    let out = tirith()
+        .args(["onboard", "--json"])
+        .current_dir(root)
+        .env_remove("TIRITH_POLICY_ROOT")
+        .output()
+        .expect("failed to run tirith onboard");
+    assert_eq!(out.status.code(), Some(0));
+
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(json["ci_detected"], true);
+    assert_eq!(
+        json["recommended_template"], "ci-strict",
+        "a CI repo with no heavy AI surface should recommend ci-strict"
+    );
+}
+
+/// M13 ch1: an explicit `--repo` mode flag with no CI recommends `individual`,
+/// and the JSON records the requested mode bias.
+#[test]
+fn onboard_json_repo_mode_recommends_individual() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+
+    let out = tirith()
+        .args(["onboard", "--repo", "--json"])
+        .current_dir(root)
+        .env_remove("TIRITH_POLICY_ROOT")
+        .output()
+        .expect("failed to run tirith onboard");
+    assert_eq!(out.status.code(), Some(0));
+
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(json["requested_mode"], "repo");
+    assert_eq!(json["recommended_template"], "individual");
+}
+
+/// M13 ch1: the mutually-exclusive mode flags must conflict (clap ArgGroup).
+#[test]
+fn onboard_conflicting_mode_flags_error() {
+    let out = tirith()
+        .args(["onboard", "--repo", "--team"])
+        .output()
+        .expect("failed to run tirith onboard");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "--repo and --team are mutually exclusive and must error"
+    );
+}
+
 /// CodeRabbit R15 #1: `tirith policy init` / `commands init` must REFUSE to
 /// overwrite an existing file WITHOUT `--force`, and atomically REPLACE it WITH
 /// `--force`. The round-12 atomic-write refactor (`write_file_atomic` always

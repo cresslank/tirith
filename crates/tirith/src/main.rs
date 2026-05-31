@@ -516,6 +516,57 @@ Examples:
         prompt_status: bool,
     },
 
+    /// Detect your environment and recommend a tirith setup (M13 ch1)
+    #[command(
+        after_help = "\
+Scans the current repo for the signals that should shape your tirith setup —
+shell, IDE configs (.cursor/.vscode), AI-config files (CLAUDE.md, .cursorrules,
+AGENTS.md, .claude/, .cursor/rules/), package managers on PATH, lockfiles, a
+.github/workflows CI pipeline, and MCP configs — then RECOMMENDS one of the
+shipping policy templates (individual / ci-strict / ai-agent-heavy) and the
+next steps to get protected.
+
+Detection is read-only and never materializes hooks. --apply performs the
+recommended SAFE steps (policy init, the init hook line) with per-step
+confirmation on stdin; it refuses to act when run non-interactively (piped /
+CI), printing what it WOULD do instead. The mode flags bias the recommendation:
+--repo / --team / --ai-agent-heavy (mutually exclusive); omit them to auto-detect.
+
+Examples:
+  tirith onboard
+  tirith onboard --json
+  tirith onboard --ai-agent-heavy
+  tirith onboard --apply",
+        // `--repo`, `--team`, and `--ai-agent-heavy` are three mutually
+        // exclusive mode biases, modeled the way `Explain` models its
+        // mutually-exclusive selectors: separate bool flags carried by an
+        // ArgGroup (multiple=false) so a stale `--repo --team` invocation
+        // surfaces a clear usage error. They collapse to one `mode` string
+        // before reaching `cli::onboard::run`.
+        group = clap::ArgGroup::new("onboard_mode")
+            .args(["repo", "team", "ai_agent_heavy"])
+            .multiple(false)
+            .required(false)
+    )]
+    Onboard {
+        /// Bias the recommendation toward a single-repo setup.
+        #[arg(long)]
+        repo: bool,
+        /// Bias the recommendation toward a locked-down team / shared setup.
+        #[arg(long)]
+        team: bool,
+        /// Bias the recommendation toward an AI-agent-heavy setup.
+        #[arg(long = "ai-agent-heavy")]
+        ai_agent_heavy: bool,
+        /// Perform the recommended SAFE actions (with per-step stdin
+        /// confirmation). Refuses to act when not an interactive terminal.
+        #[arg(long)]
+        apply: bool,
+        /// Emit the detection report + recommendation as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Print a one-line shell-prompt status (M8 ch6).
     ///
     /// Designed to be invoked from `$PS1` / `$PROMPT` / `fish_prompt` on every
@@ -6441,6 +6492,28 @@ fn run() {
             shell,
             prompt_status,
         } => cli::init::run(shell.as_deref(), prompt_status),
+
+        // M13 ch1 — onboarding wizard. The three mutually-exclusive mode flags
+        // (enforced as an ArgGroup) collapse to a single `mode` string; `None`
+        // means auto-detect.
+        Commands::Onboard {
+            repo,
+            team,
+            ai_agent_heavy,
+            apply,
+            json,
+        } => {
+            let mode = if repo {
+                Some("repo")
+            } else if team {
+                Some("team")
+            } else if ai_agent_heavy {
+                Some("ai-agent-heavy")
+            } else {
+                None
+            };
+            cli::onboard::run(mode, apply, json)
+        }
 
         Commands::PromptStatus {
             short,
