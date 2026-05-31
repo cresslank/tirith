@@ -1097,9 +1097,23 @@ fn line_is_tool_use(line: &str) -> bool {
     // drift (the safe under-match for a High-severity rule — over-broadening it
     // causes alert fatigue).
     static RUN_EXEC: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(
-            r#"(?i)(?:^|\s)(?:run|exec|shell|command|cmd)\s*[:=]|(?:^|\b)(?:run|exec|execute|spawn|invoke)\s+(?:the\s+)?(?:["'`/.]|sh\b|bash\b|zsh\b|cmd\b|powershell\b|pwsh\b|\w+\.(?:sh|py|ps1|js|rb)|(?:cargo|git|npm|npx|pnpm|yarn|pip|pip3|uv|deno|bun|python|python3|rake|gradle|mvn|docker|podman|kubectl|terraform|ansible|curl|wget|ssh|scp|rsync)\b|[\w.-]+\s+--?\w)"#,
-        )
+        // Curated closed list of real CLI tool / interpreter names. Every entry is
+        // an actual binary, NOT an English-ambiguous word, so a bare `run <tool>`
+        // is a strong command signal. English-ambiguous tokens (`go`, `make`) are
+        // deliberately kept OUT of this arm (they still fire via the glued-flag
+        // arm). The interpreter names (`node`/`ruby`/`perl`/`php`/`lua`) were added
+        // in CodeRabbit M13 round-11 R11-1 — `run node build.js` /
+        // `execute ruby setup.rb` were previously unmatched; they are interpreter
+        // binaries, not filler, so false-positive risk is low.
+        const CURATED_CLI_TOOLS: &str = concat!(
+            "cargo|git|npm|npx|pnpm|yarn|pip|pip3|uv|deno|bun",
+            "|node|ruby|perl|php|lua",
+            "|python|python3|rake|gradle|mvn|docker|podman|kubectl",
+            "|terraform|ansible|curl|wget|ssh|scp|rsync"
+        );
+        Regex::new(&format!(
+            r#"(?i)(?:^|\s)(?:run|exec|shell|command|cmd)\s*[:=]|(?:^|\b)(?:run|exec|execute|spawn|invoke)\s+(?:the\s+)?(?:["'`/.]|sh\b|bash\b|zsh\b|cmd\b|powershell\b|pwsh\b|\w+\.(?:sh|py|ps1|js|rb)|(?:{CURATED_CLI_TOOLS})\b|[\w.-]+\s+--?\w)"#,
+        ))
         .unwrap()
     });
     if RUN_EXEC.is_match(&lower) {
@@ -1128,14 +1142,38 @@ fn line_is_tool_use(line: &str) -> bool {
     //    (`Cargo.toml`, `package.json`, `.env.local`). A leading dot OR an
     //    extension is what distinguishes a file destination from a non-file noun:
     //    `memory` / `stdout` carry neither and so still do not match (R5 +
-    //    CodeRabbit M13 round-10 R10-3);
+    //    CodeRabbit M13 round-10 R10-3) — OR a CURATED well-known EXTENSIONLESS
+    //    repo file (`Dockerfile`, `Makefile`, `Gemfile`, `LICENSE`, …), a closed
+    //    allowlist that lets these dot-less names match WITHOUT re-admitting an
+    //    unbounded bare word (CodeRabbit M13 round-11 R11-2);
     //  - a shell redirection (`>`/`>>`) into the SAME destination set — a path-ish
-    //    token, a leading-dot dotfile, or a bare extension-bearing filename
-    //    (`echo x > out.txt`, `echo x > .gitignore`).
+    //    token, a leading-dot dotfile, a bare extension-bearing filename, or a
+    //    curated extensionless repo file (`echo x > out.txt`,
+    //    `echo x > .gitignore`, `echo x > Gemfile`).
     static FILE_WRITE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(
-            r#"(?i)(?:write|append|overwrite|save|echo)\b.*?\b(?:to|into|onto)\s+(?:~/|\./|\.\./|/|\$\w+[/\\]|[a-z]:[\\/]|(?:\.[\w-]+|[\w-]+(?:\.[\w.-]+)+))|>>?\s*(?:~/|\./|\.\./|/|\$\w+[/\\]|[a-z]:[\\/]|(?:\.[\w-]+|[\w-]+(?:\.[\w.-]+)+))"#,
-        )
+        // CURATED case-insensitive list of well-known EXTENSIONLESS repo files
+        // (no dot, no extension). These are real write destinations that the
+        // path/dotfile/extension alternation below cannot reach (CodeRabbit M13
+        // round-11 R11-2: `write to Dockerfile`, `append to Makefile`,
+        // `echo x > Gemfile` were unmatched). A closed allowlist — NOT an
+        // unbounded bare-word match — so `write to memory` / `write to stdout`
+        // still do NOT fire. Anchored with a trailing `\b` so a prefix
+        // (`license` in `licensee`) does not match.
+        const EXTENSIONLESS_REPO_FILES: &str = concat!(
+            "dockerfile|makefile|gemfile|procfile|vagrantfile|jenkinsfile",
+            "|rakefile|brewfile|license|readme|changelog|codeowners|authors|notice"
+        );
+        // Shared destination set, used identically by BOTH the `to|into|onto`
+        // branch and the `>`/`>>` redirection branch: a PATH-like token (absolute
+        // `/`, `~/`, `./`, `../`, `$VAR/`, Windows drive), a single leading-dot
+        // dotfile (`.env`), an extension-bearing filename (`Cargo.toml`), or a
+        // curated extensionless repo file (`Dockerfile`).
+        let dest = format!(
+            r#"(?:~/|\./|\.\./|/|\$\w+[/\\]|[a-z]:[\\/]|(?:\.[\w-]+|[\w-]+(?:\.[\w.-]+)+)|(?:{EXTENSIONLESS_REPO_FILES})\b)"#,
+        );
+        Regex::new(&format!(
+            r#"(?i)(?:write|append|overwrite|save|echo)\b.*?\b(?:to|into|onto)\s+{dest}|>>?\s*{dest}"#,
+        ))
         .unwrap()
     });
     if FILE_WRITE.is_match(&lower) {
@@ -2189,6 +2227,26 @@ mod tests {
     }
 
     #[test]
+    fn run_exec_fires_on_bare_interpreter_launches() {
+        // CodeRabbit M13 round-11 R11-1: bare interpreter launches
+        // (`run node build.js`, `execute ruby setup.rb`) were unmatched — the
+        // curated tool arm lacked the common interpreter binaries. `node`/`ruby`/
+        // `perl`/`php`/`lua` are real interpreter names (not English filler), so
+        // they were added to the curated alternation (deno/bun were already
+        // present). All four must now promote the directive to a tool-use match.
+        assert!(line_is_tool_use("run node build.js"), "`run node build.js`");
+        assert!(
+            line_is_tool_use("execute ruby setup.rb"),
+            "`execute ruby setup.rb`"
+        );
+        assert!(line_is_tool_use("invoke perl x.pl"), "`invoke perl x.pl`");
+        assert!(line_is_tool_use("run php artisan"), "`run php artisan`");
+        // The round-10 curated/path/flag arms still fire under the extended list.
+        assert!(line_is_tool_use("run cargo test"), "`run cargo test`");
+        assert!(line_is_tool_use("run ./build.sh"), "`run ./build.sh`");
+    }
+
+    #[test]
     fn run_exec_does_not_fire_on_imperative_english_prose() {
         // R10-2 FALSE-POSITIVE GUARD: these verbs also begin ordinary English
         // sentences. `regex` has no lookahead, so the exclusion of filler nouns is
@@ -2393,6 +2451,58 @@ mod tests {
         assert!(
             !line_is_tool_use("save notes to memory"),
             "`save notes to memory` has no dot/slash destination and must not fire"
+        );
+    }
+
+    #[test]
+    fn file_write_directive_matches_extensionless_repo_files() {
+        // CodeRabbit M13 round-11 R11-2: well-known EXTENSIONLESS repo files
+        // (`Dockerfile`, `Makefile`, `Gemfile`, `LICENSE`, …) carry neither a
+        // leading dot nor an extension, so the round-2/3/10 destination alternation
+        // could not reach them. A CURATED case-insensitive allowlist now admits
+        // them in BOTH the `to|into|onto` branch and the `>`/`>>` redirection
+        // branch — WITHOUT re-opening an unbounded bare-word match.
+        assert!(
+            line_is_tool_use("write to Dockerfile"),
+            "`write to Dockerfile` (extensionless repo file) must fire"
+        );
+        assert!(
+            line_is_tool_use("append to Makefile"),
+            "`append to Makefile` (extensionless repo file) must fire"
+        );
+        assert!(
+            line_is_tool_use("echo x > Gemfile"),
+            "`echo x > Gemfile` (redirection into an extensionless repo file) must fire"
+        );
+        assert!(
+            line_is_tool_use("save to LICENSE"),
+            "`save to LICENSE` (extensionless repo file) must fire"
+        );
+
+        // The round-2/3/10 destination classes still fire under the extended set.
+        assert!(
+            line_is_tool_use("write to .env"),
+            "round-10 single-component dotfile must still fire"
+        );
+        assert!(
+            line_is_tool_use("append to Cargo.toml"),
+            "round-3 extension-bearing filename must still fire"
+        );
+        assert!(
+            line_is_tool_use("save the file to /tmp/x"),
+            "round-2 absolute-path destination must still fire"
+        );
+
+        // STILL excluded: a non-file noun NOT on the curated allowlist (no dot, no
+        // extension, not a known extensionless repo file) must not fire even after
+        // a write verb + preposition.
+        assert!(
+            !line_is_tool_use("save notes to memory"),
+            "`save notes to memory` is not on the curated allowlist and must not fire"
+        );
+        assert!(
+            !line_is_tool_use("write results to stdout"),
+            "`write results to stdout` is not on the curated allowlist and must not fire"
         );
     }
 

@@ -33,14 +33,20 @@ fn tirith_in_proj(proj: &std::path::Path) -> Command {
 
 /// A `tirith onboard` command rooted at `proj` that is FULLY isolated from the
 /// real user environment. `onboard` detection reads home-relative paths
-/// (`home::home_dir()` for the Windsurf MCP config, `check_shell_profile` for
-/// the shell rc) and XDG/`APPDATA` base dirs (for `discover_local_policy_path`'s
-/// config fallback), so without these overrides a test could read the runner's
-/// real `~/.codeium/...`, shell rc, or config policy and flake
-/// (CodeRabbit M13 PR #132 R3-10). All env vars point at temp dirs:
-/// `HOME` (+ `XDG_CONFIG_HOME`/`XDG_STATE_HOME` on Unix) and `USERPROFILE` /
-/// `APPDATA`/`LOCALAPPDATA` (the Windows base dirs `home`/`etcetera` honor;
-/// `home::home_dir()` reads `USERPROFILE` on Windows — round-4 DUP).
+/// (the Windsurf MCP config via `onboard`'s env-first `home_base()`,
+/// `check_shell_profile` for the shell rc) and XDG/`APPDATA` base dirs (for
+/// `discover_local_policy_path`'s config fallback), so without these overrides a
+/// test could read the runner's real `~/.codeium/...`, shell rc, or config
+/// policy and flake (CodeRabbit M13 PR #132 R3-10). All env vars point at temp
+/// dirs: `HOME` (+ `XDG_CONFIG_HOME`/`XDG_STATE_HOME` on Unix) and `USERPROFILE`
+/// / `APPDATA`/`LOCALAPPDATA` (the Windows base dirs `home`/`etcetera` honor).
+///
+/// The Windsurf MCP scan now resolves its home base from `$HOME` / `%USERPROFILE%`
+/// (`onboard::home_base`) rather than `home::home_dir()` directly, so setting
+/// `HOME`/`USERPROFILE` here makes that scan deterministic on EVERY OS — on macOS
+/// `home::home_dir()` could fall back to `getpwuid_r` and read the runner's real
+/// `~/.codeium`, flipping an `mcp_config_count`-driven recommendation
+/// (CodeRabbit M13 PR #132 R11-3).
 /// `TIRITH_POLICY_ROOT` is cleared so an inherited value cannot redirect
 /// discovery away from `proj`. `TIRITH_INTERACTIVE` is cleared too: this file
 /// uses it as a TTY-detection override seam, so an inherited
@@ -2923,6 +2929,16 @@ fn onboard_json_reports_planted_signals_and_recommends_template() {
 }
 
 /// M13 ch1: a CI-only repo (no heavy AI surface) recommends `ci-strict`.
+///
+/// R11-3: this is the host-dependence regression guard. `recommend_template`
+/// returns `ai-agent-heavy` whenever `mcp_config_count >= 1` (BEFORE the CI
+/// branch), so if the home-relative Windsurf MCP scan leaked the runner's real
+/// `~/.codeium/windsurf/mcp_config.json`, this would flip to `ai-agent-heavy`.
+/// `tirith_onboard_isolated` repoints `HOME`/`USERPROFILE` at a temp dir and the
+/// scan now resolves its home base from that env (`onboard::home_base`), so the
+/// planted-nothing home yields `mcp_configs == []` on every OS — which we assert
+/// explicitly here so a future regression to host-dependent home resolution
+/// fails loudly instead of silently flipping the recommendation.
 #[test]
 fn onboard_json_ci_repo_recommends_ci_strict() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2940,9 +2956,77 @@ fn onboard_json_ci_repo_recommends_ci_strict() {
 
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
     assert_eq!(json["ci_detected"], true);
+
+    // No MCP config was planted (neither repo-local nor under the isolated
+    // home), so the scan MUST report zero — proving the host's real `~/.codeium`
+    // did not leak into detection.
+    let mcp = json["mcp_configs"].as_array().expect("mcp_configs array");
+    assert!(
+        mcp.is_empty(),
+        "an isolated repo+home that plants no MCP config must report mcp_configs == [], \
+         got: {mcp:?} — the host's real ~/.codeium leaked in (R11-3)"
+    );
+
     assert_eq!(
         json["recommended_template"], "ci-strict",
         "a CI repo with no heavy AI surface should recommend ci-strict"
+    );
+}
+
+/// R11-3: the positive half of the home-relative MCP isolation contract. A
+/// Windsurf MCP config planted UNDER the isolated home
+/// (`$HOME/.codeium/windsurf/mcp_config.json`) MUST be detected end-to-end
+/// through the real binary, and — because `mcp_config_count >= 1` outranks the
+/// CI branch in `recommend_template` — flip an otherwise-`ci-strict` repo to
+/// `ai-agent-heavy`. This proves the env-first `home_base()` resolution actually
+/// reaches the windsurf path in a spawned process on every OS (the companion to
+/// `onboard_json_ci_repo_recommends_ci_strict`, which asserts the absence case).
+#[test]
+fn onboard_json_detects_windsurf_mcp_under_isolated_home() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    // A CI-only repo: WITHOUT the windsurf signal this recommends ci-strict.
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join(".github/workflows")).unwrap();
+    fs::write(root.join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
+
+    // Plant the home-relative Windsurf MCP config under the ISOLATED home.
+    let home = tempfile::tempdir().expect("home");
+    let windsurf_dir = home.path().join(".codeium").join("windsurf");
+    fs::create_dir_all(&windsurf_dir).unwrap();
+    fs::write(windsurf_dir.join("mcp_config.json"), "{}\n").unwrap();
+
+    let out = tirith_onboard_isolated(root, home.path())
+        .args(["onboard", "--json"])
+        .output()
+        .expect("failed to run tirith onboard");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "onboard --json should exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+
+    // The windsurf config (an absolute path under the isolated home) must appear.
+    let mcp: Vec<String> = json["mcp_configs"]
+        .as_array()
+        .expect("mcp_configs array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        mcp.iter().any(|p| p.contains(".codeium")
+            && p.contains("windsurf")
+            && p.ends_with("mcp_config.json")),
+        "the windsurf MCP config under the isolated home must be detected, got: {mcp:?}"
+    );
+
+    // mcp_config_count >= 1 outranks the CI branch → ai-agent-heavy.
+    assert_eq!(
+        json["recommended_template"], "ai-agent-heavy",
+        "a detected home-relative MCP config must drive the recommendation to ai-agent-heavy"
     );
 }
 

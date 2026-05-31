@@ -386,8 +386,39 @@ fn detect_ci(root: &Path) -> bool {
     })
 }
 
+/// Resolve the user's home directory in an ENV-RESOLVABLE way, preferring the
+/// `$HOME` / `%USERPROFILE%` env over `home::home_dir()`.
+///
+/// `home::home_dir()` on Unix (notably macOS) can fall back to `getpwuid_r`,
+/// which ignores an unset/empty `$HOME` and returns the REAL passwd home. That
+/// makes the home-relative MCP scan ([`detect_mcp_configs`]) impossible to
+/// isolate in tests on macOS — a runner with a real
+/// `~/.codeium/windsurf/mcp_config.json` would leak in and flip an
+/// `mcp_config_count`-driven recommendation. Reading the env first (the same
+/// way `tirith_core::policy::state_dir` / `cli::checkpoint::home_dir` resolve
+/// user paths) keeps production behaviour identical for real users — `$HOME`
+/// (`%USERPROFILE%` on Windows) is set in every normal session — while letting
+/// tests point the scan at an isolated temp home on every OS. We still fall back
+/// to `home::home_dir()` when the env var is absent so a stripped environment
+/// behaves exactly as before.
+fn home_base() -> Option<PathBuf> {
+    #[cfg(unix)]
+    let env_home = std::env::var_os("HOME");
+    #[cfg(not(unix))]
+    let env_home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+
+    env_home
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .or_else(home::home_dir)
+}
+
 /// Detect MCP config files: the repo-local surface joined onto `root`, plus the
 /// home-relative Windsurf config (`~/.codeium/windsurf/mcp_config.json`).
+///
+/// The home base is resolved via [`home_base`] (env-first), NOT `home::home_dir`
+/// directly, so the home-relative scan is isolatable in tests on every OS
+/// (CodeRabbit M13 PR #132 R11-3).
 fn detect_mcp_configs(root: &Path) -> Vec<String> {
     let mut found: Vec<String> = MCP_CONFIG_RELATIVE_PATHS
         .iter()
@@ -395,7 +426,7 @@ fn detect_mcp_configs(root: &Path) -> Vec<String> {
         .map(|rel| (*rel).to_string())
         .collect();
 
-    if let Some(home) = home::home_dir() {
+    if let Some(home) = home_base() {
         let windsurf = home
             .join(".codeium")
             .join("windsurf")
@@ -879,5 +910,145 @@ mod tests {
             found.iter().any(|f| f == ".github/copilot-instructions.md"),
             ".github/copilot-instructions.md must be detected, got: {found:?}"
         );
+    }
+
+    // `HOME` / `USERPROFILE` are process-global and cargo runs unit tests in
+    // parallel. The R11-3 tests that point the home base at a temp dir must not
+    // interleave: this mutex serialises them. The RAII [`HomeGuard`] sets and
+    // restores BOTH vars so a panicking test still cleans up. (Same pattern as
+    // `bash_capability`'s `StateHomeGuard`.)
+    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct HomeGuard {
+        prev_home: Option<std::ffi::OsString>,
+        prev_userprofile: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl HomeGuard {
+        /// Point BOTH `HOME` (Unix) and `USERPROFILE` (Windows) at `dir` so
+        /// [`home_base`] resolves there on every OS, isolated from the real home.
+        fn set(dir: &Path) -> Self {
+            let lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_home = std::env::var_os("HOME");
+            let prev_userprofile = std::env::var_os("USERPROFILE");
+            std::env::set_var("HOME", dir);
+            std::env::set_var("USERPROFILE", dir);
+            Self {
+                prev_home,
+                prev_userprofile,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.prev_userprofile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
+
+    /// R11-3: [`home_base`] must resolve from the `$HOME` / `%USERPROFILE%` env,
+    /// NOT the OS passwd entry, so the home-relative MCP scan is isolatable on
+    /// every OS (incl. macOS, where `home::home_dir()` can prefer `getpwuid_r`).
+    #[test]
+    fn home_base_resolves_from_env() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = HomeGuard::set(dir.path());
+        assert_eq!(
+            home_base(),
+            Some(dir.path().to_path_buf()),
+            "home_base must honor the HOME/USERPROFILE env override"
+        );
+    }
+
+    /// R11-3: an EMPTY `HOME`/`USERPROFILE` must be treated as unset (mirroring
+    /// `policy::state_dir`'s empty-`XDG_STATE_HOME` handling), so `home_base`
+    /// never returns an empty/relative base. This is the behaviour unique to the
+    /// env-first helper — a naive `var_os("HOME")` would return `Some("")` and
+    /// silently anchor the windsurf scan at a bogus relative path. With both vars
+    /// empty, `home_base` falls back to `home::home_dir()` (a non-empty absolute
+    /// path) or `None`, never `Some("")`.
+    #[test]
+    fn home_base_treats_empty_env_as_unset() {
+        let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var_os("HOME");
+        let prev_userprofile = std::env::var_os("USERPROFILE");
+        std::env::set_var("HOME", "");
+        std::env::set_var("USERPROFILE", "");
+
+        let base = home_base();
+        // Restore before asserting so a failure can't leak empty env into siblings.
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_userprofile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+
+        assert_ne!(
+            base.as_deref(),
+            Some(Path::new("")),
+            "home_base must not return an empty path for an empty HOME/USERPROFILE"
+        );
+        if let Some(p) = &base {
+            assert!(
+                !p.as_os_str().is_empty(),
+                "home_base fallback must be a non-empty path, got {p:?}"
+            );
+        }
+    }
+
+    /// R11-3 (the core fix): the home-relative Windsurf MCP config is detected
+    /// when it lives under the ENV-resolved home, and a repo that plants no MCP
+    /// config yields ZERO — regardless of the host's real `~/.codeium`. Because
+    /// the scan resolves the home base from `HOME`/`USERPROFILE` (which the guard
+    /// repoints at a temp dir), the runner's real `~/.codeium/windsurf/...` can
+    /// never leak in, so the `onboard_json_ci_repo_recommends_ci_strict`
+    /// integration test stays deterministic on macOS.
+    #[test]
+    fn detect_mcp_configs_uses_env_home_for_windsurf() {
+        // An empty repo root (no repo-local MCP configs planted).
+        let repo = tempfile::tempdir().expect("repo");
+
+        // Case 1: isolated home WITHOUT a windsurf config → zero MCP configs,
+        // even if the real host home has one.
+        let home_absent = tempfile::tempdir().expect("home_absent");
+        {
+            let _guard = HomeGuard::set(home_absent.path());
+            let found = detect_mcp_configs(repo.path());
+            assert!(
+                found.is_empty(),
+                "an isolated home with no windsurf config must yield 0 MCP configs \
+                 (host's real ~/.codeium must not leak in), got: {found:?}"
+            );
+        }
+
+        // Case 2: plant the windsurf config UNDER the isolated home → it IS
+        // detected, proving the env-resolution path actually reads HOME.
+        let home_present = tempfile::tempdir().expect("home_present");
+        let windsurf_dir = home_present.path().join(".codeium").join("windsurf");
+        std::fs::create_dir_all(&windsurf_dir).unwrap();
+        let windsurf_cfg = windsurf_dir.join("mcp_config.json");
+        std::fs::write(&windsurf_cfg, "{}\n").unwrap();
+        {
+            let _guard = HomeGuard::set(home_present.path());
+            let found = detect_mcp_configs(repo.path());
+            assert!(
+                found
+                    .iter()
+                    .any(|f| f == &windsurf_cfg.display().to_string()),
+                "a windsurf MCP config under the isolated home must be detected, got: {found:?}"
+            );
+        }
     }
 }
