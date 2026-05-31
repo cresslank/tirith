@@ -39,9 +39,46 @@ approval_rules:
 
 # Escalation: upgrade to a block when an agent keeps re-trying flagged work.
 escalation:
-  # Block any rule that fires 5+ times within an hour.
+  # Block when a GENUINELY-RISKY rule fires 5+ times within an hour.
+  #
+  # `rule_ids` is a curated list rather than `["*"]` on purpose: the
+  # repeat_count trigger has no severity gate (it matches purely on rule_ids —
+  # see `EscalationRule::RepeatCount` in tirith-core/src/escalation.rs), so a
+  # wildcard would escalate EVERY repeated finding, including informational
+  # notes like `repo_command_unknown` and other Info-severity annotations.
+  # Normal agent churn (5 repeats of a benign-but-uncatalogued command) would
+  # then become a hard block. The list below is the pipe-to-shell /
+  # install-script / typosquat / secret / remote-exec family — the same
+  # families already escalated via severity_overrides and approval_rules above.
+  # Add a rule id here if you want repeated attempts at it to hard-block.
   - trigger: repeat_count
-    rule_ids: ["*"]
+    rule_ids:
+      # Pipe-to-shell (curl/wget/httpie/xh | sh) + generic pipe-to-interpreter.
+      - curl_pipe_shell
+      - wget_pipe_shell
+      - httpie_pipe_shell
+      - xh_pipe_shell
+      - pipe_to_interpreter
+      # Install-script / package execution risks.
+      - pip_url_install
+      - npm_url_install
+      - package_script_dangerous
+      - package_policy_unknown_package_with_install_scripts
+      # Typosquat / dependency-confusion (hallucinated or look-alike names).
+      - git_typosquat
+      - threat_package_typosquat
+      - package_policy_typosquat_distance
+      - package_dependency_confusion
+      # Secret / credential exfiltration.
+      - credential_file_sweep
+      - sensitive_env_export
+      - data_exfiltration
+      - high_entropy_secret
+      - private_key_exposed
+      - credential_in_text
+      # Remote-exec / untrusted registry.
+      - docker_untrusted_registry
+      - base64_decode_execute
     threshold: 5
     window_minutes: 60
     action: block

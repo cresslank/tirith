@@ -887,6 +887,77 @@ fn render_hook(h: &HookSummary) -> String {
 mod tests {
     use super::*;
 
+    /// The full set of environment variables that influence where
+    /// `build_policy_summary` resolves config from. `config_dir()` (etcetera)
+    /// reads `XDG_CONFIG_HOME` on Linux/macOS but `%APPDATA%`/`%LOCALAPPDATA%`
+    /// on Windows; trust counts additionally resolve via `HOME`/`USERPROFILE`;
+    /// and policy discovery / remote-fetch read `TIRITH_*`. A hermetic test must
+    /// pin EVERY one of these (so it never reads the developer's real config on
+    /// any OS) and restore EVERY one (so it never leaks into a later test).
+    const ENV_KEYS: [&str; 8] = [
+        "XDG_CONFIG_HOME",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "HOME",
+        "USERPROFILE",
+        "TIRITH_POLICY_ROOT",
+        "TIRITH_SERVER_URL",
+        "TIRITH_API_KEY",
+    ];
+
+    /// RAII guard that, on construction, SAVES the prior value of every key in
+    /// [`ENV_KEYS`] and applies the test's overrides, then on `Drop` RESTORES
+    /// every saved value (set-back or remove). Mirrors the `EnvVarGuard` shape
+    /// in `policy.rs`/`mcp/tools.rs`, but operates on the whole config-resolving
+    /// env set at once so a test cannot read real config or leak state.
+    ///
+    /// `TEST_ENV_LOCK` (held by the caller) serializes env-mutating tests; this
+    /// guard adds the restore half. Must be bound to a live local
+    /// (`let _env = …`) so it is dropped at the end of the test, not eagerly.
+    struct DashboardEnvGuard {
+        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl DashboardEnvGuard {
+        /// Snapshot all [`ENV_KEYS`], then apply `overrides`: `Some(v)` sets the
+        /// var, `None` removes it. Keys in [`ENV_KEYS`] not named in `overrides`
+        /// are removed, so the resolved environment is fully determined by the
+        /// caller regardless of what the host shell had set. Values are
+        /// `&OsStr`, so both `Path::as_os_str()` and string literals (e.g. a
+        /// `TIRITH_SERVER_URL`) pass through uniformly.
+        fn apply(overrides: &[(&'static str, Option<&std::ffi::OsStr>)]) -> Self {
+            let prev = ENV_KEYS.iter().map(|&k| (k, std::env::var_os(k))).collect();
+            // SAFETY: env mutation is serialized by `TEST_ENV_LOCK`, which the
+            // caller holds for the lifetime of this guard.
+            unsafe {
+                for &key in ENV_KEYS.iter() {
+                    let ovr = overrides.iter().find(|(k, _)| *k == key);
+                    match ovr {
+                        Some((_, Some(value))) => std::env::set_var(key, value),
+                        // Named with None, or not named at all → ensure unset so
+                        // the host environment cannot bleed in.
+                        _ => std::env::remove_var(key),
+                    }
+                }
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for DashboardEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still serialized by `TEST_ENV_LOCK` held by the caller.
+            unsafe {
+                for (key, prev) in &self.prev {
+                    match prev {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
     fn empty_snapshot() -> DashboardSnapshot {
         DashboardSnapshot {
             schema_version: 1,
@@ -1153,18 +1224,24 @@ mod tests {
         //   * NO policy file → genuine defaults, error None, path None
         //   * valid file     → parsed values, error None, path set
         // Env mutation is serialized via the crate-wide TEST_ENV_LOCK and
-        // isolated so the developer's real user-config policy is never read.
+        // isolated so the developer's real user-config policy is never read on
+        // ANY OS. The guard pins the full config-resolving env set (XDG +
+        // %APPDATA%/%LOCALAPPDATA% + HOME/USERPROFILE) at the isolated dir and
+        // clears TIRITH_*, then restores every value on drop.
         let _lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // SAFETY: serialized by TEST_ENV_LOCK across all tirith-core tests.
         let isolated_config = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::remove_var("TIRITH_POLICY_ROOT");
-            std::env::remove_var("TIRITH_SERVER_URL");
-            std::env::remove_var("TIRITH_API_KEY");
-            std::env::set_var("XDG_CONFIG_HOME", isolated_config.path());
-        }
+        let cfg = isolated_config.path().as_os_str();
+        let _env = DashboardEnvGuard::apply(&[
+            ("XDG_CONFIG_HOME", Some(cfg)),
+            ("APPDATA", Some(cfg)),
+            ("LOCALAPPDATA", Some(cfg)),
+            ("HOME", Some(cfg)),
+            ("USERPROFILE", Some(cfg)),
+            // TIRITH_POLICY_ROOT / TIRITH_SERVER_URL / TIRITH_API_KEY unnamed →
+            // removed by the guard.
+        ]);
 
         // (1) Present-but-unparseable policy file → error surfaced, no defaults.
         let broken = tempfile::tempdir().unwrap();
@@ -1232,10 +1309,7 @@ mod tests {
         assert_eq!(summary.fail_mode.as_deref(), Some("closed"));
         assert!(summary.path.is_some());
 
-        // Restore isolation env to unset so later tests start clean.
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
+        // `_env` restores the full env set on drop — no manual cleanup needed.
     }
 
     #[test]
@@ -1256,21 +1330,19 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let isolated_config = tempfile::tempdir().unwrap();
-        // SAFETY: serialized by TEST_ENV_LOCK across all tirith-core tests.
-        unsafe {
-            std::env::remove_var("TIRITH_POLICY_ROOT");
-            std::env::remove_var("TIRITH_SERVER_URL");
-            std::env::remove_var("TIRITH_API_KEY");
-            // `config_dir()` (etcetera) resolves to `<XDG_CONFIG_HOME>/tirith`
-            // on Linux/macOS but to `%APPDATA%\tirith` on Windows. Point ALL of
-            // them at an isolated dir so the developer's real user config is
-            // never read AND our user-overlay files are seen on every platform.
-            std::env::set_var("XDG_CONFIG_HOME", isolated_config.path());
-            std::env::set_var("APPDATA", isolated_config.path());
-            std::env::set_var("LOCALAPPDATA", isolated_config.path());
-            std::env::set_var("HOME", isolated_config.path());
-            std::env::set_var("USERPROFILE", isolated_config.path());
-        }
+        // `config_dir()` (etcetera) resolves to `<XDG_CONFIG_HOME>/tirith` on
+        // Linux/macOS but to `%APPDATA%\tirith` on Windows. The guard points
+        // ALL of them at the isolated dir so the developer's real user config is
+        // never read AND our user-overlay files are seen on every platform, and
+        // clears TIRITH_* — then restores every value on drop.
+        let cfg = isolated_config.path().as_os_str();
+        let _env = DashboardEnvGuard::apply(&[
+            ("XDG_CONFIG_HOME", Some(cfg)),
+            ("APPDATA", Some(cfg)),
+            ("LOCALAPPDATA", Some(cfg)),
+            ("HOME", Some(cfg)),
+            ("USERPROFILE", Some(cfg)),
+        ]);
 
         // A valid local policy with exactly one (flat) allowlist entry.
         let repo = tempfile::tempdir().unwrap();
@@ -1359,9 +1431,7 @@ mod tests {
             "numeric fields must be None when the local file failed to load: {broken:?}"
         );
 
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
+        // `_env` restores the full env set on drop — no manual cleanup needed.
     }
 
     #[test]
@@ -1383,16 +1453,26 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let isolated_config = tempfile::tempdir().unwrap();
-        // SAFETY: serialized by TEST_ENV_LOCK across all tirith-core tests.
-        unsafe {
-            std::env::remove_var("TIRITH_POLICY_ROOT");
-            std::env::set_var("XDG_CONFIG_HOME", isolated_config.path());
-            // A bogus, unreachable policy server. If the dashboard ever called
-            // `fetch_remote_policy`, this would (best case) flip the summary to
-            // the fail-closed/error state and (worst case) hang on a connect.
-            std::env::set_var("TIRITH_SERVER_URL", "http://127.0.0.1:1");
-            std::env::set_var("TIRITH_API_KEY", "bogus-key");
-        }
+        let cfg = isolated_config.path().as_os_str();
+        // Pin config resolution at the isolated dir on every OS (XDG +
+        // %APPDATA%/%LOCALAPPDATA% + HOME/USERPROFILE) so the developer's real
+        // config is never read, clear TIRITH_POLICY_ROOT, and name a bogus,
+        // unreachable policy server. If the dashboard ever called
+        // `fetch_remote_policy`, this would (best case) flip the summary to the
+        // fail-closed/error state and (worst case) hang on a connect. The guard
+        // restores every value on drop.
+        let _env = DashboardEnvGuard::apply(&[
+            ("XDG_CONFIG_HOME", Some(cfg)),
+            ("APPDATA", Some(cfg)),
+            ("LOCALAPPDATA", Some(cfg)),
+            ("HOME", Some(cfg)),
+            ("USERPROFILE", Some(cfg)),
+            (
+                "TIRITH_SERVER_URL",
+                Some(std::ffi::OsStr::new("http://127.0.0.1:1")),
+            ),
+            ("TIRITH_API_KEY", Some(std::ffi::OsStr::new("bogus-key"))),
+        ]);
 
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join(".git")).unwrap();
@@ -1422,11 +1502,7 @@ mod tests {
             "the LOCAL fail_mode must be reflected, not a fetched/remote value: {summary:?}"
         );
 
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-            std::env::remove_var("TIRITH_SERVER_URL");
-            std::env::remove_var("TIRITH_API_KEY");
-        }
+        // `_env` restores the full env set on drop — no manual cleanup needed.
     }
 
     #[test]

@@ -476,6 +476,24 @@ impl ContextSet {
         declared.iter().any(|c| self.contains(*c))
     }
 
+    /// The contexts in this set as a [`ScanContext`] list, in a stable order
+    /// (exec, paste, file). The inverse of [`ContextSet::from_contexts`]; used by
+    /// [`compile_rules`](crate::rules::custom::compile_rules) to store the CLAMPED
+    /// runtime contexts of a DSL rule.
+    pub fn to_contexts(self) -> Vec<ScanContext> {
+        let mut v = Vec::new();
+        if self.exec {
+            v.push(ScanContext::Exec);
+        }
+        if self.paste {
+            v.push(ScanContext::Paste);
+        }
+        if self.file {
+            v.push(ScanContext::FileScan);
+        }
+        v
+    }
+
     /// The contexts in this set, in a stable order, as lowercase names — for
     /// error text (e.g. "exec or paste").
     fn names(&self) -> Vec<&'static str> {
@@ -584,6 +602,43 @@ pub fn satisfiable_contexts(clause: &WhenClause) -> ContextSet {
         // serves as the identity for `any`/`not` composition.
         WhenClause::McpTool(_) | WhenClause::AgentKind(_) => ContextSet::EMPTY,
     }
+}
+
+/// The SINGLE context-resolution model shared by every DSL consumer
+/// (CodeRabbit M13 round-15 coherence): the engine's
+/// [`compile_rules`](crate::rules::custom::compile_rules), `tirith policy
+/// validate`, and `tirith rule validate` MUST classify and run a DSL rule
+/// IDENTICALLY, so they all call this one function rather than each re-deriving
+/// the rule's contexts.
+///
+/// Given a rule's DECLARED contexts (already resolved by serde's
+/// empty-→-`[exec, paste]` default for an OMITTED `context:`; see
+/// `default_custom_rule_contexts` in `policy.rs`) and its `when:` clause, this
+/// returns the contexts in which the rule both is DECLARED to run AND can be
+/// FULLY evaluated — i.e. `declared ∩ satisfiable_contexts(clause)`:
+///
+/// * `compile_rules` STORES this clamped set as the rule's runtime
+///   [`CompiledCustomRule::contexts`](crate::rules::custom::CompiledCustomRule),
+///   so [`check_dsl`](crate::rules::custom::check_dsl) only ever evaluates the
+///   clause in a context where every fact it reads is populated. (Without the
+///   clamp, a `not(file.path_matches)` rule declared `context: [exec, file]`
+///   would run in Exec — where `file_path` is `None` so `file.path_matches` is
+///   `false` and `not` flips it to `true` — a FALSE POSITIVE. R15-custom.rs:172.)
+/// * Both validators treat the rule as VALID iff this set is NON-EMPTY — exactly
+///   the condition under which `compile_rules` keeps and runs the rule — so a
+///   rule the engine compiles is never rejected by a validator and vice versa.
+///
+/// This does NOT pre-screen for the unsatisfiable (`satisfiable.is_empty()`) or
+/// unsupported-predicate (`agent.kind` / `mcp.tool`) cases; callers report those
+/// with their own dedicated messages BEFORE consulting this, so the error text
+/// stays specific. When the satisfiable set is empty this returns the empty set
+/// too (the intersection with anything is empty), which is consistent — a
+/// caller that skips the dedicated pre-checks still treats the rule as invalid.
+pub fn resolve_runtime_contexts(declared: &[ScanContext], clause: &WhenClause) -> Vec<ScanContext> {
+    let satisfiable = satisfiable_contexts(clause);
+    ContextSet::from_contexts(declared)
+        .intersect(satisfiable)
+        .to_contexts()
 }
 
 /// Scan a clause tree for a predicate that is parsed and type-checked but can
@@ -805,8 +860,12 @@ fn path_is_under(path: &str, base: &str) -> bool {
     let path = path.trim_end_matches('/');
     let base = base.trim_end_matches('/');
     if base.is_empty() {
-        // `cwd_in: ["/"]` — root contains everything.
-        return path.starts_with('/');
+        // `cwd_in: ["/"]` — the root sentinel contains every ABSOLUTE path. After
+        // `normalize_for_lexical_path_match` a POSIX absolute and a `//`-rooted
+        // UNC share both start with `/`, and a Windows drive path is `c:/…`. An
+        // empty or relative `path` is NOT root-contained (CodeRabbit M13
+        // round-15 custom_rule_dsl.rs:810).
+        return path.starts_with('/') || looks_like_windows_path(path);
     }
     if path == base {
         return true;
@@ -1232,6 +1291,56 @@ any:
     }
 
     #[test]
+    fn test_resolve_runtime_contexts_clamps_and_unifies() {
+        // CodeRabbit M13 round-15 coherence: the SINGLE shared model
+        // `resolve_runtime_contexts` returns `declared ∩ satisfiable`, which is
+        // exactly what `compile_rules` stores and what both validators test for
+        // emptiness. Cover the load-bearing cases:
+        use ScanContext::{Exec, FileScan, Paste};
+
+        // `command.*` declared `[exec, paste]` (serde's omitted-context default)
+        // resolves to {exec, paste} — accepted, runs in both.
+        let cmd = WhenClause::CommandUsesSudo(true);
+        assert_eq!(
+            resolve_runtime_contexts(&[Exec, Paste], &cmd),
+            vec![Exec, Paste],
+            "command.* under default [exec, paste] resolves to {{exec, paste}}"
+        );
+
+        // `file.path_matches` declared `[exec, paste]` (the omitted-context
+        // default) resolves to the EMPTY intersection — correctly rejected as a
+        // dead no-context file rule (the round-15 rule.rs:338 point).
+        let file = WhenClause::FilePathMatches(r"\.env$".into());
+        assert!(
+            resolve_runtime_contexts(&[Exec, Paste], &file).is_empty(),
+            "file rule under default [exec, paste] resolves empty -> rejected"
+        );
+
+        // The same file rule declared `[file]` resolves to {file} — accepted.
+        assert_eq!(
+            resolve_runtime_contexts(&[FileScan], &file),
+            vec![FileScan],
+            "explicit [file] file rule resolves to {{file}}"
+        );
+
+        // The clamp: `not(file.path_matches)` declared `[exec, file]` resolves to
+        // {file} only, dropping the exec context where the fact is absent.
+        let not_file = WhenClause::Not(Box::new(file.clone()));
+        assert_eq!(
+            resolve_runtime_contexts(&[Exec, FileScan], &not_file),
+            vec![FileScan],
+            "not(file.*) declared [exec, file] clamps to {{file}}"
+        );
+
+        // An explicit empty declared list always resolves empty (no default fires
+        // for a present-but-empty list at this layer).
+        assert!(
+            resolve_runtime_contexts(&[], &cmd).is_empty(),
+            "explicit empty declared context resolves empty -> rejected"
+        );
+    }
+
+    #[test]
     fn test_satisfiable_agent_kind_is_empty() {
         // `agent.kind` / `mcp.tool` have an EMPTY satisfiable set (no scan wires
         // up their signal). They are rejected by
@@ -1307,6 +1416,37 @@ any:
         assert!(!path_is_under("/home/user-other", "/home/user"));
         assert!(path_is_under("/anything", "/"));
         assert!(!path_is_under("relative/path", "/abs"));
+    }
+
+    #[test]
+    fn test_path_is_under_root_sentinel_matches_windows_absolutes() {
+        // CodeRabbit M13 round-15 custom_rule_dsl.rs:810: the root sentinel
+        // `cwd_in: ["/"]` (base normalizes to empty) must contain ANY absolute
+        // path, not just POSIX `/`-rooted ones. Windows drive-letter and UNC
+        // absolutes count too.
+        assert!(
+            path_is_under(r"C:\repo\sub", "/"),
+            "Windows drive-letter absolute must be root-contained"
+        );
+        assert!(
+            path_is_under("C:/repo/sub", "/"),
+            "forward-slash Windows drive absolute must be root-contained"
+        );
+        assert!(
+            path_is_under(r"\\host\share\x", "/"),
+            "UNC absolute must be root-contained"
+        );
+        // A POSIX absolute is still root-contained.
+        assert!(path_is_under("/home/x", "/"));
+        // An empty path and a relative path are NOT root-contained.
+        assert!(
+            !path_is_under("", "/"),
+            "empty path is not absolute, so not root-contained"
+        );
+        assert!(
+            !path_is_under("relative/sub", "/"),
+            "relative path is not root-contained"
+        );
     }
 
     #[test]

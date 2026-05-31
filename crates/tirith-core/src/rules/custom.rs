@@ -161,7 +161,20 @@ pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
             //     reports this as a hard error. An empty declared context here is
             //     a dead rule (no intersection) and is dropped, matching the regex
             //     path and `tirith rule validate`.
-            if !satisfiable.intersects_declared(&declared) {
+            //
+            // Resolve the rule's RUNTIME contexts through the SINGLE shared model
+            // (`resolve_runtime_contexts` = `declared ∩ satisfiable`) and store
+            // THAT, not the full `declared` (CodeRabbit M13 round-15
+            // custom.rs:172). Storing the full declared set let `check_dsl` run
+            // the clause in a declared context where its facts are ABSENT — e.g.
+            // `not(file.path_matches)` declared `[exec, file]` ran in Exec, where
+            // `file_path` is `None` so `file.path_matches` is `false` and `not`
+            // flips it to a FALSE POSITIVE. The clamp guarantees the clause is
+            // only evaluated where every fact it reads is populated. A non-empty
+            // resolved set is exactly the validity condition both validators use,
+            // so all three agree.
+            let runtime_contexts = custom_rule_dsl::resolve_runtime_contexts(&declared, when);
+            if runtime_contexts.is_empty() {
                 eprintln!(
                     "tirith: warning: custom rule '{}' when-clause can only be evaluated in context [{}] not covered by its declared context, skipping",
                     rule.id,
@@ -169,7 +182,10 @@ pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
                 );
                 continue;
             }
-            (declared, CompiledMatcher::When(Box::new(when.clone())))
+            (
+                runtime_contexts,
+                CompiledMatcher::When(Box::new(when.clone())),
+            )
         } else {
             // validate_shape already guaranteed one of the two arms above.
             unreachable!("validate_shape guarantees exactly one of pattern/when");
@@ -600,5 +616,82 @@ mod tests {
         // The regex `check` path must never match a DSL rule.
         let findings = check("sudo anything", ScanContext::Exec, &compiled);
         assert_eq!(findings.len(), 0);
+    }
+
+    #[test]
+    fn test_compile_clamps_stored_contexts_to_satisfiable() {
+        // CodeRabbit M13 round-15 custom.rs:172: `compile_rules` must STORE the
+        // CLAMPED contexts (`declared ∩ satisfiable`), not the full declared set.
+        // A `not(file.path_matches)` clause declared `context: [exec, file]` is
+        // satisfiable only in FileScan ({file}); declaring [exec, file] must
+        // resolve the stored runtime contexts to [file] alone.
+        let rule = make_dsl_rule(
+            "not-file",
+            WhenClause::Not(Box::new(WhenClause::FilePathMatches(r"\.env$".into()))),
+            &["exec", "file"],
+        );
+        let compiled = compile_rules(&[rule]);
+        assert_eq!(compiled.len(), 1, "rule is satisfiable in file and kept");
+        assert_eq!(
+            compiled[0].contexts,
+            vec![ScanContext::FileScan],
+            "stored contexts must be clamped to declared ∩ satisfiable = {{file}}, not [exec, file]"
+        );
+    }
+
+    #[test]
+    fn test_not_file_path_matches_no_false_positive_in_exec() {
+        // CodeRabbit M13 round-15 custom.rs:172 (the bug it guards): with the full
+        // declared set stored, `not(file.path_matches)` declared `[exec, file]`
+        // would run in the exec context — where `file_path` is `None`, so
+        // `file.path_matches` is `false` and `not` flips it to `true` → a FALSE
+        // POSITIVE. After the clamp the rule only runs in FileScan, so:
+        //   * exec  (file_path absent) → does NOT fire (context clamped out).
+        //   * FileScan with a NON-matching path → FIRES (inner false → not true).
+        //   * FileScan with a MATCHING `.env` path → does NOT fire (inner true).
+        let rule = make_dsl_rule(
+            "not-env",
+            WhenClause::Not(Box::new(WhenClause::FilePathMatches(r"\.env$".into()))),
+            &["exec", "file"],
+        );
+        let compiled = compile_rules(&[rule]);
+
+        // Exec context: the engine would build a backing with NO file path.
+        // Before the fix this fired (false positive); after the clamp the exec
+        // context is not a runtime context for this rule, so it is skipped.
+        let exec_ctx = DslEvalContext {
+            file_path: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            check_dsl(&exec_ctx, ScanContext::Exec, &compiled).len(),
+            0,
+            "not(file.path_matches) must NOT fire in the exec context (file_path absent)"
+        );
+
+        // FileScan with a NON-`.env` path: `file.path_matches` is false, so
+        // `not` is true and the rule legitimately FIRES (the clause works in the
+        // context where its fact is populated).
+        let scan_other = DslEvalContext {
+            file_path: Some("/repo/src/main.rs"),
+            ..Default::default()
+        };
+        assert_eq!(
+            check_dsl(&scan_other, ScanContext::FileScan, &compiled).len(),
+            1,
+            "not(file.path_matches \\.env$) must FIRE in FileScan for a non-.env path"
+        );
+
+        // FileScan with a `.env` path: `file.path_matches` is true, `not` false,
+        // so the rule does NOT fire — the clause still evaluates correctly.
+        let scan_env = DslEvalContext {
+            file_path: Some("/repo/.env"),
+            ..Default::default()
+        };
+        assert_eq!(
+            check_dsl(&scan_env, ScanContext::FileScan, &compiled).len(),
+            0,
+            "not(file.path_matches \\.env$) must NOT fire in FileScan for a .env path"
+        );
     }
 }

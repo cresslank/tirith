@@ -324,8 +324,20 @@ pub fn validate(path: Option<&str>, json: bool) -> i32 {
                         .to_string(),
                 });
             } else if unsupported.is_none() && !has_invalid_context {
+                // Route through the SAME shared resolver `compile_rules` uses
+                // (`resolve_runtime_contexts` = `declared ∩ satisfiable`) so the
+                // engine and both validators classify a rule IDENTICALLY
+                // (CodeRabbit M13 round-15 rule.rs:338). `declared_contexts`
+                // already carries serde's empty-→-`[exec, paste]` default for an
+                // OMITTED `context:`, so a no-context `command.*` rule (declared
+                // `[exec, paste]`) RESOLVES non-empty and is ACCEPTED — exactly as
+                // the engine compiles it — while a no-context `file.path_matches`
+                // rule (declared `[exec, paste]`, satisfiable `{file}`) resolves
+                // to the EMPTY intersection and is correctly REJECTED. An explicit
+                // `context: []` (which serde does NOT default) also resolves empty
+                // and is rejected (finding D).
                 let declared = declared_contexts(rule);
-                if !satisfiable.intersects_declared(&declared) {
+                if custom_rule_dsl::resolve_runtime_contexts(&declared, when).is_empty() {
                     errors.push(RuleError {
                         rule: rule.id.clone(),
                         message: format!(
@@ -798,5 +810,83 @@ mod tests {
             vec![ScanContext::Paste]
         );
         assert!(ordered_eval_contexts(&[]).is_empty());
+    }
+
+    /// Write `yaml` to a temp file and run `tirith rule validate` against it,
+    /// returning the exit code (0 = all valid, 1 = at least one invalid).
+    fn rule_validate_exit(yaml: &str) -> i32 {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(yaml.as_bytes()).expect("write yaml");
+        let path = f.path().to_string_lossy().into_owned();
+        // JSON path writes to stdout and returns the same exit code; the
+        // non-JSON path prints diagnostics to stderr. Use non-JSON so the test's
+        // stdout stays clean.
+        super::validate(Some(&path), false)
+    }
+
+    /// Whether `tirith_core::policy_validate` reports a coverage error for the
+    /// given rule id (the SAME classification `rule validate` must reach).
+    fn policy_validate_has_coverage_error(yaml: &str, rule_id: &str) -> bool {
+        tirith_core::policy_validate::validate(yaml)
+            .iter()
+            .any(|i| {
+                matches!(i.level, tirith_core::policy_validate::IssueLevel::Error)
+                    && i.message.contains(rule_id)
+                    && i.message.contains("not covered by declared context")
+            })
+    }
+
+    #[test]
+    fn validate_no_context_command_rule_is_accepted() {
+        // CodeRabbit M13 round-15 rule.rs:338: an OMITTED `context:` defaults to
+        // [exec, paste], so a no-context `command.*` rule RESOLVES to a non-empty
+        // set and `rule validate` must EXIT 0 — matching what the engine
+        // compiles+runs. And `policy validate` must agree (no coverage error).
+        let yaml = "custom_rules:\n  - id: no-ctx-cmd\n    when:\n      command.uses_sudo: true\n    title: \"no-context command rule\"\n";
+        assert_eq!(
+            rule_validate_exit(yaml),
+            0,
+            "no-context command.* rule must validate OK (resolves to exec/paste)"
+        );
+        assert!(
+            !policy_validate_has_coverage_error(yaml, "no-ctx-cmd"),
+            "policy validate must AGREE: no coverage error for the command rule"
+        );
+    }
+
+    #[test]
+    fn validate_no_context_file_rule_is_rejected() {
+        // The companion: a no-context `file.path_matches` rule resolves to
+        // [exec, paste] ∩ {file} = ∅, so it can never fire and `rule validate`
+        // must EXIT 1. `policy validate` must AGREE (it reports the coverage
+        // error). This proves the default-then-clamp model, not a literal
+        // `!declared.is_empty()` skip (which would wrongly accept this dead rule).
+        let yaml = "custom_rules:\n  - id: no-ctx-file\n    when:\n      file.path_matches: '\\.env$'\n    title: \"no-context file rule\"\n";
+        assert_eq!(
+            rule_validate_exit(yaml),
+            1,
+            "no-context file.path_matches rule must be REJECTED (can never fire)"
+        );
+        assert!(
+            policy_validate_has_coverage_error(yaml, "no-ctx-file"),
+            "policy validate must AGREE: it reports the coverage error for the file rule"
+        );
+    }
+
+    #[test]
+    fn validate_explicit_file_context_file_rule_is_accepted() {
+        // A `file.path_matches` rule that DECLARES `[file]` resolves to {file}
+        // (non-empty) and must validate OK; both validators agree.
+        let yaml = "custom_rules:\n  - id: file-ctx-file\n    when:\n      file.path_matches: '\\.env$'\n    title: \"explicit file context\"\n    context: [file]\n";
+        assert_eq!(
+            rule_validate_exit(yaml),
+            0,
+            "explicit [file] file rule must validate OK"
+        );
+        assert!(
+            !policy_validate_has_coverage_error(yaml, "file-ctx-file"),
+            "policy validate must AGREE: no coverage error for the explicit-[file] rule"
+        );
     }
 }

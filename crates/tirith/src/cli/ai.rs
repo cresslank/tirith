@@ -428,8 +428,12 @@ fn truncate_line(s: &str) -> String {
     format!("{cut}…")
 }
 
-/// Read a file as UTF-8 (lossy), with a size cap matching the scan engine's
-/// per-file cap so a pathological file cannot exhaust memory.
+/// The per-file read cap (10 MiB), matching the scan engine's per-file cap so a
+/// pathological file cannot exhaust memory. Shared by every read path in this
+/// module ([`read_text`], [`read_capped`]) so the bound is enforced uniformly.
+const READ_MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+
+/// Read a file's RAW bytes with the module's [`READ_MAX_BYTES`] cap.
 ///
 /// The cap is enforced by reading through a `take`-bounded handle rather than
 /// stat-then-read: a `metadata().len()` check is a TOCTOU race — the file can
@@ -437,20 +441,26 @@ fn truncate_line(s: &str) -> String {
 /// still slurp an arbitrarily large file. Reading at most `MAX_BYTES + 1` bytes
 /// and rejecting when the buffer exceeds `MAX_BYTES` bounds memory regardless of
 /// concurrent growth.
-fn read_text(path: &Path) -> std::io::Result<String> {
-    const MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
     let file = std::fs::File::open(path)?;
     let mut bytes = Vec::new();
     // Read one byte past the cap so an exactly-`MAX_BYTES` file is accepted while
     // anything larger is detectable.
-    file.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_BYTES {
+    file.take(READ_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > READ_MAX_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("{} is larger than 10 MiB; skipping", path.display()),
         ));
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(bytes)
+}
+
+/// Read a file as UTF-8 (lossy), with the module's [`READ_MAX_BYTES`] cap.
+/// Thin wrapper over [`read_capped`].
+fn read_text(path: &Path) -> std::io::Result<String> {
+    Ok(String::from_utf8_lossy(&read_capped(path)?).into_owned())
 }
 
 // ===========================================================================
@@ -465,7 +475,11 @@ fn read_text(path: &Path) -> std::io::Result<String> {
 /// confirmation unless `--yes`, and refuses non-interactively without `--yes`.
 pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
     let src = PathBuf::from(file);
-    let content = match std::fs::read(&src) {
+    // Capped read (R15-ai.rs:483): reuse the module's `READ_MAX_BYTES`-bounded
+    // reader rather than `std::fs::read`, so a huge AI-config file cannot force a
+    // full-file allocation before any validation. The sha below is computed from
+    // these capped bytes.
+    let content = match read_capped(&src) {
         Ok(c) => c,
         Err(e) => {
             if !emit_error(
@@ -479,8 +493,13 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
         }
     };
 
-    let sha = tirith_core::clipboard::content_sha256_hex(&content);
-    let short_sha = &sha[..sha.len().min(16)];
+    // PROVISIONAL hash, computed from the bytes we just read. For the atomic
+    // `rename` move below this may go stale if the file changes between this read
+    // and the rename (the rename moves whatever is on disk at that instant), so
+    // after a successful move we RECOMPUTE from `dest` and correct the name +
+    // emitted sha (R15-ai.rs:516). `sha` is therefore `mut`.
+    let mut sha = tirith_core::clipboard::content_sha256_hex(&content);
+    let short_sha = sha[..sha.len().min(16)].to_string();
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let basename = src
         .file_name()
@@ -513,7 +532,7 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
         return 1;
     }
 
-    let dest = qdir.join(format!("{ts}-{short_sha}-{basename}"));
+    let mut dest = qdir.join(format!("{ts}-{short_sha}-{basename}"));
 
     // --move requires confirmation (it deletes the original). Decide this BEFORE
     // copying so a refused move does not leave a stray quarantine copy.
@@ -583,7 +602,8 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
                 // and compare its hash to the bytes we quarantined. A mismatch
                 // means the file was edited after our first read; deleting now
                 // would lose the newer content, so we keep the original and fail.
-                match std::fs::read(&src) {
+                // Capped read for the same memory-bound reason as the initial read.
+                match read_capped(&src) {
                     Ok(current) => {
                         let current_sha = tirith_core::clipboard::content_sha256_hex(&current);
                         if current_sha != sha {
@@ -671,6 +691,69 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
                 return 2;
             }
             return 1;
+        }
+    }
+
+    // R15-ai.rs:516 — after a successful MOVE, the file living at `dest` is
+    // whatever `std::fs::rename` moved at the instant of the move, which (on the
+    // atomic-rename branch) may differ from the bytes we read up front. The
+    // provisional `sha`/`short_sha`/`dest` then encode the OLD hash while the
+    // quarantined file holds newer bytes. Re-read `dest` (capped), recompute the
+    // hash, and — if it differs from the provisional short hash — atomically
+    // rename WITHIN the quarantine dir to the corrected `<ts>-<new_short>-<base>`
+    // name so the filename and the emitted `sha256` describe the bytes actually
+    // at `dest`. The cross-device fallback already proved `dest == sha` (it
+    // refused to delete otherwise), so for that branch this is a no-op confirm.
+    if moved {
+        match read_capped(&dest) {
+            Ok(moved_bytes) => {
+                let actual_sha = tirith_core::clipboard::content_sha256_hex(&moved_bytes);
+                if actual_sha != sha {
+                    let new_short = actual_sha[..actual_sha.len().min(16)].to_string();
+                    let corrected = qdir.join(format!("{ts}-{new_short}-{basename}"));
+                    // Atomic in-quarantine rename to the recomputed-hash name.
+                    // Both paths share `qdir`, so this never crosses devices.
+                    if corrected != dest {
+                        if let Err(e) = std::fs::rename(&dest, &corrected) {
+                            if !emit_error(
+                                json,
+                                "tirith ai quarantine",
+                                &format!(
+                                    "moved {} to {} but failed to rename it to its \
+                                     recomputed-hash name {}: {e}",
+                                    src.display(),
+                                    dest.display(),
+                                    corrected.display()
+                                ),
+                            ) {
+                                return 2;
+                            }
+                            return 1;
+                        }
+                        dest = corrected;
+                    }
+                    sha = actual_sha;
+                }
+            }
+            Err(e) => {
+                // The move succeeded but we cannot re-read the quarantined file to
+                // confirm/correct its hash. Emitting the provisional (possibly
+                // stale) sha would be dishonest, so fail rather than advertise an
+                // unverified hash. The original is already gone (moved into `dest`).
+                if !emit_error(
+                    json,
+                    "tirith ai quarantine",
+                    &format!(
+                        "moved {} into quarantine at {} but could not re-read it to \
+                         verify its sha256: {e}",
+                        src.display(),
+                        dest.display()
+                    ),
+                ) {
+                    return 2;
+                }
+                return 1;
+            }
         }
     }
 
@@ -796,7 +879,12 @@ fn powershell_quote(p: &Path) -> String {
 /// M13 round-2 R7.)
 #[cfg(not(windows))]
 fn restore_command(from: &Path, to: &Path) -> String {
-    format!("cp {} {}", shell_quote(from), shell_quote(to))
+    // Insert the literal `--` before the path operands (R15-ai.rs:780). Without
+    // it, `shell_quote` leaves a safe-looking dash-prefixed path bare (e.g.
+    // `-backup/.cursorrules`), so `cp` would parse it as an OPTION instead of a
+    // source/destination. `--` ends option parsing so any path is treated as an
+    // operand.
+    format!("cp -- {} {}", shell_quote(from), shell_quote(to))
 }
 
 #[cfg(windows)]
@@ -1199,24 +1287,47 @@ mod tests {
     use super::*;
 
     // CodeRabbit M13 round-2 R7: the quarantine restore hint must be OS-aware.
+    // R15-ai.rs:780: the command must include a literal `--` before the path
+    // operands so a dash-prefixed path can never be parsed as a `cp` option.
     #[cfg(not(windows))]
     #[test]
     fn restore_command_unix_uses_cp_with_posix_quoting() {
-        // Plain paths: bare `cp <from> <to>`.
+        // Plain paths: `cp -- <from> <to>`.
         let cmd = restore_command(Path::new("/q/copy.txt"), Path::new("/orig/secret.txt"));
-        assert_eq!(cmd, "cp /q/copy.txt /orig/secret.txt");
+        assert_eq!(cmd, "cp -- /q/copy.txt /orig/secret.txt");
 
         // A space forces single-quoting; the restore copies FROM the quarantine
         // copy TO the original (argument order matters).
         let cmd = restore_command(Path::new("/q/a b.txt"), Path::new("/orig/my notes.txt"));
-        assert_eq!(cmd, "cp '/q/a b.txt' '/orig/my notes.txt'");
+        assert_eq!(cmd, "cp -- '/q/a b.txt' '/orig/my notes.txt'");
 
         // An embedded single quote round-trips as `'\''` (POSIX), not `''`.
         let cmd = restore_command(Path::new("/q/it's.txt"), Path::new("/orig/x.txt"));
-        assert_eq!(cmd, r#"cp '/q/it'\''s.txt' /orig/x.txt"#);
+        assert_eq!(cmd, r#"cp -- '/q/it'\''s.txt' /orig/x.txt"#);
 
         // Never emits PowerShell on Unix.
         assert!(!cmd.contains("Copy-Item"));
+    }
+
+    // R15-ai.rs:780: a dash-prefixed destination (the attack the `--` guards
+    // against) must remain an operand, not become a `cp` option. The command
+    // must contain the literal `cp -- ` separator.
+    #[cfg(not(windows))]
+    #[test]
+    fn restore_command_unix_uses_double_dash_before_operands() {
+        // A leading-dash path is exactly the case `--` protects: `shell_quote`
+        // leaves it bare, so without `--` it would parse as an option.
+        let cmd = restore_command(Path::new("/q/copy.txt"), Path::new("-backup/.cursorrules"));
+        assert!(
+            cmd.contains("cp -- "),
+            "restore command must use `cp -- ` so a dash-prefixed path is not an option: {cmd:?}"
+        );
+        // The dash-prefixed operand survives verbatim after the separator (it is
+        // shell-safe per `shell_quote`, so it stays bare — but now post-`--`).
+        assert!(
+            cmd.ends_with(" -backup/.cursorrules"),
+            "the dash-prefixed destination must remain an operand: {cmd:?}"
+        );
     }
 
     #[cfg(windows)]
@@ -1324,5 +1435,102 @@ mod tests {
             "an un-scannable file must abort `snapshot --update` with a non-zero exit"
         );
         assert_ne!(code, 0, "a None scan must never be treated as success");
+    }
+
+    // `XDG_CACHE_HOME` is process-global and cargo runs unit tests in parallel.
+    // The quarantine tests repoint it at a temp dir, so they must not interleave:
+    // this mutex serialises them.
+    static CACHE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that points `XDG_CACHE_HOME` at `dir` for the duration of a
+    /// test and restores the previous value (even on panic), so the quarantine
+    /// store resolves into an isolated temp dir.
+    struct CacheHomeGuard {
+        prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CacheHomeGuard {
+        fn set(dir: &Path) -> Self {
+            let lock = CACHE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os("XDG_CACHE_HOME");
+            std::env::set_var("XDG_CACHE_HOME", dir);
+            Self { prev, _lock: lock }
+        }
+    }
+
+    impl Drop for CacheHomeGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+        }
+    }
+
+    /// R15-ai.rs:516: a stable file quarantined via `--move --yes` must report a
+    /// sha that matches the bytes actually at `dest`, and the quarantined
+    /// filename (`<ts>-<short_sha>-<basename>`) must encode that same hash. For a
+    /// file that does not change during the move the provisional and recomputed
+    /// hashes coincide, so this confirms the emitted/encoded hash describes the
+    /// moved bytes — the property the recompute path guarantees.
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_move_reports_sha_matching_dest_bytes() {
+        let cache = tempfile::tempdir().expect("cache home");
+        let work = tempfile::tempdir().expect("work dir");
+        let src = work.path().join(".cursorrules");
+        let body = b"# stable ai-config\nallow everything\n";
+        std::fs::write(&src, body).expect("write src");
+        let expected_sha = tirith_core::clipboard::content_sha256_hex(body);
+
+        let _guard = CacheHomeGuard::set(cache.path());
+        // `--move --yes` short-circuits the confirm prompt, so no TTY is needed.
+        let code = quarantine(
+            src.to_str().unwrap(),
+            /*do_move*/ true,
+            /*yes*/ true,
+            false,
+        );
+        assert_eq!(code, 0, "a stable --move --yes quarantine must succeed");
+
+        // The original is gone (it was MOVED).
+        assert!(!src.exists(), "the original must be removed after --move");
+
+        // Locate the single quarantined file in the store and verify its bytes +
+        // the hash encoded in its filename both equal the sha of the moved bytes.
+        let qdir = cache.path().join("tirith").join("quarantine");
+        let entries: Vec<PathBuf> = std::fs::read_dir(&qdir)
+            .expect("quarantine dir exists")
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one quarantined file, got: {entries:?}"
+        );
+        let dest = &entries[0];
+
+        // The emitted/encoded sha must match the bytes physically at `dest`.
+        let dest_bytes = std::fs::read(dest).expect("read quarantined file");
+        let dest_sha = tirith_core::clipboard::content_sha256_hex(&dest_bytes);
+        assert_eq!(
+            dest_sha, expected_sha,
+            "the bytes at dest must hash to the expected sha"
+        );
+
+        // The filename encodes `<ts>-<short_sha>-<basename>`; the short hash must
+        // be the 16-char prefix of the dest bytes' sha.
+        let fname = dest.file_name().unwrap().to_string_lossy();
+        let short = &expected_sha[..expected_sha.len().min(16)];
+        assert!(
+            fname.contains(short),
+            "quarantine filename {fname:?} must encode the dest-bytes short hash {short:?}"
+        );
+        assert!(
+            fname.ends_with(".cursorrules"),
+            "quarantine filename {fname:?} must keep the basename"
+        );
     }
 }

@@ -621,6 +621,17 @@ fn fmt_list(items: &[String]) -> String {
 /// Only invokes existing safe operations (`policy init`, `init`); it never
 /// overwrites an existing `.tirith/policy.yaml` without confirmation.
 fn apply_actions(report: &OnboardReport) -> i32 {
+    apply_actions_with_interactivity(report, is_tty_pair())
+}
+
+/// The body of [`apply_actions`], with the interactivity decision INJECTED rather
+/// than read from the ambient TTY. Split out (R15-onboard.rs:650) so the
+/// non-interactive refusal path is unit-testable deterministically: a PTY-backed
+/// test runner can make `is_tty_pair()` return `true`, which would otherwise send
+/// the refusal test down the interactive branch and block on `read_line`. Tests
+/// call this directly with `interactive: false`; production calls
+/// [`apply_actions`], which passes the real `is_tty_pair()`.
+fn apply_actions_with_interactivity(report: &OnboardReport, interactive: bool) -> i32 {
     println!();
 
     // Idempotency: if the hook AND policy are already present there is no
@@ -637,7 +648,7 @@ fn apply_actions(report: &OnboardReport) -> i32 {
         return 0;
     }
 
-    if !is_tty_pair() {
+    if !interactive {
         // Non-interactive: do NOT silently perform destructive actions. This is a
         // refusal to do the requested work, so it exits NON-ZERO (M13 PR #132
         // finding N) — a CI / piped `--apply` should not look like a success.
@@ -873,32 +884,36 @@ mod tests {
     }
 
     /// R12-6: a non-interactive `--apply` on an already-configured repo (hook AND
-    /// policy present) is a NO-OP, so `apply_actions` returns 0 — it must NOT hit
-    /// the non-interactive refusal (exit 1) when there is nothing to do. Under the
-    /// test harness stdin/stderr are not a TTY, so this exercises exactly the
-    /// piped/CI path the finding is about: idempotent `--apply` must look like a
-    /// success, not a failure.
+    /// policy present) is a NO-OP, so `apply_actions_with_interactivity` returns 0
+    /// — it must NOT hit the non-interactive refusal (exit 1) when there is
+    /// nothing to do. R15-onboard.rs:650: injecting `interactive = false` makes
+    /// this deterministic regardless of the runner's ambient TTY (a PTY runner
+    /// would otherwise take the interactive branch). This is exactly the piped/CI
+    /// path the finding is about: idempotent `--apply` must look like a success.
     #[test]
     fn apply_actions_noop_when_already_configured_returns_zero() {
         let report = report_with_state(true, true);
         assert_eq!(
-            apply_actions(&report),
+            apply_actions_with_interactivity(&report, false),
             0,
             "an already-configured repo has nothing to apply — must exit 0 even non-interactively"
         );
     }
 
     /// R12-6 (the converse): when there IS a mutating step to perform (hook
-    /// missing), a non-interactive `apply_actions` still refuses and returns 1.
-    /// Pairs with the no-op test to prove the no-op short-circuit fires ONLY when
-    /// nothing is needed.
+    /// missing), a non-interactive `apply_actions_with_interactivity` still
+    /// refuses and returns 1. R15-onboard.rs:650: `interactive = false` is
+    /// injected so the refusal path is exercised deterministically — a PTY runner
+    /// can no longer divert this into the interactive branch and block on
+    /// `read_line`. Pairs with the no-op test to prove the no-op short-circuit
+    /// fires ONLY when nothing is needed.
     #[test]
     fn apply_actions_noninteractive_with_work_returns_one() {
         // Policy present but hook missing → a real step remains, so the
         // non-interactive refusal must fire (exit 1).
         let report = report_with_state(false, true);
         assert_eq!(
-            apply_actions(&report),
+            apply_actions_with_interactivity(&report, false),
             1,
             "a non-interactive --apply with work to do must refuse (exit 1)"
         );

@@ -215,8 +215,19 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
                     field: Some(format!("custom_rules.{}.when", rule.id)),
                 });
             } else if unsupported.is_none() && !has_invalid_context {
+                // Route through the SAME shared resolver `compile_rules` and
+                // `rule validate` use (`resolve_runtime_contexts` = `declared ∩
+                // satisfiable`) so the engine and both validators classify a rule
+                // IDENTICALLY (CodeRabbit M13 round-15). `parse_declared_contexts`
+                // already carries serde's empty-→-`[exec, paste]` default for an
+                // OMITTED `context:`, so a no-context `command.*` rule is ACCEPTED
+                // (resolves to a non-empty `{exec, paste}`) while a no-context
+                // `file.path_matches` rule is REJECTED (resolves to the empty
+                // `{exec, paste} ∩ {file}`). An explicit `context: []` (which
+                // serde does NOT default) likewise resolves empty and is rejected
+                // (finding D).
                 let declared = parse_declared_contexts(&rule.context);
-                if !satisfiable.intersects_declared(&declared) {
+                if crate::custom_rule_dsl::resolve_runtime_contexts(&declared, when).is_empty() {
                     issues.push(PolicyIssue {
                         level: IssueLevel::Error,
                         message: format!(
@@ -660,6 +671,36 @@ fn validate_agent_rules(policy: &crate::policy::Policy, issues: &mut Vec<PolicyI
                     field: Some(format!("{list_name}[{i}].name")),
                 });
             }
+
+            // Unenforced semantic predicates (CodeRabbit M13 round-15
+            // policy_validate.rs:744). `filesystem_write` / `network` /
+            // `secrets_access` are accepted as known matcher keys and load fine,
+            // but `policy.rs::matcher_matches` decides on `kind` + `name` ONLY —
+            // it never reads these. So a hand-written entry like
+            // `agent_rules: { deny: [{ kind: agent, network: block }] }` LOOKS
+            // conditional yet matches EVERY agent-kind caller unconditionally; the
+            // operator's intended condition is silently dropped. Warn (not error:
+            // the field is legal advisory metadata, emitted by `tirith agent
+            // block --network …`, and the `agent block` CLI gate from round 12 is
+            // the enforced path). Emit one warning per present predicate.
+            for (field, present) in [
+                ("filesystem_write", matcher.filesystem_write.is_some()),
+                ("network", matcher.network.is_some()),
+                ("secrets_access", matcher.secrets_access.is_some()),
+            ] {
+                if present {
+                    issues.push(PolicyIssue {
+                        level: IssueLevel::Warning,
+                        message: format!(
+                            "{list_name}[{i}]: matcher predicate `{field}` is recognized but \
+                             NOT enforced at runtime (agent matching is kind+name only) — this \
+                             matcher applies to every `{}` caller unconditionally",
+                            matcher.kind.as_str()
+                        ),
+                        field: Some(format!("{list_name}[{i}].{field}")),
+                    });
+                }
+            }
         }
     }
 }
@@ -1056,6 +1097,128 @@ custom_rules:
                 .any(|i| i.message.contains("defaulted-context")
                     && i.message.contains("not covered by declared context")),
             "DSL rule with omitted context (defaults to exec/paste) must be accepted: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_dsl_rule_no_context_command_accepted_file_rejected() {
+        // CodeRabbit M13 round-15 rule.rs:338 + policy_validate consistency: an
+        // OMITTED `context:` defaults (via serde) to [exec, paste], so it must be
+        // resolved THROUGH that default — not treated as raw-empty. A no-context
+        // `command.*` rule therefore RESOLVES to {exec, paste} and is ACCEPTED
+        // (the engine compiles+runs it), while a no-context `file.path_matches`
+        // rule resolves to {exec, paste} ∩ {file} = ∅ and is correctly REJECTED
+        // (it can never fire). Validity is computed the SAME way compile_rules
+        // resolves+clamps, so all three agree.
+        let cmd_yaml = r#"
+custom_rules:
+  - id: no-ctx-cmd
+    when:
+      command.uses_sudo: true
+    title: "no-context command rule"
+"#;
+        let cmd_issues = validate(cmd_yaml);
+        assert!(
+            !cmd_issues.iter().any(|i| i.message.contains("no-ctx-cmd")
+                && i.message.contains("not covered by declared context")),
+            "no-context command.* rule (defaults to exec/paste) must be ACCEPTED: {cmd_issues:?}"
+        );
+
+        let file_yaml = r#"
+custom_rules:
+  - id: no-ctx-file
+    when:
+      file.path_matches: '\.env$'
+    title: "no-context file rule"
+"#;
+        let file_issues = validate(file_yaml);
+        assert!(
+            file_issues.iter().any(|i| i.level == IssueLevel::Error
+                && i.message.contains("no-ctx-file")
+                && i.message.contains("not covered by declared context")),
+            "no-context file.path_matches rule must be REJECTED (can never fire): {file_issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_dsl_rule_explicit_file_context_file_predicate_accepted() {
+        // The counterpart: a `file.path_matches` rule that DECLARES `[file]`
+        // resolves to {file} (non-empty) and must be ACCEPTED.
+        let yaml = r#"
+custom_rules:
+  - id: file-ctx-file
+    when:
+      file.path_matches: '\.env$'
+    title: "explicit file context"
+    context: [file]
+"#;
+        let issues = validate(yaml);
+        assert!(
+            !issues.iter().any(|i| i.message.contains("file-ctx-file")
+                && (i.message.contains("not covered by declared context")
+                    || i.message.contains("never co-occur"))),
+            "explicit [file] file rule must be accepted: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_agent_matcher_unenforced_predicate_warns() {
+        // CodeRabbit M13 round-15 policy_validate.rs:744: `filesystem_write` /
+        // `network` / `secrets_access` are recognized matcher keys but
+        // `matcher_matches` ignores them (matching is kind+name only). A
+        // conditional-LOOKING matcher carrying one of them is an unconditional
+        // allow/deny at runtime, so `policy validate` must emit a WARNING (not an
+        // error, not silence).
+        let yaml = "agent_rules:\n  deny:\n    - kind: agent\n      network: block\n";
+        let issues = validate(yaml);
+        let warn = issues.iter().find(|i| {
+            i.message.contains("network")
+                && i.message.contains("NOT enforced at runtime")
+                && i.message.contains("kind+name")
+        });
+        assert!(
+            warn.is_some(),
+            "agent matcher carrying `network` must produce an unenforced-predicate WARNING: {issues:?}"
+        );
+        assert_eq!(
+            warn.unwrap().level,
+            IssueLevel::Warning,
+            "must be a Warning, not an Error"
+        );
+        // It must NOT be reported as an error (the field is legal advisory metadata).
+        assert!(
+            !issues.iter().any(|i| i.level == IssueLevel::Error
+                && i.field.as_deref() == Some("agent_rules.deny[0].network")),
+            "the unenforced predicate must not be an error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_agent_matcher_all_three_predicates_each_warn() {
+        // Each of the three advisory predicates produces its own warning.
+        let yaml = "agent_rules:\n  allow:\n    - kind: agent\n      filesystem_write: repo_only\n      network: allow\n      secrets_access: block\n";
+        let issues = validate(yaml);
+        for field in ["filesystem_write", "network", "secrets_access"] {
+            assert!(
+                issues.iter().any(|i| i.level == IssueLevel::Warning
+                    && i.message.contains(field)
+                    && i.message.contains("NOT enforced at runtime")),
+                "predicate `{field}` must produce an unenforced WARNING: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_agent_matcher_no_predicates_no_unenforced_warning() {
+        // A plain kind+name matcher carries no advisory predicates, so it must
+        // NOT trigger the unenforced-predicate warning.
+        let yaml = "agent_rules:\n  deny:\n    - kind: agent\n      name: claude-code\n";
+        let issues = validate(yaml);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.message.contains("NOT enforced at runtime")),
+            "a kind+name matcher must not warn about unenforced predicates: {issues:?}"
         );
     }
 

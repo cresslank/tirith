@@ -2684,16 +2684,20 @@ custom_rules:
             reparsed.agent_rules.deny[0], matcher,
             "the predicate-carrying matcher must round-trip unchanged"
         );
-        // And `tirith policy validate` must not flag the new fields as unknown.
+        // And `tirith policy validate` must not flag the new fields as UNKNOWN
+        // (an "unknown field" warning). They ARE recognized matcher keys. A
+        // SEPARATE, intentional "recognized but NOT enforced at runtime" warning
+        // is expected on these advisory predicates (CodeRabbit M13 round-15
+        // policy_validate.rs:744) and is asserted in `policy_validate`'s tests, so
+        // this check targets only the unknown-field category.
         let issues = crate::policy_validate::validate(&yaml);
         assert!(
-            !issues.iter().any(|i| i
-                .field
-                .as_deref()
-                .map(|f| f.contains("filesystem_write")
-                    || f.contains("network")
-                    || f.contains("secrets_access"))
-                .unwrap_or(false)),
+            !issues.iter().any(|i| i.message.contains("unknown field")
+                && i.field.as_deref().is_some_and(|f| {
+                    f.contains("filesystem_write")
+                        || f.contains("network")
+                        || f.contains("secrets_access")
+                })),
             "the M13 semantic predicate fields must not be reported as unknown: {issues:?}"
         );
     }

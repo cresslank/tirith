@@ -963,14 +963,24 @@ fn render_allow_snippet(m: &AgentMatcher) -> String {
 /// Schema honesty: the codebase's [`AgentMatcher`] carries `kind`, `name`, and
 /// (M13 ch5) the optional semantic predicates `filesystem_write` / `network` /
 /// `secrets_access`. The deny semantic is purely structural — any matcher listed
-/// under `agent_rules.deny` forces a `Block`, beating any allow entry. The M13
-/// ch5 predicates are ADVISORY metadata the operator declares alongside the
-/// matcher (they do NOT change which origins a matcher matches, which stays on
-/// `(kind, name)`); when supplied via `--filesystem-write` / `--network` /
-/// `--secrets-access` they are rendered into the snippet so the operator's intent
-/// is recorded in the policy and round-trips through `Policy::load`. The
-/// `command_pattern` positional is captured but NOT folded into the matcher; it
-/// is rendered as a YAML comment beside the snippet.
+/// under `agent_rules.deny` forces a `Block`, beating any allow entry, and the
+/// engine matcher keys on `(kind, name)` ONLY.
+///
+/// Because the engine ignores the semantic predicates when matching, a snippet
+/// carrying them would LOOK conditional ("deny only when it writes the
+/// filesystem") but actually deny EVERY command for that origin — a silent
+/// footgun. Round 12 (R12-2) therefore made `block()` REJECT the
+/// `--filesystem-write` / `--network` / `--secrets-access` flags with an error
+/// instead of minting them, and [`render_block_snippet`] no longer emits any
+/// predicate. The `AgentMatcher` struct still carries the fields and
+/// `Policy::load` still parses them, so hand-written policies round-trip for
+/// forward-compat; only `agent block` stops emitting them.
+///
+/// What IS emitted: the `kind` (+ `name` when supplied) matcher, plus the
+/// `command_pattern` positional rendered as a leading YAML comment
+/// (`# command pattern: <pattern>`). The pattern is captured but NOT folded into
+/// the matcher — the engine does not match per-command yet — so the comment is
+/// purely operator documentation.
 #[allow(clippy::too_many_arguments)]
 pub fn block(
     kind_str: &str,

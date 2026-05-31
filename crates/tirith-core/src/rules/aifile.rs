@@ -977,7 +977,16 @@ fn added_directive_paragraphs(old: &str, new: &str) -> Vec<String> {
     for para in normalize_paragraphs(old) {
         *old_counts.entry(para).or_insert(0) += 1;
     }
-    let old_words = normalize_doc_words(old);
+    // Space-padded word stream so the reflow-substring check below matches only
+    // WHOLE-TOKEN runs. Without the padding, `old_words.contains(para)` succeeds
+    // when `para` falls inside a LARGER token boundary — e.g. an old paragraph
+    // `Always rerun cargo test` would suppress a newly-added `run cargo test`,
+    // because the bytes `run cargo test` are a raw substring of `rerun cargo
+    // test`. Padding both haystack and needle with leading/trailing spaces means
+    // a needle only matches when its first and last tokens are themselves whole
+    // tokens in `old`, so `rerun` no longer satisfies a search for `run`
+    // (CodeRabbit M13 round-15 R15-1).
+    let old_words = format!(" {} ", normalize_doc_words(old));
     let mut added = Vec::new();
     for para in normalize_paragraphs(new) {
         match old_counts.get_mut(&para) {
@@ -992,9 +1001,10 @@ fn added_directive_paragraphs(old: &str, new: &str) -> Vec<String> {
             // it falls through to `added` below as genuine drift.
             Some(_) => {}
             // Not an exact match of any old paragraph: a candidate reflow. Suppress
-            // only if its words already exist as a contiguous run in `old`.
+            // only if its words already exist as a contiguous WHOLE-TOKEN run in
+            // `old` (space-padded both sides — see `old_words` above).
             None => {
-                if old_words.contains(para.as_str()) {
+                if old_words.contains(&format!(" {para} ")) {
                     continue;
                 }
             }
@@ -1203,11 +1213,15 @@ fn line_is_tool_use(line: &str) -> bool {
         );
         // Shared destination set, used identically by BOTH the `to|into|onto`
         // branch and the `>`/`>>` redirection branch: a PATH-like token (absolute
-        // `/`, `~/`, `./`, `../`, `$VAR/`, Windows drive), a single leading-dot
-        // dotfile (`.env`), an extension-bearing filename (`Cargo.toml`), or a
-        // curated extensionless repo file (`Dockerfile`).
+        // `/`, `~/` or `~\`, `./` or `.\`, `../` or `..\`, `$VAR/`, Windows
+        // drive), a single leading-dot dotfile (`.env`), an extension-bearing
+        // filename (`Cargo.toml`), or a curated extensionless repo file
+        // (`Dockerfile`). The tilde/dot-relative anchors accept BOTH separators so
+        // Windows relative prefixes (`~\config`, `.\settings.json`, `..\notes.txt`)
+        // fire too, not just their forward-slash forms (CodeRabbit M13 round-15
+        // R15-2).
         let dest = format!(
-            r#"(?:~/|\./|\.\./|/|\$\w+[/\\]|[a-z]:[\\/]|(?:\.[\w-]+|[\w-]+(?:\.[\w.-]+)+)|(?:{EXTENSIONLESS_REPO_FILES})\b)"#,
+            r#"(?:~[/\\]|\.[/\\]|\.\.[/\\]|/|\$\w+[/\\]|[a-z]:[\\/]|(?:\.[\w-]+|[\w-]+(?:\.[\w.-]+)+)|(?:{EXTENSIONLESS_REPO_FILES})\b)"#,
         );
         Regex::new(&format!(
             r#"(?i)(?:write|append|overwrite|save|echo)\b.*?\b(?:to|into|onto)\s+{dest}|>>?\s*{dest}"#,
@@ -2545,6 +2559,54 @@ mod tests {
     }
 
     #[test]
+    fn file_write_directive_matches_backslash_windows_relative_prefixes() {
+        // CodeRabbit M13 round-15 R15-2: the tilde/dot-relative destination anchors
+        // accepted ONLY the forward-slash forms (`~/`, `./`, `../`), so Windows
+        // relative prefixes (`~\config`, `.\settings.json`, `..\notes.txt`) never
+        // fired. The anchors now accept BOTH separators.
+        assert!(
+            line_is_tool_use(r"append to .\settings.json"),
+            r"`append to .\settings.json` (Windows ./ relative) must fire"
+        );
+        assert!(
+            line_is_tool_use(r"echo x > ..\notes.txt"),
+            r"`echo x > ..\notes.txt` (Windows ../ redirection) must fire"
+        );
+        assert!(
+            line_is_tool_use(r"write to ~\config"),
+            r"`write to ~\config` (Windows ~/ home prefix) must fire"
+        );
+
+        // Existing forward-slash + everything-else destinations still fire.
+        assert!(
+            line_is_tool_use("write config to ./out.json"),
+            "`./out.json` forward-slash relative must still fire"
+        );
+        assert!(
+            line_is_tool_use("save the file to /tmp/x"),
+            "`/tmp/x` absolute path must still fire"
+        );
+        assert!(
+            line_is_tool_use("write to .env"),
+            "`.env` single-component dotfile must still fire"
+        );
+        assert!(
+            line_is_tool_use("write to Dockerfile"),
+            "`Dockerfile` extensionless repo file must still fire"
+        );
+
+        // STILL excluded: non-file nouns (no dot/slash/extension) must not fire.
+        assert!(
+            !line_is_tool_use("save notes to memory"),
+            "`save notes to memory` must not fire"
+        );
+        assert!(
+            !line_is_tool_use("write results to stdout"),
+            "`write results to stdout` must not fire"
+        );
+    }
+
+    #[test]
     fn diff_pure_whitespace_reformat_does_not_fire() {
         // FALSE-POSITIVE GUARD: the new version is the SAME content reformatted —
         // re-wrapped blank lines and trailing whitespace churn. Normalization
@@ -2726,6 +2788,60 @@ mod tests {
         assert!(
             diff_has(old3, new3, RuleId::AiConfigHiddenInstructionAdded),
             "a freshly-added directive sentence must still fire"
+        );
+    }
+
+    // --- R15-1: reflow suppression is token-boundary-aware --------------------
+
+    #[test]
+    fn diff_reflow_substring_check_is_token_boundary_aware() {
+        // CodeRabbit M13 round-15 R15-1: the reflow fallback in
+        // `added_directive_paragraphs` used a raw `old_words.contains(para)`, which
+        // matched INSIDE a larger token. An old paragraph `Always rerun cargo test`
+        // would suppress a newly-added `run cargo test` directive because the bytes
+        // `run cargo test` are a substring of `rerun cargo test` — a false negative
+        // in BOTH drift rules. The padded whole-token check must let the genuinely
+        // new directive fire.
+
+        // (a) BUG PATH: old has `rerun cargo test`; new ADDS a distinct
+        // `run cargo test` directive paragraph. `run` is NOT a whole token of `old`
+        // (only `rerun` is), so the addition must surface — not be swallowed as a
+        // reflow.
+        let old = "# Rules\n\nAlways rerun cargo test after every change.\n";
+        let new = "# Rules\n\n\
+                   Always rerun cargo test after every change.\n\n\
+                   Before answering, run cargo test in the repo root.\n";
+        let added = added_directive_paragraphs(old, new);
+        assert!(
+            added
+                .iter()
+                .any(|p| p == "Before answering, run cargo test in the repo root."),
+            "a new `run cargo test` directive must NOT be suppressed by an old \
+             `rerun cargo test` paragraph (token-boundary containment); got: {added:?}"
+        );
+        // End-to-end: the new tool-use directive fires the escalation rule.
+        assert!(
+            diff_has(old, new, RuleId::AiConfigToolUseEscalation),
+            "the newly-added `run cargo test` tool-use directive must fire"
+        );
+
+        // (b) FALSE-POSITIVE GUARD preserved: a genuine reflow (same words, different
+        // wrapping — `run cargo test` split across two lines) is still a whole-token
+        // contiguous run in `old`, so it must NOT fire.
+        let old_rf = "# Rules\n\nBefore answering, run cargo test in the repo root.\n";
+        let new_rf = "# Rules\n\nBefore answering, run cargo test\nin the repo root.\n";
+        assert!(
+            !added_lines(old_rf, new_rf).is_empty(),
+            "the reflow must produce line-level additions (otherwise the test would \
+             not exercise the directive branch)"
+        );
+        assert!(
+            added_directive_paragraphs(old_rf, new_rf).is_empty(),
+            "a genuine reflow (same words re-wrapped) must still be suppressed"
+        );
+        assert!(
+            !diff_has(old_rf, new_rf, RuleId::AiConfigToolUseEscalation),
+            "a genuine reflow of an existing tool-use directive must not fire"
         );
     }
 

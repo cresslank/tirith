@@ -598,7 +598,19 @@ fn args_chain_contains_sudo_wrapper(
 }
 
 /// Tokenize a command-string argument (the body of `env -S "…"`) and report
-/// whether its leading segment's wrapper chain contains `sudo`.
+/// whether ANY of its segments' wrapper chains contain `sudo`.
+///
+/// The payload is run back through the SAME env/generic wrapper resolution the
+/// rest of the file uses ([`segment_chain_contains_sudo`] per parsed segment)
+/// rather than unwrapped to a single leading segment. Taking only `.first()`
+/// missed split-string forms whose leader is an env-assignment prefix or a
+/// nested wrapper — `env -S "FOO=1 sudo bash"` (the tokenizer strips the leading
+/// `FOO=1` so the segment leader IS `sudo`) and `env -S "env -S 'sudo bash -c
+/// id'"` (the inner `env -S` re-enters this walk) — so `command.uses_sudo` and
+/// the pipe-to-interpreter facts went false-negative (CodeRabbit M13 round-15
+/// R15-3). The round-13 `MAX_WRAPPER_DEPTH` budget is preserved by threading
+/// `depth` into every per-segment walk, so an absurdly-nested payload still
+/// terminates.
 fn command_string_chain_contains_sudo(command: &str, shell: ShellType, depth: usize) -> bool {
     if depth == 0 {
         return false;
@@ -607,10 +619,9 @@ fn command_string_chain_contains_sudo(command: &str, shell: ShellType, depth: us
     if normalized.is_empty() {
         return false;
     }
-    match tokenize::tokenize(&normalized, shell).first() {
-        Some(seg) => segment_chain_contains_sudo(seg, shell, depth - 1),
-        None => false,
-    }
+    tokenize::tokenize(&normalized, shell)
+        .iter()
+        .any(|seg| segment_chain_contains_sudo(seg, shell, depth - 1))
 }
 
 /// Resolve the effective interpreter from a segment, handling all quoting forms,
@@ -2838,6 +2849,67 @@ mod tests {
                 "non-sudo must stay false under the depth bound: {input:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_facts_uses_sudo_env_split_string_payload_uses_wrapper_parser() {
+        // CodeRabbit M13 round-15 R15-3: the `env -S "…"` payload is now run back
+        // through the SAME wrapper-chain resolution as the rest of the file (each
+        // tokenized segment via `segment_chain_contains_sudo`), not unwrapped to a
+        // single `.first()` leader. That `.first()`-only path missed split-string
+        // forms whose leader is an env-assignment prefix or a nested wrapper.
+        let split_string_sudo_cases = [
+            // env-assignment prefix INSIDE the split string: the tokenizer strips
+            // the leading `FOO=1`, so the real leader is `sudo`. `.first()` saw the
+            // assignment segment and missed it.
+            r#"env -S "FOO=1 sudo bash""#,
+            // nested `env -S` inside the payload: the inner split string re-enters
+            // the same walk and reaches the wrapped `sudo`.
+            r#"env -S "env -S 'sudo bash -c id'""#,
+            // multiple env-assignments before sudo.
+            r#"env -S "FOO=1 BAR=2 sudo apt install x""#,
+            // --split-string= form carrying an assignment-prefixed payload.
+            r#"env --split-string="FOO=1 sudo bash""#,
+        ];
+        for input in split_string_sudo_cases {
+            let facts = extract_command_facts(input, ShellType::Posix);
+            assert!(
+                facts.uses_sudo,
+                "uses_sudo must be true for an env -S payload whose wrapper chain \
+                 contains sudo: {input:?}"
+            );
+        }
+
+        // ROUND-8/9 REGRESSION GUARD: the simpler split-string forms (and plain
+        // wrapped/bare sudo) stay green; a plain interpreter stays false.
+        for input in [
+            r#"env -S "sudo bash -c id""#, // round-8/9: direct sudo leader in payload
+            "sudo bash",                   // plain bare sudo
+            "env sudo bash",               // env wraps sudo
+        ] {
+            assert!(
+                extract_command_facts(input, ShellType::Posix).uses_sudo,
+                "round-8/9 wrapped-sudo case must stay detected: {input:?}"
+            );
+        }
+        for input in [
+            "bash",                         // plain interpreter, no sudo
+            r#"env -S "bash -c id""#,       // split-string payload, no sudo
+            r#"env -S "FOO=1 bash -c id""#, // assignment-prefixed, no sudo
+        ] {
+            assert!(
+                !extract_command_facts(input, ShellType::Posix).uses_sudo,
+                "non-sudo env -S payload must stay false: {input:?}"
+            );
+        }
+
+        // BUDGET GUARD (round-13): a deep nested `env -S` payload still terminates
+        // (threaded `depth` caps the per-segment re-tokenization). The value is
+        // unspecified at exhaustion; the point is the call RETURNS without crashing.
+        let inner = r#"env -S "#.repeat(200) + "sudo bash";
+        let deep = format!(r#"env -S "{inner}""#);
+        let facts = extract_command_facts(&deep, ShellType::Posix);
+        let _ = facts.uses_sudo;
     }
 
     #[test]
