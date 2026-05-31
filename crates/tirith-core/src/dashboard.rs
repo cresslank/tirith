@@ -521,11 +521,48 @@ pub fn render_html(snap: &DashboardSnapshot) -> String {
         ("{{HOOK_SECTION}}", render_hook(&snap.hook)),
     ];
 
-    let mut html = TEMPLATE_HTML.to_string();
-    for (marker, value) in subs {
-        html = html.replace(marker, value);
+    expand_template(TEMPLATE_HTML, subs)
+}
+
+/// Expand `{{MARKER}}` placeholders in `template` in a SINGLE left-to-right
+/// pass, looking each marker up in `subs`. Because we scan the ORIGINAL
+/// template (never the growing output), a substituted value that happens to
+/// contain another marker — e.g. a user-controlled snapshot string holding the
+/// literal `{{HOOK_SECTION}}` — is emitted verbatim and is NEVER re-scanned or
+/// re-substituted (CodeRabbit M13 finding R2). All replacement values are
+/// already HTML-escaped by the caller, so this introduces no raw-interpolation
+/// path. Unknown markers are left intact (matched by the
+/// `render_html_has_no_unreplaced_placeholders` test, which asserts the
+/// template uses only known markers).
+fn expand_template(template: &str, subs: &[(&str, String)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start..];
+        match after_open.find("}}") {
+            Some(end) => {
+                // `marker` spans the full `{{…}}` token, inclusive of braces,
+                // to match the keys in `subs`.
+                let marker = &after_open[..end + 2];
+                match subs.iter().find(|(m, _)| *m == marker) {
+                    Some((_, value)) => out.push_str(value),
+                    // Unknown marker: emit it unchanged. Crucially we do NOT
+                    // rescan it, so it can never trigger nested expansion.
+                    None => out.push_str(marker),
+                }
+                rest = &after_open[end + 2..];
+            }
+            None => {
+                // No closing `}}` — the remainder is literal template text.
+                out.push_str(after_open);
+                rest = "";
+                break;
+            }
+        }
     }
-    html
+    out.push_str(rest);
+    out
 }
 
 /// A `<table>` of `(key, count)` rows, or an `unavailable`/`empty` note.
@@ -798,6 +835,40 @@ mod tests {
         assert!(
             html.contains("&#x27;xss&#x27;"),
             "single quotes in attacker bytes must be escaped as &#x27;"
+        );
+    }
+
+    #[test]
+    fn snapshot_value_with_literal_marker_is_escaped_not_expanded() {
+        // PINNED TEST (CodeRabbit M13 finding R2): a user-controlled snapshot
+        // value that contains the literal text of a template marker (here
+        // `{{HOOK_SECTION}}`) must be emitted ESCAPED and must NOT be expanded
+        // into the hook section. The old recursive `.replace()` loop would
+        // re-substitute it; the single-pass expander never re-scans output.
+        let mut snap = empty_snapshot();
+        // generated_at maps to `{{GENERATED_AT}}`. Smuggle a marker plus a
+        // sentinel inside it.
+        snap.generated_at = "SENTINEL_PRE {{HOOK_SECTION}} SENTINEL_POST".into();
+
+        let html = render_html(&snap);
+
+        // `html_escape` does not touch braces, so the marker text survives
+        // verbatim in the escaped value and must appear literally exactly once.
+        assert_eq!(
+            html.matches("SENTINEL_PRE {{HOOK_SECTION}} SENTINEL_POST")
+                .count(),
+            1,
+            "the injected marker text must appear once, verbatim and un-expanded"
+        );
+        // The real hook section (driven by the `{{HOOK_SECTION}}` placeholder in
+        // the template) is rendered exactly ONCE from the snapshot's own hook
+        // data — the injected copy did NOT spawn a second hook pill. The
+        // uninstalled hook pill is a unique, attacker-uncontrollable string.
+        assert_eq!(
+            html.matches(r#"<span class="pill pill-off">not installed</span>"#)
+                .count(),
+            1,
+            "the injected marker must not have been expanded into a 2nd hook section"
         );
     }
 

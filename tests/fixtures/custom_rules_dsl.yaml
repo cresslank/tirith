@@ -70,13 +70,16 @@ custom_rules:
     title: "Scanned a .env-style secrets file"
     context: [file]
 
-  # 7. A command run from a sensitive working directory that talks to any host
-  #    (cwd_in + url combinator, exec).
+  # 7. A command run from a sensitive working directory that ALSO reaches a
+  #    specific host (cwd_in AND url.host — `all:`, exec). The title says
+  #    "from a sensitive infra directory" AND names the host, so this is a
+  #    conjunction; `any:` (OR) would fire on either alone and contradict the
+  #    title (CodeRabbit M13 finding R12).
   - id: warn-cmd-from-infra-dir
     when:
-      any:
+      all:
         - command.cwd_in: [/srv/infra, /opt/deploy]
         - url.host: registry.company.com
     severity: medium
-    title: "Network command from a sensitive infra directory"
+    title: "Command reaching the company registry from a sensitive infra directory"
     context: [exec]

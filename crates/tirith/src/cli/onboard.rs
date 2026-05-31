@@ -564,12 +564,16 @@ fn apply_actions(report: &OnboardReport) -> i32 {
 }
 
 /// Interactive `[y/N]` prompt that reads a line from stdin. The prompt goes to
-/// stdout (the human report stream); a non-`y`/`yes` answer (or a read error)
-/// declines. Callers gate on [`is_tty_pair`] before invoking this.
+/// STDERR — the same stream [`is_tty_pair`] gates on — so it stays visible even
+/// when stdout is redirected (e.g. `tirith onboard plan --apply > out`); a
+/// non-`y`/`yes` answer (or a read error) declines. Callers gate on
+/// [`is_tty_pair`] before invoking this. (CodeRabbit M13 round-2 R8: previously
+/// printed to stdout, so a redirected stdout left `--apply` blocking on input
+/// behind an invisible prompt.)
 fn confirm_stdin(prompt: &str) -> bool {
     use std::io::Write;
-    print!("{prompt} [y/N] ");
-    let _ = std::io::stdout().flush();
+    eprint!("{prompt} [y/N] ");
+    let _ = std::io::stderr().flush();
     let mut input = String::new();
     match std::io::stdin().read_line(&mut input) {
         Ok(_) => matches!(input.trim(), "y" | "Y" | "yes" | "Yes"),

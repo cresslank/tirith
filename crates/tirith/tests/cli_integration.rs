@@ -13175,6 +13175,116 @@ fn rule_test_file_path_predicate_fires() {
     assert_eq!(v["fires"], serde_json::json!(true), ".env path should fire");
 }
 
+#[test]
+fn rule_test_invalid_rule_reports_not_firing_not_fires() {
+    // CodeRabbit M13 round-2 R9: a DSL rule with NO valid context + a command.*
+    // predicate is dropped by the engine's `compile_rules` (no context to
+    // evaluate it in). `rule test` must run the SAME compile/gate and report
+    // not-firing/invalid — never FIRES — consistent with `rule validate`.
+    let policy = r#"custom_rules:
+  - id: no-ctx-sudo
+    when:
+      command.uses_sudo: true
+    severity: high
+    title: "no context declared"
+    context: []
+"#;
+    let (_tmp, proj) = rule_project(policy);
+
+    // First confirm `rule validate` rejects it (the contract we must match).
+    let val = tirith_in_proj(&proj)
+        .args(["rule", "validate"])
+        .output()
+        .expect("run tirith");
+    assert_eq!(
+        val.status.code(),
+        Some(1),
+        "validate must reject a no-context rule"
+    );
+
+    // `rule test` (JSON) must NOT report fires:true. The rule was compiled away,
+    // so it is reported invalid (exit 1, valid:false, fires:false).
+    let out = tirith_in_proj(&proj)
+        .args([
+            "rule",
+            "test",
+            "--rule",
+            "no-ctx-sudo",
+            "--input",
+            "sudo rm -rf /",
+            "--json",
+        ])
+        .output()
+        .expect("run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "test on an invalid (compiled-away) rule should exit 1, not 0/FIRES; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(
+        v["fires"],
+        serde_json::json!(false),
+        "an invalid rule must never report FIRES"
+    );
+    assert_eq!(v["valid"], serde_json::json!(false));
+}
+
+#[test]
+fn rule_test_malformed_policy_exits_nonzero_with_parse_error() {
+    // CodeRabbit M13 round-2 R10: `rule test` must use the STRICT policy loader
+    // so a broken `.tirith/policy.yaml` surfaces a parse error (non-zero exit),
+    // not a misleading "no custom rule named …" from a warn-defaulted policy.
+    let malformed = "custom_rules: [this is not valid yaml\n";
+    let (_tmp, proj) = rule_project(malformed);
+    let out = tirith_in_proj(&proj)
+        .args(["rule", "test", "--rule", "anything", "--input", "ls"])
+        .output()
+        .expect("run tirith");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "test against a malformed policy must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("no custom rule named"),
+        "must surface the parse error, not a misleading 'no rule' message; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("tirith rule test:"),
+        "error should be attributed to `rule test`; got: {stderr}"
+    );
+}
+
+#[test]
+fn rule_explain_malformed_policy_exits_nonzero_with_parse_error() {
+    // CodeRabbit M13 round-2 R10 (explain side): a broken policy must surface a
+    // parse error rather than warn-defaulting to an empty policy that reports
+    // every rule as missing.
+    let malformed = "custom_rules: [this is not valid yaml\n";
+    let (_tmp, proj) = rule_project(malformed);
+    let out = tirith_in_proj(&proj)
+        .args(["rule", "explain", "--rule", "anything"])
+        .output()
+        .expect("run tirith");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "explain against a malformed policy must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("no custom rule named"),
+        "must surface the parse error, not a misleading 'no rule' message; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("tirith rule explain:"),
+        "error should be attributed to `rule explain`; got: {stderr}"
+    );
+}
+
 // ===========================================================================
 // M13 ch5 — `tirith ai scan|diff|quarantine|explain-config|snapshot`
 // ===========================================================================

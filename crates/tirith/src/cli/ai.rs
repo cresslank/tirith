@@ -520,7 +520,8 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
         moved = true;
     }
 
-    let restore_cmd = format!("cp {} {}", shell_quote(&dest), shell_quote(&src));
+    // Copy the quarantine copy (dest) back to the original location (src).
+    let restore_cmd = restore_command(&dest, &src);
 
     if json {
         #[derive(Serialize)]
@@ -593,6 +594,9 @@ fn create_quarantine_dir(dir: &Path) -> std::io::Result<()> {
 
 /// Single-quote a path for the printed restore command so a path with spaces /
 /// shell metacharacters round-trips. Embedded single quotes become `'\''`.
+/// (Used by the POSIX [`restore_command`]; gated to non-Windows so the Windows
+/// build doesn't warn it unused.)
+#[cfg(not(windows))]
 fn shell_quote(p: &Path) -> String {
     let s = p.to_string_lossy();
     if s.bytes().all(|b| {
@@ -601,6 +605,34 @@ fn shell_quote(p: &Path) -> String {
         return s.into_owned();
     }
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Single-quote a path for a PowerShell literal string. PowerShell escapes an
+/// embedded single quote by DOUBLING it (`'` → `''`); backslashes are literal
+/// inside single quotes, so a Windows path round-trips as-is. Always quoted (no
+/// bare-word shortcut) — `-LiteralPath` takes the value verbatim.
+#[cfg(windows)]
+fn powershell_quote(p: &Path) -> String {
+    format!("'{}'", p.to_string_lossy().replace('\'', "''"))
+}
+
+/// The shell command that restores a quarantined file by copying it back from
+/// `from` (the quarantine copy) to `to` (the original location). OS-aware: a
+/// POSIX `cp` on Unix, a PowerShell `Copy-Item -LiteralPath` on Windows (where
+/// `cp` is not a native command and POSIX `'\''`-escaping is wrong). (CodeRabbit
+/// M13 round-2 R7.)
+#[cfg(not(windows))]
+fn restore_command(from: &Path, to: &Path) -> String {
+    format!("cp {} {}", shell_quote(from), shell_quote(to))
+}
+
+#[cfg(windows)]
+fn restore_command(from: &Path, to: &Path) -> String {
+    format!(
+        "Copy-Item -LiteralPath {} -Destination {}",
+        powershell_quote(from),
+        powershell_quote(to)
+    )
 }
 
 // ===========================================================================
@@ -911,4 +943,53 @@ fn snapshot_update(force: bool, json: bool) -> i32 {
         println!("WARNING: --force recorded a snapshot despite {} High+ issue(s); the baseline may be compromised.", blocking.len());
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // CodeRabbit M13 round-2 R7: the quarantine restore hint must be OS-aware.
+    #[cfg(not(windows))]
+    #[test]
+    fn restore_command_unix_uses_cp_with_posix_quoting() {
+        // Plain paths: bare `cp <from> <to>`.
+        let cmd = restore_command(Path::new("/q/copy.txt"), Path::new("/orig/secret.txt"));
+        assert_eq!(cmd, "cp /q/copy.txt /orig/secret.txt");
+
+        // A space forces single-quoting; the restore copies FROM the quarantine
+        // copy TO the original (argument order matters).
+        let cmd = restore_command(Path::new("/q/a b.txt"), Path::new("/orig/my notes.txt"));
+        assert_eq!(cmd, "cp '/q/a b.txt' '/orig/my notes.txt'");
+
+        // An embedded single quote round-trips as `'\''` (POSIX), not `''`.
+        let cmd = restore_command(Path::new("/q/it's.txt"), Path::new("/orig/x.txt"));
+        assert_eq!(cmd, r#"cp '/q/it'\''s.txt' /orig/x.txt"#);
+
+        // Never emits PowerShell on Unix.
+        assert!(!cmd.contains("Copy-Item"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restore_command_windows_uses_copy_item_literalpath() {
+        let cmd = restore_command(
+            Path::new(r"C:\q\copy.txt"),
+            Path::new(r"C:\orig\secret.txt"),
+        );
+        assert_eq!(
+            cmd,
+            r"Copy-Item -LiteralPath 'C:\q\copy.txt' -Destination 'C:\orig\secret.txt'"
+        );
+        // Backslashes are literal inside PowerShell single quotes (no escaping);
+        // never emits a POSIX `cp` on Windows.
+        assert!(!cmd.starts_with("cp "));
+
+        // An embedded single quote is DOUBLED for PowerShell (`'` → `''`).
+        let cmd = restore_command(Path::new(r"C:\q\it's.txt"), Path::new(r"C:\orig\x.txt"));
+        assert_eq!(
+            cmd,
+            r"Copy-Item -LiteralPath 'C:\q\it''s.txt' -Destination 'C:\orig\x.txt'"
+        );
+    }
 }

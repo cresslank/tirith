@@ -582,16 +582,44 @@ fn normalize_ecosystem(s: &str) -> String {
     }
 }
 
+/// Heuristic: does this look like a Windows path? `true` for a leading
+/// drive-letter spec (`C:\…`, `c:/…`) or a UNC/`//`-rooted path. Windows file
+/// systems are case-insensitive, so such paths are lowercased before lexical
+/// comparison; POSIX paths are left untouched because they ARE case-sensitive.
+fn looks_like_windows_path(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    // Drive letter: `X:` followed by a separator (or end of string).
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return true;
+    }
+    // UNC / double-separator root (already back-slash-normalized to `/`).
+    s.starts_with("//")
+}
+
+/// Normalize a path for purely-lexical "is-under" matching: back-slashes →
+/// `/`, and (only when [`looks_like_windows_path`]) lowercased so a
+/// case-insensitive Windows file system matches `C:\repo` against
+/// `c:\repo\sub`. POSIX paths keep their case.
+fn normalize_for_lexical_path_match(s: &str) -> String {
+    let slashed = s.replace('\\', "/");
+    if looks_like_windows_path(&slashed) {
+        slashed.to_lowercase()
+    } else {
+        slashed
+    }
+}
+
 /// `true` when `path` is `base` or a descendant of it. Both are compared as
 /// `/`-separated component sequences (purely lexical — no filesystem access),
 /// so `/home/x` is under `/home` but `/home-other` is not.
 ///
-/// Windows back-slashes are normalized to `/` first, so `cwd_in: ["C:\\repo"]`
-/// matches `C:\\repo\\sub` (CodeRabbit M13 finding B). The comparison is
-/// otherwise unchanged.
+/// Windows back-slashes are normalized to `/` first, and Windows-looking paths
+/// are lowercased, so `cwd_in: ["C:\\repo"]` matches `c:\\repo\\sub` on a
+/// case-insensitive file system (CodeRabbit M13 findings B/R1). POSIX paths
+/// remain case-sensitive — `/Home` is NOT a parent of `/home/x`.
 fn path_is_under(path: &str, base: &str) -> bool {
-    let path = path.replace('\\', "/");
-    let base = base.replace('\\', "/");
+    let path = normalize_for_lexical_path_match(path);
+    let base = normalize_for_lexical_path_match(base);
     let path = path.trim_end_matches('/');
     let base = base.trim_end_matches('/');
     if base.is_empty() {
@@ -907,6 +935,22 @@ any:
         // POSIX behavior is unchanged.
         assert!(path_is_under("/home/x/y", "/home/x"));
         assert!(!path_is_under("/home-other", "/home"));
+    }
+
+    #[test]
+    fn test_path_is_under_windows_case_insensitive() {
+        // Regression (CodeRabbit M13 finding R1): a case-insensitive Windows
+        // file system must match `cwd_in: ["C:\\repo"]` against `c:\repo\sub`.
+        assert!(path_is_under(r"c:\repo\sub", r"C:\repo"));
+        assert!(path_is_under(r"C:\Repo\Sub", r"c:\repo"));
+        assert!(path_is_under(r"c:/repo/sub", "C:/REPO"));
+        // UNC / `//`-rooted paths are also treated as case-insensitive.
+        assert!(path_is_under(r"\\Server\Share\Dir", r"\\server\share"));
+        // A case-only-differing sibling is still NOT under the base.
+        assert!(!path_is_under(r"C:\repo-other\sub", r"c:\repo"));
+        // POSIX paths stay CASE-SENSITIVE: `/Home` is not a parent of `/home/x`.
+        assert!(!path_is_under("/home/x", "/Home"));
+        assert!(!path_is_under("/Home/x", "/home"));
     }
 
     #[test]

@@ -1513,7 +1513,22 @@ impl Policy {
             serde_yaml::from_str(content).map_err(|e| format!("yaml parse error: {e}"))?;
         crate::policy_migrations::migrate_forward(&mut value)
             .map_err(|e| format!("migration error: {e}"))?;
-        serde_yaml::from_value::<Policy>(value).map_err(|e| format!("deserialize error: {e}"))
+        let policy = serde_yaml::from_value::<Policy>(value)
+            .map_err(|e| format!("deserialize error: {e}"))?;
+
+        // Enforce the pattern-XOR-when invariant at LOAD time. A custom rule
+        // carrying BOTH or NEITHER deserializes into a silent no-op (the regex
+        // path ignores it, the DSL path never fires), so reject the whole
+        // policy rather than let a malformed rule slip through unnoticed
+        // (CodeRabbit M13 finding R3). This is the single chokepoint every load
+        // path routes through (local `load_from_yaml`, the remote-fetch success
+        // branch, and `load_cached_remote_policy`).
+        for (idx, rule) in policy.custom_rules.iter().enumerate() {
+            rule.validate_shape()
+                .map_err(|e| format!("custom_rules[{idx}] (id '{}'): {e}", rule.id))?;
+        }
+
+        Ok(policy)
     }
 
     /// Load a policy from YAML text, running schema migrations first.
@@ -2176,6 +2191,65 @@ mod tests {
         );
         assert_eq!(p.paranoia, 2);
         assert_eq!(p.path.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn custom_rule_with_both_pattern_and_when_fails_to_load() {
+        // CodeRabbit M13 finding R3: a custom rule carrying BOTH `pattern:` and
+        // `when:` is a silent no-op and must make the whole policy fail to load.
+        let yaml = r#"
+custom_rules:
+  - id: both-shape
+    pattern: "evil"
+    when:
+      command.uses_sudo: true
+    title: "both pattern and when"
+    context: [exec]
+"#;
+        let err =
+            Policy::try_parse_yaml(yaml).expect_err("a both-shape custom rule must fail to parse");
+        assert!(
+            err.contains("both-shape") && err.contains("has both"),
+            "error must name the rule and its both-shape defect: {err}"
+        );
+    }
+
+    #[test]
+    fn custom_rule_with_neither_pattern_nor_when_fails_to_load() {
+        // CodeRabbit M13 finding R3: a custom rule carrying NEITHER `pattern:`
+        // nor `when:` is a silent no-op and must make the policy fail to load.
+        let yaml = r#"
+custom_rules:
+  - id: neither-shape
+    title: "neither pattern nor when"
+    context: [exec]
+"#;
+        let err = Policy::try_parse_yaml(yaml)
+            .expect_err("a neither-shape custom rule must fail to parse");
+        assert!(
+            err.contains("neither-shape") && err.contains("has neither"),
+            "error must name the rule and its neither-shape defect: {err}"
+        );
+    }
+
+    #[test]
+    fn well_shaped_custom_rule_still_loads() {
+        // Counterpoint to the R3 negative tests: a valid when-only rule and a
+        // valid pattern-only rule both load cleanly through the same chokepoint.
+        let yaml = r#"
+custom_rules:
+  - id: when-only
+    when:
+      command.uses_sudo: true
+    title: "when only"
+    context: [exec]
+  - id: pattern-only
+    pattern: "rm -rf /"
+    title: "pattern only"
+    context: [exec]
+"#;
+        let p = Policy::try_parse_yaml(yaml).expect("well-shaped custom rules must load");
+        assert_eq!(p.custom_rules.len(), 2);
     }
 
     #[test]

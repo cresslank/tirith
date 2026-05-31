@@ -22,6 +22,7 @@
 use tirith_core::custom_rule_dsl::{self, Reputation, WhenClause};
 use tirith_core::extract::ScanContext;
 use tirith_core::policy::{CustomRule, Policy};
+use tirith_core::rules::custom::{compile_rules, CompiledMatcher};
 use tirith_core::tokenize::ShellType;
 use tirith_core::verdict::Action;
 
@@ -46,16 +47,17 @@ fn declared_contexts(rule: &CustomRule) -> Vec<ScanContext> {
         .collect()
 }
 
-fn scan_context_for_shell_input(rule: &CustomRule) -> ScanContext {
-    // Prefer the rule's first declared exec/paste context for a command input;
-    // a file-only rule tests in FileScan. This picks the context the engine
-    // would actually evaluate the rule in for a typed command.
-    let declared = declared_contexts(rule);
-    if declared.contains(&ScanContext::Exec) {
+/// Pick the [`ScanContext`] to evaluate a `--input` in, from a rule's COMPILED
+/// contexts. Prefer exec, then paste, then file — the order the engine would
+/// reach the rule in for a typed command. Operates on the compiled context list
+/// (the post-`compile_rules` view) so `rule test` evaluates in the same context
+/// the engine would, not a context the rule declared but compilation dropped.
+fn scan_context_for_shell_input(contexts: &[ScanContext]) -> ScanContext {
+    if contexts.contains(&ScanContext::Exec) {
         ScanContext::Exec
-    } else if declared.contains(&ScanContext::Paste) {
+    } else if contexts.contains(&ScanContext::Paste) {
         ScanContext::Paste
-    } else if declared.contains(&ScanContext::FileScan) {
+    } else if contexts.contains(&ScanContext::FileScan) {
         ScanContext::FileScan
     } else {
         ScanContext::Exec
@@ -64,53 +66,64 @@ fn scan_context_for_shell_input(rule: &CustomRule) -> ScanContext {
 
 /// `tirith rule test --rule <id> --input <s>` — evaluate one custom rule
 /// against an input and report whether it FIRES.
+///
+/// Mirrors the engine: the named rule is run through the SAME
+/// [`compile_rules`] step the engine uses, then evaluated only from the
+/// COMPILED rule. A rule the engine would skip at compile time (invalid shape /
+/// regex, no valid context, or a DSL clause whose required trigger groups the
+/// declared `context:` doesn't cover) is reported as not-firing/invalid here
+/// too — never FIRES — so `rule test` and `rule validate` agree. (CodeRabbit
+/// M13 round-2 R9.) Loads the policy strictly so a broken
+/// `.tirith/policy.yaml` surfaces a parse error, not a misleading "no rule
+/// named …" (R10).
 pub fn test(rule_id: &str, input: &str, shell: &str, json: bool) -> i32 {
-    let policy = Policy::discover(None);
-    let rule = match policy.custom_rules.iter().find(|r| r.id == rule_id) {
+    let (policy, _source) = match load_policy("test", None) {
+        Ok(pair) => pair,
+        Err(code) => return code,
+    };
+
+    // Does the rule exist in the policy at all? Distinguish "unknown id" from
+    // "declared but dropped by compilation (invalid)".
+    if !policy.custom_rules.iter().any(|r| r.id == rule_id) {
+        return emit_not_found("test", rule_id, &policy, json);
+    }
+
+    // Compile exactly as the engine does, then locate the COMPILED rule. If it
+    // isn't present, compilation dropped it as invalid — report that, not FIRES.
+    let compiled = compile_rules(&policy.custom_rules);
+    let rule = match compiled.iter().find(|r| r.id == rule_id) {
         Some(r) => r,
         None => {
-            return emit_not_found("test", rule_id, &policy, json);
+            return emit_invalid_rule("test", rule_id, json);
         }
     };
 
     let shell_type = resolve_shell(shell);
-    let context = scan_context_for_shell_input(rule);
+    let context = scan_context_for_shell_input(&rule.contexts);
 
-    let (fires, kind) = if let Some(when) = &rule.when {
-        // DSL rule: build the eval context exactly as the engine does.
-        let backing = tirith_core::engine::dsl_backing_for_input(input, shell_type, context);
-        // `cwd_in` is evaluated against the process cwd (what the engine sees);
-        // `file.path_matches` against `--input` treated as a path in FileScan.
-        let cwd = std::env::current_dir()
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned());
-        let file_path = if context == ScanContext::FileScan {
-            Some(input.to_string())
-        } else {
-            None
-        };
-        let eval_ctx = backing.as_eval_context(cwd.as_deref(), file_path.as_deref());
-        (custom_rule_dsl::evaluate(when, &eval_ctx), "when")
-    } else if let Some(pattern) = &rule.pattern {
-        // Regex rule: match the pattern against the input, mirroring the
-        // engine's `rules::custom::check`.
-        let fires = match regex::Regex::new(pattern) {
-            Ok(re) => re.is_match(input),
-            Err(e) => {
-                return emit_error(
-                    "test",
-                    &format!("rule '{rule_id}' has invalid regex: {e}"),
-                    json,
-                );
-            }
-        };
-        (fires, "pattern")
-    } else {
-        return emit_error(
-            "test",
-            &format!("rule '{rule_id}' has neither `pattern:` nor `when:`"),
-            json,
-        );
+    let (fires, kind) = match &rule.matcher {
+        CompiledMatcher::When(when) => {
+            // DSL rule: build the eval context exactly as the engine does.
+            let backing = tirith_core::engine::dsl_backing_for_input(input, shell_type, context);
+            // `cwd_in` is evaluated against the process cwd (what the engine
+            // sees); `file.path_matches` against `--input` treated as a path in
+            // FileScan.
+            let cwd = std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned());
+            let file_path = if context == ScanContext::FileScan {
+                Some(input.to_string())
+            } else {
+                None
+            };
+            let eval_ctx = backing.as_eval_context(cwd.as_deref(), file_path.as_deref());
+            (custom_rule_dsl::evaluate(when, &eval_ctx), "when")
+        }
+        CompiledMatcher::Regex(re) => {
+            // Regex rule: match against the input, mirroring the engine's
+            // `rules::custom::check`. The regex is already compiled+validated.
+            (re.is_match(input), "pattern")
+        }
     };
 
     if json {
@@ -146,7 +159,7 @@ pub fn test(rule_id: &str, input: &str, shell: &str, json: bool) -> i32 {
 /// offending rule id + reason). Cross-references `tirith policy validate` for
 /// whole-file checks.
 pub fn validate(path: Option<&str>, json: bool) -> i32 {
-    let (policy, source) = match load_policy(path) {
+    let (policy, source) = match load_policy("validate", path) {
         Ok(pair) => pair,
         Err(code) => return code,
     };
@@ -258,7 +271,14 @@ pub fn validate(path: Option<&str>, json: bool) -> i32 {
 /// `tirith rule explain --rule <id>` — print a rule's predicate tree, severity,
 /// action and context.
 pub fn explain(rule_id: &str, json: bool) -> i32 {
-    let policy = Policy::discover(None);
+    // Strict load so a broken `.tirith/policy.yaml` surfaces a parse error
+    // (non-zero exit) instead of warn-defaulting to an empty policy that would
+    // misreport every rule as "no custom rule named …" (CodeRabbit M13 round-2
+    // R10).
+    let (policy, _source) = match load_policy("explain", None) {
+        Ok(pair) => pair,
+        Err(code) => return code,
+    };
     let rule = match policy.custom_rules.iter().find(|r| r.id == rule_id) {
         Some(r) => r,
         None => {
@@ -327,14 +347,21 @@ struct RuleError {
     message: String,
 }
 
-/// Load the policy for validation: from `--path` (read the file directly) or
-/// the discovered local policy. Returns `(policy, source-label)`.
-fn load_policy(path: Option<&str>) -> Result<(Policy, String), i32> {
+/// Load the policy STRICTLY for a `rule` subcommand: from `--path` (read the
+/// file directly) or the discovered local policy. Returns `(policy,
+/// source-label)`, or `Err(exit_code)` after printing a config-load error.
+///
+/// Unlike [`Policy::discover`] (which warn-defaults a broken local policy to a
+/// fail-closed empty policy — hiding the parse error behind a misleading "no
+/// custom rule" / empty result), this surfaces a parse error as a non-zero
+/// exit with the YAML location. `cmd` names the subcommand for the message
+/// (`test` / `validate` / `explain`). (CodeRabbit M13 round-2 R10.)
+fn load_policy(cmd: &str, path: Option<&str>) -> Result<(Policy, String), i32> {
     if let Some(p) = path {
         let yaml = match std::fs::read_to_string(p) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("tirith rule validate: cannot read {p}: {e}");
+                eprintln!("tirith rule {cmd}: cannot read {p}: {e}");
                 return Err(1);
             }
         };
@@ -343,7 +370,7 @@ fn load_policy(path: Option<&str>) -> Result<(Policy, String), i32> {
         match Policy::try_parse_yaml(&yaml) {
             Ok(policy) => Ok((policy, p.to_string())),
             Err(e) => {
-                eprintln!("tirith rule validate: {p}: {e}");
+                eprintln!("tirith rule {cmd}: {p}: {e}");
                 Err(1)
             }
         }
@@ -353,14 +380,14 @@ fn load_policy(path: Option<&str>) -> Result<(Policy, String), i32> {
                 let yaml = match std::fs::read_to_string(&found) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("tirith rule validate: cannot read {}: {e}", found.display());
+                        eprintln!("tirith rule {cmd}: cannot read {}: {e}", found.display());
                         return Err(1);
                     }
                 };
                 match Policy::try_parse_yaml(&yaml) {
                     Ok(policy) => Ok((policy, found.display().to_string())),
                     Err(e) => {
-                        eprintln!("tirith rule validate: {}: {e}", found.display());
+                        eprintln!("tirith rule {cmd}: {}: {e}", found.display());
                         Err(1)
                     }
                 }
@@ -396,16 +423,30 @@ fn emit_not_found(cmd: &str, rule_id: &str, policy: &Policy, json: bool) -> i32 
     1
 }
 
-fn emit_error(cmd: &str, msg: &str, json: bool) -> i32 {
+/// The named rule exists in the policy but `compile_rules` dropped it as
+/// invalid (bad shape/regex, no valid context, or an uncovered DSL trigger
+/// group) — so the engine would never run it. Report that rather than FIRES
+/// (CodeRabbit M13 round-2 R9). Points to `tirith rule validate` for the exact
+/// reason (it prints the per-rule diagnostic). Exit 1.
+fn emit_invalid_rule(cmd: &str, rule_id: &str, json: bool) -> i32 {
+    let msg = format!(
+        "rule '{rule_id}' is invalid and would be skipped by the engine (not evaluated); \
+         run `tirith rule validate` for the reason"
+    );
     if json {
-        let v = serde_json::json!({ "error": msg });
+        let v = serde_json::json!({
+            "rule": rule_id,
+            "valid": false,
+            "fires": false,
+            "error": msg,
+        });
         let _ = write_json_stdout(
             &v,
             &format!("tirith rule {cmd}: failed to write JSON output"),
         );
-    } else {
-        eprintln!("tirith rule {cmd}: {msg}");
+        return 1;
     }
+    eprintln!("tirith rule {cmd}: {msg}");
     1
 }
 

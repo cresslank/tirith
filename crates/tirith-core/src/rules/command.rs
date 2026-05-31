@@ -396,20 +396,173 @@ pub fn extract_command_facts(input: &str, shell: ShellType) -> CommandFacts {
         }
     }
 
-    // `sudo` as a leader (bare or wrapped). `resolve_base_through_wrappers`
-    // unwraps env/command/exec/nohup; a bare `sudo` leader also counts.
-    let uses_sudo = segments.iter().any(|seg| {
-        seg.command
-            .as_deref()
-            .map(|c| normalize_cmd_base(c, shell))
-            .as_deref()
-            == Some("sudo")
-            || resolve_base_through_wrappers(seg, shell) == "sudo"
-    });
+    // `sudo` appearing as a leader ANYWHERE in the wrapper chain. The previous
+    // check only caught a bare `sudo` leader or a chain whose FINAL base was
+    // `sudo`, so `env sudo bash`, `command sudo apt`, and `env -S "sudo bash"`
+    // (where sudo sits BETWEEN the wrapper and the real command) were missed
+    // (CodeRabbit M13 finding R6). `segment_chain_contains_sudo` peels the same
+    // env/command/exec/nohup wrappers `resolve_base_through_wrappers` does and
+    // returns true if `sudo` is any link in that chain.
+    let uses_sudo = segments
+        .iter()
+        .any(|seg| segment_chain_contains_sudo(seg, shell));
 
     CommandFacts {
         pipeline_targets,
         uses_sudo,
+    }
+}
+
+/// `true` when `sudo` appears as a leader at ANY level of `seg`'s wrapper
+/// chain (`sudo …`, `env sudo …`, `command sudo …`, `env -S "sudo …"`, nested
+/// combinations). Peels the same env/command/exec/nohup wrappers as
+/// [`resolve_base_through_wrappers`] but reports presence rather than the final
+/// base, so a `sudo` sandwiched between a wrapper and the real command is still
+/// detected (CodeRabbit M13 finding R6).
+fn segment_chain_contains_sudo(seg: &tokenize::Segment, shell: ShellType) -> bool {
+    // `env -S "sudo bash"` / `env --split-string=...`: the wrapped command
+    // lives inside a single string token. Unwrap it into a fresh segment first,
+    // then fall through to the normal leader/wrapper walk.
+    if let Some(inner) = unwrap_env_split_string_segment(seg, shell) {
+        if segment_chain_contains_sudo(&inner, shell) {
+            return true;
+        }
+    }
+
+    let Some(ref cmd) = seg.command else {
+        return false;
+    };
+    let cmd_base = normalize_cmd_base(cmd, shell);
+    if cmd_base == "sudo" {
+        return true;
+    }
+    match cmd_base.as_str() {
+        "env" => args_chain_contains_sudo_env(&seg.args, shell),
+        "command" | "exec" | "nohup" => {
+            args_chain_contains_sudo_wrapper(&seg.args, &cmd_base, shell)
+        }
+        _ => false,
+    }
+}
+
+/// Walk an `env` wrapper's args (mirroring [`resolve_base_env`]'s flag/assign
+/// skipping) and report whether the wrapped command is/contains `sudo`.
+fn args_chain_contains_sudo_env(args: &[String], shell: ShellType) -> bool {
+    let value_short_flags = ["-u", "-C"];
+    let value_long_flags = [
+        "--unset",
+        "--chdir",
+        "--block-signal",
+        "--default-signal",
+        "--ignore-signal",
+    ];
+    let mut idx = 0;
+    while idx < args.len() {
+        let normalized = normalize_shell_token(args[idx].trim(), shell);
+        if normalized == "--" {
+            return args
+                .get(idx + 1)
+                .map(|c| normalize_cmd_base(c, shell) == "sudo")
+                .unwrap_or(false);
+        }
+        // `env -S "sudo …"` / `--split-string` carry the command as a string.
+        if normalized == "-S" || normalized == "--split-string" {
+            return args
+                .get(idx + 1)
+                .map(|c| command_string_chain_contains_sudo(c, shell))
+                .unwrap_or(false);
+        }
+        if let Some(val) = normalized.strip_prefix("--split-string=") {
+            return command_string_chain_contains_sudo(val, shell);
+        }
+        if normalized.starts_with("--") {
+            if value_long_flags.iter().any(|f| normalized == *f) {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        if normalized.starts_with('-') {
+            if value_short_flags.iter().any(|f| normalized == *f) {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        // env VAR=VALUE assignment — not the command itself.
+        if normalized.contains('=') {
+            idx += 1;
+            continue;
+        }
+        // First positional is the wrapped command. Recurse so nested wrappers
+        // (e.g. `env command sudo …`) still resolve.
+        let base = normalize_cmd_base(&args[idx], shell);
+        if base == "sudo" {
+            return true;
+        }
+        return match base.as_str() {
+            "env" => args_chain_contains_sudo_env(&args[idx + 1..], shell),
+            "command" | "exec" | "nohup" => {
+                args_chain_contains_sudo_wrapper(&args[idx + 1..], &base, shell)
+            }
+            _ => false,
+        };
+    }
+    false
+}
+
+/// Walk a `command`/`exec`/`nohup` wrapper's args (mirroring
+/// [`resolve_base_wrapper`]) and report whether the wrapped command
+/// is/contains `sudo`.
+fn args_chain_contains_sudo_wrapper(args: &[String], wrapper: &str, shell: ShellType) -> bool {
+    let value_flags: &[&str] = match wrapper {
+        "exec" => &["-a"],
+        _ => &[],
+    };
+    let mut idx = 0;
+    while idx < args.len() {
+        let normalized = normalize_shell_token(args[idx].trim(), shell);
+        if normalized == "--" {
+            return args
+                .get(idx + 1)
+                .map(|c| normalize_cmd_base(c, shell) == "sudo")
+                .unwrap_or(false);
+        }
+        if normalized.starts_with("--") || normalized.starts_with('-') {
+            if value_flags.iter().any(|f| normalized == *f) {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        let base = normalize_cmd_base(&args[idx], shell);
+        if base == "sudo" {
+            return true;
+        }
+        return match base.as_str() {
+            "env" => args_chain_contains_sudo_env(&args[idx + 1..], shell),
+            "command" | "exec" | "nohup" => {
+                args_chain_contains_sudo_wrapper(&args[idx + 1..], &base, shell)
+            }
+            _ => false,
+        };
+    }
+    false
+}
+
+/// Tokenize a command-string argument (the body of `env -S "…"`) and report
+/// whether its leading segment's wrapper chain contains `sudo`.
+fn command_string_chain_contains_sudo(command: &str, shell: ShellType) -> bool {
+    let normalized = normalize_shell_token(command.trim(), shell);
+    if normalized.is_empty() {
+        return false;
+    }
+    match tokenize::tokenize(&normalized, shell).first() {
+        Some(seg) => segment_chain_contains_sudo(seg, shell),
+        None => false,
     }
 }
 
@@ -2504,6 +2657,44 @@ mod tests {
                 .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
             "should detect pipe through env -u HOME bash"
         );
+    }
+
+    #[test]
+    fn test_facts_uses_sudo_through_wrappers() {
+        // CodeRabbit M13 finding R6: `command.uses_sudo` must be TRUE whenever
+        // `sudo` appears as a leader anywhere in the wrapper chain — including
+        // when it sits BETWEEN a wrapper and the real command, where the old
+        // "final base == sudo" check missed it.
+        let sudo_cases = [
+            "sudo bash -c 'echo hi'",     // bare sudo leader
+            "env sudo bash -c 'echo hi'", // env wraps sudo
+            "command sudo apt install x", // command wraps sudo
+            "env -S \"sudo bash -c id\"", // env -S string carries sudo
+            "nohup sudo bash script.sh",  // nohup wraps sudo
+            "env command sudo bash",      // nested wrappers around sudo
+            "sudo -u root bash",          // sudo with a value flag
+        ];
+        for input in sudo_cases {
+            let facts = extract_command_facts(input, ShellType::Posix);
+            assert!(
+                facts.uses_sudo,
+                "uses_sudo must be true for wrapped sudo: {input:?}"
+            );
+        }
+
+        let non_sudo_cases = [
+            "bash -c 'echo hi'",     // plain interpreter, no sudo
+            "env bash -c 'echo hi'", // env wraps bash (no sudo)
+            "command apt install x", // command wraps apt (no sudo)
+            "doas bash",             // doas is not sudo
+        ];
+        for input in non_sudo_cases {
+            let facts = extract_command_facts(input, ShellType::Posix);
+            assert!(
+                !facts.uses_sudo,
+                "uses_sudo must be false without sudo: {input:?}"
+            );
+        }
     }
 
     #[test]

@@ -6088,8 +6088,9 @@ Examples:
         /// into the matcher itself (the engine schema matches only on
         /// `(kind, name)` today).
         command_pattern: String,
-        /// M13 ch5 — per-agent filesystem-write scope predicate
-        /// (repo_only|home|everywhere). Advisory metadata recorded on the matcher.
+        /// M13 ch5 — per-agent filesystem-write scope predicate. Accepted
+        /// values: repo_only (aliases: repo-only, repo), home, everywhere
+        /// (alias: all). Advisory metadata recorded on the matcher.
         #[arg(long = "filesystem-write")]
         filesystem_write: Option<String>,
         /// M13 ch5 — per-agent network predicate (warn|block|allow). Advisory
