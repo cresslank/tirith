@@ -14,6 +14,7 @@ pub mod command_card;
 pub mod commands_manifest;
 pub mod confusables;
 pub mod context_detect;
+pub mod custom_rule_dsl;
 pub mod dashboard;
 pub mod data;
 pub mod dep_confusion;

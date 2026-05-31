@@ -1,0 +1,82 @@
+# M13 ch4 — custom-rule DSL round-trip fixture.
+#
+# Seven example `when:`-clause custom rules spanning every predicate family and
+# the logical combinators (all/any/not). These must all load via `Policy` and
+# pass `tirith rule validate`. The first rule is the acceptance example.
+#
+# NOTE: the acceptance example uses `action:` and `message:` — `message:` is a
+# serde alias for the rule's `title`, and `action:` is recorded metadata (the
+# effective action still derives from `severity`).
+custom_rules:
+  # 1. The acceptance example: unknown-domain script piped to a shell.
+  - id: block-unknown-curl-to-shell
+    when:
+      all:
+        - command.has_pipeline_to: [sh, bash, zsh]
+        - url.reputation: unknown
+        - url.domain_not_in: [company.com, github.com]
+    action: block
+    severity: critical
+    message: "Unknown-domain script piped to shell"
+    context: [exec]
+
+  # 2. Plain-HTTP fetch to a non-company host (any + not + scheme/host).
+  - id: warn-plain-http-offsite
+    when:
+      all:
+        - url.scheme: http
+        - not:
+            url.host_matches: '(^|\.)company\.com$'
+    severity: medium
+    title: "Plain-HTTP request to an off-site host"
+    description: "HTTP (not HTTPS) request whose host is not under company.com."
+    context: [exec, paste]
+
+  # 3. sudo escalation that also pipes into an interpreter (command-only).
+  - id: warn-sudo-pipe-interpreter
+    when:
+      all:
+        - command.uses_sudo: true
+        - command.has_pipeline_to: [bash, sh, python, python3, perl]
+    severity: high
+    title: "sudo command piping remote content into an interpreter"
+    context: [exec]
+
+  # 4. Install of a malicious npm package (package family, exec).
+  - id: block-malicious-npm
+    when:
+      all:
+        - package.ecosystem: npm
+        - package.reputation: malicious
+    action: block
+    severity: critical
+    title: "Known-malicious npm package install"
+    context: [exec]
+
+  # 5. Any install of a package whose name looks like an internal scope
+  #    (package.name_matches, exec).
+  - id: warn-internal-scope-from-public
+    when:
+      package.name_matches: '^@acme/'
+    severity: medium
+    title: "Install of an @acme/* scoped package from a public registry"
+    context: [exec]
+
+  # 6. A secret-shaped file being scanned (file family, file context).
+  - id: flag-env-file-scan
+    when:
+      file.path_matches: '(^|/)\.env(\.|$)'
+    severity: low
+    title: "Scanned a .env-style secrets file"
+    context: [file]
+
+  # 7. A command run from a sensitive working directory that talks to any host
+  #    (cwd_in + url combinator, exec).
+  - id: warn-cmd-from-infra-dir
+    when:
+      any:
+        - command.cwd_in: [/srv/infra, /opt/deploy]
+        - url.host: registry.company.com
+    severity: medium
+    title: "Network command from a sensitive infra directory"
+    context: [exec]

@@ -19,6 +19,180 @@ fn extract_raw_path_from_url(raw: &str) -> Option<String> {
     None
 }
 
+/// Owned backing storage for a custom-rule-DSL [`crate::custom_rule_dsl::DslEvalContext`].
+///
+/// The eval context borrows `&str` for hosts / package names, so this struct
+/// owns the lowercased hosts, schemes, ecosystems and names that the borrowed
+/// view points into. Built ONCE (only when a DSL rule exists) by
+/// [`build_dsl_backing`]; turned into a borrowing
+/// [`crate::custom_rule_dsl::DslEvalContext`] by [`Self::as_eval_context`].
+///
+/// Public so `tirith rule test` can build the SAME backing the engine builds
+/// (via [`dsl_backing_for_input`]) and evaluate a rule against the exact data
+/// production would see.
+pub struct DslBacking {
+    pipeline_targets: std::collections::BTreeSet<String>,
+    uses_sudo: bool,
+    /// `(host, scheme, reputation)` per extracted URL.
+    urls: Vec<(String, String, crate::custom_rule_dsl::Reputation)>,
+    /// `(ecosystem, name, malicious)` per extracted package.
+    packages: Vec<(String, String, Option<bool>)>,
+}
+
+impl DslBacking {
+    /// Borrow this backing as a [`crate::custom_rule_dsl::DslEvalContext`],
+    /// threading the (non-owned) cwd and file path through.
+    pub fn as_eval_context<'a>(
+        &'a self,
+        cwd: Option<&'a str>,
+        file_path: Option<&'a str>,
+    ) -> crate::custom_rule_dsl::DslEvalContext<'a> {
+        crate::custom_rule_dsl::DslEvalContext {
+            pipeline_targets: self.pipeline_targets.clone(),
+            uses_sudo: self.uses_sudo,
+            cwd,
+            urls: self
+                .urls
+                .iter()
+                .map(|(h, s, r)| crate::custom_rule_dsl::DslUrl {
+                    host: h.as_str(),
+                    scheme: s.as_str(),
+                    reputation: *r,
+                })
+                .collect(),
+            packages: self
+                .packages
+                .iter()
+                .map(|(e, n, m)| crate::custom_rule_dsl::DslPackage {
+                    ecosystem: e.clone(),
+                    name: n.as_str(),
+                    malicious: *m,
+                })
+                .collect(),
+            file_path,
+            // v1: the exec/paste hot path has no structured agent/MCP signal in
+            // scope (see `custom_rule_dsl` module docs). These stay `None` here;
+            // `tirith rule test` can set them.
+            agent_kind: None,
+            mcp_tool: None,
+        }
+    }
+}
+
+/// Classify a host's reputation against the LOCAL signed threat-DB + built-in
+/// known-domains table (no network). Malicious wins over known.
+fn host_reputation(
+    host: &str,
+    threat_db: Option<&crate::threatdb::ThreatDb>,
+) -> crate::custom_rule_dsl::Reputation {
+    use crate::custom_rule_dsl::Reputation;
+    if threat_db.and_then(|db| db.check_hostname(host)).is_some() {
+        Reputation::Malicious
+    } else if crate::data::is_known_domain(host) {
+        Reputation::Known
+    } else {
+        Reputation::Unknown
+    }
+}
+
+/// Build the owned backing for the custom-rule DSL from the engine's
+/// already-extracted data: the tokenized command (pipeline/sudo facts, reusing
+/// `rules::command`), the extracted URLs (host + scheme + reputation), and the
+/// install packages (`threatintel::extract_packages`) plus any Docker image
+/// refs surfaced as the `docker` ecosystem. The threat-DB lookup is the same
+/// local DB the `threatintel` rule already consulted; no network at eval time.
+pub fn build_dsl_backing(
+    analyzed_input: &str,
+    shell: ShellType,
+    scan_context: ScanContext,
+    extracted: &[extract::ExtractedUrl],
+    threat_db: Option<&crate::threatdb::ThreatDb>,
+) -> DslBacking {
+    // Command facts (pipeline targets + sudo) are only meaningful for a typed/
+    // pasted command line, not file content.
+    let (pipeline_targets, uses_sudo) = if scan_context == ScanContext::FileScan {
+        (std::collections::BTreeSet::new(), false)
+    } else {
+        let facts = crate::rules::command::extract_command_facts(analyzed_input, shell);
+        (
+            facts.pipeline_targets.into_iter().collect(),
+            facts.uses_sudo,
+        )
+    };
+
+    // URLs: host (lowercased) + scheme + reputation. Docker refs also become a
+    // `docker`-ecosystem package below.
+    let mut urls = Vec::new();
+    for u in extracted {
+        if let Some(host) = u.parsed.host() {
+            let host = host.to_lowercase();
+            let scheme = u.parsed.scheme().unwrap_or("").to_lowercase();
+            let rep = host_reputation(&host, threat_db);
+            urls.push((host, scheme, rep));
+        }
+    }
+
+    // Packages: install/add commands (pip/npm/cargo/...) via the shared
+    // extractor, plus Docker image refs from the extracted URLs.
+    let mut packages: Vec<(String, String, Option<bool>)> = Vec::new();
+    if scan_context != ScanContext::FileScan {
+        let segments = crate::tokenize::tokenize(analyzed_input, shell);
+        for pkg in crate::rules::threatintel::extract_packages(&segments) {
+            let malicious = threat_db.map(|db| {
+                db.check_package(pkg.ecosystem, &pkg.name, pkg.version.as_deref())
+                    .is_some()
+            });
+            packages.push((pkg.ecosystem.to_string(), pkg.name, malicious));
+        }
+    }
+    for u in extracted {
+        if let crate::parse::UrlLike::DockerRef { image, .. } = &u.parsed {
+            let malicious = threat_db.map(|db| {
+                db.check_package(crate::threatdb::Ecosystem::Docker, image, None)
+                    .is_some()
+            });
+            packages.push(("docker".to_string(), image.clone(), malicious));
+        }
+    }
+
+    DslBacking {
+        pipeline_targets,
+        uses_sudo,
+        urls,
+        packages,
+    }
+}
+
+/// Build a [`DslBacking`] from a raw input string, running the SAME tier-2
+/// extraction the engine runs on the hot path (strip a `# tirith-card:` prelude
+/// in Exec, then `extract_urls`, then [`build_dsl_backing`] against the cached
+/// threat-DB). This is the entry point `tirith rule test` uses so a tested rule
+/// sees exactly the data production would.
+pub fn dsl_backing_for_input(
+    input: &str,
+    shell: ShellType,
+    scan_context: ScanContext,
+) -> DslBacking {
+    let analyzed: std::borrow::Cow<'_, str> = if scan_context == ScanContext::Exec {
+        crate::command_card::strip_card_comment_lines_cow(input)
+    } else {
+        std::borrow::Cow::Borrowed(input)
+    };
+    let extracted = if scan_context == ScanContext::FileScan {
+        Vec::new()
+    } else {
+        extract::extract_urls(&analyzed, shell)
+    };
+    let threat_db = crate::threatdb::ThreatDb::cached();
+    build_dsl_backing(
+        &analyzed,
+        shell,
+        scan_context,
+        &extracted,
+        threat_db.as_deref(),
+    )
+}
+
 /// Analysis context passed through the pipeline.
 pub struct AnalysisContext {
     pub input: String,
@@ -2168,6 +2342,14 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         std::borrow::Cow::Borrowed(ctx.input.as_str())
     };
 
+    // M13 ch4 — the scanned file path as a `&str`, used by the custom-rule DSL
+    // `file.path_matches` predicate (FileScan context). Held here so the
+    // borrow outlives the DSL eval context built later in the custom-rule block.
+    let file_path_str: Option<String> = ctx
+        .file_path
+        .as_deref()
+        .map(|p| p.to_string_lossy().into_owned());
+
     if ctx.scan_context == ScanContext::FileScan {
         // FileScan runs byte-scan + configfile/codefile/rendered rules only.
         // It does NOT run command/env/URL-extraction rules — the input isn't a
@@ -2638,6 +2820,28 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         let custom_findings =
             crate::rules::custom::check(&analyzed_input, ctx.scan_context, &compiled);
         findings.extend(custom_findings);
+
+        // M13 ch4 — semantic-predicate (`when:`) custom rules. Only build the
+        // DslEvalContext when at least one DSL rule compiled, so the common
+        // regex-only path pays nothing. The context is built from the SAME
+        // extracted data the production rules already used (`extracted` URLs,
+        // the tokenized `analyzed_input`, the threat-DB), so a DSL rule sees
+        // exactly what the engine saw — `tirith rule test` reproduces this.
+        if crate::rules::custom::any_dsl_rules(&compiled) {
+            let backing = build_dsl_backing(
+                &analyzed_input,
+                ctx.shell,
+                ctx.scan_context,
+                &extracted,
+                threat_db.as_deref(),
+            );
+            let dsl_ctx = backing.as_eval_context(ctx.cwd.as_deref(), file_path_str.as_deref());
+            findings.extend(crate::rules::custom::check_dsl(
+                &dsl_ctx,
+                ctx.scan_context,
+                &compiled,
+            ));
+        }
     }
 
     for finding in &mut findings {

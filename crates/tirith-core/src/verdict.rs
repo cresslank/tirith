@@ -955,13 +955,23 @@ impl fmt::Display for RuleId {
 }
 
 /// Severity level for findings.
+///
+/// Serializes UPPERCASE (`CRITICAL`, …). On INPUT, lowercase spellings are also
+/// accepted via aliases so a hand-written policy (and the M13 ch4 custom-rule
+/// DSL examples, which use `severity: critical`) loads regardless of case.
+/// Output stays UPPERCASE, so round-trips normalize case but never break.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Severity {
+    #[serde(alias = "info")]
     Info,
+    #[serde(alias = "low")]
     Low,
+    #[serde(alias = "medium")]
     Medium,
+    #[serde(alias = "high")]
     High,
+    #[serde(alias = "critical")]
     Critical,
 }
 

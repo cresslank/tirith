@@ -1,0 +1,859 @@
+//! M13 ch4 — the custom-rule DSL (semantic predicates).
+//!
+//! A custom rule in `.tirith/policy.yaml` may carry EITHER a `pattern:` regex
+//! (the M-earlier [`crate::rules::custom`] path) OR a `when:` clause — a small
+//! boolean tree of semantic predicates evaluated against the engine's
+//! already-extracted analysis data (URLs, command tokens, packages, the scanned
+//! file path). The two are mutually exclusive: a rule has EXACTLY ONE of them.
+//!
+//! # Shape
+//!
+//! ```yaml
+//! when:
+//!   all:
+//!     - command.has_pipeline_to: [sh, bash, zsh]
+//!     - url.reputation: unknown
+//!     - url.domain_not_in: [company.com, github.com]
+//! ```
+//!
+//! `all` / `any` / `not` are the logical combinators; everything else is a
+//! leaf predicate. The serde representation is a **key-dispatched** (externally
+//! tagged) enum — each YAML key maps to exactly one [`WhenClause`] variant — so
+//! the shape round-trips without the ambiguity an `#[serde(untagged)]` tree
+//! would carry (`url.host` vs `url.host_matches` would otherwise both try to
+//! deserialize a bare string).
+//!
+//! # Predicate -> data binding (v1)
+//!
+//! Each leaf binds to REAL extracted data carried in [`DslEvalContext`], which
+//! the engine fills from the same extraction the production rules already ran:
+//!
+//! | Predicate                  | Binds to                                                              |
+//! |----------------------------|-----------------------------------------------------------------------|
+//! | `command.has_pipeline_to`  | a `|`-pipeline segment whose resolved interpreter (sudo/env-aware) is in the list |
+//! | `command.uses_sudo`        | any segment whose resolved leader is `sudo`                           |
+//! | `command.cwd_in`           | `ctx.cwd` is at/under one of the listed paths                          |
+//! | `url.host`                 | any extracted URL's canonical host equals (case-insensitive)           |
+//! | `url.host_matches`         | any extracted URL's host matches the regex                             |
+//! | `url.scheme`               | any extracted URL's scheme equals (case-insensitive)                   |
+//! | `url.reputation`           | `known` = built-in known-domains table; `malicious` = threat-DB hostname hit; `unknown` = neither |
+//! | `url.domain_not_in`        | at least one extracted URL whose host is NOT at/under any listed domain |
+//! | `package.ecosystem`        | an extracted install package in that ecosystem                          |
+//! | `package.name_matches`     | an extracted package whose name matches the regex                       |
+//! | `package.reputation`       | `malicious` = threat-DB package hit; `known`/`unknown` heuristic on the same DB |
+//! | `file.path_matches`        | `ctx.file_path` matches the regex                                       |
+//! | `agent.kind`               | `ctx.agent_kind` equals (see v1 limitation)                             |
+//! | `mcp.tool`                 | `ctx.mcp_tool` equals (see v1 limitation)                               |
+//!
+//! ## v1 limitations (documented, still parsed + validated)
+//!
+//! * **`agent.kind` / `mcp.tool`** — the exec/paste hot path
+//!   ([`crate::engine::analyze`]) has NO structured "current agent kind" or
+//!   "current MCP tool" in scope (agent/MCP signals live in separate flows:
+//!   `mcpdrift` runs over lockfiles in FileScan, and agent annotations are
+//!   rich-text `agent_view` enrichment). `DslEvalContext::agent_kind` /
+//!   `mcp_tool` are therefore `None` on that path, so these predicates evaluate
+//!   `false` there. They DO evaluate when a caller (e.g. `tirith rule test`)
+//!   sets them explicitly. The predicates are fully parsed, validated, and
+//!   contribute to [`required_triggers`].
+//! * **`url.reputation` / `package.reputation`** — bound to the LOCAL signed
+//!   threat-DB + built-in known-domains table reachable on the hot path; NO
+//!   network lookup happens at eval time (matching the rest of the engine's
+//!   local-first hot path). When no threat-DB is loaded, `malicious` is `false`
+//!   and every host/package is `unknown` (fail-open, never blocks the user).
+//! * **`package.*`** — packages come from [`crate::rules::threatintel::extract_packages`]
+//!   (install/add commands: pip/npm/yarn/pnpm/bun/npx/cargo/gem/go/composer/dotnet),
+//!   plus Docker image refs surfaced as the `docker` ecosystem. A command with
+//!   no recognized install leader yields no packages, so `package.*` is `false`.
+
+use std::collections::BTreeSet;
+
+use regex::Regex;
+use serde::de::{self, Deserializer, MapAccess, Visitor};
+use serde::ser::{SerializeMap, Serializer};
+use serde::{Deserialize, Serialize};
+
+use crate::extract::ScanContext;
+
+/// One node of a `when:` clause — a **key-dispatched** node: serialized as a
+/// single-key YAML mapping whose key (`all`, `any`, `not`, or a leaf predicate
+/// name like `command.has_pipeline_to`) selects exactly one variant and whose
+/// value is that variant's payload.
+///
+/// `serde`'s built-in externally-tagged enum representation uses YAML `!tag`
+/// syntax under `serde_yaml` 0.9, which is NOT the `{ key: value }` mapping the
+/// policy shape uses — so `Serialize`/`Deserialize` are implemented by hand
+/// below to produce/consume single-key maps. The variant set and payloads are
+/// otherwise an ordinary enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WhenClause {
+    /// All sub-clauses must match (logical AND). Empty list is vacuously true.
+    All(Vec<WhenClause>),
+    /// Any sub-clause must match (logical OR). Empty list is vacuously false.
+    Any(Vec<WhenClause>),
+    /// The sub-clause must NOT match (logical negation).
+    Not(Box<WhenClause>),
+
+    // ---- command.* leaves ----
+    /// `command.has_pipeline_to: [sh, bash, ...]` — a `|`-pipeline whose
+    /// resolved interpreter is one of the named shells/interpreters.
+    CommandHasPipelineTo(Vec<String>),
+    /// `command.uses_sudo: true` — the command escalates via `sudo`.
+    CommandUsesSudo(bool),
+    /// `command.cwd_in: [paths]` — the current working directory is at/under
+    /// one of the listed paths.
+    CommandCwdIn(Vec<String>),
+
+    // ---- url.* leaves ----
+    /// `url.host: <h>` — an extracted URL's canonical host equals `<h>`.
+    UrlHost(String),
+    /// `url.host_matches: <regex>` — an extracted URL's host matches the regex.
+    UrlHostMatches(String),
+    /// `url.scheme: <s>` — an extracted URL's scheme equals `<s>`.
+    UrlScheme(String),
+    /// `url.reputation: known|unknown|malicious`.
+    UrlReputation(Reputation),
+    /// `url.domain_not_in: [domains]` — at least one extracted URL whose host
+    /// is NOT at/under any listed registrable domain.
+    UrlDomainNotIn(Vec<String>),
+
+    // ---- package.* leaves ----
+    /// `package.ecosystem: <e>` — an extracted package in ecosystem `<e>`.
+    PackageEcosystem(String),
+    /// `package.name_matches: <regex>` — an extracted package name matches.
+    PackageNameMatches(String),
+    /// `package.reputation: known|unknown|malicious`.
+    PackageReputation(Reputation),
+
+    // ---- file.* leaves ----
+    /// `file.path_matches: <regex>` — the scanned file path matches the regex.
+    FilePathMatches(String),
+
+    // ---- agent.* / mcp.* leaves ----
+    /// `agent.kind: <k>` — the current agent kind equals `<k>` (v1: only when a
+    /// caller sets it; see module docs).
+    AgentKind(String),
+    /// `mcp.tool: <t>` — the current MCP tool equals `<t>` (v1: only when a
+    /// caller sets it; see module docs).
+    McpTool(String),
+}
+
+impl WhenClause {
+    /// The YAML key (predicate / combinator name) for this node.
+    pub fn key(&self) -> &'static str {
+        match self {
+            WhenClause::All(_) => "all",
+            WhenClause::Any(_) => "any",
+            WhenClause::Not(_) => "not",
+            WhenClause::CommandHasPipelineTo(_) => "command.has_pipeline_to",
+            WhenClause::CommandUsesSudo(_) => "command.uses_sudo",
+            WhenClause::CommandCwdIn(_) => "command.cwd_in",
+            WhenClause::UrlHost(_) => "url.host",
+            WhenClause::UrlHostMatches(_) => "url.host_matches",
+            WhenClause::UrlScheme(_) => "url.scheme",
+            WhenClause::UrlReputation(_) => "url.reputation",
+            WhenClause::UrlDomainNotIn(_) => "url.domain_not_in",
+            WhenClause::PackageEcosystem(_) => "package.ecosystem",
+            WhenClause::PackageNameMatches(_) => "package.name_matches",
+            WhenClause::PackageReputation(_) => "package.reputation",
+            WhenClause::FilePathMatches(_) => "file.path_matches",
+            WhenClause::AgentKind(_) => "agent.kind",
+            WhenClause::McpTool(_) => "mcp.tool",
+        }
+    }
+}
+
+impl Serialize for WhenClause {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(1))?;
+        let key = self.key();
+        match self {
+            WhenClause::All(v) | WhenClause::Any(v) => map.serialize_entry(key, v)?,
+            WhenClause::Not(v) => map.serialize_entry(key, v)?,
+            WhenClause::CommandHasPipelineTo(v)
+            | WhenClause::CommandCwdIn(v)
+            | WhenClause::UrlDomainNotIn(v) => map.serialize_entry(key, v)?,
+            WhenClause::CommandUsesSudo(b) => map.serialize_entry(key, b)?,
+            WhenClause::UrlHost(s)
+            | WhenClause::UrlHostMatches(s)
+            | WhenClause::UrlScheme(s)
+            | WhenClause::PackageEcosystem(s)
+            | WhenClause::PackageNameMatches(s)
+            | WhenClause::FilePathMatches(s)
+            | WhenClause::AgentKind(s)
+            | WhenClause::McpTool(s) => map.serialize_entry(key, s)?,
+            WhenClause::UrlReputation(r) | WhenClause::PackageReputation(r) => {
+                map.serialize_entry(key, r)?
+            }
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for WhenClause {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ClauseVisitor;
+
+        impl<'de> Visitor<'de> for ClauseVisitor {
+            type Value = WhenClause;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a single-key when-clause mapping (e.g. `url.scheme: https`)")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<WhenClause, M::Error> {
+                let key: String = map
+                    .next_key()?
+                    .ok_or_else(|| de::Error::custom("when-clause must have exactly one key"))?;
+
+                // Helper macros to deserialize the value as a concrete type.
+                macro_rules! val {
+                    ($t:ty) => {{
+                        let v: $t = map.next_value()?;
+                        v
+                    }};
+                }
+
+                let clause = match key.as_str() {
+                    "all" => WhenClause::All(val!(Vec<WhenClause>)),
+                    "any" => WhenClause::Any(val!(Vec<WhenClause>)),
+                    "not" => WhenClause::Not(Box::new(val!(WhenClause))),
+                    "command.has_pipeline_to" => {
+                        WhenClause::CommandHasPipelineTo(val!(Vec<String>))
+                    }
+                    "command.uses_sudo" => WhenClause::CommandUsesSudo(val!(bool)),
+                    "command.cwd_in" => WhenClause::CommandCwdIn(val!(Vec<String>)),
+                    "url.host" => WhenClause::UrlHost(val!(String)),
+                    "url.host_matches" => WhenClause::UrlHostMatches(val!(String)),
+                    "url.scheme" => WhenClause::UrlScheme(val!(String)),
+                    "url.reputation" => WhenClause::UrlReputation(val!(Reputation)),
+                    "url.domain_not_in" => WhenClause::UrlDomainNotIn(val!(Vec<String>)),
+                    "package.ecosystem" => WhenClause::PackageEcosystem(val!(String)),
+                    "package.name_matches" => WhenClause::PackageNameMatches(val!(String)),
+                    "package.reputation" => WhenClause::PackageReputation(val!(Reputation)),
+                    "file.path_matches" => WhenClause::FilePathMatches(val!(String)),
+                    "agent.kind" => WhenClause::AgentKind(val!(String)),
+                    "mcp.tool" => WhenClause::McpTool(val!(String)),
+                    other => {
+                        return Err(de::Error::custom(format!(
+                            "unknown when-clause predicate: '{other}'"
+                        )))
+                    }
+                };
+
+                // Reject a second key — a clause node is exactly one predicate.
+                if map.next_key::<String>()?.is_some() {
+                    return Err(de::Error::custom(
+                        "when-clause node must have exactly one key (wrap multiple in `all:`/`any:`)",
+                    ));
+                }
+                Ok(clause)
+            }
+        }
+
+        deserializer.deserialize_map(ClauseVisitor)
+    }
+}
+
+/// Reputation tri-state shared by `url.reputation` and `package.reputation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Reputation {
+    Known,
+    Unknown,
+    Malicious,
+}
+
+/// A package reference as seen by the DSL evaluator (ecosystem + name).
+///
+/// Mirrors the fields of [`crate::rules::threatintel::PackageRef`] the
+/// predicates need; the engine builds these from the same extractor.
+#[derive(Debug, Clone)]
+pub struct DslPackage<'a> {
+    /// Lowercase ecosystem name (`npm`, `pypi`, `crates.io`, `docker`, ...).
+    pub ecosystem: String,
+    /// Package / image name.
+    pub name: &'a str,
+    /// `Some(true)` = the threat-DB flags this package malicious;
+    /// `Some(false)` = looked up, not malicious; `None` = not looked up.
+    pub malicious: Option<bool>,
+}
+
+/// A URL reference as seen by the DSL evaluator (host + scheme + reputation).
+#[derive(Debug, Clone)]
+pub struct DslUrl<'a> {
+    /// Canonical (post-IDNA) host, lowercased by the engine.
+    pub host: &'a str,
+    /// URL scheme (`https`, `http`, `git`, ...); empty for schemeless refs.
+    pub scheme: &'a str,
+    /// Reputation classification computed once by the engine.
+    pub reputation: Reputation,
+}
+
+/// References to the already-extracted analysis data the predicates evaluate
+/// against. Borrows everything — the engine builds this only when at least one
+/// DSL rule exists, so the no-DSL hot path pays nothing.
+#[derive(Debug, Default)]
+pub struct DslEvalContext<'a> {
+    /// Interpreter names that appear as a `|`-pipeline target, sudo/env-aware
+    /// resolved and lowercased (e.g. `["bash"]` for `curl ... | sudo bash`).
+    pub pipeline_targets: BTreeSet<String>,
+    /// Whether any command segment escalates via `sudo`.
+    pub uses_sudo: bool,
+    /// The current working directory, if known.
+    pub cwd: Option<&'a str>,
+    /// Extracted URLs with host + scheme + reputation.
+    pub urls: Vec<DslUrl<'a>>,
+    /// Extracted packages with ecosystem + name + reputation.
+    pub packages: Vec<DslPackage<'a>>,
+    /// Path of the file being scanned (FileScan context).
+    pub file_path: Option<&'a str>,
+    /// Current agent kind (v1: usually `None` on the exec/paste hot path).
+    pub agent_kind: Option<&'a str>,
+    /// Current MCP tool (v1: usually `None` on the exec/paste hot path).
+    pub mcp_tool: Option<&'a str>,
+}
+
+/// The set of [`ScanContext`]s a clause's predicates need to be meaningful.
+///
+/// Drives the tier-1 validation invariant: a DSL rule's declared `context:`
+/// (its trigger group) must COVER this set, or the rule's predicates can never
+/// see the data they reference and the rule is rejected.
+///
+/// `url.*` needs Exec OR Paste (URLs are extracted in both), so it contributes
+/// BOTH and a rule declaring either one satisfies it. `command.*` and
+/// `package.*` need Exec. `file.path_matches` needs FileScan. `mcp.tool` is a
+/// FileScan signal (MCP lockfile drift). `agent.kind` is context-agnostic and
+/// contributes nothing (it never constrains the trigger group).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RequiredTriggerSet {
+    /// Each inner group is a DISJUNCTION: the rule's contexts must intersect it.
+    /// The outer Vec is a CONJUNCTION across predicate families. An empty outer
+    /// Vec means "no context constraint" (e.g. a rule with only `agent.kind`).
+    /// Inner groups are deduped and kept small (<= 3 contexts) — a `Vec` rather
+    /// than a `BTreeSet` because `ScanContext` is intentionally not `Ord`.
+    pub groups: Vec<Vec<ScanContext>>,
+}
+
+impl RequiredTriggerSet {
+    fn push(&mut self, ctxs: &[ScanContext]) {
+        let group: Vec<ScanContext> = ctxs.to_vec();
+        // Dedupe by set-equality (order-insensitive) so `[Exec, Paste]` is not
+        // recorded twice.
+        let already = self
+            .groups
+            .iter()
+            .any(|g| g.len() == group.len() && group.iter().all(|c| g.contains(c)));
+        if !already {
+            self.groups.push(group);
+        }
+    }
+
+    /// `true` when `declared` satisfies every required group (each group shares
+    /// at least one context with `declared`). A rule with no groups is always
+    /// satisfied.
+    pub fn is_satisfied_by(&self, declared: &[ScanContext]) -> bool {
+        self.groups
+            .iter()
+            .all(|grp| grp.iter().any(|c| declared.contains(c)))
+    }
+
+    /// Human-readable description of the unmet requirement(s), for error text.
+    pub fn describe_unmet(&self, declared: &[ScanContext]) -> String {
+        let unmet: Vec<String> = self
+            .groups
+            .iter()
+            .filter(|grp| !grp.iter().any(|c| declared.contains(c)))
+            .map(|grp| {
+                let names: Vec<&str> = grp.iter().map(scan_context_name).collect();
+                names.join(" or ")
+            })
+            .collect();
+        unmet.join(", then ")
+    }
+}
+
+fn scan_context_name(c: &ScanContext) -> &'static str {
+    match c {
+        ScanContext::Exec => "exec",
+        ScanContext::Paste => "paste",
+        ScanContext::FileScan => "file",
+    }
+}
+
+/// Derive the [`RequiredTriggerSet`] a clause needs from its leaf predicates.
+///
+/// Logical combinators (`all`/`any`/`not`) just union their children's
+/// requirements — a clause spanning families needs all of them. (`any` is a
+/// disjunction at *eval* time, but a child predicate still needs its data
+/// extracted to be evaluable, so the trigger requirement is a union here too —
+/// the conservative, correct choice for the tier-1 invariant.)
+pub fn required_triggers(clause: &WhenClause) -> RequiredTriggerSet {
+    let mut set = RequiredTriggerSet::default();
+    collect_required(clause, &mut set);
+    set
+}
+
+fn collect_required(clause: &WhenClause, set: &mut RequiredTriggerSet) {
+    use ScanContext::{Exec, FileScan, Paste};
+    match clause {
+        WhenClause::All(cs) | WhenClause::Any(cs) => {
+            for c in cs {
+                collect_required(c, set);
+            }
+        }
+        WhenClause::Not(c) => collect_required(c, set),
+
+        WhenClause::CommandHasPipelineTo(_)
+        | WhenClause::CommandUsesSudo(_)
+        | WhenClause::CommandCwdIn(_) => set.push(&[Exec]),
+
+        WhenClause::UrlHost(_)
+        | WhenClause::UrlHostMatches(_)
+        | WhenClause::UrlScheme(_)
+        | WhenClause::UrlReputation(_)
+        | WhenClause::UrlDomainNotIn(_) => set.push(&[Exec, Paste]),
+
+        WhenClause::PackageEcosystem(_)
+        | WhenClause::PackageNameMatches(_)
+        | WhenClause::PackageReputation(_) => set.push(&[Exec, FileScan]),
+
+        WhenClause::FilePathMatches(_) => set.push(&[FileScan]),
+
+        WhenClause::McpTool(_) => set.push(&[FileScan]),
+
+        // Context-agnostic: never constrains the trigger group.
+        WhenClause::AgentKind(_) => {}
+    }
+}
+
+/// Validate that every regex inside a clause compiles, returning the first
+/// error (with the offending predicate named). `Ok(())` when all are valid.
+pub fn validate_regexes(clause: &WhenClause) -> Result<(), String> {
+    match clause {
+        WhenClause::All(cs) | WhenClause::Any(cs) => {
+            for c in cs {
+                validate_regexes(c)?;
+            }
+            Ok(())
+        }
+        WhenClause::Not(c) => validate_regexes(c),
+        WhenClause::UrlHostMatches(p) => check_regex("url.host_matches", p),
+        WhenClause::PackageNameMatches(p) => check_regex("package.name_matches", p),
+        WhenClause::FilePathMatches(p) => check_regex("file.path_matches", p),
+        _ => Ok(()),
+    }
+}
+
+fn check_regex(field: &str, pattern: &str) -> Result<(), String> {
+    if pattern.len() > 1024 {
+        return Err(format!(
+            "{field}: regex too long ({} chars, max 1024)",
+            pattern.len()
+        ));
+    }
+    Regex::new(pattern)
+        .map(|_| ())
+        .map_err(|e| format!("{field}: invalid regex: {e}"))
+}
+
+/// Evaluate a `when:` clause against the extracted analysis data.
+pub fn evaluate(clause: &WhenClause, ctx: &DslEvalContext) -> bool {
+    match clause {
+        WhenClause::All(cs) => cs.iter().all(|c| evaluate(c, ctx)),
+        WhenClause::Any(cs) => cs.iter().any(|c| evaluate(c, ctx)),
+        WhenClause::Not(c) => !evaluate(c, ctx),
+
+        WhenClause::CommandHasPipelineTo(shells) => {
+            let wanted: BTreeSet<String> = shells.iter().map(|s| s.to_lowercase()).collect();
+            ctx.pipeline_targets.iter().any(|t| wanted.contains(t))
+        }
+        WhenClause::CommandUsesSudo(want) => ctx.uses_sudo == *want,
+        WhenClause::CommandCwdIn(paths) => match ctx.cwd {
+            Some(cwd) => paths.iter().any(|p| path_is_under(cwd, p)),
+            None => false,
+        },
+
+        WhenClause::UrlHost(h) => {
+            let h = h.to_lowercase();
+            ctx.urls.iter().any(|u| u.host.eq_ignore_ascii_case(&h))
+        }
+        WhenClause::UrlHostMatches(pat) => match Regex::new(pat) {
+            Ok(re) => ctx.urls.iter().any(|u| re.is_match(u.host)),
+            Err(_) => false,
+        },
+        WhenClause::UrlScheme(s) => ctx.urls.iter().any(|u| u.scheme.eq_ignore_ascii_case(s)),
+        WhenClause::UrlReputation(rep) => ctx.urls.iter().any(|u| u.reputation == *rep),
+        WhenClause::UrlDomainNotIn(domains) => {
+            // Fires when AT LEAST ONE extracted URL's host is outside every
+            // listed registrable domain — the "talking to a domain we didn't
+            // allow" shape. With no URLs there is nothing outside the list.
+            ctx.urls
+                .iter()
+                .any(|u| !domains.iter().any(|d| host_is_under_domain(u.host, d)))
+        }
+
+        WhenClause::PackageEcosystem(e) => {
+            let e = normalize_ecosystem(e);
+            ctx.packages
+                .iter()
+                .any(|p| normalize_ecosystem(&p.ecosystem) == e)
+        }
+        WhenClause::PackageNameMatches(pat) => match Regex::new(pat) {
+            Ok(re) => ctx.packages.iter().any(|p| re.is_match(p.name)),
+            Err(_) => false,
+        },
+        WhenClause::PackageReputation(rep) => ctx.packages.iter().any(|p| match rep {
+            Reputation::Malicious => p.malicious == Some(true),
+            Reputation::Known => p.malicious == Some(false),
+            // `unknown` = not looked up (no DB) — the v1 default for packages.
+            Reputation::Unknown => p.malicious.is_none(),
+        }),
+
+        WhenClause::FilePathMatches(pat) => match (&ctx.file_path, Regex::new(pat)) {
+            (Some(path), Ok(re)) => re.is_match(path),
+            _ => false,
+        },
+
+        WhenClause::AgentKind(k) => ctx.agent_kind.is_some_and(|a| a.eq_ignore_ascii_case(k)),
+        WhenClause::McpTool(t) => ctx.mcp_tool.is_some_and(|m| m.eq_ignore_ascii_case(t)),
+    }
+}
+
+/// Normalize an ecosystem alias to its canonical [`crate::threatdb::Ecosystem`]
+/// display string when recognized; otherwise lowercase the input. This lets
+/// `crates`/`cargo` match `crates.io`, etc.
+fn normalize_ecosystem(s: &str) -> String {
+    match crate::threatdb::Ecosystem::from_name(s) {
+        Some(e) => e.to_string(),
+        None => s.to_lowercase(),
+    }
+}
+
+/// `true` when `path` is `base` or a descendant of it. Both are compared as
+/// `/`-separated component sequences (purely lexical — no filesystem access),
+/// so `/home/x` is under `/home` but `/home-other` is not.
+fn path_is_under(path: &str, base: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    let base = base.trim_end_matches('/');
+    if base.is_empty() {
+        // `cwd_in: ["/"]` — root contains everything.
+        return path.starts_with('/');
+    }
+    if path == base {
+        return true;
+    }
+    path.strip_prefix(base)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// `true` when `host` equals `domain` or is a sub-domain of it
+/// (`api.github.com` is under `github.com`, but `notgithub.com` is not).
+/// Case-insensitive; a leading dot on `domain` is tolerated.
+fn host_is_under_domain(host: &str, domain: &str) -> bool {
+    let host = host.trim_end_matches('.').to_lowercase();
+    let domain = domain
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_lowercase();
+    if domain.is_empty() {
+        return false;
+    }
+    if host == domain {
+        return true;
+    }
+    host.strip_suffix(&domain)
+        .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seven shipping example DSL rules
+    /// (`tests/fixtures/custom_rules_dsl.yaml`) must all load via `Policy`, have
+    /// a valid pattern-XOR-when shape, valid inner regexes, and a declared
+    /// context that covers each clause's required triggers.
+    #[test]
+    fn test_seven_example_dsl_rules_round_trip() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests")
+            .join("fixtures")
+            .join("custom_rules_dsl.yaml");
+        let yaml = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        // Use the strict parser so a fixture typo is a hard test failure
+        // (the production `load_from_yaml` warn-and-defaults to empty).
+        let policy = crate::policy::Policy::try_parse_yaml(&yaml)
+            .unwrap_or_else(|e| panic!("fixture parse error: {e}"));
+        assert_eq!(
+            policy.custom_rules.len(),
+            7,
+            "fixture must define exactly 7 DSL rules"
+        );
+
+        for rule in &policy.custom_rules {
+            rule.validate_shape()
+                .unwrap_or_else(|e| panic!("rule '{}' bad shape: {e}", rule.id));
+            let when = rule
+                .when
+                .as_ref()
+                .unwrap_or_else(|| panic!("rule '{}' should be a DSL rule", rule.id));
+            validate_regexes(when).unwrap_or_else(|e| panic!("rule '{}' bad regex: {e}", rule.id));
+
+            let declared = parse_test_contexts(&rule.context);
+            let required = required_triggers(when);
+            assert!(
+                required.is_satisfied_by(&declared),
+                "rule '{}' context {:?} does not cover required triggers [{}]",
+                rule.id,
+                rule.context,
+                required.describe_unmet(&declared)
+            );
+        }
+
+        // The acceptance rule fires on the documented input shape.
+        let accept = policy
+            .custom_rules
+            .iter()
+            .find(|r| r.id == "block-unknown-curl-to-shell")
+            .expect("acceptance rule present");
+        let clause = accept.when.as_ref().unwrap();
+        let mut ctx = DslEvalContext::default();
+        ctx.pipeline_targets.insert("bash".to_string());
+        ctx.urls.push(DslUrl {
+            host: "evil.example",
+            scheme: "https",
+            reputation: Reputation::Unknown,
+        });
+        assert!(evaluate(clause, &ctx));
+    }
+
+    fn parse_test_contexts(context: &[String]) -> Vec<ScanContext> {
+        context
+            .iter()
+            .filter_map(|c| match c.as_str() {
+                "exec" => Some(ScanContext::Exec),
+                "paste" => Some(ScanContext::Paste),
+                "file" => Some(ScanContext::FileScan),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_acceptance_example_round_trips() {
+        let yaml = r#"
+all:
+  - command.has_pipeline_to: [sh, bash, zsh]
+  - url.reputation: unknown
+  - url.domain_not_in: [company.com, github.com]
+"#;
+        let clause: WhenClause = serde_yaml::from_str(yaml).expect("parse");
+        // Re-serialize and re-parse to prove a clean round-trip.
+        let out = serde_yaml::to_string(&clause).expect("serialize");
+        let clause2: WhenClause = serde_yaml::from_str(&out).expect("reparse");
+        assert_eq!(clause, clause2);
+
+        match &clause {
+            WhenClause::All(cs) => {
+                assert_eq!(cs.len(), 3);
+                assert!(matches!(cs[0], WhenClause::CommandHasPipelineTo(_)));
+                assert!(matches!(
+                    cs[1],
+                    WhenClause::UrlReputation(Reputation::Unknown)
+                ));
+                assert!(matches!(cs[2], WhenClause::UrlDomainNotIn(_)));
+            }
+            _ => panic!("expected All"),
+        }
+    }
+
+    #[test]
+    fn test_acceptance_example_fires() {
+        let yaml = r#"
+all:
+  - command.has_pipeline_to: [sh, bash, zsh]
+  - url.reputation: unknown
+  - url.domain_not_in: [company.com, github.com]
+"#;
+        let clause: WhenClause = serde_yaml::from_str(yaml).unwrap();
+
+        let mut ctx = DslEvalContext::default();
+        ctx.pipeline_targets.insert("bash".to_string());
+        ctx.urls.push(DslUrl {
+            host: "evil.example",
+            scheme: "https",
+            reputation: Reputation::Unknown,
+        });
+        assert!(evaluate(&clause, &ctx), "evil-domain curl|bash should fire");
+
+        // A github.com URL is in the allow list -> domain_not_in is false ->
+        // whole `all` is false.
+        let mut ctx2 = DslEvalContext::default();
+        ctx2.pipeline_targets.insert("bash".to_string());
+        ctx2.urls.push(DslUrl {
+            host: "github.com",
+            scheme: "https",
+            reputation: Reputation::Unknown,
+        });
+        assert!(!evaluate(&clause, &ctx2), "github.com should not fire");
+    }
+
+    #[test]
+    fn test_not_and_any() {
+        let yaml = r#"
+any:
+  - command.uses_sudo: true
+  - not:
+      url.scheme: https
+"#;
+        let clause: WhenClause = serde_yaml::from_str(yaml).unwrap();
+
+        // Has sudo -> any() true.
+        let ctx = DslEvalContext {
+            uses_sudo: true,
+            ..Default::default()
+        };
+        assert!(evaluate(&clause, &ctx));
+
+        // No sudo, only an https URL -> not(scheme https) is false, sudo is
+        // false -> any() false.
+        let mut ctx2 = DslEvalContext::default();
+        ctx2.urls.push(DslUrl {
+            host: "x.com",
+            scheme: "https",
+            reputation: Reputation::Known,
+        });
+        assert!(!evaluate(&clause, &ctx2));
+
+        // No sudo, a plain http URL -> not(scheme https) is true -> any() true.
+        let mut ctx3 = DslEvalContext::default();
+        ctx3.urls.push(DslUrl {
+            host: "x.com",
+            scheme: "http",
+            reputation: Reputation::Known,
+        });
+        assert!(evaluate(&clause, &ctx3));
+    }
+
+    #[test]
+    fn test_required_triggers_command_needs_exec() {
+        let clause = WhenClause::CommandUsesSudo(true);
+        let req = required_triggers(&clause);
+        assert!(req.is_satisfied_by(&[ScanContext::Exec]));
+        assert!(!req.is_satisfied_by(&[ScanContext::Paste]));
+        assert!(!req.is_satisfied_by(&[ScanContext::FileScan]));
+    }
+
+    #[test]
+    fn test_required_triggers_url_needs_exec_or_paste() {
+        let clause = WhenClause::UrlReputation(Reputation::Unknown);
+        let req = required_triggers(&clause);
+        assert!(req.is_satisfied_by(&[ScanContext::Exec]));
+        assert!(req.is_satisfied_by(&[ScanContext::Paste]));
+        assert!(!req.is_satisfied_by(&[ScanContext::FileScan]));
+    }
+
+    #[test]
+    fn test_required_triggers_file_needs_filescan() {
+        let clause = WhenClause::FilePathMatches(r"\.env$".to_string());
+        let req = required_triggers(&clause);
+        assert!(req.is_satisfied_by(&[ScanContext::FileScan]));
+        assert!(!req.is_satisfied_by(&[ScanContext::Exec]));
+    }
+
+    #[test]
+    fn test_required_triggers_spanning_clause_needs_all() {
+        // command.* (exec) AND file.* (filescan) -> a rule must declare both.
+        let clause = WhenClause::All(vec![
+            WhenClause::CommandUsesSudo(true),
+            WhenClause::FilePathMatches(r"x".to_string()),
+        ]);
+        let req = required_triggers(&clause);
+        assert!(!req.is_satisfied_by(&[ScanContext::Exec]));
+        assert!(!req.is_satisfied_by(&[ScanContext::FileScan]));
+        assert!(req.is_satisfied_by(&[ScanContext::Exec, ScanContext::FileScan]));
+    }
+
+    #[test]
+    fn test_required_triggers_agent_kind_unconstrained() {
+        let clause = WhenClause::AgentKind("claude-code".to_string());
+        let req = required_triggers(&clause);
+        // No groups -> satisfied by any single context.
+        assert!(req.is_satisfied_by(&[ScanContext::Exec]));
+        assert!(req.is_satisfied_by(&[ScanContext::Paste]));
+        assert!(req.is_satisfied_by(&[ScanContext::FileScan]));
+    }
+
+    #[test]
+    fn test_validate_regexes_catches_bad() {
+        let bad = WhenClause::UrlHostMatches(r"(unclosed".to_string());
+        assert!(validate_regexes(&bad).is_err());
+        let good = WhenClause::UrlHostMatches(r"github\.com$".to_string());
+        assert!(validate_regexes(&good).is_ok());
+    }
+
+    #[test]
+    fn test_path_is_under() {
+        assert!(path_is_under("/home/user/proj", "/home/user"));
+        assert!(path_is_under("/home/user", "/home/user"));
+        assert!(!path_is_under("/home/user-other", "/home/user"));
+        assert!(path_is_under("/anything", "/"));
+        assert!(!path_is_under("relative/path", "/abs"));
+    }
+
+    #[test]
+    fn test_host_is_under_domain() {
+        assert!(host_is_under_domain("api.github.com", "github.com"));
+        assert!(host_is_under_domain("github.com", "github.com"));
+        assert!(host_is_under_domain("github.com", ".github.com"));
+        assert!(!host_is_under_domain("notgithub.com", "github.com"));
+        assert!(!host_is_under_domain("github.com.evil.com", "github.com"));
+    }
+
+    #[test]
+    fn test_package_predicates() {
+        let yaml = r#"
+all:
+  - package.ecosystem: npm
+  - package.name_matches: "^left-pad$"
+  - package.reputation: malicious
+"#;
+        let clause: WhenClause = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = DslEvalContext::default();
+        ctx.packages.push(DslPackage {
+            ecosystem: "npm".to_string(),
+            name: "left-pad",
+            malicious: Some(true),
+        });
+        assert!(evaluate(&clause, &ctx));
+
+        // Not malicious -> reputation predicate false.
+        let mut ctx2 = DslEvalContext::default();
+        ctx2.packages.push(DslPackage {
+            ecosystem: "npm".to_string(),
+            name: "left-pad",
+            malicious: Some(false),
+        });
+        assert!(!evaluate(&clause, &ctx2));
+    }
+
+    #[test]
+    fn test_ecosystem_alias_round_trip() {
+        // `crates`/`cargo` should match the canonical `crates.io`.
+        let clause = WhenClause::PackageEcosystem("cargo".to_string());
+        let mut ctx = DslEvalContext::default();
+        ctx.packages.push(DslPackage {
+            ecosystem: "crates.io".to_string(),
+            name: "serde",
+            malicious: None,
+        });
+        assert!(evaluate(&clause, &ctx));
+    }
+}

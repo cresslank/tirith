@@ -359,6 +359,60 @@ pub fn check(
     findings
 }
 
+/// Command-shape facts the M13 ch4 custom-rule DSL needs, derived by REUSING
+/// the same pipeline/sudo resolution the `pipe_to_interpreter` and sudo rules
+/// use ([`resolve_interpreter_name`], [`resolve_base_through_wrappers`]).
+///
+/// * `pipeline_targets` — lowercase interpreter names that appear as the
+///   right-hand side of a `|` / `|&` pipeline, sudo/env/wrapper-resolved (so
+///   `curl … | sudo bash` yields `bash`). This is exactly what the
+///   `command.has_pipeline_to` predicate matches.
+/// * `uses_sudo` — any segment whose resolved leader (through env/command/exec/
+///   nohup wrappers) is `sudo`. Drives `command.uses_sudo`.
+pub struct CommandFacts {
+    pub pipeline_targets: Vec<String>,
+    pub uses_sudo: bool,
+}
+
+/// Extract [`CommandFacts`] from a command string for the custom-rule DSL.
+pub fn extract_command_facts(input: &str, shell: ShellType) -> CommandFacts {
+    let segments = tokenize::tokenize(input, shell);
+
+    let mut pipeline_targets = Vec::new();
+    for (i, seg) in segments.iter().enumerate() {
+        if i == 0 {
+            continue;
+        }
+        let is_pipe = seg
+            .preceding_separator
+            .as_deref()
+            .is_some_and(|s| s == "|" || s == "|&");
+        if is_pipe {
+            if let Some(interp) = resolve_interpreter_name(seg, shell) {
+                if !pipeline_targets.contains(&interp) {
+                    pipeline_targets.push(interp);
+                }
+            }
+        }
+    }
+
+    // `sudo` as a leader (bare or wrapped). `resolve_base_through_wrappers`
+    // unwraps env/command/exec/nohup; a bare `sudo` leader also counts.
+    let uses_sudo = segments.iter().any(|seg| {
+        seg.command
+            .as_deref()
+            .map(|c| normalize_cmd_base(c, shell))
+            .as_deref()
+            == Some("sudo")
+            || resolve_base_through_wrappers(seg, shell) == "sudo"
+    });
+
+    CommandFacts {
+        pipeline_targets,
+        uses_sudo,
+    }
+}
+
 /// Resolve the effective interpreter from a segment, handling all quoting forms,
 /// wrappers (sudo, env, command, exec, nohup), subshells, and brace groups.
 fn resolve_interpreter_name(seg: &tokenize::Segment, shell: ShellType) -> Option<String> {

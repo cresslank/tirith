@@ -61,6 +61,11 @@ help_example_tests! {
     help_doctor     => (["doctor", "--help"], "tirith doctor --fix");
     help_warnings   => (["warnings", "--help"], "tirith warnings");
     help_policy     => (["policy", "--help"], "tirith policy init");
+    // M13 ch4 — custom-rule DSL CLI.
+    help_rule          => (["rule", "--help"], "tirith rule validate");
+    help_rule_test     => (["rule", "test", "--help"], "tirith rule test --rule block-unknown-curl-to-shell");
+    help_rule_validate => (["rule", "validate", "--help"], "tirith rule validate --path .tirith/policy.yaml");
+    help_rule_explain  => (["rule", "explain", "--help"], "tirith rule explain --rule block-unknown-curl-to-shell");
     help_audit      => (["audit", "--help"], "tirith audit export");
     help_trust      => (["trust", "--help"], "tirith trust add");
     help_receipt    => (["receipt", "--help"], "tirith receipt");

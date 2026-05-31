@@ -123,19 +123,27 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
             });
         }
 
-        // Validate regex compiles
-        if let Err(e) = regex::Regex::new(&rule.pattern) {
+        // Exactly-one-of pattern/when (M13 ch4 DSL).
+        if let Err(e) = rule.validate_shape() {
             issues.push(PolicyIssue {
                 level: IssueLevel::Error,
-                message: format!(
-                    "custom_rules.{}: invalid regex '{}': {e}",
-                    rule.id, rule.pattern
-                ),
-                field: Some(format!("custom_rules.{}.pattern", rule.id)),
+                message: format!("custom_rules.{}: {e}", rule.id),
+                field: Some(format!("custom_rules.{}", rule.id)),
             });
         }
 
-        // Validate contexts
+        // Validate the regex compiles (only for a regex rule).
+        if let Some(pattern) = &rule.pattern {
+            if let Err(e) = regex::Regex::new(pattern) {
+                issues.push(PolicyIssue {
+                    level: IssueLevel::Error,
+                    message: format!("custom_rules.{}: invalid regex '{}': {e}", rule.id, pattern),
+                    field: Some(format!("custom_rules.{}.pattern", rule.id)),
+                });
+            }
+        }
+
+        // Validate contexts (shared by both rule shapes).
         let valid_contexts = ["exec", "paste", "file"];
         for ctx in &rule.context {
             if !valid_contexts.contains(&ctx.as_str()) {
@@ -149,7 +157,49 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
                 });
             }
         }
+
+        // Validate the `when:` clause (M13 ch4 DSL): inner regexes must compile
+        // and the declared context must cover the clause's required trigger
+        // groups (the tier-1 invariant — predicates need their data extracted).
+        if let Some(when) = &rule.when {
+            if let Err(e) = crate::custom_rule_dsl::validate_regexes(when) {
+                issues.push(PolicyIssue {
+                    level: IssueLevel::Error,
+                    message: format!("custom_rules.{}: invalid when-clause: {e}", rule.id),
+                    field: Some(format!("custom_rules.{}.when", rule.id)),
+                });
+            }
+            let declared = parse_declared_contexts(&rule.context);
+            let required = crate::custom_rule_dsl::required_triggers(when);
+            if !declared.is_empty() && !required.is_satisfied_by(&declared) {
+                issues.push(PolicyIssue {
+                    level: IssueLevel::Error,
+                    message: format!(
+                        "custom_rules.{}: when-clause needs context [{}] not covered by declared context {:?}",
+                        rule.id,
+                        required.describe_unmet(&declared),
+                        rule.context
+                    ),
+                    field: Some(format!("custom_rules.{}.when", rule.id)),
+                });
+            }
+        }
     }
+}
+
+/// Parse the declared `context:` strings into [`crate::extract::ScanContext`]s,
+/// dropping unknown tokens (those are reported separately as their own issue).
+fn parse_declared_contexts(context: &[String]) -> Vec<crate::extract::ScanContext> {
+    use crate::extract::ScanContext;
+    context
+        .iter()
+        .filter_map(|c| match c.as_str() {
+            "exec" => Some(ScanContext::Exec),
+            "paste" => Some(ScanContext::Paste),
+            "file" => Some(ScanContext::FileScan),
+            _ => None,
+        })
+        .collect()
 }
 
 fn validate_approval_rules(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {

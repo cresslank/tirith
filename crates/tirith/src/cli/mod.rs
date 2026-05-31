@@ -513,6 +513,7 @@ pub mod policy;
 pub mod preview;
 pub mod prompt_status;
 pub mod receipt;
+pub mod rule;
 pub mod scan;
 pub mod score;
 pub mod secret;

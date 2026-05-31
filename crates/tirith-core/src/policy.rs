@@ -837,23 +837,83 @@ pub struct AllowlistRule {
 }
 
 /// Custom detection rule defined in policy YAML.
+///
+/// A rule carries EXACTLY ONE of `pattern` (a regex, the original
+/// [`crate::rules::custom`] path) or `when` (a semantic-predicate clause, the
+/// M13 ch4 DSL — [`crate::custom_rule_dsl`]). [`Self::validate_shape`] enforces
+/// the exclusive-or; loaders that skip validation simply ignore a malformed
+/// rule (see [`crate::rules::custom::compile_rules`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomRule {
     /// Unique identifier for this custom rule.
     pub id: String,
-    /// Regex pattern to match.
-    pub pattern: String,
+    /// Regex pattern to match. Mutually exclusive with `when`. `None` for a
+    /// DSL rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// M13 ch4 — semantic-predicate clause. Mutually exclusive with `pattern`.
+    /// `None` for a regex rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<crate::custom_rule_dsl::WhenClause>,
     /// Contexts this rule applies to: "exec", "paste", "file".
     #[serde(default = "default_custom_rule_contexts")]
     pub context: Vec<String>,
     /// Severity level.
     #[serde(default = "default_custom_rule_severity")]
     pub severity: Severity,
-    /// Short title for findings.
+    /// Short title for findings. Accepts `message:` as an alias so the M13 ch4
+    /// DSL example shape (`message: "..."`) loads into the same field.
+    #[serde(alias = "message")]
     pub title: String,
     /// Description for findings.
     #[serde(default)]
     pub description: String,
+    /// M13 ch4 — optional declared action (`allow`/`warn`/`block`). RECORDED
+    /// metadata in v1: like the regex custom-rule path, the finding's effective
+    /// action still derives from its `severity` via
+    /// [`crate::verdict::action_from_findings`]. Surfaced by `tirith rule
+    /// explain`; lets the documented `action: block` example load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<crate::verdict::Action>,
+}
+
+/// Why a [`CustomRule`]'s shape is invalid (neither or both of pattern/when).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomRuleShapeError {
+    /// Neither `pattern` nor `when` was supplied.
+    Neither,
+    /// Both `pattern` and `when` were supplied.
+    Both,
+}
+
+impl std::fmt::Display for CustomRuleShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CustomRuleShapeError::Neither => {
+                write!(
+                    f,
+                    "must have exactly one of `pattern:` or `when:` (has neither)"
+                )
+            }
+            CustomRuleShapeError::Both => {
+                write!(
+                    f,
+                    "must have exactly one of `pattern:` or `when:` (has both)"
+                )
+            }
+        }
+    }
+}
+
+impl CustomRule {
+    /// Validate the pattern-XOR-when invariant: a rule must carry EXACTLY ONE.
+    pub fn validate_shape(&self) -> Result<(), CustomRuleShapeError> {
+        match (self.pattern.is_some(), self.when.is_some()) {
+            (true, false) | (false, true) => Ok(()),
+            (false, false) => Err(CustomRuleShapeError::Neither),
+            (true, true) => Err(CustomRuleShapeError::Both),
+        }
+    }
 }
 
 fn default_custom_rule_contexts() -> Vec<String> {
