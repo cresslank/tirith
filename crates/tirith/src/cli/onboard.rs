@@ -400,8 +400,8 @@ fn home_base() -> Option<PathBuf> {
         .filter(|h| !h.is_empty() && Path::new(h).is_absolute())
         .map(PathBuf::from)
         .or_else(home::home_dir)
-        // `home::home_dir()` itself can return `Some("")` on some runners when
-        // ...but `home::home_dir()` can ALSO yield a non-absolute path: on some
+        // The env branch already requires non-empty + absolute, but
+        // `home::home_dir()` can ALSO yield a non-absolute path: on some
         // runners an empty `$HOME` makes it return `Some("")` (MSRV CI: Rust 1.83
         // / Linux), and on Unix it reads `$HOME` directly, so a RELATIVE override
         // like `HOME=.` comes back verbatim instead of being skipped. Either case

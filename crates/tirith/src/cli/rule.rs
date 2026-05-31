@@ -138,7 +138,9 @@ pub fn test(rule_id: &str, input: &str, shell: &str, json: bool) -> i32 {
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned());
                 let file_path = if context == ScanContext::FileScan {
-                    Some(input.to_string())
+                    // Normalize `\`→`/` like the runtime FileScan path so
+                    // `file.path_matches` rules behave identically under test.
+                    Some(input.replace('\\', "/"))
                 } else {
                     None
                 };

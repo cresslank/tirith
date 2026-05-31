@@ -122,8 +122,8 @@ scan:
 # stays blocked even if the caller is on the allow list. Enforcement is
 # active on every analysis path: `tirith check`, the gateway, `paste`,
 # `install`, `ecosystem scan`, and all MCP `tools/call_check_*`
-# handlers. The interactive `TIRITH=0` bypass currently skips
-# `agent_rules`; revisit in M5.
+# handlers. Note: the interactive `TIRITH=0` bypass currently skips
+# `agent_rules`.
 # agent_rules:
 #   allow:
 #     - kind: agent

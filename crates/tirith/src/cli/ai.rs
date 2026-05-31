@@ -1454,16 +1454,21 @@ mod tests {
         fn set(dir: &Path) -> Self {
             let lock = CACHE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var_os("XDG_CACHE_HOME");
-            std::env::set_var("XDG_CACHE_HOME", dir);
+            // SAFETY: serialized by CACHE_ENV_LOCK; matches the `unsafe` env
+            // mutation style used across the crate's tests (e.g. policy.rs).
+            unsafe { std::env::set_var("XDG_CACHE_HOME", dir) };
             Self { prev, _lock: lock }
         }
     }
 
     impl Drop for CacheHomeGuard {
         fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-                None => std::env::remove_var("XDG_CACHE_HOME"),
+            // SAFETY: serialized by CACHE_ENV_LOCK (held in `_lock`).
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                    None => std::env::remove_var("XDG_CACHE_HOME"),
+                }
             }
         }
     }
