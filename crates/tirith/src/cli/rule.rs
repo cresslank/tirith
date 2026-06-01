@@ -390,6 +390,13 @@ pub fn validate(path: Option<&str>, json: bool) -> i32 {
 
 /// `tirith rule explain --rule <id>` — print a rule's predicate tree, severity,
 /// action and context.
+///
+/// Loads the policy strictly (so a broken `.tirith/policy.yaml` surfaces a parse
+/// error) then delegates to [`explain_policy`], which holds the actual gating +
+/// rendering. Splitting the load from the body (CodeRabbit M13 PR #132 round-22
+/// F2) lets a unit test drive the REAL explain path against a constructed
+/// `Policy` — exercising the `compile_rules` gate end-to-end — without a parallel
+/// reimplementation or a cwd dance.
 pub fn explain(rule_id: &str, json: bool) -> i32 {
     // Strict load so a broken `.tirith/policy.yaml` surfaces a parse error
     // (non-zero exit) instead of warn-defaulting to an empty policy that would
@@ -399,6 +406,14 @@ pub fn explain(rule_id: &str, json: bool) -> i32 {
         Ok(pair) => pair,
         Err(code) => return code,
     };
+    explain_policy(&policy, rule_id, json)
+}
+
+/// The body of [`explain`] against an already-loaded [`Policy`]: the ambiguity /
+/// not-found checks, the `compile_rules` gate, and the JSON/human render. Kept
+/// separate from the strict-load step so tests can call the REAL gating+render
+/// wiring directly (the CLI calls it via [`explain`]).
+fn explain_policy(policy: &Policy, rule_id: &str, json: bool) -> i32 {
     // Reject an ambiguous policy: with duplicate ids `.find()` would silently
     // explain the FIRST match, hiding the others (CodeRabbit M13 PR #132 R10-6).
     // 0 → not found; >1 → fail fast and point at `validate`; exactly 1 → proceed.
@@ -408,7 +423,7 @@ pub fn explain(rule_id: &str, json: bool) -> i32 {
         .filter(|r| r.id == rule_id)
         .count();
     if count == 0 {
-        return emit_not_found("explain", rule_id, &policy, json);
+        return emit_not_found("explain", rule_id, policy, json);
     }
     if count > 1 {
         return emit_duplicate_rule("explain", rule_id, count, json);
@@ -431,7 +446,7 @@ pub fn explain(rule_id: &str, json: bool) -> i32 {
     let rule = match policy.custom_rules.iter().find(|r| r.id == rule_id) {
         Some(r) => r,
         None => {
-            return emit_not_found("explain", rule_id, &policy, json);
+            return emit_not_found("explain", rule_id, policy, json);
         }
     };
 
@@ -441,10 +456,17 @@ pub fn explain(rule_id: &str, json: bool) -> i32 {
     // advertises contexts the rule will never be evaluated in. E.g. a
     // `file.path_matches` rule declared `[exec, file]` compiles to `[file]`
     // only. CodeRabbit M13 PR #132 round-21.
-    let runtime_contexts: Vec<&'static str> = compiled_rule
-        .contexts
-        .iter()
-        .map(|c| scan_context_name(*c))
+    //
+    // Render them in the SAME deterministic exec→paste→file order `rule test`
+    // uses (`ordered_eval_contexts`), so the two commands describe a rule's
+    // contexts identically regardless of the declared/compiled order. Without
+    // this normalization `explain` would echo `compiled_rule.contexts` verbatim
+    // (whatever order `compile_rules` happened to emit), while `rule test`
+    // already orders them — an inconsistency CodeRabbit M13 PR #132 round-22
+    // flagged.
+    let runtime_contexts: Vec<&'static str> = ordered_eval_contexts(&compiled_rule.contexts)
+        .into_iter()
+        .map(scan_context_name)
         .collect();
 
     // Effective action: a rule's declared `action:` is recorded metadata; the
@@ -919,32 +941,75 @@ mod tests {
         );
     }
 
-    // CodeRabbit M13 PR #132 R20: `rule explain` must route through the SAME
-    // `compile_rules` gate `rule test` uses, so it can never DESCRIBE a rule the
-    // engine would drop (and that `test`/`validate` reject). `agent.kind` is an
-    // unsupported predicate — `compile_rules` skips any rule using it — so a
-    // policy whose only rule uses `agent.kind` compiles to the EMPTY set, which
-    // is exactly the condition `explain`'s gate keys off to return
-    // `emit_invalid_rule` (the same path `test` takes). Pin both halves of that
-    // gate: (1) the rule is dropped by `compile_rules`, and (2) the explain-side
-    // rejection is non-zero — matching `test`.
+    // CodeRabbit M13 PR #132 R20 + round-22 F2: `rule explain` must route through
+    // the SAME `compile_rules` gate `rule test` uses, so it can never DESCRIBE a
+    // rule the engine would drop (and that `test`/`validate` reject). The round-20
+    // version of this test only asserted that `compile_rules` dropped the rule and
+    // that `emit_invalid_rule` returns non-zero IN ISOLATION — it never invoked the
+    // real `explain` path, so the gating WIRING inside `explain` was untested
+    // end-to-end. This drives the REAL post-load body (`explain_policy`, exactly
+    // what the CLI's `explain` calls after loading) against a constructed policy.
+    //
+    // `agent.kind` is an unsupported predicate — `compile_rules` skips any rule
+    // using it — so a policy whose only rule uses `agent.kind` compiles to the
+    // EMPTY set, the precise condition `explain`'s gate keys off to reject. Use
+    // the HUMAN path (`json=false`): its rejection (`emit_invalid_rule`) writes
+    // only to STDERR and returns 1, so a clean stdout proves the raw entry was
+    // NOT rendered (the human success path would `println!` the rule to stdout).
     #[test]
-    fn explain_rejects_unsupported_predicate_rule_via_compile_gate() {
+    fn explain_rejects_unsupported_predicate_rule_via_real_path() {
         let yaml = "custom_rules:\n  - id: agent-kind-only\n    when:\n      agent.kind: aider\n    title: \"unsupported predicate rule\"\n";
         let policy = Policy::try_parse_yaml(yaml).expect("policy parses");
-        // (1) `compile_rules` drops the `agent.kind` rule, so it is absent from
-        // the compiled set — the precise condition `explain`'s new gate detects.
+        // Sanity: `compile_rules` drops the `agent.kind` rule (the gate's trigger).
         let compiled = compile_rules(&policy.custom_rules);
         assert!(
             !compiled.iter().any(|r| r.id == "agent-kind-only"),
             "compile_rules must drop the agent.kind rule (unsupported predicate)"
         );
-        // (2) Given that absence, `explain` returns `emit_invalid_rule`, the SAME
-        // rejection `test` uses — a non-zero exit, never a render of the raw entry.
-        let code = emit_invalid_rule("explain", "agent-kind-only", true);
+        // The REAL explain body: it must reject (non-zero), matching `test`, rather
+        // than render a rule the engine would never run.
+        let code = explain_policy(&policy, "agent-kind-only", false);
         assert_ne!(
             code, 0,
-            "explain must reject an engine-dropped rule non-zero, matching `test`"
+            "explain (real path) must reject an engine-dropped rule non-zero, matching `test`"
+        );
+    }
+
+    // F2 (positive half): a VALID rule must explain successfully through the real
+    // `explain_policy` path — exit 0. Pairs with the rejection test so both arms of
+    // the compile gate (drop → non-zero; keep → zero) are covered end-to-end via
+    // the actual command body, not a parallel reimplementation.
+    #[test]
+    fn explain_valid_rule_via_real_path_exits_zero() {
+        let yaml = "custom_rules:\n  - id: ok-rule\n    when:\n      command.uses_sudo: true\n    title: \"a valid command rule\"\n    context: [exec]\n";
+        let policy = Policy::try_parse_yaml(yaml).expect("policy parses");
+        assert_eq!(
+            explain_policy(&policy, "ok-rule", false),
+            0,
+            "a valid rule must explain successfully (exit 0) through the real path"
+        );
+    }
+
+    // F2: a not-found id and a duplicate id must also be handled by the real
+    // `explain_policy` body — exit 1 in both cases — so the not-found / ambiguity
+    // gates are covered through the actual command path too, not just the
+    // compile-gate arm.
+    #[test]
+    fn explain_unknown_and_duplicate_ids_via_real_path_exit_one() {
+        let single = "custom_rules:\n  - id: only-rule\n    when:\n      command.uses_sudo: true\n    title: \"t\"\n    context: [exec]\n";
+        let policy = Policy::try_parse_yaml(single).expect("policy parses");
+        assert_eq!(
+            explain_policy(&policy, "no-such-rule", false),
+            1,
+            "an unknown rule id must exit 1 through the real explain path"
+        );
+
+        let dup = "custom_rules:\n  - id: dup\n    when:\n      url.scheme: http\n    title: \"a\"\n    context: [exec]\n  - id: dup\n    when:\n      url.scheme: https\n    title: \"b\"\n    context: [exec]\n";
+        let dup_policy = Policy::try_parse_yaml(dup).expect("policy parses");
+        assert_eq!(
+            explain_policy(&dup_policy, "dup", false),
+            1,
+            "a duplicate rule id must exit 1 (ambiguous) through the real explain path"
         );
     }
 
@@ -975,15 +1040,16 @@ mod tests {
 
         // The COMPILED rule — exactly what `explain` now renders from — is clamped
         // by `compile_rules` to the satisfiable intersection, i.e. file only.
+        // Build the reported list the SAME way `explain` does: pass the compiled
+        // contexts through `ordered_eval_contexts` (F1), then map each name.
         let compiled = compile_rules(&policy.custom_rules);
         let compiled_rule = compiled
             .iter()
             .find(|r| r.id == "file-rule-broad-decl")
             .expect("compile_rules must keep the file rule (it has a satisfiable context)");
-        let runtime_contexts: Vec<&'static str> = compiled_rule
-            .contexts
-            .iter()
-            .map(|c| scan_context_name(*c))
+        let runtime_contexts: Vec<&'static str> = ordered_eval_contexts(&compiled_rule.contexts)
+            .into_iter()
+            .map(scan_context_name)
             .collect();
 
         assert_eq!(
@@ -1003,6 +1069,55 @@ mod tests {
             !runtime_contexts.contains(&"exec"),
             "exec was declared but is not satisfiable for file.path_matches, so explain must \
              not advertise it"
+        );
+    }
+
+    // CodeRabbit M13 PR #132 round-22 F1: `explain` must render runtime contexts
+    // in the SAME deterministic exec→paste→file order `rule test` uses (via
+    // `ordered_eval_contexts`), not in whatever order the compiled set carries.
+    // A REGEX rule is the observable case: `compile_rules` stores its DECLARED
+    // contexts verbatim (DSL rules are already normalized to exec→paste→file by
+    // `ContextSet::to_contexts`). So a regex rule declared `context: [file, exec]`
+    // compiles to `[file, exec]` — and the pre-F1 `explain` would echo that
+    // reversed order, disagreeing with `rule test`. This pins that `explain` now
+    // normalizes it to `[exec, file]`.
+    #[test]
+    fn explain_orders_contexts_exec_before_file() {
+        let yaml = "custom_rules:\n  - id: regex-reversed-ctx\n    pattern: 'curl'\n    title: \"regex rule declared file then exec\"\n    context: [file, exec]\n";
+        let policy = Policy::try_parse_yaml(yaml).expect("policy parses");
+
+        // The compiled regex rule carries the declared order verbatim (file, exec)
+        // — proving the reorder is observable, not a no-op.
+        let compiled = compile_rules(&policy.custom_rules);
+        let compiled_rule = compiled
+            .iter()
+            .find(|r| r.id == "regex-reversed-ctx")
+            .expect("compile_rules must keep the regex rule");
+        assert_eq!(
+            compiled_rule.contexts,
+            vec![ScanContext::FileScan, ScanContext::Exec],
+            "the compiled regex rule must carry the declared (reversed) order, so the F1 \
+             reorder in explain is observable"
+        );
+
+        // What `explain` renders (the exact production transform): the contexts run
+        // through `ordered_eval_contexts` first → exec BEFORE file.
+        let reported: Vec<&'static str> = ordered_eval_contexts(&compiled_rule.contexts)
+            .into_iter()
+            .map(scan_context_name)
+            .collect();
+        assert_eq!(
+            reported,
+            vec!["exec", "file"],
+            "explain must normalize to exec→file order (matching `rule test`), not echo the \
+             declared [file, exec]"
+        );
+
+        // And it must explain successfully through the real path (exit 0).
+        assert_eq!(
+            explain_policy(&policy, "regex-reversed-ctx", false),
+            0,
+            "a valid regex rule with reversed declared contexts must still explain (exit 0)"
         );
     }
 }

@@ -367,6 +367,14 @@ fn detect_ci(root: &Path) -> bool {
         Err(_) => return false,
     };
     entries.flatten().any(|entry| {
+        // Only a REGULAR FILE counts as a workflow — a DIRECTORY whose name ends
+        // in `.yml`/`.yaml` (e.g. a dir literally named `pipeline.yaml`) is not a
+        // CI pipeline and must not flip detection (CodeRabbit M13 PR #132
+        // round-22). `file_type()` avoids an extra `stat` and, like the rest of
+        // this function, treats any IO error conservatively as non-CI.
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            return false;
+        }
         entry
             .path()
             .extension()
@@ -1082,6 +1090,47 @@ mod tests {
         assert!(
             found.iter().any(|f| f == ".github/copilot-instructions.md"),
             ".github/copilot-instructions.md must be detected, got: {found:?}"
+        );
+    }
+
+    /// CodeRabbit M13 PR #132 round-22 F3: `detect_ci` must count only REGULAR
+    /// FILES under `.github/workflows/` — a DIRECTORY whose name ends in
+    /// `.yml`/`.yaml` (e.g. a dir literally named `pipeline.yaml`) is NOT a CI
+    /// pipeline and must not flip detection. Cover both halves: a real `*.yml`
+    /// FILE → CI detected; a workflows dir containing ONLY a `*.yaml`-named
+    /// SUBDIRECTORY (no real workflow file) → CI NOT detected.
+    #[test]
+    fn detect_ci_requires_regular_file_not_directory() {
+        // Half 1: a real workflow FILE → CI detected.
+        let with_file = tempfile::tempdir().expect("tempdir");
+        let wf = with_file.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(wf.join("ci.yml"), "on: push\n").unwrap();
+        assert!(
+            detect_ci(with_file.path()),
+            "a real *.yml workflow FILE must be detected as CI"
+        );
+
+        // Half 2: the workflows dir holds ONLY a directory named like a workflow
+        // (`pipeline.yaml/`), no regular workflow file → NOT CI.
+        let dir_only = tempfile::tempdir().expect("tempdir");
+        let wf2 = dir_only.path().join(".github").join("workflows");
+        std::fs::create_dir_all(wf2.join("pipeline.yaml")).unwrap();
+        assert!(
+            !detect_ci(dir_only.path()),
+            "a DIRECTORY named *.yaml under workflows must NOT be counted as CI"
+        );
+    }
+
+    /// F3 (no-regression): a missing `.github/workflows/` directory still reads as
+    /// non-CI (the IO-error branch), so the file-type guard didn't change the
+    /// conservative no-workflows-dir behaviour.
+    #[test]
+    fn detect_ci_absent_workflows_dir_is_not_ci() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert!(
+            !detect_ci(empty.path()),
+            "no .github/workflows dir must read as non-CI"
         );
     }
 

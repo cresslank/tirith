@@ -39,7 +39,7 @@ custom_rules:
         - command.uses_sudo: true
         - command.has_pipeline_to: [bash, sh, python, python3, perl]
     severity: high
-    title: "sudo command piping remote content into an interpreter"
+    title: "sudo command piping into an interpreter"
     context: [exec]
 
   # 4. Install of a malicious npm package (package family, exec).

