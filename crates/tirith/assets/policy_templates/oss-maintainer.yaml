@@ -65,6 +65,7 @@ scan:
 # practice; `tirith agent policy init` scaffolds this block. A `deny`
 # match forces the verdict to Block and appends an
 # `agent_denied_by_policy` finding; `deny` beats any matching `allow`.
+# Note: the interactive `TIRITH=0` bypass currently skips `agent_rules`.
 # agent_rules:
 #   allow:
 #     - kind: human

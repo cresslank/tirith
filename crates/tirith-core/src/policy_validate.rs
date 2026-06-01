@@ -168,15 +168,22 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
             //     list would otherwise double-report — same discipline as the
             //     DSL coverage check and `rule validate`).
             let parsed = parse_declared_contexts(&rule.context);
-            if parsed.is_empty() && !has_invalid_context {
-                issues.push(PolicyIssue {
-                    level: IssueLevel::Error,
-                    message: format!(
-                        "custom_rules.{}: no valid contexts (regex rule needs at least one of: exec, paste, file)",
-                        rule.id
-                    ),
-                    field: Some(format!("custom_rules.{}.context", rule.id)),
-                });
+            if parsed.is_empty() {
+                if !has_invalid_context {
+                    issues.push(PolicyIssue {
+                        level: IssueLevel::Error,
+                        message: format!(
+                            "custom_rules.{}: no valid contexts (regex rule needs at least one of: exec, paste, file)",
+                            rule.id
+                        ),
+                        field: Some(format!("custom_rules.{}.context", rule.id)),
+                    });
+                }
+                // No runnable contexts ⇒ `compile_rules` drops this rule, so skip
+                // the pattern-length + regex checks below: they would emit a
+                // redundant error for a rule that can never run. Mirrors
+                // `compile_rules` (and the round-28 overlong-pattern short-circuit).
+                continue;
             }
             // (2) Pattern length cap. Measure in CHARACTERS, not UTF-8 BYTES, to
             //     mirror `compile_rules` / `check_regex` (CodeRabbit M13
@@ -1106,6 +1113,42 @@ custom_rules:
             issue.unwrap().field.as_deref(),
             Some("custom_rules.regex-empty-ctx.context"),
             "field must point at the rule's context: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_empty_context_regex_rule_short_circuits_regex_validation() {
+        // CodeRabbit M13 (post-finalization): a regex rule with no runnable
+        // contexts is DROPPED by `compile_rules`, so `policy validate` must NOT
+        // also emit an "invalid regex" error for it — the empty-context check
+        // short-circuits before the pattern-length + regex-compile checks. The
+        // pattern below is a deliberately INVALID regex AND the context is empty;
+        // validate must report ONLY the "no valid contexts" error, not a
+        // redundant regex error for a rule that can never run.
+        let yaml = r#"
+custom_rules:
+  - id: empty-ctx-bad-regex
+    pattern: "("
+    title: "Test rule"
+    context: []
+"#;
+        let issues = validate(yaml);
+        let ours: Vec<_> = issues
+            .iter()
+            .filter(|i| i.message.contains("empty-ctx-bad-regex"))
+            .collect();
+        assert!(
+            ours.iter().any(|i| i.message.contains("no valid contexts")),
+            "must report the no-valid-contexts error: {issues:?}"
+        );
+        assert!(
+            !ours.iter().any(|i| i.message.contains("invalid regex")),
+            "must NOT also emit an invalid-regex error for a dropped no-context rule: {issues:?}"
+        );
+        assert_eq!(
+            ours.len(),
+            1,
+            "exactly one issue (no valid contexts), not a redundant regex error: {issues:?}"
         );
     }
 
