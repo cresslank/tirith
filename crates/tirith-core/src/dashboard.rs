@@ -1446,9 +1446,21 @@ mod tests {
             "numeric fields must be None when the policy did not load: {summary:?}"
         );
         let err = summary.error.unwrap();
+        // On Unix, opening a directory succeeds and the fstat-based regular-file
+        // check produces the "not a regular file" message. On Windows, `File::open`
+        // on a directory fails at open time with an OS error — also fail-closed,
+        // just a different message. The cross-platform fail-closed contract (error
+        // state, no benign defaults, path reported) is asserted above; only the
+        // exact non-regular message is Unix-specific.
+        #[cfg(unix)]
         assert!(
             err.contains("not a regular file"),
             "the error should explain the non-regular rejection; got {err:?}"
+        );
+        #[cfg(not(unix))]
+        assert!(
+            !err.is_empty(),
+            "the non-regular path must surface a non-empty fail-closed error; got {err:?}"
         );
         assert!(
             summary.path.is_some(),

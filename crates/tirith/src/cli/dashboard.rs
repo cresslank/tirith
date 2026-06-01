@@ -220,7 +220,8 @@ fn percent_decode(s: &str) -> String {
 /// materializes hooks).
 fn build_snapshot() -> DashboardSnapshot {
     let detected_shell = crate::cli::init::detect_shell().to_string();
-    let (_profile, hook_installed) = crate::cli::doctor::check_shell_profile(&detected_shell);
+    let (_profile, hook_installed) =
+        crate::cli::doctor::check_shell_profile(&detected_shell, "tirith: dashboard:");
     let hook = HookSummary {
         shell: detected_shell,
         installed: hook_installed,

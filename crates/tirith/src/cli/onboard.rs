@@ -462,7 +462,8 @@ fn detect_mcp_configs(root: &Path) -> Vec<String> {
 /// and whether a policy is discoverable from `cwd` (reusing the engine's local
 /// discovery). Never materializes hooks.
 fn detect_tirith_state(cwd: &Path, detected_shell: &str) -> TirithState {
-    let (_profile, hook_installed) = crate::cli::doctor::check_shell_profile(detected_shell);
+    let (_profile, hook_installed) =
+        crate::cli::doctor::check_shell_profile(detected_shell, "tirith: onboard:");
     let cwd_str = cwd.display().to_string();
     let policy_path = tirith_core::policy::discover_local_policy_path(Some(&cwd_str));
     TirithState {

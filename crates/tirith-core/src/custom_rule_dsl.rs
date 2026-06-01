@@ -702,13 +702,36 @@ pub fn satisfiable_contexts(clause: &WhenClause) -> ContextSet {
             }
         }
 
-        // `command.*` is evaluable in Exec OR Paste. `build_dsl_backing`
-        // populates `pipeline_targets`, `uses_sudo`, AND `cwd` for EVERY
-        // non-`FileScan` context (CodeRabbit M13 round-3 R3-1); FileScan never
-        // extracts command facts.
-        WhenClause::CommandHasPipelineTo(_)
-        | WhenClause::CommandUsesSudo(_)
-        | WhenClause::CommandCwdIn(_) => ContextSet::from_contexts(&[Exec, Paste]),
+        // `command.has_pipeline_to` / `command.cwd_in` carry a LIST. An EMPTY
+        // list can never match (`evaluate` does `any(|t| wanted.contains(t))` /
+        // `paths.iter().any(..)` over an empty set, which is always `false`), so
+        // advertising {Exec, Paste} for an empty list would mislabel a dead rule
+        // as runnable — it would pass context resolution / `policy validate` yet
+        // never fire. An empty list therefore yields the EMPTY set, which
+        // `resolve_runtime_contexts` clamps to empty and `compile_rules` /
+        // `policy validate` / `rule validate` then reject as unsatisfiable
+        // (CodeRabbit M13 round-24 custom_rule_dsl.rs:709-712). A NON-empty list
+        // is evaluable in Exec OR Paste: `build_dsl_backing` populates
+        // `pipeline_targets` / `cwd` for EVERY non-`FileScan` context (round-3
+        // R3-1); FileScan never extracts command facts.
+        WhenClause::CommandHasPipelineTo(patterns) => {
+            if patterns.is_empty() {
+                ContextSet::EMPTY
+            } else {
+                ContextSet::from_contexts(&[Exec, Paste])
+            }
+        }
+        WhenClause::CommandCwdIn(paths) => {
+            if paths.is_empty() {
+                ContextSet::EMPTY
+            } else {
+                ContextSet::from_contexts(&[Exec, Paste])
+            }
+        }
+        // `command.uses_sudo` carries a BOOL, not a list — BOTH `true` and
+        // `false` are matchable against `ctx.uses_sudo`, so it is always
+        // satisfiable in Exec OR Paste (no empty-collection case to clamp).
+        WhenClause::CommandUsesSudo(_) => ContextSet::from_contexts(&[Exec, Paste]),
 
         // `url.*` is evaluable in Exec OR Paste (URLs are extracted in both).
         WhenClause::UrlHost(_)
@@ -1326,6 +1349,84 @@ any:
         assert!(sat.intersects_declared(&[ScanContext::Exec]));
         assert!(sat.intersects_declared(&[ScanContext::Paste]));
         assert!(!sat.intersects_declared(&[ScanContext::FileScan]));
+    }
+
+    #[test]
+    fn test_satisfiable_empty_list_command_predicate_is_unsatisfiable() {
+        // CodeRabbit M13 round-24 custom_rule_dsl.rs:709-712: a `command.*`
+        // predicate whose LIST is empty can never match (`evaluate` runs
+        // `any(..)` over an empty set, always `false`), so it must NOT advertise
+        // {Exec, Paste} — that would mislabel a dead rule as runnable and let it
+        // pass context resolution / `policy validate`. An empty list yields the
+        // EMPTY satisfiable set so the rule is treated as non-runnable / invalid.
+        for clause in [
+            WhenClause::CommandHasPipelineTo(vec![]),
+            WhenClause::CommandCwdIn(vec![]),
+        ] {
+            let sat = satisfiable_contexts(&clause);
+            assert!(
+                sat.is_empty(),
+                "an empty-list command predicate must be unsatisfiable (EMPTY set), got {sat:?} for {clause:?}"
+            );
+            // No declared context can rescue it — it is dead everywhere.
+            assert!(
+                !sat.intersects_declared(&[
+                    ScanContext::Exec,
+                    ScanContext::Paste,
+                    ScanContext::FileScan,
+                ]),
+                "empty-list command predicate must not intersect any declared context: {clause:?}"
+            );
+            // The satisfiability verdict agrees with `evaluate`: a fully-populated
+            // command context still never matches an empty-list predicate.
+            let mut ctx = DslEvalContext {
+                uses_sudo: true,
+                cwd: Some("/home/user/repo"),
+                ..Default::default()
+            };
+            ctx.pipeline_targets.insert("bash".to_string());
+            assert!(
+                !evaluate(&clause, &ctx),
+                "empty-list command predicate must never fire, even on a populated ctx: {clause:?}"
+            );
+            // And `resolve_runtime_contexts` clamps it to empty under the default
+            // [exec, paste] declaration — exactly what makes `compile_rules` drop
+            // it and both validators reject it.
+            assert!(
+                resolve_runtime_contexts(&[ScanContext::Exec, ScanContext::Paste], &clause)
+                    .is_empty(),
+                "empty-list command predicate under default [exec, paste] must resolve empty: {clause:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_satisfiable_nonempty_list_command_predicate_is_exec_or_paste() {
+        // Companion to the empty-list check: a NON-empty `command.has_pipeline_to`
+        // / `command.cwd_in` list is still evaluable in Exec OR Paste (and never
+        // FileScan), unchanged by the round-24 empty-list clamp.
+        for clause in [
+            WhenClause::CommandHasPipelineTo(vec!["bash".to_string()]),
+            WhenClause::CommandCwdIn(vec!["/home/user/repo".to_string()]),
+        ] {
+            let sat = satisfiable_contexts(&clause);
+            assert!(
+                !sat.is_empty(),
+                "a non-empty-list command predicate must be satisfiable: {clause:?}"
+            );
+            assert!(
+                sat.intersects_declared(&[ScanContext::Exec]),
+                "non-empty-list command predicate must be evaluable in exec: {clause:?}"
+            );
+            assert!(
+                sat.intersects_declared(&[ScanContext::Paste]),
+                "non-empty-list command predicate must be evaluable in paste: {clause:?}"
+            );
+            assert!(
+                !sat.intersects_declared(&[ScanContext::FileScan]),
+                "non-empty-list command predicate must NOT be evaluable in file: {clause:?}"
+            );
+        }
     }
 
     #[test]

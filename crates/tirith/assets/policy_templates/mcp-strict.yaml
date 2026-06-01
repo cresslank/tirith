@@ -11,9 +11,11 @@ fail_mode: closed
 # definitions and arguments, so detection is turned up.
 paranoia: 3
 
-# A human may bypass interactively; a tool / agent running non-interactively
-# must never be able to set TIRITH=0 to skip analysis.
-allow_bypass_env: true
+# Disable the `TIRITH=0` bypass entirely — interactive AND non-interactive.
+# A locked-down MCP profile is opting into hardened defaults, so neither a
+# human at a TTY nor a non-interactive tool/agent may skip analysis. Set
+# `allow_bypass_env: true` yourself if you want a local human escape hatch.
+allow_bypass_env: false
 allow_bypass_env_noninteractive: false
 
 # Require explicit acknowledgement for warn findings.

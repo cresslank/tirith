@@ -78,7 +78,7 @@ fn ordered_eval_contexts(contexts: &[ScanContext]) -> Vec<ScanContext> {
 /// `.tirith/policy.yaml` surfaces a parse error, not a misleading "no rule
 /// named …" (R10).
 pub fn test(rule_id: &str, input: &str, shell: &str, json: bool) -> i32 {
-    let (policy, _source) = match load_policy("test", None) {
+    let (policy, _source) = match load_policy_strict("test", None) {
         Ok(pair) => pair,
         Err(code) => return code,
     };
@@ -200,9 +200,38 @@ pub fn test(rule_id: &str, input: &str, shell: &str, json: bool) -> i32 {
 /// offending rule id + reason). Cross-references `tirith policy validate` for
 /// whole-file checks.
 pub fn validate(path: Option<&str>, json: bool) -> i32 {
-    let (policy, source) = match load_policy("validate", path) {
+    // Load the RAW YAML — NOT a strict-parsed Policy. The strict loader runs
+    // the pattern-XOR-when shape gate (`Policy::try_parse_yaml`) which fails the
+    // whole parse on the first both/neither rule, short-circuiting the very
+    // per-rule validator below that is meant to report that rule-level problem
+    // (with the rule id, continuing to check the rest). CodeRabbit M13 PR #132
+    // round-24.
+    let (yaml, source) = match load_policy_raw("validate", path) {
         Ok(pair) => pair,
         Err(code) => return code,
+    };
+
+    // Structural parse WITHOUT the shape gate, so a both/neither rule reaches
+    // the per-rule `validate_shape()` check below instead of dying here.
+    // Truly-malformed YAML still fails — `validate` then surfaces a parse-level
+    // error and exits non-zero rather than silently passing unparseable input.
+    let policy = match parse_policy_lenient(&yaml) {
+        Ok(p) => p,
+        Err(e) => {
+            if json {
+                let v = serde_json::json!({
+                    "source": source,
+                    "valid": false,
+                    "error": e,
+                });
+                if !write_json_stdout(&v, "tirith rule validate: failed to write JSON output") {
+                    return 2;
+                }
+                return 1;
+            }
+            eprintln!("tirith rule validate: {source}: {e}");
+            return 1;
+        }
     };
 
     let mut errors: Vec<RuleError> = Vec::new();
@@ -402,7 +431,7 @@ pub fn explain(rule_id: &str, json: bool) -> i32 {
     // (non-zero exit) instead of warn-defaulting to an empty policy that would
     // misreport every rule as "no custom rule named …" (CodeRabbit M13 round-2
     // R10).
-    let (policy, _source) = match load_policy("explain", None) {
+    let (policy, _source) = match load_policy_strict("explain", None) {
         Ok(pair) => pair,
         Err(code) => return code,
     };
@@ -530,56 +559,110 @@ struct RuleError {
     message: String,
 }
 
-/// Load the policy STRICTLY for a `rule` subcommand: from `--path` (read the
-/// file directly) or the discovered local policy. Returns `(policy,
-/// source-label)`, or `Err(exit_code)` after printing a config-load error.
+/// Resolve a `rule` subcommand's policy SOURCE: from `--path` (the file
+/// itself) or the discovered local policy. Returns `(raw-yaml, source-label)`,
+/// or `Err(exit_code)` after printing a file-read error. No YAML/shape parsing
+/// happens here — that is the caller's choice (strict vs lenient), so the two
+/// load helpers below can share one I/O path.
 ///
-/// Unlike [`Policy::discover`] (which warn-defaults a broken local policy to a
-/// fail-closed empty policy — hiding the parse error behind a misleading "no
-/// custom rule" / empty result), this surfaces a parse error as a non-zero
-/// exit with the YAML location. `cmd` names the subcommand for the message
-/// (`test` / `validate` / `explain`). (CodeRabbit M13 round-2 R10.)
-fn load_policy(cmd: &str, path: Option<&str>) -> Result<(Policy, String), i32> {
+/// A missing policy file is NOT an error: it yields an empty document
+/// (`String::new()`) labeled `<no policy file>`, which both parsers treat as
+/// the zero-custom-rule default (matches the shipping/no-policy case).
+fn read_policy_source(cmd: &str, path: Option<&str>) -> Result<(String, String), i32> {
     if let Some(p) = path {
-        let yaml = match std::fs::read_to_string(p) {
-            Ok(s) => s,
+        match std::fs::read_to_string(p) {
+            Ok(s) => Ok((s, p.to_string())),
             Err(e) => {
                 eprintln!("tirith rule {cmd}: cannot read {p}: {e}");
-                return Err(1);
-            }
-        };
-        // try_parse_yaml surfaces a parse error rather than warn-and-defaulting,
-        // so a malformed `when:` is reported as exit 1 with the YAML location.
-        match Policy::try_parse_yaml(&yaml) {
-            Ok(policy) => Ok((policy, p.to_string())),
-            Err(e) => {
-                eprintln!("tirith rule {cmd}: {p}: {e}");
                 Err(1)
             }
         }
     } else {
         match tirith_core::policy::discover_local_policy_path(None) {
-            Some(found) => {
-                let yaml = match std::fs::read_to_string(&found) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("tirith rule {cmd}: cannot read {}: {e}", found.display());
-                        return Err(1);
-                    }
-                };
-                match Policy::try_parse_yaml(&yaml) {
-                    Ok(policy) => Ok((policy, found.display().to_string())),
-                    Err(e) => {
-                        eprintln!("tirith rule {cmd}: {}: {e}", found.display());
-                        Err(1)
-                    }
+            Some(found) => match std::fs::read_to_string(&found) {
+                Ok(s) => Ok((s, found.display().to_string())),
+                Err(e) => {
+                    eprintln!("tirith rule {cmd}: cannot read {}: {e}", found.display());
+                    Err(1)
                 }
-            }
-            // No policy file at all — the default policy has zero custom rules,
-            // which is trivially valid (matches the shipping/no-policy case).
-            None => Ok((Policy::default(), "<no policy file>".to_string())),
+            },
+            None => Ok((String::new(), "<no policy file>".to_string())),
         }
     }
+}
+
+/// Load the policy STRICTLY for `test`/`explain`: read the source, then run the
+/// full [`Policy::try_parse_yaml`] (migrate → deserialize → enforce the
+/// pattern-XOR-when shape gate). Returns `(policy, source-label)`, or
+/// `Err(exit_code)` after printing a config-load error.
+///
+/// Unlike [`Policy::discover`] (which warn-defaults a broken local policy to a
+/// fail-closed empty policy — hiding the parse error behind a misleading "no
+/// custom rule" / empty result), this surfaces a parse error as a non-zero
+/// exit with the YAML location. `cmd` names the subcommand for the message
+/// (`test` / `explain`). (CodeRabbit M13 round-2 R10.)
+///
+/// `validate` does NOT use this: it must reach its own per-rule validator even
+/// for the rule-level problems (e.g. both `pattern:` and `when:`) the strict
+/// shape gate would reject up front, so it loads via [`load_policy_raw`]
+/// instead (CodeRabbit M13 PR #132 round-24).
+fn load_policy_strict(cmd: &str, path: Option<&str>) -> Result<(Policy, String), i32> {
+    let (yaml, source) = read_policy_source(cmd, path)?;
+    // An empty document (no policy file) is the zero-custom-rule default.
+    if yaml.is_empty() {
+        return Ok((Policy::default(), source));
+    }
+    // try_parse_yaml surfaces a parse error rather than warn-and-defaulting,
+    // so a malformed `when:` is reported as exit 1 with the YAML location.
+    match Policy::try_parse_yaml(&yaml) {
+        Ok(policy) => Ok((policy, source)),
+        Err(e) => {
+            eprintln!("tirith rule {cmd}: {source}: {e}");
+            Err(1)
+        }
+    }
+}
+
+/// Load the policy LENIENTLY for `validate`: read the source and return the raw
+/// YAML text + source label, deferring all parsing to the per-rule validator.
+/// Returns `Err(exit_code)` only on a file-READ failure — never on YAML/shape
+/// content (that is `validate`'s job to report per-rule).
+///
+/// Why `validate` cannot use the strict loader: [`Policy::try_parse_yaml`]
+/// enforces the pattern-XOR-when shape gate for every rule and fails the WHOLE
+/// parse on the first offender (policy.rs). That is exactly the RULE-LEVEL
+/// problem [`validate`]'s friendly per-rule validator is meant to report (with
+/// the offending rule id, and continuing to check the rest). Strict-parsing
+/// first would short-circuit that with a generic deserialize error, so
+/// `validate` never reached its own validator. Returning the raw YAML lets
+/// `validate` do its OWN structural parse (without the shape gate) and run the
+/// per-rule loop. (CodeRabbit M13 PR #132 round-24.)
+fn load_policy_raw(cmd: &str, path: Option<&str>) -> Result<(String, String), i32> {
+    read_policy_source(cmd, path)
+}
+
+/// Structurally parse policy YAML for `validate` WITHOUT the strict
+/// pattern-XOR-when shape gate — the migrate-then-deserialize half of
+/// [`Policy::try_parse_yaml`], minus its per-rule `validate_shape` enforcement.
+///
+/// Dropping the shape gate is the whole point: a rule carrying BOTH `pattern:`
+/// and `when:` (or neither) still deserializes structurally, so [`validate`]'s
+/// own per-rule loop (`rule.validate_shape()`) can report it with the rule id
+/// instead of a generic up-front parse error. Truly-malformed YAML (or a
+/// schema-migration failure) still returns `Err`, so `validate` surfaces a
+/// parse-level error and exits non-zero rather than silently passing
+/// unparseable input. (CodeRabbit M13 PR #132 round-24.)
+///
+/// An empty document (no policy file) parses to the default zero-rule policy.
+fn parse_policy_lenient(yaml: &str) -> Result<Policy, String> {
+    if yaml.is_empty() {
+        return Ok(Policy::default());
+    }
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(yaml).map_err(|e| format!("yaml parse error: {e}"))?;
+    tirith_core::policy_migrations::migrate_forward(&mut value)
+        .map_err(|e| format!("migration error: {e}"))?;
+    serde_yaml::from_value::<Policy>(value).map_err(|e| format!("deserialize error: {e}"))
 }
 
 fn emit_not_found(cmd: &str, rule_id: &str, policy: &Policy, json: bool) -> i32 {
@@ -886,6 +969,81 @@ mod tests {
                     && i.message.contains(rule_id)
                     && i.message.contains("not covered by declared context")
             })
+    }
+
+    // CodeRabbit M13 PR #132 round-24: `rule validate` must load LENIENTLY so a
+    // RULE-LEVEL problem (here: a rule carrying BOTH `pattern:` and `when:`) is
+    // reported by its OWN per-rule validator — with the rule id, exit 1 — not by
+    // a generic up-front strict-parse error. Before the fix `load_policy` always
+    // ran `Policy::try_parse_yaml`, whose pattern-XOR-when shape gate failed the
+    // whole parse on the first offender, so `validate` never reached its per-rule
+    // loop. Meanwhile `test`/`explain` (which DO need a fully-parsed Policy) keep
+    // the strict loader and must still reject the same policy up front.
+    #[test]
+    fn validate_both_pattern_and_when_reaches_per_rule_validator_not_strict_parse() {
+        let yaml = "custom_rules:\n  - id: both\n    pattern: \"foo\"\n    when:\n      command.uses_sudo: true\n    title: \"has both pattern and when\"\n    context: [exec]\n";
+
+        // The STRICT path that `test`/`explain` use rejects this up front (its
+        // shape gate fires), so those commands still fail as before.
+        assert!(
+            Policy::try_parse_yaml(yaml).is_err(),
+            "strict parse (test/explain) must still reject a both-pattern-and-when rule up front"
+        );
+
+        // The LENIENT path that `validate` now uses parses it STRUCTURALLY — the
+        // shape gate is gone, so the per-rule validator can see the rule.
+        let policy = parse_policy_lenient(yaml)
+            .expect("lenient parse must SUCCEED on a both/neither rule so validate can report it");
+        let rule = policy
+            .custom_rules
+            .iter()
+            .find(|r| r.id == "both")
+            .expect("the both/neither rule survives the lenient (gate-free) parse");
+        // And `validate`'s per-rule check produces a HELPFUL rule-level message
+        // (the exact `validate_shape` diagnostic), not a generic deserialize error.
+        let shape_err = rule
+            .validate_shape()
+            .expect_err("validate_shape must flag the both-pattern-and-when rule");
+        assert!(
+            shape_err.to_string().contains("exactly one of"),
+            "the per-rule validator must give the friendly shape message, got: {shape_err}"
+        );
+
+        // End-to-end through the REAL `validate` command: exit 1 (the offending
+        // rule is reported), and crucially NOT exit 0 (it must not silently pass).
+        assert_eq!(
+            rule_validate_exit(yaml),
+            1,
+            "rule validate must exit 1 on the both/neither rule, via its per-rule validator"
+        );
+        // `policy validate` must AGREE — it reports the same shape problem.
+        assert!(
+            tirith_core::policy_validate::validate(yaml)
+                .iter()
+                .any(|i| {
+                    matches!(i.level, tirith_core::policy_validate::IssueLevel::Error)
+                        && i.message.contains("both")
+                }),
+            "policy validate must AGREE: it reports the both-pattern-and-when rule as an error"
+        );
+    }
+
+    // round-24 companion: truly-malformed YAML must STILL make `validate` exit
+    // non-zero — lenient loading defers the shape gate, it does NOT swallow
+    // unparseable input. `parse_policy_lenient` returns Err, and the command
+    // surfaces a parse-level error (exit 1) rather than silently passing.
+    #[test]
+    fn validate_truly_malformed_yaml_still_exits_nonzero() {
+        let malformed = "custom_rules: [this is not valid yaml\n";
+        assert!(
+            parse_policy_lenient(malformed).is_err(),
+            "lenient parse must still FAIL on structurally-broken YAML"
+        );
+        assert_eq!(
+            rule_validate_exit(malformed),
+            1,
+            "rule validate must exit non-zero on truly-malformed YAML (no silent pass)"
+        );
     }
 
     #[test]

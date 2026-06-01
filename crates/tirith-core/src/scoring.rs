@@ -983,4 +983,36 @@ mod tests {
         assert!(!is_threat_intel_rule(RuleId::PolicyBlocklisted));
         assert!(!is_threat_intel_rule(RuleId::NonAsciiHostname));
     }
+
+    #[test]
+    fn ai_config_drift_rules_are_not_threat_intel() {
+        // CodeRabbit M13 round-24 scoring.rs:402-406: the M13 ch5 AI-config drift
+        // rules are a STRUCTURAL snapshot-vs-current diff of an AI-config file's
+        // hidden-content / tool-use directives, NOT a local threat-DB indicator
+        // match — so they must classify as NOT threat-intel (they live in the
+        // `=> false` arm of the exhaustive `is_threat_intel_rule` match). If a
+        // future refactor moved either variant into the threat-intel arm, the
+        // threat-intel corroboration factor would start firing off a structural
+        // drift signal; this test pins the classification.
+        assert!(
+            !is_threat_intel_rule(RuleId::AiConfigHiddenInstructionAdded),
+            "AiConfigHiddenInstructionAdded is structural drift, not threat-intel"
+        );
+        assert!(
+            !is_threat_intel_rule(RuleId::AiConfigToolUseEscalation),
+            "AiConfigToolUseEscalation is structural drift, not threat-intel"
+        );
+
+        // They are also NOT note-only annotations (those are the card/manifest/
+        // paste-source metadata rules): an AI-config drift IS an independent risk
+        // signal, so it must stay counted toward the additive score factors.
+        assert!(
+            !is_note_only_rule(RuleId::AiConfigHiddenInstructionAdded),
+            "AiConfigHiddenInstructionAdded is a substantive signal, not a note-only annotation"
+        );
+        assert!(
+            !is_note_only_rule(RuleId::AiConfigToolUseEscalation),
+            "AiConfigToolUseEscalation is a substantive signal, not a note-only annotation"
+        );
+    }
 }

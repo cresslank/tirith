@@ -7,8 +7,10 @@
 //!    `ai-agent-repo` profile) over the repo's AI-config files. Reuses
 //!    [`crate::cli::scan::run`] — no scan engine is duplicated here.
 //!  - `diff` — compare each current AI-config file to the last-known-safe
-//!    snapshot at `state_dir()/ai_config_snapshot.json` and report added /
-//!    removed instructions plus the M13 ch5 `AiConfig*` findings (produced by
+//!    snapshot (the per-repo file `snapshot_path()` resolves to:
+//!    `state_dir()/ai_config_snapshot-<hash>.json`, where `<hash>` disambiguates
+//!    repos) and report added / removed instructions plus the M13 ch5
+//!    `AiConfig*` findings (produced by
 //!    [`tirith_core::rules::aifile::diff_findings`]).
 //!  - `quarantine <file>` — **v1 default is COPY, not move**: copy the file to
 //!    `~/.cache/tirith/quarantine/<ts>-<sha256>-<basename>`, leaving the

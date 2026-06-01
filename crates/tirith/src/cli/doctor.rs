@@ -189,7 +189,7 @@ fn run_fix(yes: bool) -> i32 {
 /// Check whether shell hooks are configured in the user's profile.
 fn hooks_installed() -> bool {
     let shell = crate::cli::init::detect_shell().to_string();
-    let (_profile, configured) = check_shell_profile(&shell);
+    let (_profile, configured) = check_shell_profile(&shell, "tirith: doctor:");
     configured
 }
 
@@ -699,7 +699,7 @@ fn gather_info() -> DoctorInfo {
         })
         .unwrap_or(false);
 
-    let (shell_profile, hook_configured) = check_shell_profile(&detected_shell);
+    let (shell_profile, hook_configured) = check_shell_profile(&detected_shell, "tirith: doctor:");
 
     let bash_safe_mode = tirith_core::policy::state_dir()
         .map(|d| d.join("bash-safe-mode").exists())
@@ -2429,13 +2429,33 @@ fn print_human(info: &DoctorInfo) {
     }
 }
 
+/// Format the "could not read a shell profile" diagnostic. Kept as a pure,
+/// caller-neutral helper so the prefix is whatever the caller passed (e.g.
+/// `"tirith: doctor:"` or `"tirith: onboard:"`) rather than a hard-coded label,
+/// and so a unit test can assert the message wording without capturing stderr.
+fn unreadable_profile_msg(
+    command_label: &str,
+    profile: &std::path::Path,
+    err: &std::io::Error,
+) -> String {
+    format!(
+        "{command_label} cannot read profile {}: {err}",
+        profile.display()
+    )
+}
+
 /// Check if the user's shell profile contains tirith init configuration.
 /// Returns (profile_path, is_configured).
 ///
 /// `pub(crate)` so the read-only `tirith onboard` detector can reuse the exact
 /// same "is the shell hook wired into the profile?" check rather than
 /// reinventing profile discovery.
-pub(crate) fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
+///
+/// `command_label` is the log prefix the *caller* uses for its own diagnostics
+/// (e.g. `"tirith: doctor:"` or `"tirith: onboard:"`); the helper itself stays
+/// caller-neutral so the same code path can be reused outside `doctor` without
+/// surfacing a misleading "doctor:" prefix.
+pub(crate) fn check_shell_profile(shell: &str, command_label: &str) -> (Option<PathBuf>, bool) {
     let home = match home::home_dir() {
         Some(h) => h,
         None => return (None, false),
@@ -2502,10 +2522,7 @@ pub(crate) fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "tirith: doctor: cannot read profile {}: {e}",
-                        profile.display()
-                    );
+                    eprintln!("{}", unreadable_profile_msg(command_label, profile, &e));
                 }
             }
         }
@@ -2607,6 +2624,35 @@ mod tests {
 
     fn count_named(tools: &[DetectedTool], name: &str) -> usize {
         tools.iter().filter(|t| t.name == name).count()
+    }
+
+    // M13 PR #132 round-24 finding F2: `check_shell_profile` is shared by
+    // `doctor`, `onboard`, and `dashboard`, so its unreadable-profile diagnostic
+    // must use the *caller's* prefix rather than a hard-coded "doctor:" label.
+    #[test]
+    fn unreadable_profile_msg_uses_caller_label_not_hardcoded_doctor() {
+        let profile = PathBuf::from("/tmp/.zshrc");
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+
+        // Doctor's observable output is preserved: same prefix + wording.
+        let doctor_msg = unreadable_profile_msg("tirith: doctor:", &profile, &err);
+        assert_eq!(
+            doctor_msg,
+            "tirith: doctor: cannot read profile /tmp/.zshrc: denied"
+        );
+
+        // The onboard caller surfaces "onboard:", never the old "doctor:" label —
+        // proving the prefix is no longer hard-coded inside the helper.
+        let onboard_msg = unreadable_profile_msg("tirith: onboard:", &profile, &err);
+        assert!(
+            onboard_msg.starts_with("tirith: onboard:"),
+            "onboard label must drive the prefix, got: {onboard_msg}"
+        );
+        assert!(
+            !onboard_msg.contains("doctor:"),
+            "helper must not emit a hard-coded 'doctor:' prefix, got: {onboard_msg}"
+        );
+        assert!(onboard_msg.contains("cannot read profile /tmp/.zshrc: denied"));
     }
 
     #[test]
