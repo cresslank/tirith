@@ -3,8 +3,8 @@
 //! Detects the developer's environment (shell, IDE configs, AI-config files,
 //! package managers, lockfiles, CI, MCP configs, and tirith's own install
 //! state), prints a detection report, and RECOMMENDS one of the shipping policy
-//! templates (`individual` / `ci-strict` / `ai-agent-heavy`) plus a short list
-//! of next actions.
+//! templates (`individual` / `startup` / `ci-strict` / `ai-agent-heavy`) plus a
+//! short list of next actions.
 //!
 //! Detection is read-only and reuses the existing helpers — `init::detect_shell`
 //! for the shell, `init::find_hook_dir_readonly` + `doctor::check_shell_profile`
@@ -74,8 +74,9 @@ const ONBOARD_SCHEMA_VERSION: u32 = 1;
 /// Field naming and casing mirror the other `--json` surfaces (snake_case,
 /// `serde::Serialize` derive): see `doctor.rs`'s `DoctorInfo` / `incident.rs`'s
 /// `StatusOut`. `recommended_template` carries the canonical template NAME
-/// (`"individual"` / `"ci-strict"` / `"ai-agent-heavy"`) so a machine consumer
-/// can feed it straight back into `tirith policy init --template <name>`.
+/// (`"individual"` / `"startup"` / `"ci-strict"` / `"ai-agent-heavy"` — the set
+/// `recommend_template` can return, e.g. `"startup"` for `--team`) so a machine
+/// consumer can feed it straight back into `tirith policy init --template <name>`.
 #[derive(Debug, Clone, serde::Serialize)]
 struct OnboardReport {
     /// Schema version of this envelope (stable; bump on breaking changes).
