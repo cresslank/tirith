@@ -501,6 +501,7 @@ pub mod lab;
 pub mod last_trigger;
 pub mod license_cmd;
 pub mod logs;
+pub mod lsp;
 pub mod manpage;
 pub mod mcp;
 pub mod mcp_server;

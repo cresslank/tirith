@@ -1217,6 +1217,21 @@ Examples:
             conflicts_with = "compat"
         )]
         bundle: bool,
+
+        /// Fast status only (protection_mode, policy_path_used, hook_active);
+        /// skips DB/log/baseline probes. Read-only and safe to poll (the VS
+        /// Code extension polls `--quick --format json` ~every 30s). Compatible
+        /// with --format json / --json; mutually exclusive with the mutating
+        /// flags (--fix, --reset-bash-safe-mode) and the other report modes.
+        #[arg(
+            long,
+            conflicts_with = "fix",
+            conflicts_with = "reset_bash_safe_mode",
+            conflicts_with = "simulate_enter",
+            conflicts_with = "compat",
+            conflicts_with = "bundle"
+        )]
+        quick: bool,
     },
 
     /// Generate shell completions
@@ -1226,6 +1241,20 @@ Examples:
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+
+    /// Run tirith as an LSP server over stdio (for IDE extensions)
+    #[command(after_help = "\
+Runs a Language Server Protocol server over stdin/stdout so an editor extension
+can surface tirith diagnostics inline as you edit. The server analyzes each
+opened/changed document according to its file type (AI-config files like
+CLAUDE.md, install-doc markdown, source code, and .log files) and publishes
+diagnostics for the suspicious URLs, hidden instructions, trojan-source
+homoglyphs, and credentials it finds. It reads only the editor's in-memory text
+and never reaches the network.
+
+This command speaks the LSP wire protocol on stdio; run it from an editor's LSP
+client, not interactively.")]
+    Lsp,
 
     /// Generate man page
     #[command(hide = true)]
@@ -7048,6 +7077,7 @@ fn run() {
             simulate_enter,
             compat,
             bundle,
+            quick,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
             cli::doctor::run(
@@ -7058,10 +7088,13 @@ fn run() {
                 simulate_enter,
                 compat,
                 bundle,
+                quick,
             )
         }
 
         Commands::Completions { shell } => cli::completions::run(shell),
+
+        Commands::Lsp => cli::lsp::run(),
 
         Commands::Manpage => cli::manpage::run(),
 

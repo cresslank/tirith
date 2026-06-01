@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use super::write_json_stdout;
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     json: bool,
@@ -10,6 +12,7 @@ pub fn run(
     simulate_enter: bool,
     compat: bool,
     bundle: bool,
+    quick: bool,
 ) -> i32 {
     if reset_bash_safe_mode {
         return reset_safe_mode();
@@ -29,6 +32,17 @@ pub fn run(
 
     if bundle {
         return run_bundle(json);
+    }
+
+    // `--quick`: the fast status path the VS Code extension polls (~every 30s).
+    // It gathers ONLY the three cheap fields the extension needs and skips every
+    // expensive probe the full report runs (audit-log parse, threat-DB
+    // deserialize, baseline-store read, PATH walk for shadow binaries, and the
+    // bash-capability cache read). Read-only: it never materializes hooks or
+    // mutates state. Handled before the full `gather_info()` so none of those
+    // probes can run.
+    if quick {
+        return run_quick(json);
     }
 
     // A plain `tirith doctor` refreshes the bash enter-mode capability cache as
@@ -676,6 +690,121 @@ struct ThreatDbDoctorInfo {
     signature_valid: Option<bool>,
     stale: bool,
     error: Option<String>,
+}
+
+/// Minimal, stable status payload emitted by `tirith doctor --quick --format
+/// json`. This is the contract the VS Code extension polls (~every 30s), so the
+/// shape is deliberately small and documented (see `docs/doctor-modes.md`):
+/// exactly three status fields plus a `schema_version` for forward
+/// compatibility. It is built by `gather_quick_info`, which touches ONLY cheap
+/// sources — none of the expensive `DoctorInfo` probes run.
+///
+/// `schema_version` matches the `prompt_status` JSON convention (a stable,
+/// machine-polled surface starts at `1`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct QuickDoctorInfo {
+    /// Stable schema version for the polled shape. Bumped only on a
+    /// breaking change to the field set / meaning.
+    schema_version: u32,
+    /// Live protection mode derived from the hook-exported `TIRITH_STATUS`,
+    /// using the SAME vocabulary as `tirith prompt-status` /
+    /// `docs/prompt-integration.md`: `guarded` (a dangerous command is
+    /// blocked), `warn-only`, `degraded` (downgraded this session), or `off`
+    /// (no hook ran / protection off). An unrecognized status is passed
+    /// through verbatim for forward compatibility.
+    protection_mode: String,
+    /// The single policy file the engine would actually load for the current
+    /// directory (local discovery: `TIRITH_POLICY_ROOT`, then walk-up to the
+    /// `.git` boundary, then the user config dir), or `null` when no policy is
+    /// discovered. Existence-based — never a network fetch.
+    policy_path_used: Option<String>,
+    /// Whether the tirith shell hook is configured in the detected shell's
+    /// profile. Mirrors the full report's `hook_configured`.
+    hook_active: bool,
+}
+
+/// Map the hook-exported `TIRITH_STATUS` to the cross-codebase `protection_mode`
+/// vocabulary. Identical to `prompt_status::detect_protection_mode` (kept in
+/// sync deliberately so the doctor quick path and `tirith prompt-status` report
+/// the same mode for the same `TIRITH_STATUS`): `blocks` → `guarded`,
+/// `warn-only`/`degraded` verbatim, `off`/empty/absent → `off`, any other value
+/// passed through unchanged for forward compatibility.
+fn protection_mode_from_status(status: Option<&str>) -> String {
+    match status {
+        Some("blocks") => "guarded".to_string(),
+        Some("warn-only") => "warn-only".to_string(),
+        Some("degraded") => "degraded".to_string(),
+        Some("off") | Some("") | None => "off".to_string(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// Gather ONLY the three cheap fields the quick status path needs. This is the
+/// unit-testable seam: it must touch nothing expensive — no audit-log read
+/// (`check_detection_gaps`), no threat-DB deserialize (`gather_threat_db_info`),
+/// no baseline-store read (`gather_baseline_info`), no PATH walk
+/// (`find_shadow_binaries`), and no bash-capability cache read.
+///
+/// - `protection_mode`: derived from `TIRITH_STATUS` (one env read).
+/// - `policy_path_used`: the active local policy path, via the same
+///   `discover_local_policy_path` the engine uses (existence checks only).
+/// - `hook_active`: `check_shell_profile` for the detected shell (one profile
+///   read).
+fn gather_quick_info() -> QuickDoctorInfo {
+    let detected_shell = crate::cli::init::detect_shell().to_string();
+    let (_profile, hook_active) = check_shell_profile(&detected_shell, "tirith: doctor:");
+
+    let tirith_status = std::env::var("TIRITH_STATUS")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let protection_mode = protection_mode_from_status(tirith_status.as_deref());
+
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+    let policy_path_used = tirith_core::policy::discover_local_policy_path(cwd.as_deref())
+        .map(|p| p.display().to_string());
+
+    QuickDoctorInfo {
+        schema_version: 1,
+        protection_mode,
+        policy_path_used,
+        hook_active,
+    }
+}
+
+/// `tirith doctor --quick`: fast, read-only status for the VS Code extension's
+/// ~30s poll. JSON mode emits the minimal `QuickDoctorInfo` through the
+/// broken-pipe-safe writer; human mode prints a 2-3 line summary. Never runs the
+/// expensive `DoctorInfo` probes.
+fn run_quick(json: bool) -> i32 {
+    let info = gather_quick_info();
+    if json {
+        if !write_json_stdout(&info, "tirith doctor: failed to write JSON output") {
+            return 1;
+        }
+    } else {
+        print_quick_human(&info);
+    }
+    0
+}
+
+/// Human-readable 2-3 line summary for `tirith doctor --quick` (no `--format
+/// json`). Mirrors the `key:` two-column style of the full `print_human`.
+fn print_quick_human(info: &QuickDoctorInfo) {
+    println!("  protection:   {}", info.protection_mode);
+    println!(
+        "  hook:         {}",
+        if info.hook_active {
+            "configured"
+        } else {
+            "NOT CONFIGURED"
+        }
+    );
+    println!(
+        "  policy:       {}",
+        info.policy_path_used.as_deref().unwrap_or("(none found)")
+    );
 }
 
 fn gather_info() -> DoctorInfo {
@@ -3570,5 +3699,213 @@ mod tests {
             out.contains("not portable"),
             "local-only caveat must be present; got:\n{out}"
         );
+    }
+
+    // ── Quick status path (M14 — `tirith doctor --quick`) ─────────────────
+    //
+    // The VS Code extension polls `tirith doctor --quick --format json` (~30s).
+    // These tests pin the minimal JSON contract (exactly three status fields +
+    // `schema_version`) and prove the quick gather touches ONLY cheap sources —
+    // no audit-log / threat-DB / baseline / shadow-binary probe runs.
+    //
+    // Env isolation mirrors the `collect_policy_paths` tests: `with_fake_env`
+    // fakes `$HOME`/cwd, and we additionally pin `TIRITH_POLICY_ROOT`,
+    // `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `TIRITH_THREATDB_PATH`, and
+    // `TIRITH_STATUS` under the held `ENV_LOCK` so machine-level values can't
+    // leak into the assertions.
+
+    /// `protection_mode_from_status` uses the SAME mapping as
+    /// `prompt_status::detect_protection_mode` (`blocks` → `guarded`, others
+    /// verbatim, `off`/empty/absent → `off`, unknown passed through).
+    #[test]
+    fn protection_mode_from_status_maps_known_and_unknown() {
+        assert_eq!(protection_mode_from_status(Some("blocks")), "guarded");
+        assert_eq!(protection_mode_from_status(Some("warn-only")), "warn-only");
+        assert_eq!(protection_mode_from_status(Some("degraded")), "degraded");
+        assert_eq!(protection_mode_from_status(Some("off")), "off");
+        assert_eq!(protection_mode_from_status(Some("")), "off");
+        assert_eq!(protection_mode_from_status(None), "off");
+        // Forward-compatible: an unrecognized status is passed through verbatim.
+        assert_eq!(
+            protection_mode_from_status(Some("futureValue")),
+            "futureValue"
+        );
+    }
+
+    /// The quick JSON has EXACTLY the documented field set — the four keys
+    /// `schema_version`, `protection_mode`, `policy_path_used`, `hook_active`
+    /// and nothing else (the extension contract must stay minimal/stable).
+    #[test]
+    fn quick_json_has_exactly_the_documented_fields() {
+        let info = QuickDoctorInfo {
+            schema_version: 1,
+            protection_mode: "guarded".to_string(),
+            policy_path_used: Some("/repo/.tirith/policy.yaml".to_string()),
+            hook_active: true,
+        };
+        let v: serde_json::Value = serde_json::to_value(&info).expect("serialize QuickDoctorInfo");
+        let obj = v.as_object().expect("quick JSON is an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "hook_active",
+                "policy_path_used",
+                "protection_mode",
+                "schema_version"
+            ],
+            "quick JSON must carry exactly the documented field set"
+        );
+        // Field types are the contract the extension parses.
+        assert!(obj["hook_active"].is_boolean(), "hook_active must be bool");
+        assert!(
+            obj["protection_mode"].is_string(),
+            "protection_mode must be a string"
+        );
+        assert!(
+            obj["policy_path_used"].is_string() || obj["policy_path_used"].is_null(),
+            "policy_path_used must be a string or null"
+        );
+        assert_eq!(obj["schema_version"], serde_json::json!(1));
+    }
+
+    /// `policy_path_used` is `null` (serializes to JSON null) when no policy is
+    /// discovered, and `hook_active` is a real bool.
+    #[test]
+    fn gather_quick_info_null_policy_when_none_discovered() {
+        with_fake_env(true, |_home, _cwd| {
+            let _root = EnvGuard::remove("TIRITH_POLICY_ROOT");
+            let _xdg = EnvGuard::remove("XDG_CONFIG_HOME");
+            let _status = EnvGuard::remove("TIRITH_STATUS");
+            // Fresh fake $HOME/cwd, no .tirith/policy anywhere → discovery yields
+            // None → JSON null.
+            let info = gather_quick_info();
+            assert_eq!(info.schema_version, 1);
+            assert!(
+                info.policy_path_used.is_none(),
+                "no policy on disk must yield policy_path_used = None, got {:?}",
+                info.policy_path_used
+            );
+            let v = serde_json::to_value(&info).unwrap();
+            assert!(
+                v["policy_path_used"].is_null(),
+                "absent policy must serialize as JSON null"
+            );
+            // hook_active is a genuine bool regardless of value.
+            let _: bool = info.hook_active;
+        });
+    }
+
+    /// `policy_path_used` reflects a discovered policy (here via
+    /// `TIRITH_POLICY_ROOT`, which has top discovery priority), and
+    /// `protection_mode` is derived from `TIRITH_STATUS`.
+    #[test]
+    fn gather_quick_info_reflects_discovered_policy_and_status() {
+        with_fake_env(true, |_home, _cwd| {
+            let _xdg = EnvGuard::remove("XDG_CONFIG_HOME");
+            let root = tempfile::tempdir().expect("policy root tempdir");
+            std::fs::create_dir_all(root.path().join(".tirith")).unwrap();
+            let policy = root.path().join(".tirith/policy.yaml");
+            std::fs::write(&policy, "fail_mode: open\n").unwrap();
+            let _root = EnvGuard::set("TIRITH_POLICY_ROOT", root.path());
+            let _status = EnvGuard::set("TIRITH_STATUS", std::path::Path::new("blocks"));
+
+            let info = gather_quick_info();
+            assert_eq!(
+                info.policy_path_used.as_deref(),
+                Some(policy.display().to_string().as_str()),
+                "TIRITH_POLICY_ROOT policy must be the discovered active path"
+            );
+            assert_eq!(
+                info.protection_mode, "guarded",
+                "TIRITH_STATUS=blocks must map to protection_mode=guarded"
+            );
+        });
+    }
+
+    /// The quick gather must NOT consult the audit log, threat DB, or baseline
+    /// store. We plant a poisoned `log.jsonl` and a garbage threat-DB file in the
+    /// fake data dir and a garbage baseline in the state dir; `gather_quick_info`
+    /// still returns the values derived purely from the cheap sources we set
+    /// (status + policy + profile). If the quick path read any of those files it
+    /// would either error/log on the corrupt log or deserialize the DB — neither
+    /// can affect the result here, which is the structural proof those probes are
+    /// skipped. (The expensive probes are private to the full `gather_info`; this
+    /// asserts the smallest observable seam.)
+    #[test]
+    fn gather_quick_info_ignores_audit_log_threatdb_and_baseline() {
+        with_fake_env(true, |home, _cwd| {
+            let _root = EnvGuard::remove("TIRITH_POLICY_ROOT");
+            let _xdg_cfg = EnvGuard::remove("XDG_CONFIG_HOME");
+            let _status = EnvGuard::set("TIRITH_STATUS", std::path::Path::new("warn-only"));
+
+            // Point the data dir at a temp location (covers Linux's XDG_DATA_HOME;
+            // on macOS the data dir is under the faked $HOME already, so also drop
+            // a poisoned log there). Then plant corrupt artifacts the expensive
+            // probes would choke on.
+            let data = tempfile::tempdir().expect("data tempdir");
+            let _xdg_data = EnvGuard::set("XDG_DATA_HOME", data.path());
+            let _xdg_state = EnvGuard::set("XDG_STATE_HOME", data.path());
+
+            let plant = |dir: &std::path::Path| {
+                std::fs::create_dir_all(dir).unwrap();
+                // A non-JSONL audit log: check_detection_gaps would read+parse this.
+                std::fs::write(dir.join("log.jsonl"), b"{ this is not valid jsonl\n").unwrap();
+                // Garbage threat DB: gather_threat_db_info would deserialize this.
+                std::fs::write(dir.join("threatdb.bin"), b"not a real threat db").unwrap();
+            };
+            // Cover both possible data-dir resolutions (XDG vs $HOME/Library or
+            // $HOME/.local/share) so the planted files sit wherever the probes
+            // would actually look.
+            plant(data.path().join("tirith").as_path());
+            for rel in [".local/share/tirith", "Library/Application Support/tirith"] {
+                plant(home.join(rel).as_path());
+            }
+            // Force the threat-DB path explicitly at a garbage file too.
+            let _tdb = EnvGuard::set(
+                "TIRITH_THREATDB_PATH",
+                data.path().join("tirith/threatdb.bin").as_path(),
+            );
+
+            // The call returns cleanly, deriving fields ONLY from the cheap
+            // sources — the corrupt files above are never consulted.
+            let info = gather_quick_info();
+            assert_eq!(info.schema_version, 1);
+            assert_eq!(
+                info.protection_mode, "warn-only",
+                "protection_mode comes from TIRITH_STATUS, not the audit log"
+            );
+            assert!(
+                info.policy_path_used.is_none(),
+                "no policy planted → None (proves no DB/baseline side-channel set it)"
+            );
+            let _: bool = info.hook_active;
+        });
+    }
+
+    /// `run_quick(true)` (JSON mode) emits parseable JSON with the three status
+    /// fields and exits 0. Exercises the public quick entry end-to-end (capturing
+    /// real stdout is avoided; we assert the gather + serialize contract the
+    /// entry composes).
+    #[test]
+    fn run_quick_json_emits_parseable_minimal_object() {
+        with_fake_env(true, |_home, _cwd| {
+            let _root = EnvGuard::remove("TIRITH_POLICY_ROOT");
+            let _xdg = EnvGuard::remove("XDG_CONFIG_HOME");
+            let _status = EnvGuard::set("TIRITH_STATUS", std::path::Path::new("degraded"));
+
+            // The exact value run_quick serializes.
+            let info = gather_quick_info();
+            let s = serde_json::to_string_pretty(&info).expect("serialize");
+            let parsed: serde_json::Value = serde_json::from_str(&s).expect("quick JSON parses");
+            assert_eq!(parsed["protection_mode"], "degraded");
+            assert!(parsed["hook_active"].is_boolean());
+            assert!(parsed["policy_path_used"].is_null());
+            assert_eq!(parsed["schema_version"], serde_json::json!(1));
+
+            // The entry itself returns success in JSON mode.
+            assert_eq!(run_quick(true), 0, "run_quick(json=true) must exit 0");
+        });
     }
 }

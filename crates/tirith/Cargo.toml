@@ -37,7 +37,11 @@ sha2 = { workspace = true }
 etcetera = { workspace = true }
 url = { workspace = true }
 tempfile = "3"
-tokio = { workspace = true }
+# `io-std` is added on top of the workspace feature set so `tirith lsp` can use
+# `tokio::io::stdin()` / `stdout()` for the LSP stdio transport. tower-lsp's
+# `runtime-tokio` feature enables the tokio crate but pins NO tokio features, so
+# we must request `io-std` ourselves rather than rely on feature unification.
+tokio = { workspace = true, features = ["io-std"] }
 walkdir = { workspace = true }
 csv = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -53,6 +57,12 @@ toml = "0.8"
 # Synchronous loopback HTTP server for `tirith dashboard serve` (M13 ch3).
 # Bound to 127.0.0.1 ONLY; never exposed off-host.
 tiny_http = { workspace = true }
+# M14 (IDE Extensions) — `tirith lsp` runs a Language Server over stdio so an
+# editor extension can surface tirith diagnostics inline. tower-lsp re-exports
+# `lsp-types`; we use that re-export (`tower_lsp::lsp_types`) so the protocol
+# types can never drift from the version tower-lsp was built against. Bin-crate
+# only — tirith-core stays LSP-agnostic.
+tower-lsp = "0.20"
 
 [dev-dependencies]
 mockito = "1"
