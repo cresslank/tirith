@@ -292,6 +292,123 @@ pub fn any_dsl_rules(compiled: &[CompiledCustomRule]) -> bool {
     compiled.iter().any(|r| r.is_dsl())
 }
 
+/// `true` when the policy carries at least one DSL (`when:`) custom rule that
+/// (a) would actually COMPILE — it has a `when:` clause and uses no unsupported
+/// predicate (`agent.kind` / `mcp.tool`, which [`compile_rules`] always drops) —
+/// AND (b) keys on a SEMANTIC fact the tier-1 fast gate cannot observe
+/// ([`custom_rule_dsl::clause_has_tier1_invisible_predicate`]).
+///
+/// # The tier-1 gating bug this prevents (see CLAUDE.md)
+///
+/// The engine's tier-1 fast-exit early-returns "allow" when no regex/byte signal
+/// fired. A DSL rule whose `when:` clause keys only on `command.uses_sudo`,
+/// `command.has_pipeline_to`, `command.cwd_in`, `package.*`, `url.*`, … would
+/// then be silently SKIPPED on input it should match (e.g. a bare `sudo whoami`,
+/// which trips no tier-1 pattern) — the dotfile-overwrite gating bug class, for
+/// DSL rules. The engine calls this BEFORE the fast-exit and, when it returns
+/// `true`, forces past the early return so [`check_dsl`] runs for this input.
+///
+/// # Performance
+///
+/// This runs on the sub-millisecond tier-1 hot path, so it does the CHEAPEST
+/// possible work: an O(rules) scan over the (typically empty/tiny) raw
+/// `custom_rules` list, recursing each `when:` clause tree. It compiles NO regex
+/// and builds NO [`DslEvalContext`] / backing — it only inspects the clause
+/// SHAPE. A policy with no semantic DSL rule pays just the empty-slice scan, so
+/// the common case is unchanged.
+///
+/// Operates on the RAW [`CustomRule`]s (not [`CompiledCustomRule`]s) so the
+/// engine can consult it BEFORE the (more expensive) `compile_rules` pass that
+/// today runs only past the fast-exit. The "uses no unsupported predicate" guard
+/// keeps it in lockstep with `compile_rules`: a rule this returns `true` for is
+/// exactly one `compile_rules` would keep and `check_dsl` could fire, so the gate
+/// never forces continuation for a rule that would be dropped as dead anyway.
+pub fn any_semantic_only_dsl_rules(rules: &[CustomRule]) -> bool {
+    rules.iter().any(|rule| match &rule.when {
+        Some(clause) => {
+            custom_rule_dsl::clause_uses_unsupported_predicate(clause).is_none()
+                && clause_has_tier1_invisible_predicate(clause)
+        }
+        None => false,
+    })
+}
+
+/// `true` when a clause references AT LEAST ONE leaf predicate whose backing
+/// fact the tier-1 fast gate cannot observe — i.e. a predicate that needs tier-2
+/// extraction or tier-3 state to evaluate, so the engine MUST run the rules
+/// rather than fast-exit.
+///
+/// # Why this exists (the tier-1 gating bug class, see CLAUDE.md)
+///
+/// The engine's tier-1 fast-exit ([`crate::engine::analyze`]) early-returns
+/// "allow" when no regex/byte signal fired (no suspicious URL, no bidi /
+/// zero-width / invisible bytes, …). A DSL `when:` rule whose clause keys only on
+/// SEMANTIC facts the tier-1 gate never inspects — `command.uses_sudo`,
+/// `command.has_pipeline_to`, `command.cwd_in`, `package.*`, `url.*` — would be
+/// silently skipped on input it should match (e.g. a benign `whoami` under a
+/// watched `command.cwd_in` directory, which trips no tier-1 pattern). The engine
+/// consults this (via [`any_semantic_only_dsl_rules`]) to FORCE PAST the fast-exit
+/// when a semantic-only DSL rule is loaded, exactly as it does for taint / canary
+/// / exec-guard (the `*_triggered` flags).
+///
+/// # Which leaves are "tier-1-invisible"
+///
+/// EVERY real leaf predicate is treated as tier-1-invisible, because none of
+/// their backing facts are guaranteed to coincide with a tier-1 trigger:
+///
+/// * `command.*` — command structure (sudo / pipeline / cwd) is not by itself a
+///   reliable regex/byte signal; the leader/pipeline must be TOKENIZED first
+///   (tier-2). (`sudo` happens to ALSO trip a tier-1 fragment, but `cwd_in` /
+///   `has_pipeline_to` on a benign leader do not.)
+/// * `url.*` / `package.*` — these read EXTRACTED URLs / packages (tier-2). A
+///   benign URL (e.g. `https://company.com`) or install package trips no tier-1
+///   suspicious-URL pattern, so the gate cannot see it; the data only exists
+///   after extraction.
+/// * `file.path_matches` — reads the scanned file path (FileScan). FileScan
+///   never fast-exits ([`crate::extract::tier1_scan`] returns `true` for it), so
+///   this is moot in practice, but it is still classified invisible: it is never
+///   a tier-1 regex/byte trigger.
+///
+/// `agent.kind` / `mcp.tool` are dead predicates (their backing field is
+/// hard-coded `None` and [`compile_rules`] never compiles a rule using them), so
+/// on their own they contribute NOTHING here — a clause that is ONLY `agent.kind`
+/// returns `false` and does not force continuation (the rule could never fire
+/// anyway). A combinator returns `true` if ANY child does, so a real predicate
+/// buried inside `all`/`any`/`not` still forces continuation.
+///
+/// This errs toward `true` (run the rules) per correctness-over-micro-
+/// optimization: any clause carrying a real, evaluable predicate forces past the
+/// fast-exit. The scan is O(clause nodes) over a usually-empty custom-rule list
+/// and does NO regex work, so the common no-DSL-rule hot path is unchanged.
+fn clause_has_tier1_invisible_predicate(clause: &WhenClause) -> bool {
+    match clause {
+        // Combinators: invisible if ANY child is (a single real leaf anywhere in
+        // the tree means the rule needs tier-2/3 to decide).
+        WhenClause::All(cs) | WhenClause::Any(cs) => {
+            cs.iter().any(clause_has_tier1_invisible_predicate)
+        }
+        WhenClause::Not(c) => clause_has_tier1_invisible_predicate(c),
+
+        // Dead predicates — never compiled, can never fire, so they do NOT on
+        // their own justify forcing past the fast-exit.
+        WhenClause::AgentKind(_) | WhenClause::McpTool(_) => false,
+
+        // Every real leaf reads tier-2/3 data the tier-1 gate cannot observe.
+        WhenClause::CommandHasPipelineTo(_)
+        | WhenClause::CommandUsesSudo(_)
+        | WhenClause::CommandCwdIn(_)
+        | WhenClause::UrlHost(_)
+        | WhenClause::UrlHostMatches(_)
+        | WhenClause::UrlScheme(_)
+        | WhenClause::UrlReputation(_)
+        | WhenClause::UrlDomainNotIn(_)
+        | WhenClause::PackageEcosystem(_)
+        | WhenClause::PackageNameMatches(_)
+        | WhenClause::PackageReputation(_)
+        | WhenClause::FilePathMatches(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,6 +523,137 @@ mod tests {
         assert_eq!(compiled.len(), 1);
         assert!(compiled[0].is_dsl());
         assert!(any_dsl_rules(&compiled));
+    }
+
+    #[test]
+    fn test_any_semantic_only_dsl_rules_classification() {
+        // Tier-1 gating guard (CodeRabbit M13 PR #132): the engine consults this
+        // BEFORE the fast-exit to decide whether a semantic-only DSL rule must
+        // force continuation.
+
+        // A `command.uses_sudo` rule references a tier-1-invisible predicate -> true.
+        let sudo = make_dsl_rule("sudo", WhenClause::CommandUsesSudo(true), &["exec"]);
+        assert!(
+            any_semantic_only_dsl_rules(&[sudo]),
+            "a command.uses_sudo DSL rule is semantic-only and must force continuation"
+        );
+
+        // A `file.path_matches` rule is also tier-1-invisible -> true.
+        let file_rule = make_dsl_rule(
+            "file",
+            WhenClause::FilePathMatches(r"\.env$".into()),
+            &["file"],
+        );
+        assert!(
+            any_semantic_only_dsl_rules(&[file_rule]),
+            "a file.path_matches DSL rule is semantic-only"
+        );
+
+        // A REGEX rule (no `when:`) is NOT a DSL rule -> false (regex matching runs
+        // only past the gate; tier-1 already covers what regex rules need or not).
+        let regex = make_rule("regex", r"internal\.corp", &["exec"]);
+        assert!(
+            !any_semantic_only_dsl_rules(&[regex]),
+            "a regex-only custom rule must not force continuation"
+        );
+
+        // An `agent.kind`-ONLY DSL rule is a dead rule `compile_rules` drops, so it
+        // must NOT force continuation (it can never fire).
+        let agent = make_dsl_rule(
+            "agent",
+            WhenClause::AgentKind("claude-code".into()),
+            &["exec"],
+        );
+        assert!(
+            !any_semantic_only_dsl_rules(&[agent]),
+            "an agent.kind-only DSL rule is dead and must not force continuation"
+        );
+
+        // But a real predicate BURIED with a dead one inside `all:` still forces
+        // continuation (the rule compiles to nothing only if the dead predicate is
+        // present — which compile_rules drops — but the gate errs toward running;
+        // here `command.uses_sudo` alone would compile if the dead one were
+        // removed, and the classifier returns true because a real leaf exists).
+        let mixed = make_dsl_rule(
+            "mixed",
+            WhenClause::All(vec![
+                WhenClause::CommandUsesSudo(true),
+                WhenClause::AgentKind("claude-code".into()),
+            ]),
+            &["exec"],
+        );
+        // The clause uses an unsupported predicate, so `any_semantic_only_dsl_rules`
+        // returns FALSE (it would be dropped by compile_rules anyway — the gate
+        // stays in lockstep and never forces continuation for a rule that can't
+        // fire).
+        assert!(
+            !any_semantic_only_dsl_rules(&[mixed]),
+            "a clause containing an unsupported predicate is dropped by compile_rules, \
+             so the gate must not force continuation for it"
+        );
+
+        // Empty rule set -> false (the common hot path).
+        assert!(!any_semantic_only_dsl_rules(&[]));
+    }
+
+    #[test]
+    fn test_clause_has_tier1_invisible_predicate() {
+        use crate::custom_rule_dsl::Reputation;
+
+        // Every REAL leaf reads tier-2/3 data the tier-1 fast gate cannot observe,
+        // so each must be classified invisible (the engine forces past the
+        // fast-exit for it).
+        for leaf in [
+            WhenClause::CommandUsesSudo(true),
+            WhenClause::CommandHasPipelineTo(vec!["bash".into()]),
+            WhenClause::CommandCwdIn(vec!["/tmp".into()]),
+            WhenClause::UrlHost("example.com".into()),
+            WhenClause::UrlHostMatches(".*".into()),
+            WhenClause::UrlScheme("http".into()),
+            WhenClause::UrlReputation(Reputation::Unknown),
+            WhenClause::UrlDomainNotIn(vec!["company.com".into()]),
+            WhenClause::PackageEcosystem("npm".into()),
+            WhenClause::PackageNameMatches("^left-pad$".into()),
+            WhenClause::PackageReputation(Reputation::Malicious),
+            WhenClause::FilePathMatches(r"\.env$".into()),
+        ] {
+            assert!(
+                clause_has_tier1_invisible_predicate(&leaf),
+                "{} must be classified tier-1-invisible",
+                leaf.key()
+            );
+        }
+
+        // Dead predicates contribute nothing on their own (they can never fire, so
+        // must NOT justify forcing past the fast-exit).
+        assert!(!clause_has_tier1_invisible_predicate(
+            &WhenClause::AgentKind("claude-code".into())
+        ));
+        assert!(!clause_has_tier1_invisible_predicate(&WhenClause::McpTool(
+            "read_file".into()
+        )));
+
+        // Combinators: invisible if ANY child is.
+        assert!(clause_has_tier1_invisible_predicate(&WhenClause::All(
+            vec![
+                WhenClause::AgentKind("claude-code".into()),
+                WhenClause::CommandUsesSudo(true),
+            ]
+        )));
+        assert!(clause_has_tier1_invisible_predicate(&WhenClause::Not(
+            Box::new(WhenClause::FilePathMatches(r"\.env$".into()))
+        )));
+        // A combinator of ONLY dead predicates is not invisible.
+        assert!(!clause_has_tier1_invisible_predicate(&WhenClause::Any(
+            vec![
+                WhenClause::AgentKind("a".into()),
+                WhenClause::McpTool("b".into()),
+            ]
+        )));
+        // Empty combinator: no real leaf -> not invisible.
+        assert!(!clause_has_tier1_invisible_predicate(&WhenClause::All(
+            vec![]
+        )));
     }
 
     #[test]

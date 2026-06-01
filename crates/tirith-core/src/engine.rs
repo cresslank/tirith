@@ -2228,31 +2228,67 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         false
     };
 
+    // The LOCAL partial policy, discovered ONCE for the fast-exit gate and reused
+    // by every flag below that needs it AND by the fast-exit's own return value
+    // (so the path stays at a single `discover_partial`). Discovered only in the
+    // contexts that can actually fast-exit — Exec and Paste; FileScan never
+    // fast-exits (`tier1_scan` returns `true` for it), so the gate body is never
+    // reached there and we skip the discover entirely. `discover_partial` is
+    // local-only (no network) and cheap, but it does walk to the `.git` boundary
+    // + parse a `.tirith/policy.yaml`, so it is held behind this single binding
+    // rather than re-discovered per flag.
+    let gate_partial: Option<Policy> =
+        if matches!(ctx.scan_context, ScanContext::Exec | ScanContext::Paste) {
+            Some(Policy::discover_partial(ctx.cwd.as_deref()))
+        } else {
+            None
+        };
+
     // M9 ch5 / ch6 — the exec-provenance and repo-hook hot subsets are NOT a
     // regex/byte signal, so a bare `/tmp/foo` or a clean-looking `git commit`
     // would fast-exit at tier-1 before the exec/hook-rule block ever ran (the
     // tier-1 gating bug class — see CLAUDE.md). When the opt-in
     // `exec_guard_enabled` / `hooks_guard_enabled` flag is set in Exec context,
     // force past the fast-exit so the respective hot block gets a chance to run.
-    // The flag read is one cheap partial-policy discover (local files only),
-    // gated to Exec so the common no-flag path adds nothing. The hooks-guard
-    // force is additionally narrowed to a hook-triggering leader so an arbitrary
-    // command under a hooks-guard-on repo still fast-exits. Mirrors
-    // `exec_bidi_triggered`.
-    let (exec_guard_triggered, hooks_guard_triggered) = if ctx.scan_context == ScanContext::Exec {
-        let partial = Policy::discover_partial(ctx.cwd.as_deref());
-        // The hook-leader predicate keys off the real command, so strip any
-        // leading `# tirith-card:` prelude first (consistent with the rule path's
-        // `analyzed_input`). `strip_card_comment_lines_cow` borrows unchanged when
-        // there is no marker, so the common no-card path stays zero-alloc.
-        let hooks = partial.hooks_guard_enabled
-            && leader_is_hook_triggering(
-                ctx,
-                &crate::command_card::strip_card_comment_lines_cow(&ctx.input),
-            );
-        (partial.exec_guard_enabled, hooks)
-    } else {
-        (false, false)
+    // Reads the shared `gate_partial` (local files only), gated to Exec so the
+    // common no-flag path adds nothing. The hooks-guard force is additionally
+    // narrowed to a hook-triggering leader so an arbitrary command under a
+    // hooks-guard-on repo still fast-exits. Mirrors `exec_bidi_triggered`.
+    let (exec_guard_triggered, hooks_guard_triggered) = match (ctx.scan_context, &gate_partial) {
+        (ScanContext::Exec, Some(partial)) => {
+            // The hook-leader predicate keys off the real command, so strip any
+            // leading `# tirith-card:` prelude first (consistent with the rule
+            // path's `analyzed_input`). `strip_card_comment_lines_cow` borrows
+            // unchanged when there is no marker, so the common no-card path stays
+            // zero-alloc.
+            let hooks = partial.hooks_guard_enabled
+                && leader_is_hook_triggering(
+                    ctx,
+                    &crate::command_card::strip_card_comment_lines_cow(&ctx.input),
+                );
+            (partial.exec_guard_enabled, hooks)
+        }
+        _ => (false, false),
+    };
+
+    // M13 — the custom-rule DSL (`when:`) check keys on SEMANTIC facts the tier-1
+    // gate cannot see (`command.cwd_in`, `command.has_pipeline_to`, `package.*`,
+    // `url.*`, …), so a DSL rule that should match an otherwise tier-1-clean
+    // command (e.g. a benign `whoami` under a watched `command.cwd_in` directory)
+    // would otherwise fast-exit at tier-1 before the custom-rule block ran (the
+    // tier-1 gating bug class — see CLAUDE.md, the dotfile-overwrite bug). Force
+    // past the fast-exit when the policy carries a DSL rule whose clause
+    // references a tier-1-invisible predicate AND would actually compile
+    // (`any_semantic_only_dsl_rules` also excludes the always-dropped
+    // `agent.kind`/`mcp.tool` rules). The check is a CHEAP O(rules) clause-shape
+    // scan over the (usually empty) `custom_rules` list already loaded into
+    // `gate_partial` — NO regex compile and NO `DslEvalContext` build — so a
+    // policy with no semantic DSL rule pays nothing. Applies to Exec AND Paste (a
+    // DSL command rule is satisfiable in both); FileScan never fast-exits, so it
+    // needs no force-past. Mirrors `canary_triggered`.
+    let custom_dsl_triggered = match &gate_partial {
+        Some(partial) => crate::rules::custom::any_semantic_only_dsl_rules(&partial.custom_rules),
+        None => false,
     };
 
     // M10 ch3 — the tainted-content check is a runtime-state lookup (the parsed
@@ -2329,6 +2365,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         && !card_triggered
         && !manifest_triggered
         && !paste_source_triggered
+        && !custom_dsl_triggered
     {
         let total_ms = start.elapsed().as_secs_f64() * 1000.0;
         return (
@@ -2343,8 +2380,12 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
                 },
             ),
             // discover_partial is local-only and cheap; callers still need DLP
-            // patterns for audit redaction even on fast-exit.
-            Policy::discover_partial(ctx.cwd.as_deref()),
+            // patterns for audit redaction even on fast-exit. Reuse the partial
+            // already discovered for the gate (Exec/Paste); FileScan never reaches
+            // this fast-exit (`tier1_scan` returns `true`), so the `None` branch
+            // here is unreachable in practice but discovers afresh as a safe
+            // fallback.
+            gate_partial.unwrap_or_else(|| Policy::discover_partial(ctx.cwd.as_deref())),
         );
     }
 
@@ -3591,6 +3632,295 @@ mod tests {
                 .iter()
                 .map(|f| (&f.rule_id, &f.custom_rule_id))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Tier-1 gating guard for SEMANTIC-only custom DSL rules ────────────────
+    // (CodeRabbit M13 PR #132). The tier-1 fast-exit early-returns "allow" when no
+    // regex/byte signal fired. A custom DSL rule whose `when:` clause keys only on
+    // semantic facts tier-1 cannot observe (`command.cwd_in`, `command.*`,
+    // `package.*`, `url.*`, `file.*`) would be silently SKIPPED on input it should
+    // match — the dotfile-overwrite gating bug class, for DSL rules. The
+    // `any_semantic_only_dsl_rules` gate now forces past the fast-exit so
+    // `check_dsl` runs.
+    //
+    // NOTE on input choice: these use a benign `whoami` leader, NOT `sudo …` —
+    // `sudo` trips the `sudo_cmd` tier-1 fragment (`\bsudo\b` in build.rs) and so
+    // would reach tier 3 regardless of the gate, proving nothing. `whoami` matches
+    // no tier-1 exec fragment, and each positive test FIRST asserts the same input
+    // fast-exits with no rule, so the tier-3 reach is attributable to the gate.
+    //
+    // These drive the REAL `analyze` pipeline against a `tempfile::tempdir()` repo
+    // (a `.git` marker makes it a discovery boundary). A `TIRITH_POLICY_ROOT` in
+    // the environment would win over cwd-based discovery, so each test skips when
+    // it is set rather than asserting falsely (same guard the other policy-driven
+    // tests use).
+
+    /// Write `.tirith/policy.yaml` under `dir` (with a `.git` marker so it is a
+    /// discovery boundary) carrying the given policy `yaml` body.
+    fn write_custom_rules_policy(dir: &std::path::Path, yaml: &str) {
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join(".tirith")).unwrap();
+        std::fs::write(dir.join(".tirith").join("policy.yaml"), yaml).unwrap();
+    }
+
+    /// THE GATING GUARD. A semantic-only DSL rule must FIRE on input that trips NO
+    /// tier-1 regex/byte pattern and would otherwise fast-exit before the
+    /// custom-rule block ran. The `custom_dsl_triggered` force-past keeps the
+    /// analysis alive to tier 3, where `check_dsl` evaluates the clause and emits a
+    /// `CustomRuleMatch`. This is the DSL analogue of the dotfile-overwrite tier-1
+    /// gating bug (CLAUDE.md).
+    ///
+    /// The clause uses `command.cwd_in` keyed on the temp repo path, with a
+    /// deliberately BENIGN leader (`whoami`): unlike `sudo …` (which trips the
+    /// `sudo_cmd` tier-1 fragment `\bsudo\b`), `whoami` matches NO tier-1 exec
+    /// fragment, so the ONLY thing that can pull it to tier 3 is the semantic-DSL
+    /// force-past — exactly the bug under test. The precondition assertion below
+    /// PROVES the input is tier-1-clean by checking the SAME `whoami` fast-exits
+    /// when no semantic rule is loaded.
+    #[test]
+    fn dsl_command_cwd_in_rule_forces_past_fast_exit_exec_ctx() {
+        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
+            return;
+        }
+        use crate::verdict::RuleId;
+
+        let input = "whoami";
+
+        // Precondition: with NO custom rule, `whoami` is tier-1-clean and
+        // fast-exits — so any tier-3 reach below is attributable to the gate.
+        let clean = tempfile::tempdir().unwrap();
+        write_custom_rules_policy(clean.path(), "fail_mode: open\n");
+        assert_eq!(
+            analyze(&exec_ctx_in(input, clean.path())).tier_reached,
+            1,
+            "`whoami` must be tier-1-clean (fast-exit) with no semantic DSL rule"
+        );
+
+        // A `command.cwd_in` rule keyed on the temp repo path. `cwd_in` reads the
+        // CWD, not the command text, so a benign `whoami` cannot trip tier-1 yet
+        // the clause matches — isolating the force-past.
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().display().to_string();
+        write_custom_rules_policy(
+            dir.path(),
+            &format!(
+                "custom_rules:\n  \
+                 - id: flag-cwd\n    \
+                 when:\n      \
+                 command.cwd_in: [\"{cwd}\"]\n    \
+                 severity: high\n    \
+                 title: \"Command run under a watched directory\"\n    \
+                 context: [exec]\n"
+            ),
+        );
+
+        let verdict = analyze(&exec_ctx_in(input, dir.path()));
+
+        // 1) The force-past gate kept us alive to tier 3 (NOT a tier-1 fast-exit).
+        assert!(
+            verdict.tier_reached >= 3,
+            "a semantic-only DSL rule must force past the tier-1 fast-exit for a \
+             benign `whoami`, reaching tier 3; got tier {}",
+            verdict.tier_reached
+        );
+        // 2) The DSL rule actually fired.
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CustomRuleMatch
+                    && f.custom_rule_id.as_deref() == Some("flag-cwd")),
+            "the `command.cwd_in` DSL rule must fire on `whoami` under the watched \
+             cwd; findings: {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| (&f.rule_id, &f.custom_rule_id))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Companion guard for the PASTE context: a `command.cwd_in` DSL rule declared
+    /// `[paste]` (the clause is satisfiable in Paste too) must likewise force past
+    /// the fast-exit on a pasted benign `whoami`. Confirms the gate is not
+    /// Exec-only.
+    #[test]
+    fn dsl_command_cwd_in_rule_forces_past_fast_exit_paste_ctx() {
+        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
+            return;
+        }
+        use crate::verdict::RuleId;
+
+        // Precondition: `whoami` pasted with no semantic rule fast-exits.
+        let clean = tempfile::tempdir().unwrap();
+        write_custom_rules_policy(clean.path(), "fail_mode: open\n");
+        assert_eq!(
+            analyze(&paste_ctx_in("whoami", clean.path())).tier_reached,
+            1,
+            "pasted `whoami` must be tier-1-clean with no semantic DSL rule"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().display().to_string();
+        write_custom_rules_policy(
+            dir.path(),
+            &format!(
+                "custom_rules:\n  \
+                 - id: flag-cwd-paste\n    \
+                 when:\n      \
+                 command.cwd_in: [\"{cwd}\"]\n    \
+                 severity: high\n    \
+                 title: \"Pasted under a watched directory\"\n    \
+                 context: [paste]\n"
+            ),
+        );
+
+        let verdict = analyze(&paste_ctx_in("whoami", dir.path()));
+        assert!(
+            verdict.tier_reached >= 3,
+            "a paste-context semantic DSL rule must force past the fast-exit; got tier {}",
+            verdict.tier_reached
+        );
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CustomRuleMatch
+                    && f.custom_rule_id.as_deref() == Some("flag-cwd-paste")),
+            "the paste `command.cwd_in` DSL rule must fire; findings: {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| (&f.rule_id, &f.custom_rule_id))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A `file.path_matches` DSL rule (FileScan) must REACH evaluation and fire on
+    /// the matching path. FileScan never fast-exits (`tier1_scan` returns `true`),
+    /// so this is independently true, but it pins the gating-safe behavior end to
+    /// end through the real pipeline for the file predicate the finding called out.
+    #[test]
+    fn dsl_file_path_matches_rule_reaches_evaluation_filescan_ctx() {
+        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
+            return;
+        }
+        use crate::verdict::RuleId;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_custom_rules_policy(
+            dir.path(),
+            "custom_rules:\n  \
+             - id: flag-env\n    \
+             when:\n      \
+             file.path_matches: '(^|/)\\.env(\\.|$)'\n    \
+             severity: low\n    \
+             title: \"Scanned a .env-style secrets file\"\n    \
+             context: [file]\n",
+        );
+
+        let ctx = AnalysisContext {
+            input: "SECRET=xyz\n".to_string(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::FileScan,
+            raw_bytes: None,
+            interactive: false,
+            cwd: Some(dir.path().display().to_string()),
+            file_path: Some(std::path::PathBuf::from("/repo/.env")),
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
+        };
+        let verdict = analyze(&ctx);
+        assert!(
+            verdict.tier_reached >= 3,
+            "FileScan must reach tier 3 to evaluate the DSL rule; got tier {}",
+            verdict.tier_reached
+        );
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CustomRuleMatch
+                    && f.custom_rule_id.as_deref() == Some("flag-env")),
+            "the `file.path_matches` DSL rule must fire on `/repo/.env`; findings: {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| (&f.rule_id, &f.custom_rule_id))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// NEGATIVE / PERF guard. The gate must NOT force-run when there is nothing to
+    /// run. Three cases, all sharing the tier-1-clean benign `whoami` input the
+    /// positive tests rely on:
+    ///   (a) NO custom rules at all -> benign input still FAST-EXITS (tier 1).
+    ///   (b) a REGEX-only custom rule (no `when:`) -> tier-1 still fast-exits (the
+    ///       regex path already runs only PAST the gate; a regex rule is not a
+    ///       semantic DSL rule, so it must not force continuation).
+    ///   (c) a DSL rule whose ONLY predicate is the always-dropped `agent.kind`
+    ///       (a dead rule `compile_rules` never keeps) -> must NOT force-run.
+    /// This proves the common no-semantic-DSL hot path is unchanged.
+    #[test]
+    fn no_semantic_dsl_rule_benign_input_still_fast_exits() {
+        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
+            return;
+        }
+        let input = "whoami";
+
+        // (a) No custom rules (a policy with only `fail_mode`).
+        let bare = tempfile::tempdir().unwrap();
+        write_custom_rules_policy(bare.path(), "fail_mode: open\n");
+        let v_bare = analyze(&exec_ctx_in(input, bare.path()));
+        assert_eq!(
+            v_bare.tier_reached, 1,
+            "with no custom rules a tier-1-clean `whoami` must fast-exit; got tier {}",
+            v_bare.tier_reached
+        );
+
+        // (b) A REGEX-only custom rule (no `when:`). Not a semantic DSL rule, so
+        // the gate must not force continuation; the input is still tier-1-clean.
+        let regex_dir = tempfile::tempdir().unwrap();
+        write_custom_rules_policy(
+            regex_dir.path(),
+            "custom_rules:\n  \
+             - id: corp-host\n    \
+             pattern: 'internal\\.corp'\n    \
+             severity: high\n    \
+             title: \"corp host\"\n    \
+             context: [exec]\n",
+        );
+        let v_regex = analyze(&exec_ctx_in(input, regex_dir.path()));
+        assert_eq!(
+            v_regex.tier_reached, 1,
+            "a regex-only custom rule must NOT force past the fast-exit; got tier {}",
+            v_regex.tier_reached
+        );
+
+        // (c) A DSL rule whose only predicate is the unsupported `agent.kind` — a
+        // dead rule `compile_rules` always drops. The gate must treat it as
+        // non-forcing so a dead rule cannot defeat the fast-exit.
+        let dead_dir = tempfile::tempdir().unwrap();
+        write_custom_rules_policy(
+            dead_dir.path(),
+            "custom_rules:\n  \
+             - id: dead-agent\n    \
+             when:\n      \
+             agent.kind: claude-code\n    \
+             severity: high\n    \
+             title: \"agent kind (dead)\"\n    \
+             context: [exec]\n",
+        );
+        let v_dead = analyze(&exec_ctx_in(input, dead_dir.path()));
+        assert_eq!(
+            v_dead.tier_reached, 1,
+            "an agent.kind-only DSL rule (always dropped) must NOT force past the \
+             fast-exit; got tier {}",
+            v_dead.tier_reached
         );
     }
 

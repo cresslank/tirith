@@ -111,41 +111,85 @@ pub struct AuditSummary {
     pub skipped_lines: usize,
 }
 
+/// The effective policy values the dashboard surfaces when a policy
+/// successfully resolved (either the built-in defaults or a parsed file, in
+/// both cases with the user/org/trust overlays applied).
+///
+/// These fields are shared by [`PolicySummary::NoFile`] and
+/// [`PolicySummary::Valid`]; they are flattened into each of those variants so
+/// the `--json` shape carries them at the same level as before
+/// (`{"state":"no_file","paranoia":1,…}`), only now under a `state` tag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyValues {
+    /// Paranoia tier (1–4).
+    pub paranoia: u8,
+    /// `"open"` or `"closed"`.
+    pub fail_mode: String,
+    /// Number of allowlist entries (flat patterns), including overlays.
+    pub allowlist_count: usize,
+    /// Number of rule-scoped allowlist entries, including overlays.
+    pub allowlist_rules_count: usize,
+    /// Number of blocklist entries, including overlays.
+    pub blocklist_count: usize,
+    /// Number of custom rules.
+    pub custom_rules_count: usize,
+}
+
 /// A summary of the effective discovered policy.
 ///
 /// Three states are distinguished so the dashboard never presents a BROKEN
 /// policy as benign built-in defaults (a misleading fail-open dashboard —
-/// CodeRabbit M13 PR #132 R5-1):
+/// CodeRabbit M13 PR #132 R5-1). Modeling them as an ENUM rather than a flat
+/// struct of `Option` fields makes the contradictory "fail-open lie" state
+/// (an `error` set ALONGSIDE populated paranoia / counts) UNREPRESENTABLE by
+/// construction — the renderer and every `--json` consumer can only observe
+/// one of the three real states:
 ///
-/// * **No policy file** — the genuine built-in defaults apply. The numeric
-///   fields are populated, `path` is `None`, and `error` is `None`.
-/// * **Valid policy file** — the parsed values are populated, `path` is the
-///   file's path, and `error` is `None`.
-/// * **Present-but-unparseable policy file** — `error` carries the load/parse
-///   failure (and `path` the file that failed). The numeric fields are `None`
-///   because a policy that did not load has NO known paranoia / fail mode /
-///   counts; surfacing zeros/defaults here would be the exact fail-open lie
-///   this representation exists to prevent.
+/// * **`NoFile`** — no local policy file was discovered, so the genuine
+///   built-in defaults (plus the read-only user/org/trust overlays) apply.
+///   Carries the effective [`PolicyValues`]; there is no path and no error.
+/// * **`Valid`** — a local policy file parsed successfully. Carries its `path`
+///   and the effective [`PolicyValues`] (parsed values + overlays).
+/// * **`ParseError`** — a policy file is present but unparseable (or otherwise
+///   unreadable). Carries the `path` that failed and the `error`, and CANNOT
+///   carry any numeric values: a policy that did not load has NO known
+///   paranoia / fail mode / counts, so surfacing zeros/defaults here would be
+///   the exact fail-open lie this representation exists to prevent.
+///
+/// # serde representation
+///
+/// Internally tagged on a `state` discriminator, snake-cased, so JSON consumers
+/// see `{"state":"no_file",…}` / `{"state":"valid",…}` /
+/// `{"state":"parse_error",…}`. The `NoFile`/`Valid` variants `#[serde(flatten)]`
+/// their [`PolicyValues`], so the numeric fields sit at the top level of the
+/// `policy` object exactly as they did before this became an enum (only the
+/// `state` tag and, for `Valid`, the `path` are new there).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PolicySummary {
-    /// Paranoia tier (1–4). `None` when the policy file failed to load.
-    pub paranoia: Option<u8>,
-    /// `"open"` or `"closed"`. `None` when the policy file failed to load.
-    pub fail_mode: Option<String>,
-    /// Number of allowlist entries (flat patterns). `None` when load failed.
-    pub allowlist_count: Option<usize>,
-    /// Number of rule-scoped allowlist entries. `None` when load failed.
-    pub allowlist_rules_count: Option<usize>,
-    /// Number of blocklist entries. `None` when load failed.
-    pub blocklist_count: Option<usize>,
-    /// Number of custom rules. `None` when load failed.
-    pub custom_rules_count: Option<usize>,
-    /// Discovered policy path, if any. Populated even when `error` is set (we
-    /// know WHICH file failed to parse).
-    pub path: Option<String>,
-    /// The load/parse error when a policy file is present but unparseable.
-    /// `None` for both the valid-policy and no-policy-file cases.
-    pub error: Option<String>,
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PolicySummary {
+    /// No local policy file was discovered — genuine built-in defaults (+ the
+    /// read-only overlays) apply.
+    NoFile {
+        /// The effective values (built-in defaults + user/org/trust overlays).
+        #[serde(flatten)]
+        values: PolicyValues,
+    },
+    /// A local policy file parsed successfully.
+    Valid {
+        /// The discovered policy file path.
+        path: String,
+        /// The effective values (parsed policy + user/org/trust overlays).
+        #[serde(flatten)]
+        values: PolicyValues,
+    },
+    /// A policy file is present but could not be loaded/parsed. Carries no
+    /// numeric values by construction — the fail-closed state.
+    ParseError {
+        /// The path of the file that failed to load.
+        path: String,
+        /// The load/parse failure reason.
+        error: String,
+    },
 }
 
 /// Threat-DB status, mirroring `tirith threat-db status`.
@@ -432,36 +476,38 @@ fn build_policy_summary(cwd: Option<&str>) -> PolicySummary {
     policy_summary_from(&policy, policy.path.clone())
 }
 
-/// Build a populated [`PolicySummary`] from a successfully-loaded policy.
-fn policy_summary_from(policy: &crate::policy::Policy, path: Option<String>) -> PolicySummary {
-    PolicySummary {
-        paranoia: Some(policy.paranoia),
-        fail_mode: Some(match policy.fail_mode {
+/// Build the effective [`PolicyValues`] from a successfully-loaded policy
+/// (built-in defaults or a parsed file, in both cases with overlays applied).
+fn policy_values_from(policy: &crate::policy::Policy) -> PolicyValues {
+    PolicyValues {
+        paranoia: policy.paranoia,
+        fail_mode: match policy.fail_mode {
             crate::policy::FailMode::Open => "open".to_string(),
             crate::policy::FailMode::Closed => "closed".to_string(),
-        }),
-        allowlist_count: Some(policy.allowlist.len()),
-        allowlist_rules_count: Some(policy.allowlist_rules.len()),
-        blocklist_count: Some(policy.blocklist.len()),
-        custom_rules_count: Some(policy.custom_rules.len()),
-        path,
-        error: None,
+        },
+        allowlist_count: policy.allowlist.len(),
+        allowlist_rules_count: policy.allowlist_rules.len(),
+        blocklist_count: policy.blocklist.len(),
+        custom_rules_count: policy.custom_rules.len(),
     }
 }
 
-/// Build an error [`PolicySummary`] for a present-but-unparseable policy file.
-/// Numeric fields are `None` — a policy that did not load has no known values.
-fn policy_summary_error(path: String, error: String) -> PolicySummary {
-    PolicySummary {
-        paranoia: None,
-        fail_mode: None,
-        allowlist_count: None,
-        allowlist_rules_count: None,
-        blocklist_count: None,
-        custom_rules_count: None,
-        path: Some(path),
-        error: Some(error),
+/// Build a populated [`PolicySummary`] from a successfully-loaded policy. The
+/// presence of a discovered `path` selects [`PolicySummary::Valid`] (a real
+/// file parsed) vs [`PolicySummary::NoFile`] (genuine built-in defaults).
+fn policy_summary_from(policy: &crate::policy::Policy, path: Option<String>) -> PolicySummary {
+    let values = policy_values_from(policy);
+    match path {
+        Some(path) => PolicySummary::Valid { path, values },
+        None => PolicySummary::NoFile { values },
     }
+}
+
+/// Build the fail-closed [`PolicySummary::ParseError`] for a present-but-
+/// unparseable policy file. By construction it carries NO numeric values — a
+/// policy that did not load has no known paranoia / fail mode / counts.
+fn policy_summary_error(path: String, error: String) -> PolicySummary {
+    PolicySummary::ParseError { path, error }
 }
 
 /// Summarize threat-DB status, mirroring `tirith threat-db status`. Degrades to
@@ -826,31 +872,28 @@ fn render_activity(audit: &Option<AuditSummary>) -> String {
 
 /// The policy key/value block.
 ///
-/// A present-but-unparseable policy file (`error` set) renders an explicit
-/// "policy unavailable" notice with the parse error rather than the numeric
-/// fields — surfacing that policy loading FAILED instead of presenting benign
-/// built-in defaults (CodeRabbit M13 PR #132 R5-1). Like every other value, the
-/// path and error are HTML-escaped.
+/// The renderer `match`es exhaustively on the [`PolicySummary`] enum: the
+/// `ParseError` arm CANNOT reach the numeric block (and vice versa), so the
+/// fail-open lie — rendering benign defaults for a policy that never loaded —
+/// is now impossible by construction rather than by a runtime `if` (CodeRabbit
+/// M13 PR #132 R5-1). A present-but-unparseable policy file renders an explicit
+/// "policy unavailable" notice with the parse error; `NoFile`/`Valid` render
+/// the numeric block (with the file path, or a built-in-defaults note). Like
+/// every other value, the path and error are HTML-escaped.
 fn render_policy(p: &PolicySummary) -> String {
-    if let Some(err) = &p.error {
-        let path = p.path.as_deref().unwrap_or("(unknown)");
-        return format!(
-            "<p class=\"unavailable\">{} <code>{}</code> {} {}</p>",
-            html_escape("Policy unavailable — the policy file at"),
-            html_escape(path),
-            html_escape("could not be loaded:"),
-            html_escape(err),
-        );
-    }
-    // A dash for any numeric field that is unexpectedly absent without an error
-    // set (should not happen for a loaded/no-file policy, but render safely).
-    let num = |v: Option<usize>| v.map(|n| n.to_string()).unwrap_or_else(|| "—".to_string());
-    let paranoia = p
-        .paranoia
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "—".to_string());
-    let fail_mode = p.fail_mode.as_deref().unwrap_or("—");
-    let path = p.path.as_deref().unwrap_or("(none — built-in defaults)");
+    let (values, path) = match p {
+        PolicySummary::ParseError { path, error } => {
+            return format!(
+                "<p class=\"unavailable\">{} <code>{}</code> {} {}</p>",
+                html_escape("Policy unavailable — the policy file at"),
+                html_escape(path),
+                html_escape("could not be loaded:"),
+                html_escape(error),
+            );
+        }
+        PolicySummary::NoFile { values } => (values, "(none — built-in defaults)".to_string()),
+        PolicySummary::Valid { path, values } => (values, path.clone()),
+    };
     format!(
         "<div class=\"kv\">\
          <div><span class=\"k\">Paranoia tier</span>{}</div>\
@@ -861,13 +904,13 @@ fn render_policy(p: &PolicySummary) -> String {
          <div><span class=\"k\">Custom rules</span>{}</div>\
          <div><span class=\"k\">Policy file</span><code>{}</code></div>\
          </div>",
-        html_escape(&paranoia),
-        html_escape(fail_mode),
-        html_escape(&num(p.allowlist_count)),
-        html_escape(&num(p.allowlist_rules_count)),
-        html_escape(&num(p.blocklist_count)),
-        html_escape(&num(p.custom_rules_count)),
-        html_escape(path),
+        html_escape(&values.paranoia.to_string()),
+        html_escape(&values.fail_mode),
+        html_escape(&values.allowlist_count.to_string()),
+        html_escape(&values.allowlist_rules_count.to_string()),
+        html_escape(&values.blocklist_count.to_string()),
+        html_escape(&values.custom_rules_count.to_string()),
+        html_escape(&path),
     )
 }
 
@@ -1035,15 +1078,15 @@ mod tests {
             window_start: "2026-05-24T00:00:00+00:00".into(),
             window_end: "2026-05-31T00:00:00+00:00".into(),
             audit: None,
-            policy: PolicySummary {
-                paranoia: Some(1),
-                fail_mode: Some("open".into()),
-                allowlist_count: Some(0),
-                allowlist_rules_count: Some(0),
-                blocklist_count: Some(0),
-                custom_rules_count: Some(0),
-                path: None,
-                error: None,
+            policy: PolicySummary::NoFile {
+                values: PolicyValues {
+                    paranoia: 1,
+                    fail_mode: "open".into(),
+                    allowlist_count: 0,
+                    allowlist_rules_count: 0,
+                    blocklist_count: 0,
+                    custom_rules_count: 0,
+                },
             },
             threatdb: ThreatDbSummary {
                 installed: false,
@@ -1241,12 +1284,92 @@ mod tests {
     fn snapshot_is_serde_round_trippable() {
         let snap = empty_snapshot();
         let json = serde_json::to_string(&snap).expect("serialize");
+        // `schema_version` stays on the parent snapshot; the policy object is now
+        // internally tagged on `state` with the values flattened in.
+        assert!(
+            json.contains("\"schema_version\":1"),
+            "schema_version must remain on the parent snapshot: {json}"
+        );
+        assert!(
+            json.contains("\"state\":\"no_file\""),
+            "the policy object must carry the snake_case `state` tag: {json}"
+        );
         let back: DashboardSnapshot = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.schema_version, snap.schema_version);
         assert_eq!(back.window_days, 7);
-        assert_eq!(back.policy.fail_mode.as_deref(), Some("open"));
-        assert_eq!(back.policy.paranoia, Some(1));
-        assert!(back.policy.error.is_none());
+        // The empty snapshot's policy is the no-file/defaults state; the values are
+        // flattened alongside the `state` tag.
+        match back.policy {
+            PolicySummary::NoFile { values } => {
+                assert_eq!(values.fail_mode, "open");
+                assert_eq!(values.paranoia, 1);
+            }
+            other => panic!("expected NoFile after round-trip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_error_variant_cannot_carry_numeric_values() {
+        // The whole point of the enum refactor: the contradictory "fail-open lie"
+        // state — an error ALONGSIDE populated paranoia / counts — is now
+        // UNREPRESENTABLE. `PolicySummary::ParseError` has only `{path, error}`
+        // fields (this would not compile if someone re-added a numeric field to
+        // it), and its serialized form carries NONE of the value keys. A consumer
+        // that sees `state == "parse_error"` therefore cannot also read a paranoia
+        // tier or any count. (CodeRabbit M13 PR #132 R5-1.)
+        let err = PolicySummary::ParseError {
+            path: "/repo/.tirith/policy.yaml".into(),
+            error: "boom".into(),
+        };
+        let json = serde_json::to_value(&err).expect("serialize");
+        let obj = json.as_object().expect("a tagged-enum struct object");
+        assert_eq!(
+            obj.get("state").and_then(|v| v.as_str()),
+            Some("parse_error")
+        );
+        for k in [
+            "paranoia",
+            "fail_mode",
+            "allowlist_count",
+            "allowlist_rules_count",
+            "blocklist_count",
+            "custom_rules_count",
+        ] {
+            assert!(
+                !obj.contains_key(k),
+                "the ParseError state must not carry the numeric value key {k:?}: {obj:?}"
+            );
+        }
+        // It carries exactly the three keys it should: the `state` tag, the path,
+        // and the error — nothing that could be mistaken for a benign default.
+        assert_eq!(
+            obj.len(),
+            3,
+            "ParseError serializes to {{state, path, error}} only: {obj:?}"
+        );
+
+        // The populated states DO carry the value keys (and round-trip back to the
+        // right variant), proving the flatten is wired correctly.
+        let valid = PolicySummary::Valid {
+            path: "/repo/.tirith/policy.yaml".into(),
+            values: PolicyValues {
+                paranoia: 3,
+                fail_mode: "closed".into(),
+                allowlist_count: 2,
+                allowlist_rules_count: 1,
+                blocklist_count: 0,
+                custom_rules_count: 4,
+            },
+        };
+        let v = serde_json::to_value(&valid).expect("serialize valid");
+        assert_eq!(v.get("state").and_then(|x| x.as_str()), Some("valid"));
+        assert_eq!(v.get("paranoia").and_then(|x| x.as_u64()), Some(3));
+        assert_eq!(
+            v.get("path").and_then(|x| x.as_str()),
+            Some("/repo/.tirith/policy.yaml")
+        );
+        let back: PolicySummary = serde_json::from_value(v).expect("round-trip valid");
+        assert!(matches!(back, PolicySummary::Valid { values, .. } if values.paranoia == 3));
     }
 
     #[test]
@@ -1336,12 +1459,14 @@ mod tests {
         );
         assert!(snap.audit.is_none());
         // Policy / threatdb / trust are always populated. The isolated cwd has no
-        // broken policy file, so fail_mode is a real value (and no error is set).
-        assert!(snap.policy.error.is_none());
-        assert!(matches!(
-            snap.policy.fail_mode.as_deref(),
-            Some("open") | Some("closed")
-        ));
+        // policy file at all, so the policy is the no-file/defaults state (NOT the
+        // ParseError state), and its fail_mode is a real value.
+        match snap.policy {
+            PolicySummary::NoFile { values } => {
+                assert!(matches!(values.fail_mode.as_str(), "open" | "closed"));
+            }
+            other => panic!("isolated cwd with no policy file must be NoFile, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1360,10 +1485,13 @@ mod tests {
     fn build_policy_summary_surfaces_broken_policy_and_keeps_genuine_defaults() {
         // CodeRabbit M13 PR #132 R5-1: a security dashboard must NOT present a
         // malformed `.tirith/policy.yaml` as benign built-in defaults (a
-        // fail-open lie). `build_policy_summary` uses a STRICT load:
-        //   * broken file   → error populated, numeric fields None, path set
-        //   * NO policy file → genuine defaults, error None, path None
-        //   * valid file     → parsed values, error None, path set
+        // fail-open lie). `build_policy_summary` uses a STRICT load and returns the
+        // 3-variant `PolicySummary` enum, so the state is unambiguous:
+        //   * broken file   → ParseError { path, error }  (NO numeric values)
+        //   * NO policy file → NoFile { values }           (genuine defaults)
+        //   * valid file     → Valid { path, values }      (parsed values)
+        // Modeling these as an enum makes the contradictory "error + populated
+        // numbers" state UNREPRESENTABLE — `ParseError` has no value fields.
         // Env mutation is serialized via the crate-wide TEST_ENV_LOCK and
         // isolated so the developer's real user-config policy is never read on
         // ANY OS. The guard pins the full config-resolving env set (XDG +
@@ -1395,47 +1523,42 @@ mod tests {
         )
         .unwrap();
         let summary = build_policy_summary(Some(broken.path().to_str().unwrap()));
-        assert!(
-            summary.error.is_some(),
-            "a malformed policy file must surface an error, not silent defaults: {summary:?}"
-        );
-        assert!(
-            summary.paranoia.is_none()
-                && summary.fail_mode.is_none()
-                && summary.allowlist_count.is_none()
-                && summary.custom_rules_count.is_none(),
-            "numeric fields must be None for a policy that failed to load: {summary:?}"
-        );
-        assert!(
-            summary.path.is_some(),
-            "the path of the file that failed to parse must still be reported"
-        );
+        // A malformed file is the ParseError state — by construction it carries no
+        // numeric values (the contradictory fail-open state is unrepresentable),
+        // and it still reports WHICH file failed.
+        match summary {
+            PolicySummary::ParseError { path, error } => {
+                assert!(!error.is_empty(), "the parse error must be surfaced");
+                assert!(
+                    !path.is_empty(),
+                    "the path of the file that failed to parse must still be reported"
+                );
+            }
+            other => panic!(
+                "a malformed policy file must surface ParseError, not silent defaults: {other:?}"
+            ),
+        }
 
-        // (2) NO policy file anywhere → genuine built-in defaults, no error.
+        // (2) NO policy file anywhere → genuine built-in defaults (NoFile).
         let none_dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(none_dir.path().join(".git")).unwrap();
         let summary = build_policy_summary(Some(none_dir.path().to_str().unwrap()));
-        assert!(
-            summary.error.is_none(),
-            "absence of a policy file is NOT an error: {summary:?}"
-        );
-        assert_eq!(
-            summary.paranoia,
-            Some(1),
-            "no policy file → built-in default paranoia tier 1"
-        );
-        assert_eq!(
-            summary.fail_mode.as_deref(),
-            Some("open"),
-            "no policy file → built-in default fail mode open"
-        );
-        assert_eq!(summary.custom_rules_count, Some(0));
-        assert!(
-            summary.path.is_none(),
-            "no policy file → no path (genuine defaults)"
-        );
+        match summary {
+            PolicySummary::NoFile { values } => {
+                assert_eq!(
+                    values.paranoia, 1,
+                    "no policy file → built-in default paranoia tier 1"
+                );
+                assert_eq!(
+                    values.fail_mode, "open",
+                    "no policy file → built-in default fail mode open"
+                );
+                assert_eq!(values.custom_rules_count, 0);
+            }
+            other => panic!("absence of a policy file must be NoFile, not an error: {other:?}"),
+        }
 
-        // (3) Valid policy file → parsed values, no error.
+        // (3) Valid policy file → parsed values (Valid), path set.
         let valid = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(valid.path().join(".git")).unwrap();
         std::fs::create_dir_all(valid.path().join(".tirith")).unwrap();
@@ -1445,10 +1568,14 @@ mod tests {
         )
         .unwrap();
         let summary = build_policy_summary(Some(valid.path().to_str().unwrap()));
-        assert!(summary.error.is_none(), "a valid policy has no error");
-        assert_eq!(summary.paranoia, Some(3));
-        assert_eq!(summary.fail_mode.as_deref(), Some("closed"));
-        assert!(summary.path.is_some());
+        match summary {
+            PolicySummary::Valid { path, values } => {
+                assert_eq!(values.paranoia, 3);
+                assert_eq!(values.fail_mode, "closed");
+                assert!(!path.is_empty(), "a valid policy reports its path");
+            }
+            other => panic!("a valid policy file must be Valid, got {other:?}"),
+        }
 
         // `_env` restores the full env set on drop — no manual cleanup needed.
     }
@@ -1483,18 +1610,15 @@ mod tests {
         std::fs::create_dir_all(repo.path().join(".tirith/policy.yaml")).unwrap();
 
         let summary = build_policy_summary(Some(repo.path().to_str().unwrap()));
-        assert!(
-            summary.error.is_some(),
-            "a non-regular policy path must surface the fail-closed error state, \
-             not benign defaults: {summary:?}"
-        );
-        assert!(
-            summary.paranoia.is_none()
-                && summary.fail_mode.is_none()
-                && summary.allowlist_count.is_none(),
-            "numeric fields must be None when the policy did not load: {summary:?}"
-        );
-        let err = summary.error.as_deref().unwrap();
+        // A non-regular policy path must surface the fail-closed ParseError state,
+        // not benign defaults. The enum makes the "no numeric values" guarantee
+        // structural — ParseError has no value fields to leak.
+        let (path, err) = match summary {
+            PolicySummary::ParseError { path, error } => (path, error),
+            other => panic!(
+                "a non-regular policy path must surface ParseError, not benign defaults: {other:?}"
+            ),
+        };
         // On Unix, opening a directory succeeds and the fstat-based regular-file
         // check produces the "not a regular file" message. On Windows, `File::open`
         // on a directory fails at open time with an OS error — also fail-closed,
@@ -1512,7 +1636,7 @@ mod tests {
             "the non-regular path must surface a non-empty fail-closed error; got {err:?}"
         );
         assert!(
-            summary.path.is_some(),
+            !path.is_empty(),
             "the path that failed to load must still be reported"
         );
         // `_env` restores the full env set on drop.
@@ -1546,17 +1670,18 @@ mod tests {
         std::fs::write(repo.path().join(".tirith/policy.yaml"), &oversized).unwrap();
 
         let summary = build_policy_summary(Some(repo.path().to_str().unwrap()));
-        assert!(
-            summary.error.is_some(),
-            "an oversized policy file must be rejected (fail-closed error), \
-             not buffered and parsed: {summary:?}"
-        );
-        let err = summary.error.as_deref().unwrap();
+        let (path, err) = match summary {
+            PolicySummary::ParseError { path, error } => (path, error),
+            other => panic!(
+                "an oversized policy file must be rejected (ParseError), \
+                 not buffered and parsed: {other:?}"
+            ),
+        };
         assert!(
             err.contains("exceeds read cap"),
             "the error should explain the size rejection; got {err:?}"
         );
-        assert!(summary.path.is_some());
+        assert!(!path.is_empty());
         // `_env` restores the full env set on drop.
     }
 
@@ -1597,11 +1722,12 @@ mod tests {
         // Must complete promptly; a blocking read on the writer-less FIFO would
         // hang here. The non-regular FIFO surfaces the fail-closed error state.
         let summary = build_policy_summary(Some(repo.path().to_str().unwrap()));
+        // A FIFO at the policy path must surface the ParseError state (and not
+        // hang). ParseError carries no numeric values by construction.
         assert!(
-            summary.error.is_some(),
-            "a FIFO at the policy path must surface the error state (and not hang): {summary:?}"
+            matches!(summary, PolicySummary::ParseError { .. }),
+            "a FIFO at the policy path must surface ParseError (and not hang): {summary:?}"
         );
-        assert!(summary.paranoia.is_none());
         // `_env` restores the full env set on drop.
     }
 
@@ -1712,35 +1838,34 @@ mod tests {
 
         let summary = build_policy_summary(Some(repo.path().to_str().unwrap()));
 
-        // No error — the local file parsed.
-        assert!(
-            summary.error.is_none(),
-            "a valid local policy + overlays is not an error: {summary:?}"
-        );
-        assert_eq!(summary.paranoia, Some(2), "local paranoia is preserved");
+        // The local file parsed → Valid, carrying the effective values (which
+        // include the overlays). A ParseError here would be a regression.
+        let values = match summary {
+            PolicySummary::Valid { values, .. } => values,
+            other => panic!("a valid local policy + overlays must be Valid: {other:?}"),
+        };
+        assert_eq!(values.paranoia, 2, "local paranoia is preserved");
 
         // allowlist = 1 local + 1 user flat-file + 1 flat trust entry = 3.
         // (Round 5's strict-local-only parse would have reported just 1.)
         assert_eq!(
-            summary.allowlist_count,
-            Some(3),
-            "allowlist must include the user flat-file + flat trust overlays: {summary:?}"
+            values.allowlist_count, 3,
+            "allowlist must include the user flat-file + flat trust overlays: {values:?}"
         );
         // allowlist_rules = 1 rule-scoped trust entry.
         assert_eq!(
-            summary.allowlist_rules_count,
-            Some(1),
-            "rule-scoped trust entries must count toward allowlist_rules: {summary:?}"
+            values.allowlist_rules_count, 1,
+            "rule-scoped trust entries must count toward allowlist_rules: {values:?}"
         );
         // blocklist = 1 org flat-file line.
         assert_eq!(
-            summary.blocklist_count,
-            Some(1),
-            "blocklist must include the org flat-file overlay: {summary:?}"
+            values.blocklist_count, 1,
+            "blocklist must include the org flat-file overlay: {values:?}"
         );
 
-        // A BROKEN local file is still the hard-error state even though overlays
-        // exist — counts are meaningless when the operator's file did not load.
+        // A BROKEN local file is still the hard-error (ParseError) state even
+        // though overlays exist — counts are meaningless when the operator's file
+        // did not load, and ParseError cannot carry them by construction.
         std::fs::write(
             repo.path().join(".tirith/policy.yaml"),
             "paranoia: [unterminated\n",
@@ -1748,12 +1873,8 @@ mod tests {
         .unwrap();
         let broken = build_policy_summary(Some(repo.path().to_str().unwrap()));
         assert!(
-            broken.error.is_some(),
-            "a broken LOCAL file must still surface the error state: {broken:?}"
-        );
-        assert!(
-            broken.allowlist_count.is_none(),
-            "numeric fields must be None when the local file failed to load: {broken:?}"
+            matches!(broken, PolicySummary::ParseError { .. }),
+            "a broken LOCAL file must still surface the ParseError state: {broken:?}"
         );
 
         // `_env` restores the full env set on drop — no manual cleanup needed.
@@ -1811,20 +1932,24 @@ mod tests {
         // Must return promptly and reflect the LOCAL policy — no remote fetch.
         let summary = build_policy_summary(Some(repo.path().to_str().unwrap()));
 
-        assert!(
-            summary.error.is_none(),
-            "offline discovery must NOT surface a network/fetch error: {summary:?}"
-        );
+        // Offline discovery must NOT surface a network/fetch error: the local file
+        // parsed, so this is Valid (a remote fetch would have failed closed and
+        // yielded the ParseError state instead).
+        let values = match summary {
+            PolicySummary::Valid { values, .. } => values,
+            other => panic!(
+                "offline discovery must yield the LOCAL Valid policy, \
+                 not a fetch error: {other:?}"
+            ),
+        };
         assert_eq!(
-            summary.paranoia,
-            Some(3),
+            values.paranoia, 3,
             "the LOCAL paranoia must be reflected; a remote fetch would have \
-             failed closed and yielded None: {summary:?}"
+             failed closed and yielded ParseError: {values:?}"
         );
         assert_eq!(
-            summary.fail_mode.as_deref(),
-            Some("closed"),
-            "the LOCAL fail_mode must be reflected, not a fetched/remote value: {summary:?}"
+            values.fail_mode, "closed",
+            "the LOCAL fail_mode must be reflected, not a fetched/remote value: {values:?}"
         );
 
         // `_env` restores the full env set on drop — no manual cleanup needed.
@@ -1835,15 +1960,9 @@ mod tests {
         // The error state renders an explicit "unavailable" notice (not fake
         // defaults), and both the path and the parse error are HTML-escaped so a
         // hostile path / error string cannot break out of the report.
-        let p = PolicySummary {
-            paranoia: None,
-            fail_mode: None,
-            allowlist_count: None,
-            allowlist_rules_count: None,
-            blocklist_count: None,
-            custom_rules_count: None,
-            path: Some("/repo/.tirith/<script>.yaml".into()),
-            error: Some("yaml parse error: did not find expected <node>".into()),
+        let p = PolicySummary::ParseError {
+            path: "/repo/.tirith/<script>.yaml".into(),
+            error: "yaml parse error: did not find expected <node>".into(),
         };
         let html = render_policy(&p);
         assert!(
@@ -1869,16 +1988,17 @@ mod tests {
             "no raw <script> may appear: {html}"
         );
 
-        // Sanity: a normal (no-error) summary still renders the numeric block.
-        let ok = PolicySummary {
-            paranoia: Some(2),
-            fail_mode: Some("closed".into()),
-            allowlist_count: Some(1),
-            allowlist_rules_count: Some(0),
-            blocklist_count: Some(0),
-            custom_rules_count: Some(0),
-            path: None,
-            error: None,
+        // Sanity: a normal (Valid) summary still renders the numeric block.
+        let ok = PolicySummary::Valid {
+            path: "/repo/.tirith/policy.yaml".into(),
+            values: PolicyValues {
+                paranoia: 2,
+                fail_mode: "closed".into(),
+                allowlist_count: 1,
+                allowlist_rules_count: 0,
+                blocklist_count: 0,
+                custom_rules_count: 0,
+            },
         };
         let html = render_policy(&ok);
         assert!(html.contains("Paranoia tier"));

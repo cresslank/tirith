@@ -1869,38 +1869,37 @@ mod tests {
         assert_ne!(code, 0, "a None scan must never be treated as success");
     }
 
-    // `XDG_CACHE_HOME` is process-global and cargo runs unit tests in parallel.
-    // The quarantine tests repoint it at a temp dir, so they must not interleave:
-    // this mutex serialises them.
-    static CACHE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
 
     /// RAII guard that points `XDG_CACHE_HOME` at `dir` for the duration of a
     /// test and restores the previous value (even on panic), so the quarantine
     /// store resolves into an isolated temp dir.
+    ///
+    /// `XDG_CACHE_HOME` is process-global and cargo runs unit tests in parallel,
+    /// so the mutation must be serialized against EVERY other env-mutating test
+    /// in the crate — not just the other cache tests. We therefore hold the
+    /// SINGLE crate-wide `crate::cli::test_harness::ENV_LOCK` (the same mutex
+    /// onboard's `home_base_*` tests and the dashboard serve test take) rather
+    /// than a module-local lock: two independent locks guarding the same global
+    /// env would let a test holding one run concurrently with a test holding the
+    /// other and clobber each other's `HOME`/`XDG_CACHE_HOME` (M13 PR #132 — the
+    /// cross-lock-domain race class already fixed for onboard and the dashboard
+    /// serve test). The inner `EnvGuard` performs the failure-safe save/restore.
     struct CacheHomeGuard {
-        prev: Option<std::ffi::OsString>,
+        _xdg: EnvGuard,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl CacheHomeGuard {
         fn set(dir: &Path) -> Self {
-            let lock = CACHE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var_os("XDG_CACHE_HOME");
-            // SAFETY: serialized by CACHE_ENV_LOCK; matches the `unsafe` env
-            // mutation style used across the crate's tests (e.g. policy.rs).
-            unsafe { std::env::set_var("XDG_CACHE_HOME", dir) };
-            Self { prev, _lock: lock }
-        }
-    }
-
-    impl Drop for CacheHomeGuard {
-        fn drop(&mut self) {
-            // SAFETY: serialized by CACHE_ENV_LOCK (held in `_lock`).
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-                    None => std::env::remove_var("XDG_CACHE_HOME"),
-                }
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // `EnvGuard::set` snapshots the prior value and restores it on Drop,
+            // even on panic — same save/restore semantics as before, now under
+            // the shared lock.
+            let xdg = EnvGuard::set("XDG_CACHE_HOME", dir);
+            Self {
+                _xdg: xdg,
+                _lock: lock,
             }
         }
     }
@@ -2243,43 +2242,26 @@ mod tests {
     // we assert the invariant that holds everywhere: the result is never relative.
     #[test]
     fn cache_dir_fallback_rejects_relative_home() {
-        // Hold the same lock the `CacheHomeGuard` uses so `XDG_CACHE_HOME` and
-        // `HOME` mutations here can't interleave with the other cache tests.
-        let _lock = CACHE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Hold the SINGLE crate-wide `ENV_LOCK` (the same lock `CacheHomeGuard`,
+        // onboard's `home_base_*` tests, and the dashboard serve test take) so
+        // these `XDG_CACHE_HOME`/`HOME`/`USERPROFILE` mutations can't interleave
+        // with ANY other env-mutating test in the crate — not just the other
+        // cache tests (M13 PR #132 cross-lock-domain race fix).
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
-        let prev_home = std::env::var_os("HOME");
-        let prev_userprofile = std::env::var_os("USERPROFILE");
-
-        // XDG unset so resolution must fall through to the home_dir() branch.
-        // A clearly-relative home on every OS.
-        // SAFETY: serialized by CACHE_ENV_LOCK (held in `_lock`); matches the
-        // crate's test env-mutation style.
-        unsafe {
-            std::env::remove_var("XDG_CACHE_HOME");
-            std::env::set_var("HOME", "relative-home");
-            std::env::set_var("USERPROFILE", "relative-home");
-        }
-
-        let resolved = cache_dir();
-
-        // Restore BEFORE asserting so a failure can't leak the relative env into
-        // sibling tests.
-        // SAFETY: still serialized by CACHE_ENV_LOCK (held in `_lock`).
-        unsafe {
-            match prev_xdg {
-                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-                None => std::env::remove_var("XDG_CACHE_HOME"),
-            }
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match prev_userprofile {
-                Some(v) => std::env::set_var("USERPROFILE", v),
-                None => std::env::remove_var("USERPROFILE"),
-            }
-        }
+        // Mutate the env inside an inner scope so the `EnvGuard`s restore the
+        // prior values (failure-safe, even on panic) BEFORE the assertions run —
+        // a failing assert can never leak the relative env into sibling tests.
+        // `resolved` is captured while the relative env is in effect.
+        let resolved = {
+            // XDG unset so resolution must fall through to the home_dir() branch;
+            // a clearly-relative home on every OS. `EnvGuard` snapshots + restores
+            // each var on Drop at the end of this block.
+            let _xdg = EnvGuard::remove("XDG_CACHE_HOME");
+            let _home = EnvGuard::set("HOME", Path::new("relative-home"));
+            let _userprofile = EnvGuard::set("USERPROFILE", Path::new("relative-home"));
+            cache_dir()
+        };
 
         // It must not echo back a cwd-relative cache base built from the relative
         // HOME...

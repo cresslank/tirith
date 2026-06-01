@@ -978,6 +978,7 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("credential_file_sweep", "CredentialFileSweep"),
     ("base64_decode_execute", "Base64DecodeExecute"),
     ("data_exfiltration", "DataExfiltration"),
+    ("wrapper_chain_too_deep", "WrapperChainTooDeep"),
     (
         "ps_set_execution_policy_bypass",
         "PsSetExecutionPolicyBypass",

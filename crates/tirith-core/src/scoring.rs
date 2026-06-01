@@ -177,6 +177,9 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::CredentialFileSweep
         | RuleId::Base64DecodeExecute
         | RuleId::DataExfiltration
+        // M13 — wrapper-chain-too-deep is a structural obfuscation heuristic
+        // (interpreter resolution hit the depth limit), NOT a threat-DB hit.
+        | RuleId::WrapperChainTooDeep
         | RuleId::PsSetExecutionPolicyBypass
         | RuleId::PsDefenderExclusion
         | RuleId::PsInlineDownloadExecute
