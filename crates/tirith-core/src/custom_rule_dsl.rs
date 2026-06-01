@@ -856,10 +856,13 @@ pub fn validate_regexes(clause: &WhenClause) -> Result<(), String> {
 }
 
 fn check_regex(field: &str, pattern: &str) -> Result<(), String> {
-    if pattern.len() > 1024 {
+    // Measure the cap in CHARACTERS, not UTF-8 BYTES, so a multibyte pattern is
+    // not rejected early and the "{} chars" count is accurate (CodeRabbit M13
+    // round-26). Mirrors the char-count cap in `rules::custom::compile_rules`.
+    if pattern.chars().count() > 1024 {
         return Err(format!(
             "{field}: regex too long ({} chars, max 1024)",
-            pattern.len()
+            pattern.chars().count()
         ));
     }
     Regex::new(pattern)
@@ -1837,6 +1840,39 @@ any:
         assert!(validate_regexes(&bad).is_err());
         let good = WhenClause::UrlHostMatches(r"github\.com$".to_string());
         assert!(validate_regexes(&good).is_ok());
+    }
+
+    #[test]
+    fn test_check_regex_length_cap_counts_chars_not_bytes() {
+        // CodeRabbit M13 round-26: `check_regex` (reached here via the public
+        // `validate_regexes` through a `*_matches` predicate) must measure its
+        // 1024 cap in CHARACTERS, not UTF-8 BYTES. A multibyte pattern that is
+        // <=1024 CHARS but >1024 BYTES used to be rejected early on byte length;
+        // it must now be ACCEPTED, with any over-limit error reporting a CHAR
+        // count.
+        //
+        // 'é' (U+00E9) is 2 bytes in UTF-8. 600 of them is 600 chars / 1200
+        // bytes: under the 1024-CHAR cap, over a 1024-BYTE one. A repeated
+        // literal is a trivially-cheap, valid regex (keeps the test fast).
+        let multibyte = "é".repeat(600);
+        assert_eq!(multibyte.chars().count(), 600, "600 chars");
+        assert!(multibyte.len() > 1024, "but >1024 bytes");
+        assert!(
+            validate_regexes(&WhenClause::UrlHostMatches(multibyte)).is_ok(),
+            "a <=1024-CHAR regex must pass even when its byte length exceeds 1024"
+        );
+
+        // A pattern of >1024 CHARACTERS is still rejected, and the message
+        // reports the CHAR count (1025), not a byte count. Single-byte chars make
+        // this unambiguously a char-count trip.
+        let over = "a".repeat(1025);
+        assert_eq!(over.chars().count(), 1025, "1025 chars");
+        let err = validate_regexes(&WhenClause::UrlHostMatches(over))
+            .expect_err("a >1024-CHAR regex must be rejected by the char-count cap");
+        assert!(
+            err.contains("1025 chars"),
+            "error must report the CHAR count (got: {err})"
+        );
     }
 
     #[test]

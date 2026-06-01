@@ -94,11 +94,16 @@ pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
                 );
                 continue;
             }
-            if pattern.len() > 1024 {
+            // Measure the cap in CHARACTERS, not UTF-8 BYTES: the limit and the
+            // message both speak of "chars", so a multibyte pattern must not hit
+            // the cap early or report a misleading byte count (CodeRabbit M13
+            // round-26). `check_regex` in `custom_rule_dsl` applies the same
+            // char-count cap so regex validation stays consistent.
+            if pattern.chars().count() > 1024 {
                 eprintln!(
                     "tirith: custom rule '{}' pattern too long ({} chars), skipping",
                     rule.id,
-                    pattern.len()
+                    pattern.chars().count()
                 );
                 continue;
             }
@@ -587,6 +592,41 @@ mod tests {
             compiled.len(),
             0,
             "regex rule with pattern over the 1024-char cap must be dropped"
+        );
+    }
+
+    #[test]
+    fn test_compile_regex_pattern_cap_counts_chars_not_bytes() {
+        // CodeRabbit M13 round-26: the 1024 cap (and its "{} chars" message) must
+        // count CHARACTERS, not UTF-8 BYTES. A multibyte pattern that is <=1024
+        // CHARS but >1024 BYTES used to hit the byte-length cap early and get
+        // wrongly dropped; it must now be ACCEPTED.
+        //
+        // 'é' (U+00E9) is 2 bytes in UTF-8. 600 of them is 600 chars / 1200
+        // bytes: well under the 1024-CHAR cap yet over a 1024-BYTE one. A
+        // repeated literal is also a trivially-cheap, valid regex (keeps the
+        // test fast — no pathological backtracking).
+        let multibyte = "é".repeat(600);
+        assert_eq!(multibyte.chars().count(), 600, "600 chars");
+        assert!(multibyte.len() > 1024, "but >1024 bytes");
+        let rule = make_rule("multibyte-ok", &multibyte, &["exec"]);
+        let compiled = compile_rules(&[rule]);
+        assert_eq!(
+            compiled.len(),
+            1,
+            "a <=1024-CHAR pattern must be accepted even when its byte length exceeds 1024"
+        );
+
+        // And a pattern of >1024 CHARACTERS is still rejected (the cap holds; we
+        // only changed how the input is measured). Use a single-byte char so the
+        // rejection is unambiguously a CHAR-count, not a BYTE-count, trip.
+        let over = "a".repeat(1025);
+        assert_eq!(over.chars().count(), 1025, "1025 chars");
+        let rule = make_rule("over-chars", &over, &["exec"]);
+        assert_eq!(
+            compile_rules(&[rule]).len(),
+            0,
+            "a >1024-CHAR pattern must be rejected by the char-count cap"
         );
     }
 

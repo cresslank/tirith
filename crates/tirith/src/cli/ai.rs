@@ -1073,7 +1073,18 @@ fn cache_dir() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    home::home_dir().map(|h| h.join(".cache"))
+    // `home::home_dir()` can ALSO yield a non-absolute path: on Unix it reads
+    // `$HOME` directly, so a RELATIVE `HOME` (e.g. `HOME=.`) comes back verbatim,
+    // and an empty `$HOME` can surface as `Some("")` on some runners. Either case
+    // would root `~/.cache/tirith/quarantine` under the CURRENT WORKING DIRECTORY
+    // (the exact escape the XDG branch above guards). Filter the fallback to
+    // ABSOLUTE paths only — mirroring `home_base` (onboard.rs) — so a non-absolute
+    // home base yields `None`; the caller (`quarantine_dir` → `run_quarantine`)
+    // already treats `None` as "cannot determine the cache directory" and exits
+    // non-zero rather than writing under cwd (CodeRabbit M13 PR #132 R26).
+    home::home_dir()
+        .filter(|h| h.is_absolute())
+        .map(|h| h.join(".cache"))
 }
 
 /// Create the quarantine directory with restrictive permissions (0700 on Unix).
@@ -2102,6 +2113,74 @@ mod tests {
                 cache_dir(),
                 home.clone(),
                 "an empty XDG_CACHE_HOME must be ignored"
+            );
+        }
+    }
+
+    // CodeRabbit M13 PR #132 R26 (path escape, round-25 follow-up): the fallback
+    // branch of `cache_dir` must ALSO reject a non-absolute home base. Round-25
+    // guarded `XDG_CACHE_HOME`, but `home::home_dir()` can itself return a
+    // RELATIVE path — on Unix it reads `$HOME` verbatim — so with `XDG_CACHE_HOME`
+    // unset and a relative `HOME`, the unfiltered fallback would root the
+    // quarantine store under the current working directory. After the absolute
+    // filter, `cache_dir` returns `None` (or an absolute path) but NEVER a
+    // relative one. On Unix this exercises the `home::home_dir()` branch directly
+    // (it reads `$HOME`); on other platforms `home_dir()` may ignore `$HOME`, so
+    // we assert the invariant that holds everywhere: the result is never relative.
+    #[test]
+    fn cache_dir_fallback_rejects_relative_home() {
+        // Hold the same lock the `CacheHomeGuard` uses so `XDG_CACHE_HOME` and
+        // `HOME` mutations here can't interleave with the other cache tests.
+        let _lock = CACHE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let prev_home = std::env::var_os("HOME");
+        let prev_userprofile = std::env::var_os("USERPROFILE");
+
+        // XDG unset so resolution must fall through to the home_dir() branch.
+        // A clearly-relative home on every OS.
+        // SAFETY: serialized by CACHE_ENV_LOCK (held in `_lock`); matches the
+        // crate's test env-mutation style.
+        unsafe {
+            std::env::remove_var("XDG_CACHE_HOME");
+            std::env::set_var("HOME", "relative-home");
+            std::env::set_var("USERPROFILE", "relative-home");
+        }
+
+        let resolved = cache_dir();
+
+        // Restore BEFORE asserting so a failure can't leak the relative env into
+        // sibling tests.
+        // SAFETY: still serialized by CACHE_ENV_LOCK (held in `_lock`).
+        unsafe {
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_userprofile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+
+        // It must not echo back a cwd-relative cache base built from the relative
+        // HOME...
+        assert_ne!(
+            resolved.as_deref(),
+            Some(Path::new("relative-home").join(".cache").as_path()),
+            "cache_dir must not build its fallback from a relative HOME"
+        );
+        // ...and whatever it returns must be absolute (or absent). On Unix, where
+        // home_dir() reads $HOME verbatim, this is None; elsewhere it is whatever
+        // the OS passwd entry yields (absolute) — never relative.
+        if let Some(p) = &resolved {
+            assert!(
+                p.is_absolute(),
+                "cache_dir fallback must be absolute, got {p:?}"
             );
         }
     }
