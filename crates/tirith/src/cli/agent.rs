@@ -1410,6 +1410,41 @@ mod tests {
             rc, 0,
             "a block with a valid (kind, name, pattern) must succeed (exit 0)"
         );
+
+        // `block` writes its snippet to stdout and returns only an exit code, so
+        // it isn't directly capturable here. Round-trip the snippet `block`
+        // would emit by rendering it with the SAME matcher and pattern, mirroring
+        // how `allow_snippet_round_trips_through_yaml` parses the allow snippet.
+        let matcher = AgentMatcher::new(AgentOriginKind::Agent, Some("codex".to_string()));
+        let snippet = render_block_snippet(&matcher, "sudo *");
+
+        // The pattern comment marker is still emitted (round-28 only removed the
+        // semantic-predicate flags, not the `# command pattern:` documentation).
+        assert!(
+            snippet.contains("# command pattern:"),
+            "block snippet must still carry the pattern comment marker"
+        );
+
+        // Parse the snippet under an `agent_rules.deny:` block and assert the
+        // emitted matcher mapping carries EXACTLY `kind` + `name` — no
+        // semantic-predicate keys (`filesystem_write` / `network` /
+        // `secrets_access`), confirming the round-28 flag removal holds.
+        let yaml = format!("agent_rules:\n  deny:\n{snippet}");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("snippet parses");
+        let entry = parsed
+            .get("agent_rules")
+            .and_then(|v| v.get("deny"))
+            .and_then(|v| v.as_sequence())
+            .and_then(|s| s.first())
+            .and_then(|e| e.as_mapping())
+            .expect("deny entry is a mapping");
+        let keys: std::collections::BTreeSet<&str> =
+            entry.keys().filter_map(|k| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["kind", "name"].into_iter().collect(),
+            "block matcher must carry exactly kind + name (no semantic-predicate keys)"
+        );
     }
 
     // -----------------------------------------------------------------------

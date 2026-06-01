@@ -2394,6 +2394,25 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             // this fast-exit (`tier1_scan` returns `true`), so the `None` branch
             // here is unreachable in practice but discovers afresh as a safe
             // fallback.
+            //
+            // BY DESIGN this returns the PARTIAL policy, not the fully-resolved one
+            // the tier-3 path returns (CodeRabbit M13 PR #132: "callers should
+            // always receive the full configuration"). The fast-exit is the
+            // sub-millisecond hot path, and on the ALLOW path the verdict has ZERO
+            // findings, so the only policy fields any caller reads are no-ops:
+            // `filter_findings_by_paranoia` and `apply_agent_rules` /
+            // `post_process_verdict` short-circuit on an empty/Allowed verdict, and
+            // `dlp_custom_patterns` / `threat_intel` are needed only for
+            // audit-redaction and inline enrichment — both already present in the
+            // LOCAL policy `discover_partial` parses (the full `Policy` struct, not
+            // a stripped subset; see `Policy::discover_partial`). The partial omits
+            // only (a) a REMOTE-fetched policy and (b) the user/org/trust + label
+            // overlays. (b) is irrelevant on the allow path (no findings to filter
+            // or escalate); (a) would require a network fetch on the hot path —
+            // which is exactly the cost this fast-exit exists to avoid. A caller
+            // that needs the remote-resolved policy must NOT fast-exit (it cannot,
+            // since any remote-only forcing signal is local to discovery anyway).
+            // So the full load is deliberately NOT done here.
             gate_partial.unwrap_or_else(|| Policy::discover_partial(ctx.cwd.as_deref())),
         );
     }

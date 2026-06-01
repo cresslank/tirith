@@ -1553,6 +1553,25 @@ impl Policy {
         // (CodeRabbit M13 finding R3). This is the single chokepoint every load
         // path routes through (local `load_from_yaml`, the remote-fetch success
         // branch, and `load_cached_remote_policy`).
+        //
+        // DUPLICATE rule IDs are deliberately NOT rejected here (CodeRabbit M13
+        // PR #132: "reject duplicate custom-rule IDs in the load path"). A bad
+        // SHAPE is a silent no-op — the rule never fires — so hard-failing is the
+        // only way the operator learns their rule is dead. A duplicate ID is the
+        // OPPOSITE: `rules::custom::compile_rules` does not dedup, so BOTH rules
+        // compile and BOTH fire — the condition is runtime-BENIGN. Hard-failing
+        // here would (1) flip the engine fail-CLOSED on a benign config (this
+        // loader's local-file caller, `load_from_path`, maps a parse `Err` to
+        // `fail_closed_policy()`, blocking every command), and (2) pre-empt the
+        // richer ambiguity gate `tirith rule explain`/`test` apply downstream
+        // (`emit_duplicate_rule`: "multiple custom rules named 'X' (N found) … run
+        // `tirith rule validate`"), which requires the policy to PARSE first.
+        // Duplicates are already surfaced as hard ERRORS by the dedicated
+        // validators — `policy validate` (`policy_validate::validate_custom_rules`)
+        // and `rule validate` (`cli/rule.rs`) — which both parse LENIENTLY (no
+        // shape gate) precisely so they can report EVERY rule-level problem with
+        // its id instead of dying on the first. That is where duplicate detection
+        // belongs; the runtime loader stays permissive.
         for (idx, rule) in policy.custom_rules.iter().enumerate() {
             rule.validate_shape()
                 .map_err(|e| format!("custom_rules[{idx}] (id '{}'): {e}", rule.id))?;

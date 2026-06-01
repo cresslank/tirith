@@ -27,7 +27,16 @@ fn tirith_in_proj(proj: &std::path::Path) -> Command {
         // `.output()`-based non-interactive `ai quarantine` tests into
         // interactive behavior (CodeRabbit M13 PR #132 R8-4); clear it so these
         // builders always present as non-interactive under `.output()`.
-        .env_remove("TIRITH_INTERACTIVE");
+        .env_remove("TIRITH_INTERACTIVE")
+        // Clear the threat-DB override env vars so these builders always run
+        // with the DEFAULT threat-DB / `url.reputation` behavior. A developer
+        // who exports `TIRITH_THREATDB_PATH` / `TIRITH_THREATDB_SUPPLEMENTAL_PATH`
+        // (read by `ThreatDb::default_path` / `supplemental_path`) would otherwise
+        // have those inherited here, changing `url.reputation`/threat-db rule
+        // outcomes and making rule/reputation tests non-deterministic
+        // (CodeRabbit M13 PR #132).
+        .env_remove("TIRITH_THREATDB_PATH")
+        .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
     c
 }
 
@@ -70,6 +79,14 @@ fn tirith_onboard_isolated(proj: &std::path::Path, home: &std::path::Path) -> Co
     c.current_dir(proj)
         .env_remove("TIRITH_POLICY_ROOT")
         .env_remove("TIRITH_INTERACTIVE")
+        // Clear the threat-DB override env vars so this builder runs with the
+        // DEFAULT threat-DB / `url.reputation` behavior. An inherited
+        // `TIRITH_THREATDB_PATH` / `TIRITH_THREATDB_SUPPLEMENTAL_PATH` (read by
+        // `ThreatDb::default_path` / `supplemental_path`) would otherwise change
+        // threat-db rule outcomes and make these tests non-deterministic
+        // (CodeRabbit M13 PR #132).
+        .env_remove("TIRITH_THREATDB_PATH")
+        .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH")
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
