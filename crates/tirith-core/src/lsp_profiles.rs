@@ -65,7 +65,10 @@ pub enum LspProfile {
     /// A source file (`.rs`, `.py`, `.ts`, …). Surfaces Unicode-confusable /
     /// bidi / zero-width terminal rules plus credential leaks.
     SourceCode,
-    /// A `.log` file. Surfaces the M7 output-direction rules.
+    /// A `.log` file. Targets the M7 output-direction rules — but note these
+    /// fire only via [`crate::engine::analyze_output`], so they are NOT
+    /// surfaced on the LSP's per-document `analyze` path (PARTIAL/best-effort in
+    /// v1; see [`scan_context_for`]).
     LogFile,
 }
 

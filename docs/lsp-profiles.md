@@ -97,7 +97,12 @@ command shape matched). So in v1:
   the first suspicious char of `HomoglyphAnalysis` (confusable detection). The
   byte offset is converted to an LSP `Position` whose `character` is a **UTF-16
   code-unit** column (per the LSP spec — not a byte index and not a scalar-value
-  index), and a one-unit span is highlighted so the squiggle is visible.
+  index), and a one-unit span is highlighted so the squiggle is visible. This
+  precise path covers the text/source confusable and byte-scan findings
+  (`ByteSequence` / `HomoglyphAnalysis` with offsets, e.g. `ConfusableText`); the
+  suspicious-URL and hostname-confusable findings (`ConfusableDomain`,
+  `MixedScriptInLabel`, punycode) emit `Evidence::Url` / `HostComparison`, which
+  carry no offset, so those are whole-document in v1.
 - **Every other finding is whole-document**: its range spans from the start of
   the buffer to its end. This is correct (the finding really is about the whole
   document) but coarse; a future revision can thread richer spans through the
