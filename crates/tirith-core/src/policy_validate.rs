@@ -678,11 +678,11 @@ fn validate_agent_rules(policy: &crate::policy::Policy, issues: &mut Vec<PolicyI
             // but `policy.rs::matcher_matches` decides on `kind` + `name` ONLY —
             // it never reads these. So a hand-written entry like
             // `agent_rules: { deny: [{ kind: agent, network: block }] }` LOOKS
-            // conditional yet matches EVERY agent-kind caller unconditionally; the
-            // operator's intended condition is silently dropped. Warn (not error:
-            // the field is legal advisory metadata, emitted by `tirith agent
-            // block --network …`, and the `agent block` CLI gate from round 12 is
-            // the enforced path). Emit one warning per present predicate.
+            // conditional, yet the `network: block` predicate is silently dropped
+            // at runtime (matching is still constrained by `kind` and any `name`).
+            // Warn (not error: the field is legal advisory metadata an operator may
+            // declare in policy YAML, and the round-12 `agent block` CLI gate is the
+            // enforced path). Emit one warning per present predicate.
             for (field, present) in [
                 ("filesystem_write", matcher.filesystem_write.is_some()),
                 ("network", matcher.network.is_some()),
@@ -693,9 +693,8 @@ fn validate_agent_rules(policy: &crate::policy::Policy, issues: &mut Vec<PolicyI
                         level: IssueLevel::Warning,
                         message: format!(
                             "{list_name}[{i}]: matcher predicate `{field}` is recognized but \
-                             NOT enforced at runtime (agent matching is kind+name only) — this \
-                             matcher applies to every `{}` caller unconditionally",
-                            matcher.kind.as_str()
+                             NOT enforced at runtime (agent matching uses `kind` and optional \
+                             `name` only); this predicate has no effect"
                         ),
                         field: Some(format!("{list_name}[{i}].{field}")),
                     });
@@ -1174,7 +1173,7 @@ custom_rules:
         let warn = issues.iter().find(|i| {
             i.message.contains("network")
                 && i.message.contains("NOT enforced at runtime")
-                && i.message.contains("kind+name")
+                && i.message.contains("has no effect")
         });
         assert!(
             warn.is_some(),

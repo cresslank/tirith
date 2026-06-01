@@ -521,21 +521,21 @@ pub struct AgentMatcher {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// M13 ch5 — OPTIONAL per-agent semantic predicate: the filesystem-write
-    /// scope this agent is expected to stay within. Advisory metadata an
-    /// operator declares alongside a matcher (emitted by `tirith agent block
-    /// --filesystem-write …`); it does NOT change which origins a matcher
-    /// matches (matching stays on `kind` + `name`). `#[serde(default)]` so every
-    /// pre-M13 matcher loads unchanged.
+    /// scope this agent is expected to stay within. Advisory metadata an operator
+    /// may declare in policy YAML or construct programmatically; it does NOT
+    /// change which origins a matcher matches (matching stays on `kind` +
+    /// `name`). `#[serde(default)]` so every pre-M13 matcher loads unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filesystem_write: Option<FilesystemWriteScope>,
     /// M13 ch5 — OPTIONAL per-agent semantic predicate: how this agent's network
-    /// access should be treated. Advisory metadata (emitted by `tirith agent
-    /// block --network …`). Does not affect matching. `#[serde(default)]`.
+    /// access should be treated. Advisory metadata an operator may declare in
+    /// policy YAML or construct programmatically. Does not affect matching.
+    /// `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkPredicate>,
     /// M13 ch5 — OPTIONAL per-agent semantic predicate: whether this agent may
-    /// read secrets. Advisory metadata (emitted by `tirith agent block
-    /// --secrets-access …`). Does not affect matching. `#[serde(default)]`.
+    /// read secrets. Advisory metadata an operator may declare in policy YAML or
+    /// construct programmatically. Does not affect matching. `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets_access: Option<SecretsAccessPredicate>,
 }
@@ -560,7 +560,7 @@ impl AgentMatcher {
     /// Construct a matcher with the given `kind` + optional `name` and NO
     /// semantic predicates (the pre-M13 shape). The M13 ch5 predicate fields
     /// default to `None`; set them via the struct fields directly or with
-    /// [`AgentMatcher::with_predicates`] when emitting from `tirith agent block`.
+    /// [`AgentMatcher::with_predicates`].
     pub fn new(kind: AgentOriginKind, name: Option<String>) -> Self {
         Self {
             kind,

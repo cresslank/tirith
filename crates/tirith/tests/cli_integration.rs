@@ -13077,33 +13077,14 @@ fn browser_host_persist_failure_acks_false_and_keeps_serving() {
 // ---------------------------------------------------------------------------
 
 /// The shipping 7-rule DSL fixture, inlined so these tests are hermetic.
-const RULE_DSL_POLICY: &str = r#"custom_rules:
-  - id: block-unknown-curl-to-shell
-    when:
-      all:
-        - command.has_pipeline_to: [sh, bash, zsh]
-        - url.reputation: unknown
-        - url.domain_not_in: [company.com, github.com]
-    action: block
-    severity: critical
-    message: "Unknown-domain script piped to shell"
-    context: [exec]
-  - id: warn-plain-http-offsite
-    when:
-      all:
-        - url.scheme: http
-        - not:
-            url.host_matches: '(^|\.)company\.com$'
-    severity: medium
-    title: "Plain-HTTP request to an off-site host"
-    context: [exec, paste]
-  - id: flag-env-file-scan
-    when:
-      file.path_matches: '(^|/)\.env(\.|$)'
-    severity: low
-    title: "Scanned a .env-style secrets file"
-    context: [file]
-"#;
+// CodeRabbit M13 PR #132 R18-3: use the shipped fixture verbatim instead of a
+// hand-copied inline duplicate. The inline copy had drifted from
+// `tests/fixtures/custom_rules_dsl.yaml` (e.g. the round-17 rule-5 title fix
+// landed in the fixture only); `include_str!` keeps the two in lock-step. The
+// fixture is a strict superset of the old inline const (7 rules vs 3) — every
+// rule id these tests reference (`block-unknown-curl-to-shell`,
+// `flag-env-file-scan`) is present, and no test asserts a fixed rule count.
+const RULE_DSL_POLICY: &str = include_str!("../../../tests/fixtures/custom_rules_dsl.yaml");
 
 /// Create a temp project (cwd) with `.tirith/policy.yaml` + `.git`, returning
 /// the TempDir (keep it alive) and the project dir to run `rule` commands from.
@@ -13912,9 +13893,8 @@ fn ai_snapshot_count(state: &std::path::Path) -> usize {
         .map(|rd| {
             rd.filter_map(|e| e.ok())
                 .filter(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .starts_with("ai_config_snapshot-")
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    name.starts_with("ai_config_snapshot-") && name.ends_with(".json")
                 })
                 .count()
         })
