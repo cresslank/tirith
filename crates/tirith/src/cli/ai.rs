@@ -123,10 +123,18 @@ fn load_snapshot(root: &Path) -> std::io::Result<Option<Snapshot>> {
 /// `false` only when the JSON write itself failed (broken pipe).
 fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
     if json {
+        // JSON encodes control chars safely and machine consumers need the raw
+        // value, so the JSON path is left UNCHANGED.
         let v = serde_json::json!({ "error": msg });
         write_json_stdout(&v, &format!("{ctx}: failed to write JSON output"))
     } else {
-        eprintln!("{ctx}: {msg}");
+        // Human stderr line: `msg` (and to a lesser degree `ctx`) can embed
+        // repo / AI-config-derived content (e.g. a path `Display`ed into the
+        // message, or a serde error quoting file bytes), which could carry
+        // ANSI/OSC/control sequences to spoof or rewrite terminal output. Route
+        // both through `sanitize_display` before printing — tirith must never
+        // itself emit the terminal injection it exists to detect.
+        eprintln!("{}: {}", sanitize_display(ctx), sanitize_display(msg));
         true
     }
 }
@@ -1453,7 +1461,12 @@ fn snapshot_update(force: bool, json: bool) -> i32 {
         } else {
             eprintln!("tirith ai snapshot: {msg}");
             for (p, s, r) in &blocking {
-                eprintln!("  - {p}: {r} ({s})");
+                // `p` is a repo-derived path/filename (attacker-controlled
+                // basename) — sanitize it so a hostile filename can't spoof
+                // terminal output. `s` (Severity) and `r` (RuleId) are
+                // tirith-internal enums with no attacker influence, so they are
+                // printed as-is.
+                eprintln!("  - {}: {r} ({s})", sanitize_display(p));
             }
         }
         return 1;
@@ -1582,6 +1595,72 @@ mod tests {
         // to spaces so one display field stays on a single line.
         let multiline = "line1\nline2\tcol";
         assert_eq!(sanitize_display(multiline), "line1 line2 col");
+    }
+
+    // CodeRabbit M13 PR #132 R28 (F1): `emit_error`'s HUMAN branch interpolates
+    // `ctx` and `msg` into a stderr line. `msg` routinely embeds repo /
+    // AI-config-derived content (e.g. a `Path::display()` or a serde error
+    // quoting file bytes — see the corrupt-snapshot / re-read error paths), so a
+    // hostile filename or config could smuggle ANSI/OSC/control sequences to
+    // spoof terminal output. The R28 fix routes BOTH fields through
+    // `sanitize_display` before the `eprintln!`. The `eprintln!` to stderr isn't
+    // capturable in a unit test, so we pin the load-bearing seam: the exact
+    // string the human branch now composes carries no raw ESC byte, while the
+    // visible context/message text survives. (The JSON path is deliberately left
+    // raw — verified by NOT sanitizing in that branch — so machine consumers get
+    // the unmodified value, which JSON encodes safely.)
+    #[test]
+    fn emit_error_human_line_is_sanitized() {
+        // A `ctx` that a static caller would never produce, plus an attacker-
+        // influenced `msg` carrying a CSI escape (as a crafted path would when
+        // `Display`ed into the error string).
+        let ctx = "tirith ai \x1b[31msnapshot\x1b[0m";
+        let msg = "cannot re-read \x1b]0;pwned\x07/repo/\x1b[2Jevil.md: oops";
+        // Reproduce exactly what the human branch builds:
+        //   eprintln!("{}: {}", sanitize_display(ctx), sanitize_display(msg))
+        let line = format!("{}: {}", sanitize_display(ctx), sanitize_display(msg));
+        assert!(
+            !line.contains('\u{1b}') && !line.contains('\u{7}'),
+            "composed emit_error human line must contain no raw ESC/BEL byte, got: {line:?}"
+        );
+        // The human-readable parts survive so the operator still sees a useful
+        // diagnostic.
+        assert!(
+            line.contains("snapshot")
+                && line.contains("cannot re-read")
+                && line.contains("evil.md")
+                && line.contains("oops"),
+            "visible diagnostic text must survive sanitization, got: {line:?}"
+        );
+    }
+
+    // CodeRabbit M13 PR #132 R28 (F2): the blocking-snapshot summary loop prints
+    // one stderr line per High+ finding as `"  - {path}: {rule} ({severity})"`.
+    // The path is repo-derived (`rel_key` over a scanned file whose basename is
+    // attacker-controlled), so the R28 fix sanitizes it; `rule`/`severity` are
+    // tirith-internal enums and are printed as-is. The loop's `eprintln!` isn't
+    // unit-capturable, so we pin the same per-row seam the loop now uses — the
+    // formatted row for a hostile path carries no raw ESC byte while the path's
+    // visible text, the rule, and the severity all survive.
+    #[test]
+    fn blocking_snapshot_row_path_is_sanitized() {
+        let p = ".claude/\x1b[31mhooks\x1b[0m/\x1b]0;pwn\x07evil.sh".to_string();
+        let s = Severity::High;
+        let r = "agent_instruction_hidden".to_string();
+        // Reproduce exactly what the loop builds:
+        //   eprintln!("  - {}: {r} ({s})", sanitize_display(p))
+        let row = format!("  - {}: {r} ({s})", sanitize_display(&p));
+        assert!(
+            !row.contains('\u{1b}') && !row.contains('\u{7}'),
+            "blocking row must contain no raw ESC/BEL byte, got: {row:?}"
+        );
+        // The path's visible text plus the internal rule/severity all survive.
+        assert!(
+            row.contains("hooks")
+                && row.contains("evil.sh")
+                && row.contains("agent_instruction_hidden"),
+            "visible path text, rule, and severity must survive, got: {row:?}"
+        );
     }
 
     // CodeRabbit M13 PR #132 R20: the `--move` confirmation gate must key its

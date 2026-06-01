@@ -182,6 +182,13 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
             //     mirror `compile_rules` / `check_regex` (CodeRabbit M13
             //     round-26): a multibyte pattern must not trip the cap early or
             //     report a misleading byte count.
+            //
+            //     SHORT-CIRCUIT (CodeRabbit M13 round-28): when the cap fails,
+            //     SKIP regex compilation for this rule — `compile_rules` drops
+            //     the rule at the cap and never compiles either, so compiling
+            //     here would be wasted work (and a perf risk on a pathological
+            //     pattern) AND could push a redundant second issue. The `else if`
+            //     guarantees `Regex::new` runs only for an under-cap pattern.
             if pattern.chars().count() > 1024 {
                 issues.push(PolicyIssue {
                     level: IssueLevel::Error,
@@ -192,10 +199,9 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
                     ),
                     field: Some(format!("custom_rules.{}.pattern", rule.id)),
                 });
-            }
-            // (3) Regex must compile. Done LAST (after the cap) so the same
-            //     ordering as `compile_rules` is preserved.
-            if let Err(e) = regex::Regex::new(pattern) {
+            } else if let Err(e) = regex::Regex::new(pattern) {
+                // (3) Regex must compile. Done LAST (after the cap) so the same
+                //     ordering as `compile_rules` is preserved.
                 issues.push(PolicyIssue {
                     level: IssueLevel::Error,
                     message: format!("custom_rules.{}: invalid regex '{}': {e}", rule.id, pattern),
@@ -1106,10 +1112,25 @@ custom_rules:
     #[test]
     fn test_custom_regex_rule_pattern_too_long_rejected() {
         // CodeRabbit M13 round-27: `compile_rules` drops a regex `pattern` over
-        // the 1024-CHAR cap, so `policy validate` must flag it as an Error.
-        // 1025 single-byte chars trips the cap unambiguously (the engine uses
-        // `pattern.chars().count()`, not byte length — round-26).
-        let pattern = "a".repeat(1025);
+        // the 1024-CHAR cap, so `policy validate` must flag it as an Error
+        // (the engine uses `pattern.chars().count()`, not byte length — round-26).
+        //
+        // Round-28: the cap must ALSO short-circuit regex compilation. A plain
+        // `"a".repeat(1025)` is itself a PERFECTLY VALID regex (a 1025-char
+        // literal), so a fall-through to `Regex::new` would SUCCEED and add no
+        // second issue — making the short-circuit bug invisible. To make the
+        // short-circuit OBSERVABLE we use a pattern that is both over the cap AND
+        // would FAIL to compile: an unterminated group `(` repeated. With the
+        // round-28 fix the cap check short-circuits, so `Regex::new` is never
+        // called and the ONLY issue for this rule is the length error — never
+        // "invalid regex".
+        let pattern = "(".repeat(1025);
+        assert_eq!(pattern.chars().count(), 1025, "1025 chars (over the cap)");
+        assert!(
+            regex::Regex::new(&pattern).is_err(),
+            "the over-cap pattern must ALSO be an invalid regex, so a fall-through \
+             would add a second 'invalid regex' issue we can detect its absence of"
+        );
         let yaml = format!(
             "custom_rules:\n  - id: too-long\n    pattern: \"{pattern}\"\n    title: \"Test rule\"\n    context: [exec]\n"
         );
@@ -1129,6 +1150,24 @@ custom_rules:
             issue.unwrap().field.as_deref(),
             Some("custom_rules.too-long.pattern"),
             "field must point at the rule's pattern: {issues:?}"
+        );
+        // Round-28: the cap short-circuits regex compilation, so the over-cap
+        // (and otherwise invalid) pattern must NOT also yield an "invalid regex"
+        // issue. Exactly ONE issue for this rule proves `Regex::new` was skipped.
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.message.contains("too-long") && i.message.contains("invalid regex")),
+            "overlong pattern must not ALSO be compiled (no 'invalid regex' issue): {issues:?}"
+        );
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|i| i.message.contains("too-long"))
+                .count(),
+            1,
+            "an overlong pattern must yield exactly ONE issue (the length error), \
+             proving compilation was short-circuited: {issues:?}"
         );
     }
 

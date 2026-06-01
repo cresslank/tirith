@@ -11,8 +11,11 @@
 //!   [`crate::audit_aggregator::read_log`] + [`crate::audit_aggregator::compute_stats`].
 //!   Counts by action, top findings (rule IDs), and a best-effort top-hosts
 //!   tally extracted from the already-REDACTED command previews.
-//! * **Policy** — [`crate::policy::Policy::discover`] summarized (paranoia,
-//!   fail mode, allowlist / blocklist / custom-rule counts).
+//! * **Policy** — built by [`build_policy_summary`] from
+//!   [`crate::policy::Policy::discover_local_only`] (a STRICT LOCAL parse — it
+//!   walks up for a local `policy.yaml`/`.yml` plus local overlays and performs
+//!   NO network fetch) summarized (paranoia, fail mode, allowlist / blocklist /
+//!   custom-rule counts).
 //! * **Threat DB** — [`crate::threatdb::ThreatDb`] header/stats, mirroring
 //!   `tirith threat-db status`. Degrades to "not installed".
 //! * **Trust + canaries** — the user/repo `trust.json` stores (read directly,

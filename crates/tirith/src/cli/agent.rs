@@ -969,28 +969,20 @@ fn render_allow_snippet(m: &AgentMatcher) -> String {
 /// Because the engine ignores the semantic predicates when matching, a snippet
 /// carrying them would LOOK conditional ("deny only when it writes the
 /// filesystem") but actually deny EVERY command for that origin — a silent
-/// footgun. Round 12 (R12-2) therefore made `block()` REJECT the
-/// `--filesystem-write` / `--network` / `--secrets-access` flags with an error
-/// instead of minting them, and [`render_block_snippet`] no longer emits any
-/// predicate. The `AgentMatcher` struct still carries the fields and
-/// `Policy::load` still parses them, so hand-written policies round-trip for
-/// forward-compat; only `agent block` stops emitting them.
+/// footgun. The `--filesystem-write` / `--network` / `--secrets-access` flags
+/// were therefore REMOVED from `tirith agent block` entirely (M13 PR #132
+/// round-28): they were parse-but-always-reject dead CLI surface. The
+/// `AgentMatcher` struct still carries the fields and `Policy::load` still parses
+/// them in `tirith_core`, so hand-written policies round-trip for forward-compat
+/// (and `policy_validate` still emits its advisory "this predicate has no effect"
+/// warning) — only `agent block` stops accepting them.
 ///
 /// What IS emitted: the `kind` (+ `name` when supplied) matcher, plus the
 /// `command_pattern` positional rendered as a leading YAML comment
 /// (`# command pattern: <pattern>`). The pattern is captured but NOT folded into
 /// the matcher — the engine does not match per-command yet — so the comment is
 /// purely operator documentation.
-#[allow(clippy::too_many_arguments)]
-pub fn block(
-    kind_str: &str,
-    payload: Option<&str>,
-    command_pattern: &str,
-    filesystem_write: Option<&str>,
-    network: Option<&str>,
-    secrets_access: Option<&str>,
-    json: bool,
-) -> i32 {
+pub fn block(kind_str: &str, payload: Option<&str>, command_pattern: &str, json: bool) -> i32 {
     let Some(kind) = AgentOriginKind::parse(kind_str) else {
         report_error(
             json,
@@ -1033,25 +1025,6 @@ pub fn block(
             json,
             "tirith agent block",
             "<pattern> must not be empty — pass `*` to mean \"all commands\"",
-        );
-        return 1;
-    }
-
-    // M13 ch5 / R12-2 — GATE the semantic predicate flags. `agent_rules` matching
-    // is `(kind, name)` ONLY (see `escalation::apply_agent_rules`), so a snippet
-    // carrying `filesystem_write` / `network` / `secrets_access` would LOOK
-    // conditional but actually deny EVERY command for that origin — a silent
-    // footgun. Until the engine matcher honors these predicates, refuse to emit
-    // them (CodeRabbit M13 PR #132 R12-2). The `AgentMatcher` struct still carries
-    // the fields and `Policy::load` still parses them, so hand-written policies
-    // keep round-tripping for forward-compat; only `agent block` stops minting
-    // them.
-    if filesystem_write.is_some() || network.is_some() || secrets_access.is_some() {
-        report_error(
-            json,
-            "tirith agent block",
-            "--filesystem-write/--network/--secrets-access are not enforced by \
-             agent_rules matching yet (matching is kind+name only); omit them",
         );
         return 1;
     }
@@ -1119,11 +1092,12 @@ fn render_block_snippet(m: &AgentMatcher, pattern: &str) -> String {
     if let Some(t) = m.name.as_deref() {
         s.push_str(&format!("      name: {}\n", yaml_safe_scalar(t)));
     }
-    // R12-2: `agent block` no longer emits the M13 ch5 semantic predicates
+    // `agent block` does not emit the M13 ch5 semantic predicates
     // (`filesystem_write` / `network` / `secrets_access`). The engine matcher is
     // `(kind, name)` only, so emitting a predicate would silently widen the deny
-    // to ALL commands for the origin. The flags are gated/rejected upstream in
-    // [`block`], so the matcher reaching here never carries a predicate.
+    // to ALL commands for the origin. The `--filesystem-write` / `--network` /
+    // `--secrets-access` flags were removed from the CLI surface entirely
+    // (M13 PR #132 round-28), so the matcher reaching here never carries one.
     s
 }
 
@@ -1419,62 +1393,22 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // `agent block` — semantic predicate-flag rejection (R12-2 / R19-N4)
+    // `agent block` — happy path
     // -----------------------------------------------------------------------
 
-    /// R19-N4 (unit-level companion to the `cli_integration` end-to-end test):
-    /// `block()` must REJECT any of the M13 ch5 semantic predicate flags
-    /// (`--filesystem-write` / `--network` / `--secrets-access`) with a non-zero
-    /// (1) exit and the "not enforced" message, because `agent_rules` matching is
-    /// `(kind, name)` only — minting a snippet carrying a predicate would silently
-    /// widen the deny to EVERY command for that origin. Calling `block` directly
-    /// (rather than spawning the binary) pins the decision at the unit boundary so
-    /// a refactor of the gate is caught without depending on the CLI harness.
-    /// We use `json = false`, so the rejection path only `eprintln!`s (captured by
-    /// the test harness) and returns 1 — no stdout snippet is produced.
+    /// A well-formed `(kind, name, pattern)` matcher is accepted and returns 0.
+    /// Calling `block` directly (rather than spawning the binary) pins the
+    /// happy-path contract at the unit boundary. The M13 ch5 semantic predicate
+    /// flags (`--filesystem-write` / `--network` / `--secrets-access`) were
+    /// removed from this command entirely (M13 PR #132 round-28), so there is no
+    /// longer a predicate-rejection path to cover here — the `cli_integration`
+    /// regression test confirms those flags are now unknown clap arguments.
     #[test]
-    fn block_rejects_semantic_predicate_flags() {
-        // Each predicate set INDIVIDUALLY must trip the gate.
-        for (fs_w, net, sec) in [
-            (Some("repo_only"), None, None),
-            (None, Some("block"), None),
-            (None, None, Some("block")),
-            // And in combination.
-            (Some("repo_only"), Some("block"), Some("block")),
-        ] {
-            let rc = block(
-                "agent",
-                Some("codex"),
-                "sudo *",
-                fs_w,
-                net,
-                sec,
-                /* json = */ false,
-            );
-            assert_eq!(
-                rc, 1,
-                "a predicate flag (fs={fs_w:?}, net={net:?}, sec={sec:?}) must be rejected with exit 1"
-            );
-        }
-    }
-
-    /// R19-N4 (the converse): with NO predicate flags set, `block()` accepts a
-    /// well-formed matcher and returns 0 — proving the gate fires ONLY on the
-    /// unenforced predicates, not on every `block` invocation.
-    #[test]
-    fn block_with_no_predicate_flags_succeeds() {
-        let rc = block(
-            "agent",
-            Some("codex"),
-            "sudo *",
-            None,
-            None,
-            None,
-            /* json = */ false,
-        );
+    fn block_with_valid_matcher_succeeds() {
+        let rc = block("agent", Some("codex"), "sudo *", /* json = */ false);
         assert_eq!(
             rc, 0,
-            "a block with no predicate flags and a valid (kind, name, pattern) must succeed (exit 0)"
+            "a block with a valid (kind, name, pattern) must succeed (exit 0)"
         );
     }
 

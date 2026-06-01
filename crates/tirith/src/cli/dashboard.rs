@@ -1196,10 +1196,30 @@ mod tests {
     // actually sees: (1) a plain authorized GET with no body — what a browser
     // sends — and (2) an authorized request carrying a COMPLETE body (the case
     // the old drain claimed to "consume for connection reuse"). Both must come
-    // back 200 promptly. A bounded read timeout turns a regression (a
-    // re-introduced blocking drain) into a hard timeout failure here rather
+    // back 200 promptly. A generous, deadline-bounded read turns a regression
+    // (a re-introduced blocking drain) into a hard timeout failure here rather
     // than a hang. Each request is served by its own freshly-bound server so
     // the `Connection: close` teardown of one cannot interact with the next.
+    //
+    // ENV ISOLATION (fixes a parallel-suite flake): the authorized 200 path
+    // runs `handle_request` → `build_snapshot()` → `tirith_core::dashboard`'s
+    // `build_policy_summary` / `build_audit_summary` / `build_threatdb_summary`
+    // / `build_trust_summary`. Those resolve config/data/state dirs from the
+    // process environment (`config_dir()`/`data_dir()`/`state_dir()` read
+    // `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_STATE_HOME`, with `HOME`/
+    // `USERPROFILE` and `%APPDATA%`/`%LOCALAPPDATA%` as the per-OS bases) and
+    // probe policy discovery via `TIRITH_POLICY_ROOT` / `TIRITH_SERVER_URL` /
+    // `TIRITH_API_KEY`. The previous version of this test isolated NONE of
+    // those, so it (a) RACED every env-mutating CLI test — they serialize on
+    // `crate::cli::test_harness::ENV_LOCK`, but this test never took it, so a
+    // concurrent `set_var("HOME", …)` could be observed mid-build — and (b) did
+    // real-filesystem work against the developer's actual home/repo, which is
+    // slow under load. Either could push the server thread's render past the
+    // client read deadline, yielding the intermittent status-0 timeout. We now
+    // hold `ENV_LOCK` and point every resolved base at FRESH EMPTY temp dirs
+    // (and an empty cwd, so the repo walk-up finds no `.git`). With nothing on
+    // disk to read, the snapshot build is fast and deterministic, and no other
+    // test can mutate the environment underneath it.
     //
     // (We deliberately do NOT test a never-completed oversized body: tiny_http
     // 0.12's own `Request::respond` blocks reconciling an unread lazy body for
@@ -1208,13 +1228,47 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn authorized_request_is_served_without_body_drain() {
-        use std::time::Duration as StdDuration;
+        use crate::cli::test_harness::{CwdGuard, EnvGuard, ENV_LOCK};
+        use std::time::{Duration as StdDuration, Instant as StdInstant};
 
         let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
 
+        // HERMETIC ENV: serialize against every other env-mutating CLI test on
+        // the shared crate lock, then redirect every base the snapshot build
+        // resolves config/data/state from at fresh EMPTY temp dirs. `EnvGuard`
+        // restores each var on Drop; `_lock` releases at end of test. Tolerate a
+        // poisoned lock so one panicking test does not cascade-fail this one.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home_tmp = tempfile::tempdir().expect("home tempdir");
+        let config_tmp = tempfile::tempdir().expect("config tempdir");
+        let data_tmp = tempfile::tempdir().expect("data tempdir");
+        let state_tmp = tempfile::tempdir().expect("state tempdir");
+        let cwd_tmp = tempfile::tempdir().expect("cwd tempdir");
+        // Per-OS bases for `config_dir()`/`data_dir()`/`state_dir()` +
+        // `home::home_dir()`. On Linux/macOS the XDG_* vars win; on Windows the
+        // %APPDATA%/%LOCALAPPDATA% + %USERPROFILE% bases do — set BOTH families
+        // so the test is hermetic on either. Pointing them at empty dirs means
+        // every policy/audit/threat-db/trust/canary file lookup misses fast.
+        let _home = EnvGuard::set("HOME", home_tmp.path());
+        let _userprofile = EnvGuard::set("USERPROFILE", home_tmp.path());
+        let _xdg_config = EnvGuard::set("XDG_CONFIG_HOME", config_tmp.path());
+        let _xdg_data = EnvGuard::set("XDG_DATA_HOME", data_tmp.path());
+        let _xdg_state = EnvGuard::set("XDG_STATE_HOME", state_tmp.path());
+        let _appdata = EnvGuard::set("APPDATA", config_tmp.path());
+        let _localappdata = EnvGuard::set("LOCALAPPDATA", config_tmp.path());
+        // Policy discovery + remote-fetch probes: remove so discovery finds no
+        // local-only root and never even considers a network fetch.
+        let _policy_root = EnvGuard::remove("TIRITH_POLICY_ROOT");
+        let _server_url = EnvGuard::remove("TIRITH_SERVER_URL");
+        let _api_key = EnvGuard::remove("TIRITH_API_KEY");
+        // An empty cwd (no `.git`) so `find_repo_root` returns `None` and the
+        // repo-scope policy/trust/org overlays resolve to nothing.
+        let _cwd = CwdGuard::set(cwd_tmp.path());
+
         // Serve exactly one forged request through the real `handle_request`
         // path and return its numeric status. A fresh issue time keeps the TTL
-        // open; a bounded client read timeout means a regression fails fast.
+        // open; a generous, deadline-bounded client read means a regression
+        // (a re-introduced blocking drain) still fails — just not flakily.
         fn serve_one(token: &str, raw_request: &str) -> u16 {
             let issued = Utc::now();
             let issued_mono = Instant::now();
@@ -1234,27 +1288,73 @@ mod tests {
             let req = raw_request.replace("{port}", &port.to_string());
             stream.write_all(req.as_bytes()).expect("write request");
             stream.flush().expect("flush");
+            // Per-syscall timeout kept short so a blocked read wakes often; the
+            // hard ceiling below is what actually bounds the regression. We keep
+            // it generous (well above any legitimate snapshot-build latency)
+            // because a re-introduced blocking drain makes the server block
+            // ~indefinitely, so even a long ceiling still catches it.
             stream
-                .set_read_timeout(Some(StdDuration::from_secs(10)))
+                .set_read_timeout(Some(StdDuration::from_secs(2)))
                 .expect("set read timeout");
 
-            // Read just the first chunk (the status line arrives in the first
-            // packet). We do NOT drain to EOF: a re-introduced blocking drain
-            // would delay the status line itself, so observing it promptly is
-            // the regression signal. The bounded timeout caps any hang.
-            let mut buf = [0u8; 256];
-            let n = stream.read(&mut buf).unwrap_or(0);
-            let text = String::from_utf8_lossy(&buf[..n]);
-            let status = text
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .split_whitespace()
-                .nth(1)
-                .and_then(|c| c.parse().ok())
-                .unwrap_or(0);
-            handle.join().expect("server thread");
-            status
+            // Read until a status line is parseable or a hard deadline elapses.
+            // We do NOT drain to EOF: a re-introduced blocking drain would delay
+            // the status line itself, so observing it promptly is the regression
+            // signal. Crucially we LOOP rather than collapse a single transient
+            // empty / `WouldBlock` / `TimedOut` read into status 0 — under a busy
+            // parallel suite the server thread can be scheduled late, and a one-
+            // shot read would race that scheduling and report a false 0. A real
+            // hang still fails because the parsed-status branch is never reached
+            // before the 30s ceiling.
+            let deadline = StdInstant::now() + StdDuration::from_secs(30);
+            let mut acc: Vec<u8> = Vec::with_capacity(256);
+            loop {
+                if let Some(code) = parse_status_line(&acc) {
+                    handle.join().expect("server thread");
+                    return code;
+                }
+                if StdInstant::now() >= deadline {
+                    handle.join().expect("server thread");
+                    // No status line within the ceiling ⇒ a genuine hang (the
+                    // regression this test exists to catch). Surface 0 so the
+                    // caller's assert_eq! fails with its descriptive message.
+                    return 0;
+                }
+                let mut buf = [0u8; 256];
+                match stream.read(&mut buf) {
+                    // EOF before a status line: the peer closed without a
+                    // complete response. Stop reading and let the (absent)
+                    // status fail the assertion.
+                    Ok(0) => {
+                        handle.join().expect("server thread");
+                        return parse_status_line(&acc).unwrap_or(0);
+                    }
+                    Ok(n) => acc.extend_from_slice(&buf[..n]),
+                    // A per-read timeout or non-blocking would-block is NOT a
+                    // failure on its own — the server may just be slow to be
+                    // scheduled. Retry until the hard deadline.
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    // Any other IO error is terminal.
+                    Err(_) => {
+                        handle.join().expect("server thread");
+                        return parse_status_line(&acc).unwrap_or(0);
+                    }
+                }
+            }
+        }
+
+        // Parse the numeric status from the first line of an (possibly partial)
+        // HTTP response. Returns `None` until a full status line ("HTTP/1.1 200
+        // …\r\n") has arrived, so a half-read header block keeps the caller
+        // looping instead of mis-parsing a truncated line.
+        fn parse_status_line(bytes: &[u8]) -> Option<u16> {
+            let text = String::from_utf8_lossy(bytes);
+            // Only trust the first line once it is terminated — otherwise we
+            // could be mid-status-line and parse a partial code.
+            let (first, _rest) = text.split_once("\r\n")?;
+            first.split_whitespace().nth(1)?.parse().ok()
         }
 
         // 1. Plain authorized GET, no body — the canonical browser request.

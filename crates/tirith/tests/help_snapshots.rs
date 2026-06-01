@@ -126,8 +126,6 @@ help_example_tests! {
     help_mcp_permissions => (["mcp", "permissions", "--help"], "tirith mcp permissions");
     help_agent_current   => (["agent", "current", "--help"], "tirith agent current");
     help_agent_block     => (["agent", "block", "--help"], "tirith agent block --kind agent --tool untrusted-tool");
-    // M13 ch5 — `tirith agent block` semantic predicate flags.
-    help_agent_block_predicates => (["agent", "block", "--help"], "--filesystem-write repo_only --network block --secrets-access block");
     help_explain_finding => (["explain", "--help"], "tirith explain --finding evt-abc:0");
     help_verify_self => (["verify-self", "--help"], "tirith verify-self --format json");
     help_update     => (["update", "--help"], "tirith update --verify");

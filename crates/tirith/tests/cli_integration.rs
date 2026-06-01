@@ -14272,12 +14272,13 @@ fn ai_snapshot_update_refuses_high_findings_without_force() {
 }
 
 #[test]
-fn ai_agent_block_rejects_semantic_predicate_flags() {
-    // R12-2 (was `ai_agent_block_emits_semantic_predicates`): the M13 ch5
-    // predicate flags are NOT enforced by `agent_rules` matching (which is
-    // kind+name only), so emitting them would silently widen the deny to ALL
-    // commands for the origin. `tirith agent block` now REJECTS them with a
-    // "not enforced yet" message instead of minting an unenforced snippet.
+fn ai_agent_block_predicate_flags_are_removed() {
+    // M13 PR #132 round-28: the `--filesystem-write` / `--network` /
+    // `--secrets-access` flags were REMOVED from `tirith agent block`. They were
+    // parse-but-always-reject dead surface — `agent_rules` matching is kind+name
+    // only, so a snippet carrying a predicate would silently widen the deny to
+    // ALL commands for the origin. Passing one now fails as an UNKNOWN argument
+    // (clap usage error, exit 2), locking that the surface is gone.
     for flag in [
         ["--filesystem-write", "repo_only"],
         ["--network", "block"],
@@ -14292,57 +14293,26 @@ fn ai_agent_block_rejects_semantic_predicate_flags() {
             .expect("run tirith");
         assert_eq!(
             out.status.code(),
-            Some(1),
-            "predicate flag {flag:?} must be rejected (exit 1)"
+            Some(2),
+            "removed flag {flag:?} must fail as an unknown argument (clap exit 2)"
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("not enforced by")
-                && stderr.contains("agent_rules")
-                && stderr.contains("kind+name"),
-            "rejection must explain predicates are not enforced yet; flag {flag:?}, got: {stderr}"
+            stderr.contains("unexpected argument") || stderr.contains("unexpected"),
+            "removed flag {flag:?} must produce a clap unknown-argument error; got: {stderr}"
         );
         // No snippet was emitted (nothing on stdout to paste).
         assert!(
             out.stdout.is_empty(),
-            "a rejected predicate flag must not emit a snippet; flag {flag:?}, stdout: {}",
+            "a removed flag must not emit a snippet; flag {flag:?}, stdout: {}",
             String::from_utf8_lossy(&out.stdout)
         );
     }
 }
 
 #[test]
-fn ai_agent_block_rejects_predicate_flags_in_json_mode() {
-    // R12-2: the rejection is honored in --json mode too (a machine-readable
-    // error envelope, not a snippet).
-    let out = tirith()
-        .args([
-            "agent",
-            "block",
-            "--kind",
-            "agent",
-            "--tool",
-            "codex",
-            "sudo *",
-            "--filesystem-write",
-            "repo_only",
-            "--json",
-        ])
-        .output()
-        .expect("run tirith");
-    assert_eq!(out.status.code(), Some(1), "must be rejected with exit 1");
-    let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("rejection must be a JSON envelope");
-    let err = v["error"].as_str().expect("error string");
-    assert!(
-        err.contains("not enforced by") && err.contains("kind+name"),
-        "JSON error must explain predicates are not enforced yet; got: {err}"
-    );
-}
-
-#[test]
 fn ai_agent_block_still_round_trips_without_predicates() {
-    // Acceptance: the pre-M13 invocation form still works unchanged.
+    // Acceptance: a valid `(kind, name, pattern)` block still works.
     let out = tirith()
         .args([
             "agent", "block", "--kind", "agent", "--tool", "codex", "sudo *", "--json",
@@ -14361,102 +14331,6 @@ fn ai_agent_block_still_round_trips_without_predicates() {
         parsed["agent_rules"]["deny"][0]["name"],
         serde_yaml::Value::String("codex".into())
     );
-}
-
-// ---------------------------------------------------------------------------
-// R21 — the predicate flags are typed `ValueEnum`s: an invalid spelling is
-// rejected at clap PARSE time (exit 2), BEFORE the presence-gate in `block()`
-// (exit 1) ever runs. A VALID spelling parses and reaches the presence-gate.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn ai_agent_block_invalid_predicate_value_fails_at_parse() {
-    // R21 (was `ai_agent_block_predicate_gate_precedes_value_parsing`): the
-    // M13 ch5 predicate flags are now modeled as clap `ValueEnum`s, so an
-    // unknown value fails at PARSE time with exit 2 — clap's usage/validation
-    // exit code — and never reaches the handler's presence-gate (which would
-    // exit 1 with the "not enforced yet" message). This is the inverse of the
-    // old R12-2 ordering: value-validity is now checked first. Typos thus fail
-    // with a "possible values" list instead of a misleading "not enforced"
-    // error.
-    let out = tirith()
-        .args([
-            "agent",
-            "block",
-            "--kind",
-            "agent",
-            "--tool",
-            "codex",
-            "sudo *",
-            "--filesystem-write",
-            "bogus",
-        ])
-        .output()
-        .expect("run tirith");
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "an invalid --filesystem-write value must fail at parse time (clap exit 2)"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    // clap's value validation enumerates the accepted spellings.
-    assert!(
-        stderr.contains("repo_only") && stderr.contains("everywhere"),
-        "parse error must enumerate the possible values; got: {stderr}"
-    );
-    // The handler's presence-gate never ran — its "not enforced" message
-    // (which only fires once a value has parsed) must NOT appear.
-    assert!(
-        !stderr.contains("not enforced by"),
-        "parse-time rejection must precede the handler's presence-gate; got: {stderr}"
-    );
-    // No snippet was emitted.
-    assert!(
-        out.stdout.is_empty(),
-        "a parse failure must not emit a snippet; stdout: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-}
-
-#[test]
-fn ai_agent_block_valid_predicate_value_parses_then_hits_presence_gate() {
-    // R21 companion: a VALID predicate spelling (incl. an alias) PARSES — proving
-    // the `ValueEnum` accepts the documented value set — and then reaches the
-    // presence-gate in `block()`, which still rejects it with exit 1 (these flags
-    // are not enforced by `agent_rules` matching yet). This pins both halves: the
-    // value set is honored at parse, and the unchanged presence-based rejection
-    // still fires for accepted values.
-    for value in ["repo_only", "repo", "everywhere", "all", "home"] {
-        let out = tirith()
-            .args([
-                "agent",
-                "block",
-                "--kind",
-                "agent",
-                "--tool",
-                "codex",
-                "sudo *",
-                "--filesystem-write",
-                value,
-            ])
-            .output()
-            .expect("run tirith");
-        assert_eq!(
-            out.status.code(),
-            Some(1),
-            "valid --filesystem-write={value} must PARSE then hit the presence-gate (exit 1)"
-        );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("not enforced by") && stderr.contains("kind+name"),
-            "a parsed predicate must reach the presence-gate's not-enforced message; value={value}, got: {stderr}"
-        );
-        assert!(
-            out.stdout.is_empty(),
-            "a rejected predicate must not emit a snippet; value={value}, stdout: {}",
-            String::from_utf8_lossy(&out.stdout)
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------

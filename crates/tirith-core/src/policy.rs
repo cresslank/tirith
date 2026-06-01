@@ -2457,6 +2457,14 @@ custom_rules:
             "local bypass flag must be preserved (fail-closed would clear it)"
         );
         assert_eq!(policy.paranoia, 3, "local paranoia must be preserved");
+
+        // Drop the process-global incident cache again so the negative result
+        // keyed to this (about-to-be-removed) tempdir state dir does not leak
+        // into a sibling test, mirroring how the `apply_runtime_overrides_*`
+        // tests bracket the cache (CodeRabbit M13 PR #132 round-28). The
+        // EnvVarGuards below restore `XDG_STATE_HOME` on Drop; without this the
+        // stale cached entry would outlive the tempdir.
+        crate::incident::invalidate_cache();
     }
 
     /// Snapshot an env var on construction and restore it on `Drop`.
