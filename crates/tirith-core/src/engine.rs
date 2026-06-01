@@ -2502,12 +2502,12 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     // Back-slashes are normalized to `/` so the predicate is PLATFORM-INDEPENDENT:
     // DSL `file.path_matches` regexes are written with `/` separators (e.g.
     // `(^|/)\.env(\.|$)`), so without this a Windows path like `C:\repo\.env`
-    // would never match (CodeRabbit M13 round-20 engine.rs:2418-2424). Mirrors the
-    // `\`→`/` normalization the FileScan path already applies in cli/rule.rs.
-    let file_path_str: Option<String> = ctx
-        .file_path
-        .as_deref()
-        .map(|p| p.to_string_lossy().replace('\\', "/"));
+    // would never match (CodeRabbit M13 round-20 engine.rs:2418-2424). Routed
+    // through the shared `normalize_path_separators` helper so this production
+    // FileScan path and `tirith rule test` use byte-identical normalization
+    // (CodeRabbit M13 PR #132 F2).
+    let file_path_str: Option<String> =
+        crate::util::normalize_path_separators(ctx.file_path.as_deref());
 
     if ctx.scan_context == ScanContext::FileScan {
         // FileScan runs byte-scan + configfile/codefile/rendered rules only.

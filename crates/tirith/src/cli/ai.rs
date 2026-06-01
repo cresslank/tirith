@@ -2182,6 +2182,16 @@ mod tests {
     // would otherwise root the quarantine store under the current working dir.
     #[test]
     fn cache_dir_ignores_relative_and_empty_xdg() {
+        // Hold the shared `ENV_LOCK` for the WHOLE test (not per-block via
+        // `CacheHomeGuard`) so the `home_dir()` baseline AND every `cache_dir()`
+        // call observe the SAME, un-mutated `HOME`. The sibling
+        // `cache_dir_fallback_rejects_relative_home` sets `HOME=relative-home`
+        // under this same lock; reading `home_dir()` outside it (or releasing the
+        // lock between sub-cases via a per-block guard) let that mutation leak in
+        // and flaked CI (M13 PR #132). `EnvGuard::set` snapshots/restores
+        // `XDG_CACHE_HOME` per sub-case WITHOUT re-locking — the lock is already
+        // held here, and the Mutex is not reentrant.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = home::home_dir().map(|h| h.join(".cache"));
 
         // Absolute → honored verbatim.
@@ -2191,7 +2201,7 @@ mod tests {
             } else {
                 "/abs/cache"
             };
-            let _g = CacheHomeGuard::set(Path::new(abs));
+            let _x = EnvGuard::set("XDG_CACHE_HOME", Path::new(abs));
             assert_eq!(
                 cache_dir(),
                 Some(PathBuf::from(abs)),
@@ -2201,7 +2211,7 @@ mod tests {
 
         // Relative ("cache") → ignored, falls back to ~/.cache.
         {
-            let _g = CacheHomeGuard::set(Path::new("cache"));
+            let _x = EnvGuard::set("XDG_CACHE_HOME", Path::new("cache"));
             assert_eq!(
                 cache_dir(),
                 home.clone(),
@@ -2211,7 +2221,7 @@ mod tests {
 
         // Relative (".") → ignored too.
         {
-            let _g = CacheHomeGuard::set(Path::new("."));
+            let _x = EnvGuard::set("XDG_CACHE_HOME", Path::new("."));
             assert_eq!(
                 cache_dir(),
                 home.clone(),
@@ -2221,7 +2231,7 @@ mod tests {
 
         // Empty → ignored (the original guard, preserved).
         {
-            let _g = CacheHomeGuard::set(Path::new(""));
+            let _x = EnvGuard::set("XDG_CACHE_HOME", Path::new(""));
             assert_eq!(
                 cache_dir(),
                 home.clone(),

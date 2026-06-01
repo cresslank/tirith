@@ -138,9 +138,12 @@ pub fn test(rule_id: &str, input: &str, shell: &str, json: bool) -> i32 {
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned());
                 let file_path = if context == ScanContext::FileScan {
-                    // Normalize `\`→`/` like the runtime FileScan path so
-                    // `file.path_matches` rules behave identically under test.
-                    Some(input.replace('\\', "/"))
+                    // Normalize `\`→`/` via the SAME shared helper the runtime
+                    // FileScan path uses (`tirith_core::util::normalize_path_separators`)
+                    // so `file.path_matches` rules behave byte-identically under
+                    // test (CodeRabbit M13 PR #132 F2). `--input` is treated as the
+                    // scanned path here.
+                    tirith_core::util::normalize_path_separators(Some(std::path::Path::new(input)))
                 } else {
                     None
                 };

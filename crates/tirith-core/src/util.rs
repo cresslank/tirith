@@ -553,6 +553,21 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
     dp[m][n]
 }
 
+/// Normalize a filesystem path's separators to forward slashes for the
+/// `file.path_matches` custom-rule DSL predicate.
+///
+/// DSL `file.path_matches` regexes are written with `/` separators (e.g.
+/// `(^|/)\.env(\.|$)`), so a Windows path like `C:\repo\.env` would never match
+/// without this normalization. Both the production FileScan path
+/// ([`crate::engine`]) and `tirith rule test` route their scanned path through
+/// here so the two use byte-identical normalization (CodeRabbit M13 PR #132).
+///
+/// Returns `Option<String>` to mirror the engine's `file_path_str` shape:
+/// `None` passes straight through (no path → no `file.path_matches` fact).
+pub fn normalize_path_separators(path: Option<&Path>) -> Option<String> {
+    path.map(|p| p.to_string_lossy().replace('\\', "/"))
+}
+
 #[cfg(test)]
 mod open_regular_tests {
     use super::{open_regular_capped, read_regular_capped, read_store_lines, OpenRegularError};
@@ -843,5 +858,50 @@ mod fsync_parent_dir_tests {
         // The genuine no-parent case (`/` has `parent() == None`) stays a
         // vacuous `Ok(())` no-op — there is no containing directory to fsync.
         fsync_parent_dir(Path::new("/")).expect("a path with no parent is a vacuous Ok no-op");
+    }
+}
+
+#[cfg(test)]
+mod normalize_path_separators_tests {
+    use super::normalize_path_separators;
+    use std::path::Path;
+
+    #[test]
+    fn backslashes_become_forward_slashes() {
+        assert_eq!(
+            normalize_path_separators(Some(Path::new(r"C:\repo\.env"))).as_deref(),
+            Some("C:/repo/.env"),
+            "Windows backslash separators must normalize to forward slashes so \
+             `file.path_matches` regexes (written with `/`) match"
+        );
+    }
+
+    #[test]
+    fn none_passes_through() {
+        assert_eq!(
+            normalize_path_separators(None),
+            None,
+            "no path → None, so there is no `file.path_matches` fact"
+        );
+    }
+
+    #[test]
+    fn mixed_separators_normalize_to_forward_slashes() {
+        assert_eq!(
+            normalize_path_separators(Some(Path::new(r"a/b\c/d\.env"))).as_deref(),
+            Some("a/b/c/d/.env"),
+            "mixed `/` and `\\` separators all normalize to `/`"
+        );
+    }
+
+    #[test]
+    fn plain_forward_slash_path_is_unchanged() {
+        // A POSIX path with no backslashes is returned byte-identical, so the
+        // common (non-Windows) FileScan path is behaviorally unchanged.
+        assert_eq!(
+            normalize_path_separators(Some(Path::new("src/secrets/.env"))).as_deref(),
+            Some("src/secrets/.env"),
+            "a path with no backslashes is returned unchanged"
+        );
     }
 }
