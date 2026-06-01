@@ -3212,34 +3212,6 @@ fn enrich_team(findings: &mut [Finding]) {
 mod tests {
     use super::*;
 
-    /// Snapshot an env var on construction and restore it on `Drop` — so a test
-    /// that must clear an ambient variable (e.g. a developer's `TIRITH_POLICY_ROOT`)
-    /// cannot leak its change into another test, even on panic. Mirrors the
-    /// `EnvVarGuard` in `policy.rs`'s test module. `std::env::set_var`/`remove_var`
-    /// are `rustc_deprecated_safe_2024`, hence the `unsafe` wrappers (edition 2021).
-    /// Pair with `crate::TEST_ENV_LOCK` to serialize env-mutating tests.
-    struct EnvVarGuard {
-        key: &'static str,
-        prev: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn unset(key: &'static str) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::remove_var(key) };
-            Self { key, prev }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
     /// CodeRabbit M13 finding C: package reputation must be a real tri-state
     /// through the engine's `build_dsl_backing`, not a collapsed boolean. With a
     /// DB LOADED we must be able to distinguish a malicious hit, a known-popular
@@ -3554,17 +3526,20 @@ mod tests {
         // (`C:\repo\.env`) must be normalized to `/` before the regex runs — else
         // the predicate would silently miss every Windows path.
         //
-        // ISOLATION (CodeRabbit M13 round-22): policy discovery checks
+        // ISOLATION (CodeRabbit M13 round-23): policy discovery checks
         // `TIRITH_POLICY_ROOT` BEFORE the cwd walk-up. If a developer's shell
         // exports it, `analyze` would load THAT policy instead of the temp repo
         // built below, and the custom rule would never load — making this test
-        // flaky/non-hermetic. Serialize via `TEST_ENV_LOCK` (other env-mutating
-        // tests do too) and clear `TIRITH_POLICY_ROOT` for the duration; the RAII
-        // guard restores the prior value on drop, even on panic.
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _policy_root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
+        // non-hermetic. Round-22 MUTATED the var (locked) for the test's duration,
+        // but other tests read `TIRITH_POLICY_ROOT` WITHOUT taking that lock, so
+        // even a briefly-mutated process-wide var races them. Match the existing
+        // "skip when set" pattern used by the other env-sensitive tests in this
+        // module (e.g. `exec_guard_on_fires_exec_in_tmp_off_fast_exits`): if the
+        // var is set we cannot control global env, so skip rather than mutate or
+        // assert falsely. In CI (where the var is unset) the test still runs fully.
+        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         // `.git` marks the repo root so `Policy::discover` stops walking here.

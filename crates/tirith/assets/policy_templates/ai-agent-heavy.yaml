@@ -23,6 +23,8 @@ strict_warn: true
 severity_overrides:
   curl_pipe_shell: CRITICAL
   wget_pipe_shell: CRITICAL
+  httpie_pipe_shell: CRITICAL
+  xh_pipe_shell: CRITICAL
   pipe_to_interpreter: HIGH
   shortened_url: HIGH
   docker_untrusted_registry: HIGH
@@ -33,6 +35,8 @@ approval_rules:
   - rule_ids:
       - curl_pipe_shell
       - wget_pipe_shell
+      - httpie_pipe_shell
+      - xh_pipe_shell
       - pipe_to_interpreter
     timeout_secs: 120
     fallback: block

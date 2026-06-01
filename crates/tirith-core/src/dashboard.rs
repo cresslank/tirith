@@ -296,6 +296,30 @@ fn top_hosts(records: &[AuditRecord]) -> Vec<(String, usize)> {
     hosts
 }
 
+/// Read cap for the discovered local policy file. A `.tirith/policy.yaml` is a
+/// small hand-authored document; 1 MiB is far above any legitimate size and
+/// bounds the in-memory buffer when the path is attacker-influenced.
+const POLICY_READ_CAP: u64 = 1024 * 1024;
+
+/// Read cap for a `trust.json` store. The dashboard only counts entries, so even
+/// a large store is bounded well under this for the snapshot's purposes.
+const TRUST_READ_CAP: u64 = 1024 * 1024;
+
+/// Render a [`crate::util::OpenRegularError`] as a short, human-readable reason
+/// for the dashboard's policy `error` state. `OpenRegularError` has no `Display`
+/// impl (callers elsewhere match its variants), so map each variant here, keeping
+/// the wording consistent with the FIFO/device/oversize hardening it reports.
+fn open_error_text(e: &crate::util::OpenRegularError) -> String {
+    match e {
+        crate::util::OpenRegularError::NotFound => "file not found".to_string(),
+        crate::util::OpenRegularError::NotRegularFile => {
+            "not a regular file (FIFO, device, socket, or directory)".to_string()
+        }
+        crate::util::OpenRegularError::TooLarge => "exceeds read cap".to_string(),
+        crate::util::OpenRegularError::Io(io) => io.to_string(),
+    }
+}
+
 /// Summarize the EFFECTIVE policy the engine enforces, while still surfacing a
 /// broken LOCAL policy file rather than masking it as benign defaults.
 ///
@@ -354,13 +378,34 @@ fn build_policy_summary(cwd: Option<&str>) -> PolicySummary {
     // would otherwise silently present).
     if let Some(path) = crate::policy::discover_local_policy_path(cwd) {
         let path_str = path.display().to_string();
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                if let Err(e) = crate::policy::Policy::try_parse_yaml(&content) {
-                    return policy_summary_error(path_str, e);
+        // HARDENED READ (CodeRabbit M13 PR #132 R23): `discover_local_policy_path`
+        // returns a repo-CONTROLLED path. A plain `std::fs::read_to_string` follows
+        // symlinks, applies no size cap, and would BLOCK on a FIFO/device — so a
+        // `.tirith/policy.yaml` symlinked at `/dev/zero` (or a multi-GiB file) could
+        // hang or OOM the render. Route through the shared, race-free
+        // `read_regular_capped`: it opens with `O_NONBLOCK`, `fstat`s the OPEN fd
+        // (rejecting non-regular files without blocking), and caps the body. Its
+        // error maps into the SAME `policy_summary_error` fail-closed state a read
+        // failure already produced, preserving the `path_str` context.
+        let content = match crate::util::read_regular_capped(&path, POLICY_READ_CAP) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    return policy_summary_error(
+                        path_str,
+                        format!("cannot read: not valid UTF-8: {e}"),
+                    )
                 }
+            },
+            Err(e) => {
+                return policy_summary_error(
+                    path_str,
+                    format!("cannot read: {}", open_error_text(&e)),
+                )
             }
-            Err(e) => return policy_summary_error(path_str, format!("cannot read: {e}")),
+        };
+        if let Err(e) = crate::policy::Policy::try_parse_yaml(&content) {
+            return policy_summary_error(path_str, e);
         }
     }
 
@@ -498,7 +543,16 @@ fn count_trust_entries(path: &Path) -> usize {
 /// entry advances past `now` before the check runs, hiding the `>` vs `>=`
 /// distinction).
 fn count_trust_entries_at(path: &Path, now: chrono::DateTime<chrono::Utc>) -> usize {
-    let Ok(content) = std::fs::read_to_string(path) else {
+    // HARDENED READ (CodeRabbit M13 PR #132 R23): `path` is a repo-CONTROLLED
+    // `.tirith/trust.json`. As with the policy read above, a plain
+    // `read_to_string` would follow a symlink to a FIFO/device (blocking the
+    // render) or apply no size cap. Route through the race-free
+    // `read_regular_capped`; a non-regular/oversize/unreadable file collapses to
+    // the SAME zero-count safe path a missing-or-unparseable file already takes.
+    let Ok(bytes) = crate::util::read_regular_capped(path, TRUST_READ_CAP) else {
+        return 0;
+    };
+    let Ok(content) = String::from_utf8(bytes) else {
         return 0;
     };
     let Ok(store) = serde_json::from_str::<TrustStoreFile>(&content) else {
@@ -1348,6 +1402,178 @@ mod tests {
         assert!(summary.path.is_some());
 
         // `_env` restores the full env set on drop — no manual cleanup needed.
+    }
+
+    #[test]
+    fn build_policy_summary_non_regular_policy_yields_safe_error() {
+        // CodeRabbit M13 PR #132 R23: the discovered policy path is repo-CONTROLLED.
+        // A NON-REGULAR file at `.tirith/policy.yaml` (here a DIRECTORY; `mkdir
+        // policy.yaml` is the simplest cross-platform non-regular) must surface the
+        // fail-closed `error` state via `read_regular_capped`'s `NotRegularFile`
+        // rejection — NOT panic, and NOT read as benign defaults. (`find_policy_in_dir`
+        // discovers any path that `.exists()`, directory included, so this exercises
+        // the hardened read.) Env is isolated exactly as the sibling broken-policy
+        // test so the developer's real user-config policy is never consulted.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let isolated_config = tempfile::tempdir().unwrap();
+        let cfg = isolated_config.path().as_os_str();
+        let _env = DashboardEnvGuard::apply(&[
+            ("XDG_CONFIG_HOME", Some(cfg)),
+            ("APPDATA", Some(cfg)),
+            ("LOCALAPPDATA", Some(cfg)),
+            ("HOME", Some(cfg)),
+            ("USERPROFILE", Some(cfg)),
+        ]);
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::create_dir_all(repo.path().join(".tirith")).unwrap();
+        // The policy "file" is a directory — a non-regular path.
+        std::fs::create_dir_all(repo.path().join(".tirith/policy.yaml")).unwrap();
+
+        let summary = build_policy_summary(Some(repo.path().to_str().unwrap()));
+        assert!(
+            summary.error.is_some(),
+            "a non-regular policy path must surface the fail-closed error state, \
+             not benign defaults: {summary:?}"
+        );
+        assert!(
+            summary.paranoia.is_none()
+                && summary.fail_mode.is_none()
+                && summary.allowlist_count.is_none(),
+            "numeric fields must be None when the policy did not load: {summary:?}"
+        );
+        let err = summary.error.unwrap();
+        assert!(
+            err.contains("not a regular file"),
+            "the error should explain the non-regular rejection; got {err:?}"
+        );
+        assert!(
+            summary.path.is_some(),
+            "the path that failed to load must still be reported"
+        );
+        // `_env` restores the full env set on drop.
+    }
+
+    #[test]
+    fn build_policy_summary_oversized_policy_yields_safe_error() {
+        // CodeRabbit M13 PR #132 R23: an OVERSIZED policy file (> POLICY_READ_CAP)
+        // must be refused by `read_regular_capped` BEFORE it is buffered, surfacing
+        // the fail-closed `error` state rather than reading the whole file into
+        // memory. We write one byte past the cap.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let isolated_config = tempfile::tempdir().unwrap();
+        let cfg = isolated_config.path().as_os_str();
+        let _env = DashboardEnvGuard::apply(&[
+            ("XDG_CONFIG_HOME", Some(cfg)),
+            ("APPDATA", Some(cfg)),
+            ("LOCALAPPDATA", Some(cfg)),
+            ("HOME", Some(cfg)),
+            ("USERPROFILE", Some(cfg)),
+        ]);
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::create_dir_all(repo.path().join(".tirith")).unwrap();
+        // One byte over the cap. The content is otherwise harmless YAML padding,
+        // proving rejection is on SIZE, not parse failure.
+        let oversized = vec![b' '; (POLICY_READ_CAP as usize) + 1];
+        std::fs::write(repo.path().join(".tirith/policy.yaml"), &oversized).unwrap();
+
+        let summary = build_policy_summary(Some(repo.path().to_str().unwrap()));
+        assert!(
+            summary.error.is_some(),
+            "an oversized policy file must be rejected (fail-closed error), \
+             not buffered and parsed: {summary:?}"
+        );
+        let err = summary.error.unwrap();
+        assert!(
+            err.contains("exceeds read cap"),
+            "the error should explain the size rejection; got {err:?}"
+        );
+        assert!(summary.path.is_some());
+        // `_env` restores the full env set on drop.
+    }
+
+    /// CodeRabbit M13 PR #132 R23: a FIFO at the discovered policy path would BLOCK
+    /// a plain `std::fs::read_to_string` forever waiting for a writer. The hardened
+    /// `read_regular_capped` opens with `O_NONBLOCK` and rejects the non-regular
+    /// target, so `build_policy_summary` returns PROMPTLY with the fail-closed error
+    /// state. If the guard regressed to a blocking read this test would HANG (caught
+    /// by the suite timeout). Unix-only (needs `mkfifo`).
+    #[cfg(unix)]
+    #[test]
+    fn build_policy_summary_fifo_policy_does_not_hang() {
+        use std::ffi::CString;
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let isolated_config = tempfile::tempdir().unwrap();
+        let cfg = isolated_config.path().as_os_str();
+        let _env = DashboardEnvGuard::apply(&[
+            ("XDG_CONFIG_HOME", Some(cfg)),
+            ("APPDATA", Some(cfg)),
+            ("LOCALAPPDATA", Some(cfg)),
+            ("HOME", Some(cfg)),
+            ("USERPROFILE", Some(cfg)),
+        ]);
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::create_dir_all(repo.path().join(".tirith")).unwrap();
+        let fifo = repo.path().join(".tirith/policy.yaml");
+        let c_path = CString::new(fifo.as_os_str().to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        if rc != 0 {
+            eprintln!("skipping: mkfifo unsupported here");
+            return;
+        }
+
+        // Must complete promptly; a blocking read on the writer-less FIFO would
+        // hang here. The non-regular FIFO surfaces the fail-closed error state.
+        let summary = build_policy_summary(Some(repo.path().to_str().unwrap()));
+        assert!(
+            summary.error.is_some(),
+            "a FIFO at the policy path must surface the error state (and not hang): {summary:?}"
+        );
+        assert!(summary.paranoia.is_none());
+        // `_env` restores the full env set on drop.
+    }
+
+    #[test]
+    fn count_trust_entries_non_regular_path_counts_zero() {
+        // CodeRabbit M13 PR #132 R23: `trust.json` is a repo-controlled path read by
+        // the dashboard. A NON-REGULAR path (here a directory) must collapse to the
+        // SAME zero-count safe path a missing/unparseable file takes — via
+        // `read_regular_capped`'s `NotRegularFile` rejection, never a panic or hang.
+        let dir = tempfile::tempdir().unwrap();
+        let trust = dir.path().join("trust.json");
+        std::fs::create_dir_all(&trust).unwrap();
+        assert_eq!(
+            count_trust_entries(&trust),
+            0,
+            "a non-regular trust.json must count as zero (safe), not panic"
+        );
+    }
+
+    #[test]
+    fn count_trust_entries_oversized_path_counts_zero() {
+        // CodeRabbit M13 PR #132 R23: an OVERSIZED trust.json (> TRUST_READ_CAP) is
+        // refused before buffering and counts as zero — the dashboard never reads an
+        // unbounded file into memory just to count entries.
+        let dir = tempfile::tempdir().unwrap();
+        let trust = dir.path().join("trust.json");
+        let oversized = vec![b' '; (TRUST_READ_CAP as usize) + 1];
+        std::fs::write(&trust, &oversized).unwrap();
+        assert_eq!(
+            count_trust_entries(&trust),
+            0,
+            "an oversized trust.json must count as zero (refused before buffering)"
+        );
     }
 
     #[test]

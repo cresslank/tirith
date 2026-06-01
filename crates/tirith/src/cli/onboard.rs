@@ -1136,43 +1136,38 @@ mod tests {
 
     // `HOME` / `USERPROFILE` are process-global and cargo runs unit tests in
     // parallel. The R11-3 tests that point the home base at a temp dir must not
-    // interleave: this mutex serialises them. The RAII [`HomeGuard`] sets and
-    // restores BOTH vars so a panicking test still cleans up. (Same pattern as
-    // `bash_capability`'s `StateHomeGuard`.)
-    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // interleave with each other OR with any OTHER env-mutating test in the
+    // crate. Rather than duplicate the crate-wide lock/guard, reuse
+    // `test_harness::{ENV_LOCK, EnvGuard}` — the SINGLE crate-wide HOME/env lock
+    // every other env-mutating test (`doctor`, `setup::tools`, ...) already
+    // serialises on. `HomeGuard` is now a thin RAII wrapper that holds the
+    // crate-wide lock plus two `EnvGuard`s (one each for `HOME` / `USERPROFILE`)
+    // so it still points BOTH vars at `dir` on every OS and restores them on
+    // Drop even if the test panics — identical behaviour, no duplicate locking.
+    use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
 
     struct HomeGuard {
-        prev_home: Option<std::ffi::OsString>,
-        prev_userprofile: Option<std::ffi::OsString>,
+        // Field order matters for Drop: the `EnvGuard`s must restore the env
+        // vars BEFORE the lock is released, so they precede `_lock` (Rust drops
+        // struct fields in declaration order).
+        _home: EnvGuard,
+        _userprofile: EnvGuard,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl HomeGuard {
         /// Point BOTH `HOME` (Unix) and `USERPROFILE` (Windows) at `dir` so
         /// [`home_base`] resolves there on every OS, isolated from the real home.
+        /// Acquires the crate-wide `ENV_LOCK` so no other env-mutating test can
+        /// race; the two `EnvGuard`s restore the prior values on Drop.
         fn set(dir: &Path) -> Self {
-            let lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prev_home = std::env::var_os("HOME");
-            let prev_userprofile = std::env::var_os("USERPROFILE");
-            std::env::set_var("HOME", dir);
-            std::env::set_var("USERPROFILE", dir);
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let home = EnvGuard::set("HOME", dir);
+            let userprofile = EnvGuard::set("USERPROFILE", dir);
             Self {
-                prev_home,
-                prev_userprofile,
+                _home: home,
+                _userprofile: userprofile,
                 _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            match &self.prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match &self.prev_userprofile {
-                Some(v) => std::env::set_var("USERPROFILE", v),
-                None => std::env::remove_var("USERPROFILE"),
             }
         }
     }
@@ -1199,7 +1194,7 @@ mod tests {
     /// `home::home_dir()` instead, and never echoes back the relative path.
     #[test]
     fn home_base_rejects_relative_home() {
-        let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_home = std::env::var_os("HOME");
         let prev_userprofile = std::env::var_os("USERPROFILE");
         // A clearly-relative override on every OS.
@@ -1242,7 +1237,7 @@ mod tests {
     /// path) or `None`, never `Some("")`.
     #[test]
     fn home_base_treats_empty_env_as_unset() {
-        let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_home = std::env::var_os("HOME");
         let prev_userprofile = std::env::var_os("USERPROFILE");
         std::env::set_var("HOME", "");

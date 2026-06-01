@@ -720,8 +720,8 @@ fn render_agent_policy_scaffold_yaml(scaffold: &AgentPolicyScaffold) -> String {
     s.push_str("# MCP `tools/call_check_*` handlers (`call_check_command`,\n");
     s.push_str("# `call_check_url`, `call_check_paste`). The interactive `TIRITH=0`\n");
     s.push_str("# bypass currently skips `agent_rules` (pinned by\n");
-    s.push_str("# `agent_rules_deny_skipped_under_tirith_bypass_today`); revisit\n");
-    s.push_str("# in M5.\n");
+    s.push_str("# `agent_rules_deny_skipped_under_tirith_bypass_today`); we plan\n");
+    s.push_str("# to revisit this in a future release.\n");
     s.push_str("#\n");
     s.push_str("# Trust model: every signal feeding AgentOrigin is OPERATOR-TRUST,\n");
     s.push_str("# never adversary-resistant — TIRITH_INTEGRATION, MCP clientInfo,\n");
@@ -824,7 +824,7 @@ fn print_policy_init_human(example_path: &Path, scaffold: &AgentPolicyScaffold) 
         );
         eprintln!("  Every entry is commented out — uncomment the ones you wish to declare.");
         eprintln!("  Enforcement is active on every analysis path: `tirith check`, the gateway, `paste`, `install`, `ecosystem scan`, and all MCP `tools/call_check_*` handlers.");
-        eprintln!("  The interactive `TIRITH=0` bypass currently skips `agent_rules` (pinned by `agent_rules_deny_skipped_under_tirith_bypass_today`); revisit in M5.");
+        eprintln!("  The interactive `TIRITH=0` bypass currently skips `agent_rules` (pinned by `agent_rules_deny_skipped_under_tirith_bypass_today`); we plan to revisit this in a future release.");
     }
     eprintln!("  wrote {}", example_path.display());
     println!("{}", example_path.display());
@@ -2044,6 +2044,28 @@ mod tests {
         assert!(
             body.contains("\\u001b"),
             "escaped ESC must be present: {body}"
+        );
+    }
+
+    /// CodeRabbit M13 PR #132 round-23 F2: the user-facing scaffold header must
+    /// use EVERGREEN wording for the `TIRITH=0`-bypass caveat — no stale milestone
+    /// reference ("revisit in M5") should ship in the generated example file. The
+    /// header block is emitted unconditionally, so any scaffold exercises it.
+    #[test]
+    fn policy_init_scaffold_header_uses_evergreen_wording() {
+        let scaffold = AgentPolicyScaffold {
+            audit_present: false,
+            log_path: "<unset>".to_string(),
+            origins: vec![],
+        };
+        let body = render_agent_policy_scaffold_yaml(&scaffold);
+        assert!(
+            !body.contains("M5"),
+            "scaffold header must not reference the M5 milestone: {body}"
+        );
+        assert!(
+            body.contains("we plan\n# to revisit this in a future release."),
+            "scaffold header must use the evergreen 'future release' wording: {body}"
         );
     }
 
