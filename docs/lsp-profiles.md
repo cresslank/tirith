@@ -13,12 +13,17 @@ When a document is opened or changed, the server:
 2. Runs the engine over the buffer once per **scan context** the profile names
    (`contexts_for`), **unions** the findings, and applies the profile's
    **retain** allow-set (`retains`) — keeping only the diagnostics that make
-   sense for that file type.
+   sense for that file type. The **Log file** profile is the one exception: a
+   `.log` buffer is captured command output, so it is analyzed through the M7
+   **output firewall** (`engine::analyze_output`) instead — selected by
+   `uses_output_analysis` — and the same `retains` allow-set is applied to the
+   resulting findings.
 3. Maps each retained finding to one LSP diagnostic (severity, message, the
    rule-id as `code`, source `tirith`, and a range — see below).
 
 `tirith lsp` adds **no new detection rules**. Every diagnostic it emits comes
-from a rule that already ships and is reachable today via the named context.
+from a rule that already ships and is reachable today via the named context (or,
+for the Log file profile, via the `analyze_output` output firewall).
 
 ## Profiles
 
@@ -27,7 +32,7 @@ from a rule that already ships and is reachable today via the named context.
 | **AI-config**         | `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, anything under `.claude/` / `.cursor/`, MCP server configs | `FileScan` **and** `Paste` | See [AI-config rule families](#ai-config-rule-families)       |
 | **Markdown install doc** | `README.md`, `INSTALL.md`, `INSTALLATION.md`, `getting-started.md`, and friends (a curated set — **not** every `.md`) | `Paste`                | See [Markdown install doc rule families](#markdown-install-doc-rule-families) |
 | **Source code**       | a curated source-extension set (`.rs`, `.py`, `.ts`, `.go`, `.sh`, …)        | `Paste`                | See [Source code rule families](#source-code-rule-families)  |
-| **Log file**          | the `.log` extension                                                         | `Paste`                | See [Log file rule families](#log-file-rule-families)        |
+| **Log file**          | the `.log` extension                                                         | `analyze_output` (output firewall) | See [Log file rule families](#log-file-rule-families)        |
 
 ### AI-config rule families
 
@@ -50,7 +55,18 @@ from a rule that already ships and is reachable today via the named context.
 
 ### Log file rule families
 
-- terminal byte-scan + prompt-injection over the raw bytes (best-effort — see the limitation below)
+A `.log` buffer is captured command output, so it is analyzed through the M7
+**output firewall** (`engine::analyze_output`) — where the output-direction
+rules fire (they fire **only** there, never on the `engine::analyze` path the
+other profiles use):
+
+- OSC 52 clipboard writes (`output_osc52_clipboard_write`)
+- hidden text in terminal output (`output_hidden_text`)
+- fake shell prompts (`output_fake_prompt`)
+- OSC 8 hyperlink mismatch (`output_terminal_hyperlink_mismatch`)
+- terminal-title manipulation (`output_title_manipulation`)
+- mid-stream screen clears (`output_clear_screen`)
+- truncated escape sequences at end-of-buffer (`output_truncated_escape_sequence`)
 
 ### Routing precedence
 
@@ -117,22 +133,15 @@ Severities map as: Critical / High → `Error`, Medium → `Warning`, Low →
 
 | limitation                          | detail                                                                                                                                                                                                 |
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Log-file diagnostics are partial** | See [Log-file diagnostics are partial](#log-file-diagnostics-are-partial) below.                                                                                                                                                                                                       |
 | **AI-config drift is out of scope**  | The drift rules `ai_config_hidden_instruction_added` / `ai_config_tool_use_escalation` compare a file against a last-known-safe **snapshot** (`tirith ai diff`). They cannot fire on a single in-editor buffer with no snapshot to diff against, so the LSP never produces them (they remain in the AI-config retain set only so a future snapshot-aware client keeps them if present). |
 | **Whole-document ranges**            | As above — findings without byte-offset evidence are reported against the whole document rather than a precise span.                                                                                    |
 | **No quick-fixes / code actions**    | v1 publishes diagnostics only. It does not offer code actions, hovers, or completions.                                                                                                                  |
 
-### Log-file diagnostics are partial
-
-The M7 `output_*` rules (OSC-52 clipboard writes, fake prompts, hidden text in
-terminal output, hyperlink mismatch, title manipulation, …) fire **only**
-through `engine::analyze_output`, never through the `engine::analyze` path the
-LSP per-document loop uses. So a `.log` file surfaces only the terminal
-byte-scan + prompt-injection subset that `analyze` produces in `Paste`. A
-LogFile-aware client that wants the true `output_*` diagnostics must route the
-buffer through `analyze_output` and apply the same retain allow-set; the LSP
-server does not do this in v1 because forcing a second, divergent analysis path
-for one file type was judged more fragile than documenting the gap.
+> **Note:** Log-file diagnostics are **no longer** a v1 limitation. A `.log`
+> buffer is captured command output, so the server now analyzes it through the
+> M7 output firewall (`engine::analyze_output`) — the semantically-correct
+> analyzer for an output stream — where the `output_*` direction rules fire. See
+> [Log file rule families](#log-file-rule-families).
 
 ## Running it
 

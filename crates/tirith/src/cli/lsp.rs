@@ -14,7 +14,13 @@
 //!   [`contexts_for`](tirith_core::lsp_profiles::contexts_for) the buffer is run
 //!   through [`engine::analyze`], the findings are UNIONed, and the per-profile
 //!   [`retains`](tirith_core::lsp_profiles::retains) allow-set is applied. (Only
-//!   `AiConfig` uses two contexts — see that module's docs.)
+//!   `AiConfig` uses two contexts — see that module's docs.) The ONE exception
+//!   is the `LogFile` profile: a `.log` buffer is captured command output, so it
+//!   is analyzed via the M7 output firewall
+//!   ([`engine::analyze_output`](tirith_core::engine::analyze_output)) instead —
+//!   selected by
+//!   [`uses_output_analysis`](tirith_core::lsp_profiles::uses_output_analysis) —
+//!   and the SAME `retains` allow-set is applied to its findings.
 //! * Each retained [`Finding`] becomes one LSP [`Diagnostic`]. A finding whose
 //!   evidence carries a BYTE OFFSET into the buffer
 //!   ([`Evidence::ByteSequence`] / [`Evidence::HomoglyphAnalysis`]) gets a
@@ -30,16 +36,19 @@
 //! * Only `didOpen` / `didChange` drive analysis. Sync kind is FULL: every
 //!   change notification carries the entire document text, so each re-analysis
 //!   is self-contained from the notification alone (no server-side text cache).
-//! * LogFile diagnostics are best-effort: the M7 `output_*` rules fire only via
-//!   `engine::analyze_output`, not `analyze`, so the `analyze`+`Paste` path used
-//!   here surfaces the terminal/prompt-injection subset only. See
-//!   `docs/lsp-profiles.md`.
+//! * A `.log` buffer is CAPTURED COMMAND OUTPUT, so it is analyzed through the
+//!   M7 OUTPUT FIREWALL (`engine::analyze_output`) rather than the per-context
+//!   `analyze` path the other profiles use — that is where the `output_*`
+//!   direction rules (OSC 52 clipboard writes, fake prompts, hidden text, …)
+//!   fire. The server selects this via
+//!   [`lsp_profiles::uses_output_analysis`](tirith_core::lsp_profiles::uses_output_analysis).
+//!   See `docs/lsp-profiles.md`.
 //! * AI-config DRIFT rules need a snapshot diff (`tirith ai diff`) and cannot
 //!   fire on a single buffer.
 
 use std::path::{Path, PathBuf};
 
-use tirith_core::engine::{self, AnalysisContext};
+use tirith_core::engine::{self, AnalysisContext, OutputContext};
 use tirith_core::extract::ScanContext;
 use tirith_core::lsp_profiles;
 use tirith_core::tokenize::ShellType;
@@ -224,6 +233,27 @@ pub fn diagnostics_for(path: &Path, text: &str) -> Vec<Diagnostic> {
         return Vec::new();
     };
 
+    // LogFile profile: a `.log` buffer is CAPTURED COMMAND OUTPUT, so it is
+    // analyzed through the M7 OUTPUT FIREWALL (`engine::analyze_output`) — the
+    // semantically-correct analyzer for an output stream and the ONLY path on
+    // which the `output_*` direction rules (OSC 52 clipboard writes, fake
+    // prompts, hidden text, …) fire. This path runs ONCE (no per-context union;
+    // the output pipeline is a single byte-scan over the whole buffer) and is
+    // mutually exclusive with the `analyze` loop below. The same `retains`
+    // allow-set and the same finding→diagnostic mapping (byte-offset→Position
+    // where the evidence carries an offset — OSC 52 etc. do — else whole-doc)
+    // are applied. No dedup is needed: a single analysis pass cannot produce the
+    // cross-context duplicate the `analyze` union has to collapse.
+    if lsp_profiles::uses_output_analysis(profile) {
+        let verdict = engine::analyze_output(text, OutputContext::default());
+        return verdict
+            .findings
+            .into_iter()
+            .filter(|f| lsp_profiles::retains(profile, f.rule_id))
+            .map(|f| finding_to_diagnostic(&f, text))
+            .collect();
+    }
+
     // Analyze once PER context (only AiConfig has >1), UNION the findings, then
     // keep only those the profile retains.
     //
@@ -377,12 +407,30 @@ fn finding_to_diagnostic(finding: &Finding, text: &str) -> Diagnostic {
 fn finding_range(finding: &Finding, text: &str) -> Range {
     if let Some(offset) = first_byte_offset(finding) {
         let start = byte_offset_to_position(text, offset);
-        // Highlight a single code unit at the offset so the squiggle is visible
-        // rather than zero-width; the exact extent of the suspicious bytes is
-        // not always carried, and a 1-unit marker reads well in every editor.
+        // Highlight the FULL Unicode scalar at the offset so the squiggle is
+        // visible rather than zero-width, and — critically — so the end never
+        // lands MID-surrogate-pair (an invalid LSP range). The byte offset is
+        // clamped to the buffer the same way `byte_offset_to_position` clamps,
+        // then snapped UP to a char boundary (an offset inside a multi-byte
+        // char snaps to that char's start, matching `byte_offset_to_position`'s
+        // "not-yet-passed" convention), so `chars().next()` reads the scalar the
+        // `start` position points at. Advance by its `len_utf16()` (2 units for
+        // an astral scalar, 1 for BMP) — so an astral char's squiggle covers the
+        // whole surrogate pair, not half of it. If no char sits at the offset
+        // (offset at/past end), fall back to a 1-unit marker.
+        let clamped = offset.min(text.len());
+        let mut boundary = clamped;
+        while boundary < text.len() && !text.is_char_boundary(boundary) {
+            boundary += 1;
+        }
+        let units = text[boundary..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf16() as u32)
+            .unwrap_or(1);
         let end = Position {
             line: start.line,
-            character: start.character.saturating_add(1),
+            character: start.character.saturating_add(units),
         };
         Range { start, end }
     } else {
@@ -893,6 +941,58 @@ mod tests {
         );
     }
 
+    // --- F1: LogFile surfaces output-direction diagnostics via analyze_output -
+
+    /// F1 acceptance: a `.log` buffer carrying an OUTPUT-DIRECTION pattern (an
+    /// OSC 52 clipboard-write escape) yields ≥1 diagnostic. This proves the
+    /// LogFile profile is routed through `engine::analyze_output` (the output
+    /// firewall) — the `output_*` rules fire ONLY there, never on the
+    /// `engine::analyze` path the other profiles use — and that the `retains`
+    /// allow-set keeps the `output_osc52_clipboard_write` finding. The OSC 52
+    /// evidence carries a byte offset, so the diagnostic also gets a precise
+    /// (non-whole-document) range.
+    #[test]
+    fn log_file_osc52_clipboard_write_produces_diagnostic() {
+        // `\x1b]52;c;<base64>\x07` — a silent system-clipboard write embedded in
+        // a captured log line. (Same shape as the `extract.rs` OSC 52 fixtures.)
+        let body = "starting up\n\u{1b}]52;c;aGVsbG8=\u{07}done\n";
+        let diags = diagnostics_for(Path::new("server.log"), body);
+        assert!(
+            !diags.is_empty(),
+            "a .log buffer with an OSC 52 clipboard-write must yield ≥1 diagnostic; got none"
+        );
+        for d in &diags {
+            assert_eq!(d.source.as_deref(), Some("tirith"));
+            assert!(matches!(d.code, Some(NumberOrString::String(_))));
+        }
+        let codes = codes_of(&diags);
+        assert!(
+            codes.iter().any(|c| c == "output_osc52_clipboard_write"),
+            "expected output_osc52_clipboard_write; got {codes:?}"
+        );
+        // The OSC 52 finding carries a ByteSequence offset → a precise range on
+        // the line where the escape sits (NOT the whole document).
+        let osc = diags
+            .iter()
+            .find(|d| matches!(&d.code, Some(NumberOrString::String(s)) if s == "output_osc52_clipboard_write"))
+            .unwrap();
+        assert!(
+            osc.range.end.character > osc.range.start.character,
+            "a ranged diagnostic must be non-empty"
+        );
+    }
+
+    /// A benign `.log` (plain captured output, no escape sequences) yields no
+    /// diagnostics — the output firewall does not false-positive on prose.
+    #[test]
+    fn benign_log_file_yields_no_diagnostics() {
+        let body = "2026-06-01 INFO starting up\n2026-06-01 INFO listening on :8080\n";
+        assert!(
+            diagnostics_for(Path::new("app.log"), body).is_empty(),
+            "a benign .log must yield no diagnostics"
+        );
+    }
+
     // --- byte_offset_to_position: cross-line + inside-char (gap) ------------
 
     /// A multibyte char on a NON-ZERO line: the UTF-16 column must reset to 0
@@ -932,5 +1032,62 @@ mod tests {
             pos(0, 4),
             "must never land mid-surrogate-pair (col 4)"
         );
+    }
+
+    // --- F2: ranged-diagnostic end must cover a full astral scalar -----------
+
+    /// F2 regression: a finding whose byte offset points at an ASTRAL char
+    /// (`𝐀`, U+1D400 — a surrogate pair = 2 UTF-16 units) must produce an
+    /// `end.character` that is `start + 2` (the full surrogate pair), NOT
+    /// `start + 1` (which would land MID-surrogate-pair, an invalid LSP range).
+    /// A BMP char stays `start + 1`.
+    #[test]
+    fn finding_range_covers_full_astral_scalar_not_half() {
+        // Layout (bytes): a[0] 𝐀[1..5] b[5]  — the astral char starts at byte 1.
+        let text = "a\u{1D400}b";
+        assert_eq!(text.len(), 6, "sanity: byte length of the fixture");
+        let astral = byte_seq_finding(1);
+        let r = finding_range(&astral, text);
+        // start sits after 'a' (1 UTF-16 unit).
+        assert_eq!(r.start, pos(0, 1));
+        // end advances by the astral scalar's 2 surrogate units → col 3, NOT
+        // col 2 (which would split the surrogate pair).
+        assert_eq!(
+            r.end,
+            pos(0, 3),
+            "astral end must cover the full surrogate pair (start+2), not start+1"
+        );
+        assert_ne!(
+            r.end,
+            pos(0, 2),
+            "end must never land mid-surrogate-pair (start+1)"
+        );
+
+        // And a BMP char (U+00E9 'é', 1 UTF-16 unit) stays start+1.
+        let bmp_text = "a\u{00E9}b";
+        let bmp = byte_seq_finding(1);
+        let rb = finding_range(&bmp, bmp_text);
+        assert_eq!(rb.start, pos(0, 1));
+        assert_eq!(rb.end, pos(0, 2), "a BMP char advances the end by 1 unit");
+    }
+
+    /// A `ByteSequence`-evidence finding pointing at byte `offset`, for the
+    /// ranged-diagnostic tests above.
+    fn byte_seq_finding(offset: usize) -> Finding {
+        Finding {
+            rule_id: RuleId::BidiControls,
+            severity: Severity::High,
+            title: "t".into(),
+            description: String::new(),
+            evidence: vec![Evidence::ByteSequence {
+                offset,
+                hex: String::new(),
+                description: String::new(),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }
     }
 }

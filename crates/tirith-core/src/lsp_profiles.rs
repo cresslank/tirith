@@ -65,10 +65,14 @@ pub enum LspProfile {
     /// A source file (`.rs`, `.py`, `.ts`, …). Surfaces Unicode-confusable /
     /// bidi / zero-width terminal rules plus credential leaks.
     SourceCode,
-    /// A `.log` file. Targets the M7 output-direction rules — but note these
-    /// fire only via [`crate::engine::analyze_output`], so they are NOT
-    /// surfaced on the LSP's per-document `analyze` path (PARTIAL/best-effort in
-    /// v1; see [`scan_context_for`]).
+    /// A `.log` file — captured command output. Analyzed through the M7 OUTPUT
+    /// FIREWALL ([`crate::engine::analyze_output`]), the semantically-correct
+    /// analyzer for an output stream, so the `output_*` direction rules (OSC 52
+    /// clipboard writes, fake prompts, hidden text, hyperlink mismatch, …)
+    /// actually surface. The LSP server signals this routing via
+    /// [`uses_output_analysis`]; [`contexts_for`] / [`scan_context_for`] are not
+    /// consulted for this profile (it does not take the per-context `analyze`
+    /// path). See [`retains`] for the allow-set.
     LogFile,
 }
 
@@ -185,15 +189,15 @@ pub fn profile_for_path(path: &Path) -> Option<LspProfile> {
 ///   the invisible-char subset and drops ANSI / control. `credential::check`
 ///   fires in both Exec and Paste (it only no-ops for `FileScan`).
 ///
-/// * [`LspProfile::LogFile`] → [`ScanContext::Paste`]. DOCUMENTED LIMITATION
-///   (see [`retains`]): the M7 `output_*` rules fire ONLY from
-///   [`crate::engine::analyze_output`], never from `engine::analyze` in ANY
-///   context. Since the LSP per-document path calls `analyze`, the `output_*`
-///   family is not reachable on a single buffer through `analyze`. `Paste` is
-///   the best-fit `analyze` context for a log (terminal byte-scan + prompt-
-///   injection over the raw bytes); a LogFile-aware LSP server that wants the
-///   true `output_*` diagnostics must route the buffer through `analyze_output`
-///   instead and apply the same [`retains`] allow-set.
+/// * [`LspProfile::LogFile`] → [`ScanContext::Paste`]. NOTE: the LogFile profile
+///   does NOT actually take the per-context `analyze` path — a `.log` buffer is
+///   captured command output, so the LSP server routes it through the M7 OUTPUT
+///   FIREWALL ([`crate::engine::analyze_output`]) instead, where the `output_*`
+///   direction rules live (they fire ONLY from `analyze_output`, never from
+///   `engine::analyze`). The server selects that path via
+///   [`uses_output_analysis`]. The `Paste` value returned here is therefore only
+///   a harmless default for the one-context accessor; it is not consulted for
+///   this profile. See [`retains`] for the (output-direction) allow-set.
 pub fn scan_context_for(profile: LspProfile) -> ScanContext {
     // The first (primary) element of `contexts_for` — single source of truth so
     // the one-context accessor can never drift from the multi-context list.
@@ -237,8 +241,28 @@ pub fn contexts_for(profile: LspProfile) -> &'static [ScanContext] {
         LspProfile::AiConfig => &[ScanContext::FileScan, ScanContext::Paste],
         LspProfile::MarkdownInstallDoc => &[ScanContext::Paste],
         LspProfile::SourceCode => &[ScanContext::Paste],
+        // LogFile does NOT take the per-context `analyze` path (see
+        // `uses_output_analysis`); this value is an unused harmless default kept
+        // only so the one-context accessor (`scan_context_for`) stays total.
         LspProfile::LogFile => &[ScanContext::Paste],
     }
+}
+
+/// Whether the LSP server should analyze this profile's buffer through the M7
+/// OUTPUT FIREWALL ([`crate::engine::analyze_output`]) instead of the per-context
+/// [`crate::engine::analyze`] path that [`contexts_for`] drives.
+///
+/// `true` ONLY for [`LspProfile::LogFile`]: a `.log` buffer is captured command
+/// output, and the `output_*` direction rules ([`retains`] for the list) fire
+/// ONLY from `analyze_output`, never from `engine::analyze` in any
+/// [`ScanContext`]. Every other profile analyzes via `analyze` (`false`), so for
+/// them [`contexts_for`] selects the rule families and this returns `false`.
+///
+/// The two paths are mutually exclusive: when this is `true` the server runs
+/// `analyze_output` ONCE and ignores [`contexts_for`]; when `false` it runs the
+/// `contexts_for` + `analyze` union. Both apply the same [`retains`] allow-set.
+pub fn uses_output_analysis(profile: LspProfile) -> bool {
+    matches!(profile, LspProfile::LogFile)
 }
 
 /// Whether a `rule_id` is RETAINED in the diagnostics for a given profile — the
@@ -352,10 +376,12 @@ pub fn retains(profile: LspProfile, rule_id: RuleId) -> bool {
             | RuleId::PrivateKeyExposed
         ),
 
-        // Log files: the M7 output-direction rules. NOTE: these are reachable
-        // only via `analyze_output` (see the limitation in `scan_context_for`),
-        // so on the `analyze`+`Paste` path the LSP surfaces nothing here unless
-        // the server routes the buffer through `analyze_output`.
+        // Log files: the M7 output-direction rules. These fire ONLY via
+        // `engine::analyze_output` (never `engine::analyze`), so the LSP server
+        // routes a `.log` buffer through that output-firewall path —
+        // `uses_output_analysis(LogFile)` is `true` — and applies this allow-set
+        // to the resulting findings. (A `.log` IS captured command output, so
+        // the output firewall is the semantically-correct analyzer.)
         LspProfile::LogFile => matches!(
             rule_id,
             RuleId::OutputOsc52ClipboardWrite
@@ -583,5 +609,23 @@ mod tests {
         assert!(retains(LspProfile::LogFile, RuleId::OutputFakePrompt));
         // An unrelated rule is not a log diagnostic.
         assert!(!retains(LspProfile::LogFile, RuleId::CredentialInText));
+    }
+
+    #[test]
+    fn uses_output_analysis_is_logfile_only() {
+        // LogFile is the ONLY profile analyzed via the output firewall
+        // (`analyze_output`); every other profile takes the per-context
+        // `analyze` path.
+        assert!(uses_output_analysis(LspProfile::LogFile));
+        for p in [
+            LspProfile::AiConfig,
+            LspProfile::MarkdownInstallDoc,
+            LspProfile::SourceCode,
+        ] {
+            assert!(
+                !uses_output_analysis(p),
+                "{p:?} must NOT use output analysis (takes the analyze path)"
+            );
+        }
     }
 }

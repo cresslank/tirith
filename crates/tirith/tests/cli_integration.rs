@@ -14792,6 +14792,7 @@ fn lsp_stdio_initialize_didopen_didchange_lifecycle() {
     use std::io::{Read, Write};
     use std::process::Stdio;
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     // Assemble the punycode homograph host at runtime so the literal never
@@ -14945,6 +14946,10 @@ fn lsp_stdio_initialize_didopen_didchange_lifecycle() {
 
     let mut stdin = child.stdin.take().expect("server stdin");
     let stdout = child.stdout.take().expect("server stdout");
+    // Share ownership of the process so the watchdog (below) can `kill()` a hung
+    // server on timeout instead of leaking it. The waiter thread gets a clone of
+    // the Arc; the parent keeps `child_arc` to kill+reap on the timeout branch.
+    let child_arc = Arc::new(Mutex::new(child));
     let rx = spawn_reader(stdout);
 
     // ---- 1+2. initialize → assert capabilities, then `initialized` --------
@@ -15119,9 +15124,26 @@ fn lsp_stdio_initialize_didopen_didchange_lifecycle() {
 
     // Bound the exit wait with a watchdog: a server that fails to exit on
     // `exit` would otherwise hang the suite. Kill + fail fast on timeout.
+    //
+    // The waiter polls `try_wait` and releases the Mutex between polls (never
+    // holding the lock across a blocking call), so on a timeout the parent can
+    // still acquire the lock to `kill()` the hung process — no double-`wait`
+    // deadlock.
     let (etx, erx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = etx.send(child.wait());
+    let waiter_arc = Arc::clone(&child_arc);
+    std::thread::spawn(move || loop {
+        let polled = waiter_arc.lock().unwrap().try_wait();
+        match polled {
+            Ok(Some(status)) => {
+                let _ = etx.send(Ok(status));
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => {
+                let _ = etx.send(Err(e));
+                return;
+            }
+        }
     });
     match erx.recv_timeout(Duration::from_secs(20)) {
         Ok(status) => {
@@ -15133,7 +15155,12 @@ fn lsp_stdio_initialize_didopen_didchange_lifecycle() {
             );
         }
         Err(_) => {
-            panic!("tirith lsp did not exit within 20s of `exit` — transport shutdown regressed")
+            // Timed out: the server hung. Kill it so we don't leak the process
+            // into CI, then reap it, before failing the test.
+            let mut guard = child_arc.lock().unwrap();
+            let _ = guard.kill(); // ignore: it may have just exited
+            let _ = guard.wait(); // reap the (now-dead) child
+            panic!("LSP server did not exit within 20s of `exit` — transport shutdown regressed")
         }
     }
 }
