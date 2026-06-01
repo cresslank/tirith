@@ -842,14 +842,40 @@ fn normalize_ecosystem(s: &str) -> String {
 }
 
 /// Heuristic: does this look like a Windows path? `true` for a leading
-/// drive-letter spec (`C:\…`, `c:/…`) or a UNC/`//`-rooted path. Windows file
-/// systems are case-insensitive, so such paths are lowercased before lexical
-/// comparison; POSIX paths are left untouched because they ARE case-sensitive.
+/// drive-letter spec (`C:\…`, `c:/…`, or even drive-RELATIVE `C:rel`) or a
+/// UNC/`//`-rooted path. Windows file systems are case-insensitive, so such
+/// paths are lowercased before lexical comparison; POSIX paths are left
+/// untouched because they ARE case-sensitive.
+///
+/// NOTE: this matches drive-RELATIVE forms like `C:relative` (no separator), so
+/// it must NOT be used to decide root-containment — use
+/// [`is_windows_absolute_path`] there. It is only used for case-normalization,
+/// where treating a drive-relative path as "Windows" (and thus lower-casing it)
+/// is harmless.
 fn looks_like_windows_path(s: &str) -> bool {
     let bytes = s.as_bytes();
-    // Drive letter: `X:` followed by a separator (or end of string).
+    // Drive letter: `X:` (possibly followed by anything, incl. nothing).
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         return true;
+    }
+    // UNC / double-separator root (already back-slash-normalized to `/`).
+    s.starts_with("//")
+}
+
+/// `true` only when `s` is an ABSOLUTE Windows path: a drive letter + `:`
+/// followed by a separator (slash/backslash) OR end-of-string (`C:/…`, `c:\…`,
+/// bare `C:`), or a leading `//` UNC / double-separator root. Unlike
+/// [`looks_like_windows_path`], this rejects drive-RELATIVE forms like
+/// `C:relative` (a path relative to the drive's current directory), which are
+/// NOT absolute and must not be treated as root-contained (CodeRabbit M13
+/// round-19 custom_rule_dsl.rs:884-891).
+fn is_windows_absolute_path(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    // Drive letter root: `X:` then a separator, or `X:` at end of string.
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        // (Back-slashes are normalized to `/` before this is reached, but accept
+        // both so the helper is correct independent of that pre-pass.)
+        return bytes.len() == 2 || bytes[2] == b'/' || bytes[2] == b'\\';
     }
     // UNC / double-separator root (already back-slash-normalized to `/`).
     s.starts_with("//")
@@ -886,8 +912,11 @@ fn path_is_under(path: &str, base: &str) -> bool {
         // `normalize_for_lexical_path_match` a POSIX absolute and a `//`-rooted
         // UNC share both start with `/`, and a Windows drive path is `c:/…`. An
         // empty or relative `path` is NOT root-contained (CodeRabbit M13
-        // round-15 custom_rule_dsl.rs:810).
-        return path.starts_with('/') || looks_like_windows_path(path);
+        // round-15 custom_rule_dsl.rs:810). Use the strict
+        // `is_windows_absolute_path` (NOT `looks_like_windows_path`, which also
+        // matches drive-RELATIVE `c:rel`) so a non-absolute path is never treated
+        // as root-contained (CodeRabbit M13 round-19 custom_rule_dsl.rs:884-891).
+        return path.starts_with('/') || is_windows_absolute_path(path);
     }
     if path == base {
         return true;
@@ -1531,6 +1560,54 @@ any:
             !path_is_under("relative/sub", "/"),
             "relative path is not root-contained"
         );
+    }
+
+    #[test]
+    fn test_path_is_under_root_sentinel_rejects_drive_relative() {
+        // CodeRabbit M13 round-19 custom_rule_dsl.rs:884-891: the old root
+        // sentinel used `looks_like_windows_path`, which also matches drive-
+        // RELATIVE forms (`C:relative` — relative to the drive's current dir, NOT
+        // absolute), so a non-absolute path was wrongly treated as root-contained.
+        // Drive-letter ABSOLUTES still count:
+        assert!(
+            path_is_under("C:/x", "/"),
+            "drive-letter absolute (with separator) is root-contained"
+        );
+        assert!(
+            path_is_under("C:", "/"),
+            "bare drive root `C:` is an absolute root and is root-contained"
+        );
+        // But a drive-RELATIVE path is NOT absolute, so NOT root-contained:
+        assert!(
+            !path_is_under("C:relative", "/"),
+            "drive-relative `C:relative` (no separator after the colon) is NOT \
+             absolute and must not be root-contained"
+        );
+        // And a bare relative path is still not root-contained:
+        assert!(
+            !path_is_under("relative", "/"),
+            "bare relative path is not root-contained"
+        );
+    }
+
+    #[test]
+    fn test_is_windows_absolute_path() {
+        // Drive-letter ABSOLUTES (separator or end-of-string).
+        assert!(is_windows_absolute_path("C:/x"));
+        assert!(is_windows_absolute_path(r"C:\x"));
+        assert!(is_windows_absolute_path("C:")); // bare drive root
+        assert!(is_windows_absolute_path("c:/x")); // lower-case drive letter
+                                                   // UNC / double-separator root.
+        assert!(is_windows_absolute_path("//host/share"));
+        // Drive-RELATIVE (no separator after colon) is NOT absolute.
+        assert!(!is_windows_absolute_path("C:relative"));
+        // POSIX and bare-relative inputs are not Windows-absolute.
+        assert!(!is_windows_absolute_path("/home/x")); // POSIX absolute, handled by `starts_with('/')`
+        assert!(!is_windows_absolute_path("relative"));
+        assert!(!is_windows_absolute_path(""));
+        // `looks_like_windows_path` is the LOOSER check and DOES match drive-
+        // relative — confirming why the strict variant is needed for the sentinel.
+        assert!(looks_like_windows_path("C:relative"));
     }
 
     #[test]

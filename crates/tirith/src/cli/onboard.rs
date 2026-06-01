@@ -329,6 +329,12 @@ fn detect_ai_config(root: &Path) -> Vec<String> {
             found.push(".cursor/rules/".to_string());
         }
     }
+    // Sort for a STABLE order (R19-N1): the themed `.clinerules-*` / `.roorules-*`
+    // glob above is driven by `std::fs::read_dir`, whose iteration order is
+    // OS-/filesystem-dependent and non-deterministic. Without this sort the
+    // `onboard --json` report's `ai_config_files` array could reorder run-to-run
+    // on the same tree. Sorting makes the serialized output deterministic.
+    found.sort();
     found
 }
 
@@ -435,6 +441,11 @@ fn detect_mcp_configs(root: &Path) -> Vec<String> {
             found.push(windsurf.display().to_string());
         }
     }
+    // Sort for a STABLE order (R19-N1). The repo-local matches are already produced
+    // in a fixed order from `MCP_CONFIG_RELATIVE_PATHS`, but sorting keeps the
+    // serialized `mcp_configs` array deterministic regardless of how the home
+    // windsurf path interleaves, matching `detect_ai_config`'s contract.
+    found.sort();
     found
 }
 
@@ -977,6 +988,80 @@ mod tests {
             template,
             PolicyTemplate::AiAgentHeavy,
             "a repo with multiple broader AI-config signals must recommend ai-agent-heavy"
+        );
+    }
+
+    /// R19-N1: the detected `ai_config_files` list must be SORTED so the
+    /// `onboard --json` report is deterministic. `detect_ai_config` globs themed
+    /// `.clinerules-*` / `.roorules-*` via `read_dir`, whose iteration order is
+    /// OS-/filesystem-dependent — without the sort, planting several such files
+    /// (plus the deterministic basename + `.claude/` / `.cursor/rules/` entries)
+    /// could yield a different array order from one run to the next. Plant a
+    /// multi-file tree spanning all three code paths and assert the result is in
+    /// sorted order.
+    #[test]
+    fn detect_ai_config_is_sorted_for_stable_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // Basename-loop entries (deterministic source order in AI_CONFIG_BASENAMES,
+        // chosen here so their natural order differs from sorted order).
+        std::fs::write(root.join("CLAUDE.md"), "x\n").unwrap();
+        std::fs::write(root.join(".cursorrules"), "x\n").unwrap();
+        std::fs::write(root.join("AGENTS.md"), "x\n").unwrap();
+        // read_dir-driven themed rules — the non-deterministic source.
+        std::fs::write(root.join(".clinerules-security"), "x\n").unwrap();
+        std::fs::write(root.join(".clinerules-perf"), "x\n").unwrap();
+        std::fs::write(root.join(".roorules-review"), "x\n").unwrap();
+        // Directory-signal entries appended after the loops.
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::create_dir_all(root.join(".cursor").join("rules")).unwrap();
+        std::fs::write(root.join(".cursor").join("rules").join("a.mdc"), "rule\n").unwrap();
+
+        let found = detect_ai_config(root);
+        let mut sorted = found.clone();
+        sorted.sort();
+        assert_eq!(
+            found, sorted,
+            "ai_config_files must be returned in sorted order for deterministic JSON, got: {found:?}"
+        );
+        // Sanity: the multi-source tree really did populate all three paths.
+        assert!(found.iter().any(|f| f == "CLAUDE.md"));
+        assert!(found.iter().any(|f| f == ".clinerules-security"));
+        assert!(found.iter().any(|f| f == ".claude/"));
+        assert!(found.iter().any(|f| f == ".cursor/rules/"));
+    }
+
+    /// R19-N1: the `mcp_configs` list is likewise returned sorted, so the
+    /// `onboard --json` report's `mcp_configs` array is deterministic. Plant
+    /// several repo-local MCP configs (whose un-sorted order follows the
+    /// `MCP_CONFIG_RELATIVE_PATHS` table) and assert the result is sorted.
+    #[test]
+    fn detect_mcp_configs_is_sorted_for_stable_json() {
+        let repo = tempfile::tempdir().expect("repo");
+        let root = repo.path();
+        // Plant a few repo-local MCP configs whose table order is NOT sorted order
+        // (`.vscode/mcp.json` precedes `.cursor/mcp.json` in the table but sorts
+        // after it lexically).
+        std::fs::write(root.join("mcp.json"), "{}\n").unwrap();
+        std::fs::create_dir_all(root.join(".vscode")).unwrap();
+        std::fs::write(root.join(".vscode").join("mcp.json"), "{}\n").unwrap();
+        std::fs::create_dir_all(root.join(".cursor")).unwrap();
+        std::fs::write(root.join(".cursor").join("mcp.json"), "{}\n").unwrap();
+
+        // Isolate the home base so a runner's real ~/.codeium can't leak in.
+        let home = tempfile::tempdir().expect("home");
+        let _guard = HomeGuard::set(home.path());
+
+        let found = detect_mcp_configs(root);
+        let mut sorted = found.clone();
+        sorted.sort();
+        assert_eq!(
+            found, sorted,
+            "mcp_configs must be returned in sorted order for deterministic JSON, got: {found:?}"
+        );
+        assert!(
+            found.len() >= 3,
+            "expected the three planted repo-local MCP configs, got: {found:?}"
         );
     }
 

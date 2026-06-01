@@ -1419,6 +1419,66 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // `agent block` — semantic predicate-flag rejection (R12-2 / R19-N4)
+    // -----------------------------------------------------------------------
+
+    /// R19-N4 (unit-level companion to the `cli_integration` end-to-end test):
+    /// `block()` must REJECT any of the M13 ch5 semantic predicate flags
+    /// (`--filesystem-write` / `--network` / `--secrets-access`) with a non-zero
+    /// (1) exit and the "not enforced" message, because `agent_rules` matching is
+    /// `(kind, name)` only — minting a snippet carrying a predicate would silently
+    /// widen the deny to EVERY command for that origin. Calling `block` directly
+    /// (rather than spawning the binary) pins the decision at the unit boundary so
+    /// a refactor of the gate is caught without depending on the CLI harness.
+    /// We use `json = false`, so the rejection path only `eprintln!`s (captured by
+    /// the test harness) and returns 1 — no stdout snippet is produced.
+    #[test]
+    fn block_rejects_semantic_predicate_flags() {
+        // Each predicate set INDIVIDUALLY must trip the gate.
+        for (fs_w, net, sec) in [
+            (Some("repo_only"), None, None),
+            (None, Some("block"), None),
+            (None, None, Some("block")),
+            // And in combination.
+            (Some("repo_only"), Some("block"), Some("block")),
+        ] {
+            let rc = block(
+                "agent",
+                Some("codex"),
+                "sudo *",
+                fs_w,
+                net,
+                sec,
+                /* json = */ false,
+            );
+            assert_eq!(
+                rc, 1,
+                "a predicate flag (fs={fs_w:?}, net={net:?}, sec={sec:?}) must be rejected with exit 1"
+            );
+        }
+    }
+
+    /// R19-N4 (the converse): with NO predicate flags set, `block()` accepts a
+    /// well-formed matcher and returns 0 — proving the gate fires ONLY on the
+    /// unenforced predicates, not on every `block` invocation.
+    #[test]
+    fn block_with_no_predicate_flags_succeeds() {
+        let rc = block(
+            "agent",
+            Some("codex"),
+            "sudo *",
+            None,
+            None,
+            None,
+            /* json = */ false,
+        );
+        assert_eq!(
+            rc, 0,
+            "a block with no predicate flags and a valid (kind, name, pattern) must succeed (exit 0)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // sessions
     // -----------------------------------------------------------------------
 

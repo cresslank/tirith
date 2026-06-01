@@ -22,6 +22,17 @@ fn tirith() -> Command {
 /// unsplittable token).
 fn assert_help_has_examples(args: &[&str], expected_substring: &str) {
     let out = tirith().args(args).output().expect("failed to run tirith");
+    // R19-N2: clap's `--help` is a successful invocation and exits 0. Assert the
+    // status FIRST — a `--help` that errored out (e.g. a malformed `after_help`
+    // template panicking, or the subcommand being dropped so the arg is rejected
+    // with exit 2) would otherwise pass the stdout content checks vacuously on an
+    // empty/partial body. Pinning success catches that regression class.
+    assert!(
+        out.status.success(),
+        "{args:?} --help should exit successfully (clap --help exits 0), got status {:?}\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("Examples:"),

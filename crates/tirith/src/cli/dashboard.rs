@@ -317,10 +317,21 @@ fn resolve_export_path(out: Option<&str>) -> Result<PathBuf, String> {
 /// repo-internal hostnames / paths even after redaction, so it should be
 /// "private by default" (mirrors `incident report --out`).
 ///
+/// Atomic publish (M13 PR #132 finding R19-N3): the bytes are written to a
+/// sibling temp file in the SAME directory, `sync_all`'d, then renamed over
+/// `path` — via the shared [`crate::cli::write_file_atomic`] helper. A mid-write
+/// failure (disk full, crash) therefore can no longer truncate or corrupt a
+/// previously-good export at `path`: a reader sees either the old complete file
+/// or the new complete file, never a partial one.
+///
 /// Platform split (M13 PR #132 finding R12-3):
 ///
-/// * **Unix** — the file is created and re-chmodded to `0600` so only the owner
-///   can read it, regardless of any pre-existing world-readable file at `path`.
+/// * **Unix** — `write_file_atomic`'s temp file is created `0600`
+///   (`tempfile::NamedTempFile`'s default mode) and the rename carries that
+///   permission onto the destination, so the published report is owner-only
+///   regardless of any pre-existing world-readable file at `path`. The 0600 mode
+///   is applied to the temp file BEFORE the rename publishes it, so sensitive
+///   content never lands in a world-readable file even momentarily.
 /// * **Non-Unix (Windows)** — `std` has no portable equivalent of `chmod 0600`
 ///   without an extra crate, so we do NOT apply an explicit restriction. We do
 ///   NOT fail closed: the default destination (`%USERPROFILE%\Documents`) is
@@ -332,35 +343,13 @@ fn resolve_export_path(out: Option<&str>) -> Result<PathBuf, String> {
 ///   possible future enhancement; it is intentionally out of scope here to
 ///   avoid adding a dependency.)
 fn write_html_file(path: &Path, html: &str) -> Result<(), String> {
-    use std::io::Write as _;
-
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-        }
-    }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts
-        .open(path)
-        .map_err(|e| format!("open {}: {e}", path.display()))?;
-    // Re-assert 0600 even when overwriting a pre-existing (possibly
-    // world-readable) file: `mode()` only applies on CREATE. We chmod BEFORE the
-    // body write so a chmod failure aborts before sensitive content lands in a
-    // file we could not lock down (mirrors audit.rs / incident.rs).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("chmod 0600 {}: {e}", path.display()))?;
-    }
-    f.write_all(html.as_bytes())
+    // Atomic temp+fsync+rename via the shared helper. `overwrite = true` replaces
+    // an existing export (the operator asked to (re)write this report). On Unix
+    // the temp file is mode 0600 by default and the rename preserves that mode, so
+    // the published file is owner-only even if a world-readable file existed at
+    // `path` before. `write_file_atomic` also creates any missing parent dirs (it
+    // places the temp file beside the resolved destination).
+    crate::cli::write_file_atomic(path, html.as_bytes(), /* overwrite = */ true)
         .map_err(|e| format!("write {}: {e}", path.display()))?;
 
     // On platforms without Unix file modes we could not apply an explicit
@@ -839,6 +828,81 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = resolve_export_path(Some(dir.path().to_str().unwrap())).unwrap();
         assert_eq!(p, dir.path().join("dashboard.html"));
+    }
+
+    /// R19-N3: a successful export lands the COMPLETE rendered HTML at `path`
+    /// (no truncation) and, on Unix, the published file is owner-only `0600` —
+    /// the atomic temp+fsync+rename via `write_file_atomic` must preserve both
+    /// the byte content and the restrictive mode through the rename. Also assert
+    /// no stray `.tmp*` sibling is left behind in the directory.
+    #[test]
+    fn write_html_file_lands_intact_bytes_and_0600_perms() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dashboard.html");
+        // Distinctive multi-line body so a truncating/partial write would be
+        // visible as a short read.
+        let html = "<html>\n<body>tirith dashboard export — intact?</body>\n</html>\n";
+
+        write_html_file(&path, html).expect("export must succeed");
+
+        // Byte-for-byte intact.
+        let read_back = std::fs::read(&path).expect("read exported file");
+        assert_eq!(
+            read_back,
+            html.as_bytes(),
+            "exported file must contain the complete HTML, untruncated"
+        );
+
+        // No temp sibling left over — the rename published the temp file.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "dashboard.html")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp/partial files should remain after a successful export, found: {leftovers:?}"
+        );
+
+        // Owner-only on Unix: the rename must carry the temp file's 0600 mode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "exported report must be owner-only 0600, got {mode:o}"
+            );
+        }
+    }
+
+    /// R19-N3 (the core preservation guarantee): a SECOND successful export over
+    /// an existing file replaces it atomically with the new complete content and
+    /// keeps the 0600 mode — i.e. re-exporting never leaves a half-written file.
+    #[test]
+    fn write_html_file_overwrite_preserves_intact_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dashboard.html");
+
+        write_html_file(&path, "<html>old</html>\n").expect("first export");
+        let new_html = "<html>\nnew and longer content here\n</html>\n";
+        write_html_file(&path, new_html).expect("second export");
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            new_html.as_bytes(),
+            "re-export must atomically replace with the complete new content"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "re-exported report must remain 0600, got {mode:o}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
