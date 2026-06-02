@@ -1163,13 +1163,8 @@ fn is_service_loaded() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::test_harness::ENV_LOCK;
     use tirith_core::verdict::Action;
-
-    /// Serializes the tests that mutate the process-wide `XDG_STATE_HOME`
-    /// env var (which `state_dir()` reads) so they cannot race each other
-    /// under the parallel test runner. Mirrors `CONTEXT_TEST_LOCK` in
-    /// `crates/tirith-core/tests/golden_fixtures.rs`.
-    static SIDECAR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Regression test for the M12 paste-sidecar finding (CodeRabbit Major):
     /// `copy()` analyzes the contents of a LOCAL FILE being copied TO the
@@ -1194,7 +1189,12 @@ mod tests {
         use tirith_core::clipboard::{content_sha256_hex, ClipboardSourceState};
         use tirith_core::verdict::RuleId;
 
-        let _lock = SIDECAR_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // This test mutates the process-wide `XDG_STATE_HOME` (read by
+        // `state_dir()`). Hold the SINGLE crate-wide `ENV_LOCK` — the same lock
+        // every other env-mutating CLI test uses — so it can't race a sibling
+        // that sets `HOME`/`XDG_*` under a DIFFERENT mutex (a private lock would
+        // only serialize against itself, not against the shared-lock tests).
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         // An input that pipes to a shell (so it reaches tier 3) and carries a
         // destination host (`evil.example`) that differs from the recorded
@@ -1216,7 +1216,7 @@ mod tests {
         std::fs::write(tirith_state.join("clipboard_source.json"), record_json).unwrap();
 
         let prev_xdg = std::env::var_os("XDG_STATE_HOME");
-        // SAFETY: serialized via SIDECAR_TEST_LOCK; restored below.
+        // SAFETY: serialized via ENV_LOCK; restored below.
         unsafe {
             std::env::set_var("XDG_STATE_HOME", state_dir.display().to_string());
         }
@@ -1226,7 +1226,7 @@ mod tests {
         let absent = analyze_as_paste(input, ClipboardSourceState::AbsentOrInvalid);
         let unread = analyze_as_paste(input, ClipboardSourceState::Unread);
 
-        // SAFETY: serialized via SIDECAR_TEST_LOCK.
+        // SAFETY: serialized via ENV_LOCK.
         unsafe {
             match prev_xdg {
                 Some(v) => std::env::set_var("XDG_STATE_HOME", v),
