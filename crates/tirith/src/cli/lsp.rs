@@ -171,16 +171,20 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let version = Some(params.text_document.version);
+        let uri = params.text_document.uri;
         // FULL sync → the last content change holds the complete new text.
         let Some(change) = params.content_changes.into_iter().next_back() else {
+            // Defensive: an empty `contentChanges` is non-conforming under FULL
+            // sync, but if one arrives, CLEAR this document's diagnostics rather
+            // than leaving stale squiggles visible (Greptile P2) — never silently
+            // keep a stale result.
+            self.client
+                .publish_diagnostics(uri, Vec::new(), version)
+                .await;
             return;
         };
-        self.analyze_and_publish(
-            params.text_document.uri,
-            change.text,
-            Some(params.text_document.version),
-        )
-        .await;
+        self.analyze_and_publish(uri, change.text, version).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {

