@@ -14106,6 +14106,62 @@ fn lsp_stdio_initialize_didopen_didchange_lifecycle() {
         "a non-file URI has no path to profile → empty diagnostics, and the server must stay alive; got {untitled_note}"
     );
 
+    // ---- 5.5. didOpen an OVER-CAP document → a VISIBLE "not scanned" notice,
+    // NOT a silent empty set (a security tool must never render "not scanned"
+    // as "clean"). End-to-end coverage of the async over-cap publish path. ----
+    let huge_uri = url::Url::from_file_path(dir.path().join("huge.md"))
+        .expect("huge.md → file URI")
+        .to_string();
+    // Just over the 10 MiB analysis cap (`scan::MAX_FILE_SIZE`).
+    let huge_text = "x".repeat(11 * 1024 * 1024);
+    let did_open_huge = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": huge_uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": huge_text,
+            }
+        }
+    })
+    .to_string();
+    write_msg(&mut stdin, &did_open_huge);
+
+    let huge_note = wait_for(
+        &rx,
+        30,
+        "publishDiagnostics (over-cap didOpen)",
+        is_publish_for(&huge_uri),
+    );
+    let huge_diags = huge_note["params"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    assert_eq!(
+        huge_diags.len(),
+        1,
+        "an over-cap document must publish exactly one 'not scanned' notice, not a silent empty set; got {huge_note}"
+    );
+    let notice = &huge_diags[0];
+    assert_eq!(
+        notice["severity"].as_i64(),
+        Some(3),
+        "the over-cap notice must be INFORMATION (LSP severity 3); got {notice}"
+    );
+    assert!(
+        notice["code"].as_str().is_none(),
+        "the over-cap notice carries no rule-id code (it is a notice, not a finding); got {notice}"
+    );
+    assert_eq!(notice["source"].as_str(), Some("tirith"));
+    assert!(
+        notice["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("NOT scanned"),
+        "the notice message must say the file was NOT scanned; got {notice}"
+    );
+
     // ---- 6. shutdown → exit → assert a clean rc 0 within a timeout --------
 
     write_msg(
