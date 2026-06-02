@@ -2079,7 +2079,9 @@ elif [[ $rc -eq 2 ]]; then echo WARN
 elif [[ $rc -eq 1 ]]; then echo BLOCK
 else echo UNEXPECTED; fi
 "#;
-    let out = Command::new("zsh").args(["-c", script]).output();
+    // `-f` (NO_RCS): skip the machine's `~/.zshenv` so a broken user startup
+    // file can't make `zsh -c` exit before our script runs (keeps it hermetic).
+    let out = Command::new("zsh").args(["-f", "-c", script]).output();
     match out {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -8827,6 +8829,10 @@ fn temp_run_creates_file_in_temp_dir_not_cwd() {
     let out = tirith()
         .args(["temp-run", "--json", "--", "touch foo.txt"])
         .current_dir(&workdir)
+        // Pin the child shell: `temp-run` runs the command through `$SHELL`, so
+        // a broken interactive `$SHELL` on the test host would make this
+        // non-hermetic. `/bin/sh` is always present on unix.
+        .env("SHELL", "/bin/sh")
         .output()
         .expect("failed to run tirith");
 
@@ -8875,6 +8881,9 @@ fn temp_run_creates_file_in_temp_dir_not_cwd() {
 fn temp_run_smoke_true_emits_isolation_kind() {
     let out = tirith()
         .args(["temp-run", "--json", "--", "true"])
+        // Pin the child shell (see `temp_run_creates_file_in_temp_dir_not_cwd`):
+        // `temp-run` executes via `$SHELL`; `/bin/sh` keeps the test hermetic.
+        .env("SHELL", "/bin/sh")
         .output()
         .expect("failed to run tirith");
 
