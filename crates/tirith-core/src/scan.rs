@@ -130,12 +130,15 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     }
 }
 
+/// Maximum analyzable content size: 10 MiB. Large enough for any realistic
+/// config/source file, small enough that a hostile `.git/objects/pack-*.pack`
+/// (or a huge editor buffer opened via the LSP server) won't blow us up.
+/// Exposed so the file-scan path here and the in-memory LSP document path
+/// (`tirith` crate `cli::lsp`) enforce the SAME ceiling from one definition.
+pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
 /// Scan a single file and return its results.
 pub fn scan_single_file(file_path: &Path) -> Option<FileScanResult> {
-    // 10 MiB cap — large enough for any realistic config/source file but
-    // small enough that a hostile `.git/objects/pack-*.pack` won't blow us up.
-    const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
-
     let metadata = match std::fs::metadata(file_path) {
         Ok(m) => m,
         Err(e) => {

