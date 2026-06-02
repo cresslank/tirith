@@ -720,7 +720,7 @@ struct QuickDoctorInfo {
     policy_path_used: Option<String>,
     /// Whether the tirith shell hook is configured in the detected shell's
     /// profile. Mirrors the full report's `hook_configured`.
-    hook_active: bool,
+    hook_configured: bool,
 }
 
 /// Gather ONLY the three cheap fields the quick status path needs. This is the
@@ -732,11 +732,11 @@ struct QuickDoctorInfo {
 /// - `protection_mode`: derived from `TIRITH_STATUS` (one env read).
 /// - `policy_path_used`: the active local policy path, via the same
 ///   `discover_local_policy_path` the engine uses (existence checks only).
-/// - `hook_active`: `check_shell_profile` for the detected shell (one profile
+/// - `hook_configured`: `check_shell_profile` for the detected shell (one profile
 ///   read).
 fn gather_quick_info() -> QuickDoctorInfo {
     let detected_shell = crate::cli::init::detect_shell().to_string();
-    let (_profile, hook_active) = check_shell_profile(&detected_shell, "tirith: doctor:");
+    let (_profile, hook_configured) = check_shell_profile(&detected_shell, "tirith: doctor:");
 
     let tirith_status = std::env::var("TIRITH_STATUS")
         .ok()
@@ -756,7 +756,7 @@ fn gather_quick_info() -> QuickDoctorInfo {
         schema_version: 1,
         protection_mode,
         policy_path_used,
-        hook_active,
+        hook_configured,
     }
 }
 
@@ -782,7 +782,7 @@ fn print_quick_human(info: &QuickDoctorInfo) {
     println!("  protection:   {}", info.protection_mode);
     println!(
         "  hook:         {}",
-        if info.hook_active {
+        if info.hook_configured {
             "configured"
         } else {
             "NOT CONFIGURED"
@@ -3751,7 +3751,7 @@ mod tests {
     }
 
     /// The quick JSON has EXACTLY the documented field set — the four keys
-    /// `schema_version`, `protection_mode`, `policy_path_used`, `hook_active`
+    /// `schema_version`, `protection_mode`, `policy_path_used`, `hook_configured`
     /// and nothing else (the extension contract must stay minimal/stable).
     #[test]
     fn quick_json_has_exactly_the_documented_fields() {
@@ -3759,7 +3759,7 @@ mod tests {
             schema_version: 1,
             protection_mode: "guarded".to_string(),
             policy_path_used: Some("/repo/.tirith/policy.yaml".to_string()),
-            hook_active: true,
+            hook_configured: true,
         };
         let v: serde_json::Value = serde_json::to_value(&info).expect("serialize QuickDoctorInfo");
         let obj = v.as_object().expect("quick JSON is an object");
@@ -3768,7 +3768,7 @@ mod tests {
         assert_eq!(
             keys,
             [
-                "hook_active",
+                "hook_configured",
                 "policy_path_used",
                 "protection_mode",
                 "schema_version"
@@ -3776,7 +3776,10 @@ mod tests {
             "quick JSON must carry exactly the documented field set"
         );
         // Field types are the contract the extension parses.
-        assert!(obj["hook_active"].is_boolean(), "hook_active must be bool");
+        assert!(
+            obj["hook_configured"].is_boolean(),
+            "hook_configured must be bool"
+        );
         assert!(
             obj["protection_mode"].is_string(),
             "protection_mode must be a string"
@@ -3789,7 +3792,7 @@ mod tests {
     }
 
     /// `policy_path_used` is `null` (serializes to JSON null) when no policy is
-    /// discovered, and `hook_active` is a real bool.
+    /// discovered, and `hook_configured` is a real bool.
     #[test]
     fn gather_quick_info_null_policy_when_none_discovered() {
         with_fake_env(true, |_home, _cwd| {
@@ -3810,8 +3813,8 @@ mod tests {
                 v["policy_path_used"].is_null(),
                 "absent policy must serialize as JSON null"
             );
-            // hook_active is a genuine bool regardless of value.
-            let _: bool = info.hook_active;
+            // hook_configured is a genuine bool regardless of value.
+            let _: bool = info.hook_configured;
         });
     }
 
@@ -3898,7 +3901,7 @@ mod tests {
                 info.policy_path_used.is_none(),
                 "no policy planted → None (proves no DB/baseline side-channel set it)"
             );
-            let _: bool = info.hook_active;
+            let _: bool = info.hook_configured;
         });
     }
 
@@ -3918,7 +3921,7 @@ mod tests {
             let s = serde_json::to_string_pretty(&info).expect("serialize");
             let parsed: serde_json::Value = serde_json::from_str(&s).expect("quick JSON parses");
             assert_eq!(parsed["protection_mode"], "degraded");
-            assert!(parsed["hook_active"].is_boolean());
+            assert!(parsed["hook_configured"].is_boolean());
             assert!(parsed["policy_path_used"].is_null());
             assert_eq!(parsed["schema_version"], serde_json::json!(1));
 

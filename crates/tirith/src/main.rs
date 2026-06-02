@@ -1218,7 +1218,7 @@ Examples:
         )]
         bundle: bool,
 
-        /// Fast status only (protection_mode, policy_path_used, hook_active);
+        /// Fast status only (protection_mode, policy_path_used, hook_configured);
         /// skips DB/log/baseline probes. Read-only and safe to poll (the VS
         /// Code extension polls `--quick --format json` ~every 30s). Compatible
         /// with --format json / --json; mutually exclusive with the mutating

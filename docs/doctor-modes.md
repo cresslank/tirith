@@ -54,7 +54,7 @@ The JSON object is intentionally minimal and stable — exactly these fields:
 | `schema_version`  | integer          | Version of this payload's shape. Currently `1`. Bumped only on a breaking change to the field set or meaning.                                                                                                  |
 | `protection_mode` | string           | Live protection mode derived from the hook-exported `TIRITH_STATUS`. One of `guarded`, `warn-only`, `degraded`, or `off`. An unrecognized status value is passed through verbatim for forward compatibility.   |
 | `policy_path_used`| string or `null` | The single policy file the engine would load for the current directory, or `null` when none is discovered. Existence-based discovery only — never a network fetch.                                            |
-| `hook_active`     | boolean          | Whether the tirith shell hook is configured in the detected shell's profile.                                                                                                                                   |
+| `hook_configured` | boolean          | Whether the tirith shell hook is configured in the detected shell's profile.                                                                                                                                   |
 
 Example:
 
@@ -63,7 +63,7 @@ Example:
   "schema_version": 1,
   "protection_mode": "guarded",
   "policy_path_used": "/path/to/repo/.tirith/policy.yaml",
-  "hook_active": true
+  "hook_configured": true
 }
 ```
 
