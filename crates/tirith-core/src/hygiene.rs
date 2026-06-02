@@ -82,7 +82,8 @@ impl HygieneFinding {
     }
 }
 
-/// Scan the real home dir + cwd repo root. Empty if home cannot be resolved.
+/// Scan the real home dir + cwd repo root. With no home dir, falls back to the
+/// cwd repo root alone; empty only if neither resolves.
 pub fn scan() -> Vec<HygieneFinding> {
     let home = home::home_dir();
     let cwd = std::env::current_dir().ok();
