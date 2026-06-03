@@ -546,9 +546,74 @@ fn is_ascii_nearby(input: &[u8], offset: usize) -> bool {
     input[start..end].iter().any(|b| b.is_ascii_alphabetic())
 }
 
-/// `true` when the confusable char and ASCII letters share a word (no boundary
-/// between them): "gіthub" → true, "Note: Привет" → false.
+/// `true` when the confusable char at `offset` shares a "word" with ASCII
+/// letters — no boundary between the two:
+/// - `gіthub` → true (Cyrillic `і` mixed into a Latin word — the attack shape).
+/// - `Note: Привет`, `echo Привет` → false (whitespace/`:` boundary; the
+///   Cyrillic word has no ASCII).
+/// - `Rustを使う。` → false (the Hiragana terminates the word, so the `。`
+///   confusable is isolated from `Rust`). Fixes #126.
+/// - `…/filename_Отсканированный_документ.pdf` → false (path/`_` separators
+///   isolate the pure-Cyrillic segments). Fixes #134.
+///
+/// Boundaries are script-aware: any non-alphanumeric ASCII byte (whitespace,
+/// punctuation, and identifier/path separators like `/ _ . -`), plus any
+/// character whose Unicode script is outside the confusable-bearing set
+/// {Latin, Cyrillic, Greek, Common, Inherited} — so Han/Hiragana/Katakana/
+/// Hangul/Thai/Arabic/… terminate a word. The word is suspicious only if, after
+/// trimming at those boundaries, it still contains an ASCII letter.
 fn is_same_word_as_ascii(input: &[u8], offset: usize) -> bool {
+    use unicode_script::{Script, UnicodeScript};
+
+    // Chars that stay *inside* a word. Non-alphanumeric ASCII and any
+    // non-confusable-bearing script are boundaries that split it.
+    fn is_word_char(ch: char) -> bool {
+        if ch.is_ascii() {
+            return ch.is_ascii_alphanumeric();
+        }
+        matches!(
+            ch.script(),
+            Script::Latin | Script::Cyrillic | Script::Greek | Script::Common | Script::Inherited
+        )
+    }
+
+    let Ok(text) = std::str::from_utf8(input) else {
+        // Non-UTF-8 buffer (e.g. a binary file): fall back to the conservative
+        // ASCII-only boundary scan so we never silently stop flagging.
+        return same_word_as_ascii_bytes(input, offset);
+    };
+    if offset > text.len() || !text.is_char_boundary(offset) {
+        return false;
+    }
+
+    // Expand left to the start of the word (the confusable itself is covered by
+    // the forward pass below).
+    let mut word_start = offset;
+    for (i, ch) in text[..offset].char_indices().rev() {
+        if !is_word_char(ch) {
+            break;
+        }
+        word_start = i;
+    }
+
+    // Expand right to the end of the word.
+    let mut word_end = offset;
+    for (i, ch) in text[offset..].char_indices() {
+        if !is_word_char(ch) {
+            break;
+        }
+        word_end = offset + i + ch.len_utf8();
+    }
+
+    text.as_bytes()[word_start..word_end]
+        .iter()
+        .any(|b| b.is_ascii_alphabetic())
+}
+
+/// Conservative ASCII-only fallback used only when the scanned buffer is not
+/// valid UTF-8 (binary content): only ASCII whitespace/punctuation breaks a
+/// word. Over-flags rather than under-flags, matching the prior heuristic.
+fn same_word_as_ascii_bytes(input: &[u8], offset: usize) -> bool {
     fn is_word_boundary(b: u8) -> bool {
         matches!(
             b,

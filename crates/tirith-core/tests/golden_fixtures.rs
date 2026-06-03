@@ -1502,6 +1502,11 @@ fn test_non_ascii_paste_not_sole_warn() {
         "Ünïcödé",
         "こんにちは世界",
         "مرحبا",
+        // #126: Japanese with an embedded Latin word + ideographic period / fullwidth Latin.
+        "Rustを使う。",
+        "RustのＡＰＩを呼ぶ",
+        // #134: a local path whose filename segment is a non-English (Cyrillic) word.
+        "/tmp/backup_сервер.log",
     ];
 
     for input in &non_ascii_inputs {

@@ -469,3 +469,36 @@ input = "echo \u041F\u0440\u0438\u0432\u0435\u0442"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# Regression for #126: ordinary Japanese (Latin word "Rust" + Hiragana/Kanji
+# "wo tsukau" + ideographic period U+3002). U+3002 is a confusable for ".", but
+# the surrounding Hiragana terminates the word, isolating it from "Rust".
+[[fixture]]
+name = "confusable_text_benign_cjk_ascii_word"
+min_milestone = 4
+input = "Rust\u3092\u4F7F\u3046\u3002"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+
+# Regression for #126: fullwidth Latin (U+FF21 A / U+FF30 P / U+FF29 I) inside
+# Japanese text ("Rust no API wo yobu"). The fullwidth letters are confusables,
+# but bounded by Hiragana they form their own non-ASCII word with no ASCII letter.
+[[fixture]]
+name = "confusable_text_benign_cjk_fullwidth"
+min_milestone = 4
+input = "Rust\u306E\uFF21\uFF30\uFF29\u3092\u547C\u3076"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+
+# Regression for #134: a Cyrillic filename segment in a local path. The path/`_`
+# separators isolate the pure-Cyrillic word "server" (U+0441 U+0435 U+0440
+# U+0432 U+0435 U+0440) from the ASCII segments, so it is not mixed-into-ASCII.
+[[fixture]]
+name = "confusable_text_benign_cyrillic_path"
+min_milestone = 4
+input = "/tmp/backup_\u0441\u0435\u0440\u0432\u0435\u0440.log"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
