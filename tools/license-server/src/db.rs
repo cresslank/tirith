@@ -257,19 +257,30 @@ impl Db {
                 }
             }
 
-            tx.execute(
-                "INSERT INTO pending_receipts (receipt_secret, subscription_id, api_key_enc, api_key_nonce, token, checkout_id, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now', '+1 hour'))",
-                params![
-                    data.receipt_secret,
-                    data.subscription_id,
-                    data.api_key_enc,
-                    data.api_key_nonce,
-                    if revoked == 0 { data.token.as_deref() } else { None },
-                    data.checkout_id,
-                ],
-            )
-            .map_err(|e| AppError::Internal(format!("db insert receipt: {e}")))?;
+            // A pending_receipts row is the one-time browser-delivery vehicle,
+            // looked up by checkout_id at /receipt/lookup. Only create it when
+            // we have a real checkout_id. For checkout-less subscriptions
+            // (checkout_id is None) there is no browser checkout redirect to
+            // deliver through, and a row keyed by a guessable placeholder (the
+            // old "unknown" value) would be raceable via
+            // /receipt/lookup?checkout=unknown. The key/token/subscription are
+            // still provisioned above; out-of-band subscribers use the API key
+            // with `tirith license refresh`.
+            if let Some(ref checkout_id) = data.checkout_id {
+                tx.execute(
+                    "INSERT INTO pending_receipts (receipt_secret, subscription_id, api_key_enc, api_key_nonce, token, checkout_id, expires_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now', '+1 hour'))",
+                    params![
+                        data.receipt_secret,
+                        data.subscription_id,
+                        data.api_key_enc,
+                        data.api_key_nonce,
+                        if revoked == 0 { data.token.as_deref() } else { None },
+                        checkout_id,
+                    ],
+                )
+                .map_err(|e| AppError::Internal(format!("db insert receipt: {e}")))?;
+            }
 
             tx.commit().map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
             if revoked == 1 {
@@ -472,19 +483,22 @@ impl Db {
                 return Ok(UpdatedOutcome::Duplicate);
             }
 
-            // Read previous status BEFORE any writes so the terminal guard
-            // below can compare against the real prior state.
-            let prev_status: Option<String> = tx
+            // Read previous status AND last_event_at BEFORE any writes so the
+            // terminal and ordering guards below can compare against the real
+            // prior state.
+            let prev_row: Option<(String, Option<String>)> = tx
                 .query_row(
-                    "SELECT status FROM subscriptions WHERE id=?1",
+                    "SELECT status, last_event_at FROM subscriptions WHERE id=?1",
                     params![data.subscription_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
                 .map_err(|e| AppError::Internal(format!("db read prev: {e}")))?;
+            let prev_status = prev_row.as_ref().map(|(s, _)| s.as_str());
+            let prev_last_event_at = prev_row.as_ref().and_then(|(_, t)| t.as_deref());
 
             // revoked absorbs every non-revoked transition.
-            if prev_status.as_deref() == Some("revoked") && data.new_status != "revoked" {
+            if prev_status == Some("revoked") && data.new_status != "revoked" {
                 tx.execute(
                     "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, ?2)",
                     params![data.event_id, data.event_type],
@@ -492,6 +506,31 @@ impl Db {
                 .map_err(|e| AppError::Internal(format!("db mark event: {e}")))?;
                 tx.commit().map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
                 return Ok(UpdatedOutcome::TerminalIgnored);
+            }
+
+            // Out-of-order guard: a stale/reordered genuine event whose
+            // occurred_at predates the row's last_event_at must not overwrite
+            // the status or touch the `revoked` flag. Without this, an older
+            // `active` arriving after `past_due`/`revoked` would re-enable a
+            // key that was correctly disabled by the newer event.
+            //
+            // last_event_at is only ever stored from a Polar event's
+            // `created_at` (the same source as occurred_at), so both sides use
+            // the identical RFC3339/ISO8601 format and a lexicographic compare
+            // is a valid chronological compare. This mirrors the stale
+            // dead-letter check in main.rs.
+            if let (Some(occurred), Some(prev_at)) =
+                (data.occurred_at.as_deref(), prev_last_event_at)
+            {
+                if occurred < prev_at {
+                    tx.execute(
+                        "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, ?2)",
+                        params![data.event_id, data.event_type],
+                    )
+                    .map_err(|e| AppError::Internal(format!("db mark event: {e}")))?;
+                    tx.commit().map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
+                    return Ok(UpdatedOutcome::StaleIgnored);
+                }
             }
 
             tx.execute(
@@ -833,7 +872,12 @@ pub struct CreatedData {
     pub tier: String,
     pub product_id: String,
     pub occurred_at: Option<String>,
-    pub checkout_id: String,
+    /// Polar checkout id, used as the browser-receipt lookup key. `None` for
+    /// checkout-less subscriptions (e.g. admin/API-created), in which case no
+    /// `pending_receipts` row is created — there is no browser checkout flow to
+    /// deliver one, and a row keyed by a guessable placeholder would let an
+    /// attacker race the one-time receipt via `/receipt/lookup`.
+    pub checkout_id: Option<String>,
     pub key_hash: String,
     pub token: Option<String>,
     pub token_expires_at: i64,
@@ -893,6 +937,11 @@ pub enum UpdatedOutcome {
     ActiveNoKey,
     StatusUpdated,
     TerminalIgnored,
+    /// A genuine event arrived out of order (its `occurred_at` is older than
+    /// the row's `last_event_at`). Recorded for idempotency but applied no
+    /// status overwrite or `revoked` side-effect, so a stale `active` can
+    /// never re-enable a key revoked by a newer `past_due`/`revoked`.
+    StaleIgnored,
     UnknownStatusRevoked,
 }
 
@@ -949,7 +998,7 @@ mod tests {
             tier: tier.to_string(),
             product_id: "prod_1".to_string(),
             occurred_at: Some("2024-01-01T00:00:00Z".to_string()),
-            checkout_id: format!("checkout_{event_id}"),
+            checkout_id: Some(format!("checkout_{event_id}")),
             key_hash: format!("keyhash_{sub_id}"),
             token: Some("token_1".to_string()),
             token_expires_at: 9999999999,
@@ -1050,10 +1099,60 @@ mod tests {
         db.process_subscription_created(data1).await.unwrap();
 
         let mut data2 = make_created("evt_2", "sub_1", "team");
-        data2.checkout_id = "checkout_2".to_string();
+        data2.checkout_id = Some("checkout_2".to_string());
         data2.receipt_secret = "receipt_2".to_string();
         let outcome = db.process_subscription_created(data2).await.unwrap();
         assert!(matches!(outcome, CreatedOutcome::AlreadyProvisioned));
+    }
+
+    /// Count pending_receipts rows for a subscription (test helper).
+    fn count_receipts(db: &Db, sub_id: &str) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM pending_receipts WHERE subscription_id=?1",
+            params![sub_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// F5 regression: a checkout-less subscription (`checkout_id = None`) must
+    /// NOT create a `pending_receipts` row keyed by a guessable id, so an
+    /// attacker cannot grab the one-time receipt via
+    /// `/receipt/lookup?checkout=unknown`. The API key is still provisioned.
+    #[tokio::test]
+    async fn test_checkout_less_provision_creates_no_lookupable_receipt() {
+        let db = test_db();
+        let mut data = make_created("evt_1", "sub_1", "team");
+        data.checkout_id = None;
+        let outcome = db.process_subscription_created(data).await.unwrap();
+        assert!(matches!(outcome, CreatedOutcome::Provisioned));
+
+        // The key/token/subscription were still provisioned.
+        let (status, revoked) = read_state(&db, "sub_1");
+        assert_eq!(status, "active");
+        assert_eq!(revoked, Some(false));
+
+        // But NO pending_receipts row exists, so nothing is lookup-able.
+        assert_eq!(count_receipts(&db, "sub_1"), 0);
+
+        // The old "unknown" placeholder — and any guess — cannot match.
+        assert_eq!(db.receipt_lookup("unknown").await.unwrap(), None);
+    }
+
+    /// Happy path stays intact: a real checkout_id yields a lookup-able receipt.
+    #[tokio::test]
+    async fn test_checkout_provision_receipt_is_lookupable() {
+        let db = test_db();
+        let mut data = make_created("evt_1", "sub_1", "team");
+        data.checkout_id = Some("checkout_real".to_string());
+        db.process_subscription_created(data).await.unwrap();
+
+        assert_eq!(count_receipts(&db, "sub_1"), 1);
+        let secret = db.receipt_lookup("checkout_real").await.unwrap();
+        assert_eq!(secret, Some("receipt_evt_1".to_string()));
+        // A different/guessed checkout still does not match.
+        assert_eq!(db.receipt_lookup("unknown").await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -1140,6 +1239,46 @@ mod tests {
         let (status, revoked) = read_state(&db, "sub_1");
         assert_eq!(status, "active");
         assert_eq!(revoked, Some(false));
+    }
+
+    /// F21 regression: a stale/out-of-order `active` (older occurred_at than the
+    /// `past_due` that revoked the key) must NOT re-enable the key. It is
+    /// recorded for idempotency but applies no status overwrite or unrevoke.
+    #[tokio::test]
+    async fn test_stale_active_after_past_due_is_ignored() {
+        let db = test_db();
+        let created = make_created("evt_1", "sub_1", "team");
+        db.process_subscription_created(created).await.unwrap();
+
+        // past_due arrives with a NEWER occurred_at — revokes the key and
+        // advances last_event_at to 2024-03-01.
+        let mut past_due = make_updated("evt_2", "sub_1", "past_due");
+        past_due.occurred_at = Some("2024-03-01T00:00:00Z".to_string());
+        let outcome = db.process_subscription_updated(past_due).await.unwrap();
+        assert_eq!(outcome, UpdatedOutcome::Revoked);
+
+        let (status, revoked) = read_state(&db, "sub_1");
+        assert_eq!(status, "past_due");
+        assert_eq!(revoked, Some(true));
+
+        // A genuine `active` that was emitted BEFORE the past_due but delivered
+        // after it (occurred_at 2024-02-01 < last_event_at 2024-03-01). It must
+        // be ignored as stale, leaving the key revoked and status unchanged.
+        let mut stale_active = make_updated("evt_3", "sub_1", "active");
+        stale_active.occurred_at = Some("2024-02-01T00:00:00Z".to_string());
+        let outcome = db.process_subscription_updated(stale_active).await.unwrap();
+        assert_eq!(outcome, UpdatedOutcome::StaleIgnored);
+
+        let (status, revoked) = read_state(&db, "sub_1");
+        assert_eq!(status, "past_due");
+        assert_eq!(revoked, Some(true));
+
+        // The stale event is still recorded so a re-delivery is a no-op
+        // duplicate (idempotency preserved).
+        let mut redelivered = make_updated("evt_3", "sub_1", "active");
+        redelivered.occurred_at = Some("2024-02-01T00:00:00Z".to_string());
+        let outcome = db.process_subscription_updated(redelivered).await.unwrap();
+        assert_eq!(outcome, UpdatedOutcome::Duplicate);
     }
 
     #[tokio::test]

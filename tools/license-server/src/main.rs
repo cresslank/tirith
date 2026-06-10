@@ -9,7 +9,6 @@ mod webhook_verify;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
@@ -53,10 +52,19 @@ async fn main() {
     spawn_dead_letter_retry_task(db.clone(), Arc::new(config.clone()), http_client);
     spawn_backup_task(config.clone());
 
+    // No permissive CORS. Receipts (`/receipt/lookup`, `/receipt/{secret}`)
+    // deliver one-time license tokens / API keys and are viewed same-origin in
+    // a browser. The previous global `CorsLayer::permissive()` reflected any
+    // Origin and set `Access-Control-Allow-Origin: *`, which would have let a
+    // malicious cross-origin page read a victim's receipt via fetch(). With no
+    // CORS layer the browser default — same-origin only — applies to every
+    // route, blocking cross-origin reads. None of the other endpoints need
+    // cross-origin access: the Polar webhook is server-to-server and license
+    // refresh is called by the CLI (neither is subject to browser CORS), and
+    // health is trivial.
     let app = routes::router()
         .with_state(state)
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive());
+        .layer(TraceLayer::new_for_http());
 
     let addr = format!("0.0.0.0:{port}");
     info!("listening on {addr}");
