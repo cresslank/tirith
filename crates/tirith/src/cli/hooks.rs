@@ -207,14 +207,46 @@ const MAX_POLICY_SIZE: u64 = 1024 * 1024;
 /// mirror the change in the other.
 ///
 /// Symlink-hardened (F16): the policy path is a repo-discovered
-/// `.tirith/policy.yaml`, so an attacker who can plant a symlink there could
-/// otherwise redirect this truncating write onto an arbitrary file. The read uses
-/// `O_NOFOLLOW` + a size cap, the write uses `O_NOFOLLOW` + `0600`, and
-/// `canonical_within` rejects an intermediate-directory symlink that escapes the
-/// policy directory.
+/// `<repo>/.tirith/policy.yaml` (or `<config>/tirith/policy.yaml`), so an attacker
+/// who can plant a symlink there could otherwise redirect this truncating write
+/// onto an arbitrary file. Three layers defend the write:
+///   * `canonical_within` against the GRANDPARENT (`<repo>` / `<config>`)
+///     canonicalizes through the containing `.tirith` directory, so a SYMLINKED
+///     `.tirith` that escapes the repo is rejected before any read or write.
+///   * the read uses `O_NOFOLLOW` + a size cap (refuses a symlinked final
+///     component, bounds a hostile target); and
+///   * the write uses `O_NOFOLLOW` + `0600` (refuses a symlinked final component).
+///
+/// The grandparent is the right containment root because the policy path is always
+/// at least three components deep (`<root>/.tirith/policy.yaml`); passing the
+/// parent (`.tirith`) instead is a tautology for a fixed `policy.yaml` filename and
+/// would NOT catch a symlinked `.tirith`. A malformed path with no grandparent is
+/// rejected rather than written.
 fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
+    // The containment root is the grandparent: <repo>/.tirith/policy.yaml → <repo>,
+    // <config>/tirith/policy.yaml → <config>. A policy path is always at least
+    // three components deep; refuse a malformed shallower path rather than guess.
+    let containment_root = path.parent().and_then(|p| p.parent()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "policy path must be <root>/<dir>/policy.yaml",
+        )
+    })?;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+
+    // Containment FIRST: reject a symlinked containing directory (e.g. a planted
+    // `.tirith` symlink) that escapes the trusted root before we read or write
+    // through it. `O_NOFOLLOW` on the final component alone misses this, because
+    // the OS still follows an intermediate-dir symlink during path resolution.
+    // Done after create_dir_all so a legit first-run `.tirith` exists to canonicalize.
+    if !tirith_core::util::canonical_within(path, containment_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to write policy through a symlinked path",
+        ));
     }
 
     // Read the current contents WITHOUT following a symlinked final component. An
@@ -245,17 +277,6 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
         }
         out.push_str(&new_line);
         out.push('\n');
-    }
-
-    // Containment: the policy file's real location must stay inside its own
-    // directory, rejecting an intermediate-dir symlink escape O_NOFOLLOW misses.
-    if let Some(parent) = path.parent() {
-        if !tirith_core::util::canonical_within(path, parent) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "refusing to write policy through a symlinked path",
-            ));
-        }
     }
 
     // Truncating write that REFUSES to follow a symlinked final component (0600).
@@ -460,8 +481,12 @@ mod tests {
 
     #[test]
     fn update_policy_guard_key_appends_and_replaces() {
+        // Real layout: <root>/.tirith/policy.yaml so the grandparent containment
+        // root (<root>) exists and is not a symlink — the legit write must pass.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("policy.yaml");
+        let tirith_dir = dir.path().join(".tirith");
+        std::fs::create_dir(&tirith_dir).unwrap();
+        let path = tirith_dir.join("policy.yaml");
         std::fs::write(&path, "paranoia: 2\nfail_mode: open\n").unwrap();
 
         update_policy_guard_key(&path, true).unwrap();
@@ -479,9 +504,9 @@ mod tests {
         );
     }
 
-    /// F16: a guard toggle whose policy path is a SYMLINK must NOT write through
-    /// to the link target — the truncating `O_NOFOLLOW` write refuses the symlink,
-    /// so a sentinel the link points at is left byte-for-byte unchanged.
+    /// F16: a guard toggle whose policy path's FINAL component is a SYMLINK must
+    /// NOT write through to the link target — the truncating `O_NOFOLLOW` write
+    /// refuses the symlink, so a sentinel the link points at is byte-unchanged.
     #[cfg(unix)]
     #[test]
     fn update_policy_guard_key_does_not_follow_symlink() {
@@ -490,8 +515,12 @@ mod tests {
         let original = "paranoia: 2\n# do not clobber\n";
         std::fs::write(&sentinel, original).unwrap();
 
-        // policy.yaml -> sentinel.yaml (symlinked FINAL component).
-        let policy = dir.path().join("policy.yaml");
+        // Real layout: <root>/.tirith/ (a genuine dir, so the grandparent
+        // containment passes) with policy.yaml -> ../sentinel.yaml as the
+        // symlinked FINAL component — the case O_NOFOLLOW must catch.
+        let tirith_dir = dir.path().join(".tirith");
+        std::fs::create_dir(&tirith_dir).unwrap();
+        let policy = tirith_dir.join("policy.yaml");
         std::os::unix::fs::symlink(&sentinel, &policy).unwrap();
 
         // The toggle must FAIL closed rather than rewrite the sentinel.
@@ -506,6 +535,50 @@ mod tests {
         assert!(
             !after.contains("hooks_guard_enabled"),
             "the guard key must not have leaked into the symlink target: {after}"
+        );
+    }
+
+    /// F16 (intermediate-dir escape): when the CONTAINING `.tirith` is itself a
+    /// symlink to an outside directory, the write must be rejected. `O_NOFOLLOW`
+    /// on the final component alone does NOT catch this (the OS follows the dir
+    /// symlink during path resolution, and `policy.yaml` inside it is a real
+    /// file) — only the grandparent `canonical_within` containment does. The
+    /// outside sentinel must be left byte-for-byte unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn update_policy_guard_key_rejects_symlinked_intermediate_dir() {
+        let base = tempfile::tempdir().unwrap();
+
+        // An outside directory holding a real (non-symlink) policy.yaml sentinel.
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("policy.yaml");
+        let original = "paranoia: 2\n# do not clobber via dir symlink\n";
+        std::fs::write(&sentinel, original).unwrap();
+
+        // The repo root, with `.tirith` a SYMLINK pointing at `outside`.
+        let root = base.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let tirith_link = root.join(".tirith");
+        std::os::unix::fs::symlink(&outside, &tirith_link).unwrap();
+
+        // Toggling on <root>/.tirith/policy.yaml resolves to outside/policy.yaml.
+        let policy = tirith_link.join("policy.yaml");
+        let res = update_policy_guard_key(&policy, true);
+        assert!(
+            res.is_err(),
+            "a symlinked intermediate `.tirith` dir must be rejected, got {res:?}"
+        );
+
+        // The outside sentinel must be untouched: not written through.
+        let after = std::fs::read_to_string(&sentinel).unwrap();
+        assert_eq!(
+            after, original,
+            "the dir-symlink target must be byte-unchanged"
+        );
+        assert!(
+            !after.contains("hooks_guard_enabled"),
+            "the guard key must not have leaked through the dir symlink: {after}"
         );
     }
 }

@@ -204,12 +204,7 @@ fn collect_json_string_leaves(
 fn sanitize_json_strings(v: &mut serde_json::Value) {
     match v {
         serde_json::Value::String(s) => {
-            let mut out = Vec::with_capacity(s.len());
-            sanitize_text_into(s.as_bytes(), &mut out);
-            // Scrubbed output stays valid UTF-8 (whole chars dropped, never split).
-            if let Ok(scrubbed) = String::from_utf8(out) {
-                *s = scrubbed;
-            }
+            *s = sanitize_text_str(s);
         }
         serde_json::Value::Array(items) => {
             for item in items.iter_mut() {
@@ -256,13 +251,19 @@ fn apply_warn(result: &mut ToolCallResult, event_id: &str, findings: &[Finding])
         if item.content_type != "text" {
             continue;
         }
-        let mut out = Vec::with_capacity(item.text.len());
-        sanitize_text_into(item.text.as_bytes(), &mut out);
-        // Scrubbed output stays valid UTF-8 (we drop whole chars, never split one).
-        item.text = String::from_utf8(out).unwrap_or_else(|_| item.text.clone());
+        item.text = sanitize_text_str(&item.text);
     }
 
     result.content.insert(0, warning);
+}
+
+/// Scrub terminal-control / zero-width bytes from `s`, returning an owned
+/// `String`. Thin `&str` wrapper over [`sanitize_text_into`]; the scrub drops
+/// whole chars (never splits one) so the result is always valid UTF-8.
+pub fn sanitize_text_str(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    sanitize_text_into(s.as_bytes(), &mut out);
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 /// Strip ANSI/OSC/APC/DCS escapes and zero-width chars from `chunk` into `out`.

@@ -84,6 +84,44 @@ pub fn fetch_resolver() -> Arc<SsrfGuardResolver> {
     })
 }
 
+/// Maximum redirect hops the server clients will follow before giving up.
+/// reqwest's implicit default would silently follow up to 10 hops into
+/// anywhere; the server paths cap at 5 and re-validate every hop.
+const SERVER_MAX_REDIRECTS: usize = 5;
+
+/// Decide whether a server client should follow one redirect hop.
+///
+/// This is the testable core of [`server_redirect_policy`], shared by every
+/// server client (policy fetch, audit upload, license refresh, webhook
+/// delivery). It enforces two things on every hop:
+///
+/// 1. The hop count stays under [`SERVER_MAX_REDIRECTS`] — `prior_hops` is the
+///    number of redirects already followed (reqwest's `attempt.previous().len()`).
+/// 2. The redirect target re-passes [`crate::url_validate::validate_server_url`],
+///    so an open redirect cannot bounce a request from a public host into a
+///    private/loopback/metadata destination.
+///
+/// Returns `Ok(())` to follow the hop, or `Err(reason)` to abort the request.
+pub fn server_redirect_decision(target_url: &str, prior_hops: usize) -> Result<(), String> {
+    if prior_hops >= SERVER_MAX_REDIRECTS {
+        return Err("too many redirects".to_string());
+    }
+    crate::url_validate::validate_server_url(target_url)
+}
+
+/// Shared redirect policy for the server clients: re-validate every redirect
+/// target and cap the hop count. The decision lives in
+/// [`server_redirect_decision`] so it can be unit-tested without driving a real
+/// HTTP redirect; this just adapts that decision onto reqwest's `Attempt` API.
+pub fn server_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        match server_redirect_decision(attempt.url().as_str(), attempt.previous().len()) {
+            Ok(()) => attempt.follow(),
+            Err(e) => attempt.error(e),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::url_validate::is_public_addr;
@@ -126,5 +164,35 @@ mod tests {
     #[test]
     fn test_resolver_constructs() {
         let _r = super::ssrf_guard_resolver();
+    }
+
+    // server_redirect_decision: the testable core of the shared server redirect
+    // policy. Pins both the per-hop SSRF re-validation and the hop cap — neither
+    // is reachable from the existing tests, which never drive a real redirect.
+
+    #[test]
+    fn test_server_redirect_rejects_private_target() {
+        // An open redirect bouncing a public request into loopback must be
+        // refused even on the first hop (prior_hops = 0).
+        let result = super::server_redirect_decision("http://127.0.0.1/x", 0);
+        assert!(result.is_err(), "redirect to loopback must be rejected");
+    }
+
+    #[test]
+    fn test_server_redirect_rejects_over_hop_cap() {
+        // A public target is fine on its own, but 5 prior hops trips the cap.
+        let result = super::server_redirect_decision("https://8.8.8.8/api", 5);
+        assert!(result.is_err(), "hop count at the cap must be rejected");
+        assert!(result.unwrap_err().contains("too many redirects"));
+    }
+
+    #[test]
+    fn test_server_redirect_allows_public_under_cap() {
+        // HTTPS public target, hop count under the cap → follow.
+        let result = super::server_redirect_decision("https://8.8.8.8/api", 4);
+        assert!(
+            result.is_ok(),
+            "public target under the cap must be followed"
+        );
     }
 }

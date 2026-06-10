@@ -1207,11 +1207,61 @@ impl Policy {
     /// checkout is attacker-controllable content, so its `.tirith/policy.yaml`
     /// must never be able to WEAKEN, SUPPRESS, or EXFIL. This resets every field
     /// a hostile repo could use for those ends back to the
-    /// [`Policy::default()`] value, while LEAVING the tightening-only fields
-    /// (`blocklist`, `network_deny`, `approval_rules`, `action_overrides`
-    /// (upgrade-only by construction), `custom_rules`, `paranoia`, `strict_warn`,
-    /// the M8/M9 guard toggles, etc.) untouched so a repo can still add its own
-    /// restrictions.
+    /// [`Policy::default()`] value.
+    ///
+    /// RESET (a repo could WEAKEN/SUPPRESS/EXFIL through these):
+    /// * `allowlist`, `allowlist_rules`, `network_allow`,
+    ///   `additional_known_domains`, `severity_overrides` — drop or downgrade a
+    ///   finding (engine.rs `findings.retain` + the severity-override path).
+    /// * `allow_bypass_env`, `allow_bypass_env_noninteractive` — re-enable the
+    ///   `TIRITH=0` bypass.
+    /// * `policy_fetch_fail_mode`, `enforce_fail_mode` — steer a remote-fetch
+    ///   failure toward open/cached.
+    /// * `webhooks`, `policy_server_url`, `policy_server_api_key`,
+    ///   `dlp_custom_patterns` — exfil findings / redirect discovery to a
+    ///   repo-controlled sink.
+    /// * `context_guard_enabled` — `false` disables the M8 operational-context
+    ///   destructive-command guard (`rules::context`/`container`/`iac`
+    ///   early-return). Pure suppression.
+    /// * `package_policy` — demote/silence supply-chain findings
+    ///   (`install_txn`): `block_dependency_confusion`/
+    ///   `warn_install_script_network_call` flips, raised
+    ///   `block_aggregate_score`/`warn_aggregate_score`/`block_osv_min_cvss`.
+    ///   Several fire OFFLINE (typosquat distance, aggregate score).
+    /// * `threat_intel` — `osv_enabled`/`deps_dev_enabled: false` disable
+    ///   advisory lookups (`threatdb_api`); also a home for planted API keys.
+    /// * `allowed_install_domains` — listing the attacker's host DOWNGRADES
+    ///   `PasteSourceMismatch` from High to Info (`rules::paste_provenance`).
+    /// * `scan.trusted_mcp_servers` — listing a server NAME silences
+    ///   `mcp_insecure_server`/`mcp_untrusted_server`/`mcp_suspicious_args`/
+    ///   `mcp_overly_permissive` and filters drift (`rules::configfile`/
+    ///   `mcpdrift`). `scan.ignore_patterns`/`fail_on`/`profiles` suppress the
+    ///   `tirith scan` walk / relax its CI gate. All reset.
+    ///
+    /// LEFT INTACT (tightening-only or inert at repo scope, each verified):
+    /// * `blocklist`, `network_deny` — only ADD blocks.
+    /// * `approval_rules` — only ADD an approval gate.
+    /// * `action_overrides` — upgrade-only ("block"), validated at load.
+    /// * `escalation` — `EscalationAction` is Block-only (never a downgrade).
+    /// * `custom_rules` — only ADD detections.
+    /// * `paranoia` — `retain_by_paranoia` keeps Medium+ at any tier; raising it
+    ///   keeps MORE Info/Low. A lower value is never weaker than the default 1.
+    /// * `strict_warn`, the M8/M9 guard toggles (`iac_require_plan_before_apply`,
+    ///   `sudo_require_reason`, `env_guard_enabled`, `exec_guard_enabled`,
+    ///   `hooks_guard_enabled`, `baseline_enabled`) — default `false`/off; a repo
+    ///   can only turn them ON, which adds rules. `context_destructive_verbs`,
+    ///   `env_guard_sensitive_vars` only WIDEN the destructive/sensitive sets.
+    /// * `agent_rules` — `deny` tightens; `allow` is NOT a bypass (escalation.rs).
+    /// * `checkpoints`, `sudo_session_ttl`, `scan.additional_config_files`/
+    ///   `mcp_allowed_tools` — retention/coverage/tightening, never a guard relax.
+    /// * `share` (`customer_id_patterns`) — only ADDS redactions (more scrubbing).
+    /// * `schema_version`, `fail_mode`, `webhooks` `min_severity` — inert here
+    ///   (`fail_mode: open` is already the default; a repo `closed` only tightens).
+    /// * `context_labels`/`ssh_host_labels` — `#[serde(skip)]`, loaded separately.
+    ///
+    /// Whenever a new [`Policy`] field is added, classify it here AND in the
+    /// `f9_sanitize_classification_is_exhaustive` tripwire test (which fails to
+    /// compile until the field is accounted for).
     ///
     /// Only called for [`PolicyScope::Repo`] (see [`Self::discover_local`]).
     fn sanitize_repo_scoped(&mut self) {
@@ -1239,6 +1289,24 @@ impl Policy {
         self.policy_server_url = None;
         self.policy_server_api_key = None;
         self.dlp_custom_patterns = defaults.dlp_custom_patterns;
+
+        // Guard-disable suppression — a repo must not be able to turn OFF a guard
+        // that defaults ON, demote/silence supply-chain findings, disable threat
+        // lookups, or downgrade a paste-source mismatch by self-listing its host.
+        self.context_guard_enabled = defaults.context_guard_enabled;
+        self.package_policy = defaults.package_policy.clone();
+        self.threat_intel = defaults.threat_intel.clone();
+        self.allowed_install_domains = defaults.allowed_install_domains.clone();
+
+        // MCP / scan suppression — a `trusted_mcp_servers` NAME silences the four
+        // MCP config rules + drift; `ignore_patterns`/`fail_on`/`profiles` suppress
+        // the `tirith scan` walk or relax its CI gate. Reset the weakening scan
+        // sub-fields; `additional_config_files` and `mcp_allowed_tools` are
+        // tightening (more coverage / an opt-in tool allow-list) and stay.
+        self.scan.trusted_mcp_servers = defaults.scan.trusted_mcp_servers.clone();
+        self.scan.ignore_patterns = defaults.scan.ignore_patterns.clone();
+        self.scan.fail_on = defaults.scan.fail_on.clone();
+        self.scan.profiles = defaults.scan.profiles.clone();
     }
 
     /// Return a fail-closed policy that blocks everything.
@@ -2918,5 +2986,338 @@ custom_rules:
         // incident pointing at this now-deleted tempdir.
         let _ = crate::incident::stop_at(&flag);
         crate::incident::invalidate_cache();
+    }
+
+    // ----------------------------- F9 sanitize exhaustiveness tripwire -----
+
+    /// F9 tripwire — make `sanitize_repo_scoped` total over the [`Policy`]
+    /// struct, so a future field is IMPOSSIBLE to add without a deliberate
+    /// trust-boundary decision.
+    ///
+    /// HOW IT GATES: the body destructures a `Policy` binding EVERY field by
+    /// name with NO `..` rest pattern. When someone adds a field to `Policy`,
+    /// this destructure stops compiling until they add the field here and
+    /// classify it as RESET or KEPT. (A `..` would silently swallow new fields
+    /// and defeat the whole point — never add one.)
+    ///
+    /// WHAT IT ASSERTS: it sanitizes a policy whose every weakening knob is set
+    /// to a hostile non-default, then for each field asserts the post-sanitize
+    /// value matches its classification — RESET fields equal a fresh
+    /// `Policy::default()`'s value, KEPT (tightening-only) fields keep the
+    /// hostile value. So the test fails if `sanitize_repo_scoped` and this
+    /// classification ever disagree, in EITHER direction (a reset that was
+    /// dropped, or a field newly reset without updating the doc/intent here).
+    #[test]
+    fn f9_sanitize_classification_is_exhaustive() {
+        // A maximally-hostile policy: every field that COULD weaken is set to a
+        // value distinct from the default, so a missing reset is observable.
+        let mut p = Policy {
+            // --- fields the sanitizer RESETS (set hostile here) ---
+            allowlist: vec!["evil.example".into()],
+            allowlist_rules: vec![AllowlistRule {
+                rule_id: "curl_pipe_shell".into(),
+                patterns: vec!["evil.example".into()],
+            }],
+            network_allow: vec!["169.254.169.254".into()],
+            additional_known_domains: vec!["evil.example".into()],
+            severity_overrides: HashMap::from([("curl_pipe_shell".into(), Severity::Low)]),
+            allow_bypass_env: true,
+            allow_bypass_env_noninteractive: true,
+            policy_fetch_fail_mode: Some("cached".into()),
+            enforce_fail_mode: Some(true),
+            webhooks: vec![WebhookConfig {
+                url: "https://attacker.example/exfil".into(),
+                min_severity: Severity::Info,
+                headers: HashMap::new(),
+                payload_template: None,
+            }],
+            policy_server_url: Some("https://attacker.example/policy".into()),
+            policy_server_api_key: Some("planted".into()),
+            dlp_custom_patterns: vec!["secret-[0-9]+".into()],
+            context_guard_enabled: false,
+            package_policy: PackagePolicy {
+                block_dependency_confusion: false,
+                warn_install_script_network_call: false,
+                block_aggregate_score: Some(100),
+                block_osv_min_cvss: Some(10.0),
+                ..PackagePolicy::default()
+            },
+            threat_intel: ThreatIntelConfig {
+                osv_enabled: false,
+                deps_dev_enabled: false,
+                ..ThreatIntelConfig::default()
+            },
+            allowed_install_domains: vec!["attacker.example".into()],
+            scan: ScanPolicyConfig {
+                trusted_mcp_servers: vec!["attacker-mcp".into()],
+                ignore_patterns: vec!["**".into()],
+                fail_on: Some("critical".into()),
+                profiles: HashMap::from([("loose".into(), ScanProfile::default())]),
+                // KEPT scan sub-fields set hostile-distinct too (must survive):
+                additional_config_files: vec!["extra.toml".into()],
+                mcp_allowed_tools: HashMap::from([("srv".into(), vec!["read".into()])]),
+            },
+            // --- fields the sanitizer KEEPS (tightening-only; set distinct so a
+            //     stray reset would be caught) ---
+            blocklist: vec!["blocked.example".into()],
+            network_deny: vec!["10.0.0.0/8".into()],
+            approval_rules: vec![ApprovalRule {
+                rule_ids: vec!["curl_pipe_shell".into()],
+                timeout_secs: 0,
+                fallback: "block".into(),
+            }],
+            action_overrides: HashMap::from([("curl_pipe_shell".into(), "block".into())]),
+            escalation: vec![crate::escalation::EscalationRule::MultiMedium {
+                min_findings: 2,
+                action: crate::escalation::EscalationAction::Block,
+            }],
+            custom_rules: vec![CustomRule {
+                id: "x".into(),
+                pattern: Some("evil".into()),
+                when: None,
+                context: vec!["exec".into()],
+                severity: Severity::High,
+                title: "x".into(),
+                description: String::new(),
+                action: None,
+            }],
+            paranoia: 4,
+            strict_warn: true,
+            iac_require_plan_before_apply: true,
+            sudo_require_reason: true,
+            sudo_session_ttl: Some(60),
+            env_guard_enabled: true,
+            env_guard_sensitive_vars: vec!["MY_SECRET".into()],
+            exec_guard_enabled: true,
+            hooks_guard_enabled: true,
+            baseline_enabled: true,
+            context_destructive_verbs: HashMap::from([("aws".into(), vec!["nuke".into()])]),
+            agent_rules: AgentRules {
+                allow: Vec::new(),
+                deny: vec![AgentMatcher::new(AgentOriginKind::Mcp, Some("evil".into()))],
+            },
+            share: ShareConfig {
+                customer_id_patterns: vec!["CUST-[0-9]{4}".into()],
+            },
+            checkpoints: CheckpointPolicyConfig {
+                max_count: 1,
+                max_age_hours: 1,
+                max_storage_bytes: 1,
+            },
+            fail_mode: FailMode::Closed,
+            schema_version: 1,
+            // Loader-stamped / serde-skipped — set so the destructure is total.
+            path: Some("test".into()),
+            scope: PolicyScope::Repo,
+            context_labels: BTreeMap::new(),
+            ssh_host_labels: BTreeMap::new(),
+        };
+
+        p.sanitize_repo_scoped();
+
+        // The single source of truth for "what a reset field should look like".
+        let d = Policy::default();
+
+        // EXHAUSTIVE, NO-`..` DESTRUCTURE — the compile-time gate. Adding a field
+        // to `Policy` breaks this line until the new field is bound and
+        // classified below. DO NOT add `..` to silence the error; add the field.
+        let Policy {
+            // RESET group — must equal the default after sanitize.
+            allowlist,
+            allowlist_rules,
+            network_allow,
+            additional_known_domains,
+            severity_overrides,
+            allow_bypass_env,
+            allow_bypass_env_noninteractive,
+            policy_fetch_fail_mode,
+            enforce_fail_mode,
+            webhooks,
+            policy_server_url,
+            policy_server_api_key,
+            dlp_custom_patterns,
+            context_guard_enabled,
+            package_policy,
+            threat_intel,
+            allowed_install_domains,
+            scan,
+            // KEPT group — tightening-only; must retain the hostile-distinct value.
+            blocklist,
+            network_deny,
+            approval_rules,
+            action_overrides,
+            escalation,
+            custom_rules,
+            paranoia,
+            strict_warn,
+            iac_require_plan_before_apply,
+            sudo_require_reason,
+            sudo_session_ttl,
+            env_guard_enabled,
+            env_guard_sensitive_vars,
+            exec_guard_enabled,
+            hooks_guard_enabled,
+            baseline_enabled,
+            context_destructive_verbs,
+            agent_rules,
+            share,
+            checkpoints,
+            fail_mode,
+            schema_version,
+            // Provenance / serde-skipped — not part of the trust decision, but
+            // bound so the destructure stays total.
+            path,
+            scope,
+            context_labels,
+            ssh_host_labels,
+        } = p;
+
+        // ---- RESET: every weakening/suppression/exfil knob back to default ----
+        assert_eq!(allowlist, d.allowlist, "RESET: allowlist");
+        assert!(allowlist_rules.is_empty(), "RESET: allowlist_rules");
+        assert_eq!(network_allow, d.network_allow, "RESET: network_allow");
+        assert_eq!(
+            additional_known_domains, d.additional_known_domains,
+            "RESET: additional_known_domains"
+        );
+        assert_eq!(
+            severity_overrides, d.severity_overrides,
+            "RESET: severity_overrides"
+        );
+        assert!(
+            !allow_bypass_env,
+            "RESET: allow_bypass_env (forced false; default is true, a repo cannot enable the bypass)"
+        );
+        assert_eq!(
+            allow_bypass_env_noninteractive, d.allow_bypass_env_noninteractive,
+            "RESET: allow_bypass_env_noninteractive"
+        );
+        assert_eq!(
+            policy_fetch_fail_mode, d.policy_fetch_fail_mode,
+            "RESET: policy_fetch_fail_mode"
+        );
+        assert_eq!(
+            enforce_fail_mode, d.enforce_fail_mode,
+            "RESET: enforce_fail_mode"
+        );
+        assert_eq!(webhooks.len(), d.webhooks.len(), "RESET: webhooks");
+        assert_eq!(
+            policy_server_url, d.policy_server_url,
+            "RESET: policy_server_url"
+        );
+        assert_eq!(
+            policy_server_api_key, d.policy_server_api_key,
+            "RESET: policy_server_api_key"
+        );
+        assert_eq!(
+            dlp_custom_patterns, d.dlp_custom_patterns,
+            "RESET: dlp_custom_patterns"
+        );
+        assert_eq!(
+            context_guard_enabled, d.context_guard_enabled,
+            "RESET: context_guard_enabled (false would disable the context guard)"
+        );
+        assert_eq!(
+            package_policy, d.package_policy,
+            "RESET: package_policy (demotes/silences supply-chain findings)"
+        );
+        assert_eq!(
+            threat_intel.osv_enabled, d.threat_intel.osv_enabled,
+            "RESET: threat_intel.osv_enabled"
+        );
+        assert_eq!(
+            threat_intel.deps_dev_enabled, d.threat_intel.deps_dev_enabled,
+            "RESET: threat_intel.deps_dev_enabled"
+        );
+        assert_eq!(
+            allowed_install_domains, d.allowed_install_domains,
+            "RESET: allowed_install_domains (self-listing downgrades PasteSourceMismatch)"
+        );
+        assert_eq!(
+            scan.trusted_mcp_servers, d.scan.trusted_mcp_servers,
+            "RESET: scan.trusted_mcp_servers (a listed name silences MCP findings)"
+        );
+        assert_eq!(
+            scan.ignore_patterns, d.scan.ignore_patterns,
+            "RESET: scan.ignore_patterns"
+        );
+        assert_eq!(scan.fail_on, d.scan.fail_on, "RESET: scan.fail_on");
+        assert!(scan.profiles.is_empty(), "RESET: scan.profiles");
+
+        // ---- KEPT: tightening-only knobs survive (hostile-distinct values) ----
+        // scan's tightening sub-fields must NOT have been reset.
+        assert_eq!(
+            scan.additional_config_files,
+            vec!["extra.toml".to_string()],
+            "KEPT: scan.additional_config_files (adds coverage)"
+        );
+        assert!(
+            scan.mcp_allowed_tools.contains_key("srv"),
+            "KEPT: scan.mcp_allowed_tools (opt-in tool allow-list, tightening)"
+        );
+        assert_eq!(
+            blocklist,
+            vec!["blocked.example".to_string()],
+            "KEPT: blocklist"
+        );
+        assert_eq!(
+            network_deny,
+            vec!["10.0.0.0/8".to_string()],
+            "KEPT: network_deny"
+        );
+        assert_eq!(approval_rules.len(), 1, "KEPT: approval_rules");
+        assert!(
+            action_overrides.contains_key("curl_pipe_shell"),
+            "KEPT: action_overrides (upgrade-only)"
+        );
+        assert_eq!(escalation.len(), 1, "KEPT: escalation (Block-only upgrade)");
+        assert_eq!(custom_rules.len(), 1, "KEPT: custom_rules");
+        assert_eq!(paranoia, 4, "KEPT: paranoia (higher only keeps more)");
+        assert!(strict_warn, "KEPT: strict_warn");
+        assert!(
+            iac_require_plan_before_apply,
+            "KEPT: iac_require_plan_before_apply"
+        );
+        assert!(sudo_require_reason, "KEPT: sudo_require_reason");
+        assert_eq!(sudo_session_ttl, Some(60), "KEPT: sudo_session_ttl");
+        assert!(env_guard_enabled, "KEPT: env_guard_enabled");
+        assert_eq!(
+            env_guard_sensitive_vars,
+            vec!["MY_SECRET".to_string()],
+            "KEPT: env_guard_sensitive_vars (widens the sensitive set)"
+        );
+        assert!(exec_guard_enabled, "KEPT: exec_guard_enabled");
+        assert!(hooks_guard_enabled, "KEPT: hooks_guard_enabled");
+        assert!(baseline_enabled, "KEPT: baseline_enabled");
+        assert!(
+            context_destructive_verbs.contains_key("aws"),
+            "KEPT: context_destructive_verbs (widens destructive verbs)"
+        );
+        assert_eq!(
+            agent_rules.deny.len(),
+            1,
+            "KEPT: agent_rules (deny tightens)"
+        );
+        assert_eq!(
+            share.customer_id_patterns.len(),
+            1,
+            "KEPT: share (only adds redactions)"
+        );
+        assert_eq!(
+            checkpoints.max_count, 1,
+            "KEPT: checkpoints (retention only)"
+        );
+        assert_eq!(
+            fail_mode,
+            FailMode::Closed,
+            "KEPT: fail_mode (closed tightens)"
+        );
+        assert_eq!(schema_version, 1, "KEPT: schema_version (inert)");
+
+        // ---- Provenance / serde-skipped — untouched by the sanitizer. ----
+        assert_eq!(path.as_deref(), Some("test"), "untouched: path");
+        assert_eq!(scope, PolicyScope::Repo, "untouched: scope");
+        assert!(context_labels.is_empty(), "untouched: context_labels");
+        assert!(ssh_host_labels.is_empty(), "untouched: ssh_host_labels");
     }
 }

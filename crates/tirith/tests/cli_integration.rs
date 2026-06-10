@@ -9469,6 +9469,33 @@ fn command_card_mismatch_is_high_and_other_findings_fire() {
     );
 }
 
+/// F6 first-hop SSRF guard: a private/loopback fetch must be REJECTED by DEFAULT
+/// (no opt-in). The sibling `command_card_fetch_rejects_unreachable_url` sets
+/// `TIRITH_ALLOW_PRIVATE_FETCH=1` which DISABLES the guard; this pins that without
+/// the opt-in the guard blocks the request before any connection is attempted.
+#[cfg(unix)]
+#[test]
+fn command_card_fetch_blocks_private_url_without_opt_in() {
+    let home = tempfile::tempdir().unwrap();
+    let out = tirith()
+        .args(["command-card", "fetch", "http://127.0.0.1:9/nope.json"])
+        .env("HOME", home.path())
+        .env_remove("TIRITH_ALLOW_PRIVATE_FETCH")
+        .output()
+        .expect("fetch");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a private-host fetch without the opt-in must be rejected; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("non-public"),
+        "stderr must report the SSRF block (non-public address), got:\n{stderr}"
+    );
+}
+
 /// `command-card fetch` against an unreachable URL must fail on the CONNECTION path (not a usage
 /// error) rather than caching junk (CodeRabbit R7).
 #[cfg(unix)]

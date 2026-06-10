@@ -237,6 +237,29 @@ fn embedded_ipv4_in_v6(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
         ));
     }
 
+    // 6to4 (`2002::/16`, RFC 3056): the embedded IPv4 is octets [2..6]. A
+    // literal like `2002:7f00:1::` tunnels 127.0.0.1, so without decoding it
+    // would otherwise pass the v6 checks as a "public" address. We decode the
+    // embedded IPv4 (rather than blanket-blocking the whole /16) so a 6to4
+    // address wrapping a genuinely public IPv4 is still allowed. The IPv4
+    // forbidden check is the single source of truth either way.
+    if octets[0] == 0x20 && octets[1] == 0x02 {
+        return Some(Ipv4Addr::new(octets[2], octets[3], octets[4], octets[5]));
+    }
+
+    // Teredo (`2001:0000::/32`, RFC 4380): the server (client external) IPv4 is
+    // the LAST 4 octets, each XORed with 0xFF (obfuscated). Decode and apply the
+    // same IPv4 check so a Teredo address embedding a private/loopback IPv4
+    // can't be used as an SSRF bounce.
+    if octets[0] == 0x20 && octets[1] == 0x01 && octets[2] == 0x00 && octets[3] == 0x00 {
+        return Some(Ipv4Addr::new(
+            octets[12] ^ 0xff,
+            octets[13] ^ 0xff,
+            octets[14] ^ 0xff,
+            octets[15] ^ 0xff,
+        ));
+    }
+
     None
 }
 
@@ -575,6 +598,64 @@ mod tests {
             &resolver_with("2607:f8b0:4004:800::200e".parse().unwrap()),
         );
         assert!(result.is_ok(), "Resolved public IPv6 must be allowed");
+    }
+
+    // 6to4 (2002::/16) and Teredo (2001:0000::/32) embed an IPv4 the v6 checks
+    // would otherwise miss. The embedded IPv4 is decoded and run through the
+    // IPv4-forbidden check.
+
+    #[test]
+    fn test_rejects_6to4_encoded_loopback() {
+        // 2002:7f00:1:: is the 6to4 wrapping of 127.0.0.1.
+        let result = validate_outbound_url_with_resolver(
+            "https://[2002:7f00:1::]/",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(result.is_err(), "6to4-encoded loopback must be blocked");
+        assert!(result.unwrap_err().contains("non-public"));
+    }
+
+    #[test]
+    fn test_allows_6to4_encoded_public_ipv4() {
+        // 2002:0808:0808:: wraps 8.8.8.8 (public) — must stay allowed.
+        let result = validate_outbound_url_with_resolver(
+            "https://[2002:0808:0808::]/",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(result.is_ok(), "6to4-encoded public IPv4 should be allowed");
+    }
+
+    #[test]
+    fn test_rejects_teredo_encoded_private_ipv4() {
+        // Teredo address whose embedded server IPv4 is 192.168.1.1: the last 32
+        // bits are the server IPv4 XOR 0xff per octet (0x3f57:fefe).
+        let result = validate_outbound_url_with_resolver(
+            "https://[2001:0:0:0:0:0:3f57:fefe]/",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(
+            result.is_err(),
+            "Teredo-encoded private IPv4 must be blocked"
+        );
+        assert!(result.unwrap_err().contains("non-public"));
+    }
+
+    #[test]
+    fn test_normal_public_ipv6_still_allowed_after_carveout() {
+        // A genuine public v6 (Cloudflare DNS) must not collide with the 6to4 or
+        // Teredo prefixes added by the carve-out.
+        let result = validate_outbound_url_with_resolver(
+            "https://[2606:4700:4700::1111]/",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(
+            result.is_ok(),
+            "Public IPv6 must still be allowed after the 6to4/Teredo carve-out"
+        );
     }
 
     // F6: `validate_fetch_url` must reject IP-literal SSRF targets up front

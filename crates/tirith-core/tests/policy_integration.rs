@@ -704,9 +704,11 @@ fn scan_config_file(repo: &TempDir, file_path: &str) -> tirith_core::verdict::Ve
 fn test_policy_round_trip_for_mcp_fields() {
     // A policy with `trusted_mcp_servers` AND `mcp_allowed_tools` must load,
     // validate, and be honored end-to-end through the engine.
-    // NOTE: `scan.*` is NOT part of the F9 repo-sanitizer's field list, so a repo
-    // policy's `trusted_mcp_servers` still suppresses here. (Flagged as a residual
-    // repo-scoped suppression surface outside this change's scope.)
+    // F9: `scan.trusted_mcp_servers` is a SUPPRESSION knob (a listed server name
+    // silences `mcp_insecure_server`), so it is neutralized at REPO scope. This
+    // test exercises the feature at ORG scope (`TIRITH_POLICY_ROOT`), where
+    // operator-managed policy is honored. Repo-scope non-suppression is covered by
+    // the F9 tests above.
     let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     clear_policy_env();
     let policy_yaml = r#"
@@ -718,10 +720,11 @@ scan:
     my-trusted-server:
       - read_only
 "#;
-    let repo = make_repo(policy_yaml);
+    let _org = set_org_policy(policy_yaml);
 
-    // A config that would normally trigger McpInsecureServer (http://) — the
-    // trusted name must suppress the finding.
+    // Scan target (a separate dir): a config that would normally trigger
+    // McpInsecureServer (http://). The org-scoped trusted name suppresses it.
+    let repo = make_repo("fail_mode: open\n");
     fs::write(
         repo.path().join("mcp.json"),
         r#"{"mcpServers":{"my-trusted-server":{"url":"http://insecure.example.com/mcp"}}}"#,
@@ -734,7 +737,7 @@ scan:
             .findings
             .iter()
             .any(|f| f.rule_id == RuleId::McpInsecureServer),
-        "trusted server name must suppress mcp_insecure_server: {:?}",
+        "org-scoped trusted server name must suppress mcp_insecure_server: {:?}",
         verdict
             .findings
             .iter()
@@ -854,6 +857,21 @@ policy_fetch_fail_mode: cached
 enforce_fail_mode: true
 dlp_custom_patterns:
   - "secret-[0-9]+"
+context_guard_enabled: false
+package_policy:
+  block_dependency_confusion: false
+  warn_install_script_network_call: false
+  block_aggregate_score: 100
+threat_intel:
+  osv_enabled: false
+  deps_dev_enabled: false
+allowed_install_domains:
+  - attacker.example
+scan:
+  trusted_mcp_servers:
+    - attacker-mcp
+  ignore_patterns:
+    - "**"
 "#;
 
 #[test]
@@ -933,6 +951,52 @@ fn test_f9_repo_policy_fields_are_sanitized() {
     assert!(
         p.dlp_custom_patterns.is_empty(),
         "repo dlp_custom_patterns must be cleared"
+    );
+
+    // Guard-disable suppression reset (the F9 trust-boundary-gap fix). A repo
+    // must not be able to turn OFF a guard that defaults ON, demote/silence
+    // supply-chain findings, disable threat lookups, or self-list a host to
+    // downgrade a paste-source mismatch.
+    assert!(
+        p.context_guard_enabled,
+        "repo context_guard_enabled:false must be reset to the default true"
+    );
+    assert_eq!(
+        p.package_policy,
+        tirith_core::policy::PackagePolicy::default(),
+        "repo package_policy must be reset to default (no supply-chain demotion)"
+    );
+    assert!(
+        p.package_policy.block_dependency_confusion,
+        "repo block_dependency_confusion:false must be reset to default true"
+    );
+    assert!(
+        p.package_policy.warn_install_script_network_call,
+        "repo warn_install_script_network_call:false must be reset to default true"
+    );
+    assert!(
+        p.package_policy.block_aggregate_score.is_none(),
+        "repo raised block_aggregate_score must be reset to the baseline (None)"
+    );
+    assert!(
+        p.threat_intel.osv_enabled,
+        "repo threat_intel.osv_enabled:false must be reset to default true"
+    );
+    assert!(
+        p.threat_intel.deps_dev_enabled,
+        "repo threat_intel.deps_dev_enabled:false must be reset to default true"
+    );
+    assert!(
+        p.allowed_install_domains.is_empty(),
+        "repo allowed_install_domains must be cleared (no PasteSourceMismatch downgrade)"
+    );
+    assert!(
+        p.scan.trusted_mcp_servers.is_empty(),
+        "repo scan.trusted_mcp_servers must be cleared (no MCP-finding silencing)"
+    );
+    assert!(
+        p.scan.ignore_patterns.is_empty(),
+        "repo scan.ignore_patterns must be cleared (no scan-walk suppression)"
     );
 }
 
@@ -1094,6 +1158,81 @@ allowlist_rules:
             .collect::<Vec<_>>()
     );
     assert_eq!(verdict.action, Action::Allow);
+}
+
+#[test]
+fn test_f9_org_scope_guard_disable_knobs_are_honored() {
+    // Counterpart to the repo-scope guard-disable sanitization: the SAME
+    // weakening knobs that F9 neutralizes at repo scope (context_guard_enabled,
+    // a weakening package_policy, threat_intel.osv_enabled) MUST be honored at
+    // org scope (TIRITH_POLICY_ROOT — operator-controlled). Asserting on the
+    // loaded policy object: org scope leaves them exactly as written.
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    clear_policy_env();
+
+    let _org = set_org_policy(
+        r#"
+fail_mode: open
+context_guard_enabled: false
+package_policy:
+  block_dependency_confusion: false
+  block_aggregate_score: 100
+threat_intel:
+  osv_enabled: false
+  deps_dev_enabled: false
+allowed_install_domains:
+  - install.example
+scan:
+  trusted_mcp_servers:
+    - corp-mcp
+  ignore_patterns:
+    - "vendor/**"
+"#,
+    );
+    // A non-repo cwd so the walk-up branch finds nothing and the org branch wins.
+    let plain_cwd = TempDir::new().unwrap();
+
+    let p = Policy::discover_local_only(plain_cwd.path().to_str());
+    // SAFETY: serialized via ENV_LOCK (held for this test).
+    unsafe { std::env::remove_var("TIRITH_POLICY_ROOT") };
+
+    assert_eq!(p.scope, PolicyScope::Org, "TIRITH_POLICY_ROOT stamps Org");
+    assert!(
+        !p.context_guard_enabled,
+        "org context_guard_enabled:false must be HONORED (not reset)"
+    );
+    assert!(
+        !p.package_policy.block_dependency_confusion,
+        "org package_policy demotion must be HONORED"
+    );
+    assert_eq!(
+        p.package_policy.block_aggregate_score,
+        Some(100),
+        "org raised block_aggregate_score must be HONORED"
+    );
+    assert!(
+        !p.threat_intel.osv_enabled,
+        "org threat_intel.osv_enabled:false must be HONORED"
+    );
+    assert!(
+        !p.threat_intel.deps_dev_enabled,
+        "org threat_intel.deps_dev_enabled:false must be HONORED"
+    );
+    assert_eq!(
+        p.allowed_install_domains,
+        vec!["install.example".to_string()],
+        "org allowed_install_domains must be HONORED"
+    );
+    assert_eq!(
+        p.scan.trusted_mcp_servers,
+        vec!["corp-mcp".to_string()],
+        "org scan.trusted_mcp_servers must be HONORED"
+    );
+    assert_eq!(
+        p.scan.ignore_patterns,
+        vec!["vendor/**".to_string()],
+        "org scan.ignore_patterns must be HONORED"
+    );
 }
 
 #[test]

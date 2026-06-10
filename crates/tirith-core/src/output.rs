@@ -11,10 +11,7 @@ const SCHEMA_VERSION: u32 = 3;
 /// otherwise repaint the user's terminal at warn time. Reuses the MCP filter's
 /// scrubber so both surfaces sanitize identically.
 fn sanitize_field(s: &str) -> String {
-    let mut out = Vec::with_capacity(s.len());
-    crate::mcp::output_filter::sanitize_text_into(s.as_bytes(), &mut out);
-    // Scrubbed output stays valid UTF-8 (whole chars dropped, never split).
-    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+    crate::mcp::output_filter::sanitize_text_str(s)
 }
 
 /// A [`Finding`] serialized with its per-rule `remediation` appended. The
