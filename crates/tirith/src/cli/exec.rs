@@ -104,13 +104,38 @@ fn resolve_policy_path_for_guard() -> Result<PathBuf, i32> {
     Ok(user.join("policy.yaml"))
 }
 
+/// Largest policy file we will read-modify-write for a guard toggle. A policy
+/// YAML is hand-authored and tiny; 1 MiB bounds a hostile or symlinked-to-huge
+/// target so the read cannot be turned into an unbounded slurp.
+const MAX_POLICY_SIZE: u64 = 1024 * 1024;
+
 /// Idempotently set the `exec_guard_enabled` line in a policy YAML, leaving
-/// other lines untouched (mirrors `cli::hooks::update_policy_guard_key`).
+/// other lines untouched.
+///
+/// NOTE: byte-for-byte identical (apart from the `exec_guard_enabled` key) to
+/// `cli::hooks::update_policy_guard_key`. The two are kept as deliberate
+/// duplicates because unifying them would require a shared third module; if you
+/// edit one, mirror the change in the other.
+///
+/// Symlink-hardened (F16): the policy path is a repo-discovered
+/// `.tirith/policy.yaml`, so an attacker who can plant a symlink there could
+/// otherwise redirect this truncating write onto an arbitrary file. The read uses
+/// `O_NOFOLLOW` + a size cap, the write uses `O_NOFOLLOW` + `0600`, and
+/// `canonical_within` rejects an intermediate-directory symlink that escapes the
+/// policy directory.
 fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+
+    // Read the current contents WITHOUT following a symlinked final component. An
+    // absent file is an empty baseline (the key is then appended); any other read
+    // failure (symlinked, oversized, I/O) aborts rather than clobbering blind.
+    let existing = match tirith_core::util::read_text_no_follow_capped(path, MAX_POLICY_SIZE) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(tirith_core::util::OpenRegularError::NotFound) => String::new(),
+        Err(e) => return Err(open_regular_io_error(e)),
+    };
     let new_line = format!("exec_guard_enabled: {enable}");
 
     let mut out = String::new();
@@ -133,15 +158,39 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
         out.push('\n');
     }
 
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+    // Containment: the policy file's real location must stay inside its own
+    // directory, rejecting an intermediate-dir symlink escape O_NOFOLLOW misses.
+    if let Some(parent) = path.parent() {
+        if !tirith_core::util::canonical_within(path, parent) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "refusing to write policy through a symlinked path",
+            ));
+        }
     }
-    let mut f = opts.open(path)?;
+
+    // Truncating write that REFUSES to follow a symlinked final component (0600).
+    let mut f = tirith_core::util::open_write_no_follow(path, true)?;
     f.write_all(out.as_bytes())
+}
+
+/// Map an `OpenRegularError` from the no-follow policy read onto an `io::Error`
+/// so the guard read-modify-write surfaces a single failure type to the caller.
+fn open_regular_io_error(e: tirith_core::util::OpenRegularError) -> std::io::Error {
+    match e {
+        tirith_core::util::OpenRegularError::Io(io) => io,
+        tirith_core::util::OpenRegularError::NotRegularFile => std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "policy path is not a regular file (symlink or special file)",
+        ),
+        tirith_core::util::OpenRegularError::TooLarge => std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "policy file exceeds the size cap",
+        ),
+        tirith_core::util::OpenRegularError::NotFound => {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "policy file not found")
+        }
+    }
 }
 
 /// `tirith exec check <bin>` — resolve `bin` on `$PATH`, report provenance +
@@ -395,6 +444,36 @@ mod tests {
         assert!(
             parsed.exec_guard_enabled,
             "exec_guard_enabled must round-trip to the engine-readable Policy"
+        );
+    }
+
+    /// F16: a guard toggle whose policy path is a SYMLINK must NOT write through
+    /// to the link target — the truncating `O_NOFOLLOW` write refuses the symlink,
+    /// so a sentinel the link points at is left byte-for-byte unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn update_policy_guard_key_does_not_follow_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("sentinel.yaml");
+        let original = "paranoia: 2\n# do not clobber\n";
+        std::fs::write(&sentinel, original).unwrap();
+
+        // policy.yaml -> sentinel.yaml (symlinked FINAL component).
+        let policy = dir.path().join("policy.yaml");
+        std::os::unix::fs::symlink(&sentinel, &policy).unwrap();
+
+        // The toggle must FAIL closed rather than rewrite the sentinel.
+        let res = update_policy_guard_key(&policy, true);
+        assert!(
+            res.is_err(),
+            "writing through a symlinked policy path must error, got {res:?}"
+        );
+        // The sentinel target is untouched: no key written, content identical.
+        let after = std::fs::read_to_string(&sentinel).unwrap();
+        assert_eq!(after, original, "symlink target must be unchanged");
+        assert!(
+            !after.contains("exec_guard_enabled"),
+            "the guard key must not have leaked into the symlink target: {after}"
         );
     }
 }

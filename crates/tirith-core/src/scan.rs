@@ -146,29 +146,37 @@ pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Scan a single file and return its results.
 pub fn scan_single_file(file_path: &Path) -> Option<FileScanResult> {
-    let metadata = match std::fs::metadata(file_path) {
-        Ok(m) => m,
-        Err(e) => {
+    // Read race-free, refusing to FOLLOW a symlinked final component (so a planted
+    // symlink at a matched path can't redirect the read onto a file outside the
+    // tree) and enforcing the same `MAX_FILE_SIZE` ceiling in one open-then-fstat.
+    // Every failure (absent, non-regular, symlinked, oversized, I/O) is a benign
+    // skip → `None`, preserving the `skipped_count` / `scan_single_file_guarded`
+    // `Ok(None)` contract.
+    let raw_bytes = match crate::util::read_text_no_follow_capped(file_path, MAX_FILE_SIZE) {
+        Ok(b) => b,
+        Err(crate::util::OpenRegularError::TooLarge) => {
             eprintln!(
-                "tirith: scan: cannot read metadata for {}: {e}",
+                "tirith: scan: skipping {} (exceeds {}B limit)",
+                file_path.display(),
+                MAX_FILE_SIZE
+            );
+            return None;
+        }
+        Err(crate::util::OpenRegularError::NotFound) => {
+            eprintln!(
+                "tirith: scan: cannot read {} (not found)",
                 file_path.display()
             );
             return None;
         }
-    };
-    if metadata.len() > MAX_FILE_SIZE {
-        eprintln!(
-            "tirith: scan: skipping {} ({}B exceeds {}B limit)",
-            file_path.display(),
-            metadata.len(),
-            MAX_FILE_SIZE
-        );
-        return None;
-    }
-
-    let raw_bytes = match std::fs::read(file_path) {
-        Ok(b) => b,
-        Err(e) => {
+        Err(crate::util::OpenRegularError::NotRegularFile) => {
+            eprintln!(
+                "tirith: scan: skipping {} (symlink or non-regular file)",
+                file_path.display()
+            );
+            return None;
+        }
+        Err(crate::util::OpenRegularError::Io(e)) => {
             eprintln!("tirith: scan: cannot read {}: {e}", file_path.display());
             return None;
         }
@@ -375,7 +383,26 @@ fn collect_files_recursive(
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-        if path.is_dir() {
+        // Classify the entry WITHOUT following symlinks (`entry.file_type()` reports
+        // the link itself, not its target). A symlink — to a directory OR a file —
+        // is skipped outright so traversal can neither recurse through a symlinked
+        // directory out of the tree (e.g. a planted `node_modules -> /`) nor read a
+        // file through a symlink that escapes the scan root.
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "tirith: scan: cannot stat entry {}: {e} (skipped)",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if file_type.is_dir() {
             if should_skip_dir(name) && !is_known_config_dir(name) {
                 continue;
             }
@@ -442,6 +469,16 @@ fn collect_files_recursive(
             .iter()
             .any(|pat| matches_ignore_pattern(name, pat) || matches_ignore_pattern(rel_path, pat))
         {
+            continue;
+        }
+
+        // Final containment gate: the file's REAL location (resolving every
+        // intermediate directory) must stay inside the selected scan root. The
+        // per-entry symlink skip above stops a symlinked leaf or directory, but an
+        // intermediate-directory symlink planted higher in the walk could still let
+        // a regular leaf resolve outside `root`; `canonical_within` (fail-closed)
+        // rejects that.
+        if !crate::util::canonical_within(&path, root) {
             continue;
         }
 
@@ -743,6 +780,65 @@ mod tests {
         assert!(
             !names.contains(&"c.rs"),
             "c.rs should not match *.md include"
+        );
+    }
+
+    /// F15: a SYMLINKED directory under the scan root must NOT be traversed, so a
+    /// planted `subdir -> /outside` cannot pull files from outside the tree into
+    /// the walk.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directory_is_not_traversed() {
+        let root = tempfile::tempdir().expect("create scan root");
+        let outside = tempfile::tempdir().expect("create outside tree");
+        // A uniquely-named file OUTSIDE the scan root.
+        std::fs::write(outside.path().join("escaped_unique_name.md"), "secret").unwrap();
+        // A real in-tree file that SHOULD be collected.
+        std::fs::write(root.path().join("inside.md"), "ok").unwrap();
+        // root/link_dir -> <outside>.
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link_dir")).unwrap();
+
+        let files = collect_files(root.path(), true, &[], &[], &[]);
+        let names: Vec<&str> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+        assert!(
+            names.contains(&"inside.md"),
+            "the in-tree file must be collected"
+        );
+        assert!(
+            !names.contains(&"escaped_unique_name.md"),
+            "a file reached only via a symlinked directory must not be collected: {names:?}"
+        );
+    }
+
+    /// F15: a SYMLINKED file is skipped by the walk, and a direct
+    /// `scan_single_file` on a symlink refuses to read THROUGH it (`O_NOFOLLOW`),
+    /// so neither path discloses a file the link points at outside the tree.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_file_is_not_read_through() {
+        let root = tempfile::tempdir().expect("create scan root");
+        let outside = tempfile::tempdir().expect("create outside tree");
+        let target = outside.path().join("leak.md");
+        std::fs::write(&target, "SECRET_LEAK_CONTENT").unwrap();
+        // root/leak.md -> <outside>/leak.md.
+        let link = root.path().join("leak.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // The walk skips the symlinked leaf entirely.
+        let files = collect_files(root.path(), true, &[], &[], &[]);
+        assert!(
+            files
+                .iter()
+                .all(|p| p.file_name().and_then(|n| n.to_str()) != Some("leak.md")),
+            "a symlinked file must not be collected by the walk: {files:?}"
+        );
+        // And reading the symlink path directly is refused (no read-through).
+        assert!(
+            scan_single_file(&link).is_none(),
+            "scan_single_file must refuse to read through a symlinked final component"
         );
     }
 

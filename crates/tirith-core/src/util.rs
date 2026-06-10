@@ -55,6 +55,15 @@ pub fn open_regular_capped(path: &Path, cap: u64) -> Result<File, OpenRegularErr
         }
         Err(e) => return Err(OpenRegularError::Io(e)),
     };
+    check_regular_capped(file, cap)
+}
+
+/// Shared post-open guard: `fstat` the OPEN fd (not a path — the inode we will
+/// actually read) and accept it ONLY when it is a regular file no larger than
+/// `cap` bytes. Factored out of [`open_regular_capped`] so the `O_NOFOLLOW`
+/// variants ([`open_read_no_follow_capped`]) share one TOCTOU-safe size/type
+/// gate instead of duplicating it.
+fn check_regular_capped(file: File, cap: u64) -> Result<File, OpenRegularError> {
     // fstat the OPEN fd, not the path — the inode we will read.
     let meta = file.metadata().map_err(OpenRegularError::Io)?;
     if !meta.is_file() {
@@ -64,6 +73,153 @@ pub fn open_regular_capped(path: &Path, cap: u64) -> Result<File, OpenRegularErr
         return Err(OpenRegularError::TooLarge);
     }
     Ok(file)
+}
+
+/// Open `path` for writing, REFUSING to follow a symlink at the final path
+/// component (defence against an attacker pre-planting a symlink at a known
+/// write target to redirect the write onto a sensitive file). Creates the file
+/// `0o600` if absent; `truncate` selects truncate-vs-append-position semantics.
+///
+/// On unix this is `O_NOFOLLOW`, so a symlinked final component makes `open`
+/// fail with `ELOOP` — the write never reaches the link target. On non-unix
+/// (no `O_NOFOLLOW`) we `symlink_metadata` first and refuse a symlink, accepting
+/// the small metadata→open TOCTOU there as best-effort.
+///
+/// NOTE: `O_NOFOLLOW` only guards the FINAL component; an intermediate-directory
+/// symlink is not caught here. Callers that must contain the resolved location
+/// within a trusted root should additionally gate on [`canonical_within`].
+pub fn open_write_no_follow(path: &Path, truncate: bool) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(truncate)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::{Error, ErrorKind};
+        if std::fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(Error::new(
+                ErrorKind::Other,
+                "refusing to open symlink for write",
+            ));
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(truncate)
+            .open(path)
+    }
+}
+
+/// Like [`open_regular_capped`] but ALSO refuses a symlinked final component, so
+/// a reader cannot be redirected through an attacker-planted symlink. Combines
+/// `O_NOFOLLOW` (no symlink follow) with the race-free open-then-`fstat` regular
+/// /cap gate of [`open_regular_capped`].
+///
+/// On unix a symlinked final component yields `ELOOP`, mapped to
+/// [`OpenRegularError::NotRegularFile`] (it is, by intent, not a regular file we
+/// will read). `O_NONBLOCK` is also set so a FIFO open returns immediately. On
+/// non-unix we `symlink_metadata`-reject a symlink, then delegate to
+/// [`open_regular_capped`].
+///
+/// NOTE: as with [`open_write_no_follow`], `O_NOFOLLOW` only guards the FINAL
+/// component; pair with [`canonical_within`] to also reject intermediate-dir
+/// symlink escapes.
+pub fn open_read_no_follow_capped(path: &Path, cap: u64) -> Result<File, OpenRegularError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let open_result = std::fs::OpenOptions::new()
+            .read(true)
+            // O_NOFOLLOW: a symlinked final component fails ELOOP (mapped below).
+            // O_NONBLOCK: a writer-less FIFO open returns immediately; the fstat
+            // in check_regular_capped then rejects it.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path);
+        let file = match open_result {
+            Ok(f) => f,
+            // A symlinked final component: refuse as "not a regular file" since
+            // O_NOFOLLOW means we never opened the link target.
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(OpenRegularError::NotRegularFile)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(OpenRegularError::NotFound)
+            }
+            Err(e) => return Err(OpenRegularError::Io(e)),
+        };
+        check_regular_capped(file, cap)
+    }
+    #[cfg(not(unix))]
+    {
+        if std::fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(OpenRegularError::NotRegularFile);
+        }
+        open_regular_capped(path, cap)
+    }
+}
+
+/// Read at most `cap` bytes from a regular file at `path`, refusing to follow a
+/// symlinked final component. Like [`read_regular_capped`] but built on
+/// [`open_read_no_follow_capped`]; reads through `take(cap + 1)` so a TOCTOU
+/// grow between the `fstat` and the read is caught as
+/// [`OpenRegularError::TooLarge`] rather than buffered.
+pub fn read_text_no_follow_capped(path: &Path, cap: u64) -> Result<Vec<u8>, OpenRegularError> {
+    use std::io::Read as _;
+    let file = open_read_no_follow_capped(path, cap)?;
+    let mut buf = Vec::new();
+    file.take(cap.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(OpenRegularError::Io)?;
+    if buf.len() as u64 > cap {
+        return Err(OpenRegularError::TooLarge);
+    }
+    Ok(buf)
+}
+
+/// Return `true` only when `path`'s REAL filesystem location resolves to
+/// somewhere inside the canonical `root`. Unlike the `O_NOFOLLOW` openers (which
+/// only guard the final component), this canonicalizes through ALL intermediate
+/// directories, so an intermediate-directory symlink that escapes `root` is
+/// rejected.
+///
+/// `path` need NOT already exist: its parent is canonicalized and the file name
+/// re-attached, so a not-yet-created target is still containment-checked. A path
+/// with no parent/filename is canonicalized directly. ANY canonicalization
+/// failure (missing parent, broken link, permission) returns `false` —
+/// fail-closed.
+pub fn canonical_within(path: &Path, root: &Path) -> bool {
+    let Ok(canonical_root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    // Resolve path's real location even when `path` itself does not yet exist:
+    // canonicalize the (existing) parent, then re-attach the final component.
+    let resolved = match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            let Ok(canonical_parent) = std::fs::canonicalize(parent) else {
+                return false;
+            };
+            canonical_parent.join(name)
+        }
+        // No parent or no filename (e.g. `/`, `.`, `..`): canonicalize directly.
+        _ => match std::fs::canonicalize(path) {
+            Ok(p) => p,
+            Err(_) => return false,
+        },
+    };
+    resolved.starts_with(&canonical_root)
 }
 
 /// Read at most `cap` bytes from a regular file at `path`, race-free. Wraps
@@ -548,6 +704,181 @@ mod open_regular_tests {
             read_regular_capped(&link, 4096),
             Err(OpenRegularError::NotRegularFile)
         ));
+    }
+}
+
+#[cfg(test)]
+mod no_follow_tests {
+    use super::{
+        canonical_within, open_read_no_follow_capped, open_write_no_follow,
+        read_text_no_follow_capped, OpenRegularError,
+    };
+    use tempfile::tempdir;
+
+    #[test]
+    fn open_write_no_follow_writes_to_a_normal_path() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("out.txt");
+        {
+            use std::io::Write as _;
+            let mut f = open_write_no_follow(&p, true).expect("write to a normal path");
+            f.write_all(b"payload").unwrap();
+        }
+        assert_eq!(std::fs::read(&p).unwrap(), b"payload");
+    }
+
+    /// O_NOFOLLOW (unix) / symlink_metadata reject (non-unix): a write target that
+    /// is a symlink to a sentinel must be REFUSED, leaving the sentinel untouched.
+    /// A regression that followed the link would clobber the sentinel.
+    #[cfg(unix)]
+    #[test]
+    fn open_write_no_follow_refuses_symlink_and_leaves_target_unchanged() {
+        let dir = tempdir().unwrap();
+        let sentinel = dir.path().join("sentinel.txt");
+        std::fs::write(&sentinel, b"original").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&sentinel, &link).unwrap();
+
+        let err = open_write_no_follow(&link, true)
+            .expect_err("opening a symlinked write target must be refused");
+        // unix surfaces ELOOP for an O_NOFOLLOW symlink; assert on the raw errno so
+        // the refusal reason is exactly "followed-a-symlink", not some other I/O error.
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+        // The sentinel must be byte-for-byte unchanged: the write never reached it.
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"original",
+            "the symlink target must be untouched"
+        );
+    }
+
+    #[test]
+    fn open_read_no_follow_capped_reads_a_normal_file() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("ok.bin");
+        std::fs::write(&p, b"hello").unwrap();
+        let file = open_read_no_follow_capped(&p, 1024).expect("a normal file opens");
+        let meta = file.metadata().unwrap();
+        assert_eq!(meta.len(), 5);
+        // And the read helper returns its bytes.
+        assert_eq!(
+            read_text_no_follow_capped(&p, 1024).expect("reads bytes"),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn open_read_no_follow_capped_respects_the_cap() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("big.bin");
+        // One byte over the cap — open succeeds (regular file) but the size fstat
+        // in check_regular_capped must reject it before any read.
+        std::fs::write(&p, vec![b'x'; 1025]).unwrap();
+        assert!(matches!(
+            open_read_no_follow_capped(&p, 1024),
+            Err(OpenRegularError::TooLarge)
+        ));
+        assert!(matches!(
+            read_text_no_follow_capped(&p, 1024),
+            Err(OpenRegularError::TooLarge)
+        ));
+        // Exactly at the cap is accepted.
+        let exact = dir.path().join("exact.bin");
+        std::fs::write(&exact, vec![b'y'; 1024]).unwrap();
+        assert_eq!(
+            read_text_no_follow_capped(&exact, 1024)
+                .expect("exactly cap is fine")
+                .len(),
+            1024
+        );
+    }
+
+    #[test]
+    fn open_read_no_follow_capped_absent_is_not_found() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("nope.bin");
+        assert!(matches!(
+            open_read_no_follow_capped(&p, 1024),
+            Err(OpenRegularError::NotFound)
+        ));
+    }
+
+    /// A symlink to a perfectly ordinary regular file must STILL be refused — the
+    /// no-follow reader rejects the link itself (ELOOP → NotRegularFile), never
+    /// opening the target. This is the whole point of the helper.
+    #[cfg(unix)]
+    #[test]
+    fn open_read_no_follow_capped_refuses_symlink_to_regular_file() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real.bin");
+        std::fs::write(&real, b"secret-contents").unwrap();
+        let link = dir.path().join("link.bin");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(matches!(
+            open_read_no_follow_capped(&link, 4096),
+            Err(OpenRegularError::NotRegularFile)
+        ));
+        assert!(matches!(
+            read_text_no_follow_capped(&link, 4096),
+            Err(OpenRegularError::NotRegularFile)
+        ));
+    }
+
+    #[test]
+    fn canonical_within_true_for_a_path_inside_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // An existing child.
+        let inside = root.join("child.txt");
+        std::fs::write(&inside, b"x").unwrap();
+        assert!(canonical_within(&inside, root));
+        // A not-yet-created child: parent canonicalizes, name re-attached.
+        let not_yet = root.join("does-not-exist-yet.txt");
+        assert!(
+            canonical_within(&not_yet, root),
+            "a missing-but-inside target must still be contained"
+        );
+    }
+
+    #[test]
+    fn canonical_within_false_for_dotdot_escape() {
+        let dir = tempdir().unwrap();
+        // root/inner is the trusted root; root/inner/../escape resolves to
+        // root/escape which is OUTSIDE inner.
+        let inner = dir.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        let escape = dir.path().join("escape.txt");
+        std::fs::write(&escape, b"x").unwrap();
+        let traversal = inner.join("..").join("escape.txt");
+        assert!(
+            !canonical_within(&traversal, &inner),
+            "a ../ escape must resolve outside the root and be rejected"
+        );
+    }
+
+    /// The intermediate-directory symlink case O_NOFOLLOW alone does NOT catch:
+    /// root/link is a symlink to an outside dir, so root/link/file resolves
+    /// outside root even though `file` is not itself a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn canonical_within_false_when_intermediate_dir_is_symlink_outside_root() {
+        let base = tempdir().unwrap();
+        let root = base.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"x").unwrap();
+
+        // root/link → outside (an intermediate-directory symlink escape).
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let escaping = link.join("secret.txt");
+        assert!(
+            !canonical_within(&escaping, &root),
+            "an intermediate-dir symlink pointing outside root must be rejected"
+        );
     }
 }
 
