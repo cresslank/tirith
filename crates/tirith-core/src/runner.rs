@@ -66,11 +66,17 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         return Err("tirith run requires an interactive terminal or --no-exec flag".to_string());
     }
 
+    // F6: validate the first hop up front so an SSRF target gives a fast, clear
+    // error instead of a connect failure. The connect-time DNS guard below is
+    // the rebinding backstop; this is the pre-flight check.
+    crate::url_validate::validate_fetch_url(&opts.url)?;
+
     let mut redirects: Vec<String> = Vec::new();
     let redirect_list = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let redirect_list_clone = redirect_list.clone();
 
     let client = reqwest::blocking::Client::builder()
+        .dns_resolver(crate::ssrf_guard::fetch_resolver())
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if let Ok(mut list) = redirect_list_clone.lock() {
                 list.push(attempt.url().to_string());
@@ -303,10 +309,15 @@ pub fn download_to_path(
     dest: &std::path::Path,
     expected_sha256: Option<&str>,
 ) -> Result<DownloadResult, String> {
+    // F6: validate the first hop up front (see `run()` — same pre-flight check;
+    // the connect-time DNS guard below is the rebinding backstop).
+    crate::url_validate::validate_fetch_url(url)?;
+
     let redirect_list = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let redirect_list_clone = redirect_list.clone();
 
     let client = reqwest::blocking::Client::builder()
+        .dns_resolver(crate::ssrf_guard::fetch_resolver())
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if let Ok(mut list) = redirect_list_clone.lock() {
                 list.push(attempt.url().to_string());

@@ -1,6 +1,6 @@
 //! URL validation for outbound HTTP requests — SSRF protection.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
 type HostResolver = dyn Fn(&str, u16) -> Result<Vec<IpAddr>, String>;
 
@@ -51,6 +51,16 @@ fn validate_parsed_url_with_resolver(
         .ok_or_else(|| "URL is missing a host".to_string())?
         .trim_end_matches('.')
         .to_ascii_lowercase();
+
+    // Fetch paths honor an explicit opt-in to reach private/loopback/metadata
+    // destinations (fetching a command card or script from an internal registry,
+    // and tests that serve from 127.0.0.1). It is gated behind a user-set env
+    // var, so an attacker who only controls the URL cannot enable it. Server
+    // paths and the default fetch path stay locked to public destinations. The
+    // scheme and embedded-credential checks above still apply.
+    if matches!(mode, UrlValidationMode::Fetch) && allow_private_fetch() {
+        return Ok(());
+    }
 
     if host_label == "localhost" || host_label.ends_with(".localhost") {
         return Err(format!(
@@ -139,6 +149,26 @@ fn validate_resolved_ip(host: &str, ip: &IpAddr) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// Whether a resolved socket address points at a routable, public destination.
+///
+/// This is the single source of truth for the private/loopback/link-local/
+/// metadata/reserved CIDR classification used by both the URL validators (which
+/// resolve via `to_socket_addrs`) and the connect-time DNS guard in
+/// [`crate::ssrf_guard`]. Returns `false` for any address the validators would
+/// reject as non-public.
+pub fn is_public_addr(addr: &SocketAddr) -> bool {
+    !is_forbidden_ip(&addr.ip())
+}
+
+/// Whether fetch paths may reach private/loopback/metadata destinations, gated
+/// behind an explicit `TIRITH_ALLOW_PRIVATE_FETCH=1` opt-in (mirrors
+/// `TIRITH_ALLOW_HTTP`). Only honored for [`UrlValidationMode::Fetch`]; server
+/// paths stay locked. An attacker controls the fetched URL, not the user's
+/// environment, so a malicious command card or instruction cannot enable it.
+pub fn allow_private_fetch() -> bool {
+    std::env::var("TIRITH_ALLOW_PRIVATE_FETCH").ok().as_deref() == Some("1")
 }
 
 fn is_cloud_metadata_host(host: &str) -> bool {
@@ -545,5 +575,79 @@ mod tests {
             &resolver_with("2607:f8b0:4004:800::200e".parse().unwrap()),
         );
         assert!(result.is_ok(), "Resolved public IPv6 must be allowed");
+    }
+
+    // F6: `validate_fetch_url` must reject IP-literal SSRF targets up front
+    // (these are the fast-clear-error cases the runner pre-check relies on).
+
+    #[test]
+    fn test_fetch_rejects_loopback_literal() {
+        let result = validate_fetch_url("http://127.0.0.1");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-public"));
+    }
+
+    #[test]
+    fn test_fetch_rejects_metadata_literal() {
+        let result = validate_fetch_url("http://169.254.169.254");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-public"));
+    }
+
+    #[test]
+    fn test_fetch_rejects_ipv6_loopback_literal() {
+        let result = validate_fetch_url("http://[::1]");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-public"));
+    }
+
+    #[test]
+    fn test_fetch_rejects_private_10_literal() {
+        let result = validate_fetch_url("http://10.0.0.1");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-public"));
+    }
+
+    // is_public_addr: the shared classifier reused by the DNS guard.
+
+    fn sock(ip: &str) -> SocketAddr {
+        SocketAddr::new(ip.parse().unwrap(), 443)
+    }
+
+    #[test]
+    fn test_is_public_addr_rejects_private() {
+        assert!(!is_public_addr(&sock("10.0.0.1")));
+        assert!(!is_public_addr(&sock("172.16.0.1")));
+        assert!(!is_public_addr(&sock("192.168.1.1")));
+    }
+
+    #[test]
+    fn test_is_public_addr_rejects_loopback() {
+        assert!(!is_public_addr(&sock("127.0.0.1")));
+        assert!(!is_public_addr(&sock("::1")));
+    }
+
+    #[test]
+    fn test_is_public_addr_rejects_link_local() {
+        assert!(!is_public_addr(&sock("169.254.1.1")));
+        assert!(!is_public_addr(&sock("fe80::1")));
+    }
+
+    #[test]
+    fn test_is_public_addr_rejects_metadata() {
+        assert!(!is_public_addr(&sock("169.254.169.254")));
+    }
+
+    #[test]
+    fn test_is_public_addr_rejects_mapped_ipv6() {
+        assert!(!is_public_addr(&sock("::ffff:127.0.0.1")));
+        assert!(!is_public_addr(&sock("::ffff:169.254.169.254")));
+    }
+
+    #[test]
+    fn test_is_public_addr_accepts_public() {
+        assert!(is_public_addr(&sock("93.184.216.34")));
+        assert!(is_public_addr(&sock("8.8.8.8")));
+        assert!(is_public_addr(&sock("2607:f8b0:4004:800::200e")));
     }
 }

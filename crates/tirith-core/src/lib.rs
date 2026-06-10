@@ -65,6 +65,7 @@ pub mod secret_rotation;
 pub mod selfupdate;
 pub mod session;
 pub mod session_warnings;
+pub mod ssrf_guard;
 pub mod style;
 pub mod sudo_session;
 pub mod taint;

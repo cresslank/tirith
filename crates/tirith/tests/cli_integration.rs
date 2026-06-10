@@ -2365,8 +2365,12 @@ fn warnings_clear_resets_session() {
 fn paranoia_filters_low_finding_to_allow() {
     let tmpdir = tempfile::tempdir().expect("tempdir");
     let state_dir = tmpdir.path().join("state");
-    let policy_dir = tmpdir.path().join("project/.tirith");
-    fs::create_dir_all(&policy_dir).unwrap();
+    // The severity-override/paranoia feature is exercised at ORG scope
+    // (TIRITH_POLICY_ROOT): F9 NEUTRALIZES `severity_overrides` for a repo-scoped
+    // `.tirith/policy.yaml`, so a repo policy could no longer downgrade the
+    // finding. Org scope is operator-controlled, so the override is honored there.
+    let org_dir = tmpdir.path().join("org/.tirith");
+    fs::create_dir_all(&org_dir).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
 
     // paranoia 1 + LOW override for shortened_url filters the finding out.
@@ -2374,13 +2378,16 @@ fn paranoia_filters_low_finding_to_allow() {
 severity_overrides:
   shortened_url: LOW
 "#;
-    fs::write(policy_dir.join("policy.yaml"), policy).unwrap();
-    fs::create_dir_all(tmpdir.path().join("project/.git")).unwrap();
+    fs::write(org_dir.join("policy.yaml"), policy).unwrap();
+
+    // A plain (non-repo) cwd so only the org branch supplies a policy.
+    let project_dir = tmpdir.path().join("project");
+    fs::create_dir_all(&project_dir).unwrap();
 
     let session_id = format!("test-paranoia-low-{}", std::process::id());
-    let project_dir = tmpdir.path().join("project");
 
     let out = tirith_isolated(&session_id, &state_dir, &project_dir)
+        .env("TIRITH_POLICY_ROOT", tmpdir.path().join("org"))
         .args([
             "check",
             "--non-interactive",
@@ -2395,7 +2402,8 @@ severity_overrides:
     assert_eq!(
         out.status.code(),
         Some(0),
-        "LOW finding at paranoia=1 should be filtered to Allow (exit 0), got stderr: {}",
+        "LOW finding at paranoia=1 (org-scope severity_override) should be filtered \
+         to Allow (exit 0), got stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -3597,22 +3605,23 @@ fn update_rollback_refused_for_non_self_managed() {
     );
 }
 
-/// `--verify` and `--rollback` are mutually exclusive (clap-enforced).
+/// `--allow-unsigned` and `--rollback` are mutually exclusive (clap-enforced):
+/// rollback never downloads, so the signature-policy flag is meaningless with it.
 #[test]
-fn update_verify_and_rollback_conflict() {
+fn update_allow_unsigned_and_rollback_conflict() {
     let out = tirith()
-        .args(["update", "--verify", "--rollback"])
+        .args(["update", "--allow-unsigned", "--rollback"])
         .output()
-        .expect("failed to run tirith update --verify --rollback");
+        .expect("failed to run tirith update --allow-unsigned --rollback");
     assert_ne!(
         out.status.code(),
         Some(0),
-        "--verify and --rollback together should be rejected"
+        "--allow-unsigned and --rollback together should be rejected"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("cannot be used with") || stderr.contains("conflict"),
-        "clap should report the --verify/--rollback conflict, got: {stderr}"
+        "clap should report the --allow-unsigned/--rollback conflict, got: {stderr}"
     );
 }
 
@@ -4719,9 +4728,7 @@ fn scan_directory_walk_finds_dockerfile_workflow_and_notebook() {
     );
     assert_eq!(json["panic_count"], 0, "a clean scan reports zero panics");
     assert!(
-        json["panic_files"]
-            .as_array()
-            .is_some_and(|a| a.is_empty()),
+        json["panic_files"].as_array().is_some_and(|a| a.is_empty()),
         "panic_files must be present and empty on a clean scan, got: {}",
         json["panic_files"]
     );
@@ -9471,6 +9478,9 @@ fn command_card_fetch_rejects_unreachable_url() {
     let out = tirith()
         .args(["command-card", "fetch", "http://127.0.0.1:9/nope.json"])
         .env("HOME", home.path())
+        // The localhost test endpoint is reachable only with the explicit
+        // private-fetch opt-in; the SSRF guard blocks 127.0.0.1 by default.
+        .env("TIRITH_ALLOW_PRIVATE_FETCH", "1")
         .output()
         .expect("fetch");
     assert_eq!(
@@ -9563,6 +9573,8 @@ fn command_card_fetch_is_idempotent_for_identical_bytes() {
             .args(["command-card", "fetch", &url])
             .env("HOME", home.path())
             .env("XDG_CACHE_HOME", cache.path())
+            // Reach the 127.0.0.1 test server past the default SSRF guard.
+            .env("TIRITH_ALLOW_PRIVATE_FETCH", "1")
             .output()
             .expect("fetch")
     };
@@ -9663,6 +9675,8 @@ fn command_card_fetch_rejects_card_over_read_cap() {
         .args(["command-card", "fetch", &url])
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", cache.path())
+        // Reach the 127.0.0.1 test server past the default SSRF guard.
+        .env("TIRITH_ALLOW_PRIVATE_FETCH", "1")
         .output()
         .expect("fetch");
 
