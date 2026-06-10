@@ -46,8 +46,17 @@ impl Resolve for SsrfGuardResolver {
             let resolved =
                 lookup.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
+            // Cloud-metadata IPs (IMDS — instance credentials) are dropped
+            // UNCONDITIONALLY, even under the `allow_private` carve-out: the
+            // `TIRITH_ALLOW_PRIVATE_FETCH` opt-in relaxes private/loopback/
+            // link-local destinations but must never reach a metadata endpoint,
+            // so a redirect or DNS-rebind can't land on IMDS once the env is set.
+            // Outside the carve-out the strict public-only filter already
+            // excludes them; this is the backstop for the relaxed path.
             let filtered: Vec<std::net::SocketAddr> = if allow_private {
-                resolved.collect()
+                resolved
+                    .filter(|addr| !crate::url_validate::is_cloud_metadata_addr(addr))
+                    .collect()
             } else {
                 resolved
                     .filter(crate::url_validate::is_public_addr)
@@ -124,7 +133,7 @@ pub fn server_redirect_policy() -> reqwest::redirect::Policy {
 
 #[cfg(test)]
 mod tests {
-    use crate::url_validate::is_public_addr;
+    use crate::url_validate::{is_cloud_metadata_addr, is_public_addr};
     use std::net::SocketAddr;
 
     fn sock(ip: &str) -> SocketAddr {
@@ -164,6 +173,63 @@ mod tests {
     #[test]
     fn test_resolver_constructs() {
         let _r = super::ssrf_guard_resolver();
+    }
+
+    // Under the `TIRITH_ALLOW_PRIVATE_FETCH` relaxation the resolver keeps
+    // private/loopback/link-local addresses (it skips `is_public_addr`) but must
+    // STILL drop cloud-metadata IPs via `is_cloud_metadata_addr`. We can't drive
+    // real DNS hermetically, so we pin the predicate the relaxed path filters on
+    // and replicate the relaxed filter over a representative resolved set.
+
+    #[test]
+    fn test_metadata_filter_flags_imds_addresses() {
+        assert!(is_cloud_metadata_addr(&sock("169.254.169.254")));
+        assert!(is_cloud_metadata_addr(&sock("100.100.100.200")));
+        assert!(is_cloud_metadata_addr(&sock("fd00:ec2::254")));
+        assert!(is_cloud_metadata_addr(&sock("::ffff:169.254.169.254")));
+        // Non-metadata private/link-local addresses are NOT flagged — the
+        // carve-out may legitimately reach these.
+        assert!(!is_cloud_metadata_addr(&sock("169.254.1.1")));
+        assert!(!is_cloud_metadata_addr(&sock("127.0.0.1")));
+        assert!(!is_cloud_metadata_addr(&sock("10.0.0.1")));
+    }
+
+    #[test]
+    fn test_relaxed_filter_drops_metadata_keeps_private() {
+        // Mirror the `allow_private` branch of `SsrfGuardResolver::resolve`: it
+        // collects everything EXCEPT metadata IPs. The private 10.x address is
+        // kept under the carve-out; all three metadata IPs (AWS/GCP/Azure,
+        // Alibaba, and the AWS IPv6 IMDS) are dropped.
+        let resolved = [
+            sock("10.0.0.1"),
+            sock("169.254.169.254"),
+            sock("100.100.100.200"),
+            sock("fd00:ec2::254"),
+        ];
+        let kept: Vec<SocketAddr> = resolved
+            .into_iter()
+            .filter(|addr| !is_cloud_metadata_addr(addr))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![sock("10.0.0.1")],
+            "relaxed resolver must drop every metadata IP but keep the private one"
+        );
+    }
+
+    #[test]
+    fn test_relaxed_filter_metadata_only_yields_empty() {
+        // If a host resolves ONLY to metadata IPs, the relaxed filter empties the
+        // set, which the resolver turns into a hard lookup failure.
+        let resolved = [sock("169.254.169.254"), sock("fd00:ec2::254")];
+        let kept: Vec<SocketAddr> = resolved
+            .into_iter()
+            .filter(|addr| !is_cloud_metadata_addr(addr))
+            .collect();
+        assert!(
+            kept.is_empty(),
+            "a metadata-only resolution must leave nothing to connect to"
+        );
     }
 
     // server_redirect_decision: the testable core of the shared server redirect

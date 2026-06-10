@@ -514,15 +514,50 @@ impl Db {
             // `active` arriving after `past_due`/`revoked` would re-enable a
             // key that was correctly disabled by the newer event.
             //
-            // last_event_at is only ever stored from a Polar event's
-            // `created_at` (the same source as occurred_at), so both sides use
-            // the identical RFC3339/ISO8601 format and a lexicographic compare
-            // is a valid chronological compare. This mirrors the stale
-            // dead-letter check in main.rs.
+            // Both sides carry a Polar event's `created_at`, but
+            // last_event_at is persisted verbatim from the payload, so an
+            // equivalent-or-older instant may be encoded with a different UTC
+            // offset (e.g. `+02:00` vs `Z`) or fractional-second format. A raw
+            // string compare sorts those incorrectly and would let a stale
+            // event through, so parse BOTH to a normalized instant first and
+            // compare the instants.
+            //
+            // Fail-safe policy: a parse failure must never let a stale event
+            // re-apply status side effects. If the incoming occurred_at is
+            // unparseable we cannot trust it is newer, so we reject it as a
+            // non-advance (StaleIgnored). If prev_last_event_at is unparseable
+            // (e.g. a malformed legacy value) we likewise cannot prove the
+            // incoming event is newer, so we conservatively treat the incoming
+            // event as stale. Only a successful parse of BOTH with
+            // occurred >= prev advances the row.
             if let (Some(occurred), Some(prev_at)) =
                 (data.occurred_at.as_deref(), prev_last_event_at)
             {
-                if occurred < prev_at {
+                let is_stale = match (
+                    chrono::DateTime::parse_from_rfc3339(occurred),
+                    chrono::DateTime::parse_from_rfc3339(prev_at),
+                ) {
+                    (Ok(occurred_ts), Ok(prev_ts)) => occurred_ts < prev_ts,
+                    (Err(e), _) => {
+                        tracing::warn!(
+                            event_id = %data.event_id,
+                            occurred_at = %occurred,
+                            error = %e,
+                            "unparseable incoming occurred_at; rejecting as stale (non-advance)"
+                        );
+                        true
+                    }
+                    (Ok(_), Err(e)) => {
+                        tracing::warn!(
+                            event_id = %data.event_id,
+                            last_event_at = %prev_at,
+                            error = %e,
+                            "unparseable stored last_event_at; conservatively treating incoming event as stale"
+                        );
+                        true
+                    }
+                };
+                if is_stale {
                     tx.execute(
                         "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, ?2)",
                         params![data.event_id, data.event_type],
@@ -1279,6 +1314,45 @@ mod tests {
         redelivered.occurred_at = Some("2024-02-01T00:00:00Z".to_string());
         let outcome = db.process_subscription_updated(redelivered).await.unwrap();
         assert_eq!(outcome, UpdatedOutcome::Duplicate);
+    }
+
+    /// F21 regression: the stale guard must compare timestamps as instants,
+    /// not raw RFC3339 strings. An `active` whose occurred_at is chronologically
+    /// OLDER than the stored last_event_at but encoded with a non-`Z` UTC offset
+    /// sorts LATER lexicographically (`...T13:30:00+02:00` > `...T12:00:00Z` as
+    /// bytes, even though 13:30+02:00 == 11:30Z < 12:00Z). A raw string compare
+    /// would treat it as newer and re-enable the revoked key; the instant
+    /// compare correctly flags it as stale.
+    #[tokio::test]
+    async fn test_stale_active_with_offset_encoding_is_ignored() {
+        let db = test_db();
+        let created = make_created("evt_1", "sub_1", "team");
+        db.process_subscription_created(created).await.unwrap();
+
+        // past_due revokes the key and advances last_event_at to a Z-encoded
+        // instant of 2024-03-01T12:00:00Z.
+        let mut past_due = make_updated("evt_2", "sub_1", "past_due");
+        past_due.occurred_at = Some("2024-03-01T12:00:00Z".to_string());
+        let outcome = db.process_subscription_updated(past_due).await.unwrap();
+        assert_eq!(outcome, UpdatedOutcome::Revoked);
+
+        let (status, revoked) = read_state(&db, "sub_1");
+        assert_eq!(status, "past_due");
+        assert_eq!(revoked, Some(true));
+
+        // A genuine but stale `active`: 13:30:00+02:00 == 11:30:00Z, which is
+        // 30 minutes BEFORE the stored 12:00:00Z. Lexicographically its string
+        // sorts after the stored value (the '13' hour), so the old raw-string
+        // compare would let it through and un-revoke the key.
+        let mut stale_active = make_updated("evt_3", "sub_1", "active");
+        stale_active.occurred_at = Some("2024-03-01T13:30:00+02:00".to_string());
+        let outcome = db.process_subscription_updated(stale_active).await.unwrap();
+        assert_eq!(outcome, UpdatedOutcome::StaleIgnored);
+
+        // Status and key state are untouched — the key stays revoked.
+        let (status, revoked) = read_state(&db, "sub_1");
+        assert_eq!(status, "past_due");
+        assert_eq!(revoked, Some(true));
     }
 
     #[tokio::test]

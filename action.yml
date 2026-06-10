@@ -43,10 +43,13 @@ runs:
         # the installer from that exact release tag; otherwise fall back to the
         # ref this action was resolved from (a tag or commit SHA when the caller
         # pinned `uses: sheeki03/tirith@<sha>`).
+        # Strip a leading "v" so a caller passing "v1.2.3" (the common tag form)
+        # doesn't produce a double-"v" ref like "vv1.2.3" that 404s.
+        VERSION_NO_V="${TIRITH_VERSION#v}"
         if [ "$TIRITH_VERSION" = "latest" ]; then
           INSTALLER_REF="${ACTION_REF:-main}"
         else
-          INSTALLER_REF="v${TIRITH_VERSION}"
+          INSTALLER_REF="v${VERSION_NO_V}"
         fi
         INSTALLER_URL="https://raw.githubusercontent.com/sheeki03/tirith/${INSTALLER_REF}/scripts/install.sh"
         echo "Fetching installer from ${INSTALLER_URL}"
@@ -58,7 +61,7 @@ runs:
         if [ "$TIRITH_VERSION" = "latest" ]; then
           curl -sSfL "$INSTALLER_URL" | TIRITH_INSTALL_DIR=/usr/local/bin sh
         else
-          curl -sSfL "$INSTALLER_URL" | TIRITH_INSTALL_DIR=/usr/local/bin TIRITH_VERSION="$TIRITH_VERSION" sh
+          curl -sSfL "$INSTALLER_URL" | TIRITH_INSTALL_DIR=/usr/local/bin TIRITH_VERSION="$VERSION_NO_V" sh
         fi
     - name: Run scan
       id: scan

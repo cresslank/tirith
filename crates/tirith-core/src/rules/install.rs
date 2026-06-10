@@ -52,13 +52,15 @@ fn cmd_base(raw: &str, shell: ShellType) -> String {
 }
 
 /// Resolve a segment's effective command + args, stepping past leading
-/// `sudo` / `doas` / `env` / `command` wrappers (and their flags, plus `env`'s
-/// leading `VAR=val` assignments) — install commands are commonly run under
-/// these, so reading `segment.command` directly would miss `sudo apt-get ...`,
-/// `env dnf ...`, or `command dnf ...`. Wrappers are peeled iteratively, so
-/// `sudo env dnf ...` also resolves. The `env`/`command` handling mirrors
-/// `crate::extract::resolve_named_command`; the `sudo`/`doas` flag handling is
-/// kept local and unchanged.
+/// `sudo` / `doas` / `env` / `command` / `time` / `tirith` wrappers (and their
+/// flags, plus `env`'s leading `VAR=val` assignments) — install commands are
+/// commonly run under these, so reading `segment.command` directly would miss
+/// `sudo apt-get ...`, `env dnf ...`, `command dnf ...`, or `time dnf ...`.
+/// Wrappers are peeled iteratively, so `sudo env dnf ...` also resolves. The
+/// wrapper SET and per-wrapper handling are kept in lockstep with the shared
+/// `crate::extract::resolve_named_command` (which can't be reused directly here:
+/// it is private and returns a borrowed-args struct over `command + args`, not
+/// this `(base, &args)` shape over a whole `Segment`).
 fn resolve_command(seg: &tokenize::Segment, shell: ShellType) -> Option<(String, &[String])> {
     let mut base = cmd_base(seg.command.as_deref()?, shell);
     let mut args = seg.args.as_slice();
@@ -66,10 +68,17 @@ fn resolve_command(seg: &tokenize::Segment, shell: ShellType) -> Option<(String,
     // Peel wrappers until the command word is a real command. Bounded by the
     // arg count, so a degenerate `env env env …` cannot loop forever.
     loop {
+        // `tirith` is terminal: `tirith run …` is itself a sink (resolves to
+        // `tirith-run`) and any other subcommand stays `tirith` — neither peels
+        // to an inner command. Mirrors `extract::resolve_tirith_command`.
+        if base == "tirith" {
+            return Some(resolve_tirith(args));
+        }
         let inner_idx = match base.as_str() {
             "sudo" | "doas" => wrapper_inner_index_sudo(args),
             "env" => wrapper_inner_index_env(args),
             "command" => wrapper_inner_index_command(args),
+            "time" => wrapper_inner_index_time(args),
             _ => return Some((base, args)),
         };
         let idx = inner_idx?;
@@ -181,6 +190,42 @@ fn wrapper_inner_index_command(args: &[String]) -> Option<usize> {
         break;
     }
     (idx < args.len()).then_some(idx)
+}
+
+/// Index of the wrapped command word after a `time` leader. Steps past flags,
+/// with `-f`/`--format`/`-o`/`--output` consuming a following value (mirrors
+/// `extract::resolve_time_wrapper`). Returns `None` when no command word follows.
+fn wrapper_inner_index_time(args: &[String]) -> Option<usize> {
+    let mut idx = 0;
+    while idx < args.len() {
+        let a = strip_quotes(&args[idx]);
+        if a == "--" {
+            idx += 1;
+            break;
+        }
+        if a.starts_with('-') {
+            if a == "-f" || a == "--format" || a == "-o" || a == "--output" {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    (idx < args.len()).then_some(idx)
+}
+
+/// Resolve a `tirith` invocation to its effective command + args, mirroring
+/// `extract::resolve_tirith_command`: `tirith run …` is the download-and-execute
+/// sink (resolved name `tirith-run`, args after `run`); any other subcommand
+/// (or bare `tirith`) stays `tirith` with its args unchanged.
+fn resolve_tirith(args: &[String]) -> (String, &[String]) {
+    let subcommand = args.first().map(|a| strip_quotes(a).to_ascii_lowercase());
+    match subcommand.as_deref() {
+        Some("run") => ("tirith-run".to_string(), &args[1..]),
+        _ => ("tirith".to_string(), args),
+    }
 }
 
 /// Whether a normalized arg looks like a remote `http(s)://` or `ftp://` URL.
@@ -1747,6 +1792,44 @@ mod tests {
             ShellType::Posix,
             RuleId::GpgCheckDisabled,
         ));
+    }
+
+    #[test]
+    fn test_time_wrapper_resolved() {
+        // F20: the shared resolver unwraps `time`, so the local resolver must
+        // too — otherwise `time dnf …` hides the package manager behind `time`.
+        assert!(
+            has(
+                "time dnf install --nogpgcheck pkg",
+                ShellType::Posix,
+                RuleId::GpgCheckDisabled,
+            ),
+            "a time-wrapped dnf must resolve so --nogpgcheck still fires"
+        );
+        // A value-taking `time` flag before the command must be skipped.
+        assert!(has(
+            "time -o /tmp/t dnf install --nogpgcheck pkg",
+            ShellType::Posix,
+            RuleId::GpgCheckDisabled,
+        ));
+        // Nested with sudo (`sudo time dnf …`) resolves through both wrappers.
+        assert!(has(
+            "sudo time dnf install --nogpgcheck pkg",
+            ShellType::Posix,
+            RuleId::GpgCheckDisabled,
+        ));
+    }
+
+    #[test]
+    fn test_tirith_wrapper_resolved() {
+        // F20: the shared resolver unwraps `tirith` (any non-`run` subcommand
+        // stays `tirith`, so the wrapped command is NOT reached) — but it must
+        // still resolve in lockstep so the local set matches. `tirith run dnf …`
+        // is a sink and does not unwrap further; neither shape should now panic
+        // or diverge from the shared resolver. The realistic exec-wrapper case
+        // is `time`/`env`/`command`; `tirith` is included only for set parity.
+        // A bare `tirith` with a non-run subcommand must not be misread as dnf.
+        assert!(none("tirith check dnf install pkg", ShellType::Posix));
     }
 
     #[test]

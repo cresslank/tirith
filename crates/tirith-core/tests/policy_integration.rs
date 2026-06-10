@@ -1663,6 +1663,8 @@ fn test_policy_file_fifo_fails_closed() {
     // A repo can make `.tirith/policy.yaml` a FIFO. The no-follow, size-capped
     // reader opens it O_NONBLOCK and rejects it as not-a-regular-file, so the read
     // fails closed instead of hanging on a writer that never arrives.
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    clear_policy_env();
     let repo = TempDir::new().unwrap();
     fs::create_dir_all(repo.path().join(".git")).unwrap();
     let tirith = repo.path().join(".tirith");
@@ -1696,6 +1698,8 @@ fn test_policy_file_symlink_fails_closed() {
     // A repo can plant a symlink at `.tirith/policy.yaml` pointing at an arbitrary
     // file. O_NOFOLLOW rejects the final-component symlink (ELOOP → not-regular),
     // so the policy read fails closed and the link target is never consumed.
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    clear_policy_env();
     let repo = TempDir::new().unwrap();
     fs::create_dir_all(repo.path().join(".git")).unwrap();
     let tirith = repo.path().join(".tirith");

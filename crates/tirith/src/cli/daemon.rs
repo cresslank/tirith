@@ -49,20 +49,26 @@ fn runtime_dir() -> PathBuf {
         return state;
     }
 
+    let euid = unsafe { libc::geteuid() };
+
     // `$XDG_RUNTIME_DIR` is a per-user 0700 dir on most modern Linux desktops.
-    // Treat empty as unset (matches shell `${VAR:-fallback}` semantics).
+    // Treat empty as unset (matches shell `${VAR:-fallback}` semantics). Only use
+    // it when the BASE is a real dir we own that is not group/other-writable —
+    // otherwise another user could swap the leaf dir or socket from the parent.
     if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
         let trimmed = rt.trim();
         if !trimmed.is_empty() {
-            return PathBuf::from(trimmed).join("tirith");
+            let base = PathBuf::from(trimmed);
+            if dir_owned_by_euid(&base, euid) {
+                return base.join("tirith");
+            }
         }
     }
 
-    let euid = unsafe { libc::geteuid() };
-
     // `/run/user/<euid>` is the systemd-managed per-user runtime dir. Only use it
-    // when it already exists AND is owned by us — otherwise fall through to the
-    // uid-scoped tempdir. `ensure_private_dir` re-verifies the `tirith` subdir.
+    // when it already exists AND is a safe per-user base (owned, not group/other-
+    // writable) — otherwise fall through to the uid-scoped tempdir.
+    // `ensure_private_dir` re-verifies the `tirith` subdir.
     let run_user = PathBuf::from(format!("/run/user/{euid}"));
     if dir_owned_by_euid(&run_user, euid) {
         return run_user.join("tirith");
@@ -71,15 +77,22 @@ fn runtime_dir() -> PathBuf {
     std::env::temp_dir().join(format!("tirith-{euid}"))
 }
 
-/// `true` when `path` is a real directory (not a symlink) owned by `euid`. Used
-/// to decide whether `/run/user/<euid>` is a usable per-user runtime base.
-/// `symlink_metadata` (lstat) so a symlinked entry pointing at a victim dir is
-/// rejected rather than followed.
+/// `true` when `path` is a real directory (not a symlink), owned by `euid`, and
+/// NOT writable by group or other. Used to decide whether a per-user runtime base
+/// (`$XDG_RUNTIME_DIR`, `/run/user/<euid>`) is safe to bind under: a group/other-
+/// writable base would let another local user remove or replace the leaf dir or
+/// the socket. `symlink_metadata` (lstat) so a symlinked entry pointing at a
+/// victim dir is rejected rather than followed.
 #[cfg(unix)]
 fn dir_owned_by_euid(path: &std::path::Path, euid: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
     match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta.is_dir() && !meta.file_type().is_symlink() && meta.uid() == euid,
+        Ok(meta) => {
+            meta.is_dir()
+                && !meta.file_type().is_symlink()
+                && meta.uid() == euid
+                && (meta.mode() & 0o022) == 0
+        }
         Err(_) => false,
     }
 }
@@ -1361,6 +1374,28 @@ mod tests {
         assert!(
             !super::dir_owned_by_euid(&tmp.0.join("missing"), euid),
             "a missing path must be rejected"
+        );
+    }
+
+    #[test]
+    fn dir_owned_by_euid_rejects_group_or_other_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TmpDir::new("loosebase");
+        let euid = unsafe { libc::geteuid() };
+        let dir = tmp.0.join("d");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        // A base we own but that is group/other-writable lets another user swap the
+        // leaf dir or socket from the parent, so it must be rejected.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert!(
+            !super::dir_owned_by_euid(&dir, euid),
+            "a group/other-writable base must be rejected even when we own it"
+        );
+        // Tightening to 0700 makes it acceptable again.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        assert!(
+            super::dir_owned_by_euid(&dir, euid),
+            "an owned 0700 base must be accepted"
         );
     }
 

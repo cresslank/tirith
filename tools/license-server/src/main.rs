@@ -137,14 +137,23 @@ async fn retry_dead_letters(
         if let (Some(ref dl_occurred), Some(ref sub_last)) =
             (&entry.occurred_at, &entry.last_event_at)
         {
-            if dl_occurred < sub_last {
-                info!(
-                    dead_letter_id = entry.id,
-                    sub_id = %sub_id,
-                    "dead letter older than latest event, removing stale entry"
-                );
-                let _ = db.delete_dead_letter(entry.id).await;
-                continue;
+            // Compare as instants, not raw strings — a different UTC offset or
+            // fractional-second encoding sorts incorrectly lexicographically. If
+            // either timestamp fails to parse, keep the dead letter: its retry
+            // reconciles against the CURRENT subscription state, which is safe.
+            if let (Ok(dl_ts), Ok(sub_ts)) = (
+                chrono::DateTime::parse_from_rfc3339(dl_occurred),
+                chrono::DateTime::parse_from_rfc3339(sub_last),
+            ) {
+                if dl_ts < sub_ts {
+                    info!(
+                        dead_letter_id = entry.id,
+                        sub_id = %sub_id,
+                        "dead letter older than latest event, removing stale entry"
+                    );
+                    let _ = db.delete_dead_letter(entry.id).await;
+                    continue;
+                }
             }
         }
 

@@ -661,7 +661,11 @@ fn collect_lefthook(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
                     rel.to_string(),
                     HookProvider::Lefthook,
                     path,
-                    Vec::new(),
+                    // A readable lefthook config could hook ANY git event; since we
+                    // can't parse this blocked one, tag the placeholder with all of
+                    // them so a git-leader scan still matches it (LeaderTarget::matches
+                    // triggers Lefthook entries only via git_events / name).
+                    GIT_EVENTS.iter().map(|e| (*e).to_string()).collect(),
                     &reason,
                 );
                 return; // only one lefthook config
@@ -2011,6 +2015,33 @@ mod tests {
                 .any(|f| f.rule_id == RuleId::RepoHookNetworkCall),
             "a body rule must not fire on a symlink-rejected .envrc: {:?}",
             envrc.findings
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_lefthook_config_still_triggers_under_git_leader() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let sentinel = outside.path().join("real_lefthook.yml");
+        std::fs::write(
+            &sentinel,
+            "pre-commit:\n  commands:\n    a:\n      run: echo hi\n",
+        )
+        .unwrap();
+        // repo/lefthook.yml -> outside sentinel: O_NOFOLLOW rejects the symlinked
+        // final component, so the config is blocked (Unreadable). Its placeholder
+        // must still trigger under a git leader (it carries GIT_EVENTS), not vanish.
+        std::os::unix::fs::symlink(&sentinel, root.path().join("lefthook.yml")).unwrap();
+
+        let findings = scan_triggered_by_leader(root.path(), "git", Some("commit"))
+            .expect("git commit is hook-triggering");
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Info && f.detail.contains("unreadable")),
+            "a blocked lefthook.yml must surface the Info unreadable finding under a git leader, got {:?}",
+            findings
         );
     }
 
