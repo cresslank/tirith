@@ -51,25 +51,45 @@ fn cmd_base(raw: &str, shell: ShellType) -> String {
         .unwrap_or(lower)
 }
 
-/// Resolve a segment's effective command + args, stepping past a single leading
-/// `sudo` / `doas` wrapper (and its value-taking flags) — install commands are
-/// commonly run under `sudo`, so reading `segment.command` directly would miss
-/// `sudo apt-get ...`.
+/// Resolve a segment's effective command + args, stepping past leading
+/// `sudo` / `doas` / `env` / `command` wrappers (and their flags, plus `env`'s
+/// leading `VAR=val` assignments) — install commands are commonly run under
+/// these, so reading `segment.command` directly would miss `sudo apt-get ...`,
+/// `env dnf ...`, or `command dnf ...`. Wrappers are peeled iteratively, so
+/// `sudo env dnf ...` also resolves. The `env`/`command` handling mirrors
+/// `crate::extract::resolve_named_command`; the `sudo`/`doas` flag handling is
+/// kept local and unchanged.
 fn resolve_command(seg: &tokenize::Segment, shell: ShellType) -> Option<(String, &[String])> {
-    let cmd = seg.command.as_deref()?;
-    let base = cmd_base(cmd, shell);
-    if base != "sudo" && base != "doas" {
-        return Some((base, seg.args.as_slice()));
-    }
+    let mut base = cmd_base(seg.command.as_deref()?, shell);
+    let mut args = seg.args.as_slice();
 
-    // Step past sudo/doas flags; the value-taking ones consume their value.
+    // Peel wrappers until the command word is a real command. Bounded by the
+    // arg count, so a degenerate `env env env …` cannot loop forever.
+    loop {
+        let inner_idx = match base.as_str() {
+            "sudo" | "doas" => wrapper_inner_index_sudo(args),
+            "env" => wrapper_inner_index_env(args),
+            "command" => wrapper_inner_index_command(args),
+            _ => return Some((base, args)),
+        };
+        let idx = inner_idx?;
+        let inner = args.get(idx)?;
+        base = cmd_base(inner, shell);
+        args = &args[idx + 1..];
+    }
+}
+
+/// Index of the wrapped command word after a `sudo`/`doas` leader. Steps past
+/// flags (value-taking ones consume their value) and leading `VAR=val`
+/// assignments. Returns `None` when no command word follows.
+fn wrapper_inner_index_sudo(args: &[String]) -> Option<usize> {
     let value_short = ["-u", "-g", "-C", "-h", "-p", "-r", "-t", "-D", "-R", "-T"];
     let value_long = [
         "--user", "--group", "--chdir", "--host", "--prompt", "--role", "--type",
     ];
     let mut idx = 0;
-    while idx < seg.args.len() {
-        let a = strip_quotes(&seg.args[idx]);
+    while idx < args.len() {
+        let a = strip_quotes(&args[idx]);
         if a == "--" {
             idx += 1;
             break;
@@ -94,9 +114,73 @@ fn resolve_command(seg: &tokenize::Segment, shell: ShellType) -> Option<(String,
         }
         break;
     }
-    let inner = seg.args.get(idx)?;
-    let inner_base = cmd_base(inner, shell);
-    Some((inner_base, &seg.args[idx + 1..]))
+    (idx < args.len()).then_some(idx)
+}
+
+/// Index of the wrapped command word after an `env` leader. Steps past leading
+/// `VAR=val` assignments and env flags (mirrors
+/// `extract::resolve_env_command`): `--unset`/`--chdir`/`--split-string` and
+/// `-u`/`-C`/`-S` take a value unless joined with `=`. After a `--`, the next
+/// non-assignment token is the command.
+fn wrapper_inner_index_env(args: &[String]) -> Option<usize> {
+    let mut idx = 0;
+    while idx < args.len() {
+        let a = strip_quotes(&args[idx]);
+        if a == "--" {
+            idx += 1;
+            break;
+        }
+        if tokenize::is_env_assignment(a) {
+            idx += 1;
+            continue;
+        }
+        if a.starts_with('-') {
+            if a.starts_with("--") {
+                let name = a.split_once('=').map(|(n, _)| n).unwrap_or(a);
+                let takes_value =
+                    matches!(name, "--unset" | "--chdir" | "--split-string") && !a.contains('=');
+                idx += if takes_value { 2 } else { 1 };
+                continue;
+            }
+            if a == "-u" || a == "-C" || a == "-S" {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        // First non-flag, non-assignment token is the command word.
+        return Some(idx);
+    }
+    // After `--`: skip any remaining assignments, then the command word.
+    while idx < args.len() {
+        if tokenize::is_env_assignment(strip_quotes(&args[idx])) {
+            idx += 1;
+            continue;
+        }
+        return Some(idx);
+    }
+    None
+}
+
+/// Index of the wrapped command word after a `command` builtin leader. `command`
+/// only takes flags (`-p`, `-v`, `-V`); after them (or a `--`) comes the command
+/// (mirrors `extract::resolve_command_wrapper`).
+fn wrapper_inner_index_command(args: &[String]) -> Option<usize> {
+    let mut idx = 0;
+    while idx < args.len() {
+        let a = strip_quotes(&args[idx]);
+        if a == "--" {
+            idx += 1;
+            break;
+        }
+        if a.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+    (idx < args.len()).then_some(idx)
 }
 
 /// Whether a normalized arg looks like a remote `http(s)://` or `ftp://` URL.
@@ -1633,6 +1717,33 @@ mod tests {
     fn test_doas_wrapper_resolved() {
         assert!(has(
             "doas dnf install --nogpgcheck pkg",
+            ShellType::Posix,
+            RuleId::GpgCheckDisabled,
+        ));
+    }
+
+    #[test]
+    fn test_env_wrapper_resolved() {
+        // `env dnf …` must resolve through the `env` wrapper so the wrapped
+        // command is recognized (mirrors `test_dnf_nogpgcheck` under sudo).
+        assert!(has(
+            "env dnf install --nogpgcheck pkg",
+            ShellType::Posix,
+            RuleId::GpgCheckDisabled,
+        ));
+        // Leading `VAR=val` assignments and env flags must be skipped too.
+        assert!(has(
+            "env FOO=1 dnf install --nogpgcheck pkg",
+            ShellType::Posix,
+            RuleId::GpgCheckDisabled,
+        ));
+    }
+
+    #[test]
+    fn test_command_wrapper_resolved() {
+        // `command dnf …` must resolve through the `command` builtin wrapper.
+        assert!(has(
+            "command dnf install --nogpgcheck pkg",
             ShellType::Posix,
             RuleId::GpgCheckDisabled,
         ));
