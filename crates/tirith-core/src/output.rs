@@ -5,6 +5,18 @@ use crate::verdict::{Action, Evidence, Finding, Verdict};
 
 const SCHEMA_VERSION: u32 = 3;
 
+/// Strip terminal-control bytes from an untrusted finding field before it is
+/// written to a terminal. `finding.description` embeds the offending URL/payload
+/// verbatim (engine.rs), so a blocklisted URL carrying ANSI/OSC/zero-width could
+/// otherwise repaint the user's terminal at warn time. Reuses the MCP filter's
+/// scrubber so both surfaces sanitize identically.
+fn sanitize_field(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    crate::mcp::output_filter::sanitize_text_into(s.as_bytes(), &mut out);
+    // Scrubbed output stays valid UTF-8 (whole chars dropped, never split).
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
 /// A [`Finding`] serialized with its per-rule `remediation` appended. The
 /// remediation text is static and secret-free (no redaction needed); this view
 /// confines it to the `check`/`paste` JSON surface, leaving every other
@@ -114,8 +126,14 @@ pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std
     for finding in &verdict.findings {
         let sev = crate::style::severity_label(&finding.severity, crate::style::Stream::Stderr);
 
-        writeln!(w, "  {} {} — {}", sev, finding.rule_id, finding.title)?;
-        writeln!(w, "    {}", finding.description)?;
+        writeln!(
+            w,
+            "  {} {} — {}",
+            sev,
+            finding.rule_id,
+            sanitize_field(&finding.title)
+        )?;
+        writeln!(w, "    {}", sanitize_field(&finding.description))?;
 
         for evidence in &finding.evidence {
             if let Evidence::HomoglyphAnalysis {
@@ -282,9 +300,11 @@ fn write_human_no_color(
         writeln!(
             w,
             "  [{}] {} — {}",
-            finding.severity, finding.rule_id, finding.title
+            finding.severity,
+            finding.rule_id,
+            sanitize_field(&finding.title)
         )?;
-        writeln!(w, "    {}", finding.description)?;
+        writeln!(w, "    {}", sanitize_field(&finding.description))?;
 
         for evidence in &finding.evidence {
             if let Evidence::HomoglyphAnalysis {
@@ -527,6 +547,55 @@ mod tests {
         let mut buf = Vec::new();
         write_safe_suggestions(&[], &mut buf).unwrap();
         assert!(buf.is_empty(), "no suggestions → no output");
+    }
+
+    #[test]
+    fn human_output_sanitizes_terminal_control_in_finding_fields() {
+        // engine.rs embeds the offending URL/payload verbatim into a finding's
+        // title/description. A blocklisted URL carrying terminal-control bytes
+        // (here clear-screen + cursor-home) must be scrubbed before it is
+        // written to the terminal (F11) — no raw ESC may reach the writer.
+        let evil = "\x1b[2J\x1b[1;1Hwiped";
+        let verdict = Verdict::from_findings(
+            vec![Finding {
+                rule_id: RuleId::PlainHttpToSink,
+                severity: Severity::High,
+                title: format!("Blocklisted URL {evil}"),
+                description: format!("matched http://evil.example/{evil}/x.sh"),
+                evidence: vec![Evidence::Url {
+                    raw: "http://evil.example/x.sh".to_string(),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }],
+            3,
+            Timings::default(),
+        );
+
+        // no-color path
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        assert!(
+            !buf.contains(&0x1b),
+            "no-color human output must strip raw ESC from finding fields"
+        );
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("Blocklisted URL") && out.contains("wiped"),
+            "surrounding text must survive sanitization: {out}"
+        );
+
+        // color path (write_human emits its own SGR for styling, so we only
+        // assert the untrusted payload's clear-screen/cursor-home are gone).
+        let mut cbuf = Vec::new();
+        write_human(&verdict, false, &mut cbuf).unwrap();
+        let cout = String::from_utf8(cbuf).unwrap();
+        assert!(
+            !cout.contains("\x1b[2J") && !cout.contains("\x1b[1;1H"),
+            "color human output must strip the attacker's CSI sequences: {cout}"
+        );
     }
 
     #[test]

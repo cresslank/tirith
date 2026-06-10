@@ -1,12 +1,17 @@
 //! MCP tool-result output filter (M7 ch4). Routes a [`ToolCallResult`]'s
-//! `content[].text` through [`crate::engine::analyze_output`] and rewrites by
-//! verdict [`Action`]:
+//! `content[].text` plus the string leaves of `structuredContent` through
+//! [`crate::engine::analyze_output`] and rewrites by verdict [`Action`]:
 //!
 //! * `Block` — replace `content` with one placeholder text item citing the
-//!   `event_id` (for audit-log correlation) and set `isError: true`.
+//!   `event_id` (for audit-log correlation), clear `structuredContent`, and set
+//!   `isError: true`.
 //! * `Warn` — keep `isError`; prepend a `[tirith: WARNING …]` item and sanitize
 //!   existing text in place (strip ANSI/OSC/zero-width, structure preserved).
 //! * `Allow` — pass through unchanged.
+//!
+//! On every verdict (Allow included), `structuredContent` string leaves are
+//! scrubbed of ANSI/control/zero-width bytes: structured output is data, not a
+//! terminal stream, so it must never carry display-control payloads (F10).
 //!
 //! Blocks use MCP `isError: true` + placeholder, NOT a JSON-RPC error envelope
 //! (that signals transport failure, not content policy). See
@@ -63,7 +68,9 @@ pub fn filter_tool_result(result: &mut ToolCallResult, fail_mode_closed: bool) -
     let event_id = uuid::Uuid::new_v4().to_string();
 
     // Concatenate `content[].text` (text items only; others pass through). A NUL
-    // separates items so an OSC payload split across items isn't rejoined.
+    // separates items so an OSC payload split across items isn't rejoined. The
+    // STRING leaves of `structured_content` are appended (also NUL-separated) so
+    // taint living only in structured output is still analyzed (F10).
     let mut joined = String::new();
     let mut total_bytes: usize = 0;
     let mut truncated = false;
@@ -71,27 +78,15 @@ pub fn filter_tool_result(result: &mut ToolCallResult, fail_mode_closed: bool) -
         if item.content_type != "text" {
             continue;
         }
-        if !joined.is_empty() {
-            joined.push('\0');
-            total_bytes += 1;
-        }
-        let remaining = MAX_SCAN_BYTES.saturating_sub(total_bytes);
-        if remaining == 0 {
+        if !append_scan_chunk(&mut joined, &mut total_bytes, &item.text) {
             truncated = true;
             break;
         }
-        if item.text.len() > remaining {
-            // Char-boundary safe truncate.
-            let mut cut = remaining;
-            while cut > 0 && !item.text.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            joined.push_str(&item.text[..cut]);
-            truncated = true;
-            break;
+    }
+    if !truncated {
+        if let Some(sc) = &result.structured_content {
+            truncated = !collect_json_string_leaves(sc, &mut joined, &mut total_bytes);
         }
-        joined.push_str(&item.text);
-        total_bytes += item.text.len();
     }
 
     let start = std::time::Instant::now();
@@ -134,7 +129,100 @@ pub fn filter_tool_result(result: &mut ToolCallResult, fail_mode_closed: bool) -
         }
     }
 
+    // Structured content is data, not a terminal stream, and must never carry
+    // ANSI/control/zero-width bytes regardless of verdict — sanitize on every
+    // path (F10). `apply_block` already cleared it to None, so this is a no-op
+    // there; on Warn/Allow it scrubs the string leaves in place.
+    if let Some(sc) = result.structured_content.as_mut() {
+        sanitize_json_strings(sc);
+    }
+
     outcome
+}
+
+/// Append `text` to the scan buffer `joined`, NUL-separating from prior content
+/// and honoring the [`MAX_SCAN_BYTES`] budget tracked in `total_bytes`. Returns
+/// `false` if the cap was hit (caller should mark the scan truncated and stop).
+fn append_scan_chunk(joined: &mut String, total_bytes: &mut usize, text: &str) -> bool {
+    if !joined.is_empty() {
+        joined.push('\0');
+        *total_bytes += 1;
+    }
+    let remaining = MAX_SCAN_BYTES.saturating_sub(*total_bytes);
+    if remaining == 0 {
+        return false;
+    }
+    if text.len() > remaining {
+        // Char-boundary safe truncate.
+        let mut cut = remaining;
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        joined.push_str(&text[..cut]);
+        return false;
+    }
+    joined.push_str(text);
+    *total_bytes += text.len();
+    true
+}
+
+/// Recursively append every string leaf of `v` (object values, array elements,
+/// and bare strings) to the scan buffer via [`append_scan_chunk`]. Object keys
+/// are not attacker-controlled output and are skipped. Returns `false` if the
+/// scan budget was exhausted partway (the caller marks the scan truncated).
+fn collect_json_string_leaves(
+    v: &serde_json::Value,
+    joined: &mut String,
+    total_bytes: &mut usize,
+) -> bool {
+    match v {
+        serde_json::Value::String(s) => append_scan_chunk(joined, total_bytes, s),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if !collect_json_string_leaves(item, joined, total_bytes) {
+                    return false;
+                }
+            }
+            true
+        }
+        serde_json::Value::Object(map) => {
+            for val in map.values() {
+                if !collect_json_string_leaves(val, joined, total_bytes) {
+                    return false;
+                }
+            }
+            true
+        }
+        // Numbers/bools/null carry no scannable text.
+        _ => true,
+    }
+}
+
+/// Recursively rewrite every string leaf of `v` through [`sanitize_text_into`],
+/// stripping ANSI/OSC/control/zero-width bytes. Object keys are left untouched
+/// (structurally significant, not display output).
+fn sanitize_json_strings(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::String(s) => {
+            let mut out = Vec::with_capacity(s.len());
+            sanitize_text_into(s.as_bytes(), &mut out);
+            // Scrubbed output stays valid UTF-8 (whole chars dropped, never split).
+            if let Ok(scrubbed) = String::from_utf8(out) {
+                *s = scrubbed;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                sanitize_json_strings(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for val in map.values_mut() {
+                sanitize_json_strings(val);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Block path: replace `content` with one placeholder text item and set
@@ -146,6 +234,9 @@ fn apply_block(result: &mut ToolCallResult, event_id: &str) {
             "[tirith: tool output blocked \u{2014} see audit log entry {event_id} for details]"
         ),
     }];
+    // Drop structured output too — it can carry the same taint and would
+    // otherwise pass through raw on a Block (F10).
+    result.structured_content = None;
     result.is_error = true;
 }
 
@@ -486,5 +577,88 @@ mod tests {
         // UUID v4 stringified is 36 chars: 8-4-4-4-12
         assert_eq!(outcome.event_id.len(), 36, "{}", outcome.event_id);
         assert_eq!(outcome.event_id.matches('-').count(), 4);
+    }
+
+    #[test]
+    fn taint_only_in_structured_content_is_not_allowed() {
+        // The dangerous payload lives ONLY in structuredContent; `content` is
+        // benign. Before F10 this scanned clean → Allow → passed through raw.
+        // It must now reach the scanner and be flagged (Block here, via OSC 52).
+        let mut result = ToolCallResult {
+            content: vec![text_item("benign summary\n")],
+            is_error: false,
+            structured_content: Some(serde_json::json!({
+                "rows": [
+                    { "name": "ok" },
+                    { "name": osc52_text() }
+                ]
+            })),
+        };
+        let outcome = filter_tool_result(&mut result, false);
+        assert_ne!(
+            outcome.action,
+            Action::Allow,
+            "taint hidden in structuredContent must not pass as Allow; got {:?}",
+            outcome.action,
+        );
+        assert!(
+            matches!(outcome.action, Action::Warn | Action::Block),
+            "structured-only taint must Warn or Block; got {:?}",
+            outcome.action,
+        );
+    }
+
+    #[test]
+    fn structured_content_is_sanitized_even_when_allowed() {
+        // Plain SGR + zero-width in structuredContent: the verdict is Allow
+        // (SGR alone doesn't block, and these strings aren't enough to warn),
+        // but the structured strings must still be scrubbed — structured output
+        // is data and must never carry control/zero-width bytes.
+        let mut result = ToolCallResult {
+            content: vec![text_item("benign output\n")],
+            is_error: false,
+            structured_content: Some(serde_json::json!({
+                "label": "\x1B[31mred\x1B[0m\u{200B}value",
+                "nested": { "items": ["plain", "a\x1B[2J\u{FEFF}b"] }
+            })),
+        };
+        let outcome = filter_tool_result(&mut result, false);
+        assert_eq!(
+            outcome.action,
+            Action::Allow,
+            "plain SGR + zero-width should land at Allow here; got {:?} ({:?})",
+            outcome.action,
+            outcome.rule_ids,
+        );
+        let sc = result
+            .structured_content
+            .expect("structured content kept on Allow");
+        let label = sc["label"].as_str().unwrap();
+        assert_eq!(
+            label, "redvalue",
+            "ANSI + zero-width must be stripped: {label:?}"
+        );
+        assert!(!label.as_bytes().contains(&0x1B), "no raw ESC may remain");
+        let nested = sc["nested"]["items"][1].as_str().unwrap();
+        assert_eq!(
+            nested, "ab",
+            "nested array strings must be sanitized: {nested:?}"
+        );
+    }
+
+    #[test]
+    fn apply_block_clears_structured_content() {
+        let mut result = ToolCallResult {
+            content: vec![text_item("x")],
+            is_error: false,
+            structured_content: Some(serde_json::json!({ "secret": "data" })),
+        };
+        apply_block(&mut result, "evt-123");
+        assert!(
+            result.structured_content.is_none(),
+            "block must drop structuredContent so it can't pass through raw"
+        );
+        assert!(result.is_error);
+        assert_eq!(result.content.len(), 1);
     }
 }
