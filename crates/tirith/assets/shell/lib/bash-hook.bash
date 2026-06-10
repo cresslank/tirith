@@ -1002,13 +1002,6 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         fi
       done
 
-      # Honor explicit TIRITH=0 bypass: skip paste scanning
-      if [[ "${TIRITH:-}" == "0" ]]; then
-        READLINE_LINE="${READLINE_LINE:0:$READLINE_POINT}${pasted}${READLINE_LINE:$READLINE_POINT}"
-        READLINE_POINT=$((READLINE_POINT + ${#pasted}))
-        return
-      fi
-
       if [[ -n "$pasted" ]]; then
         # Check with tirith paste, use temp file to prevent tty leakage
         local tmpfile=$(mktemp)
