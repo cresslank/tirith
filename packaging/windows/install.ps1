@@ -89,7 +89,7 @@ if (!$cosign) {
     & cosign verify-blob `
         --signature $sigPath `
         --certificate $pemPath `
-        --certificate-identity-regexp 'github.com/sheeki03/tirith' `
+        --certificate-identity-regexp '^https://github\.com/sheeki03/tirith/\.github/workflows/' `
         --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' `
         $checksumsPath
     if ($LASTEXITCODE -ne 0) {

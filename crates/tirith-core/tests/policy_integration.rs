@@ -1332,14 +1332,34 @@ fn test_f9_user_scope_allowlist_is_honored() {
     // Non-repo cwd so user is the matching branch.
     let plain_cwd = TempDir::new().unwrap();
 
+    // `user_policy_path` resolves the user config dir via etcetera, which reads
+    // XDG_CONFIG_HOME on unix but APPDATA/LOCALAPPDATA on Windows. Set all three to
+    // the temp config dir so the user policy is found cross-platform (this binary's
+    // Windows CI job runs this test). Restore APPDATA/LOCALAPPDATA after.
     // SAFETY: serialized via ENV_LOCK (held for this test).
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", cfg.path()) };
+    let prior_appdata = std::env::var_os("APPDATA");
+    let prior_localappdata = std::env::var_os("LOCALAPPDATA");
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", cfg.path());
+        std::env::set_var("APPDATA", cfg.path());
+        std::env::set_var("LOCALAPPDATA", cfg.path());
+    }
     let p = Policy::discover_local_only(plain_cwd.path().to_str());
     let verdict = analyze_exec(
         "curl https://bit.ly/install",
         plain_cwd.path().to_str().unwrap(),
     );
-    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    unsafe {
+        std::env::remove_var("XDG_CONFIG_HOME");
+        match prior_appdata {
+            Some(v) => std::env::set_var("APPDATA", v),
+            None => std::env::remove_var("APPDATA"),
+        }
+        match prior_localappdata {
+            Some(v) => std::env::set_var("LOCALAPPDATA", v),
+            None => std::env::remove_var("LOCALAPPDATA"),
+        }
+    }
 
     assert_eq!(p.scope, PolicyScope::User, "user config stamps User");
     assert!(

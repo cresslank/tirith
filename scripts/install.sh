@@ -140,7 +140,7 @@ verify_cosign() {
   if ! cosign verify-blob \
     --signature "${workdir}/checksums.txt.sig" \
     --certificate "${workdir}/checksums.txt.pem" \
-    --certificate-identity-regexp 'github.com/sheeki03/tirith' \
+    --certificate-identity-regexp '^https://github\.com/sheeki03/tirith/\.github/workflows/' \
     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
     "${workdir}/checksums.txt"; then
     # A FAILED verification is always fatal: even under TIRITH_ALLOW_UNSIGNED,
