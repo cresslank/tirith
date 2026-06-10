@@ -1192,8 +1192,8 @@ impl Policy {
                 // neutralized before any caller sees the policy. (The parallel
                 // repo flat-file suppression channel is closed in
                 // [`Self::load_org_lists`]; the repo `.tirith/trust.json` overlay
-                // in [`Self::load_trust_entries`] is a separate, opt-in trust
-                // surface and is intentionally left to its own review.)
+                // is no longer auto-honored by [`Self::load_trust_entries`] — only
+                // the user-scope trust store is merged.)
                 if scope == PolicyScope::Repo {
                     p.sanitize_repo_scoped();
                 }
@@ -1321,16 +1321,33 @@ impl Policy {
     }
 
     fn load_from_path(path: &Path) -> Self {
-        let content = match std::fs::read_to_string(path) {
+        // Read via the no-follow, size-capped reader (mirrors `merge_context_labels`
+        // / repo_hooks / scan). The matched file may be an attacker-controlled repo
+        // `.tirith/policy.yaml`, consumed HERE — BEFORE `scope == Repo` sanitization
+        // runs in `discover_local` — so a plain `read_to_string` would let a repo
+        // make it a FIFO (hang), a huge file (memory blow-up), or a symlink
+        // (redirect the read). `read_text_no_follow_capped` refuses non-regular /
+        // symlinked / oversize files. ANY read error on a NAMED policy file is a
+        // misconfiguration (or a hostile special file), not "no policy" — fail
+        // closed (the open default is only for "no policy found anywhere", handled
+        // by the discovery walk).
+        let bytes = match crate::util::read_text_no_follow_capped(path, POLICY_FILE_READ_CAP) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "tirith: warning: cannot read policy at {}: {e:?}",
+                    path.display()
+                );
+                return Self::fail_closed_policy();
+            }
+        };
+        let content = match String::from_utf8(bytes) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!(
-                    "tirith: warning: cannot read policy at {}: {e}",
+                    "tirith: warning: policy at {} is not valid UTF-8: {e}",
                     path.display()
                 );
-                // Read failure on a NAMED policy file is a misconfiguration,
-                // not "no policy" — fail closed (the open default is only for
-                // "no policy found anywhere", handled by the discovery walk).
                 return Self::fail_closed_policy();
             }
         };
@@ -1520,14 +1537,20 @@ impl Policy {
 
     /// Merge non-expired trust.json entries into allowlist/allowlist_rules.
     /// On the analysis hot path — MUST stay read-only (no file mutation).
-    pub fn load_trust_entries(&mut self, cwd: Option<&str>) {
+    ///
+    /// F9 — ONLY the USER `config_dir/trust.json` (operator-controlled, trusted)
+    /// is merged. The repo `<repo>/.tirith/trust.json` is NOT auto-honored: it is
+    /// attacker-controllable repo content, so a malicious repo could SHIP a
+    /// pre-populated trust.json full of non-expired entries and thereby recover
+    /// exactly the suppression channel F9 removes — the same class as the repo
+    /// `allowlist` field ([`Self::sanitize_repo_scoped`]) and the repo flat-
+    /// allowlist file ([`Self::load_org_lists`]), both already skipped. To trust
+    /// an entry, add it at user scope (`tirith trust --scope user`); committed
+    /// `--scope repo` entries are recorded but no longer auto-suppress.
+    pub fn load_trust_entries(&mut self, _cwd: Option<&str>) {
         if let Some(config) = config_dir() {
             let user_trust = config.join("trust.json");
             self.merge_trust_store(&user_trust);
-        }
-        if let Some(repo_root) = find_repo_root(cwd) {
-            let repo_trust = repo_root.join(".tirith").join("trust.json");
-            self.merge_trust_store(&repo_trust);
         }
     }
 
@@ -1733,8 +1756,14 @@ pub fn discover_local_policy_path(cwd: Option<&str>) -> Option<PathBuf> {
 /// when nothing is found.
 pub fn discover_local_policy_path_scoped(cwd: Option<&str>) -> Option<(PathBuf, PolicyScope)> {
     if let Ok(root) = std::env::var("TIRITH_POLICY_ROOT") {
-        if let Some(path) = find_policy_in_dir(&PathBuf::from(&root).join(".tirith")) {
-            return Some((path, PolicyScope::Org));
+        // F9 — treat an empty/whitespace-only value as unset. `PathBuf::from("")`
+        // joins to `./.tirith` (relative to cwd), which would match the REPO's own
+        // policy and stamp it `Org`, skipping repo-scope sanitization — a bypass.
+        let root = root.trim();
+        if !root.is_empty() {
+            if let Some(path) = find_policy_in_dir(&PathBuf::from(root).join(".tirith")) {
+                return Some((path, PolicyScope::Org));
+            }
         }
     }
     if let Some(path) = discover_policy_path(cwd) {
@@ -1836,6 +1865,12 @@ pub fn repo_ssh_host_labels_path(cwd: Option<&str>) -> Option<PathBuf> {
 pub fn iac_plans_dir() -> Option<PathBuf> {
     state_dir().map(|s| s.join("iac_plans"))
 }
+
+/// Maximum size of a policy file (`.tirith/policy.yaml`) we will read in
+/// [`Policy::load_from_path`]. Policies are small; 1 MiB is far above any
+/// legitimate file and caps a hostile/oversized (or FIFO/symlink) repo file
+/// consumed before repo-scope sanitization runs.
+const POLICY_FILE_READ_CAP: u64 = 1024 * 1024;
 
 /// Maximum size of a labels file we will read (F17). Flat `provider:context →
 /// criticality` maps are tiny; 1 MiB is far above any legitimate file and caps a

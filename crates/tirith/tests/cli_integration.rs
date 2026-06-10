@@ -3613,10 +3613,10 @@ fn update_allow_unsigned_and_rollback_conflict() {
         .args(["update", "--allow-unsigned", "--rollback"])
         .output()
         .expect("failed to run tirith update --allow-unsigned --rollback");
-    assert_ne!(
+    assert_eq!(
         out.status.code(),
-        Some(0),
-        "--allow-unsigned and --rollback together should be rejected"
+        Some(2),
+        "--allow-unsigned and --rollback together must be rejected at parse time (clap usage error, exit 2)"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

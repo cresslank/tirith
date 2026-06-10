@@ -1504,3 +1504,213 @@ fn test_f17_write_label_succeeds_for_legitimate_path() {
         "second write must preserve the first entry, got: {written}"
     );
 }
+
+// ===========================================================================
+// F9 — trust.json suppression boundary
+// ===========================================================================
+
+/// A trust store whose single entry would allowlist `bit.ly` (no `rule_id` →
+/// plain allowlist) and so suppress `ShortenedUrl`. The far-future `ttl_expires`
+/// keeps it non-expired without pulling in a clock dependency.
+const BIT_LY_TRUST_JSON: &str = r#"{
+  "entries": [
+    { "pattern": "bit.ly", "ttl_expires": "2999-01-01T00:00:00Z" }
+  ]
+}"#;
+
+#[test]
+fn test_f9_repo_trust_json_does_not_suppress_finding() {
+    // F9 — a malicious repo can SHIP a pre-populated `.tirith/trust.json` with a
+    // non-expired allowlist entry. Pre-fix, `load_trust_entries` merged it into
+    // the allowlist and recovered exactly the suppression channel F9 removes. The
+    // repo trust.json must now be ignored: `ShortenedUrl` on bit.ly still fires.
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    clear_policy_env();
+
+    let repo = make_repo("fail_mode: open\n");
+    fs::write(repo.path().join(".tirith/trust.json"), BIT_LY_TRUST_JSON).unwrap();
+    let cwd = repo.path().to_str().unwrap();
+
+    let verdict = analyze_exec("curl https://bit.ly/install", cwd);
+    assert!(
+        verdict
+            .findings
+            .iter()
+            .any(|f| f.rule_id == RuleId::ShortenedUrl),
+        "repo .tirith/trust.json must NOT suppress ShortenedUrl. Findings: {:?}",
+        verdict
+            .findings
+            .iter()
+            .map(|f| f.rule_id.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_f9_user_trust_json_is_still_honored() {
+    // The other half of the boundary: the USER `config_dir/trust.json` is
+    // operator-controlled and trusted, so a non-expired entry there IS still
+    // honored and suppresses ShortenedUrl → Allow. (Mirrors
+    // `test_f9_user_scope_allowlist_is_honored` for the trust-store path.)
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    clear_policy_env();
+
+    let cfg = TempDir::new().unwrap();
+    let tirith_cfg = cfg.path().join("tirith");
+    fs::create_dir_all(&tirith_cfg).unwrap();
+    fs::write(tirith_cfg.join("trust.json"), BIT_LY_TRUST_JSON).unwrap();
+    // Non-repo cwd so no repo branch interferes; the user trust store is the only
+    // suppression on offer.
+    let plain_cwd = TempDir::new().unwrap();
+
+    // `config_dir` resolves via etcetera: XDG_CONFIG_HOME on unix, APPDATA /
+    // LOCALAPPDATA on Windows. Set all three so the user trust store is found
+    // cross-platform; restore the Windows vars after.
+    // SAFETY: serialized via ENV_LOCK (held for this test).
+    let prior_appdata = std::env::var_os("APPDATA");
+    let prior_localappdata = std::env::var_os("LOCALAPPDATA");
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", cfg.path());
+        std::env::set_var("APPDATA", cfg.path());
+        std::env::set_var("LOCALAPPDATA", cfg.path());
+    }
+    let verdict = analyze_exec(
+        "curl https://bit.ly/install",
+        plain_cwd.path().to_str().unwrap(),
+    );
+    unsafe {
+        std::env::remove_var("XDG_CONFIG_HOME");
+        match prior_appdata {
+            Some(v) => std::env::set_var("APPDATA", v),
+            None => std::env::remove_var("APPDATA"),
+        }
+        match prior_localappdata {
+            Some(v) => std::env::set_var("LOCALAPPDATA", v),
+            None => std::env::remove_var("LOCALAPPDATA"),
+        }
+    }
+
+    assert_eq!(
+        verdict.action,
+        Action::Allow,
+        "user-scope trust.json must suppress ShortenedUrl → Allow. Findings: {:?}",
+        verdict
+            .findings
+            .iter()
+            .map(|f| f.rule_id.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+// ===========================================================================
+// F9 — empty TIRITH_POLICY_ROOT must not reclassify a repo policy as Org
+// ===========================================================================
+
+#[test]
+fn test_f9_empty_policy_root_does_not_reclassify_repo_as_org() {
+    // `TIRITH_POLICY_ROOT=""` → `PathBuf::from("").join(".tirith")` == `./.tirith`
+    // (relative to cwd). Pre-fix that matched the REPO's own policy and stamped it
+    // Org, skipping repo-scope sanitization. With the empty value treated as unset,
+    // the repo policy stays Repo and the hostile suppression fields are neutralized.
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    clear_policy_env();
+
+    let repo = make_repo(HOSTILE_POLICY_YAML);
+    let cwd = repo.path().to_str().unwrap();
+
+    // SAFETY: serialized via ENV_LOCK (held for this test).
+    unsafe { std::env::set_var("TIRITH_POLICY_ROOT", "   ") };
+    let p = Policy::discover_local_only(Some(cwd));
+    unsafe { std::env::remove_var("TIRITH_POLICY_ROOT") };
+
+    assert_eq!(
+        p.scope,
+        PolicyScope::Repo,
+        "empty/whitespace TIRITH_POLICY_ROOT must not stamp the repo policy Org"
+    );
+    // And the sanitization that Org scope would have skipped did run.
+    assert!(
+        p.allowlist.is_empty(),
+        "repo allowlist must be sanitized (proves repo scope, not Org)"
+    );
+    assert!(
+        !p.allow_bypass_env,
+        "repo allow_bypass_env must be sanitized to false (proves repo scope, not Org)"
+    );
+
+    // End-to-end: the hostile repo's curl_pipe_shell LOW override + allowlist_rule
+    // must not relax the verdict.
+    let verdict = analyze_exec("curl https://bit.ly/install | bash", cwd);
+    assert_eq!(
+        verdict.action,
+        Action::Block,
+        "empty TIRITH_POLICY_ROOT must not let the repo policy relax the verdict"
+    );
+}
+
+// ===========================================================================
+// F-policy-read — a hostile repo policy file must fail closed, not hang/leak
+// ===========================================================================
+
+#[cfg(unix)]
+#[test]
+fn test_policy_file_fifo_fails_closed() {
+    // A repo can make `.tirith/policy.yaml` a FIFO. The no-follow, size-capped
+    // reader opens it O_NONBLOCK and rejects it as not-a-regular-file, so the read
+    // fails closed instead of hanging on a writer that never arrives.
+    let repo = TempDir::new().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    let tirith = repo.path().join(".tirith");
+    fs::create_dir_all(&tirith).unwrap();
+    let fifo = tirith.join("policy.yaml");
+
+    let cpath = std::ffi::CString::new(fifo.as_os_str().to_str().unwrap()).unwrap();
+    // SAFETY: cpath is a valid NUL-terminated path; 0o600 is a valid mode.
+    let rc = unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo must succeed to set up the FIFO policy file");
+
+    let p = Policy::discover_local_only(repo.path().to_str());
+    assert_eq!(
+        p.fail_mode,
+        tirith_core::policy::FailMode::Closed,
+        "a FIFO policy file must fail closed (path={:?})",
+        p.path
+    );
+    assert_eq!(
+        p.path.as_deref(),
+        Some("fail-closed"),
+        "fail-closed policy must be stamped, not parsed as a real file"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_policy_file_symlink_fails_closed() {
+    use std::os::unix::fs::symlink;
+
+    // A repo can plant a symlink at `.tirith/policy.yaml` pointing at an arbitrary
+    // file. O_NOFOLLOW rejects the final-component symlink (ELOOP → not-regular),
+    // so the policy read fails closed and the link target is never consumed.
+    let repo = TempDir::new().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    let tirith = repo.path().join(".tirith");
+    fs::create_dir_all(&tirith).unwrap();
+
+    // A benign, valid target — the point is that we must refuse to FOLLOW it.
+    let target = repo.path().join("real-policy.yaml");
+    fs::write(&target, "fail_mode: open\n").unwrap();
+    symlink(&target, tirith.join("policy.yaml")).unwrap();
+
+    let p = Policy::discover_local_only(repo.path().to_str());
+    assert_eq!(
+        p.fail_mode,
+        tirith_core::policy::FailMode::Closed,
+        "a symlinked policy file must fail closed, not follow the link (path={:?})",
+        p.path
+    );
+    assert_eq!(
+        p.path.as_deref(),
+        Some("fail-closed"),
+        "fail-closed policy must be stamped"
+    );
+}

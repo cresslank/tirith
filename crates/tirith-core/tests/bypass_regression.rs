@@ -10,6 +10,7 @@
 //! suppression feature is covered in `policy_integration.rs`.
 
 use std::fs;
+use std::sync::Mutex;
 
 use tempfile::TempDir;
 
@@ -27,7 +28,22 @@ fn make_repo(policy_yaml: &str) -> TempDir {
     tmp
 }
 
+/// Serializes policy-discovery env access across these single-process tests, and
+/// lets `analyze_exec` clear an ambient policy env without racing a sibling test.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
 fn analyze_exec(input: &str, cwd: &str) -> tirith_core::verdict::Verdict {
+    // Isolate policy discovery from an ambient TIRITH_POLICY_ROOT / user config:
+    // either would override the repo walk-up these F9 regressions rely on and make
+    // results machine-dependent. Hold the lock across discovery (engine::analyze
+    // reads it below) so the cleared env cannot race a concurrent test.
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    unsafe {
+        std::env::remove_var("TIRITH_POLICY_ROOT");
+        std::env::remove_var("TIRITH_SERVER_URL");
+        std::env::remove_var("TIRITH_API_KEY");
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
     let ctx = AnalysisContext {
         input: input.to_string(),
         shell: ShellType::Posix,
