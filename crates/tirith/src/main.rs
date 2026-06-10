@@ -1284,25 +1284,33 @@ Updates tirith to the latest release. tirith detects how it was installed:
   * Package-manager installs (Homebrew, cargo, npm, Scoop, AUR, apt/dnf) are
     NEVER self-modified — tirith prints the exact command to run instead.
   * A self-managed install (the install.sh tarball or a standalone binary) is
-    updated in place: tirith downloads the release, verifies it, then performs
-    an atomic swap, keeping the previous binary so --rollback can revert.
+    updated in place: tirith downloads the release, verifies its cosign
+    signature, then performs an atomic swap, keeping the previous binary so
+    --rollback can revert.
+
+By default the release's cosign signature is REQUIRED: if it cannot be verified
+(cosign missing, or the release published no signature) the update aborts. Pass
+--allow-unsigned to fall back to checksum-only verification (a checksum mismatch
+still always aborts).
 
 This command reaches the network; it does so only when you run it.
 
 Examples:
   tirith update
-  tirith update --verify
+  tirith update --allow-unsigned
   tirith update --rollback
   tirith update --dry-run")]
     Update {
-        /// Verify the new release's provenance (checksum + cosign signature)
-        /// before installing; verification failure aborts the update.
+        /// Allow a checksum-only update when the cosign signature cannot be
+        /// verified (cosign missing, or no signature published). By default the
+        /// signature is mandatory and the update aborts without it. A checksum
+        /// mismatch always aborts regardless of this flag.
         #[arg(long)]
-        verify: bool,
+        allow_unsigned: bool,
 
         /// Revert to the previously-installed binary (self-managed installs
-        /// only). Conflicts with --verify.
-        #[arg(long, conflicts_with = "verify")]
+        /// only). Conflicts with --allow-unsigned.
+        #[arg(long, conflicts_with = "allow_unsigned")]
         rollback: bool,
 
         /// Show what would happen without changing anything.
@@ -7082,7 +7090,7 @@ fn run() {
         }
 
         Commands::Update {
-            verify,
+            allow_unsigned,
             rollback,
             dry_run,
             yes,
@@ -7090,7 +7098,7 @@ fn run() {
             json,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::selfupdate::update(verify, rollback, dry_run, yes, json)
+            cli::selfupdate::update(allow_unsigned, rollback, dry_run, yes, json)
         }
 
         Commands::Version {

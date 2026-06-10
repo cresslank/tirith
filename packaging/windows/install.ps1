@@ -19,6 +19,8 @@ $releaseUrl = "https://api.github.com/repos/$repo/releases/latest"
 $release = Invoke-RestMethod -Uri $releaseUrl
 $asset = $release.assets | Where-Object { $_.name -like "*Windows*" } | Select-Object -First 1
 $checksums = $release.assets | Where-Object { $_.name -eq "checksums.txt" } | Select-Object -First 1
+$checksumsSig = $release.assets | Where-Object { $_.name -eq "checksums.txt.sig" } | Select-Object -First 1
+$checksumsPem = $release.assets | Where-Object { $_.name -eq "checksums.txt.pem" } | Select-Object -First 1
 
 if (!$asset) {
     Write-Error "Could not find Windows release asset"
@@ -27,6 +29,8 @@ if (!$asset) {
 
 $zipPath = "$env:TEMP\tirith.zip"
 $checksumsPath = "$env:TEMP\tirith-checksums.txt"
+$sigPath = "$env:TEMP\tirith-checksums.txt.sig"
+$pemPath = "$env:TEMP\tirith-checksums.txt.pem"
 
 if (!$checksums) {
     Write-Error "Could not find checksums.txt asset"
@@ -52,6 +56,50 @@ $actual = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
 if ($actual -ne $expected) {
     Write-Error "Checksum verification failed"
     exit 1
+}
+
+# Verify the cosign signature over checksums.txt. This is MANDATORY by default
+# (fail-closed): a missing cosign, a missing signature/certificate asset, or a
+# failed verification aborts the install. Set $env:TIRITH_ALLOW_UNSIGNED = "1"
+# to fall back to checksum-only verification with a warning. Uses the SAME
+# pinned Sigstore identity and OIDC issuer as the Unix installer.
+$allowUnsigned = ($env:TIRITH_ALLOW_UNSIGNED -eq "1")
+$cosign = Get-Command cosign -ErrorAction SilentlyContinue
+
+if (!$cosign) {
+    if ($allowUnsigned) {
+        Write-Warning "cosign not found - skipping signature verification (TIRITH_ALLOW_UNSIGNED=1; checksum only)"
+    } else {
+        Write-Error "cosign is required to verify the release signature but was not found. Install cosign (https://github.com/sigstore/cosign), or set `$env:TIRITH_ALLOW_UNSIGNED = '1' to install with checksum-only verification (NOT recommended)."
+        exit 1
+    }
+} elseif (!$checksumsSig -or !$checksumsPem) {
+    if ($allowUnsigned) {
+        Write-Warning "release signature/certificate not published - skipping signature verification (TIRITH_ALLOW_UNSIGNED=1; checksum only)"
+    } else {
+        Write-Error "the release did not publish a cosign signature (checksums.txt.sig / .pem). Set `$env:TIRITH_ALLOW_UNSIGNED = '1' to install with checksum-only verification (NOT recommended)."
+        exit 1
+    }
+} else {
+    Write-Host "Downloading checksums.txt.sig and checksums.txt.pem..."
+    Invoke-WebRequest -Uri $checksumsSig.browser_download_url -OutFile $sigPath
+    Invoke-WebRequest -Uri $checksumsPem.browser_download_url -OutFile $pemPath
+
+    Write-Host "Verifying checksums signature with cosign..."
+    & cosign verify-blob `
+        --signature $sigPath `
+        --certificate $pemPath `
+        --certificate-identity-regexp 'github.com/sheeki03/tirith' `
+        --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' `
+        $checksumsPath
+    if ($LASTEXITCODE -ne 0) {
+        # A FAILED verification is always fatal, even under TIRITH_ALLOW_UNSIGNED:
+        # a present-but-bad signature means tampering, not a missing-tool fallback.
+        Write-Error "cosign verification failed - the release signature did NOT verify. Do not trust these artifacts."
+        exit 1
+    }
+    Remove-Item $sigPath -ErrorAction SilentlyContinue
+    Remove-Item $pemPath -ErrorAction SilentlyContinue
 }
 
 # Extract

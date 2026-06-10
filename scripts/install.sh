@@ -17,6 +17,10 @@ info() {
   printf '%s\n' "$1"
 }
 
+warn() {
+  printf 'warning: %s\n' "$1" >&2
+}
+
 detect_platform() {
   OS="$(uname -s)"
   ARCH="$(uname -m)"
@@ -93,11 +97,21 @@ verify_sha256() {
   fi
 }
 
+# Signature verification is MANDATORY by default: a missing cosign, an
+# undownloadable signature/certificate, or a failed verification all abort the
+# install. Set TIRITH_ALLOW_UNSIGNED=1 to opt out and fall back to best-effort
+# (checksum-only) with a clear warning. Only do this if you understand the
+# supply-chain risk.
 verify_cosign() {
   local workdir="$1"
+  local allow_unsigned="${TIRITH_ALLOW_UNSIGNED:-}"
+
   if ! command -v cosign >/dev/null 2>&1; then
-    info "cosign not found, skipping signature verification"
-    return 0
+    if [ -n "$allow_unsigned" ]; then
+      warn "cosign not found; skipping signature verification (TIRITH_ALLOW_UNSIGNED=1; checksum only)"
+      return 0
+    fi
+    err "cosign is required to verify the release signature but was not found. Install cosign (https://github.com/sigstore/cosign), or set TIRITH_ALLOW_UNSIGNED=1 to install with checksum-only verification (NOT recommended)."
   fi
 
   local sig_url
@@ -105,23 +119,34 @@ verify_cosign() {
   sig_url="$(download_url checksums.txt.sig)"
   pem_url="$(download_url checksums.txt.pem)"
 
-  # Try downloading signature and certificate; skip if either is missing
+  # Download the signature and certificate. Failure to fetch either is fatal
+  # unless the caller opted out of signature verification.
   if ! fetch "$sig_url" "${workdir}/checksums.txt.sig" 2>/dev/null; then
-    info "cosign verification skipped (signature not available)"
-    return 0
+    if [ -n "$allow_unsigned" ]; then
+      warn "signature not available; skipping signature verification (TIRITH_ALLOW_UNSIGNED=1; checksum only)"
+      return 0
+    fi
+    err "could not download the release signature (checksums.txt.sig). The release may be unsigned, or the download failed. Set TIRITH_ALLOW_UNSIGNED=1 to install with checksum-only verification (NOT recommended)."
   fi
   if ! fetch "$pem_url" "${workdir}/checksums.txt.pem" 2>/dev/null; then
-    info "cosign verification skipped (certificate not available)"
-    return 0
+    if [ -n "$allow_unsigned" ]; then
+      warn "certificate not available; skipping signature verification (TIRITH_ALLOW_UNSIGNED=1; checksum only)"
+      return 0
+    fi
+    err "could not download the release certificate (checksums.txt.pem). The release may be unsigned, or the download failed. Set TIRITH_ALLOW_UNSIGNED=1 to install with checksum-only verification (NOT recommended)."
   fi
 
   info "Verifying checksums signature with cosign..."
-  cosign verify-blob \
+  if ! cosign verify-blob \
     --signature "${workdir}/checksums.txt.sig" \
     --certificate "${workdir}/checksums.txt.pem" \
     --certificate-identity-regexp 'github.com/sheeki03/tirith' \
     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-    "${workdir}/checksums.txt" || err "cosign verification failed"
+    "${workdir}/checksums.txt"; then
+    # A FAILED verification is always fatal: even under TIRITH_ALLOW_UNSIGNED,
+    # a present-but-bad signature means tampering, not a missing-tool fallback.
+    err "cosign verification failed; the release signature did NOT verify. Do not trust these artifacts."
+  fi
 }
 
 main() {

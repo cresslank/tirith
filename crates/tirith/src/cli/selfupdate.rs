@@ -530,23 +530,31 @@ fn emit_verify_self(
 
 /// `tirith update`. Update tirith to the latest release, package-manager-aware.
 ///
-/// * `verify` — verify the new release's provenance before installing.
+/// * `allow_unsigned` — permit a checksum-only update when the cosign signature
+///   cannot be verified. By default the signature is MANDATORY and the update
+///   aborts without it (a checksum mismatch always aborts, regardless).
 /// * `rollback` — revert to the previously-installed version (self-managed
 ///   installs only).
 /// * `dry_run` — show what would happen, change nothing.
 ///
 /// Exit `0` on success or a clean no-op, `1` on any failure.
-pub fn update(verify: bool, rollback: bool, dry_run: bool, yes: bool, json: bool) -> i32 {
+pub fn update(allow_unsigned: bool, rollback: bool, dry_run: bool, yes: bool, json: bool) -> i32 {
     let prov = gather_provenance();
 
     if rollback {
         return run_rollback(&prov, dry_run, yes, json);
     }
 
-    run_update(&prov, verify, dry_run, yes, json)
+    run_update(&prov, allow_unsigned, dry_run, yes, json)
 }
 
-fn run_update(prov: &Provenance, verify: bool, dry_run: bool, yes: bool, json: bool) -> i32 {
+fn run_update(
+    prov: &Provenance,
+    allow_unsigned: bool,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+) -> i32 {
     // Package-manager (and unknown) installs: never self-modify. Advise.
     if !prov.install_method.is_self_replaceable() {
         return advise_package_manager(prov, json);
@@ -627,7 +635,7 @@ fn run_update(prov: &Provenance, verify: bool, dry_run: bool, yes: bool, json: b
                 "latest_version": latest.to_string(),
                 "install_method": prov.install_method.as_str(),
                 "binary_path": binary_path.display().to_string(),
-                "verify": verify,
+                "allow_unsigned": allow_unsigned,
             });
             println!("{v}");
         } else {
@@ -636,8 +644,12 @@ fn run_update(prov: &Provenance, verify: bool, dry_run: bool, yes: bool, json: b
             println!("  latest:   v{latest}");
             println!("  binary:   {}", binary_path.display());
             println!(
-                "  would download, {}verify, and atomically replace the binary in place.",
-                if verify { "" } else { "optionally " }
+                "  would download, {}, and atomically replace the binary in place.",
+                if allow_unsigned {
+                    "verify the checksum (cosign signature optional)"
+                } else {
+                    "verify the checksum and cosign signature"
+                }
             );
         }
         return 0;
@@ -668,9 +680,10 @@ fn run_update(prov: &Provenance, verify: bool, dry_run: bool, yes: bool, json: b
         }
     };
 
-    // 3. Verify the downloaded release. `--verify` makes verification
-    //    MANDATORY; without it we still refuse on a hard FAILED (checksum
-    //    mismatch) but tolerate an honest "unverified" (e.g. cosign missing).
+    // 3. Verify the downloaded release. The cosign signature is MANDATORY by
+    //    default: a checksum-only result aborts unless `--allow-unsigned` was
+    //    passed. A hard FAILED (checksum or signature mismatch) and a missing
+    //    checksum entry always abort, regardless of `--allow-unsigned`.
     let archive_verdict = verify_archive_against_checksums(&release, &archive_name);
     match &archive_verdict {
         ArchiveVerdict::Failed(reason) => {
@@ -692,14 +705,26 @@ fn run_update(prov: &Provenance, verify: bool, dry_run: bool, yes: bool, json: b
             );
             return 1;
         }
-        ArchiveVerdict::Ok { signed, .. } => {
-            if verify && *signed == ChecksumStrength::ChecksumOnly {
+        ArchiveVerdict::Ok {
+            signed,
+            cosign_note,
+        } => {
+            if !allow_unsigned && *signed == ChecksumStrength::ChecksumOnly {
+                // Signature is mandatory by default. The checksum DID verify,
+                // but the cosign signature did not — surface the precise reason
+                // (cosign absent vs no signature published vs cosign broken).
+                let why = cosign_note.as_deref().unwrap_or(
+                    "the cosign signature could not be verified (cosign is not installed, or \
+                     this release did not publish a signature)",
+                );
                 emit_update_error(
                     json,
-                    "--verify was requested but the cosign signature could not be verified \
-                     (either cosign is not installed, or this release did not publish a \
-                     signature). The release checksum DID verify. Install cosign and re-run, \
-                     or drop --verify to proceed with checksum-only verification.",
+                    &format!(
+                        "release signature verification is required but could not be completed: \
+                         {why}. The release checksum DID verify. Install cosign and re-run, or \
+                         pass --allow-unsigned to update with checksum-only verification (NOT \
+                         recommended)."
+                    ),
                 );
                 return 1;
             }

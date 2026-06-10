@@ -113,7 +113,7 @@ help_example_tests! {
     help_agent_block     => (["agent", "block", "--help"], "tirith agent block --kind agent --tool untrusted-tool");
     help_explain_finding => (["explain", "--help"], "tirith explain --finding evt-abc:0");
     help_verify_self => (["verify-self", "--help"], "tirith verify-self --format json");
-    help_update     => (["update", "--help"], "tirith update --verify");
+    help_update     => (["update", "--help"], "tirith update --allow-unsigned");
     help_update_rollback => (["update", "--help"], "tirith update --rollback");
     help_version    => (["version", "--help"], "tirith version --provenance");
     help_lab        => (["lab", "--help"], "tirith lab --filter powershell");

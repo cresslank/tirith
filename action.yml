@@ -22,15 +22,43 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    # tirith's installer verifies the release's cosign signature by default
+    # (fail-closed). Install cosign first so the signed path is available; this
+    # keeps the action from needing TIRITH_ALLOW_UNSIGNED.
+    - name: Install cosign
+      uses: sigstore/cosign-installer@v3
     - name: Install tirith
       shell: bash
       env:
         TIRITH_VERSION: ${{ inputs.version }}
+        # The ref this action was resolved to (tag, branch, or SHA when pinned by
+        # commit). Used to fetch the installer from an immutable ref so a pinned
+        # action version also binds the installer it runs.
+        ACTION_REF: ${{ github.action_ref }}
       run: |
+        set -euo pipefail
+        # Pin the installer fetch to an immutable ref so a pinned `version:` (or a
+        # pinned action SHA) actually binds the install.sh that runs — NOT
+        # whatever currently sits on `main`. When a version is requested, fetch
+        # the installer from that exact release tag; otherwise fall back to the
+        # ref this action was resolved from (a tag or commit SHA when the caller
+        # pinned `uses: sheeki03/tirith@<sha>`).
         if [ "$TIRITH_VERSION" = "latest" ]; then
-          curl -sSfL https://raw.githubusercontent.com/sheeki03/tirith/main/scripts/install.sh | sh -s -- --to /usr/local/bin
+          INSTALLER_REF="${ACTION_REF:-main}"
         else
-          curl -sSfL https://raw.githubusercontent.com/sheeki03/tirith/main/scripts/install.sh | sh -s -- --to /usr/local/bin --tag "v$TIRITH_VERSION"
+          INSTALLER_REF="v${TIRITH_VERSION}"
+        fi
+        INSTALLER_URL="https://raw.githubusercontent.com/sheeki03/tirith/${INSTALLER_REF}/scripts/install.sh"
+        echo "Fetching installer from ${INSTALLER_URL}"
+        # install.sh reads TIRITH_INSTALL_DIR / TIRITH_VERSION from the
+        # environment (it does not parse CLI flags), so the pinned version and
+        # install dir are passed as env vars. With a pinned version, the
+        # installer enforces signatures by default; cosign is installed above so
+        # the signed path is available. `latest` installs the newest release.
+        if [ "$TIRITH_VERSION" = "latest" ]; then
+          curl -sSfL "$INSTALLER_URL" | TIRITH_INSTALL_DIR=/usr/local/bin sh
+        else
+          curl -sSfL "$INSTALLER_URL" | TIRITH_INSTALL_DIR=/usr/local/bin TIRITH_VERSION="$TIRITH_VERSION" sh
         fi
     - name: Run scan
       id: scan
