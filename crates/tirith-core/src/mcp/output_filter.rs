@@ -166,10 +166,12 @@ fn append_scan_chunk(joined: &mut String, total_bytes: &mut usize, text: &str) -
     true
 }
 
-/// Recursively append every string leaf of `v` (object values, array elements,
-/// and bare strings) to the scan buffer via [`append_scan_chunk`]. Object keys
-/// are not attacker-controlled output and are skipped. Returns `false` if the
-/// scan budget was exhausted partway (the caller marks the scan truncated).
+/// Recursively append every string leaf of `v` (object keys + values, array
+/// elements, and bare strings) to the scan buffer via [`append_scan_chunk`].
+/// Object KEYS are attacker-controlled MCP tool output too — a control/zero-width
+/// payload hidden in a key must reach the scanner, or it escapes detection and
+/// rides through on Allow/Warn (F10). Returns `false` if the scan budget was
+/// exhausted partway (the caller marks the scan truncated).
 fn collect_json_string_leaves(
     v: &serde_json::Value,
     joined: &mut String,
@@ -186,7 +188,12 @@ fn collect_json_string_leaves(
             true
         }
         serde_json::Value::Object(map) => {
-            for val in map.values() {
+            for (key, val) in map {
+                // Scan the key first, then recurse into the value; both honor the
+                // shared MAX_SCAN_BYTES budget via append_scan_chunk's early return.
+                if !append_scan_chunk(joined, total_bytes, key) {
+                    return false;
+                }
                 if !collect_json_string_leaves(val, joined, total_bytes) {
                     return false;
                 }
@@ -199,8 +206,12 @@ fn collect_json_string_leaves(
 }
 
 /// Recursively rewrite every string leaf of `v` through [`sanitize_text_into`],
-/// stripping ANSI/OSC/control/zero-width bytes. Object keys are left untouched
-/// (structurally significant, not display output).
+/// stripping ANSI/OSC/control/zero-width bytes. Object KEYS are sanitized too:
+/// they are attacker-controlled tool output, and a control/zero-width payload in
+/// a key would otherwise survive raw in `structured_content` on Allow/Warn (F10).
+/// The map is rebuilt with each key scrubbed and each value recursively
+/// sanitized; if two distinct keys collapse to the same scrubbed string, last
+/// wins (acceptable — the payload is gone either way).
 fn sanitize_json_strings(v: &mut serde_json::Value) {
     match v {
         serde_json::Value::String(s) => {
@@ -212,9 +223,12 @@ fn sanitize_json_strings(v: &mut serde_json::Value) {
             }
         }
         serde_json::Value::Object(map) => {
-            for val in map.values_mut() {
-                sanitize_json_strings(val);
+            let mut rebuilt = serde_json::Map::with_capacity(map.len());
+            for (key, mut val) in std::mem::take(map) {
+                sanitize_json_strings(&mut val);
+                rebuilt.insert(sanitize_text_str(&key), val);
             }
+            *map = rebuilt;
         }
         _ => {}
     }
@@ -661,5 +675,81 @@ mod tests {
         );
         assert!(result.is_error);
         assert_eq!(result.content.len(), 1);
+    }
+
+    #[test]
+    fn taint_only_in_structured_content_key_is_not_allowed() {
+        // The dangerous payload lives ONLY in an object KEY; `content` and every
+        // value are benign. Keys are attacker-controlled tool output too, so the
+        // key must reach the scanner — taint there alone must not pass as Allow.
+        let mut map = serde_json::Map::new();
+        map.insert(osc52_text(), serde_json::json!("benign value"));
+        let mut result = ToolCallResult {
+            content: vec![text_item("benign summary\n")],
+            is_error: false,
+            structured_content: Some(serde_json::Value::Object(map)),
+        };
+        let outcome = filter_tool_result(&mut result, false);
+        assert_ne!(
+            outcome.action,
+            Action::Allow,
+            "taint hidden in a structuredContent KEY must not pass as Allow; got {:?}",
+            outcome.action,
+        );
+        assert!(
+            matches!(outcome.action, Action::Warn | Action::Block),
+            "structured-key taint must Warn or Block; got {:?}",
+            outcome.action,
+        );
+    }
+
+    #[test]
+    fn structured_content_key_is_sanitized_even_when_allowed() {
+        // A KEY carrying clear-screen (CSI) + zero-width: the verdict is Allow
+        // (these bytes alone don't warn/block), but the key must still be scrubbed
+        // — structured output is data and must never carry control/zero-width
+        // bytes, in keys or values.
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "col\x1b[2J\u{200B}name".to_string(),
+            serde_json::json!("value"),
+        );
+        let mut result = ToolCallResult {
+            content: vec![text_item("benign output\n")],
+            is_error: false,
+            structured_content: Some(serde_json::Value::Object(map)),
+        };
+        let outcome = filter_tool_result(&mut result, false);
+        assert_eq!(
+            outcome.action,
+            Action::Allow,
+            "clear-screen + zero-width in a key should land at Allow here; got {:?} ({:?})",
+            outcome.action,
+            outcome.rule_ids,
+        );
+        let sc = result
+            .structured_content
+            .expect("structured content kept on Allow");
+        let obj = sc.as_object().expect("object preserved");
+        // Original tainted key is gone; the sanitized key carries no control bytes.
+        assert!(
+            obj.get("col\x1b[2J\u{200B}name").is_none(),
+            "raw tainted key must not survive"
+        );
+        assert!(
+            obj.contains_key("colname"),
+            "key must be present in scrubbed form: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        for key in obj.keys() {
+            assert!(
+                !key.as_bytes().contains(&0x1B),
+                "no raw ESC may remain in any key: {key:?}"
+            );
+            assert!(
+                !key.contains('\u{200B}'),
+                "no zero-width may remain in any key: {key:?}"
+            );
+        }
     }
 }

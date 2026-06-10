@@ -191,6 +191,13 @@ pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std
 
 /// Format a string highlighting suspicious characters — red background when
 /// color is enabled, bracket-wrapped (`[x]`) when color is off.
+///
+/// `raw` is untrusted (the offending input verbatim), so it is scrubbed of
+/// terminal-control / zero-width bytes before emission, mirroring the
+/// title/description sanitization (F11). Marker placement stays byte-exact: each
+/// run of non-suspicious chars is sanitized as a unit (so multi-byte ESC
+/// sequences are stripped whole, not split), and the marker boundaries are keyed
+/// off the ORIGINAL `raw` byte offsets, so the highlight never desyncs.
 fn format_visual_with_markers(
     raw: &str,
     suspicious_chars: &[crate::verdict::SuspiciousChar],
@@ -201,23 +208,36 @@ fn format_visual_with_markers(
     let use_color = crate::style::use_color_for(crate::style::Stream::Stderr);
 
     let mut result = String::new();
+    let mut run = String::new();
     let mut byte_offset = 0;
 
     for ch in raw.chars() {
         if suspicious_offsets.contains(&byte_offset) {
+            // Flush the pending (untrusted) run through the sanitizer as a unit so
+            // any multi-byte escape sequence is removed whole.
+            if !run.is_empty() {
+                result.push_str(&sanitize_field(&run));
+                run.clear();
+            }
+            // Suspicious chars are confusable letters (non-ASCII), never ASCII
+            // escape introducers, so a single-char scrub is safe here.
+            let safe = sanitize_field(ch.encode_utf8(&mut [0u8; 4]));
             if use_color {
                 result.push_str("\x1b[41m\x1b[97m"); // red bg, white fg
-                result.push(ch);
+                result.push_str(&safe);
                 result.push_str("\x1b[0m");
             } else {
                 result.push('[');
-                result.push(ch);
+                result.push_str(&safe);
                 result.push(']');
             }
         } else {
-            result.push(ch);
+            run.push(ch);
         }
         byte_offset += ch.len_utf8();
+    }
+    if !run.is_empty() {
+        result.push_str(&sanitize_field(&run));
     }
 
     result
@@ -352,7 +372,13 @@ fn write_human_no_color(
     Ok(())
 }
 
-/// Format a string with brackets around suspicious characters (for no-color mode)
+/// Format a string with brackets around suspicious characters (for no-color mode).
+///
+/// `raw` is untrusted, so it is scrubbed of terminal-control / zero-width bytes
+/// before emission (F11). Marker placement stays byte-exact: each run of
+/// non-suspicious chars is sanitized as a unit (so multi-byte ESC sequences are
+/// stripped whole, not split), and the bracket boundaries are keyed off the
+/// ORIGINAL `raw` byte offsets, so the highlight never desyncs.
 fn format_visual_with_brackets(
     raw: &str,
     suspicious_chars: &[crate::verdict::SuspiciousChar],
@@ -362,17 +388,26 @@ fn format_visual_with_brackets(
     let suspicious_offsets: HashSet<usize> = suspicious_chars.iter().map(|sc| sc.offset).collect();
 
     let mut result = String::new();
+    let mut run = String::new();
     let mut byte_offset = 0;
 
     for ch in raw.chars() {
         if suspicious_offsets.contains(&byte_offset) {
+            if !run.is_empty() {
+                result.push_str(&sanitize_field(&run));
+                run.clear();
+            }
+            let safe = sanitize_field(ch.encode_utf8(&mut [0u8; 4]));
             result.push('[');
-            result.push(ch);
+            result.push_str(&safe);
             result.push(']');
         } else {
-            result.push(ch);
+            run.push(ch);
         }
         byte_offset += ch.len_utf8();
+    }
+    if !run.is_empty() {
+        result.push_str(&sanitize_field(&run));
     }
 
     result
@@ -592,6 +627,74 @@ mod tests {
         assert!(
             !cout.contains("\x1b[2J") && !cout.contains("\x1b[1;1H"),
             "color human output must strip the attacker's CSI sequences: {cout}"
+        );
+    }
+
+    #[test]
+    fn visual_line_sanitizes_terminal_control_in_homoglyph_raw() {
+        use crate::verdict::SuspiciousChar;
+
+        // Evidence::HomoglyphAnalysis.raw is the offending input verbatim, so a
+        // payload that embeds a clear-screen CSI must be scrubbed before the
+        // `Visual:` line reaches the terminal (F11). `raw` = "gіtESC[2Jub" where
+        // 'і' is Cyrillic (U+0456, 2 bytes) at byte offset 1; the CSI lives in the
+        // non-suspicious tail and must be stripped whole (no residual `[2J`).
+        let raw = "gіt\x1b[2Jub".to_string();
+        let suspicious = vec![SuspiciousChar {
+            offset: 1,
+            character: 'і',
+            codepoint: "U+0456".to_string(),
+            description: "Cyrillic 'і' (looks like Latin 'i')".to_string(),
+            hex_bytes: "d1 96".to_string(),
+        }];
+        let verdict = Verdict::from_findings(
+            vec![Finding {
+                rule_id: RuleId::MixedScriptInLabel,
+                severity: Severity::High,
+                title: "Mixed-script hostname".to_string(),
+                description: "homograph".to_string(),
+                evidence: vec![Evidence::HomoglyphAnalysis {
+                    raw,
+                    // Keep `escaped` ASCII so the Escaped line can't be the source
+                    // of any ESC byte the assertions catch.
+                    escaped: "githubub".to_string(),
+                    suspicious_chars: suspicious,
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }],
+            3,
+            Timings::default(),
+        );
+
+        // no-color path: the formatter emits only brackets, so no ESC at all may
+        // appear anywhere in the output.
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        assert!(
+            !buf.contains(&0x1b),
+            "no-color Visual line must strip raw ESC from homoglyph raw"
+        );
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("Visual:") && out.contains("[і]"),
+            "the suspicious char must still be bracket-marked: {out}"
+        );
+        assert!(
+            !out.contains("[2J"),
+            "the clear-screen CSI must be stripped whole, no residual: {out}"
+        );
+
+        // color path: write_human emits its own SGR for styling, so we assert the
+        // attacker's specific clear-screen CSI is gone (not "no ESC at all").
+        let mut cbuf = Vec::new();
+        write_human(&verdict, false, &mut cbuf).unwrap();
+        let cout = String::from_utf8(cbuf).unwrap();
+        assert!(
+            !cout.contains("\x1b[2J"),
+            "color Visual line must strip the attacker's clear-screen CSI: {cout}"
         );
     }
 

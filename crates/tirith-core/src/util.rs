@@ -94,6 +94,7 @@ pub fn open_write_no_follow(path: &Path, truncate: bool) -> std::io::Result<File
         use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .write(true)
+            .append(!truncate)
             .create(true)
             .truncate(truncate)
             .mode(0o600)
@@ -114,6 +115,7 @@ pub fn open_write_no_follow(path: &Path, truncate: bool) -> std::io::Result<File
         }
         std::fs::OpenOptions::new()
             .write(true)
+            .append(!truncate)
             .create(true)
             .truncate(truncate)
             .open(path)

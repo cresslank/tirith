@@ -104,10 +104,13 @@ verify_sha256() {
 # supply-chain risk.
 verify_cosign() {
   local workdir="$1"
-  local allow_unsigned="${TIRITH_ALLOW_UNSIGNED:-}"
+  local allow_unsigned=0
+  if [ "${TIRITH_ALLOW_UNSIGNED:-}" = "1" ]; then
+    allow_unsigned=1
+  fi
 
   if ! command -v cosign >/dev/null 2>&1; then
-    if [ -n "$allow_unsigned" ]; then
+    if [ "$allow_unsigned" = "1" ]; then
       warn "cosign not found; skipping signature verification (TIRITH_ALLOW_UNSIGNED=1; checksum only)"
       return 0
     fi
@@ -122,14 +125,14 @@ verify_cosign() {
   # Download the signature and certificate. Failure to fetch either is fatal
   # unless the caller opted out of signature verification.
   if ! fetch "$sig_url" "${workdir}/checksums.txt.sig" 2>/dev/null; then
-    if [ -n "$allow_unsigned" ]; then
+    if [ "$allow_unsigned" = "1" ]; then
       warn "signature not available; skipping signature verification (TIRITH_ALLOW_UNSIGNED=1; checksum only)"
       return 0
     fi
     err "could not download the release signature (checksums.txt.sig). The release may be unsigned, or the download failed. Set TIRITH_ALLOW_UNSIGNED=1 to install with checksum-only verification (NOT recommended)."
   fi
   if ! fetch "$pem_url" "${workdir}/checksums.txt.pem" 2>/dev/null; then
-    if [ -n "$allow_unsigned" ]; then
+    if [ "$allow_unsigned" = "1" ]; then
       warn "certificate not available; skipping signature verification (TIRITH_ALLOW_UNSIGNED=1; checksum only)"
       return 0
     fi

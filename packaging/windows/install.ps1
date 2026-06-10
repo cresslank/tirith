@@ -82,24 +82,39 @@ if (!$cosign) {
     }
 } else {
     Write-Host "Downloading checksums.txt.sig and checksums.txt.pem..."
-    Invoke-WebRequest -Uri $checksumsSig.browser_download_url -OutFile $sigPath
-    Invoke-WebRequest -Uri $checksumsPem.browser_download_url -OutFile $pemPath
-
-    Write-Host "Verifying checksums signature with cosign..."
-    & cosign verify-blob `
-        --signature $sigPath `
-        --certificate $pemPath `
-        --certificate-identity-regexp '^https://github\.com/sheeki03/tirith/\.github/workflows/' `
-        --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' `
-        $checksumsPath
-    if ($LASTEXITCODE -ne 0) {
-        # A FAILED verification is always fatal, even under TIRITH_ALLOW_UNSIGNED:
-        # a present-but-bad signature means tampering, not a missing-tool fallback.
-        Write-Error "cosign verification failed - the release signature did NOT verify. Do not trust these artifacts."
-        exit 1
+    # A DOWNLOAD failure is "signature not available": fatal by default, but it
+    # may fall back to checksum-only under the opt-out. $ErrorActionPreference is
+    # 'Stop', so wrap the fetch to keep the fallback reachable.
+    $sigDownloaded = $true
+    try {
+        Invoke-WebRequest -Uri $checksumsSig.browser_download_url -OutFile $sigPath
+        Invoke-WebRequest -Uri $checksumsPem.browser_download_url -OutFile $pemPath
+    } catch {
+        if (-not $allowUnsigned) {
+            Write-Error "could not download the release signature/certificate (checksums.txt.sig / .pem). The download failed, or the release is unsigned. Set `$env:TIRITH_ALLOW_UNSIGNED = '1' to install with checksum-only verification (NOT recommended)."
+            exit 1
+        }
+        Write-Warning "could not download the release signature/certificate - skipping signature verification (TIRITH_ALLOW_UNSIGNED=1; checksum only)"
+        $sigDownloaded = $false
     }
-    Remove-Item $sigPath -ErrorAction SilentlyContinue
-    Remove-Item $pemPath -ErrorAction SilentlyContinue
+
+    if ($sigDownloaded) {
+        Write-Host "Verifying checksums signature with cosign..."
+        & cosign verify-blob `
+            --signature $sigPath `
+            --certificate $pemPath `
+            --certificate-identity-regexp '^https://github\.com/sheeki03/tirith/\.github/workflows/' `
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' `
+            $checksumsPath
+        if ($LASTEXITCODE -ne 0) {
+            # A FAILED verification is always fatal, even under TIRITH_ALLOW_UNSIGNED:
+            # a present-but-bad signature means tampering, not a missing-tool fallback.
+            Write-Error "cosign verification failed - the release signature did NOT verify. Do not trust these artifacts."
+            exit 1
+        }
+        Remove-Item $sigPath -ErrorAction SilentlyContinue
+        Remove-Item $pemPath -ErrorAction SilentlyContinue
+    }
 }
 
 # Extract

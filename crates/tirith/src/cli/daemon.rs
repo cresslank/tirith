@@ -25,20 +25,63 @@ use tirith_core::verdict::{upgraded_action_from_findings, Evidence, RuleId, Seve
 
 /// Directory that holds the daemon's runtime files (socket + PID).
 ///
-/// Prefers `state_dir()` (`$XDG_STATE_HOME/tirith` or `~/.local/state/tirith`).
-/// When that is unresolvable (no `XDG_STATE_HOME` and no home directory) we fall
-/// back to a *per-uid* `/tmp/tirith-<uid>` directory rather than the shared,
-/// world-writable `/tmp`. The bare `/tmp/daemon.sock` fallback let any same-host
-/// user pre-bind the socket and feed the hook path forged verdicts (F19); a
-/// uid-scoped `0700` dir keeps the path predictable for both client and server
-/// while denying other users write access. The `0700` mode is enforced when the
-/// directory is materialized (see `ensure_private_dir`).
+/// Resolution order (first that yields a path wins):
+///   1. `state_dir()` (`$XDG_STATE_HOME/tirith` or `~/.local/state/tirith`).
+///   2. `$XDG_RUNTIME_DIR/tirith` — already a per-user, `0700`, OS-managed dir.
+///   3. `/run/user/<euid>/tirith`, but only when `/run/user/<euid>` exists and is
+///      owned by the euid (the standard systemd per-user runtime dir).
+///   4. Last resort: a *per-uid* `/tmp/tirith-<uid>` directory.
+///
+/// The earlier options are per-user runtime dirs that are already `0700`; the
+/// `/tmp` fallback shares the world-writable, sticky tempdir, so the bare
+/// `/tmp/daemon.sock` path used to let any same-host user pre-bind the socket and
+/// feed the hook path forged verdicts (F19). A uid-scoped subdir keeps the path
+/// predictable for both client and server while denying other users write access.
+///
+/// Whatever dir is chosen, `ensure_private_dir` is the gate that actually makes
+/// it safe to bind inside: it materializes the dir at `0700`, then STATs it and
+/// refuses (fail-closed) if it is a symlink, not owned by the euid, or not exactly
+/// `0700`. A deterministic `/tmp` path another user pre-created is therefore
+/// rejected rather than reused or chmod-coerced.
 #[cfg(unix)]
 fn runtime_dir() -> PathBuf {
-    tirith_core::policy::state_dir().unwrap_or_else(|| {
-        let uid = unsafe { libc::geteuid() };
-        std::env::temp_dir().join(format!("tirith-{uid}"))
-    })
+    if let Some(state) = tirith_core::policy::state_dir() {
+        return state;
+    }
+
+    // `$XDG_RUNTIME_DIR` is a per-user 0700 dir on most modern Linux desktops.
+    // Treat empty as unset (matches shell `${VAR:-fallback}` semantics).
+    if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
+        let trimmed = rt.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join("tirith");
+        }
+    }
+
+    let euid = unsafe { libc::geteuid() };
+
+    // `/run/user/<euid>` is the systemd-managed per-user runtime dir. Only use it
+    // when it already exists AND is owned by us — otherwise fall through to the
+    // uid-scoped tempdir. `ensure_private_dir` re-verifies the `tirith` subdir.
+    let run_user = PathBuf::from(format!("/run/user/{euid}"));
+    if dir_owned_by_euid(&run_user, euid) {
+        return run_user.join("tirith");
+    }
+
+    std::env::temp_dir().join(format!("tirith-{euid}"))
+}
+
+/// `true` when `path` is a real directory (not a symlink) owned by `euid`. Used
+/// to decide whether `/run/user/<euid>` is a usable per-user runtime base.
+/// `symlink_metadata` (lstat) so a symlinked entry pointing at a victim dir is
+/// rejected rather than followed.
+#[cfg(unix)]
+fn dir_owned_by_euid(path: &std::path::Path, euid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta.is_dir() && !meta.file_type().is_symlink() && meta.uid() == euid,
+        Err(_) => false,
+    }
 }
 
 #[cfg(not(unix))]
@@ -54,21 +97,89 @@ fn pid_path() -> PathBuf {
     runtime_dir().join("daemon.pid")
 }
 
-/// Create `dir` (and parents) with mode `0700` so only the owner can traverse or
-/// write inside it. If the directory already exists, tighten its mode to `0700`.
-/// Used for the daemon runtime dir so a peer cannot drop a same-named socket
-/// alongside ours or pre-create the path with looser permissions.
+/// Create `dir` (and parents) with mode `0700`, then PROVE it is safe to bind
+/// inside before returning. This is the gate that defeats a same-host squatter:
+/// when `runtime_dir()` falls back to a deterministic path in the world-writable,
+/// sticky tempdir (`/tmp/tirith-<uid>`), another local user can `mkdir` it first.
+/// Re-asserting `0700` is not enough — an attacker-owned dir would let the daemon
+/// bind its socket inside a directory it does not control. So after materializing
+/// the dir we STAT it (`symlink_metadata`, lstat — never follow a symlinked dir)
+/// and FAIL CLOSED unless ALL hold:
+///   * it is a real directory, not a symlink, and
+///   * it is owned by our effective uid, and
+///   * its permission bits are exactly `0700` (no group/other access).
+///
+/// A pre-created attacker-owned or loosened/symlinked path is rejected (the daemon
+/// refuses to start) rather than reused or chmod-coerced. Owner-by-us tightening
+/// stays: a dir WE pre-created world-writable is pulled back to `0700` and then
+/// passes the re-stat.
 #[cfg(unix)]
 fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
+    // Create (then verify) as atomically as practical. `recursive(true)` is
+    // idempotent if the path already exists; the stat gate below — not this
+    // call — is what decides whether an extant entry is trustworthy.
     std::fs::DirBuilder::new()
         .mode(0o700)
         .recursive(true)
         .create(dir)?;
-    // `recursive(true)` leaves a pre-existing dir's mode untouched, so re-assert
-    // 0700 to close a looser-permission pre-create.
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+
+    let euid = unsafe { libc::geteuid() };
+
+    // lstat first so a symlink the squatter dropped in our place is caught BEFORE
+    // any `set_permissions` (which follows symlinks and would chmod the target).
+    let meta = std::fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(Error::other(format!(
+            "runtime dir {} is a symlink or not a directory; refusing to use it",
+            dir.display()
+        )));
+    }
+    if meta.uid() != euid {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "runtime dir {} is owned by uid {}, not {euid}; refusing to use a \
+                 directory another user controls",
+                dir.display(),
+                meta.uid()
+            ),
+        ));
+    }
+
+    // We own it and it is a real dir: safe to tighten a pre-existing looser mode
+    // (`recursive(true)` leaves an extant dir's mode untouched).
+    if meta.mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    // Re-stat and require exactly 0700 (no group/other bits). Closes the window
+    // between the chmod and now, and rejects any setuid/setgid/sticky variation
+    // we did not intend.
+    let meta = std::fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() || !meta.is_dir() || meta.uid() != euid {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "runtime dir {} changed identity under us; refusing to use it",
+                dir.display()
+            ),
+        ));
+    }
+    if meta.mode() & 0o777 != 0o700 {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "runtime dir {} is mode {:#o} after tightening, not 0700; refusing \
+                 to bind inside a group/other-accessible directory",
+                dir.display(),
+                meta.mode() & 0o777
+            ),
+        ));
+    }
+
     Ok(())
 }
 
@@ -510,11 +621,13 @@ fn extract_host_from_url(url: &str) -> Option<String> {
 #[cfg(unix)]
 fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
     if let Some(parent) = sock.parent() {
-        // 0700 so no other user can drop a same-named socket beside ours or read
-        // the directory (F19). Refuse to start if we can't lock it down.
+        // 0700, owned-by-us, non-symlink so no other user can drop a same-named
+        // socket beside ours, read the directory, or pre-squat the path (F19).
+        // Refuse to start if `ensure_private_dir` can't prove all of that.
         if let Err(e) = ensure_private_dir(parent) {
             eprintln!(
-                "tirith: failed to create runtime dir {} with 0700 perms: {e}",
+                "tirith: refusing to start — runtime dir {} is not a private \
+                 owner-only directory: {e}",
                 parent.display()
             );
             return 1;
@@ -1156,5 +1269,121 @@ mod tests {
         // materializes any such dir at 0700 — proven by
         // `ensure_private_dir_creates_0700`, so we don't touch the shared
         // production fallback path here.
+    }
+
+    /// A pre-existing fallback dir owned by us at exactly mode 0700 is accepted
+    /// (the common case: our own prior run, or a freshly created dir).
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_accepts_owned_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TmpDir::new("accept0700");
+        std::fs::create_dir_all(&tmp.0).expect("pre-create");
+        std::fs::set_permissions(&tmp.0, std::fs::Permissions::from_mode(0o700)).expect("0700");
+        // Owned by us (this process created it) and exactly 0700 → accepted.
+        super::ensure_private_dir(&tmp.0).expect("owned 0700 dir must be accepted");
+        assert_eq!(mode_of(&tmp.0), 0o700, "still 0700 after the gate");
+    }
+
+    /// A fallback dir with loose perms (0777) that WE own is tightened to 0700 and
+    /// then accepted — the gate coerces our own loosened dir but never an
+    /// attacker-owned one (that path fails the ownership check, which we can't
+    /// simulate without root).
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_tightens_loose_owned_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TmpDir::new("loose0777");
+        std::fs::create_dir_all(&tmp.0).expect("pre-create");
+        std::fs::set_permissions(&tmp.0, std::fs::Permissions::from_mode(0o777)).expect("loosen");
+        assert_eq!(mode_of(&tmp.0), 0o777, "precondition: world-writable");
+        // We own it, so the gate tightens 0777 → 0700 and the re-stat passes.
+        super::ensure_private_dir(&tmp.0).expect("owned loose dir must be tightened, not rejected");
+        assert_eq!(mode_of(&tmp.0), 0o700, "must be re-tightened to 0700");
+    }
+
+    /// A runtime dir that is a SYMLINK (even to a directory we own) is rejected:
+    /// `ensure_private_dir` lstat-refuses it rather than binding through the link.
+    /// This exercises the same fail-closed gate that rejects an attacker-owned
+    /// pre-created `/tmp/tirith-<uid>` (which we cannot simulate without root).
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_rejects_symlinked_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TmpDir::new("symlink");
+        // A real target dir we own, locked down to 0700 so ONLY the symlink-ness
+        // (not perms/ownership) is what the gate rejects.
+        let target = tmp.0.join("real-target");
+        std::fs::create_dir_all(&target).expect("create target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).expect("0700");
+
+        let link = tmp.0.join("link-to-target");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        let err = super::ensure_private_dir(&link)
+            .expect_err("a symlinked runtime dir must be rejected (fail closed)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("symlink") || msg.contains("not a directory"),
+            "rejection must cite the symlink, got: {msg}"
+        );
+        // The target's mode was NOT coerced through the link.
+        assert_eq!(
+            mode_of(&target),
+            0o700,
+            "gate must not chmod through the link"
+        );
+    }
+
+    /// `dir_owned_by_euid` is true for a real dir we own and false for a symlink
+    /// (even one pointing at a dir we own) — the predicate that decides whether
+    /// `/run/user/<euid>` is a usable runtime base.
+    #[cfg(unix)]
+    #[test]
+    fn dir_owned_by_euid_rejects_symlink() {
+        let tmp = TmpDir::new("ownedby");
+        let euid = unsafe { libc::geteuid() };
+        let target = tmp.0.join("d");
+        std::fs::create_dir_all(&target).expect("create dir");
+        assert!(
+            super::dir_owned_by_euid(&target, euid),
+            "a real dir we own must be accepted"
+        );
+
+        let link = tmp.0.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(
+            !super::dir_owned_by_euid(&link, euid),
+            "a symlink must be rejected even when its target is owned by us"
+        );
+
+        // A non-existent path is not a usable base.
+        assert!(
+            !super::dir_owned_by_euid(&tmp.0.join("missing"), euid),
+            "a missing path must be rejected"
+        );
+    }
+
+    /// `runtime_dir()` honors `XDG_RUNTIME_DIR` (as `<dir>/tirith`) when
+    /// `state_dir()` is unset. Mutates a process-global env var, so it is marked
+    /// `#[ignore]` to avoid racing the other parallel tests in this binary that
+    /// read env; run explicitly with `--ignored` (or in isolation) to verify.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "mutates process-global XDG env; run with --ignored in isolation"]
+    fn runtime_dir_prefers_xdg_runtime_dir_when_no_state_dir() {
+        let tmp = TmpDir::new("xdgrt");
+        std::fs::create_dir_all(&tmp.0).expect("create");
+        // Clear state-dir inputs so resolution falls past option (1).
+        std::env::remove_var("XDG_STATE_HOME");
+        std::env::remove_var("HOME");
+        std::env::set_var("XDG_RUNTIME_DIR", &tmp.0);
+        let dir = super::runtime_dir();
+        assert_eq!(
+            dir,
+            tmp.0.join("tirith"),
+            "with no state_dir, XDG_RUNTIME_DIR/tirith should win"
+        );
+        std::env::remove_var("XDG_RUNTIME_DIR");
     }
 }

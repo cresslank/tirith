@@ -35,6 +35,11 @@ fn clear_policy_env() {
         // the XDG base strategy) can't inject a user-scope allowlist into a
         // repo/org assertion, and so a leak from a panicking sibling can't bleed in.
         std::env::remove_var("XDG_CONFIG_HOME");
+        // etcetera resolves the user config dir from APPDATA/LOCALAPPDATA on
+        // Windows; clear those too so an ambient user policy can't leak into a
+        // repo/org/default scope assertion (or bleed from a panicking sibling).
+        std::env::remove_var("APPDATA");
+        std::env::remove_var("LOCALAPPDATA");
     }
 }
 
