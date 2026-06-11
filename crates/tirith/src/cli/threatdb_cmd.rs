@@ -23,7 +23,7 @@ static VERIFY_KEY_BYTES: &[u8; PUBLIC_KEY_LENGTH] =
 const MANIFEST_URL_PRIMARY: &str =
     "https://raw.githubusercontent.com/sheeki03/tirith/main/threatdb-manifest.json";
 const MANIFEST_URL_FALLBACK: &str =
-    "https://github.com/sheeki03/tirith/releases/latest/download/threatdb-manifest.json";
+    "https://github.com/sheeki03/tirith/releases/download/threatdb-latest/threatdb-manifest.json";
 
 const MAX_MANIFEST_SIZE: u64 = 64 * 1024;
 const MAX_DB_SIZE: u64 = 256 * 1024 * 1024;
@@ -2855,10 +2855,10 @@ mod tests {
     #[test]
     fn primary_and_fallback_independent_cache_state() {
         let tmp = tempfile::tempdir().unwrap();
-        let primary =
-            "https://raw.githubusercontent.com/sheeki03/tirith/main/threatdb-manifest.json";
-        let fallback =
-            "https://github.com/sheeki03/tirith/releases/latest/download/threatdb-manifest.json";
+        // Reference the real consts so this test tracks them and never goes stale
+        // when a URL changes (e.g. the fallback moving to the rolling release).
+        let primary = super::MANIFEST_URL_PRIMARY;
+        let fallback = super::MANIFEST_URL_FALLBACK;
 
         let pk = super::manifest_cache_key(primary);
         let fk = super::manifest_cache_key(fallback);
