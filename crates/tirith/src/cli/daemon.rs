@@ -970,6 +970,12 @@ fn start_detached() -> i32 {
         }
     }
 
+    // No live daemon owns this socket (the PID guard above did not short-circuit),
+    // so any socket file here is stale. Remove it before spawning so `poll_startup`
+    // only sees a socket the freshly spawned child actually (re)bound — otherwise a
+    // leftover file yields a premature/false `SocketUp`.
+    let _ = std::fs::remove_file(&sock);
+
     // Mirror the detached-spawn idiom used by the periodic threat-DB updater:
     // null all stdio so the background daemon holds no terminal fds, and
     // `setsid()` in the forked child so it leaves the controlling TTY and

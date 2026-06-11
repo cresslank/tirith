@@ -701,14 +701,7 @@ struct EffectivePolicy {
 ///
 /// [`PolicyScope`]: tirith_core::policy::PolicyScope
 fn scope_label(scope: tirith_core::policy::PolicyScope) -> &'static str {
-    use tirith_core::policy::PolicyScope;
-    match scope {
-        PolicyScope::Repo => "repo",
-        PolicyScope::User => "user",
-        PolicyScope::Org => "org",
-        PolicyScope::Remote => "remote",
-        PolicyScope::Default => "default",
-    }
+    scope.as_str()
 }
 
 /// Gather the effective local policy for `cwd`: its source path + scope (via

@@ -107,14 +107,7 @@ fn status_json(
 }
 
 fn scope_label(s: tirith_core::policy::PolicyScope) -> &'static str {
-    use tirith_core::policy::PolicyScope::*;
-    match s {
-        Repo => "repo",
-        User => "user",
-        Org => "org",
-        Remote => "remote",
-        Default => "default",
-    }
+    s.as_str()
 }
 
 fn threatdb_summary(t: &threatdb_cmd::ThreatDbStatus) -> String {

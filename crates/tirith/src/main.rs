@@ -7951,8 +7951,13 @@ mod help_category_tests {
                     if name == "help" {
                         continue; // clap's auto-generated built-in
                     }
+                    // Token-level match (not substring): a command name must appear
+                    // as a whole whitespace-delimited token, so e.g. `run` can't
+                    // false-pass by being a substring of `temp-run`.
                     assert!(
-                        COMMANDS_BY_CATEGORY.contains(name),
+                        COMMANDS_BY_CATEGORY
+                            .split_whitespace()
+                            .any(|tok| tok == name),
                         "command `{name}` is missing from COMMANDS_BY_CATEGORY — add it to a category"
                     );
                 }

@@ -72,6 +72,19 @@ pub enum PolicyScope {
     Default,
 }
 
+impl PolicyScope {
+    /// Canonical lowercase scope label (matches the JSON `policy_scope` field).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Repo => "repo",
+            Self::User => "user",
+            Self::Org => "org",
+            Self::Remote => "remote",
+            Self::Default => "default",
+        }
+    }
+}
+
 /// Policy configuration loaded from YAML.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

@@ -239,20 +239,24 @@ fn print_table(w: &SessionWarnings, top_rules: &[(String, u32)], paranoia: u8) {
     let suggestion_threshold = 3;
     for (rule, count) in top_rules {
         if *count >= suggestion_threshold {
-            // Shell-quote the domain: it derives from analyzed (attacker-
-            // controlled) command text and this line is copy-paste-ready, so an
-            // unquoted `$(...)` / backtick / `;` would execute on paste (same class
-            // as the block "To allow" line). A target that cannot be safely quoted
-            // falls back to the `<pattern>` placeholder, never a runnable line.
-            let quoted = find_domain_for_rule(w, rule)
-                .and_then(tirith_core::safe_command::shell_single_quote);
+            // The domain comes from analyzed (attacker-controlled) command text and this
+            // line is copy-paste-ready. Scrub terminal-control bytes (ANSI/OSC/zero-width)
+            // first so the target cannot repaint the terminal, then shell-single-quote so
+            // `$(...)`/backtick/`;`/space can't execute on paste. find_domain_for_rule yields
+            // a BARE domain, which `trust add` classifies as broad and rejects without
+            // --broad, so emit --broad to keep the line runnable. An unquotable target falls
+            // back to the <pattern> placeholder.
+            let quoted = find_domain_for_rule(w, rule).and_then(|d| {
+                let scrubbed = tirith_core::mcp::output_filter::sanitize_text_str(d);
+                tirith_core::safe_command::shell_single_quote(&scrubbed)
+            });
             if let Some(d) = quoted {
                 println!(
-                    "\nSuggestion: {rule} fired {count} times. Consider: tirith trust add {d} --rule {rule}"
+                    "\nSuggestion: {rule} fired {count} times. Consider: tirith trust add {d} --broad --rule {rule}"
                 );
             } else {
                 println!(
-                    "\nSuggestion: {rule} fired {count} times. Consider: tirith trust add <pattern> --rule {rule}"
+                    "\nSuggestion: {rule} fired {count} times. Consider: tirith trust add <pattern> --broad --rule {rule}"
                 );
             }
         }

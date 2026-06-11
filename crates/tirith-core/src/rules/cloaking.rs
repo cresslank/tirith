@@ -195,23 +195,19 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
     let baseline_idx = 0;
     let baseline_body = &responses[baseline_idx].2;
 
-    // A failed baseline would otherwise flag every successful agent as cloaked.
+    // The baseline (chrome) is the reference every other user-agent is diffed
+    // against. If it never loaded (its fetch failed, or returned an empty body)
+    // there is nothing to compare to, so the check could not actually run. This
+    // is only reachable when the baseline UA specifically failed while some other
+    // UA succeeded; an all-failed run already returned the `successful_count == 0`
+    // error above. Report it as inconclusive (Err) rather than `cloaking_detected:
+    // false`. Claiming "no cloaking" off an absent baseline is a false negative,
+    // and a cloaking site that serves chrome an empty/blocked page is exactly the
+    // case we must not silently pass.
     if baseline_body.is_empty() {
-        let agent_responses: Vec<AgentResponse> = responses
-            .iter()
-            .map(|(name, status, body)| AgentResponse {
-                agent_name: name.clone(),
-                status_code: *status,
-                content_length: body.len(),
-            })
-            .collect();
-        return Ok(CloakingResult {
-            url: url.to_string(),
-            cloaking_detected: false,
-            findings: Vec::new(),
-            agent_responses,
-            diff_pairs: Vec::new(),
-        });
+        return Err("baseline (chrome) fetch failed or returned an empty body, \
+             cloaking analysis inconclusive (no reference to compare against)"
+            .to_string());
     }
 
     let baseline_normalized = normalize_html(baseline_body);
@@ -517,6 +513,12 @@ mod tests {
 
     #[test]
     fn test_cloaking_rejects_localhost_target_before_fetch() {
+        // Serialize with the empty-baseline test below: that test sets
+        // `TIRITH_ALLOW_PRIVATE_FETCH=1` process-wide, which (if it overlapped)
+        // would relax the very localhost rejection this test asserts.
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match check("http://localhost/") {
             Ok(_) => panic!("expected localhost target to be rejected"),
             Err(err) => assert!(err.contains("localhost")),
@@ -624,5 +626,109 @@ mod tests {
         // And of the two error variants, only Connect is treated as unreachable.
         assert!(FetchErr::Connect(String::new()).is_host_unreachable());
         assert!(!FetchErr::Other(String::new()).is_host_unreachable());
+    }
+
+    /// Snapshot an env var and restore it on `Drop`.
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    /// When the BASELINE (chrome, USER_AGENTS[0]) returns an empty body but other
+    /// user-agents succeed, there is no reference to diff against and the check
+    /// could not actually run. It MUST come back inconclusive (`Err`), never
+    /// `Ok { cloaking_detected: false }`. Claiming "no cloaking" off an absent
+    /// baseline is the false negative this guards. A cloaking site that serves
+    /// chrome an empty/blocked page while serving bots real content is exactly
+    /// this case, so a silent "no cloaking" would be the worst possible answer.
+    ///
+    /// Driven end-to-end against a loopback server that returns an empty 200 to
+    /// the chrome UA and real content to everyone else. `successful_count` is
+    /// therefore > 0 (chrome's empty 200 still counts as a successful fetch), so
+    /// the `successful_count == 0` guard does NOT fire and execution reaches the
+    /// empty-baseline branch under test.
+    #[test]
+    fn test_empty_baseline_is_inconclusive_not_no_cloaking() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        // Loopback fetches are SSRF-blocked by default; the carve-out opt-in is
+        // process-wide, so serialize with other env-sensitive cloaking tests.
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _allow_private = EnvVarGuard::set("TIRITH_ALLOW_PRIVATE_FETCH", "1");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+
+        // Serve one connection per user-agent. Chrome (the baseline) gets an empty
+        // 200; every other UA gets a non-empty body. `Connection: close` keeps each
+        // request on its own connection so the accept loop stays deterministic.
+        let n_agents = USER_AGENTS.len();
+        let server = std::thread::spawn(move || {
+            for _ in 0..n_agents {
+                let (mut sock, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                // Read the request head; the User-Agent line tells us who is asking.
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let is_chrome = req
+                    .lines()
+                    .filter_map(|l| l.split_once(':'))
+                    .any(|(k, v)| k.eq_ignore_ascii_case("user-agent") && v.contains("Chrome/"));
+
+                let body = if is_chrome {
+                    String::new()
+                } else {
+                    "<html><body>Real content served to this agent.</body></html>".to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+
+        let result = check(&format!("http://{addr}/"));
+        let _ = server.join();
+
+        // The contract: an empty baseline is inconclusive (Err), NOT a successful
+        // `cloaking_detected: false`. Before the fix this returned exactly that
+        // false-negative Ok value.
+        match result {
+            Ok(r) => panic!(
+                "empty baseline must be inconclusive (Err), got Ok with \
+                 cloaking_detected={}",
+                r.cloaking_detected
+            ),
+            Err(msg) => assert!(
+                msg.contains("baseline") && msg.contains("inconclusive"),
+                "error should name the empty baseline as inconclusive, got: {msg}"
+            ),
+        }
     }
 }

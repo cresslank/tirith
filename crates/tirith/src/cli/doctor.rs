@@ -198,7 +198,12 @@ fn run_fix(yes: bool) -> i32 {
     }
 
     if fixed == 0 {
-        println!("tirith: no issues to fix");
+        if shadows.is_empty() {
+            println!("tirith: no issues to fix");
+        } else {
+            // Shadow guidance was printed above but isn't auto-fixable; don't claim "nothing to fix".
+            println!("tirith: no auto-fixable issues (see manual steps above)");
+        }
     } else {
         println!("tirith: fixed {fixed} issue(s)");
     }

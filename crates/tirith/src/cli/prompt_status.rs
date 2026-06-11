@@ -602,13 +602,13 @@ mod tests {
 
     #[test]
     fn protection_health_classify_and_exit_codes() {
-        // Guarded is the only posture that exits 0 (actively blocking).
+        // Guarded exits 0 (actively blocking); ConfiguredUnknown also exits 0 (see below).
         let guarded = ProtectionHealth::classify("guarded", true);
         assert_eq!(guarded, ProtectionHealth::Guarded);
         assert_eq!(guarded.exit_code(), 0);
         assert_eq!(guarded.label(), "guarded");
 
-        // Everything else exits 1.
+        // Provably-reduced postures (warn-only, degraded, hook-missing, unknown) exit 1.
         let warn_only = ProtectionHealth::classify("warn-only", true);
         assert_eq!(warn_only, ProtectionHealth::WarnOnly);
         assert_eq!(warn_only.exit_code(), 1);

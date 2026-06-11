@@ -226,8 +226,8 @@ pub fn scan_for_repo(repo_root: &Path) -> RepoHookScan {
 /// Match an entry for `tirith hooks explain` against either its short display name
 /// (`pre-commit`) OR the path `hooks scan` prints (`.git/hooks/pre-commit`), so a user
 /// can copy-paste either form. Tries, in order: exact name; the source path's file name;
-/// the full displayed path; the displayed path with a trailing `/<query>` (or bare
-/// suffix) so a relative fragment of the printed path also matches.
+/// the full displayed path; or the displayed path with a trailing `/<query>` so a
+/// path-segment-aligned fragment of the printed path also matches.
 fn entry_matches(entry: &RepoHookEntry, query: &str) -> bool {
     if entry.name == query {
         return true;
@@ -237,7 +237,7 @@ fn entry_matches(entry: &RepoHookEntry, query: &str) -> bool {
         return true;
     }
     let disp = sp.to_string_lossy();
-    disp == query || disp.ends_with(&format!("/{query}")) || disp.ends_with(query)
+    disp == query || disp.ends_with(&format!("/{query}"))
 }
 
 /// Look up a surface by name for `tirith hooks explain`. Returns every matching entry
@@ -1835,6 +1835,21 @@ mod tests {
         assert!(
             explain_for_repo(root.path(), ".git/hooks/bogus").is_empty(),
             "an unknown path must not match"
+        );
+
+        // Partial-COMPONENT fragments must NOT match (these only matched via the
+        // now-removed bare `ends_with(query)` clause).
+        for q in ["commit", "mit", "re-commit"] {
+            assert!(
+                explain_for_repo(root.path(), q).is_empty(),
+                "partial-component fragment {q:?} must not match"
+            );
+        }
+        // But a path-segment-aligned suffix of the displayed path DOES match (the
+        // `/<query>` clause): `.git/hooks/pre-commit` ends with `/hooks/pre-commit`.
+        assert!(
+            !explain_for_repo(root.path(), "hooks/pre-commit").is_empty(),
+            "segment-aligned suffix hooks/pre-commit should match via the /<query> clause"
         );
     }
 

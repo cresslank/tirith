@@ -814,6 +814,38 @@ fn extract_target_rule_pairs(val: &serde_json::Value) -> Vec<(String, Option<Str
     pairs
 }
 
+/// Normalize a per-finding target to the bare host `last()` displays and
+/// prompts on. `extract_target_rule_pairs` may yield a FULL URL or a bare host;
+/// `last()`'s `domains` list is always a bare host (via `extract_host` /
+/// `raw_host`). Reduce a URL target to its host so a pair can be matched back to
+/// the host the user was actually asked about; a target that is already a bare
+/// host (or any non-URL) maps to itself.
+fn target_host(target: &str) -> String {
+    extract_host(target).unwrap_or_else(|| target.to_string())
+}
+
+/// The rule_id(s) that actually fired for a single host in the last trigger.
+///
+/// Reuses `extract_target_rule_pairs` (the same per-finding source
+/// `from_last_trigger` uses) as the single source of truth, then keeps only the
+/// rules whose finding targeted `host`, never the flat top-level `rule_ids`
+/// array. This is what stops `last()`'s rule-scoped choice from granting one
+/// host every rule in the whole verdict. Results are de-duped, preserving order.
+fn rules_for_host(val: &serde_json::Value, host: &str) -> Vec<String> {
+    let mut rules: Vec<String> = Vec::new();
+    for (target, rule_id) in extract_target_rule_pairs(val) {
+        if target_host(&target) != host {
+            continue;
+        }
+        if let Some(rid) = rule_id {
+            if !rules.contains(&rid) {
+                rules.push(rid);
+            }
+        }
+    }
+    rules
+}
+
 /// Read + parse + extract in one step: per-finding `(target, rule_id)` pairs.
 ///
 /// Each target prefers a full URL, else a bare domain (see
@@ -912,6 +944,7 @@ pub fn from_last_trigger(apply: bool) -> i32 {
     // OWN rule id (never a rule that fired on a different target). A bare-domain
     // target is broad, so pass `broad = true`; a full-URL (narrow) one does not.
     let mut added = 0;
+    let mut failed = 0;
     for (target, rule_id) in &pairs {
         let broad = classify_scope(target).is_broad();
         // Pass DEFAULT_TTL explicitly (not None) so the applied entry uses the
@@ -930,10 +963,19 @@ pub fn from_last_trigger(apply: bool) -> i32 {
         ) == 0
         {
             added += 1;
+        } else {
+            failed += 1;
         }
     }
 
     eprintln!("tirith: added {added} trust entry/entries from last trigger");
+    // A partial apply (some entries rejected by `add()`, e.g. a blocklisted or
+    // control-char target) must NOT exit 0 and masquerade as a clean success --
+    // surface the count and fail loud so the operator knows not every entry stuck.
+    if failed > 0 {
+        eprintln!("tirith: {failed} trust entry/entries could not be added");
+        return 1;
+    }
     0
 }
 
@@ -989,16 +1031,6 @@ pub fn last() -> i32 {
         return 0;
     }
 
-    let rule_ids: Vec<String> = val
-        .get("rule_ids")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
     for domain in &domains {
         eprintln!();
         eprint!("Trust {domain}? [y/N/r(rule-scoped)/t(temporary 7d)] ");
@@ -1018,11 +1050,16 @@ pub fn last() -> i32 {
                 add(domain, None, None, false, true, None, "user", false);
             }
             "r" | "rule" => {
-                if rule_ids.is_empty() {
-                    eprintln!("tirith: no rule IDs in last trigger, adding global trust");
+                // Pair this host with ONLY the rule(s) that actually fired for
+                // it (per-finding, from `extract_target_rule_pairs`), not every
+                // top-level rule in the verdict. Trusting one host under a rule
+                // that fired on a DIFFERENT target would be over-broad.
+                let host_rules = rules_for_host(&val, domain);
+                if host_rules.is_empty() {
+                    eprintln!("tirith: no rule IDs for {domain}, adding global trust");
                     add(domain, None, None, false, true, None, "user", false);
                 } else {
-                    for rid in &rule_ids {
+                    for rid in &host_rules {
                         // Rule-scoped trust is narrow by construction.
                         add(domain, Some(rid), None, false, true, None, "user", false);
                     }
@@ -2348,6 +2385,63 @@ mod tests {
         });
     }
 
+    /// `--apply` must fail loud on a PARTIAL apply: if `add()` rejects even one
+    /// entry, the command exits non-zero instead of 0, so a partial result never
+    /// masquerades as a clean success. Here the first finding's target is a valid
+    /// narrow URL (`add()` accepts it -> stored), while the second's `raw_host`
+    /// carries a control byte (0x07 BEL) that `validate_pattern` rejects ->
+    /// `add()` returns 1 for that entry. Both reach the apply loop, so one
+    /// succeeds and one fails: the overall exit must be 1.
+    #[test]
+    fn from_last_trigger_apply_partial_failure_returns_one() {
+        let json = "{\
+            \"rule_ids\": [\"shortened_url\", \"homograph\"],\
+            \"findings\": [\
+                {\
+                    \"rule_id\": \"shortened_url\",\
+                    \"title\": \"Shortened URL\",\
+                    \"evidence\": [ { \"raw\": \"https://good.example/install.sh\" } ]\
+                },\
+                {\
+                    \"rule_id\": \"homograph\",\
+                    \"title\": \"Homograph\",\
+                    \"evidence\": [ { \"raw_host\": \"evil.example\\u0007\" } ]\
+                }\
+            ]\
+        }";
+
+        with_seeded_last_trigger(json, || {
+            // Both targets survive extraction: the good URL and the control-char
+            // host (raw_host is pushed verbatim, no validation at read time).
+            let pairs = read_last_trigger().expect("read_last_trigger");
+            assert_eq!(
+                pairs,
+                vec![
+                    (
+                        "https://good.example/install.sh".to_string(),
+                        Some("shortened_url".to_string())
+                    ),
+                    (
+                        "evil.example\u{0007}".to_string(),
+                        Some("homograph".to_string())
+                    ),
+                ],
+                "both entries must reach the apply loop so one can succeed and one fail"
+            );
+
+            // Suggest (print-only) still exits 0 -- it never calls `add()`.
+            assert_eq!(from_last_trigger(false), 0);
+
+            // --apply: the good URL is stored, the control-char host is rejected
+            // by `validate_pattern` inside `add()`. A partial apply must exit 1.
+            assert_eq!(
+                from_last_trigger(true),
+                1,
+                "a partial apply (one entry rejected by add) must fail loud, not exit 0"
+            );
+        });
+    }
+
     /// F1 (HIGH): the suggestion line is copy/paste-ready, so a hostile target
     /// carrying shell metacharacters must be single-quoted; a target that can't
     /// be safely quoted (newline) must NOT yield a runnable command.
@@ -2409,6 +2503,96 @@ mod tests {
             osc.contains("tirith trust add"),
             "scrubbed target should still yield a runnable trust line: {osc:?}"
         );
+    }
+
+    /// `last()`'s rule-scoped ("r") choice must trust a host under ONLY the
+    /// rule(s) that fired for THAT host, never every top-level rule in the
+    /// verdict. `rules_for_host` is the per-host lookup that branch uses; here
+    /// finding A (rule `shortened_url`) fired for `a.example`, finding B (rule
+    /// `plain_http_to_sink`) for `b.example`. The old `last()` would have added
+    /// BOTH rules to BOTH hosts (over-broad). `rules_for_host` must return each
+    /// host's own single rule.
+    #[test]
+    fn rules_for_host_returns_only_that_hosts_rules() {
+        let val: serde_json::Value = serde_json::from_str(
+            r#"{
+            "rule_ids": ["shortened_url", "plain_http_to_sink"],
+            "findings": [
+                {
+                    "rule_id": "shortened_url",
+                    "title": "Shortened URL",
+                    "evidence": [ { "raw": "https://a.example/x" } ]
+                },
+                {
+                    "rule_id": "plain_http_to_sink",
+                    "title": "Plain HTTP",
+                    "evidence": [ { "raw": "http://b.example/y" } ]
+                }
+            ]
+        }"#,
+        )
+        .unwrap();
+
+        // The display loop / prompt key on the bare host (via `extract_host`).
+        assert_eq!(rules_for_host(&val, "a.example"), vec!["shortened_url"]);
+        assert_eq!(
+            rules_for_host(&val, "b.example"),
+            vec!["plain_http_to_sink"]
+        );
+        // A host that did not trigger gets no rules (falls back to global trust).
+        assert!(rules_for_host(&val, "c.example").is_empty());
+    }
+
+    /// When ONE host triggers MULTIPLE rules, the rule-scoped choice must add
+    /// each of that host's own rules (and de-dupe), not collapse to one.
+    #[test]
+    fn rules_for_host_returns_all_own_rules_deduped() {
+        let val: serde_json::Value = serde_json::from_str(
+            r#"{
+            "rule_ids": ["shortened_url", "plain_http_to_sink", "homograph"],
+            "findings": [
+                {
+                    "rule_id": "shortened_url",
+                    "evidence": [ { "raw": "https://a.example/x" }, { "raw_host": "a.example" } ]
+                },
+                {
+                    "rule_id": "plain_http_to_sink",
+                    "evidence": [ { "raw": "http://a.example/y" } ]
+                },
+                {
+                    "rule_id": "homograph",
+                    "evidence": [ { "raw_host": "b.example" } ]
+                }
+            ]
+        }"#,
+        )
+        .unwrap();
+
+        // a.example fired on two distinct rules across its findings; both are
+        // returned, de-duped despite the repeated `raw`/`raw_host` evidence.
+        assert_eq!(
+            rules_for_host(&val, "a.example"),
+            vec!["shortened_url", "plain_http_to_sink"],
+            "a host with multiple rules keeps all of its own rules, deduped"
+        );
+        // b.example's unrelated rule must NOT leak onto a.example.
+        assert_eq!(rules_for_host(&val, "b.example"), vec!["homograph"]);
+    }
+
+    /// A finding with evidence but no `rule_id` yields a host with no rules, so
+    /// the rule-scoped branch falls back to global trust for that host. (Mirrors
+    /// the old "no rule IDs in last trigger" path, now scoped per-host.)
+    #[test]
+    fn rules_for_host_empty_when_finding_has_no_rule_id() {
+        let val: serde_json::Value = serde_json::from_str(
+            r#"{
+            "findings": [
+                { "title": "Mystery", "evidence": [ { "raw_host": "a.example" } ] }
+            ]
+        }"#,
+        )
+        .unwrap();
+        assert!(rules_for_host(&val, "a.example").is_empty());
     }
 
     /// A missing/empty trigger is the common "nothing happened yet" case:
