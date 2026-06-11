@@ -3,9 +3,11 @@
 //! Builds on the cheap `doctor --quick` gather (protection mode + hook + policy)
 //! and adds policy SCOPE and threat-DB freshness. Unlike the poller-safe
 //! `doctor --quick` (which always exits 0 for the VS Code extension), `status`
-//! carries the exit-code contract: it exits NON-ZERO whenever protection is not
-//! actively blocking (warn-only / degraded / off / hook-missing), so a CI step or
-//! a wary user gets a hard signal that they are not fully protected.
+//! carries an exit-code contract: it exits NON-ZERO when protection is PROVABLY
+//! reduced (warn-only / degraded / no hook), and 0 when actively blocking OR when a
+//! configured hook's live mode is not visible to this external process (only bash
+//! re-exports it). A CI step or wary user gets a hard signal on a real downgrade,
+//! without a false alarm on a protected shell whose live mode it cannot see.
 
 use crate::cli::doctor;
 use crate::cli::prompt_status::ProtectionHealth;

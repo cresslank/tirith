@@ -37,7 +37,9 @@ pub fn run(
                 &stdin_cmd
             }
             Err(e) => {
-                eprintln!("tirith: failed to read stdin: {e}");
+                // Fail CLOSED: an unreadable or OVER-LIMIT stream must never fall
+                // through to a clean "no issues" verdict on a truncated command.
+                eprintln!("tirith: cannot analyze piped input: {e}");
                 return 1;
             }
         }

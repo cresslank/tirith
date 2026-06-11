@@ -8017,8 +8017,9 @@ fn init_prompt_status_emits_marker_wrapped_snippet_zsh() {
         "zsh snippet must set PROMPT_SUBST; got: {stdout}"
     );
     assert!(
-        stdout.contains("'$(tirith prompt-status --short) '"),
-        "zsh snippet must single-quote the command substitution; got: {stdout}"
+        stdout.contains("'$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '"),
+        "zsh snippet must single-quote the command substitution and forward the \
+         non-exported TIRITH_STATUS; got: {stdout}"
     );
 }
 
@@ -8061,7 +8062,8 @@ fn init_prompt_status_is_idempotent_when_run_twice() {
     );
 
     // The PS1 / PROMPT wrap-line must also appear exactly once.
-    let prompt_line = "PROMPT='$(tirith prompt-status --short) '\"$PROMPT\"";
+    let prompt_line =
+        "PROMPT='$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '\"$PROMPT\"";
     assert_eq!(
         stdout_a.matches(prompt_line).count(),
         1,
@@ -8086,7 +8088,10 @@ fn init_without_prompt_status_does_not_emit_snippet() {
 #[test]
 fn init_prompt_status_supports_bash_and_fish_and_powershell() {
     for (shell, must_contain) in [
-        ("bash", "PS1='$(tirith prompt-status --short) '\"$PS1\""),
+        (
+            "bash",
+            "PS1='$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '\"$PS1\"",
+        ),
         ("fish", "function fish_right_prompt"),
         ("powershell", "function global:prompt"),
     ] {
@@ -14469,6 +14474,40 @@ fn check_reads_command_from_piped_stdin() {
     assert!(
         err.contains("shortened_url") || err.contains("curl_pipe_shell"),
         "check must analyze a command piped on stdin; stderr: {err}"
+    );
+}
+
+#[test]
+fn check_rejects_oversized_piped_stdin() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    // Over-limit piped input (1 MiB + 1) must be REJECTED, never silently
+    // truncated to a clean verdict: a 1 MiB benign prefix could otherwise hide a
+    // `... | sh` tail and read as "no issues".
+    let mut child = tirith()
+        .args(["check", "--shell", "posix"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn check");
+    {
+        let mut stdin = child.stdin.take().expect("stdin");
+        let blob = vec![b'a'; 1024 * 1024 + 1];
+        // The child may reject and exit before draining the whole blob, so a
+        // broken-pipe write error here is expected, not a test failure.
+        let _ = stdin.write_all(&blob);
+    }
+    let out = child.wait_with_output().expect("wait check");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "over-limit piped input must be rejected (fail closed), not analyzed as clean"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("no issues"),
+        "must not print a clean verdict on truncated input; stderr: {err}"
     );
 }
 

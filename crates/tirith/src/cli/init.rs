@@ -174,7 +174,7 @@ pub(crate) fn prompt_status_snippet(shell: &str) -> String {
             "if [[ -z \"${_TIRITH_PROMPT_STATUS_LOADED:-}\" ]]; then",
             "  _TIRITH_PROMPT_STATUS_LOADED=1",
             "  setopt PROMPT_SUBST",
-            "  PROMPT='$(tirith prompt-status --short) '\"$PROMPT\"",
+            "  PROMPT='$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '\"$PROMPT\"",
             "fi",
             "# <<< tirith prompt-status (M8 ch6) <<<",
         ]
@@ -183,7 +183,7 @@ pub(crate) fn prompt_status_snippet(shell: &str) -> String {
             "# >>> tirith prompt-status (M8 ch6) >>>",
             "if [ -z \"${_TIRITH_PROMPT_STATUS_LOADED:-}\" ]; then",
             "  _TIRITH_PROMPT_STATUS_LOADED=1",
-            "  PS1='$(tirith prompt-status --short) '\"$PS1\"",
+            "  PS1='$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '\"$PS1\"",
             "fi",
             "# <<< tirith prompt-status (M8 ch6) <<<",
         ]
@@ -197,7 +197,7 @@ pub(crate) fn prompt_status_snippet(shell: &str) -> String {
             "        functions -c fish_right_prompt _tirith_orig_fish_right_prompt",
             "    end",
             "    function fish_right_prompt",
-            "        tirith prompt-status --short",
+            "        env TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short",
             "        if functions -q _tirith_orig_fish_right_prompt",
             "            _tirith_orig_fish_right_prompt",
             "        end",
@@ -214,7 +214,8 @@ pub(crate) fn prompt_status_snippet(shell: &str) -> String {
             "        Copy-Item Function:prompt Function:_tirith_orig_prompt -Force",
             "    }",
             "    function global:prompt {",
-            "        $line = (& tirith prompt-status --short) 2>$null",
+            "        $_tps = $env:TIRITH_STATUS; $env:TIRITH_STATUS = $global:TIRITH_STATUS",
+            "        try { $line = (& tirith prompt-status --short) 2>$null } finally { if ($null -eq $_tps) { Remove-Item Env:\\TIRITH_STATUS -ErrorAction SilentlyContinue } else { $env:TIRITH_STATUS = $_tps } }",
             "        if (Get-Command _tirith_orig_prompt -ErrorAction SilentlyContinue) {",
             "            \"$line $(_tirith_orig_prompt)\"",
             "        } else {",
@@ -564,14 +565,18 @@ mod tests {
         assert!(s.contains("# <<< tirith prompt-status (M8 ch6) <<<"));
         assert!(s.contains("setopt PROMPT_SUBST"));
         assert!(s.contains("_TIRITH_PROMPT_STATUS_LOADED"));
-        // Single-quoted so PROMPT re-renders each redraw.
-        assert!(s.contains("'$(tirith prompt-status --short) '"));
+        // Single-quoted so PROMPT re-renders each redraw, AND the non-exported
+        // TIRITH_STATUS is forwarded inline so the child can actually read it
+        // (a bare `tirith prompt-status` child sees a non-exported var as unset).
+        assert!(s.contains("'$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '"));
     }
 
     #[test]
     fn prompt_status_snippet_bash_uses_ps1_with_single_quoted_subst() {
         let s = prompt_status_snippet("bash");
-        assert!(s.contains("PS1='$(tirith prompt-status --short) '\"$PS1\""));
+        assert!(s.contains(
+            "PS1='$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '\"$PS1\""
+        ));
         assert!(s.contains("_TIRITH_PROMPT_STATUS_LOADED"));
         assert!(s.contains("# >>> tirith prompt-status (M8 ch6) >>>"));
         assert!(s.contains("# <<< tirith prompt-status (M8 ch6) <<<"));
@@ -581,7 +586,19 @@ mod tests {
     fn prompt_status_snippet_fish_wraps_right_prompt() {
         let s = prompt_status_snippet("fish");
         assert!(s.contains("function fish_right_prompt"));
-        assert!(s.contains("tirith prompt-status --short"));
+        // Forwards the non-exported TIRITH_STATUS via `env` so the child sees it.
+        assert!(s.contains("env TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short"));
+        assert!(s.contains("_TIRITH_PROMPT_STATUS_LOADED"));
+    }
+
+    #[test]
+    fn prompt_status_snippet_powershell_forwards_status_env() {
+        let s = prompt_status_snippet("powershell");
+        // PowerShell stores $global:TIRITH_STATUS (a PS variable, NOT $env:), which
+        // a child process cannot see — forward it via $env: for the call, restored
+        // in `finally` so it does not leak into the session.
+        assert!(s.contains("$env:TIRITH_STATUS = $global:TIRITH_STATUS"));
+        assert!(s.contains("finally"));
         assert!(s.contains("_TIRITH_PROMPT_STATUS_LOADED"));
     }
 

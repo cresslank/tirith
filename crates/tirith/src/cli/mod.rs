@@ -690,10 +690,22 @@ pub fn note(msg: impl std::fmt::Display) {
 
 /// Read at most `max` bytes from stdin — the shared cap used by `check`/`paste`
 /// when consuming piped input. Returns the raw bytes; callers decode lossily.
+///
+/// FAILS CLOSED on over-limit input: it reads ONE byte past `max` so an oversized
+/// stream is DETECTABLE, then returns an error rather than silently truncating.
+/// Silent truncation is unsafe here — a command analyzed only up to `max` could
+/// drop a dangerous tail (e.g. `... | sh` after a 1 MiB prefix) and read as
+/// benign. Mirrors `paste`'s explicit over-limit rejection.
 pub fn read_stdin_capped(max: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let mut buf = Vec::new();
     std::io::stdin().take(max + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("input exceeds the {max}-byte limit"),
+        ));
+    }
     Ok(buf)
 }
 

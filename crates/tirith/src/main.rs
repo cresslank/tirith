@@ -640,8 +640,9 @@ Output forms:
 Examples:
   tirith prompt-status --short
   tirith prompt-status --json
-  PS1='$(tirith prompt-status --short) '\"$PS1\"          # bash
-  PROMPT='$(tirith prompt-status --short) '\"$PROMPT\"     # zsh (after setopt PROMPT_SUBST)
+  PS1='$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '\"$PS1\"        # bash
+  PROMPT='$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '\"$PROMPT\"  # zsh (after setopt PROMPT_SUBST)
+  # The TIRITH_STATUS= prefix forwards the hook's non-exported status var to the child.
 
 Cache:
   $XDG_RUNTIME_DIR/tirith/prompt-<uid>.cache (30s TTL).
@@ -661,7 +662,9 @@ Cache:
 
     /// Show whether tirith is actively protecting this shell: protection mode,
     /// hook health, active policy + scope, and threat-DB freshness. Exits NON-ZERO
-    /// unless protection is actively blocking — use it in CI or a prompt guard.
+    /// when protection is provably reduced (warn-only, degraded, or no hook); exits
+    /// 0 when actively blocking, or when a configured hook's live mode is not
+    /// visible to an external check (run `tirith doctor` in your shell to confirm).
     Status {
         /// Output as JSON.
         #[arg(long)]

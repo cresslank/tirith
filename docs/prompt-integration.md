@@ -61,31 +61,42 @@ etc.) prevents double-wrapping if your rc file is re-sourced.
 ```zsh
 # ~/.zshrc
 setopt PROMPT_SUBST
-PROMPT='$(tirith prompt-status --short) '"$PROMPT"
+PROMPT='$(TIRITH_STATUS="$TIRITH_STATUS" tirith prompt-status --short) '"$PROMPT"
 ```
 
-**Use single quotes** around `$(tirith prompt-status --short)`. With
-double quotes, the command substitution happens once when `PROMPT` is
-assigned — your prompt then shows a frozen status. With single quotes
-zsh defers the substitution to prompt-render time.
+**Use single quotes** around the substitution. With double quotes, the
+command substitution happens once when `PROMPT` is assigned — your prompt
+then shows a frozen status. With single quotes zsh defers the substitution
+to prompt-render time.
+
+**Forward `TIRITH_STATUS`.** The shell hooks expose the live status as a
+deliberately NON-exported variable, so a bare `tirith prompt-status` child
+process cannot see it (it would always show `off`). The
+`TIRITH_STATUS="$TIRITH_STATUS"` prefix passes it into the child for that one
+call without exporting it session-wide.
 
 ### bash
 
 ```bash
 # ~/.bashrc
-PS1='$(tirith prompt-status --short) '"$PS1"
+PS1='$(TIRITH_STATUS="$TIRITH_STATUS" tirith prompt-status --short) '"$PS1"
 ```
 
-Same quoting rule as zsh: single quotes around the substitution.
+Same rules as zsh: single quotes around the substitution, and the
+`TIRITH_STATUS="$TIRITH_STATUS"` prefix to forward the hook's non-exported
+status into the child.
 
 ### fish
 
 ```fish
 # ~/.config/fish/config.fish
 function fish_right_prompt
-    tirith prompt-status --short
+    env TIRITH_STATUS="$TIRITH_STATUS" tirith prompt-status --short
 end
 ```
+
+The `env TIRITH_STATUS="$TIRITH_STATUS"` prefix forwards the hook's
+non-exported status into the child (fish has no bare `VAR=val cmd` form).
 
 The right prompt keeps tirith's status out of the way of your main
 prompt. If you'd rather have it on the left, override `fish_prompt`
@@ -96,7 +107,12 @@ instead and prepend the substitution.
 ```powershell
 # $PROFILE
 function global:prompt {
-    $line = (& tirith prompt-status --short) 2>$null
+    # The hook stores $global:TIRITH_STATUS (a PowerShell variable, not $env:),
+    # which a child process cannot see — forward it via $env: for this one call,
+    # restored in finally so it does not leak into the session.
+    $prev = $env:TIRITH_STATUS; $env:TIRITH_STATUS = $global:TIRITH_STATUS
+    try { $line = (& tirith prompt-status --short) 2>$null }
+    finally { if ($null -eq $prev) { Remove-Item Env:\TIRITH_STATUS -ErrorAction SilentlyContinue } else { $env:TIRITH_STATUS = $prev } }
     "$line PS $($executionContext.SessionState.Path.CurrentLocation)> "
 }
 ```
