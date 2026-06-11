@@ -29,6 +29,7 @@ Browsers solved this years ago. Terminals still render Unicode, ANSI escapes, an
 
 ```bash
 brew install sheeki03/tap/tirith
+brew trust --formula sheeki03/tap/tirith   # Homebrew 5.1.15+ tap trust
 ```
 
 Then activate in your shell profile:
@@ -395,7 +396,14 @@ Detects content invisible to humans but readable by AI in HTML, Markdown, and PD
 
 ```bash
 brew install sheeki03/tap/tirith
+brew trust --formula sheeki03/tap/tirith   # Homebrew 5.1.15+ tap trust
 ```
+
+Homebrew 5.1.15 and newer treat third-party taps as untrusted until you opt in
+(loading a tap evaluates its Ruby). `brew trust --formula sheeki03/tap/tirith`
+trusts just this formula; `brew trust sheeki03/tap` trusts the whole tap. Without
+it you'll see a "tap is not trusted" warning, and from Homebrew 5.2.0 / 6.0.0
+(whichever lands first) the trust step becomes required.
 
 ### Linux Packages
 
