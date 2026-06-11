@@ -52,7 +52,7 @@ The JSON object is intentionally minimal and stable — exactly these fields:
 | field             | type             | meaning                                                                                                                                                                                                       |
 | ----------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `schema_version`  | integer          | Version of this payload's shape. Currently `1`. Bumped only on a breaking change to the field set or meaning.                                                                                                  |
-| `protection_mode` | string           | Live protection mode derived from the hook-exported `TIRITH_STATUS`. One of `guarded`, `warn-only`, `degraded`, or `off`. An unrecognized status value is passed through verbatim for forward compatibility.   |
+| `protection_mode` | string           | Live protection mode. `doctor --quick` is an external process, so it reads the hook-EXPORTED `TIRITH_BASH_EFFECTIVE_PROTECTION` first (the bash hook re-exports it for exactly this reason) and falls back to `TIRITH_STATUS`, which the hooks deliberately leave non-exported. One of `guarded`, `warn-only`, `degraded`, or `off`; an unrecognized value is passed through verbatim. (`off` here can also mean "a configured hook whose live mode this external process cannot see" — `tirith status` reports that case as still-protected.) |
 | `policy_path_used`| string or `null` | The single policy file the engine would load for the current directory, or `null` when none is discovered. Existence-based discovery only — never a network fetch.                                            |
 | `hook_configured` | boolean          | Whether the tirith shell hook is configured in the detected shell's profile.                                                                                                                                   |
 
@@ -70,14 +70,16 @@ Example:
 ### `protection_mode` values
 
 `protection_mode` uses the same vocabulary as `tirith prompt-status` (see
-`docs/prompt-integration.md`), derived from `TIRITH_STATUS`:
+`docs/prompt-integration.md`), derived from the hook's effective-protection
+signal — `TIRITH_BASH_EFFECTIVE_PROTECTION` first, falling back to
+`TIRITH_STATUS`. Both carry the same value set:
 
-| `TIRITH_STATUS`     | `protection_mode` | meaning                                            |
+| hook signal value   | `protection_mode` | meaning                                            |
 | ------------------- | ----------------- | -------------------------------------------------- |
 | `blocks`            | `guarded`         | A dangerous command is stopped before it runs.     |
 | `warn-only`         | `warn-only`       | Commands are checked but not blocked.              |
 | `degraded`          | `degraded`        | Protection was downgraded to warn-only this session.|
-| `off`, empty, unset | `off`             | No tirith hook ran in this process / protection off.|
+| `off`, empty, unset | `off`             | No live mode visible to this external process / protection off.|
 | (any other value)   | (verbatim)        | Forwarded unchanged for forward compatibility.     |
 
 `protection_mode` reflects the live hook state of the process that invoked

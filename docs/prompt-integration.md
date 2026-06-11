@@ -35,9 +35,12 @@ $ tirith prompt-status --json
 
 The JSON envelope is the stable interface — `schema_version` is pinned
 at `1` and additive fields are allowed without bumping it; structural
-changes will bump the version. Use the JSON form from external prompt
-renderers (Starship, oh-my-zsh themes) that want to do their own
-formatting.
+changes will bump the version. An in-shell wrapper that already forwards
+`TIRITH_STATUS` (the snippets below) can parse the JSON form for its own
+formatting. Note that a fully **external** renderer that shells out as a
+separate process (Starship) cannot see the non-exported `TIRITH_STATUS` and
+would read `off` regardless of output format — see the
+[Starship](#starship) section for the export-based approach it needs.
 
 ## Auto-install (recommended)
 
