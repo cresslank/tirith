@@ -3527,6 +3527,11 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Restore ambient `TIRITH_STATUS` on Drop; overwritten per-iteration.
         let _status_guard = EnvGuard::remove("TIRITH_STATUS");
+        // `gather_quick_info` now prefers `TIRITH_BASH_EFFECTIVE_PROTECTION`; a
+        // dev running `cargo test` inside a tirith-protected shell would have it
+        // ambiently exported, which would override the per-iteration
+        // `TIRITH_STATUS` and spuriously diverge from `prompt-status`.
+        let _eff_guard = EnvGuard::remove("TIRITH_BASH_EFFECTIVE_PROTECTION");
 
         for status in ["blocks", "warn-only", "degraded", "off", "", "futureValue"] {
             // SAFETY: serialized via ENV_LOCK above; restored by the guard.
@@ -3540,6 +3545,40 @@ mod tests {
                 "doctor --quick and prompt-status disagree for TIRITH_STATUS={status:?}"
             );
         }
+    }
+
+    /// `gather_quick_info` prefers the EXPORTED `TIRITH_BASH_EFFECTIVE_PROTECTION`
+    /// signal and only falls back to `TIRITH_STATUS` when the effective var is
+    /// unset/empty. `TIRITH_STATUS` is non-exported, so a protected external
+    /// process must read the re-exported effective var to see the truth.
+    #[test]
+    fn gather_quick_info_prefers_effective_protection_over_status() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Restore ambient values on Drop; overwritten below.
+        let _eff_guard = EnvGuard::remove("TIRITH_BASH_EFFECTIVE_PROTECTION");
+        let _status_guard = EnvGuard::remove("TIRITH_STATUS");
+
+        // Effective var present and disagreeing with TIRITH_STATUS → it wins.
+        let _eff = EnvGuard::set(
+            "TIRITH_BASH_EFFECTIVE_PROTECTION",
+            std::path::Path::new("blocks"),
+        );
+        let _status = EnvGuard::set("TIRITH_STATUS", std::path::Path::new("off"));
+        assert_eq!(
+            gather_quick_info().protection_mode,
+            "guarded",
+            "TIRITH_BASH_EFFECTIVE_PROTECTION=blocks must win over TIRITH_STATUS=off"
+        );
+
+        // Effective var unset → fall back to TIRITH_STATUS.
+        drop(_eff);
+        let _eff_removed = EnvGuard::remove("TIRITH_BASH_EFFECTIVE_PROTECTION");
+        let _status2 = EnvGuard::set("TIRITH_STATUS", std::path::Path::new("warn-only"));
+        assert_eq!(
+            gather_quick_info().protection_mode,
+            "warn-only",
+            "absent effective var must fall back to TIRITH_STATUS=warn-only"
+        );
     }
 
     /// The quick JSON has EXACTLY the four documented keys and nothing else

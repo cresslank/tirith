@@ -2408,6 +2408,78 @@ severity_overrides:
     );
 }
 
+/// F9 SECURITY notice: when a repo-scoped `.tirith/policy.yaml` carries a WEAKENING field
+/// (here `allowlist`), it is neutralized and the operator is told once per session via an
+/// UNCONDITIONAL `eprintln!` in `warn_repo_policy_neutralized` — it must NOT route through
+/// `note()`/`--quiet`. A unique `XDG_STATE_HOME` keeps the per-session throttle marker fresh
+/// for each run (and off the real state dir).
+#[test]
+fn repo_policy_weakening_emits_neutralized_notice_even_when_quiet() {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let proj = tmpdir.path().join("project");
+    // Policy discovery walks up to `.git`, so seed one; the repo-scoped `allowlist` is a
+    // weakening field and gets dropped (and reported).
+    fs::create_dir_all(proj.join(".git")).unwrap();
+    fs::create_dir_all(proj.join(".tirith")).unwrap();
+    fs::write(
+        proj.join(".tirith").join("policy.yaml"),
+        "allowlist:\n  - evil.com\n",
+    )
+    .unwrap();
+
+    // Distinctive substrings from the real `warn_repo_policy_neutralized` message.
+    let assert_notice = |stderr: &str, ctx: &str| {
+        assert!(
+            stderr.contains("tightening-only") && stderr.contains("were ignored"),
+            "{ctx}: expected the repo-policy neutralization notice, got stderr:\n{stderr}"
+        );
+    };
+
+    // Run from the repo cwd so policy discovery loads `<proj>/.tirith/policy.yaml` as Repo
+    // scope. Clear `TIRITH_POLICY_ROOT` so an inherited value can't redirect discovery.
+    let out = tirith()
+        .current_dir(&proj)
+        .env_remove("TIRITH_POLICY_ROOT")
+        .env("XDG_STATE_HOME", tmpdir.path().join("state-normal"))
+        .args([
+            "check",
+            "--non-interactive",
+            "--no-daemon",
+            "--shell",
+            "posix",
+            "--",
+            "ls",
+        ])
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("failed to run tirith check");
+    assert_notice(&String::from_utf8_lossy(&out.stderr), "normal run");
+
+    // A `--quiet` run with a FRESH state dir (so the marker doesn't suppress it) STILL shows
+    // the notice — proving the security notice bypasses the quiet gate.
+    let out_quiet = tirith()
+        .current_dir(&proj)
+        .env_remove("TIRITH_POLICY_ROOT")
+        .env("XDG_STATE_HOME", tmpdir.path().join("state-quiet"))
+        .args([
+            "--quiet",
+            "check",
+            "--non-interactive",
+            "--no-daemon",
+            "--shell",
+            "posix",
+            "--",
+            "ls",
+        ])
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("failed to run tirith --quiet check");
+    assert_notice(
+        &String::from_utf8_lossy(&out_quiet.stderr),
+        "--quiet run (notice must bypass quiet)",
+    );
+}
+
 #[test]
 fn check_warn_only_block_renders_as_detected() {
     let out = tirith()

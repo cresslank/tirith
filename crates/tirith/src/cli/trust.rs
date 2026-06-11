@@ -847,20 +847,27 @@ fn suggestion_lines(pairs: &[(String, Option<String>)]) -> Vec<String> {
 fn format_add_line(target: &str, rule_id: Option<&str>, needs_broad: bool) -> String {
     // The target is attacker-controlled (a URL/host pulled from the trigger's
     // finding evidence) and this line is printed for the operator to copy/paste
-    // into a shell. Shell-single-quote it so a target carrying `$( )`, backticks,
-    // `;`, spaces, a `>` redirect, or a glob cannot execute on paste. If it can't
-    // be safely quoted (e.g. it contains a newline), do NOT emit a runnable
-    // command — print a safe manual-trust note instead. The `--rule <rid>` is a
-    // snake_case enum Display (not attacker-controlled), so it needs no quoting.
-    let Some(quoted) = tirith_core::safe_command::shell_single_quote(target) else {
+    // into a shell. Scrub terminal-control bytes first, then shell-single-quote.
+    // The scrub (`sanitize_text_str`, same filter `output.rs::write_block_advisories`
+    // applies to blocklist URLs) strips ANSI/OSC/zero-width bytes so the target
+    // cannot repaint the operator's terminal at suggest time. The single-quote
+    // then keeps a target carrying `$( )`, backticks, `;`, spaces, a `>` redirect,
+    // or a glob from executing on paste. If it can't be safely quoted (e.g. it
+    // contains a newline), do NOT emit a runnable command — print a safe
+    // manual-trust note instead. The `--rule <rid>` is a snake_case enum Display
+    // (not attacker-controlled), so it needs no quoting. The printed `--ttl` uses
+    // `DEFAULT_TTL`, the same value `--apply` resolves to (see `from_last_trigger`),
+    // so the suggestion and the applied entry can't drift.
+    let scrubbed = tirith_core::mcp::output_filter::sanitize_text_str(target);
+    let Some(quoted) = tirith_core::safe_command::shell_single_quote(&scrubbed) else {
         return "# trust this target manually with `tirith trust add` \
                 (it contains characters unsafe to embed in a suggested command)."
             .to_string();
     };
     let broad = if needs_broad { " --broad" } else { "" };
     match rule_id {
-        Some(rid) => format!("tirith trust add {quoted}{broad} --rule {rid} --ttl 30d"),
-        None => format!("tirith trust add {quoted}{broad} --ttl 30d"),
+        Some(rid) => format!("tirith trust add {quoted}{broad} --rule {rid} --ttl {DEFAULT_TTL}"),
+        None => format!("tirith trust add {quoted}{broad} --ttl {DEFAULT_TTL}"),
     }
 }
 
@@ -907,10 +914,14 @@ pub fn from_last_trigger(apply: bool) -> i32 {
     let mut added = 0;
     for (target, rule_id) in &pairs {
         let broad = classify_scope(target).is_broad();
+        // Pass DEFAULT_TTL explicitly (not None) so the applied entry uses the
+        // same source the printed suggestion's `--ttl {DEFAULT_TTL}` does. `add()`
+        // would resolve None to DEFAULT_TTL anyway, but sharing the one constant
+        // keeps suggest and apply from drifting on separate literals.
         if add(
             target,
             rule_id.as_deref(),
-            None,
+            Some(DEFAULT_TTL),
             false,
             broad,
             None,
@@ -2377,6 +2388,26 @@ mod tests {
             format_add_line("evil.example/a\nrm -rf ~", Some("confusable_domain"), true),
             "# trust this target manually with `tirith trust add` \
              (it contains characters unsafe to embed in a suggested command)."
+        );
+
+        // Defense-in-depth: ANSI/OSC escape bytes in the target are scrubbed
+        // BEFORE quoting (single-quoting blocks shell execution, but a raw ESC
+        // could still spoof the operator's terminal as the line is printed). The
+        // emitted line must carry no raw ESC (0x1B) byte.
+        let osc = format_add_line(
+            "evil.example/\u{1b}]0;pwned\u{7}\u{1b}[31m",
+            Some("confusable_domain"),
+            true,
+        );
+        assert!(
+            !osc.contains('\u{1b}'),
+            "ESC (0x1B) must be scrubbed before the suggestion is printed: {osc:?}"
+        );
+        // The scrub strips the control bytes but keeps the printable remainder,
+        // so this is still a runnable (single-quoted) trust command.
+        assert!(
+            osc.contains("tirith trust add"),
+            "scrubbed target should still yield a runnable trust line: {osc:?}"
         );
     }
 

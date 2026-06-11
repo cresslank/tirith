@@ -663,12 +663,15 @@ pub fn find_shadow_binaries() -> Vec<String> {
 /// errors, and JSON do NOT, so quiet never hides anything that matters.
 static QUIET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
+/// Whether `TIRITH_QUIET`'s value is truthy. Pure helper over the raw env value so
+/// the `1`/`true` (case-insensitive) parsing is unit-testable without process globals.
+fn quiet_from_env(val: Option<&str>) -> bool {
+    matches!(val, Some(v) if v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 /// Set once in `main()` right after clap parse. `--quiet` OR `TIRITH_QUIET=1/true`.
 pub fn init_quiet(flag: bool) {
-    let env = std::env::var("TIRITH_QUIET")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let env = quiet_from_env(std::env::var("TIRITH_QUIET").ok().as_deref());
     let _ = QUIET.set(flag || env);
 }
 
@@ -709,6 +712,20 @@ pub fn read_stdin_capped(max: u64) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Gate decision for [`warn_repo_policy_neutralized`]: emit the once-per-session notice
+/// only for a REPO-scoped policy (the only untrusted scope) that actually had weakening
+/// fields dropped, and only when this session hasn't been warned yet (marker absent).
+/// Pure so the matrix is unit-testable without `state_dir()` I/O or process globals.
+fn should_warn_neutralized(
+    scope: tirith_core::policy::PolicyScope,
+    neutralized_fields: &[&str],
+    marker_exists: bool,
+) -> bool {
+    scope == tirith_core::policy::PolicyScope::Repo
+        && !neutralized_fields.is_empty()
+        && !marker_exists
+}
+
 /// Once per shell SESSION (per policy), tell the operator that a repo-scoped policy
 /// had WEAKENING fields neutralized (F9 — a repo may tighten, never weaken). A repo
 /// author who sets `allowlist`/`severity_overrides` otherwise gets zero feedback that
@@ -716,8 +733,9 @@ pub fn read_stdin_capped(max: u64) -> std::io::Result<Vec<u8>> {
 /// through `note()`/`--quiet`. `tirith policy effective` always lists the full drop
 /// set regardless of this throttle.
 pub fn warn_repo_policy_neutralized(policy: &tirith_core::policy::Policy) {
-    use tirith_core::policy::PolicyScope;
-    if policy.scope != PolicyScope::Repo || policy.neutralized_fields.is_empty() {
+    if policy.scope != tirith_core::policy::PolicyScope::Repo
+        || policy.neutralized_fields.is_empty()
+    {
         return;
     }
     // Throttle by SESSION id (so it re-warns in every new shell) + policy path —
@@ -734,7 +752,7 @@ pub fn warn_repo_policy_neutralized(policy: &tirith_core::policy::Policy) {
         format!("{:016x}", h.finish())
     };
     let marker = dir.join(format!("{session}-{path_key}"));
-    if marker.exists() {
+    if !should_warn_neutralized(policy.scope, &policy.neutralized_fields, marker.exists()) {
         return;
     }
     eprintln!(
@@ -749,9 +767,12 @@ pub fn warn_repo_policy_neutralized(policy: &tirith_core::policy::Policy) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_shim_target, resolve_shim_target, shell_join};
+    use super::{
+        parse_shim_target, quiet_from_env, resolve_shim_target, shell_join, should_warn_neutralized,
+    };
     use std::fs;
     use std::path::PathBuf;
+    use tirith_core::policy::PolicyScope;
 
     #[test]
     fn shell_join_preserves_argv_boundaries() {
@@ -929,5 +950,41 @@ mod tests {
 
             assert_eq!(resolve_npm_wrapper_target(&pip), None);
         }
+    }
+
+    #[test]
+    fn should_warn_neutralized_only_fires_for_repo_with_drops_and_no_marker() {
+        // Repo scope + something neutralized + no session marker → warn.
+        assert!(should_warn_neutralized(
+            PolicyScope::Repo,
+            &["allowlist"],
+            false
+        ));
+        // Already warned this session (marker present) → silent.
+        assert!(!should_warn_neutralized(
+            PolicyScope::Repo,
+            &["allowlist"],
+            true
+        ));
+        // A non-repo (trusted) scope is never sanitized, so never warned — even with
+        // a (would-be) drop set and no marker.
+        assert!(!should_warn_neutralized(
+            PolicyScope::Org,
+            &["allowlist"],
+            false
+        ));
+        // Repo scope but nothing was neutralized → nothing to report.
+        assert!(!should_warn_neutralized(PolicyScope::Repo, &[], false));
+    }
+
+    #[test]
+    fn quiet_from_env_recognizes_only_truthy_values() {
+        for v in ["1", "true", "TRUE", "True"] {
+            assert!(quiet_from_env(Some(v)), "{v:?} should be truthy");
+        }
+        for v in ["0", "", "yes", "false", "01", " 1"] {
+            assert!(!quiet_from_env(Some(v)), "{v:?} should NOT be truthy");
+        }
+        assert!(!quiet_from_env(None), "unset TIRITH_QUIET is not quiet");
     }
 }

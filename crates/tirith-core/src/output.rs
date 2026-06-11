@@ -197,8 +197,9 @@ pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std
 /// Block verdict warrants the blast-radius header (item 14c). Covers the whole
 /// `Blast*` family (both the hot-path `cheap_check` rules and the
 /// `tirith preview` simulator rules, so a preview verdict reads the same) and
-/// every pipe-to-interpreter variant. Match is exhaustive on purpose: a new
-/// destructive/fetch RuleId surfaces here as a compile error to be triaged.
+/// every pipe-to-interpreter variant. This list is hand-maintained: `matches!`
+/// falls through to `false`, so a new destructive/fetch RuleId added to the enum
+/// will silently NOT get the blast-radius header until it is added here.
 fn is_destructive_or_fetch_pipe(r: RuleId) -> bool {
     matches!(
         r,

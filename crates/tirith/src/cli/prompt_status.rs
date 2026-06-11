@@ -284,7 +284,8 @@ impl ProtectionHealth {
     /// Map a `protection_mode` string (same vocabulary as
     /// [`protection_mode_from_status`]) plus `hook_configured` to a health.
     /// `"off"` resolves to [`HookMissing`](Self::HookMissing) when no hook is
-    /// configured, otherwise [`Off`](Self::Off). Anything outside the known
+    /// configured, otherwise [`ConfiguredUnknown`](Self::ConfiguredUnknown).
+    /// Anything outside the known
     /// vocabulary (including values passed through verbatim) is
     /// [`Unknown`](Self::Unknown).
     pub(crate) fn classify(protection_mode: &str, hook_configured: bool) -> Self {

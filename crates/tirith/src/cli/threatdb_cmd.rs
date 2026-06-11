@@ -526,18 +526,20 @@ pub(crate) struct ThreatDbStatus {
     pub(crate) installed: bool,
     pub(crate) path: Option<String>,
     pub(crate) age_hours: Option<f64>,
-    build_timestamp: Option<u64>,
-    build_sequence: Option<u64>,
-    package_count: Option<u32>,
-    hostname_count: Option<u32>,
-    ip_count: Option<u32>,
-    typosquat_count: Option<u32>,
-    popular_count: Option<u32>,
-    total_entries: Option<u32>,
-    skipped_range_only: Option<u32>,
+    // pub(crate) so a sibling module (e.g. status.rs tests) can build a fixture
+    // via functional-update; serialized by the derive, never weakening anything.
+    pub(crate) build_timestamp: Option<u64>,
+    pub(crate) build_sequence: Option<u64>,
+    pub(crate) package_count: Option<u32>,
+    pub(crate) hostname_count: Option<u32>,
+    pub(crate) ip_count: Option<u32>,
+    pub(crate) typosquat_count: Option<u32>,
+    pub(crate) popular_count: Option<u32>,
+    pub(crate) total_entries: Option<u32>,
+    pub(crate) skipped_range_only: Option<u32>,
     pub(crate) signature_valid: Option<bool>,
     pub(crate) stale: bool,
-    error: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 pub(crate) fn gather_status() -> ThreatDbStatus {

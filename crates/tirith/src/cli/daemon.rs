@@ -953,6 +953,23 @@ fn start_detached() -> i32 {
 
     let sock = socket_path();
 
+    // Pre-spawn already-running guard, mirroring the foreground `start()` path.
+    // Without this, an existing daemon's live socket makes `poll_startup` return
+    // `SocketUp` on the first iteration, so we'd print "started in background
+    // (PID …)" for the throwaway child that is about to exit 1, masking the
+    // real daemon and giving no "already running" feedback. Short-circuit here.
+    let pid_file = pid_path();
+    if pid_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid_num) = content.trim().parse::<u32>() {
+                if process_alive(pid_num) {
+                    eprintln!("tirith: daemon already running (PID {pid_num})");
+                    return 1;
+                }
+            }
+        }
+    }
+
     // Mirror the detached-spawn idiom used by the periodic threat-DB updater:
     // null all stdio so the background daemon holds no terminal fds, and
     // `setsid()` in the forked child so it leaves the controlling TTY and
@@ -1695,6 +1712,39 @@ mod tests {
             "socket must exist after start"
         );
         assert_eq!(super::status(), 0, "daemon must be reachable via ping");
+
+        assert_eq!(super::stop(), 0, "stop() must shut the daemon down");
+
+        std::env::remove_var("XDG_STATE_HOME");
+    }
+
+    /// The detach path honors the pre-spawn already-running guard: once a daemon
+    /// is up, a second `start(true)` must short-circuit with `1` (mirroring the
+    /// foreground path) instead of mistaking the live socket for a freshly bound
+    /// child and reporting `0`.
+    ///
+    /// `#[ignore]` for the same reason as the end-to-end test above: it points
+    /// process-global `XDG_STATE_HOME` at a temp dir and binds a real socket,
+    /// which races the other parallel env-reading tests. Run with `--ignored`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "mutates process-global XDG_STATE_HOME and binds a real socket; run with --ignored in isolation"]
+    fn start_detach_short_circuits_when_already_running() {
+        let tmp = TmpDir::new("detach-already-running");
+        std::fs::create_dir_all(&tmp.0).expect("create state dir");
+        std::env::set_var("XDG_STATE_HOME", &tmp.0);
+
+        // Clean slate, then bring a daemon up so the socket + PID file exist.
+        let _ = super::stop();
+        assert_eq!(super::start(true), 0, "first start(true) must succeed");
+
+        // Second detach attempt must hit the already-running guard and return 1,
+        // NOT report a spurious "started in background" for a throwaway child.
+        assert_eq!(
+            super::start(true),
+            1,
+            "a second start(true) must short-circuit as already-running"
+        );
 
         assert_eq!(super::stop(), 0, "stop() must shut the daemon down");
 
