@@ -296,8 +296,18 @@ fn write_block_advisories(verdict: &Verdict, mut w: impl Write) -> std::io::Resu
             // would otherwise execute the moment the developer pastes it.
             // `sanitize_field` (terminal-control scrub, kept for display defense)
             // is NOT a shell escaper. If the target can't be safely single-quoted
-            // (e.g. it contains a newline), refuse to print a runnable command.
-            match crate::safe_command::shell_single_quote(&sanitize_field(url)) {
+            // (e.g. it contains a newline), refuse to print a runnable command. And
+            // if the scrub CHANGED the target (zero-width/control bytes stripped),
+            // a `trust add <scrubbed>` would trust a DIFFERENT target than the one
+            // that was blocked, so fall back to the manual message rather than
+            // emit a misleading command.
+            let sanitized = sanitize_field(url);
+            let quoted = if sanitized == url {
+                crate::safe_command::shell_single_quote(&sanitized)
+            } else {
+                None
+            };
+            match quoted {
                 Some(quoted) => writeln!(
                     w,
                     "  To allow: tirith trust add {quoted} --rule {rule} --ttl 30d"
@@ -314,9 +324,17 @@ fn write_block_advisories(verdict: &Verdict, mut w: impl Write) -> std::io::Resu
         // without `--broad`, and `--broad` trusts the whole domain.
         let domains = crate::session_warnings::extract_domains_from_evidence(&finding.evidence);
         if let Some(domain) = domains.first() {
-            // Same shell-injection hazard as the URL branch — single-quote the
-            // attacker-controlled domain before it lands in a pasteable command.
-            match crate::safe_command::shell_single_quote(&sanitize_field(domain)) {
+            // Same shell-injection hazard as the URL branch: single-quote the
+            // attacker-controlled domain before it lands in a pasteable command,
+            // and fall back to the manual message if the scrub changed the target
+            // (a `trust add <scrubbed>` would trust a different domain than blocked).
+            let sanitized = sanitize_field(domain);
+            let quoted = if &sanitized == domain {
+                crate::safe_command::shell_single_quote(&sanitized)
+            } else {
+                None
+            };
+            match quoted {
                 Some(quoted) => writeln!(
                     w,
                     "  To allow (trusts the whole domain): tirith trust add {quoted} --broad --rule {rule} --ttl 30d"
@@ -1143,6 +1161,38 @@ mod tests {
             assert!(
                 out.contains("trust this target manually with `tirith trust add`"),
                 "an unquotable target must fall back to the safe manual note (color={color}): {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_to_allow_target_changed_by_scrub_prints_safe_fallback_not_command() {
+        // If terminal-control scrubbing CHANGES the target (here a zero-width
+        // space is stripped), a `trust add <scrubbed>` would trust a DIFFERENT
+        // target than the one blocked, so we must print the manual fallback rather
+        // than a misleading runnable command.
+        let verdict = block_verdict_with_evidence(
+            RuleId::ShortenedUrl,
+            vec![Evidence::Url {
+                // U+200B ZERO WIDTH SPACE inside the host: quotable, but scrubbed.
+                raw: "https://exa\u{200b}mple.com/x".to_string(),
+            }],
+        );
+        for color in [false, true] {
+            let mut buf = Vec::new();
+            if color {
+                write_human(&verdict, false, &mut buf).unwrap();
+            } else {
+                write_human_no_color(&verdict, false, &mut buf).unwrap();
+            }
+            let out = String::from_utf8(buf).unwrap();
+            assert!(
+                !out.contains("tirith trust add 'https"),
+                "a scrub-altered target must not produce a runnable command (color={color}): {out}"
+            );
+            assert!(
+                out.contains("trust this target manually with `tirith trust add`"),
+                "a scrub-altered target must fall back to the safe manual note (color={color}): {out}"
             );
         }
     }
