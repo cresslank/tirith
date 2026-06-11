@@ -1033,7 +1033,15 @@ fn sanitize_for_display(s: &str) -> String {
 /// Returns `None` when the token contains a byte that cannot be safely carried
 /// in a single-token single-quoted string — a newline (`\n`) or NUL — so the
 /// caller refuses the rewrite rather than emit a multi-line / truncated command.
-fn shell_single_quote(s: &str) -> Option<String> {
+///
+/// `pub` so the copy-paste suggestion surfaces in both crates can neutralize an
+/// attacker-controlled URL/domain before interpolating it into a suggested
+/// `tirith trust add …` line (`output.rs::write_block_advisories`,
+/// `trust.rs::format_add_line`): a blocked URL carrying `$( )`, backticks, `;`,
+/// spaces, redirects, or globs would otherwise EXECUTE when the developer copies
+/// the line. `sanitize_field` only strips terminal-control bytes; it is NOT a
+/// shell escaper.
+pub fn shell_single_quote(s: &str) -> Option<String> {
     if s.bytes().any(|b| b == b'\n' || b == b'\0') {
         return None;
     }

@@ -1304,7 +1304,7 @@ mod tests {
             std::fs::create_dir_all(cwd.join(".git")).unwrap();
             std::fs::create_dir_all(cwd.join(".tirith")).unwrap();
             std::fs::write(
-                cwd.join(".tirith/policy.yaml"),
+                cwd.join(".tirith").join("policy.yaml"),
                 "fail_mode: open\nallowlist:\n  - evil.example\n",
             )
             .unwrap();
@@ -1312,7 +1312,11 @@ mod tests {
             let info = gather_effective(cwd.to_str());
 
             // Source path: the repo-root policy we just wrote.
-            let expected_path = cwd.join(".tirith/policy.yaml").display().to_string();
+            let expected_path = cwd
+                .join(".tirith")
+                .join("policy.yaml")
+                .display()
+                .to_string();
             assert_eq!(
                 info.source_path.as_deref(),
                 Some(expected_path.as_str()),

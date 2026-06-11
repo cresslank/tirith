@@ -14346,39 +14346,45 @@ fn lsp_stdio_initialize_didopen_didchange_lifecycle() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn status_exits_zero_when_guarded() {
+fn status_guarded_via_exported_signal_exits_zero() {
+    // The REAL hook contract: a protected shell's `TIRITH_STATUS` is NON-exported,
+    // so an external `tirith status` must read the EXPORTED
+    // `TIRITH_BASH_EFFECTIVE_PROTECTION` (which the bash hook re-exports precisely
+    // so an external check sees the truth). Prove it by setting ONLY the exported
+    // signal and clearing TIRITH_STATUS — a real protected shell never exports it.
     let out = tirith()
-        .env("TIRITH_STATUS", "blocks")
+        .env_remove("TIRITH_STATUS")
+        .env("TIRITH_BASH_EFFECTIVE_PROTECTION", "blocks")
         .args(["status"])
         .output()
         .expect("run status");
-    assert_eq!(out.status.code(), Some(0), "guarded protection must exit 0");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a guarded shell (via the exported signal, not TIRITH_STATUS) must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
-fn status_exits_nonzero_when_not_guarded() {
-    for mode in ["warn-only", "off"] {
+fn status_warn_only_and_degraded_exit_nonzero() {
+    // Provably-reduced postures fail regardless of hook_configured. (The "off" /
+    // unset cases depend on the runner's shell profile and are covered
+    // deterministically by the `protection_health_classify_and_exit_codes` unit
+    // test instead.)
+    for mode in ["warn-only", "degraded"] {
         let out = tirith()
-            .env("TIRITH_STATUS", mode)
+            .env_remove("TIRITH_STATUS")
+            .env("TIRITH_BASH_EFFECTIVE_PROTECTION", mode)
             .args(["status"])
             .output()
             .expect("run status");
         assert_ne!(
             out.status.code(),
             Some(0),
-            "non-guarded protection ({mode}) must exit non-zero"
+            "{mode} protection must exit non-zero"
         );
     }
-    let out = tirith()
-        .env_remove("TIRITH_STATUS")
-        .args(["status"])
-        .output()
-        .expect("run status");
-    assert_ne!(
-        out.status.code(),
-        Some(0),
-        "unset TIRITH_STATUS must exit non-zero"
-    );
 }
 
 #[test]

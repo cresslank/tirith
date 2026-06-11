@@ -68,10 +68,15 @@ pub fn run(json: bool) -> i32 {
     println!();
     // The verdict line: PROTECTED on stdout when guarded; otherwise the reason on
     // stderr (a security notice — always shown, never `--quiet`-gated).
-    if health == ProtectionHealth::Guarded {
-        println!("tirith: PROTECTED");
-    } else {
-        eprintln!("tirith: NOT FULLY PROTECTED — {}", health_reason(health));
+    match health {
+        ProtectionHealth::Guarded => println!("tirith: PROTECTED"),
+        // Configured, but this external process can't see the live per-shell mode
+        // (TIRITH_STATUS is non-exported; only bash re-exports it). Not provably
+        // off, so exit 0 — yet say so honestly rather than claim full protection.
+        ProtectionHealth::ConfiguredUnknown => println!(
+            "tirith: hook configured; this external check can't see the live per-shell mode\n  (only bash re-exports it, so run `tirith doctor` in your shell to confirm)"
+        ),
+        other => eprintln!("tirith: NOT FULLY PROTECTED — {}", health_reason(other)),
     }
     health.exit_code()
 }
@@ -109,7 +114,9 @@ fn health_reason(h: ProtectionHealth) -> &'static str {
         ProtectionHealth::Guarded => "protected",
         ProtectionHealth::WarnOnly => "the hook is warn-only and cannot block (TIRITH_BASH_MODE=enter or `tirith doctor --reset-bash-safe-mode`)",
         ProtectionHealth::Degraded => "protection degraded to warn-only this session (`tirith doctor --fix`)",
-        ProtectionHealth::Off => "the hook is inactive in this shell",
+        ProtectionHealth::ConfiguredUnknown => {
+            "the hook is configured but its live mode is not visible to an external check"
+        }
         ProtectionHealth::HookMissing => "the shell hook is not configured (run `tirith init`)",
         ProtectionHealth::Unknown => "protection state could not be determined",
     }

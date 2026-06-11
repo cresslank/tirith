@@ -710,12 +710,24 @@ pub(crate) fn gather_quick_info() -> QuickDoctorInfo {
     let detected_shell = crate::cli::init::detect_shell().to_string();
     let (_profile, hook_configured) = check_shell_profile(&detected_shell, "tirith: doctor:");
 
-    let tirith_status = std::env::var("TIRITH_STATUS")
+    // Prefer the EXPORTED effective-protection signal. A manually-run `tirith
+    // status` / `doctor --quick` is an EXTERNAL process, and `TIRITH_STATUS` is
+    // deliberately NON-exported (prompt-only), so a protected shell never passes
+    // it down — reading it alone makes a protected shell look "off". The bash hook
+    // re-exports `TIRITH_BASH_EFFECTIVE_PROTECTION` on every state change PRECISELY
+    // so an external check sees the truth; fall back to `TIRITH_STATUS` only for a
+    // user/shell that does export it.
+    let live_protection = std::env::var("TIRITH_BASH_EFFECTIVE_PROTECTION")
         .ok()
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("TIRITH_STATUS")
+                .ok()
+                .filter(|s| !s.is_empty())
+        });
     // Shared with `tirith prompt-status` so the two surfaces never drift.
     let protection_mode =
-        crate::cli::prompt_status::protection_mode_from_status(tirith_status.as_deref());
+        crate::cli::prompt_status::protection_mode_from_status(live_protection.as_deref());
 
     let cwd = std::env::current_dir()
         .ok()

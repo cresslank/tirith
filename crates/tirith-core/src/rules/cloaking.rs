@@ -85,15 +85,20 @@ impl std::fmt::Display for FetchErr {
 
 /// Classify a `reqwest::Error` from the request/connect phase.
 ///
-/// A connect failure or a connect-phase timeout means the host is unreachable
-/// regardless of user-agent → `Connect` (short-circuit). reqwest folds DNS
-/// resolution failures into the connect phase, so `is_connect()` covers the
-/// "host does not resolve" case too. Anything else (including redirect-policy
-/// errors such as our SSRF re-validation or too-many-redirects) is `Other` so
-/// the caller keeps probing the other user-agents.
+/// A connect failure means the host is unreachable regardless of user-agent →
+/// `Connect` (short-circuit). reqwest folds DNS resolution failures into the
+/// connect phase, so `is_connect()` covers the "host does not resolve" case too.
+///
+/// A TIMEOUT is deliberately NOT host-unreachable. A reachable but malicious
+/// server can accept the connection and then stall the RESPONSE for one
+/// user-agent past the client timeout (`is_timeout()` true, `is_connect()`
+/// false); short-circuiting there would skip the remaining user-agents and miss
+/// exactly the cloaking the detector exists to catch (Codex Security, PR #139).
+/// So a timeout — like a redirect-policy error or an HTTP-level failure — is
+/// `Other`, and the caller keeps probing the other user-agents.
 #[cfg(unix)]
 fn classify_reqwest_err(e: &reqwest::Error) -> FetchErr {
-    if e.is_connect() || e.is_timeout() {
+    if e.is_connect() {
         FetchErr::Connect(format!("request failed: {e}"))
     } else {
         FetchErr::Other(format!("request failed: {e}"))
@@ -545,6 +550,52 @@ mod tests {
             "a connect/DNS failure must short-circuit the user-agent loop"
         );
         assert!(matches!(classified, FetchErr::Connect(_)));
+    }
+
+    /// A reachable server that ACCEPTS the connection but stalls the RESPONSE past
+    /// the client timeout produces `is_timeout() == true` / `is_connect() == false`.
+    /// That is NOT host-unreachable: short-circuiting there would skip the remaining
+    /// user-agents and miss exactly the cloaking the detector exists to catch (Codex
+    /// Security, PR #139). Assert it classifies as `Other` so the loop keeps probing.
+    #[test]
+    fn test_response_timeout_does_not_short_circuit() {
+        use std::io::Read as _;
+        use std::net::TcpListener;
+
+        // Loopback listener that ACCEPTS the TCP connect (so this is NOT a connect
+        // failure) but never writes a response, forcing a RESPONSE-phase timeout.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 64];
+                let _ = sock.read(&mut buf);
+                std::thread::sleep(std::time::Duration::from_millis(800));
+            }
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .expect("client");
+        let err = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .expect_err("a stalled response must time out");
+        assert!(
+            err.is_timeout() && !err.is_connect(),
+            "expected a response-phase timeout, not a connect failure, got: {err:?}"
+        );
+
+        let classified = classify_reqwest_err(&err);
+        assert!(
+            !classified.is_host_unreachable(),
+            "a response timeout from a REACHABLE server must NOT short-circuit the \
+             user-agent sweep (cloaking evasion guard)"
+        );
+        assert!(matches!(classified, FetchErr::Other(_)));
+
+        let _ = handle.join();
     }
 
     /// The non-connect path must NOT short-circuit, so the loop keeps probing the

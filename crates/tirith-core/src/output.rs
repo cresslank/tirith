@@ -252,22 +252,43 @@ fn write_block_advisories(verdict: &Verdict, mut w: impl Write) -> std::io::Resu
         let rule = finding.rule_id; // snake_case via Display
                                     // Prefer a full URL: it is a NARROW trust pattern, so no `--broad`.
         if let Some(url) = first_url_in_evidence(&finding.evidence) {
-            writeln!(
-                w,
-                "  To allow: tirith trust add {} --rule {rule} --ttl 30d",
-                sanitize_field(url)
-            )?;
+            // The URL is attacker-controlled and the line is meant to be
+            // copy/pasted into a shell, so it MUST be shell-single-quoted: a URL
+            // carrying `$( )`, backticks, `;`, spaces, a `>` redirect, or a glob
+            // would otherwise execute the moment the developer pastes it.
+            // `sanitize_field` (terminal-control scrub, kept for display defense)
+            // is NOT a shell escaper. If the target can't be safely single-quoted
+            // (e.g. it contains a newline), refuse to print a runnable command.
+            match crate::safe_command::shell_single_quote(&sanitize_field(url)) {
+                Some(quoted) => writeln!(
+                    w,
+                    "  To allow: tirith trust add {quoted} --rule {rule} --ttl 30d"
+                )?,
+                None => writeln!(
+                    w,
+                    "  To allow: trust this target manually with `tirith trust add` \
+                     (it contains characters unsafe to embed in a suggested command)."
+                )?,
+            }
             break;
         }
         // Else fall back to a bare domain; `trust add` rejects bare domains
         // without `--broad`, and `--broad` trusts the whole domain.
         let domains = crate::session_warnings::extract_domains_from_evidence(&finding.evidence);
         if let Some(domain) = domains.first() {
-            writeln!(
-                w,
-                "  To allow (trusts the whole domain): tirith trust add {} --broad --rule {rule} --ttl 30d",
-                sanitize_field(domain)
-            )?;
+            // Same shell-injection hazard as the URL branch — single-quote the
+            // attacker-controlled domain before it lands in a pasteable command.
+            match crate::safe_command::shell_single_quote(&sanitize_field(domain)) {
+                Some(quoted) => writeln!(
+                    w,
+                    "  To allow (trusts the whole domain): tirith trust add {quoted} --broad --rule {rule} --ttl 30d"
+                )?,
+                None => writeln!(
+                    w,
+                    "  To allow: trust this target manually with `tirith trust add` \
+                     (it contains characters unsafe to embed in a suggested command)."
+                )?,
+            }
             break;
         }
     }
@@ -825,7 +846,8 @@ mod tests {
     #[test]
     fn block_with_full_url_renders_to_allow_without_broad() {
         // 14a: a finding carrying a full URL emits the NARROW trust line — the
-        // exact URL, the snake_case rule id, a 30d TTL, and NO `--broad`.
+        // exact URL (single-quoted), the snake_case rule id, a 30d TTL, and NO
+        // `--broad`.
         let verdict = block_verdict_with_evidence(
             RuleId::ShortenedUrl,
             vec![Evidence::Url {
@@ -842,9 +864,9 @@ mod tests {
             let out = String::from_utf8(buf).unwrap();
             assert!(
                 out.contains(
-                    "To allow: tirith trust add https://bit.ly/x --rule shortened_url --ttl 30d"
+                    "To allow: tirith trust add 'https://bit.ly/x' --rule shortened_url --ttl 30d"
                 ),
-                "full-URL block must render the narrow To-allow line (color={color}): {out}"
+                "full-URL block must render the narrow, single-quoted To-allow line (color={color}): {out}"
             );
             assert!(
                 !out.contains("--broad"),
@@ -856,7 +878,8 @@ mod tests {
     #[test]
     fn block_with_bare_domain_only_renders_broad_to_allow() {
         // 14a: a finding with only a HOST (no full URL) must emit the domain form
-        // WITH `--broad`, because `trust add` rejects bare domains otherwise.
+        // WITH `--broad` (single-quoted), because `trust add` rejects bare domains
+        // otherwise.
         let verdict = block_verdict_with_evidence(
             RuleId::ConfusableDomain,
             vec![Evidence::HostComparison {
@@ -869,16 +892,16 @@ mod tests {
         let out = String::from_utf8(buf).unwrap();
         assert!(
             out.contains(
-                "To allow (trusts the whole domain): tirith trust add gіthub.com --broad --rule confusable_domain --ttl 30d"
+                "To allow (trusts the whole domain): tirith trust add 'gіthub.com' --broad --rule confusable_domain --ttl 30d"
             ),
-            "bare-domain block must render the --broad To-allow line: {out}"
+            "bare-domain block must render the single-quoted --broad To-allow line: {out}"
         );
     }
 
     #[test]
     fn block_with_url_and_host_prefers_full_url_no_broad() {
         // When both a full URL and a host are present, the full URL wins (narrow,
-        // no --broad) and only ONE To-allow line is emitted.
+        // no --broad, single-quoted) and only ONE To-allow line is emitted.
         let verdict = block_verdict_with_evidence(
             RuleId::PlainHttpToSink,
             vec![
@@ -896,7 +919,7 @@ mod tests {
         let out = String::from_utf8(buf).unwrap();
         assert!(
             out.contains(
-                "tirith trust add http://evil.example/x.sh --rule plain_http_to_sink --ttl 30d"
+                "tirith trust add 'http://evil.example/x.sh' --rule plain_http_to_sink --ttl 30d"
             ),
             "full URL must be preferred over the host: {out}"
         );
@@ -909,6 +932,125 @@ mod tests {
             1,
             "exactly one To-allow line: {out}"
         );
+    }
+
+    #[test]
+    fn block_to_allow_url_shell_quotes_injection_payloads() {
+        // F1 (HIGH): the To-allow line is meant to be copy/pasted into a shell,
+        // so an attacker-controlled URL carrying shell metacharacters must be
+        // single-quoted — a developer who pastes the suggested line must NOT
+        // trigger command substitution, separators, redirects, or globbing.
+        let hostile = [
+            "https://x/$(touch X)",
+            "https://x/`id`",
+            "https://x/a;rm -rf ~",
+            "https://x/a b",
+            "https://x/a'b",
+            "https://x/a>b",
+            "https://x/a*b",
+        ];
+        for raw in hostile {
+            let verdict = block_verdict_with_evidence(
+                RuleId::ShortenedUrl,
+                vec![Evidence::Url {
+                    raw: raw.to_string(),
+                }],
+            );
+            for color in [false, true] {
+                let mut buf = Vec::new();
+                if color {
+                    write_human(&verdict, false, &mut buf).unwrap();
+                } else {
+                    write_human_no_color(&verdict, false, &mut buf).unwrap();
+                }
+                let out = String::from_utf8(buf).unwrap();
+                let line = out
+                    .lines()
+                    .find(|l| l.contains("tirith trust add"))
+                    .unwrap_or_else(|| {
+                        panic!("no To-allow line for {raw:?} (color={color}): {out}")
+                    });
+                // The emitted token is the single-quoted form of the URL. A
+                // single quote in the URL is escaped as '\'' (still one token).
+                let expected_token =
+                    crate::safe_command::shell_single_quote(raw).expect("quotable URL");
+                assert!(
+                    line.contains(&expected_token),
+                    "URL must be single-quoted on the To-allow line so a shell would NOT \
+                     expand it (raw={raw:?}, color={color}): {line}"
+                );
+                // The dangerous fragment must never appear UNquoted (outside the
+                // single-quoted token), which is what would let it execute.
+                let outside = line.replace(&expected_token, "");
+                for needle in ["$(", "`", ";rm", " a b", ">b", "*b"] {
+                    assert!(
+                        !outside.contains(needle),
+                        "no bare {needle:?} may survive outside the quoted token \
+                         (raw={raw:?}): {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_to_allow_domain_shell_quotes_injection_payloads() {
+        // F1 (HIGH): same neutralization on the bare-domain (`--broad`) branch.
+        // `extract_domains_from_evidence` pulls the host from `raw_host`, so plant
+        // the hostile metacharacters there.
+        let verdict = block_verdict_with_evidence(
+            RuleId::ConfusableDomain,
+            vec![Evidence::HostComparison {
+                raw_host: "evil.example/$(touch X)".to_string(),
+                similar_to: "ok.example".to_string(),
+            }],
+        );
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        let line = out
+            .lines()
+            .find(|l| l.contains("tirith trust add"))
+            .unwrap_or_else(|| panic!("no To-allow line: {out}"));
+        assert!(
+            line.contains('\''),
+            "the domain target must be single-quoted: {line}"
+        );
+        // `$(touch X)` must not appear bare (outside the quoted token).
+        assert!(
+            !line.contains("add $(") && !line.contains("add evil.example/$("),
+            "the command substitution must be inside single quotes, not runnable: {line}"
+        );
+    }
+
+    #[test]
+    fn block_to_allow_url_with_newline_prints_safe_fallback_not_command() {
+        // F1 (HIGH): a target that cannot be safely single-quoted (it contains a
+        // newline) must NOT yield a runnable `tirith trust add` command line —
+        // instead a safe manual-trust note is printed.
+        let verdict = block_verdict_with_evidence(
+            RuleId::ShortenedUrl,
+            vec![Evidence::Url {
+                raw: "https://x/a\nrm -rf ~".to_string(),
+            }],
+        );
+        for color in [false, true] {
+            let mut buf = Vec::new();
+            if color {
+                write_human(&verdict, false, &mut buf).unwrap();
+            } else {
+                write_human_no_color(&verdict, false, &mut buf).unwrap();
+            }
+            let out = String::from_utf8(buf).unwrap();
+            assert!(
+                !out.contains("tirith trust add 'https"),
+                "an unquotable (newline) target must not produce a runnable command (color={color}): {out}"
+            );
+            assert!(
+                out.contains("trust this target manually with `tirith trust add`"),
+                "an unquotable target must fall back to the safe manual note (color={color}): {out}"
+            );
+        }
     }
 
     #[test]

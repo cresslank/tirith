@@ -758,91 +758,109 @@ fn load_last_trigger_value() -> Result<Option<serde_json::Value>, String> {
     Ok(Some(val))
 }
 
-/// Extract trust targets and rule IDs from a parsed `last_trigger.json`.
+/// Extract `(target, rule_id)` PAIRS from a parsed `last_trigger.json`.
 ///
-/// `targets` prefer a FULL URL when the finding evidence carries one (a `raw`
-/// string with a scheme that parses) so the suggested trust can be narrow; it
-/// falls back to a bare host/domain otherwise. Order and de-dup mirror the way
-/// `last()` walks findings (per-finding `raw` first, then `raw_host`).
-fn extract_targets_and_rules(val: &serde_json::Value) -> (Vec<String>, Vec<String>) {
-    let mut targets: Vec<String> = Vec::new();
-    let push = |t: String, targets: &mut Vec<String>| {
-        if !t.is_empty() && !targets.contains(&t) {
-            targets.push(t);
+/// Pairing is PER FINDING: each finding carries its OWN `rule_id` and its own
+/// `evidence`, so a target pulled from a finding's evidence is paired with THAT
+/// finding's `rule_id` — never the flat top-level `rule_ids` array. Pairing
+/// against the top-level array would form a cartesian product, so for a
+/// multi-finding trigger `--apply` could trust URL A under rule B even though
+/// rule B fired for a DIFFERENT target.
+///
+/// Each target prefers a FULL URL when the evidence carries one (a `raw` string
+/// with a scheme that parses) so the suggested trust can be narrow; it falls
+/// back to a bare host/domain otherwise. Per-finding `raw` is read before
+/// `raw_host`, mirroring how `last()` walks findings. A finding with no
+/// extractable rule_id yields `(target, None)`. Results are de-duped on the full
+/// `(target, rule_id)` pair, so the same URL flagged by two different rules
+/// keeps both pairings.
+fn extract_target_rule_pairs(val: &serde_json::Value) -> Vec<(String, Option<String>)> {
+    let mut pairs: Vec<(String, Option<String>)> = Vec::new();
+    let push = |t: String, rid: &Option<String>, pairs: &mut Vec<(String, Option<String>)>| {
+        if t.is_empty() {
+            return;
+        }
+        let pair = (t, rid.clone());
+        if !pairs.contains(&pair) {
+            pairs.push(pair);
         }
     };
     if let Some(findings) = val.get("findings").and_then(|v| v.as_array()) {
         for finding in findings {
+            // THIS finding's own rule id — paired with every target it produces.
+            let rule_id = finding
+                .get("rule_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             if let Some(evidence) = finding.get("evidence").and_then(|v| v.as_array()) {
                 for ev in evidence {
                     if let Some(raw) = ev.get("raw").and_then(|v| v.as_str()) {
                         // Prefer the full URL when `raw` is one; else fall back
                         // to the bare host so we still have something to trust.
                         if raw.contains("://") && url::Url::parse(raw).is_ok() {
-                            push(raw.to_string(), &mut targets);
+                            push(raw.to_string(), &rule_id, &mut pairs);
                         } else if let Some(host) = extract_host(raw) {
-                            push(host, &mut targets);
+                            push(host, &rule_id, &mut pairs);
                         }
                     }
                     if let Some(host) = ev.get("raw_host").and_then(|v| v.as_str()) {
-                        push(host.to_string(), &mut targets);
+                        push(host.to_string(), &rule_id, &mut pairs);
                     }
                 }
             }
         }
     }
 
-    let rule_ids: Vec<String> = val
-        .get("rule_ids")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    (targets, rule_ids)
+    pairs
 }
 
-/// Read + parse + extract in one step: `(targets, rule_ids)`.
+/// Read + parse + extract in one step: per-finding `(target, rule_id)` pairs.
 ///
-/// `targets` prefer full URLs, else bare domains (see `extract_targets_and_rules`).
-/// `Err` covers both "no recent trigger" (so callers can print a friendly note)
-/// and real read/parse failures.
-fn read_last_trigger() -> Result<(Vec<String>, Vec<String>), String> {
+/// Each target prefers a full URL, else a bare domain (see
+/// `extract_target_rule_pairs`). `Err` covers both "no recent trigger" (so
+/// callers can print a friendly note) and real read/parse failures.
+fn read_last_trigger() -> Result<Vec<(String, Option<String>)>, String> {
     match load_last_trigger_value()? {
-        Some(val) => Ok(extract_targets_and_rules(&val)),
+        Some(val) => Ok(extract_target_rule_pairs(&val)),
         None => Err("no recent trigger found".into()),
     }
 }
 
 /// Build the ready-to-run `tirith trust add` suggestion lines for each
-/// (target, rule_id) pair. A full-URL target is narrow, so it is suggested
-/// without `--broad`; a bare domain needs `--broad` because `trust add` rejects
-/// broad scopes without the opt-in (see `add()` / `classify_scope`).
-fn suggestion_lines(targets: &[String], rule_ids: &[String]) -> Vec<String> {
-    let mut lines = Vec::new();
-    for target in targets {
-        // A target that classifies as broad (bare domain/wildcard/TLD) needs
-        // `--broad`; a full URL (or any narrow pattern) does not.
-        let needs_broad = classify_scope(target).is_broad();
-        if rule_ids.is_empty() {
-            lines.push(format_add_line(target, None, needs_broad));
-        } else {
-            for rid in rule_ids {
-                lines.push(format_add_line(target, Some(rid), needs_broad));
-            }
-        }
-    }
-    lines
+/// per-finding `(target, rule_id)` pair. A full-URL target is narrow, so it is
+/// suggested without `--broad`; a bare domain needs `--broad` because
+/// `trust add` rejects broad scopes without the opt-in (see `add()` /
+/// `classify_scope`). Each pair carries ITS OWN rule id, so a rule is never
+/// suggested for a target it didn't fire on.
+fn suggestion_lines(pairs: &[(String, Option<String>)]) -> Vec<String> {
+    pairs
+        .iter()
+        .map(|(target, rule_id)| {
+            // A target that classifies as broad (bare domain/wildcard/TLD) needs
+            // `--broad`; a full URL (or any narrow pattern) does not.
+            let needs_broad = classify_scope(target).is_broad();
+            format_add_line(target, rule_id.as_deref(), needs_broad)
+        })
+        .collect()
 }
 
 fn format_add_line(target: &str, rule_id: Option<&str>, needs_broad: bool) -> String {
+    // The target is attacker-controlled (a URL/host pulled from the trigger's
+    // finding evidence) and this line is printed for the operator to copy/paste
+    // into a shell. Shell-single-quote it so a target carrying `$( )`, backticks,
+    // `;`, spaces, a `>` redirect, or a glob cannot execute on paste. If it can't
+    // be safely quoted (e.g. it contains a newline), do NOT emit a runnable
+    // command — print a safe manual-trust note instead. The `--rule <rid>` is a
+    // snake_case enum Display (not attacker-controlled), so it needs no quoting.
+    let Some(quoted) = tirith_core::safe_command::shell_single_quote(target) else {
+        return "# trust this target manually with `tirith trust add` \
+                (it contains characters unsafe to embed in a suggested command)."
+            .to_string();
+    };
     let broad = if needs_broad { " --broad" } else { "" };
     match rule_id {
-        Some(rid) => format!("tirith trust add {target}{broad} --rule {rid} --ttl 30d"),
-        None => format!("tirith trust add {target}{broad} --ttl 30d"),
+        Some(rid) => format!("tirith trust add {quoted}{broad} --rule {rid} --ttl 30d"),
+        None => format!("tirith trust add {quoted}{broad} --ttl 30d"),
     }
 }
 
@@ -853,7 +871,7 @@ fn format_add_line(target: &str, rule_id: Option<&str>, needs_broad: bool) -> St
 /// Print-only by default mirrors the codebase's `policy tune` stance: suggest,
 /// don't mutate.
 pub fn from_last_trigger(apply: bool) -> i32 {
-    let (targets, rule_ids) = match read_last_trigger() {
+    let pairs = match read_last_trigger() {
         Ok(v) => v,
         // A missing/empty trigger is not an error for this command -- it is the
         // common "nothing happened yet" case, so exit 0 with a friendly note.
@@ -867,7 +885,7 @@ pub fn from_last_trigger(apply: bool) -> i32 {
         }
     };
 
-    if targets.is_empty() {
+    if pairs.is_empty() {
         eprintln!("tirith: no recent trigger to trust");
         return 0;
     }
@@ -875,7 +893,7 @@ pub fn from_last_trigger(apply: bool) -> i32 {
     if !apply {
         eprintln!("Suggested trust commands (run the narrowest one that fits):");
         eprintln!();
-        for line in suggestion_lines(&targets, &rule_ids) {
+        for line in suggestion_lines(&pairs) {
             println!("{line}");
         }
         eprintln!();
@@ -883,21 +901,24 @@ pub fn from_last_trigger(apply: bool) -> i32 {
         return 0;
     }
 
-    // --apply: actually add each entry. A bare-domain target is broad, so pass
-    // `broad = true`; a full-URL (narrow) target does not need it.
+    // --apply: actually add each per-finding entry, pairing each target with ITS
+    // OWN rule id (never a rule that fired on a different target). A bare-domain
+    // target is broad, so pass `broad = true`; a full-URL (narrow) one does not.
     let mut added = 0;
-    for target in &targets {
+    for (target, rule_id) in &pairs {
         let broad = classify_scope(target).is_broad();
-        if rule_ids.is_empty() {
-            if add(target, None, None, false, broad, None, "user", false) == 0 {
-                added += 1;
-            }
-        } else {
-            for rid in &rule_ids {
-                if add(target, Some(rid), None, false, broad, None, "user", false) == 0 {
-                    added += 1;
-                }
-            }
+        if add(
+            target,
+            rule_id.as_deref(),
+            None,
+            false,
+            broad,
+            None,
+            "user",
+            false,
+        ) == 0
+        {
+            added += 1;
         }
     }
 
@@ -2166,7 +2187,8 @@ mod tests {
     }
 
     /// A full-URL evidence target is suggested NARROW: a copy/paste-ready
-    /// `tirith trust add <url> --rule <rule_id> --ttl 30d` line with NO `--broad`.
+    /// `tirith trust add '<url>' --rule <rule_id> --ttl 30d` line (URL
+    /// single-quoted) with NO `--broad`.
     #[test]
     fn from_last_trigger_suggests_narrow_url_without_broad() {
         let json = r#"{
@@ -2176,6 +2198,7 @@ mod tests {
             "timestamp": "2026-06-10T00:00:00Z",
             "findings": [
                 {
+                    "rule_id": "shortened_url",
                     "title": "Shortened URL",
                     "evidence": [
                         { "raw": "https://example.com/install.sh" }
@@ -2185,18 +2208,24 @@ mod tests {
         }"#;
 
         with_seeded_last_trigger(json, || {
-            // read_last_trigger prefers the FULL URL as the target.
-            let (targets, rule_ids) = read_last_trigger().expect("read_last_trigger");
-            assert_eq!(targets, vec!["https://example.com/install.sh".to_string()]);
-            assert_eq!(rule_ids, vec!["shortened_url".to_string()]);
+            // read_last_trigger prefers the FULL URL as the target and pairs it
+            // with THAT finding's rule_id.
+            let pairs = read_last_trigger().expect("read_last_trigger");
+            assert_eq!(
+                pairs,
+                vec![(
+                    "https://example.com/install.sh".to_string(),
+                    Some("shortened_url".to_string())
+                )]
+            );
 
-            // The suggested line is the narrow, no-`--broad` form.
-            let lines = suggestion_lines(&targets, &rule_ids);
+            // The suggested line is the narrow, single-quoted, no-`--broad` form.
+            let lines = suggestion_lines(&pairs);
             let expected =
-                "tirith trust add https://example.com/install.sh --rule shortened_url --ttl 30d";
+                "tirith trust add 'https://example.com/install.sh' --rule shortened_url --ttl 30d";
             assert!(
                 lines.iter().any(|l| l == expected),
-                "expected narrow URL suggestion {expected:?}, got: {lines:?}"
+                "expected narrow single-quoted URL suggestion {expected:?}, got: {lines:?}"
             );
             assert!(
                 lines.iter().all(|l| !l.contains("--broad")),
@@ -2215,21 +2244,140 @@ mod tests {
         let json = r#"{
             "rule_ids": ["homograph"],
             "findings": [
-                { "title": "Homograph", "evidence": [ { "raw_host": "example.com" } ] }
+                { "rule_id": "homograph", "title": "Homograph", "evidence": [ { "raw_host": "example.com" } ] }
             ]
         }"#;
 
         with_seeded_last_trigger(json, || {
-            let (targets, rule_ids) = read_last_trigger().expect("read_last_trigger");
-            assert_eq!(targets, vec!["example.com".to_string()]);
+            let pairs = read_last_trigger().expect("read_last_trigger");
+            assert_eq!(
+                pairs,
+                vec![("example.com".to_string(), Some("homograph".to_string()))]
+            );
 
-            let lines = suggestion_lines(&targets, &rule_ids);
-            let expected = "tirith trust add example.com --broad --rule homograph --ttl 30d";
+            let lines = suggestion_lines(&pairs);
+            let expected = "tirith trust add 'example.com' --broad --rule homograph --ttl 30d";
             assert!(
                 lines.iter().any(|l| l == expected),
-                "expected bare-domain suggestion with --broad {expected:?}, got: {lines:?}"
+                "expected single-quoted bare-domain suggestion with --broad {expected:?}, got: {lines:?}"
             );
         });
+    }
+
+    /// F2 (P1): a MULTI-finding trigger must pair each target with ITS OWN
+    /// finding's rule_id — never the cartesian product of all targets × all
+    /// top-level `rule_ids`. Here finding A (rule `shortened_url`) fired for
+    /// `https://a.example/x`, finding B (rule `plain_http_to_sink`) for
+    /// `http://b.example/y`. The wrong (old) behavior would suggest trusting A
+    /// under `plain_http_to_sink` and B under `shortened_url`.
+    #[test]
+    fn from_last_trigger_pairs_each_target_with_its_own_rule() {
+        let json = r#"{
+            "rule_ids": ["shortened_url", "plain_http_to_sink"],
+            "findings": [
+                {
+                    "rule_id": "shortened_url",
+                    "title": "Shortened URL",
+                    "evidence": [ { "raw": "https://a.example/x" } ]
+                },
+                {
+                    "rule_id": "plain_http_to_sink",
+                    "title": "Plain HTTP",
+                    "evidence": [ { "raw": "http://b.example/y" } ]
+                }
+            ]
+        }"#;
+
+        with_seeded_last_trigger(json, || {
+            let pairs = read_last_trigger().expect("read_last_trigger");
+            assert_eq!(
+                pairs,
+                vec![
+                    (
+                        "https://a.example/x".to_string(),
+                        Some("shortened_url".to_string())
+                    ),
+                    (
+                        "http://b.example/y".to_string(),
+                        Some("plain_http_to_sink".to_string())
+                    ),
+                ],
+                "each target must keep its own finding's rule_id (no cartesian product)"
+            );
+
+            let lines = suggestion_lines(&pairs);
+            // Exactly the two correct pairings — and NO cross-paired line.
+            assert!(
+                lines.iter().any(|l| l
+                    == "tirith trust add 'https://a.example/x' --rule shortened_url --ttl 30d"),
+                "A must pair with shortened_url: {lines:?}"
+            );
+            assert!(
+                lines.iter().any(|l| l
+                    == "tirith trust add 'http://b.example/y' --rule plain_http_to_sink --ttl 30d"),
+                "B must pair with plain_http_to_sink: {lines:?}"
+            );
+            assert_eq!(
+                lines.len(),
+                2,
+                "exactly two lines, no cartesian product: {lines:?}"
+            );
+            assert!(
+                !lines.iter().any(
+                    |l| l.contains("'https://a.example/x'") && l.contains("plain_http_to_sink")
+                ),
+                "A must NOT be cross-paired with plain_http_to_sink: {lines:?}"
+            );
+            assert!(
+                !lines
+                    .iter()
+                    .any(|l| l.contains("'http://b.example/y'") && l.contains("shortened_url")),
+                "B must NOT be cross-paired with shortened_url: {lines:?}"
+            );
+        });
+    }
+
+    /// F1 (HIGH): the suggestion line is copy/paste-ready, so a hostile target
+    /// carrying shell metacharacters must be single-quoted; a target that can't
+    /// be safely quoted (newline) must NOT yield a runnable command.
+    #[test]
+    fn from_last_trigger_shell_quotes_hostile_target() {
+        // `extract_host` is applied to a schemeless `raw`; use `raw_host` so the
+        // hostile bytes survive verbatim into the suggested line.
+        let json = r#"{
+            "rule_ids": ["confusable_domain"],
+            "findings": [
+                {
+                    "rule_id": "confusable_domain",
+                    "title": "Confusable",
+                    "evidence": [ { "raw_host": "evil.example/$(touch X)" } ]
+                }
+            ]
+        }"#;
+        with_seeded_last_trigger(json, || {
+            let pairs = read_last_trigger().expect("read_last_trigger");
+            let lines = suggestion_lines(&pairs);
+            let line = lines
+                .iter()
+                .find(|l| l.contains("tirith trust add"))
+                .expect("a suggestion line");
+            assert!(
+                line.contains("'evil.example/$(touch X)'"),
+                "hostile target must be single-quoted so $(touch X) cannot execute: {line}"
+            );
+            assert!(
+                !line.replace("'evil.example/$(touch X)'", "").contains("$("),
+                "no bare $( may survive outside the quoted token: {line}"
+            );
+        });
+
+        // A target with a newline cannot be single-quoted as one token → no
+        // runnable command, just the safe manual-trust note.
+        assert_eq!(
+            format_add_line("evil.example/a\nrm -rf ~", Some("confusable_domain"), true),
+            "# trust this target manually with `tirith trust add` \
+             (it contains characters unsafe to embed in a suggested command)."
+        );
     }
 
     /// A missing/empty trigger is the common "nothing happened yet" case:

@@ -257,18 +257,25 @@ pub(crate) fn protection_mode_from_status(status: Option<&str>) -> String {
 
 /// Protection posture classified for an exit-code contract. Built from the
 /// `protection_mode` string [`protection_mode_from_status`] emits plus whether a
-/// shell hook is actually configured — `"off"` splits into [`HookMissing`]
-/// (nothing wired up) versus [`Off`] (hook present but inactive). Drives the new
-/// `tirith status` exit code; `prompt-status` stays always-0.
+/// shell hook is configured. A manually-run `tirith status` is an EXTERNAL process
+/// that sees only EXPORTED env: a protected shell's live mode lives in the
+/// deliberately-non-exported `TIRITH_STATUS`, and only bash re-exports it (as
+/// `TIRITH_BASH_EFFECTIVE_PROTECTION`). So a missing live signal does NOT prove
+/// "unprotected": `"off"` with a configured hook is [`ConfiguredUnknown`] (live
+/// mode unverifiable here, exit 0), and only `"off"` with NO hook is
+/// [`HookMissing`] (a real failure). Drives the new `tirith status` exit code;
+/// `prompt-status` stays always-0.
 ///
 /// [`HookMissing`]: ProtectionHealth::HookMissing
-/// [`Off`]: ProtectionHealth::Off
+/// [`ConfiguredUnknown`]: ProtectionHealth::ConfiguredUnknown
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProtectionHealth {
     Guarded,
     WarnOnly,
     Degraded,
-    Off,
+    /// Hook configured, but this external process can't see the live per-shell
+    /// mode (it's non-exported; only bash re-exports it). Not provably off.
+    ConfiguredUnknown,
     HookMissing,
     Unknown,
 }
@@ -285,20 +292,26 @@ impl ProtectionHealth {
             "guarded" => Self::Guarded,
             "warn-only" => Self::WarnOnly,
             "degraded" => Self::Degraded,
-            "off" if !hook_configured => Self::HookMissing,
-            "off" => Self::Off,
+            // No live mode signal. A protected shell's TIRITH_STATUS is
+            // non-exported, so an external `tirith status` legitimately sees "off"
+            // even when protected — a CONFIGURED hook is not provably off (exit 0);
+            // only a MISSING hook is a real failure.
+            "off" if hook_configured => Self::ConfiguredUnknown,
+            "off" => Self::HookMissing,
             _ => Self::Unknown,
         }
     }
 
-    /// Exit-code contract: `0` only when actively blocking ([`Guarded`]); every
-    /// other posture (warn-only, degraded, off, hook-missing, unknown) is `1` so
-    /// callers can fail CI / prompts on anything less than full protection.
+    /// Exit-code contract: `0` when actively blocking ([`Guarded`]) OR when the
+    /// hook is configured but the live mode is unverifiable from this external
+    /// process ([`ConfiguredUnknown`] — not provably off). Every PROVABLY-reduced
+    /// posture (warn-only, degraded, hook-missing, unknown) is `1`.
     ///
     /// [`Guarded`]: Self::Guarded
+    /// [`ConfiguredUnknown`]: Self::ConfiguredUnknown
     pub(crate) fn exit_code(self) -> i32 {
         match self {
-            Self::Guarded => 0,
+            Self::Guarded | Self::ConfiguredUnknown => 0,
             _ => 1,
         }
     }
@@ -309,7 +322,7 @@ impl ProtectionHealth {
             Self::Guarded => "guarded",
             Self::WarnOnly => "warn-only",
             Self::Degraded => "degraded",
-            Self::Off => "off",
+            Self::ConfiguredUnknown => "configured",
             Self::HookMissing => "hook-missing",
             Self::Unknown => "unknown",
         }
@@ -599,15 +612,19 @@ mod tests {
         assert_eq!(warn_only, ProtectionHealth::WarnOnly);
         assert_eq!(warn_only.exit_code(), 1);
 
-        // "off" splits on hook_configured.
+        // "off" splits on hook_configured. With NO hook it is a real failure.
         let hook_missing = ProtectionHealth::classify("off", false);
         assert_eq!(hook_missing, ProtectionHealth::HookMissing);
         assert_eq!(hook_missing.exit_code(), 1);
         assert_eq!(hook_missing.label(), "hook-missing");
 
-        let off = ProtectionHealth::classify("off", true);
-        assert_eq!(off, ProtectionHealth::Off);
-        assert_eq!(off.exit_code(), 1);
+        // With a CONFIGURED hook, "off" only means the live mode is invisible to
+        // this external process (TIRITH_STATUS is non-exported) — not provably off,
+        // so it does NOT fail the exit code.
+        let configured = ProtectionHealth::classify("off", true);
+        assert_eq!(configured, ProtectionHealth::ConfiguredUnknown);
+        assert_eq!(configured.exit_code(), 0);
+        assert_eq!(configured.label(), "configured");
 
         let degraded = ProtectionHealth::classify("degraded", true);
         assert_eq!(degraded, ProtectionHealth::Degraded);

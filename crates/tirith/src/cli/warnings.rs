@@ -239,8 +239,14 @@ fn print_table(w: &SessionWarnings, top_rules: &[(String, u32)], paranoia: u8) {
     let suggestion_threshold = 3;
     for (rule, count) in top_rules {
         if *count >= suggestion_threshold {
-            let domain = find_domain_for_rule(w, rule);
-            if let Some(d) = domain {
+            // Shell-quote the domain: it derives from analyzed (attacker-
+            // controlled) command text and this line is copy-paste-ready, so an
+            // unquoted `$(...)` / backtick / `;` would execute on paste (same class
+            // as the block "To allow" line). A target that cannot be safely quoted
+            // falls back to the `<pattern>` placeholder, never a runnable line.
+            let quoted = find_domain_for_rule(w, rule)
+                .and_then(tirith_core::safe_command::shell_single_quote);
+            if let Some(d) = quoted {
                 println!(
                     "\nSuggestion: {rule} fired {count} times. Consider: tirith trust add {d} --rule {rule}"
                 );
