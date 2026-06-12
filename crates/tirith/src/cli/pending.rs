@@ -8,8 +8,18 @@ use std::path::PathBuf;
 
 use tirith_core::pending::{self, PendingStatus};
 
+/// Default retention window before a still-`Pending` decision ages out to
+/// `Expired` (30 days). Applied on the read path so the store self-trims rather
+/// than growing unbounded; matches the "configured retention window" the
+/// `PendingStatus::Expired` doc-comment promises.
+const PENDING_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+
 /// List unresolved pending decisions as a human table or JSON.
 pub fn list(format_json: bool) -> i32 {
+    // Age out stale entries first so they drop off the unresolved list and the
+    // store does not accumulate forever (best-effort; an error here is non-fatal
+    // to listing).
+    let _ = pending::expire_older_than(PENDING_RETENTION_SECS);
     let entries = pending::list_unresolved();
     if format_json {
         match serde_json::to_string_pretty(&entries) {

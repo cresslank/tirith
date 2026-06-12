@@ -18,7 +18,7 @@ COMMANDS BY CATEGORY:
   Shell & System:   daemon hooks exec env path sudo ssh context persistence hygiene aliases
   Supply-chain:     package ecosystem threat-db iac canary secret command-card commands
   Integrations:     mcp mcp-server gateway agent ai lsp license
-  Forensics:        audit incident checkpoint share redact clipboard
+  Forensics:        audit incident checkpoint pending share redact clipboard
 
 Run `tirith <command> --help` for details on any command.";
 

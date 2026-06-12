@@ -193,6 +193,7 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
     entry.prev_hash = prev_hash;
     // Opt-in signing: sign the canonical form (`sig` excluded, `prev_hash`
     // included) only when a signing key file exists.
+    let mut signed_now = false;
     if let Ok(mut unsigned) = serde_json::to_value(&entry) {
         if let Some(o) = unsigned.as_object_mut() {
             o.remove("sig");
@@ -200,8 +201,13 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
         let canon = canonical_json_string(&unsigned);
         if let Some(sig) = sign_canonical(canon.as_bytes()) {
             entry.sig = Some(sig);
+            signed_now = true;
         }
     }
+    // Signing state is monotonic per log: once any entry was signed, the receipt
+    // records it so a later signature strip is detectable even if the current
+    // entry happens to be unsigned.
+    let signing_enabled = signed_now || head_before.map(|h| h.signing_enabled).unwrap_or(false);
     let line = match serde_json::to_string(&entry) {
         Ok(l) => l,
         Err(e) => {
@@ -240,6 +246,7 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
             &HeadReceipt {
                 head_hash: self_hash,
                 count: prev_count + 1,
+                signing_enabled,
             },
         );
     }
@@ -358,6 +365,13 @@ fn count_lines(path: &std::path::Path) -> u64 {
 struct HeadReceipt {
     head_hash: String,
     count: u64,
+    /// W4 downgrade-resistance: set once signing has produced at least one `sig`
+    /// for this log. Recorded OUT-OF-BAND (the chain hash deliberately excludes
+    /// `sig`, so a stripped signature is otherwise byte-identical to an unsigned
+    /// line). Verification uses it to flag a chained entry that lost its `sig`.
+    /// Defaults to false so pre-signing receipts parse unchanged.
+    #[serde(default)]
+    signing_enabled: bool,
 }
 
 fn head_path(log_path: &std::path::Path) -> PathBuf {
@@ -418,6 +432,12 @@ pub struct AuditVerifyReport {
     pub ok: bool,
     pub head_status: String,
     pub problems: Vec<String>,
+    /// Number of chained lines that carried a `sig`.
+    pub signed_lines: usize,
+    /// Whether the head receipt records that signing was enabled for this log
+    /// (so a chained entry without `sig` is a downgrade, not a legitimately
+    /// unsigned line).
+    pub signing_expected: bool,
 }
 
 /// Verify the tamper-evident chain over `log_path` by parsing RAW JSON lines
@@ -437,6 +457,8 @@ pub fn verify_audit_log(
         ok: true,
         head_status: String::new(),
         problems: Vec::new(),
+        signed_lines: 0,
+        signing_expected: false,
     };
     let content = match fs::read_to_string(log_path) {
         Ok(c) => c,
@@ -451,6 +473,11 @@ pub fn verify_audit_log(
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
     report.total_lines = lines.len();
     let verify_key = audit_verify_key();
+    // Read the head receipt once: its `signing_enabled` flag tells us whether a
+    // chained entry missing `sig` is a downgrade (signature stripped) rather than
+    // a legitimately unsigned line.
+    let head = read_head(log_path);
+    report.signing_expected = head.as_ref().map(|h| h.signing_enabled).unwrap_or(false);
     let mut hashes: Vec<String> = Vec::with_capacity(lines.len());
     let mut chaining_started = false;
 
@@ -489,9 +516,21 @@ pub fn verify_audit_log(
                     .problems
                     .push(format!("line {}: chain break (prev_hash mismatch)", i + 1));
             }
-            if let (Some(sig_b64), Some(vk)) =
-                (val.get("sig").and_then(|v| v.as_str()), verify_key.as_ref())
-            {
+            let sig_present = val.get("sig").and_then(|v| v.as_str());
+            if sig_present.is_some() {
+                report.signed_lines += 1;
+            } else if report.signing_expected {
+                // The head receipt says this log is signed, but this chained
+                // entry has no `sig`. Because `sig` is excluded from the chain
+                // hash, stripping it leaves the chain intact and is otherwise
+                // invisible, so flag it as a signature downgrade.
+                report.ok = false;
+                report.problems.push(format!(
+                    "line {}: missing signature on a signed log (possible signature downgrade)",
+                    i + 1
+                ));
+            }
+            if let (Some(sig_b64), Some(vk)) = (sig_present, verify_key.as_ref()) {
                 let mut unsigned = val.clone();
                 if let Some(o) = unsigned.as_object_mut() {
                     o.remove("sig");
@@ -525,7 +564,7 @@ pub fn verify_audit_log(
         hashes.push(this_hash);
     }
 
-    match read_head(log_path) {
+    match head {
         Some(head) => {
             let n = hashes.len();
             if n > 0 && head.head_hash == hashes[n - 1] {
@@ -1416,5 +1455,196 @@ mod tests {
         let head = line_hash(last).unwrap();
         assert!(verify_audit_log(&log, Some(&head)).ok);
         assert!(!verify_audit_log(&log, Some("deadbeef")).ok);
+    }
+
+    #[test]
+    fn audit_verify_tolerates_head_one_entry_behind() {
+        // Simulate the documented crash window: the last log line synced to disk
+        // but the process died before write_head ran, so the head receipt still
+        // points at the SECOND-to-last line. Verification must accept this.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        append_chain(&log, &["Allow", "Block", "Warn"]);
+
+        // Compute the hash of the second-to-last line and rewrite ONLY the head
+        // sidecar to point at it (count = total - 1). The log file is untouched.
+        let content = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let second_to_last = line_hash(lines[lines.len() - 2]).unwrap();
+        write_head(
+            &log,
+            &HeadReceipt {
+                head_hash: second_to_last,
+                count: (lines.len() - 1) as u64,
+                signing_enabled: false,
+            },
+        );
+
+        let report = verify_audit_log(&log, None);
+        assert!(
+            report.ok,
+            "a head one entry behind is the crash window and must verify ok: {:?}",
+            report.problems
+        );
+        assert!(
+            report.head_status.contains("one entry behind"),
+            "head_status should flag the crash window: {}",
+            report.head_status
+        );
+    }
+
+    #[test]
+    fn audit_verify_head_two_behind_is_truncation() {
+        // A head pointing at NEITHER the last nor the second-to-last line is not
+        // the crash window; it is treated as a possible truncation (the n-2 arm
+        // must not over-tolerate). Pins the boundary between the n-2 arm and else.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        append_chain(&log, &["Allow", "Block", "Warn"]);
+
+        // Point the head at a hash matching no current line.
+        write_head(
+            &log,
+            &HeadReceipt {
+                head_hash: "f00dfeed".repeat(8),
+                count: 1,
+                signing_enabled: false,
+            },
+        );
+
+        let report = verify_audit_log(&log, None);
+        assert!(!report.ok, "a head matching no line must fail verification");
+        assert!(
+            report.head_status.contains("truncation"),
+            "head_status should flag possible truncation: {}",
+            report.head_status
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_signature_strip_is_detected_as_downgrade() {
+        // With signing enabled, an attacker who strips `sig` from a signed entry
+        // leaves the chain intact (the chain hash excludes `sig`) and the line
+        // becomes byte-identical to an unsigned one. The head receipt's
+        // signing_enabled flag makes the downgrade detectable.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        // Deterministic ed25519 keypair from fixed secret bytes.
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let vk = sk.verifying_key();
+        std::fs::write(cfg.join("tirith").join("audit-signing.key"), sk.to_bytes()).unwrap();
+        std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
+
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("TIRITH_LOG", "1");
+            std::env::set_var("XDG_CONFIG_HOME", &cfg);
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            append_chain(&log, &["Allow", "Block", "Warn"]);
+
+            // Sanity: signed + intact chain verifies clean and reports signing.
+            let clean = verify_audit_log(&log, None);
+            assert!(
+                clean.ok,
+                "a signed, intact chain must verify ok: {:?}",
+                clean.problems
+            );
+            assert!(clean.signing_expected, "head must record signing enabled");
+            assert!(clean.signed_lines >= 2, "chained lines were signed");
+
+            // Strip `sig` from the LAST line, leaving the chain otherwise intact.
+            let content = std::fs::read_to_string(&log).unwrap();
+            let mut lines: Vec<String> = content.lines().map(String::from).collect();
+            let last = lines.last_mut().unwrap();
+            let mut v: serde_json::Value = serde_json::from_str(last).unwrap();
+            assert!(
+                v.get("sig").is_some(),
+                "precondition: the last line was signed"
+            );
+            v.as_object_mut().unwrap().remove("sig");
+            *last = serde_json::to_string(&v).unwrap();
+            std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+
+            // The downgrade must now be detected.
+            let report = verify_audit_log(&log, None);
+            assert!(
+                !report.ok,
+                "stripping a signature on a signed log must fail verification"
+            );
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("signature downgrade")),
+                "a signature-downgrade problem must be reported: {:?}",
+                report.problems
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            std::env::remove_var("TIRITH_LOG");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_chain_concurrent_appends_stay_consistent() {
+        // The exclusive fs2 lock must serialize concurrent in-process writers so
+        // no interleave breaks a prev_hash. Spawn several threads each appending
+        // a few entries to ONE log, then verify the chain and line count.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 4;
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let log = log.clone();
+                scope.spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let _ = append_to_audit_log(
+                            &chain_test_entry(&format!("t{t}-{i}")),
+                            Some(log.clone()),
+                        );
+                    }
+                });
+            }
+        });
+
+        let total = std::fs::read_to_string(&log).unwrap().lines().count();
+        assert_eq!(total, THREADS * PER_THREAD, "every append must land");
+        let report = verify_audit_log(&log, None);
+        assert!(
+            report.ok,
+            "concurrent appends must produce an unbroken chain: {:?}",
+            report.problems
+        );
+        // Genesis line is unchained; every subsequent line is chained.
+        assert_eq!(report.chained_lines, THREADS * PER_THREAD - 1);
     }
 }

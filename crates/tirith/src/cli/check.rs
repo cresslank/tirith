@@ -449,7 +449,11 @@ pub fn run(
                     .iter()
                     .map(|f| f.rule_id.to_string())
                     .collect(),
-                severity: max_sev.map(|s| s.to_string()).unwrap_or_default(),
+                // Documented as a lowercase string (pending.rs); Severity::Display
+                // renders UPPERCASE, so lowercase it here at the sole producer.
+                severity: max_sev
+                    .map(|s| s.to_string().to_lowercase())
+                    .unwrap_or_default(),
                 command_redacted: cmd.chars().take(120).collect(),
                 status: tirith_core::pending::PendingStatus::Pending,
                 resolved_at: None,
@@ -457,20 +461,39 @@ pub fn run(
                 reason: None,
                 refs: std::collections::BTreeMap::new(),
             };
-            let _ = tirith_core::pending::register(decision);
-            tirith_core::audit::log_hook_event(
-                "check",
-                "defer",
-                "deferred_block",
-                None,
-                Some("exit=4"),
-            );
-            if !json {
-                eprintln!(
-                    "tirith: blocked, pending review (deferred). Resolve with `tirith pending`."
-                );
+            // Fail CLOSED: only downgrade the hard block to a soft exit-4 pending
+            // outcome when the pending entry actually persisted. If register fails
+            // (no state dir, read-only FS, disk full, serialize error) the block
+            // must STAND at exit 1, never a click-through exit 4 that points the
+            // user at a pending entry that was never recorded.
+            match tirith_core::pending::register(decision) {
+                Ok(_) => {
+                    tirith_core::audit::log_hook_event(
+                        "check",
+                        "defer",
+                        "deferred_block",
+                        None,
+                        Some("exit=4"),
+                    );
+                    if !json {
+                        eprintln!(
+                            "tirith: blocked, pending review (deferred). Resolve with `tirith pending`."
+                        );
+                    }
+                    return 4;
+                }
+                Err(e) => {
+                    tirith_core::audit::log_hook_event(
+                        "check",
+                        "defer",
+                        "deferred_block_failed",
+                        None,
+                        Some("exit=1"),
+                    );
+                    eprintln!("tirith: defer failed to record pending entry ({e}); hard-blocking.");
+                    // Fall through to the normal block exit path below.
+                }
             }
-            return 4;
         }
     }
 

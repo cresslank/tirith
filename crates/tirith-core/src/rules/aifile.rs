@@ -14,8 +14,6 @@
 
 use std::path::Path;
 
-use base64::Engine;
-
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 /// Classification of an AI-relevant file `aifile` rules understand.
@@ -175,54 +173,12 @@ fn scan_invisible(s: &str) -> (usize, Vec<String>) {
     (count, codepoints)
 }
 
-/// Minimum length of a base64 run worth treating as an embedded payload (a
-/// short run — a hash, an id — is not interesting).
-const MIN_BASE64_BLOB_LEN: usize = 96;
-
 /// Whether `s` contains a long base64 run that decodes successfully — the
 /// shape of an embedded encoded payload smuggled into a text field. Returns
-/// the matched run (truncated) when found.
+/// the matched run (truncated with the ellipsis variant) when found. Shares the
+/// scan/decode logic with `configfile` via [`crate::rules::shared::find_base64_blob_with`].
 fn find_base64_blob(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
-    let is_b64 =
-        |b: u8| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'-' || b == b'_';
-    let mut i = 0;
-    while i < bytes.len() {
-        if !is_b64(bytes[i]) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len() && is_b64(bytes[i]) {
-            i += 1;
-        }
-        // Tolerate trailing `=` padding.
-        let mut end = i;
-        while end < bytes.len() && bytes[end] == b'=' {
-            end += 1;
-        }
-        let run = &s[start..end];
-        if run.len() >= MIN_BASE64_BLOB_LEN {
-            // Require it to actually decode (standard or URL-safe).
-            let decodes = base64::engine::general_purpose::STANDARD
-                .decode(run)
-                .is_ok()
-                || base64::engine::general_purpose::URL_SAFE
-                    .decode(run)
-                    .is_ok()
-                || base64::engine::general_purpose::STANDARD_NO_PAD
-                    .decode(run)
-                    .is_ok()
-                || base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(run)
-                    .is_ok();
-            if decodes {
-                return Some(truncate(run, 64));
-            }
-        }
-        i = end.max(i);
-    }
-    None
+    crate::rules::shared::find_base64_blob_with(s, truncate)
 }
 
 // Jupyter notebook checks
@@ -1633,7 +1589,12 @@ fn join_reasons(reasons: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use std::path::PathBuf;
+
+    // The base64-blob constant now lives in `rules::shared`; alias it so the
+    // existing test bodies keep their concise name.
+    const MIN_BASE64_BLOB_LEN: usize = crate::rules::shared::MIN_BASE64_BLOB_LEN;
 
     fn run(content: &str, path: &str) -> Vec<Finding> {
         check(content, Some(&PathBuf::from(path)))

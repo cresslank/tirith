@@ -474,6 +474,7 @@ mod tests {
             hidden_events: std::collections::VecDeque::new(),
             cooldowns: std::collections::BTreeMap::new(),
             typed_events: std::collections::VecDeque::new(),
+            surfaced_correlations: std::collections::VecDeque::new(),
         };
         let top_rules = w.top_rules();
         assert_eq!(w.total_warnings, 0);
@@ -495,6 +496,7 @@ mod tests {
             hidden_events: std::collections::VecDeque::new(),
             cooldowns: std::collections::BTreeMap::new(),
             typed_events: std::collections::VecDeque::new(),
+            surfaced_correlations: std::collections::VecDeque::new(),
         };
         // Matches the gate in run(): total_warnings == 0 && hidden >= 3.
         assert_eq!(w.total_warnings, 0);

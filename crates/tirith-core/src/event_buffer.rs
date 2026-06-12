@@ -95,6 +95,11 @@ pub struct CorrelationHit {
     pub title: String,
     /// Human-readable description of the matched sequence.
     pub description: String,
+    /// Stable signature identifying THIS specific match (rule id + the
+    /// timestamps of the events that triggered it). A session-level consumer
+    /// uses it to de-duplicate: the same A-then-B pair, still inside its window
+    /// on the next command, produces the same signature and is surfaced once.
+    pub signature: String,
 }
 
 /// Window, in seconds, for each correlation rule.
@@ -197,7 +202,15 @@ fn earliest_in_window<'a>(
         .min_by(|a, b| a.timestamp.cmp(&b.timestamp))
 }
 
-/// `B` of kind `b_kind` happened at-or-after `after_ts`, within the window.
+/// `B` of kind `b_kind` happened STRICTLY after `after_ts`, within the window.
+///
+/// The boundary is strict (`>`, not `>=`) on purpose: every event a single
+/// command emits is stamped with one shared `now` (see
+/// `escalation::derive_typed_events`), so a same-instant `B` can only be the
+/// SAME command as `A` (e.g. `curl https://x -o id_rsa` is both the secret
+/// write and the network call). Requiring a later instant means a real
+/// "A then B" sequence must span two distinct commands, which are recorded at
+/// distinct wall-clock instants.
 fn any_after<'a>(
     events: &'a [TypedEvent],
     b_kind: EventKind,
@@ -208,8 +221,19 @@ fn any_after<'a>(
     events.iter().find(|e| {
         e.kind == b_kind
             && within_window(&e.timestamp, cutoff, now_rfc3339)
-            && e.timestamp.as_str() >= after_ts
+            && e.timestamp.as_str() > after_ts
     })
+}
+
+/// Build a stable de-dup signature for a correlation from its rule and the
+/// timestamps of the events that triggered it.
+fn signature(rule_id: RuleId, parts: &[&str]) -> String {
+    let mut sig = format!("{rule_id:?}");
+    for p in parts {
+        sig.push('|');
+        sig.push_str(p);
+    }
+    sig
 }
 
 /// SecretWrite THEN Network within 30s -> CRITICAL.
@@ -235,6 +259,10 @@ fn secret_then_network(events: &[TypedEvent], now_rfc3339: &str) -> Option<Corre
         title: "Secret write followed by network egress".to_string(),
         description: format!(
             "A secret-bearing file was written, then a network call to {host} ran within {SECRET_THEN_NETWORK_WINDOW_SECS}s. This is the shape of a credential-exfiltration chain."
+        ),
+        signature: signature(
+            RuleId::SecretWriteThenNetwork,
+            &[&secret.timestamp, &net.timestamp],
         ),
     })
 }
@@ -285,6 +313,10 @@ fn dependency_change_then_network(
         description: format!(
             "{what} was modified, then a network call to {host} ran within {DEP_CHANGE_THEN_NETWORK_WINDOW_SECS}s. A dependency edit that immediately phones out can indicate a poisoned install step."
         ),
+        signature: signature(
+            RuleId::DependencyChangeThenNetwork,
+            &[&manifest_write.timestamp, &net.timestamp],
+        ),
     })
 }
 
@@ -299,7 +331,6 @@ fn delete_then_force_push(events: &[TypedEvent], now_rfc3339: &str) -> Option<Co
         &cut,
         now_rfc3339,
     )?;
-    let _ = push;
     Some(CorrelationHit {
         rule_id: RuleId::DeleteThenForcePush,
         severity: Severity::Critical,
@@ -307,13 +338,17 @@ fn delete_then_force_push(events: &[TypedEvent], now_rfc3339: &str) -> Option<Co
         description: format!(
             "A file was deleted, then a `git push --force` ran within {DELETE_THEN_FORCE_PUSH_WINDOW_SECS}s. Deleting then force-pushing can erase history and overwrite a remote branch."
         ),
+        signature: signature(
+            RuleId::DeleteThenForcePush,
+            &[&del.timestamp, &push.timestamp],
+        ),
     })
 }
 
 /// >= 3 FileDelete within 20s, EXCLUDING build-artifact paths -> CRITICAL.
 fn mass_file_deletion(events: &[TypedEvent], now_rfc3339: &str) -> Option<CorrelationHit> {
     let cut = cutoff(now_rfc3339, MASS_DELETE_WINDOW_SECS)?;
-    let count = events
+    let matched: Vec<&TypedEvent> = events
         .iter()
         .filter(|e| {
             e.kind == EventKind::FileDelete && within_window(&e.timestamp, &cut, now_rfc3339)
@@ -325,14 +360,23 @@ fn mass_file_deletion(events: &[TypedEvent], now_rfc3339: &str) -> Option<Correl
                 .map(|p| !crate::util_build_dirs::is_build_artifact_path(p))
                 .unwrap_or(true)
         })
-        .count();
+        .collect();
+    let count = matched.len();
     if count >= MASS_DELETE_THRESHOLD {
+        // Signature spans the latest contributing delete so a later burst (a
+        // genuinely new mass deletion) re-surfaces while the same set does not.
+        let mut stamps: Vec<&str> = matched.iter().map(|e| e.timestamp.as_str()).collect();
+        stamps.sort_unstable();
         Some(CorrelationHit {
             rule_id: RuleId::MassFileDeletion,
             severity: Severity::Critical,
             title: "Mass file deletion in a short window".to_string(),
             description: format!(
                 "{count} non-build files were deleted within {MASS_DELETE_WINDOW_SECS}s. A burst of deletions can be destructive (ransomware-like or an accidental recursive wipe)."
+            ),
+            signature: signature(
+                RuleId::MassFileDeletion,
+                &[stamps.last().copied().unwrap_or_default()],
             ),
         })
     } else {
@@ -410,6 +454,22 @@ mod tests {
         let events = vec![
             ev(ts(base, -20), EventKind::Network),
             ev(ts(base, -10), EventKind::SecretWrite),
+        ];
+        let hits = correlate(&events, &base.to_rfc3339());
+        assert!(!fired(&hits, RuleId::SecretWriteThenNetwork));
+    }
+
+    #[test]
+    fn secret_then_network_same_instant_does_not_fire() {
+        // A single command (`curl https://x -o id_rsa`) emits BOTH a SecretWrite
+        // and a Network at one shared timestamp. The network call IS the write,
+        // not a subsequent exfiltration, so the strict `>` boundary must keep
+        // this from firing a Critical credential-exfiltration correlation.
+        let base = now();
+        let same = ts(base, -10);
+        let events = vec![
+            ev(same.clone(), EventKind::SecretWrite),
+            ev(same, EventKind::Network),
         ];
         let hits = correlate(&events, &base.to_rfc3339());
         assert!(!fired(&hits, RuleId::SecretWriteThenNetwork));

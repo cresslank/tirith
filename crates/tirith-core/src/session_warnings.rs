@@ -22,6 +22,8 @@ const MAX_ESCALATION_EVENTS: usize = 20;
 const MAX_HIDDEN_EVENTS: usize = 50;
 /// W7: maximum typed events retained per session for cross-event correlation.
 const MAX_TYPED_EVENTS: usize = 200;
+/// W7: maximum surfaced-correlation signatures retained per session (for dedup).
+const MAX_SURFACED_CORRELATIONS: usize = 100;
 
 /// Per-session warning accumulator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +58,12 @@ pub struct SessionWarnings {
     /// [`MAX_TYPED_EVENTS`].
     #[serde(default)]
     pub typed_events: VecDeque<crate::event_buffer::TypedEvent>,
+    /// W7: signatures of correlation hits already surfaced this session, so a hit
+    /// whose A-then-B pair is still inside its window on the next command is
+    /// surfaced exactly once. Bounded to [`MAX_SURFACED_CORRELATIONS`] (oldest
+    /// dropped first; the ring keeps insertion order alongside the set).
+    #[serde(default)]
+    pub surfaced_correlations: VecDeque<String>,
 }
 
 /// A single warning event within a session.
@@ -105,6 +113,7 @@ impl SessionWarnings {
             hidden_events: VecDeque::new(),
             cooldowns: std::collections::BTreeMap::new(),
             typed_events: VecDeque::new(),
+            surfaced_correlations: VecDeque::new(),
         }
     }
 
@@ -224,6 +233,14 @@ pub fn load(session_id: &str) -> SessionWarnings {
 /// the finding into a rollup rather than surfacing it again; otherwise it starts
 /// a fresh cooldown and returns `false`. A suppressed hit is never dropped
 /// silently: it emits a compact `finding_suppressed` audit rollup.
+///
+/// NOTE (W6 scoping): the production CALL SITE that collapses repeated Warn /
+/// WarnAck findings in the user-facing output is intentionally deferred to a
+/// later milestone (it is strictly a UX/output-layer change and must never
+/// suppress an `Action::Block` or feed back into detection). This function and
+/// its `finding_suppressed` audit-rollup contract are exercised end-to-end by
+/// `suppress_check_emits_finding_suppressed_rollup`, so the "never dropped
+/// silently" guarantee is verified even though no hot-path caller exists yet.
 pub fn suppress_check(
     session_id: &str,
     rule_id: &str,
@@ -393,14 +410,45 @@ pub fn record_typed_event(session_id: &str, event: crate::event_buffer::TypedEve
 }
 
 /// W7: run cross-event correlation over the session's typed-event ring as of
-/// now. Loads the session (best-effort; empty on any I/O error) and delegates to
-/// the pure [`crate::event_buffer::correlate`]. Returns the correlation hits, if
-/// any. Never panics and never mutates session state.
+/// now, returning only hits NOT already surfaced this session.
+///
+/// Because the typed-event ring is never drained, a single recorded sequence
+/// stays correlatable on every subsequent command until it falls out of its
+/// window. To avoid re-emitting the same CRITICAL hit on each command, every
+/// returned hit's [`signature`](crate::event_buffer::CorrelationHit::signature)
+/// (rule id + triggering-event timestamps) is recorded in the session's
+/// `surfaced_correlations` marker under the lock; a hit whose signature is
+/// already present is filtered out. Best-effort: an I/O failure means the marker
+/// is not persisted, so at worst a hit is surfaced again rather than lost.
 pub fn correlate_session(session_id: &str) -> Vec<crate::event_buffer::CorrelationHit> {
-    let session = load(session_id);
-    let events: Vec<crate::event_buffer::TypedEvent> =
-        session.typed_events.iter().cloned().collect();
-    crate::event_buffer::correlate(&events, &chrono::Utc::now().to_rfc3339())
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut fresh = Vec::new();
+    with_session_locked(session_id, |session| {
+        let events: Vec<crate::event_buffer::TypedEvent> =
+            session.typed_events.iter().cloned().collect();
+        let already: std::collections::HashSet<&str> = session
+            .surfaced_correlations
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let hits = crate::event_buffer::correlate(&events, &now);
+        let new_sigs: Vec<String> = hits
+            .into_iter()
+            .filter(|h| !already.contains(h.signature.as_str()))
+            .map(|h| {
+                let sig = h.signature.clone();
+                fresh.push(h);
+                sig
+            })
+            .collect();
+        for sig in new_sigs {
+            session.surfaced_correlations.push_back(sig);
+        }
+        while session.surfaced_correlations.len() > MAX_SURFACED_CORRELATIONS {
+            session.surfaced_correlations.pop_front();
+        }
+    });
+    fresh
 }
 
 /// Shared atomic lock-read-modify-write: open the session file, take an
@@ -911,6 +959,62 @@ mod tests {
         unsafe {
             std::env::remove_var("XDG_STATE_HOME");
             std::env::remove_var("TIRITH_LOG");
+        }
+    }
+
+    /// W6 safety contract: a SUPPRESSED hit must emit a compact
+    /// `finding_suppressed` audit rollup (the "never dropped silently"
+    /// guarantee). Drives `suppress_check` with logging ENABLED and reads the
+    /// audit log back to assert the rollup landed.
+    #[cfg(unix)]
+    #[test]
+    fn suppress_check_emits_finding_suppressed_rollup() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        // Isolate BOTH state (session record) and data (audit log) into the temp
+        // dir, and ENABLE logging so the rollup is actually written.
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+            std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
+            std::env::set_var("TIRITH_LOG", "1");
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let sid = "test-suppress-rollup";
+            // First sighting starts the cooldown, is NOT suppressed, emits nothing.
+            assert!(!suppress_check(sid, "curl_pipe_shell", None, 3600));
+            // Second sighting is suppressed -> must emit the rollup.
+            assert!(suppress_check(sid, "curl_pipe_shell", None, 3600));
+
+            let log = crate::audit::audit_log_path().expect("audit log path");
+            let body = std::fs::read_to_string(&log).expect("audit log written");
+            let rollup = body.lines().find(|l| l.contains("finding_suppressed"));
+            let rollup = rollup.expect("a finding_suppressed rollup line must exist");
+            let v: serde_json::Value =
+                serde_json::from_str(rollup).expect("rollup line is valid JSON");
+            assert_eq!(v["event"], "finding_suppressed");
+            assert_eq!(v["hook_type"], "cooldown");
+            assert_eq!(v["integration"], "suppression");
+            assert!(
+                v["detail"]
+                    .as_str()
+                    .map(|d| d.contains("rule_id=curl_pipe_shell"))
+                    .unwrap_or(false),
+                "rollup detail must carry the rule id: {v}"
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("TIRITH_LOG");
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
         }
     }
 }

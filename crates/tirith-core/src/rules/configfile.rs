@@ -905,58 +905,13 @@ fn is_agent_memory_file(path: &Path) -> bool {
     false
 }
 
-/// Minimum length of a base64 run worth treating as an embedded payload (a short
-/// run, like a hash or an id, is not interesting). Mirrors
-/// `aifile::MIN_BASE64_BLOB_LEN`.
-const MIN_BASE64_BLOB_LEN: usize = 96;
-
 /// Whether `content` contains a long base64 run that actually decodes: the
 /// shape of an encoded payload smuggled into a memory file. Returns the matched
-/// run (ASCII-truncated) when found. Decode-checked port of
-/// `aifile::find_base64_blob` (private there; copied to avoid a cross-module
-/// dependency). Kept ASCII-only (no ellipsis char) so the evidence string never
-/// introduces non-ASCII bytes.
+/// run (ASCII-truncated, no ellipsis char) when found, so the evidence string
+/// never introduces non-ASCII bytes. Shares the scan/decode logic with `aifile`
+/// via [`crate::rules::shared::find_base64_blob_with`].
 fn find_base64_blob(content: &str) -> Option<String> {
-    let bytes = content.as_bytes();
-    let is_b64 =
-        |b: u8| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'-' || b == b'_';
-    let mut i = 0;
-    while i < bytes.len() {
-        if !is_b64(bytes[i]) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len() && is_b64(bytes[i]) {
-            i += 1;
-        }
-        // Tolerate trailing `=` padding.
-        let mut end = i;
-        while end < bytes.len() && bytes[end] == b'=' {
-            end += 1;
-        }
-        let run = &content[start..end];
-        if run.len() >= MIN_BASE64_BLOB_LEN {
-            use base64::Engine as _;
-            let decodes = base64::engine::general_purpose::STANDARD
-                .decode(run)
-                .is_ok()
-                || base64::engine::general_purpose::URL_SAFE
-                    .decode(run)
-                    .is_ok()
-                || base64::engine::general_purpose::STANDARD_NO_PAD
-                    .decode(run)
-                    .is_ok()
-                || base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(run)
-                    .is_ok();
-            if decodes {
-                return Some(truncate_ascii(run, 64));
-            }
-        }
-        i = end.max(i);
-    }
-    None
+    crate::rules::shared::find_base64_blob_with(content, truncate_ascii)
 }
 
 /// Truncate `s` to at most `max` chars (char-boundary safe), appending `...`

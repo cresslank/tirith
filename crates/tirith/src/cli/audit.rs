@@ -220,6 +220,8 @@ pub fn verify(expected_head: Option<&str>, json: bool) -> i32 {
             "chained_lines": report.chained_lines,
             "legacy_prefix": report.legacy_prefix,
             "head_status": report.head_status,
+            "signed_lines": report.signed_lines,
+            "signing_expected": report.signing_expected,
             "problems": problems,
         });
         println!("{obj}");
@@ -232,6 +234,12 @@ pub fn verify(expected_head: Option<&str>, json: bool) -> i32 {
             report.legacy_prefix
         );
         println!("  {}", report.head_status);
+        if report.signing_expected {
+            println!(
+                "  signing: enabled ({} signed line(s))",
+                report.signed_lines
+            );
+        }
         for p in &report.problems {
             println!("  problem: {p}");
         }

@@ -1120,6 +1120,114 @@ mod tests {
         );
     }
 
+    /// The SUCCESS path of `restore_reported`: a verified blob is copied back
+    /// into `restored` (live file content restored to the checkpointed bytes),
+    /// AND a `snapshot_restore` audit record is emitted. The existing buckets
+    /// test only sabotages both blobs, so this is the only coverage of a
+    /// non-empty `restored` and of the restore audit side-effect.
+    #[cfg(unix)]
+    #[test]
+    fn test_restore_reported_happy_path() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let workdir = tmpdir.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+
+        let state_dir = tmpdir.path().join("state");
+        let data_dir = tmpdir.path().join("data");
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_data = std::env::var("XDG_DATA_HOME").ok();
+        let prev_log = std::env::var("TIRITH_LOG").ok();
+        let prev_cwd = std::env::current_dir().ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules. Point the
+        // audit log at the temp data dir and ENABLE logging so the restore
+        // emission is observable.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &state_dir);
+            std::env::set_var("XDG_DATA_HOME", &data_dir);
+            std::env::set_var("TIRITH_LOG", "1");
+        }
+
+        let name_a = "a.txt";
+        let name_b = "b.txt";
+
+        let run = || -> Result<RestoreReport, String> {
+            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
+            fs::write(name_a, "original alpha").map_err(|e| format!("write a: {e}"))?;
+            fs::write(name_b, "original bravo").map_err(|e| format!("write b: {e}"))?;
+            let meta = create(&[name_a, name_b], Some("rm -rf project"))?;
+            // Overwrite the live files; a successful restore must put the
+            // original bytes back.
+            fs::write(name_a, "MUTATED alpha").map_err(|e| format!("rewrite a: {e}"))?;
+            fs::write(name_b, "MUTATED bravo").map_err(|e| format!("rewrite b: {e}"))?;
+            restore_reported(&meta.id)
+        };
+
+        let result = run();
+        let live_a = fs::read_to_string(workdir.join(name_a)).ok();
+        let live_b = fs::read_to_string(workdir.join(name_b)).ok();
+        let audit_log = crate::audit::audit_log_path();
+        let audit_body = audit_log.as_ref().and_then(|p| fs::read_to_string(p).ok());
+
+        // Restore cwd + env before assertions so cleanup runs even on failure.
+        if let Some(dir) = prev_cwd {
+            let _ = std::env::set_current_dir(dir);
+        }
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_data {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("TIRITH_LOG", v),
+                None => std::env::remove_var("TIRITH_LOG"),
+            }
+        }
+
+        let report = result.expect("restore_reported should succeed");
+        assert_eq!(
+            report.attempted, 2,
+            "two file entries processed: {report:?}"
+        );
+        assert!(
+            report.restored.contains(&name_a.to_string())
+                && report.restored.contains(&name_b.to_string()),
+            "both files must restore cleanly: {report:?}"
+        );
+        assert!(report.missing.is_empty(), "no missing: {report:?}");
+        assert!(report.corrupt.is_empty(), "no corrupt: {report:?}");
+        assert!(report.errors.is_empty(), "no errors: {report:?}");
+
+        // Live files restored to their original (checkpointed) bytes.
+        assert_eq!(live_a.as_deref(), Some("original alpha"));
+        assert_eq!(live_b.as_deref(), Some("original bravo"));
+
+        // The restore audit record must have been emitted with restored=2.
+        let body = audit_body.expect("audit log written");
+        let line = body
+            .lines()
+            .find(|l| l.contains("snapshot_restore"))
+            .expect("a snapshot_restore audit line must exist");
+        let v: serde_json::Value = serde_json::from_str(line).expect("audit line is valid JSON");
+        assert_eq!(v["integration"], "checkpoint");
+        assert_eq!(v["hook_type"], "restore");
+        assert_eq!(v["event"], "snapshot_restore");
+        assert!(
+            v["detail"]
+                .as_str()
+                .map(|d| d.contains("restored=2"))
+                .unwrap_or(false),
+            "restore audit detail must report restored=2: {v}"
+        );
+    }
+
     #[test]
     fn test_create_and_purge_removes_expired() {
         // create_and_purge() must create a new checkpoint AND purge age-expired

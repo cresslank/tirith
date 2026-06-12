@@ -14600,6 +14600,479 @@ fn policy_validate_accepts_a_positional_path() {
     );
 }
 
+// ── W8: deferred-outcome (`--defer` / TIRITH_DEFER=1) enforcement boundaries ──
+//
+// These exercise the load-bearing gates in cli/check.rs: a non-critical Block is
+// softened to a soft exit-4 "pending review" outcome ONLY in a non-interactive
+// context AND only when the pending entry actually persists; a CRITICAL block
+// never downgrades; and the `!interactive_detected` gate confines deferral to
+// non-interactive use. Subprocess writes are unix-gated per the project's
+// Windows-audit/pending-write caveat.
+
+/// Path to the deferred-decision store under an isolated XDG_STATE_HOME.
+#[cfg(unix)]
+fn pending_store(state_home: &std::path::Path) -> PathBuf {
+    state_home.join("tirith").join("pending.json")
+}
+
+#[cfg(unix)]
+#[test]
+fn defer_non_interactive_non_critical_block_exits_4_and_registers() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--no-daemon",
+            "--offline",
+            "--non-interactive",
+            "--defer",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ])
+        .env("XDG_STATE_HOME", &state)
+        .env_remove("TIRITH_INTERACTIVE")
+        .env_remove("TIRITH_DEFER")
+        .output()
+        .expect("run check --defer");
+
+    // A non-critical (HIGH) block is downgraded to the soft exit-4 outcome.
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "non-interactive --defer on a non-critical block should exit 4; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("pending review (deferred)"),
+        "stderr should mention the deferred pending review: {stderr}"
+    );
+
+    // A PendingSource::Deferred entry must have been registered.
+    let store = pending_store(&state);
+    let body =
+        fs::read_to_string(&store).expect("pending.json should exist after a deferred block");
+    let map: serde_json::Value = serde_json::from_str(&body).expect("pending.json is valid JSON");
+    let entries = map.as_object().expect("pending store is a JSON object");
+    assert_eq!(entries.len(), 1, "exactly one deferred entry expected");
+    let entry = entries.values().next().unwrap();
+    assert_eq!(entry["source"], "deferred", "source must be Deferred");
+    assert_eq!(entry["status"], "pending");
+    // Severity is documented lowercase; the producer must honor that.
+    assert_eq!(
+        entry["severity"], "high",
+        "deferred severity must be the lowercase string form"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn defer_non_interactive_critical_block_stays_hard_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    // `metadata_endpoint` is a CRITICAL structural rule (no network needed).
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--no-daemon",
+            "--offline",
+            "--non-interactive",
+            "--defer",
+            "--",
+            "curl http://169.254.169.254/latest/meta-data/",
+        ])
+        .env("XDG_STATE_HOME", &state)
+        .env_remove("TIRITH_INTERACTIVE")
+        .env_remove("TIRITH_DEFER")
+        .output()
+        .expect("run check --defer on critical");
+
+    // CRITICAL must NOT downgrade: a hard exit-1 block stands.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a CRITICAL block must stay a hard block under --defer; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // And NO deferred entry may be registered.
+    let store = pending_store(&state);
+    assert!(
+        !store.exists(),
+        "a critical block must not register a deferred pending entry"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn defer_interactive_context_does_not_downgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    // Force an interactive context via the TTY-detection override seam.
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--no-daemon",
+            "--offline",
+            "--interactive",
+            "--defer",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ])
+        .env("XDG_STATE_HOME", &state)
+        .env("TIRITH_INTERACTIVE", "1")
+        .output()
+        .expect("run check --defer interactive");
+
+    // The `!interactive_detected` gate holds: exit 1, not 4.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an interactive context must not defer (exit 1, not 4); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let store = pending_store(&state);
+    assert!(
+        !store.exists(),
+        "an interactive defer must not register a pending entry"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn no_defer_opt_in_keeps_default_hard_block() {
+    // Pins the default: without --defer / TIRITH_DEFER, a non-critical block is a
+    // plain exit-1 block and nothing is registered.
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--no-daemon",
+            "--offline",
+            "--non-interactive",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ])
+        .env("XDG_STATE_HOME", &state)
+        .env_remove("TIRITH_DEFER")
+        .output()
+        .expect("run check without defer");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "default (no --defer) keeps the hard block; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !pending_store(&state).exists(),
+        "no defer opt-in must not register a pending entry"
+    );
+}
+
+// ── `tirith pending` CLI subcommand (list / resolve / export) ────────────────
+
+#[cfg(unix)]
+#[test]
+fn pending_list_empty_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let out = tirith()
+        .args(["pending", "list"])
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .expect("run pending list");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("No pending decisions."),
+        "empty store prints the no-decisions line: {stdout}"
+    );
+
+    // `--json` on an empty store is a valid empty array.
+    let out_json = tirith()
+        .args(["pending", "list", "--json"])
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .expect("run pending list --json");
+    assert_eq!(out_json.status.code(), Some(0));
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out_json.stdout).expect("valid JSON array");
+    assert_eq!(parsed.as_array().map(|a| a.len()), Some(0));
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_resolve_rollback_prints_restore_command_then_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let store = pending_store(&state);
+    fs::create_dir_all(store.parent().unwrap()).unwrap();
+    // Seed a decision carrying a checkpoint reference so rollback surfaces the
+    // exact restore command.
+    let seed = serde_json::json!({
+        "cp01abcd": {
+            "id": "cp01abcd",
+            "created_at": "2026-06-12T00:00:00+00:00",
+            "source": "restore",
+            "rule_ids": ["blast_writes_system_path"],
+            "severity": "high",
+            "command_redacted": "rm -rf /etc",
+            "status": "pending",
+            "resolved_at": null,
+            "resolved_by": null,
+            "reason": null,
+            "refs": { "checkpoint_id": "ckpt-9999" }
+        }
+    });
+    fs::write(&store, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+    // First rollback transitions it and prints the restore command.
+    let out = tirith()
+        .args(["pending", "resolve", "cp01abcd", "rollback"])
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .expect("run pending resolve rollback");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("tirith checkpoint restore ckpt-9999"),
+        "rollback must print the exact restore command: {stdout}"
+    );
+
+    // Resolving again is idempotent: already-resolved -> exit 1.
+    let again = tirith()
+        .args(["pending", "resolve", "cp01abcd", "rollback"])
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .expect("run pending resolve rollback again");
+    assert_eq!(
+        again.status.code(),
+        Some(1),
+        "second resolve of the same id is not-found/already-resolved -> exit 1"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_resolve_no_checkpoint_and_unknown_action_and_missing_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let store = pending_store(&state);
+    fs::create_dir_all(store.parent().unwrap()).unwrap();
+    let seed = serde_json::json!({
+        "nocp0001": {
+            "id": "nocp0001",
+            "created_at": "2026-06-12T00:00:00+00:00",
+            "source": "deferred",
+            "rule_ids": ["curl_pipe_shell"],
+            "severity": "high",
+            "command_redacted": "curl x | sh",
+            "status": "pending",
+            "resolved_at": null,
+            "resolved_by": null,
+            "reason": null,
+            "refs": {}
+        }
+    });
+    fs::write(&store, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+    // Unknown action -> exit 2.
+    let bogus = tirith()
+        .args(["pending", "resolve", "nocp0001", "bogus"])
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .expect("run pending resolve bogus");
+    assert_eq!(bogus.status.code(), Some(2), "unknown action -> exit 2");
+    assert!(String::from_utf8_lossy(&bogus.stderr).contains("unknown action"));
+
+    // rollback on an entry with no checkpoint ref: resolves (exit 0) but prints
+    // the "nothing to restore" line.
+    let nocp = tirith()
+        .args(["pending", "resolve", "nocp0001", "rollback"])
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .expect("run pending resolve rollback no-checkpoint");
+    assert_eq!(nocp.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&nocp.stdout).contains("nothing to restore automatically"),
+        "a decision with no checkpoint_id prints the no-restore line"
+    );
+
+    // Resolving a missing id -> exit 1.
+    let missing = tirith()
+        .args(["pending", "resolve", "deadbeef", "keep"])
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .expect("run pending resolve missing");
+    assert_eq!(missing.status.code(), Some(1), "missing id -> exit 1");
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_export_to_file_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let store = pending_store(&state);
+    fs::create_dir_all(store.parent().unwrap()).unwrap();
+    let seed = serde_json::json!({
+        "exp00001": {
+            "id": "exp00001",
+            "created_at": "2026-06-12T00:00:00+00:00",
+            "source": "finding",
+            "rule_ids": [],
+            "severity": "medium",
+            "command_redacted": "echo hi",
+            "status": "pending",
+            "resolved_at": null,
+            "resolved_by": null,
+            "reason": null,
+            "refs": {}
+        }
+    });
+    fs::write(&store, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+    let out_file = dir.path().join("export.json");
+    let out = tirith()
+        .args(["pending", "export", "--output", out_file.to_str().unwrap()])
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .expect("run pending export");
+    assert_eq!(out.status.code(), Some(0));
+    let exported = fs::read_to_string(&out_file).expect("export file written");
+    let parsed: serde_json::Value = serde_json::from_str(&exported).expect("exported JSON array");
+    let arr = parsed.as_array().expect("export is a JSON array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"], "exp00001");
+}
+
+// ── `tirith audit verify` CLI subcommand ─────────────────────────────────────
+
+#[cfg(unix)]
+#[test]
+fn audit_verify_empty_log_is_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let cfg = dir.path().join("config"); // isolate signing keys (none) for determinism
+                                         // Human output mentions there is no log; exit 0.
+    let out = tirith()
+        .args(["audit", "verify"])
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &cfg)
+        .output()
+        .expect("run audit verify (empty)");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("no audit log"),
+        "empty-log human output mentions no audit log"
+    );
+
+    // `--json` body parses and reports ok=true, total_lines=0, note present.
+    let out_json = tirith()
+        .args(["audit", "verify", "--json"])
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &cfg)
+        .output()
+        .expect("run audit verify --json (empty)");
+    assert_eq!(out_json.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_slice(&out_json.stdout).expect("valid JSON for empty verify");
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["total_lines"], 0);
+    assert!(v.get("note").is_some(), "empty verify carries a note");
+}
+
+#[cfg(unix)]
+#[test]
+fn audit_verify_clean_chain_then_detects_tamper_and_expected_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let state = dir.path().join("state");
+    let cfg = dir.path().join("config"); // isolate signing keys (none) for determinism
+                                         // Drive two checks so the binary writes a real chained log (genesis + 1).
+    for cmd in ["ls -la", "curl https://example.com/install.sh | bash"] {
+        let _ = tirith()
+            .args([
+                "check",
+                "--shell",
+                "posix",
+                "--no-daemon",
+                "--offline",
+                "--non-interactive",
+                "--",
+                cmd,
+            ])
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_CONFIG_HOME", &cfg)
+            .output()
+            .expect("run check to populate audit log");
+    }
+    let log = data.join("tirith").join("log.jsonl");
+    assert!(log.exists(), "audit log should have been written");
+
+    // (1) Clean chain verifies OK with ok=true.
+    let clean = tirith()
+        .args(["audit", "verify", "--json"])
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &cfg)
+        .output()
+        .expect("run audit verify --json (clean)");
+    assert_eq!(clean.status.code(), Some(0));
+    let cv: serde_json::Value = serde_json::from_slice(&clean.stdout).expect("clean verify JSON");
+    assert_eq!(cv["ok"], true, "clean chain must verify ok: {cv}");
+
+    // Capture the correct tail hash for the --expected-head check by re-reading
+    // it from the human output is awkward, so derive it from a known-good run:
+    // a correct --expected-head exits 0, a wrong one exits 1.
+    let wrong_head = tirith()
+        .args(["audit", "verify", "--expected-head", "deadbeefdeadbeef"])
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &cfg)
+        .output()
+        .expect("run audit verify wrong expected-head");
+    assert_eq!(
+        wrong_head.status.code(),
+        Some(1),
+        "a wrong --expected-head must fail verification"
+    );
+
+    // (2) Tamper a line: editing the genesis line breaks the next line's
+    // prev_hash, so verification fails (exit 1, ok=false, a chain-break problem).
+    let body = fs::read_to_string(&log).unwrap();
+    let mut lines: Vec<String> = body.lines().map(String::from).collect();
+    lines[0] = lines[0].replace("ls -la", "EVIL-EDIT");
+    fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let tampered = tirith()
+        .args(["audit", "verify", "--json"])
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &cfg)
+        .output()
+        .expect("run audit verify --json (tampered)");
+    assert_eq!(tampered.status.code(), Some(1));
+    let tv: serde_json::Value =
+        serde_json::from_slice(&tampered.stdout).expect("tampered verify JSON");
+    assert_eq!(
+        tv["ok"], false,
+        "a tampered chain must report ok=false: {tv}"
+    );
+    assert!(
+        tv["problems"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
+        "a tampered chain must report at least one problem: {tv}"
+    );
+}
+
 #[test]
 fn fix_on_non_tty_prints_rerun_hint() {
     // Item 14d (pre-existing): the non-interactive `tirith fix` path must surface

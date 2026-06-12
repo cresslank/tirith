@@ -1,5 +1,63 @@
 //! Shared constants and helpers used by multiple rule modules.
 
+/// Minimum length of a base64 run worth treating as an embedded payload (a short
+/// run, like a hash or an id, is not interesting). Shared by `aifile.rs` and
+/// `configfile.rs`.
+pub const MIN_BASE64_BLOB_LEN: usize = 96;
+
+/// Whether `content` contains a long base64 run that actually decodes (standard
+/// or URL-safe, padded or not): the shape of an encoded payload smuggled into a
+/// text field. Returns the matched run passed through `truncate` when found.
+///
+/// The `truncate` parameter is the only thing that differs between call sites:
+/// `aifile` truncates with a non-ASCII ellipsis, `configfile` truncates ASCII-
+/// only so its evidence string never introduces non-ASCII bytes.
+pub fn find_base64_blob_with(
+    content: &str,
+    truncate: impl Fn(&str, usize) -> String,
+) -> Option<String> {
+    use base64::Engine as _;
+    let bytes = content.as_bytes();
+    let is_b64 =
+        |b: u8| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'-' || b == b'_';
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_b64(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_b64(bytes[i]) {
+            i += 1;
+        }
+        // Tolerate trailing `=` padding.
+        let mut end = i;
+        while end < bytes.len() && bytes[end] == b'=' {
+            end += 1;
+        }
+        let run = &content[start..end];
+        if run.len() >= MIN_BASE64_BLOB_LEN {
+            let decodes = base64::engine::general_purpose::STANDARD
+                .decode(run)
+                .is_ok()
+                || base64::engine::general_purpose::URL_SAFE
+                    .decode(run)
+                    .is_ok()
+                || base64::engine::general_purpose::STANDARD_NO_PAD
+                    .decode(run)
+                    .is_ok()
+                || base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(run)
+                    .is_ok();
+            if decodes {
+                return Some(truncate(run, 64));
+            }
+        }
+        i = end.max(i);
+    }
+    None
+}
+
 /// Sensitive-credential env var names. Used by `command.rs` (SensitiveEnvExport)
 /// and `credential.rs` (dedup suppression).
 pub const SENSITIVE_KEY_VARS: &[&str] = &[
