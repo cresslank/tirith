@@ -2213,6 +2213,9 @@ mod tests {
         assert!(!is_agent_memory_file(Path::new("README.md"), None));
     }
 
+    // Hardcodes Unix-style absolute paths; the normalization logic is exercised
+    // cross-platform by the other is_agent_memory_file tests.
+    #[cfg(unix)]
     #[test]
     fn test_is_agent_memory_file_absolute_path_normalized() {
         // An ABSOLUTE path whose memory dir is NOT the leading component must
