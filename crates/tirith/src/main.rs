@@ -172,6 +172,12 @@ Examples:
         #[arg(long)]
         warn_only: bool,
 
+        /// Defer a non-critical block in a no-TTY context to exit 4 ("blocked,
+        /// pending review") and record it in the pending registry instead of a
+        /// hard block. Opt-in; CRITICAL still hard-blocks. (Or set TIRITH_DEFER=1.)
+        #[arg(long)]
+        defer: bool,
+
         /// Suppress all network activity on the hot path: skip the periodic
         /// background threat-DB refresh so analysis runs purely locally.
         /// Also honored via the TIRITH_OFFLINE environment variable.
@@ -6452,6 +6458,7 @@ fn run() {
             strict_warn,
             no_daemon,
             warn_only,
+            defer,
             offline,
             suggest_safe_command,
             card,
@@ -6470,6 +6477,7 @@ fn run() {
                 strict_warn,
                 no_daemon,
                 warn_only,
+                defer,
                 offline,
                 suggest_safe_command,
                 card,

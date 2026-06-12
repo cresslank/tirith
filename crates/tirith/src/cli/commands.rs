@@ -528,7 +528,7 @@ pub fn check(cmd: &str, shell: &str, json: bool) -> i32 {
     super::check::run(
         cmd, shell, json, /* non_interactive */ false, /* interactive_flag */ false,
         /* approval_check */ false, /* strict_warn */ false, /* no_daemon */ true,
-        /* warn_only */ false, /* offline */ false,
+        /* warn_only */ false, /* defer */ false, /* offline */ false,
         /* suggest_safe_command */ false, /* card */ None,
     )
 }

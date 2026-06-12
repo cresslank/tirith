@@ -20,6 +20,7 @@ pub fn run(
     strict_warn: bool,
     no_daemon: bool,
     warn_only: bool,
+    defer: bool,
     offline: bool,
     suggest_safe_command: bool,
     card: Option<String>,
@@ -428,9 +429,53 @@ pub fn run(
         }
     }
 
+    let exit_code = effective.action.exit_code();
+
+    // W8 deferred outcome (opt-in via --defer or TIRITH_DEFER=1): in a no-TTY /
+    // no-approval context, a NON-critical block is recorded in the pending
+    // registry and returns exit 4 ("blocked, pending review") instead of a hard
+    // exit-1 block. CRITICAL always hard-blocks. Default behavior is unchanged.
+    let deferred_opt_in = defer || std::env::var("TIRITH_DEFER").ok().as_deref() == Some("1");
+    if deferred_opt_in && !effective.interactive_detected && exit_code == Action::Block.exit_code()
+    {
+        let max_sev = effective.findings.iter().map(|f| f.severity).max();
+        if max_sev != Some(tirith_core::verdict::Severity::Critical) {
+            let decision = tirith_core::pending::PendingDecision {
+                id: String::new(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                source: tirith_core::pending::PendingSource::Deferred,
+                rule_ids: effective
+                    .findings
+                    .iter()
+                    .map(|f| f.rule_id.to_string())
+                    .collect(),
+                severity: max_sev.map(|s| s.to_string()).unwrap_or_default(),
+                command_redacted: cmd.chars().take(120).collect(),
+                status: tirith_core::pending::PendingStatus::Pending,
+                resolved_at: None,
+                resolved_by: None,
+                reason: None,
+                refs: std::collections::BTreeMap::new(),
+            };
+            let _ = tirith_core::pending::register(decision);
+            tirith_core::audit::log_hook_event(
+                "check",
+                "defer",
+                "deferred_block",
+                None,
+                Some("exit=4"),
+            );
+            if !json {
+                eprintln!(
+                    "tirith: blocked, pending review (deferred). Resolve with `tirith pending`."
+                );
+            }
+            return 4;
+        }
+    }
+
     // Mode A (direct CLI strict_warn): prompt interactively. In non-interactive
     // mode we fall through to exit code 2 for backward compatibility.
-    let exit_code = effective.action.exit_code();
     if exit_code == 2 && (strict_warn || policy.strict_warn) && interactive {
         eprint!(
             "tirith: proceed with {} warning(s)? [y/N] ",
