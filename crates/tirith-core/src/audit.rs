@@ -191,6 +191,14 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
 
     let mut entry = entry.clone();
     entry.prev_hash = prev_hash;
+    // Whether the log was ALREADY signed before this append (head receipt says so).
+    // Once true, an unsigned append would be an undetectable-from-tampering
+    // downgrade, so a failure to sign here must FAIL the write, not silently
+    // write an unsigned line.
+    let was_signed = head_before
+        .as_ref()
+        .map(|h| h.signing_enabled)
+        .unwrap_or(false);
     // Opt-in signing: sign the canonical form (`sig` excluded, `prev_hash`
     // included) only when a signing key file exists.
     let mut signed_now = false;
@@ -199,15 +207,28 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
             o.remove("sig");
         }
         let canon = canonical_json_string(&unsigned);
-        if let Some(sig) = sign_canonical(canon.as_bytes()) {
-            entry.sig = Some(sig);
-            signed_now = true;
+        match sign_canonical(canon.as_bytes()) {
+            Some(sig) => {
+                entry.sig = Some(sig);
+                signed_now = true;
+            }
+            // The log carried signatures, but we cannot sign this entry (key
+            // gone / unreadable). Writing it unsigned would poison the log: on
+            // verify it is indistinguishable from a stripped signature. Refuse.
+            None if was_signed => {
+                let reason =
+                    "signing key unavailable for a previously signed audit log".to_string();
+                audit_diagnostic(format!("tirith: audit: {reason}"));
+                let _ = fs2::FileExt::unlock(&file);
+                return AuditWrite::Failed(reason);
+            }
+            None => {}
         }
     }
     // Signing state is monotonic per log: once any entry was signed, the receipt
     // records it so a later signature strip is detectable even if the current
     // entry happens to be unsigned.
-    let signing_enabled = signed_now || head_before.map(|h| h.signing_enabled).unwrap_or(false);
+    let signing_enabled = signed_now || was_signed;
     let line = match serde_json::to_string(&entry) {
         Ok(l) => l,
         Err(e) => {
@@ -240,15 +261,23 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
         return AuditWrite::Failed(reason);
     }
     // Refresh the head receipt (the truncation anchor) while still under the lock.
+    // The log line is already durable; if the receipt cannot be made durable too,
+    // a later crash could leave verify reporting a false truncation, so treat a
+    // receipt-durability failure as a write failure rather than reporting success.
     if let Some(self_hash) = line_hash(&line) {
-        write_head(
+        if let Err(e) = write_head(
             &path,
             &HeadReceipt {
                 head_hash: self_hash,
                 count: prev_count + 1,
                 signing_enabled,
             },
-        );
+        ) {
+            let reason = format!("head receipt write failed: {e}");
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            let _ = fs2::FileExt::unlock(&file);
+            return AuditWrite::Failed(reason);
+        }
     }
     let _ = fs2::FileExt::unlock(&file);
 
@@ -385,19 +414,39 @@ fn read_head(log_path: &std::path::Path) -> Option<HeadReceipt> {
     serde_json::from_str(&s).ok()
 }
 
-/// Refresh the per-log head receipt. Best-effort; we already hold the log's
-/// exclusive lock, so a partial write is replaced on the next append.
-fn write_head(log_path: &std::path::Path, receipt: &HeadReceipt) {
+/// Refresh the per-log head receipt durably. We already hold the log's exclusive
+/// lock, so there is no concurrent writer. The receipt is the truncation anchor;
+/// if the log line is durable but the receipt is lost or rolled back by more than
+/// one entry, `verify_audit_log` reports a false truncation. So the temp file is
+/// fsynced before the atomic rename, and the parent directory is fsynced after,
+/// before this returns. `Err` means the receipt is NOT durably on disk.
+fn write_head(log_path: &std::path::Path, receipt: &HeadReceipt) -> std::io::Result<()> {
     let hp = head_path(log_path);
-    let Ok(s) = serde_json::to_string(receipt) else {
-        return;
-    };
+    let s = serde_json::to_string(receipt)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let mut tmp_os = hp.as_os_str().to_owned();
     tmp_os.push(".tmp");
     let tmp = PathBuf::from(tmp_os);
-    if fs::write(&tmp, s.as_bytes()).is_ok() {
-        let _ = fs::rename(&tmp, &hp);
+
+    // Write + fsync the temp file so its bytes are durable before the rename.
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(s.as_bytes())?;
+        f.sync_all()?;
     }
+    // Atomic rename into place, then fsync the directory so the rename itself is
+    // durable (a rename is a directory metadata change).
+    fs::rename(&tmp, &hp)?;
+    if let Some(dir) = hp.parent() {
+        if let Ok(d) = fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// Optional ed25519 signing secret key (32 raw bytes). Signing is OPT-IN: it
@@ -434,9 +483,11 @@ pub struct AuditVerifyReport {
     pub problems: Vec<String>,
     /// Number of chained lines that carried a `sig`.
     pub signed_lines: usize,
-    /// Whether the head receipt records that signing was enabled for this log
-    /// (so a chained entry without `sig` is a downgrade, not a legitimately
-    /// unsigned line).
+    /// Whether this log is expected to carry signatures — true if the head
+    /// receipt records signing was enabled OR any retained line still carries a
+    /// `sig` (so the signal is also anchored in the chained data, not only in the
+    /// mutable sidecar). When true, a chained entry without `sig` is a downgrade,
+    /// and verification fails closed if no verifying key is available.
     pub signing_expected: bool,
 }
 
@@ -477,7 +528,21 @@ pub fn verify_audit_log(
     // chained entry missing `sig` is a downgrade (signature stripped) rather than
     // a legitimately unsigned line.
     let head = read_head(log_path);
-    report.signing_expected = head.as_ref().map(|h| h.signing_enabled).unwrap_or(false);
+    // "Signatures required" must NOT rest solely on the mutable `<log>.head`
+    // sidecar: an attacker could strip every `sig` AND rewrite the receipt to
+    // `signing_enabled: false`. So anchor the signal in the (hash-chained) log
+    // data too — if ANY retained line still carries a `sig`, signing was enabled
+    // and every chained line is expected to be signed. Stripping a single sig
+    // then becomes detectable from the lines that remain signed, independent of
+    // the sidecar. (The pre-scan is over the same lines we re-read below.)
+    let any_line_signed = lines.iter().any(|l| {
+        serde_json::from_str::<serde_json::Value>(l.trim())
+            .ok()
+            .and_then(|v| v.get("sig").and_then(|s| s.as_str()).map(|s| !s.is_empty()))
+            .unwrap_or(false)
+    });
+    report.signing_expected =
+        head.as_ref().map(|h| h.signing_enabled).unwrap_or(false) || any_line_signed;
     let mut hashes: Vec<String> = Vec::with_capacity(lines.len());
     let mut chaining_started = false;
 
@@ -520,10 +585,11 @@ pub fn verify_audit_log(
             if sig_present.is_some() {
                 report.signed_lines += 1;
             } else if report.signing_expected {
-                // The head receipt says this log is signed, but this chained
-                // entry has no `sig`. Because `sig` is excluded from the chain
-                // hash, stripping it leaves the chain intact and is otherwise
-                // invisible, so flag it as a signature downgrade.
+                // This log is signed (per the head receipt OR a still-signed line
+                // observed in the pre-scan), but this chained entry has no `sig`.
+                // Because `sig` is excluded from the chain hash, stripping it
+                // leaves the chain intact and is otherwise invisible, so flag it
+                // as a signature downgrade.
                 report.ok = false;
                 report.problems.push(format!(
                     "line {}: missing signature on a signed log (possible signature downgrade)",
@@ -562,6 +628,21 @@ pub fn verify_audit_log(
             ));
         }
         hashes.push(this_hash);
+    }
+
+    // Fail CLOSED when a signed log cannot actually be authenticated. If
+    // signatures are expected (head receipt OR an observed `sig`) but no public
+    // key (`audit-signing.pub`) is configured, the signatures present in the log
+    // were never verified above, so we cannot vouch for the log. Reporting `ok`
+    // here would let a signed log "pass" purely because the verifier lacks the
+    // key — a fail-open hole. Require the key to be present to call it verified.
+    if report.signing_expected && verify_key.is_none() {
+        report.ok = false;
+        report.problems.push(
+            "log is signed but no verifying key (audit-signing.pub) is available; \
+             cannot authenticate signatures"
+                .to_string(),
+        );
     }
 
     match head {
@@ -1490,7 +1571,8 @@ mod tests {
                 count: (lines.len() - 1) as u64,
                 signing_enabled: false,
             },
-        );
+        )
+        .expect("rewrite head receipt");
 
         let report = verify_audit_log(&log, None);
         assert!(
@@ -1527,7 +1609,8 @@ mod tests {
                 count: 1,
                 signing_enabled: false,
             },
-        );
+        )
+        .expect("rewrite head receipt");
 
         let report = verify_audit_log(&log, None);
         assert!(!report.ok, "a head matching no line must fail verification");
@@ -1604,6 +1687,116 @@ mod tests {
                 "a signature-downgrade problem must be reported: {:?}",
                 report.problems
             );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            std::env::remove_var("TIRITH_LOG");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_signed_log_without_pubkey_fails_closed() {
+        // A signed log must NOT verify `ok` when no verifying key is available:
+        // the signatures present were never checked, so the verifier cannot
+        // authenticate the log. Reporting ok here would be a fail-open hole.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        // Write ONLY the secret key (so appends sign) — deliberately NO pub key.
+        std::fs::write(cfg.join("tirith").join("audit-signing.key"), sk.to_bytes()).unwrap();
+
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("TIRITH_LOG", "1");
+            std::env::set_var("XDG_CONFIG_HOME", &cfg);
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            append_chain(&log, &["Allow", "Block", "Warn"]);
+
+            let report = verify_audit_log(&log, None);
+            assert!(
+                report.signing_expected,
+                "a log with signed lines must be treated as signing-expected"
+            );
+            assert!(
+                !report.ok,
+                "a signed log cannot verify ok without a verifying key"
+            );
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("no verifying key")),
+                "a missing-verifying-key problem must be reported: {:?}",
+                report.problems
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            std::env::remove_var("TIRITH_LOG");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_append_fails_when_signed_log_loses_its_key() {
+        // Once a log is signed, an append that cannot sign (key removed) must
+        // FAIL rather than silently write an unsigned line that verify cannot
+        // distinguish from a stripped-signature attack.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let key_path = cfg.join("tirith").join("audit-signing.key");
+        std::fs::write(&key_path, sk.to_bytes()).unwrap();
+
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("TIRITH_LOG", "1");
+            std::env::set_var("XDG_CONFIG_HOME", &cfg);
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            // First append signs (key present) and records signing_enabled.
+            let first = append_to_audit_log(&chain_test_entry("Allow"), Some(log.clone()));
+            assert!(
+                matches!(first, AuditWrite::Written(_)),
+                "the first signed append must succeed"
+            );
+
+            // Remove the key, then append again: signing now fails, and because
+            // the head receipt records signing_enabled, the write must FAIL.
+            std::fs::remove_file(&key_path).unwrap();
+            let second = append_to_audit_log(&chain_test_entry("Block"), Some(log.clone()));
+            assert!(
+                matches!(second, AuditWrite::Failed(_)),
+                "an append that cannot sign a previously signed log must fail"
+            );
+
+            // The poisoned unsigned line must NOT have been written.
+            let n = std::fs::read_to_string(&log).unwrap().lines().count();
+            assert_eq!(n, 1, "the unsigned entry must not have been appended");
         });
 
         // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.

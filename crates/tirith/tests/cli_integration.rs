@@ -14668,6 +14668,66 @@ fn defer_non_interactive_non_critical_block_exits_4_and_registers() {
     );
 }
 
+/// SECURITY: a deferred command carrying a credential must be REDACTED in the
+/// pending store, not stored verbatim. `tirith pending list`/`export` surface
+/// `command_redacted` later, so a raw token here would re-expose the secret.
+#[cfg(unix)]
+#[test]
+fn defer_redacts_secret_in_pending_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    // A non-critical (HIGH curl-pipe-shell) block whose command embeds a GitHub
+    // PAT-shaped token the built-in DLP redactor scrubs.
+    let token = format!("ghp_{}", "a".repeat(36));
+    let cmd = format!("curl https://example.com/install.sh?t={token} | bash");
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--no-daemon",
+            "--offline",
+            "--non-interactive",
+            "--defer",
+            "--",
+            &cmd,
+        ])
+        .env("XDG_STATE_HOME", &state)
+        .env_remove("TIRITH_INTERACTIVE")
+        .env_remove("TIRITH_DEFER")
+        .output()
+        .expect("run check --defer with a secret-bearing command");
+
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "the secret-bearing non-critical block should still defer to exit 4; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let store = pending_store(&state);
+    let body =
+        fs::read_to_string(&store).expect("pending.json should exist after a deferred block");
+    let map: serde_json::Value = serde_json::from_str(&body).expect("pending.json is valid JSON");
+    let entries = map.as_object().expect("pending store is a JSON object");
+    let entry = entries.values().next().expect("one deferred entry");
+    let stored = entry["command_redacted"].as_str().unwrap_or_default();
+
+    assert!(
+        !stored.contains(&token),
+        "the raw token must NOT be persisted in command_redacted: {stored}"
+    );
+    assert!(
+        stored.contains("[REDACTED"),
+        "the deferred command preview must carry a redaction marker: {stored}"
+    );
+    // The whole store file must not leak the secret anywhere either.
+    assert!(
+        !body.contains(&token),
+        "the raw token must not appear anywhere in the pending store"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn defer_non_interactive_critical_block_stays_hard_block() {
@@ -15054,9 +15114,19 @@ fn audit_verify_clean_chain_then_detects_tamper_and_expected_head() {
 
     // (2) Tamper a line: editing the genesis line breaks the next line's
     // prev_hash, so verification fails (exit 1, ok=false, a chain-break problem).
+    // Mutate UNCONDITIONALLY and in a content-agnostic way: rewrite a field value
+    // inside the genesis JSON so its canonical hash changes regardless of how the
+    // logged command was redacted. A trailing-whitespace edit would NOT work here
+    // because the verifier trims+re-canonicalizes each line before hashing, so the
+    // hash would be unchanged; overwriting a field value is what guarantees a break
+    // while keeping the line valid JSON (exercising the chain-break path, not the
+    // invalid-JSON path).
     let body = fs::read_to_string(&log).unwrap();
     let mut lines: Vec<String> = body.lines().map(String::from).collect();
-    lines[0] = lines[0].replace("ls -la", "EVIL-EDIT");
+    let mut genesis: serde_json::Value =
+        serde_json::from_str(&lines[0]).expect("genesis line is valid JSON");
+    genesis["command_redacted"] = serde_json::Value::String("EVIL-EDIT".to_string());
+    lines[0] = serde_json::to_string(&genesis).expect("re-serialize tampered genesis");
     fs::write(&log, lines.join("\n") + "\n").unwrap();
     let tampered = tirith()
         .args(["audit", "verify", "--json"])

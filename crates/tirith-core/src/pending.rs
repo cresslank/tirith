@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 /// Where a pending decision originated.
@@ -139,6 +140,59 @@ fn save_map(map: &BTreeMap<String, PendingDecision>) -> Result<(), String> {
     Ok(())
 }
 
+/// Path to the cross-process lock file guarding the store: `pending.json.lock`.
+///
+/// A DEDICATED lock file (stable inode) is used rather than locking `pending.json`
+/// directly, because `save_map` replaces the data file via an atomic temp+rename.
+/// Locking the data file and then renaming over it would let a second process
+/// acquire the lock on the now-stale inode and clobber the first writer; locking
+/// a separate file that is never renamed avoids that race while still serialising
+/// the whole load/modify/save sequence across processes.
+fn lock_path() -> Option<PathBuf> {
+    crate::policy::state_dir().map(|d| d.join("pending.json.lock"))
+}
+
+/// Run `mutate` over the store map under a cross-process exclusive lock, holding
+/// the lock across the entire load -> mutate -> save sequence so concurrent
+/// `register` / `resolve` / expiry calls cannot start from the same snapshot and
+/// clobber each other. Returns the closure's value on success. If the state dir
+/// is unavailable, the lock cannot be acquired, or the save fails, an `Err` is
+/// returned and the closure's effect is not persisted.
+fn with_store_locked<T, F>(mutate: F) -> Result<T, String>
+where
+    F: FnOnce(&mut BTreeMap<String, PendingDecision>) -> T,
+{
+    let lp = lock_path().ok_or_else(|| "state dir unavailable".to_string())?;
+    if let Some(dir) = lp.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create state dir: {e}"))?;
+    }
+
+    // Open (creating if needed) and exclusively lock the dedicated lock file.
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.mode(0o600);
+    }
+    let lock_file = open_opts
+        .open(&lp)
+        .map_err(|e| format!("open pending lock {}: {e}", lp.display()))?;
+    lock_file
+        .lock_exclusive()
+        .map_err(|e| format!("lock pending store {}: {e}", lp.display()))?;
+
+    // Critical section: load, mutate, save — all while the lock is held.
+    let mut map = load_map();
+    let out = mutate(&mut map);
+    let save_result = save_map(&map);
+
+    // Release the lock regardless of the save outcome.
+    let _ = FileExt::unlock(&lock_file);
+    save_result?;
+    Ok(out)
+}
+
 /// Generate an 8-char id from a v4 uuid (hyphen-stripped hex prefix).
 fn generate_id() -> String {
     uuid::Uuid::new_v4()
@@ -160,23 +214,25 @@ fn now_rfc3339() -> String {
 /// chance of a collision with an existing entry). `created_at` is filled in
 /// when empty. The updated map is written atomically.
 pub fn register(mut decision: PendingDecision) -> Result<String, String> {
-    let mut map = load_map();
-
-    if decision.id.trim().is_empty() {
-        let mut id = generate_id();
-        while map.contains_key(&id) {
-            id = generate_id();
+    // The whole id-generation + insert + save runs under the cross-process lock,
+    // so two concurrent registers cannot pick the same generated id off the same
+    // snapshot or drop each other's entry.
+    with_store_locked(move |map| {
+        if decision.id.trim().is_empty() {
+            let mut id = generate_id();
+            while map.contains_key(&id) {
+                id = generate_id();
+            }
+            decision.id = id;
         }
-        decision.id = id;
-    }
-    if decision.created_at.trim().is_empty() {
-        decision.created_at = now_rfc3339();
-    }
+        if decision.created_at.trim().is_empty() {
+            decision.created_at = now_rfc3339();
+        }
 
-    let id = decision.id.clone();
-    map.insert(id.clone(), decision);
-    save_map(&map)?;
-    Ok(id)
+        let id = decision.id.clone();
+        map.insert(id.clone(), decision);
+        id
+    })
 }
 
 /// Resolve a pending decision idempotently.
@@ -196,51 +252,50 @@ pub fn resolve(
         return Ok(false);
     }
 
-    let mut map = load_map();
-    let Some(entry) = map.get_mut(id) else {
-        return Ok(false);
-    };
-    if entry.status.is_resolved() {
-        return Ok(false);
-    }
-
-    entry.status = status;
-    entry.resolved_at = Some(now_rfc3339());
-    entry.reason = reason;
-    entry.resolved_by = resolved_by;
-
-    save_map(&map)?;
-    Ok(true)
+    // Load + check + mutate + save under the cross-process lock so a concurrent
+    // resolve/expire cannot race the status transition.
+    with_store_locked(move |map| {
+        let Some(entry) = map.get_mut(id) else {
+            return false;
+        };
+        if entry.status.is_resolved() {
+            return false;
+        }
+        entry.status = status;
+        entry.resolved_at = Some(now_rfc3339());
+        entry.reason = reason;
+        entry.resolved_by = resolved_by;
+        true
+    })
 }
 
 /// Mark every still-`Pending` entry older than `secs` seconds as `Expired`.
 /// Returns the number of entries transitioned. Entries with an unparseable
 /// `created_at` are left untouched.
 pub fn expire_older_than(secs: i64) -> Result<usize, String> {
-    let mut map = load_map();
     let cutoff = chrono::Utc::now() - chrono::Duration::seconds(secs);
-    let mut expired = 0usize;
 
-    for entry in map.values_mut() {
-        if entry.status.is_resolved() {
-            continue;
+    // Sweep + save under the cross-process lock so the load/modify/save cannot be
+    // clobbered by a concurrent register/resolve.
+    with_store_locked(move |map| {
+        let mut expired = 0usize;
+        for entry in map.values_mut() {
+            if entry.status.is_resolved() {
+                continue;
+            }
+            let created = match chrono::DateTime::parse_from_rfc3339(&entry.created_at) {
+                Ok(t) => t.with_timezone(&chrono::Utc),
+                Err(_) => continue,
+            };
+            if created < cutoff {
+                entry.status = PendingStatus::Expired;
+                entry.resolved_at = Some(now_rfc3339());
+                entry.resolved_by = Some("expiry".to_string());
+                expired += 1;
+            }
         }
-        let created = match chrono::DateTime::parse_from_rfc3339(&entry.created_at) {
-            Ok(t) => t.with_timezone(&chrono::Utc),
-            Err(_) => continue,
-        };
-        if created < cutoff {
-            entry.status = PendingStatus::Expired;
-            entry.resolved_at = Some(now_rfc3339());
-            entry.resolved_by = Some("expiry".to_string());
-            expired += 1;
-        }
-    }
-
-    if expired > 0 {
-        save_map(&map)?;
-    }
-    Ok(expired)
+        expired
+    })
 }
 
 /// All decisions, newest first (by `created_at`, then id for stability).
@@ -343,6 +398,54 @@ mod tests {
         })();
 
         // Restore env regardless of assertion outcome.
+        match prev {
+            Some(val) => unsafe { std::env::set_var("XDG_STATE_HOME", val) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
+        result
+    }
+
+    #[test]
+    fn concurrent_registers_do_not_lose_entries() {
+        // Without an interprocess lock, two register() calls that load the same
+        // snapshot and save back race: the last rename wins and drops the other
+        // entry. With the lock held across load/modify/save, every entry lands.
+        // fs2 uses flock() on Unix, which serialises distinct file handles even
+        // within one process, so threads here genuinely contend on the lock.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var("XDG_STATE_HOME").ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+
+        let result = (|| {
+            const THREADS: usize = 8;
+            const PER_THREAD: usize = 3;
+            std::thread::scope(|scope| {
+                for t in 0..THREADS {
+                    scope.spawn(move || {
+                        for i in 0..PER_THREAD {
+                            let mut d = sample(PendingSource::Finding, "low");
+                            // A stable, unique id per (thread, i) so we can count
+                            // exact survivors regardless of generation.
+                            d.id = format!("t{t:02}i{i}");
+                            let _ = register(d);
+                        }
+                    });
+                }
+            });
+
+            let all = load_all();
+            assert_eq!(
+                all.len(),
+                THREADS * PER_THREAD,
+                "every concurrent register must survive the lock-protected save"
+            );
+        })();
+
         match prev {
             Some(val) => unsafe { std::env::set_var("XDG_STATE_HOME", val) },
             None => unsafe { std::env::remove_var("XDG_STATE_HOME") },

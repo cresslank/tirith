@@ -528,7 +528,7 @@ pub fn check(
     // config files that legitimately carry URLs (mcp.json, settings.json, ...)
     // are excluded so they stay unaffected.
     if let Some(path) = file_path {
-        if is_agent_memory_file(path) {
+        if is_agent_memory_file(path, repo_root) {
             check_memory_content_signals(content, is_known, &mut findings);
         }
     }
@@ -871,11 +871,26 @@ const AGENT_MEMORY_DIRS: &[(&[&str], &[&str])] = &[
 /// URL). This is a NARROW subset of the known-config surface; non-memory config
 /// files (mcp.json, settings.json, ...) are excluded so their legitimate URLs
 /// do not false-positive.
-fn is_agent_memory_file(path: &Path) -> bool {
+fn is_agent_memory_file(path: &Path, repo_root: Option<&Path>) -> bool {
+    // Directory-anchored matches below (`.hermes`, `.claude/memory`) are
+    // ROOT-ANCHORED: the memory dir must be the path's LEADING component(s). An
+    // absolute path carries the repo's own folder components first (e.g.
+    // `/home/me/repo/.hermes/notes.md`), so the anchor would never line up. Strip
+    // the repo root first when the path is absolute and the root is known, so an
+    // absolute and a repo-relative path normalize to the same component list.
+    let normalized: &Path = if path.is_absolute() {
+        match repo_root {
+            Some(root) => path.strip_prefix(root).unwrap_or(path),
+            None => path,
+        }
+    } else {
+        path
+    };
+
     // Normalize to forward components, dropping any prefix/root so the check is
     // the same for repo-relative and absolute paths. ParentDir/Prefix bail out.
     let mut components: Vec<String> = Vec::new();
-    for c in path.components() {
+    for c in normalized.components() {
         match c {
             Component::CurDir | Component::RootDir => continue,
             Component::Prefix(_) | Component::ParentDir => return false,
@@ -899,7 +914,7 @@ fn is_agent_memory_file(path: &Path) -> bool {
     // at least one component (the file) beyond the dir prefix, AND the file's
     // extension must be in the dir's allowed set (so the content-scan surface
     // matches the extension-gated KNOWN_CONFIG_DEEP_DIRS surface, not every blob).
-    let ext_lower = path
+    let ext_lower = normalized
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
@@ -2155,33 +2170,83 @@ mod tests {
 
     #[test]
     fn test_is_agent_memory_file_subset() {
-        // In-subset memory/instruction files.
-        assert!(is_agent_memory_file(Path::new("CLAUDE.md")));
-        assert!(is_agent_memory_file(Path::new(".cursorrules")));
-        assert!(is_agent_memory_file(Path::new(".clinerules")));
-        assert!(is_agent_memory_file(Path::new(".windsurfrules")));
-        assert!(is_agent_memory_file(Path::new("AGENTS.md")));
-        assert!(is_agent_memory_file(Path::new(".aider.conf.yml")));
-        assert!(is_agent_memory_file(Path::new(".aider.conf.yaml")));
-        assert!(is_agent_memory_file(Path::new("agent-memory.json")));
-        assert!(is_agent_memory_file(Path::new("memories.json")));
-        assert!(is_agent_memory_file(Path::new(".hermes/notes.md")));
-        assert!(is_agent_memory_file(Path::new(".hermes/state.json")));
-        assert!(is_agent_memory_file(Path::new(".hermes/config.yaml")));
-        assert!(is_agent_memory_file(Path::new(".claude/memory/prefs.md")));
-        assert!(is_agent_memory_file(Path::new(".claude/memory/store.json")));
+        // In-subset memory/instruction files (repo-relative; no root needed).
+        assert!(is_agent_memory_file(Path::new("CLAUDE.md"), None));
+        assert!(is_agent_memory_file(Path::new(".cursorrules"), None));
+        assert!(is_agent_memory_file(Path::new(".clinerules"), None));
+        assert!(is_agent_memory_file(Path::new(".windsurfrules"), None));
+        assert!(is_agent_memory_file(Path::new("AGENTS.md"), None));
+        assert!(is_agent_memory_file(Path::new(".aider.conf.yml"), None));
+        assert!(is_agent_memory_file(Path::new(".aider.conf.yaml"), None));
+        assert!(is_agent_memory_file(Path::new("agent-memory.json"), None));
+        assert!(is_agent_memory_file(Path::new("memories.json"), None));
+        assert!(is_agent_memory_file(Path::new(".hermes/notes.md"), None));
+        assert!(is_agent_memory_file(Path::new(".hermes/state.json"), None));
+        assert!(is_agent_memory_file(Path::new(".hermes/config.yaml"), None));
+        assert!(is_agent_memory_file(
+            Path::new(".claude/memory/prefs.md"),
+            None
+        ));
+        assert!(is_agent_memory_file(
+            Path::new(".claude/memory/store.json"),
+            None
+        ));
+        // A leading `./` must not defeat the directory-anchored match.
+        assert!(is_agent_memory_file(Path::new("./.hermes/notes.md"), None));
         // The directory-anchored match is extension-gated to the same surface as
         // KNOWN_CONFIG_DEEP_DIRS: a non-allowed extension under a memory dir is
         // NOT content-scanned (so `.hermes/blob.bin` stays out of the subset).
-        assert!(!is_agent_memory_file(Path::new(".hermes/blob.bin")));
-        assert!(!is_agent_memory_file(Path::new(".claude/memory/data.bin")));
+        assert!(!is_agent_memory_file(Path::new(".hermes/blob.bin"), None));
+        assert!(!is_agent_memory_file(
+            Path::new(".claude/memory/data.bin"),
+            None
+        ));
         // NOT in subset: MCP / IDE config files that legitimately carry URLs.
-        assert!(!is_agent_memory_file(Path::new("mcp.json")));
-        assert!(!is_agent_memory_file(Path::new(".mcp.json")));
-        assert!(!is_agent_memory_file(Path::new(".vscode/mcp.json")));
-        assert!(!is_agent_memory_file(Path::new(".claude/settings.json")));
-        assert!(!is_agent_memory_file(Path::new(".codex/config.toml")));
-        assert!(!is_agent_memory_file(Path::new("README.md")));
+        assert!(!is_agent_memory_file(Path::new("mcp.json"), None));
+        assert!(!is_agent_memory_file(Path::new(".mcp.json"), None));
+        assert!(!is_agent_memory_file(Path::new(".vscode/mcp.json"), None));
+        assert!(!is_agent_memory_file(
+            Path::new(".claude/settings.json"),
+            None
+        ));
+        assert!(!is_agent_memory_file(Path::new(".codex/config.toml"), None));
+        assert!(!is_agent_memory_file(Path::new("README.md"), None));
+    }
+
+    #[test]
+    fn test_is_agent_memory_file_absolute_path_normalized() {
+        // An ABSOLUTE path whose memory dir is NOT the leading component must
+        // still match once the repo root is stripped. Before normalization the
+        // directory-anchored check failed (leading components were the repo
+        // folder, not `.hermes` / `.claude`).
+        let root = Path::new("/home/me/repo");
+        assert!(
+            is_agent_memory_file(Path::new("/home/me/repo/.hermes/notes.md"), Some(root)),
+            "absolute .hermes path under repo root must match after stripping the root"
+        );
+        assert!(
+            is_agent_memory_file(
+                Path::new("/home/me/repo/.claude/memory/prefs.md"),
+                Some(root)
+            ),
+            "absolute .claude/memory path under repo root must match"
+        );
+        // Basename-only matches do not depend on the dir anchor, so they match
+        // even with an absolute path and no root.
+        assert!(is_agent_memory_file(
+            Path::new("/home/me/repo/CLAUDE.md"),
+            None
+        ));
+        // A non-memory config under the repo must still NOT match after stripping.
+        assert!(!is_agent_memory_file(
+            Path::new("/home/me/repo/.claude/settings.json"),
+            Some(root)
+        ));
+        // Extension gate still applies to the normalized absolute path.
+        assert!(!is_agent_memory_file(
+            Path::new("/home/me/repo/.hermes/blob.bin"),
+            Some(root)
+        ));
     }
 
     #[test]

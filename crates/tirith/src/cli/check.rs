@@ -454,7 +454,16 @@ pub fn run(
                 severity: max_sev
                     .map(|s| s.to_string().to_lowercase())
                     .unwrap_or_default(),
-                command_redacted: cmd.chars().take(120).collect(),
+                // SECURITY: this is persisted to state_dir()/pending.json and
+                // later surfaced verbatim by `tirith pending list` / `export`, so
+                // a raw truncation would leak any token/credential in the command.
+                // Apply the SAME DLP redaction the audit log uses (built-in +
+                // policy custom patterns) on the FULL command, THEN truncate, so a
+                // secret straddling the 120-char boundary is still scrubbed.
+                command_redacted: tirith_core::util::truncate_bytes(
+                    &tirith_core::redact::redact_command_text(cmd, &policy.dlp_custom_patterns),
+                    120,
+                ),
                 status: tirith_core::pending::PendingStatus::Pending,
                 resolved_at: None,
                 resolved_by: None,

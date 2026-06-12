@@ -573,7 +573,7 @@ pub fn post_process_verdict(
         Vec::new()
     };
     if !correlation_hits.is_empty() {
-        for hit in correlation_hits {
+        for hit in &correlation_hits {
             let mut severity = hit.severity;
             if let Some(override_sev) = policy.severity_override(&hit.rule_id) {
                 severity = override_sev;
@@ -581,10 +581,10 @@ pub fn post_process_verdict(
             effective.findings.push(Finding {
                 rule_id: hit.rule_id,
                 severity,
-                title: hit.title,
+                title: hit.title.clone(),
                 description: hit.description.clone(),
                 evidence: vec![Evidence::Text {
-                    detail: hit.description,
+                    detail: hit.description.clone(),
                 }],
                 human_view: None,
                 agent_view: None,
@@ -592,6 +592,16 @@ pub fn post_process_verdict(
                 custom_rule_id: None,
             });
         }
+        // Persist the freshly-surfaced correlation hits as warning events. This
+        // runs AFTER `record_outcome` above, so without it a correlation that
+        // upgraded an otherwise-Allow command would never reach SessionWarnings
+        // and `tirith warnings` / repeat-count logic would miss the first hit.
+        crate::session_warnings::record_correlation_findings(
+            session_id,
+            &correlation_hits,
+            cmd,
+            &policy.dlp_custom_patterns,
+        );
         // Re-derive the action from the augmented finding set, only ever raising
         // it (a correlation must never weaken an existing Block/Warn).
         effective.action =
@@ -850,24 +860,50 @@ fn first_path_arg(args: &[String]) -> Option<String> {
     args.iter().find(|a| !a.starts_with('-')).cloned()
 }
 
-/// True if `args` (the args AFTER `git`) describe a force-push: a `push`
-/// subcommand together with `--force`, `-f`, or `--force-with-lease`.
+/// True if `args` (the args AFTER `git`) describe a force-push: the git
+/// SUBCOMMAND is `push` AND a force flag (`--force`, `-f`, `--force-with-lease`)
+/// is present. The subcommand is the first token that is neither a global option
+/// nor a global option's value, so a `-f` belonging to a different subcommand
+/// (e.g. `git tag -f push`) does NOT count: there the subcommand is `tag`, not
+/// `push`. Global options before the subcommand (`git -c k=v push --force`,
+/// `git -C dir push --force`) are skipped, including the separate value that
+/// `-c` / `-C` consume.
 fn git_is_force_push(args: &[String]) -> bool {
-    let mut saw_push = false;
-    let mut saw_force = false;
-    for a in args {
-        if a == "push" {
-            saw_push = true;
-        }
-        if a == "--force"
+    let Some(subcommand) = git_subcommand(args) else {
+        return false;
+    };
+    if subcommand != "push" {
+        return false;
+    }
+    args.iter().any(|a| {
+        a == "--force"
             || a == "-f"
             || a == "--force-with-lease"
             || a.starts_with("--force-with-lease=")
-        {
-            saw_force = true;
+    })
+}
+
+/// The git subcommand: the first token that is neither a global option nor the
+/// value a value-taking global option consumes. `-c <name=value>` and `-C <path>`
+/// take a SEPARATE following token, so that token is skipped too (otherwise it
+/// would be mistaken for the subcommand). Other `--opt=value` global options are
+/// self-contained and skipped by the leading-`-` test.
+fn git_subcommand(args: &[String]) -> Option<&String> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a.starts_with('-') {
+            // `-c` / `-C` in their separate-value form consume the next token.
+            if (a == "-c" || a == "-C") && i + 1 < args.len() {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
         }
+        return Some(a);
     }
-    saw_push && saw_force
+    None
 }
 
 /// True if `args` contain a package-install subcommand (`install`, `i`, `add`,
@@ -911,8 +947,10 @@ fn write_target(seg: &tokenize::Segment, leader_base: &str, args: &[String]) -> 
         return Some(path);
     }
 
-    // 2) Downloader output flag: `curl -o .env`, `wget -O id_rsa`.
-    if matches!(leader_base, "curl" | "wget" | "http" | "xh") {
+    // 2) Downloader output flag: `curl -o .env`, `wget -O id_rsa`. Includes the
+    // `https` HTTPie alias so it stays in sync with the network-leader match above
+    // (otherwise `https ... --output .env` would miss the SecretWrite event).
+    if matches!(leader_base, "curl" | "wget" | "http" | "https" | "xh") {
         let mut want_value = false;
         for a in args {
             if want_value {
@@ -1946,6 +1984,21 @@ mod tests {
     }
 
     #[test]
+    fn derive_secret_write_from_httpie_https_output_flag() {
+        // The `https` HTTPie alias is a network leader (line 707), so its
+        // `--output` target must also be detected as a SecretWrite; otherwise
+        // `https ... --output .env` would silently drop the follow-on correlation.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let events = derive_typed_events("https example.com/k --output .env", &v);
+        let ks = kinds(&events);
+        assert!(
+            ks.contains(&EventKind::SecretWrite),
+            "https --output .env must record a SecretWrite: {ks:?}"
+        );
+        assert!(ks.contains(&EventKind::Network));
+    }
+
+    #[test]
     fn derive_non_secret_write_records_nothing() {
         // Writing an ordinary file is NOT recorded from the command string.
         let v = raw_verdict_with(Action::Allow, vec![], None);
@@ -1982,9 +2035,28 @@ mod tests {
                 .contains(&EventKind::GitForcePush)
         );
         assert!(kinds(&derive_typed_events("git push -f", &v)).contains(&EventKind::GitForcePush));
+        assert!(kinds(&derive_typed_events(
+            "git push --force-with-lease origin main",
+            &v
+        ))
+        .contains(&EventKind::GitForcePush));
+        // A force flag before the subcommand still counts (subcommand is `push`).
+        assert!(kinds(&derive_typed_events("git -c k=v push --force", &v))
+            .contains(&EventKind::GitForcePush));
         // A plain push is NOT a force-push.
         assert!(!kinds(&derive_typed_events("git push origin main", &v))
             .contains(&EventKind::GitForcePush));
+        // A `-f` belonging to a DIFFERENT subcommand must NOT synthesize a
+        // GitForcePush, even though a `push` token appears as an argument.
+        assert!(
+            !kinds(&derive_typed_events("git tag -f push", &v)).contains(&EventKind::GitForcePush),
+            "`git tag -f push` is not a force-push (subcommand is `tag`)"
+        );
+        assert!(
+            !kinds(&derive_typed_events("git branch -f push origin/main", &v))
+                .contains(&EventKind::GitForcePush),
+            "`git branch -f push` is not a force-push (subcommand is `branch`)"
+        );
     }
 
     #[test]
@@ -2095,6 +2167,24 @@ mod tests {
                 out2.action,
                 Action::Block,
                 "a Critical correlation must escalate the action to Block"
+            );
+
+            // The correlation hit must be PERSISTED to the session (not just
+            // returned in the verdict): `record_outcome` ran before the W7 block,
+            // so the correlation is recorded in a dedicated second pass. Without
+            // it `tirith warnings` and repeat-count logic would miss this hit.
+            let session = crate::session_warnings::load(session_id);
+            assert!(
+                session
+                    .events
+                    .iter()
+                    .any(|e| e.rule_id == RuleId::SecretWriteThenNetwork.to_string()),
+                "the surfaced correlation must be persisted as a session warning event: {:?}",
+                session
+                    .events
+                    .iter()
+                    .map(|e| &e.rule_id)
+                    .collect::<Vec<_>>()
             );
 
             // Dedup: a THIRD command that ALSO records a network event (so

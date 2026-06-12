@@ -233,15 +233,17 @@ pub fn list() -> Result<Vec<CheckpointListEntry>, String> {
     Ok(entries)
 }
 
-/// Validate that a restore path does not contain path traversal components
-/// or absolute paths.
+/// Validate that a restore path does not contain `..` traversal components.
+///
+/// Absolute paths are ALLOWED: `create()` records `original_path` verbatim, and
+/// the auto-checkpoint path feeds it an absolute cwd, so a checkpoint of an
+/// absolute path is legitimate and must restore. The escape risk that remains
+/// (a destination reached through a symlink) is handled separately by
+/// [`reject_symlinked_restore_dest`], which is the real overwrite guard. We still
+/// reject `..` here so a crafted manifest cannot climb out of an otherwise
+/// in-tree path.
 fn validate_restore_path(path: &str) -> Result<(), String> {
     let p = Path::new(path);
-    // `Path::is_absolute()` on Windows only matches paths with a drive letter,
-    // so also reject Unix-style absolute paths explicitly on all platforms.
-    if p.is_absolute() || path.starts_with('/') {
-        return Err(format!("restore path is absolute: {path}"));
-    }
     for component in p.components() {
         if matches!(component, std::path::Component::ParentDir) {
             return Err(format!("restore path contains '..': {path}"));
@@ -349,9 +351,17 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
             continue; // Directories are created implicitly when their children restore.
         }
 
-        validate_restore_path(&entry.original_path)?;
-        validate_sha256_filename(&entry.sha256)?;
         report.attempted += 1;
+        // A bad path/sha in ONE manifest entry must not abort the whole restore:
+        // bucket it into errors and move on so the remaining entries still run.
+        if let Err(e) = validate_restore_path(&entry.original_path) {
+            report.errors.push((entry.original_path.clone(), e));
+            continue;
+        }
+        if let Err(e) = validate_sha256_filename(&entry.sha256) {
+            report.errors.push((entry.original_path.clone(), e));
+            continue;
+        }
 
         let src = files_dir.join(&entry.sha256);
         if !src.exists() {
@@ -1022,17 +1032,21 @@ mod tests {
 
     #[test]
     fn test_validate_restore_path_rejects_traversal() {
+        // `..` traversal is always rejected, including inside an absolute path.
         assert!(validate_restore_path("../../etc/passwd").is_err());
         assert!(validate_restore_path("/tmp/../etc/evil").is_err());
         assert!(validate_restore_path("normal/path/file.txt").is_ok());
-        // Unix-style absolute paths must be rejected on all platforms
+        // Absolute paths are ALLOWED: create() records original_path verbatim
+        // (the auto-checkpoint feeds an absolute cwd), so a legitimate absolute
+        // checkpoint must restore. Symlink-overwrite escape is guarded separately
+        // by reject_symlinked_restore_dest, not by this path validator.
         assert!(
-            validate_restore_path("/absolute/path/file.txt").is_err(),
-            "absolute paths should be rejected"
+            validate_restore_path("/absolute/path/file.txt").is_ok(),
+            "absolute paths must be allowed (create() writes them verbatim)"
         );
         assert!(
-            validate_restore_path("/etc/passwd").is_err(),
-            "absolute paths should be rejected"
+            validate_restore_path("/etc/passwd").is_ok(),
+            "a plain absolute path is allowed; symlink escape is guarded elsewhere"
         );
     }
 
@@ -1351,6 +1365,80 @@ mod tests {
             sentinel_after.as_deref(),
             Some("SENTINEL DO NOT OVERWRITE"),
             "restore must NOT write through the symlink to the outside target"
+        );
+    }
+
+    /// Regression: `create()` records `original_path` verbatim, so an absolute
+    /// checkpoint path (what the auto-checkpoint feeds from an absolute cwd) must
+    /// RESTORE, not be rejected as "restore path is absolute". The first such
+    /// entry must also not abort the whole report.
+    #[cfg(unix)]
+    #[test]
+    fn test_restore_reported_absolute_path_restores() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let state_dir = tmpdir.path().join("state");
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_log = std::env::var("TIRITH_LOG").ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &state_dir);
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        // An ABSOLUTE path under the tempdir (not a symlink) — exactly the shape
+        // create() records for an auto-checkpoint of an absolute target. Canonicalize
+        // the base first: on macOS the temp root is under `/var`, a symlink to
+        // `/private/var`, which the (correct) symlinked-ancestor guard would
+        // otherwise reject. Canonicalizing removes that incidental symlink so the
+        // test exercises the absolute-path-allowed behavior, not the symlink guard.
+        let work_dir = tmpdir.path().join("work");
+        fs::create_dir_all(&work_dir).unwrap();
+        let abs_file = fs::canonicalize(&work_dir).unwrap().join("data.txt");
+        fs::write(&abs_file, "original bytes").unwrap();
+        let abs_str = abs_file.to_string_lossy().to_string();
+
+        let run = || -> Result<RestoreReport, String> {
+            let meta = create(&[abs_str.as_str()], Some("rm -rf work"))?;
+            // Mutate the live file so a successful restore is observable.
+            fs::write(&abs_file, "MUTATED").map_err(|e| format!("rewrite: {e}"))?;
+            restore_reported(&meta.id)
+        };
+
+        let result = run();
+        let live = fs::read_to_string(&abs_file).ok();
+
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("TIRITH_LOG", v),
+                None => std::env::remove_var("TIRITH_LOG"),
+            }
+        }
+
+        let report = result.expect("restore_reported should succeed");
+        assert_eq!(
+            report.attempted, 1,
+            "the absolute entry is attempted: {report:?}"
+        );
+        assert!(
+            report.restored.contains(&abs_str),
+            "an absolute checkpoint path must restore, not be rejected: {report:?}"
+        );
+        assert!(
+            report.errors.is_empty(),
+            "a legitimate absolute path must not land in errors: {report:?}"
+        );
+        assert_eq!(
+            live.as_deref(),
+            Some("original bytes"),
+            "the live file must be restored to its checkpointed bytes"
         );
     }
 

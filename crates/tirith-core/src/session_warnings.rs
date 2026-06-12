@@ -451,6 +451,63 @@ pub fn correlate_session(session_id: &str) -> Vec<crate::event_buffer::Correlati
     fresh
 }
 
+/// W7: persist freshly-surfaced cross-event correlation hits as warning events.
+///
+/// `correlate_session` only records the de-duplication *markers* (signatures) and
+/// returns the hits; the hits themselves are appended to the verdict's findings
+/// by the caller AFTER `record_outcome` has already run. Without this second
+/// pass, a correlation that upgrades an otherwise-`Allow` command to `Warn`/`Block`
+/// would never land in `SessionWarnings`, so `tirith warnings` and repeat-count
+/// logic would miss the first surfaced correlation hit. Recording them here as
+/// `WarningEvent`s closes that gap. Best-effort and off the hot path.
+pub fn record_correlation_findings(
+    session_id: &str,
+    hits: &[crate::event_buffer::CorrelationHit],
+    cmd: &str,
+    dlp_patterns: &[String],
+) {
+    if hits.is_empty() {
+        return;
+    }
+
+    // Redact + truncate outside the lock to minimise hold time (mirrors
+    // `record_outcome`).
+    let command_redacted = crate::redact::redact_command_text(cmd, dlp_patterns);
+    let command_redacted = crate::util::truncate_bytes(&command_redacted, 120);
+    let now = chrono::Utc::now().to_rfc3339();
+
+    struct HitData {
+        rule_id: String,
+        severity: String,
+        title: String,
+    }
+    let hit_data: Vec<HitData> = hits
+        .iter()
+        .map(|h| HitData {
+            rule_id: h.rule_id.to_string(),
+            severity: h.severity.to_string(),
+            title: crate::util::truncate_bytes(&h.title, 120),
+        })
+        .collect();
+
+    with_session_locked(session_id, |session| {
+        for hd in &hit_data {
+            session.events.push_back(WarningEvent {
+                timestamp: now.clone(),
+                rule_id: hd.rule_id.clone(),
+                severity: hd.severity.clone(),
+                title: hd.title.clone(),
+                command_redacted: command_redacted.clone(),
+                domains: Vec::new(),
+            });
+            session.total_warnings = session.total_warnings.saturating_add(1);
+        }
+        while session.events.len() > MAX_EVENTS {
+            session.events.pop_front();
+        }
+    });
+}
+
 /// Shared atomic lock-read-modify-write: open the session file, take an
 /// exclusive lock, read-or-create state, run `mutate`, write back, unlock, GC.
 /// All I/O is best-effort; failures are logged and never panic.
