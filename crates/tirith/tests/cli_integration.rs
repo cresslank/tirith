@@ -15032,9 +15032,16 @@ fn audit_verify_clean_chain_then_detects_tamper_and_expected_head() {
 
     // Capture the correct tail hash for the --expected-head check by re-reading
     // it from the human output is awkward, so derive it from a known-good run:
-    // a correct --expected-head exits 0, a wrong one exits 1.
+    // a correct --expected-head exits 0, a wrong one exits 1. Use a canonical
+    // 64-hex-char (sha256-shaped) fake so this exercises mismatch behavior rather
+    // than any future arg-length validation that would reject a short hash.
     let wrong_head = tirith()
-        .args(["audit", "verify", "--expected-head", "deadbeefdeadbeef"])
+        .args([
+            "audit",
+            "verify",
+            "--expected-head",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        ])
         .env("XDG_DATA_HOME", &data)
         .env("XDG_CONFIG_HOME", &cfg)
         .output()

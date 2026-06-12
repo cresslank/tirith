@@ -250,6 +250,43 @@ fn validate_restore_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuse a restore destination that is reached through a symlink. `fs::copy`
+/// follows symlinks at the destination, so an attacker who repoints `dst` (or
+/// any existing parent component) at a path outside the working tree could
+/// redirect the restored bytes there. We reject if `dst` itself is a symlink, or
+/// if any existing ancestor component is a symlink. `symlink_metadata` does NOT
+/// follow links, so a missing component (yet to be created by `create_dir_all`)
+/// simply yields no metadata and is skipped. Only a present symlink trips this.
+fn reject_symlinked_restore_dest(dst: &Path) -> Result<(), String> {
+    // The destination file: a symlink here would have `fs::copy` write through it.
+    if let Ok(meta) = fs::symlink_metadata(dst) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "refusing to restore through symlink at destination: {}",
+                dst.display()
+            ));
+        }
+    }
+    // Every existing ancestor: a symlinked directory in the path could escape the
+    // tree even though the leaf itself is not (yet) a link.
+    let mut cur = dst.parent();
+    while let Some(p) = cur {
+        if p.as_os_str().is_empty() {
+            break;
+        }
+        if let Ok(meta) = fs::symlink_metadata(p) {
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing to restore through symlinked parent directory: {}",
+                    p.display()
+                ));
+            }
+        }
+        cur = p.parent();
+    }
+    Ok(())
+}
+
 /// Validate that a SHA-256 filename is exactly 64 lowercase hex characters.
 fn validate_sha256_filename(sha: &str) -> Result<(), String> {
     if sha.len() != 64
@@ -351,6 +388,16 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
         }
 
         let dst = Path::new(&entry.original_path);
+
+        // Refuse to write through a symlink. `fs::copy` follows symlinks at the
+        // destination, so a repointed symlink at `dst` (or any existing parent
+        // component) could redirect the write outside the intended tree. Reject
+        // the entry and leave whatever the link points at untouched.
+        if let Err(e) = reject_symlinked_restore_dest(dst) {
+            report.errors.push((entry.original_path.clone(), e));
+            continue;
+        }
+
         if let Some(parent) = dst.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
                 report.errors.push((
@@ -1225,6 +1272,85 @@ mod tests {
                 .map(|d| d.contains("restored=2"))
                 .unwrap_or(false),
             "restore audit detail must report restored=2: {v}"
+        );
+    }
+
+    /// Security: a restore destination that has become a symlink (e.g. an
+    /// attacker repointed it at a file outside the working tree) must be REFUSED.
+    /// `fs::copy` follows destination symlinks, so without the guard the restored
+    /// bytes would be written through the link. The entry must land in `errors`
+    /// and the symlink's target file must be left untouched.
+    #[cfg(unix)]
+    #[test]
+    fn test_restore_refuses_symlinked_destination() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let workdir = tmpdir.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        // The sentinel lives OUTSIDE the workdir; a followed symlink would clobber it.
+        let outside = tmpdir.path().join("outside_secret.txt");
+        fs::write(&outside, "SENTINEL DO NOT OVERWRITE").unwrap();
+
+        let state_dir = tmpdir.path().join("state");
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_log = std::env::var("TIRITH_LOG").ok();
+        let prev_cwd = std::env::current_dir().ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &state_dir);
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let name = "victim.txt";
+        let outside_for_run = outside.clone();
+        let run = || -> Result<RestoreReport, String> {
+            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
+            fs::write(name, "checkpointed bytes").map_err(|e| format!("write: {e}"))?;
+            let meta = create(&[name], Some("rm -rf project"))?;
+            // Remove the live file and replace it with a symlink that escapes the
+            // tree, pointing at the sentinel. A naive `fs::copy` would follow it.
+            fs::remove_file(name).map_err(|e| format!("rm: {e}"))?;
+            std::os::unix::fs::symlink(&outside_for_run, name)
+                .map_err(|e| format!("symlink: {e}"))?;
+            restore_reported(&meta.id)
+        };
+
+        let result = run();
+        let sentinel_after = fs::read_to_string(&outside).ok();
+
+        // Restore cwd + env before assertions so cleanup runs even on failure.
+        if let Some(dir) = prev_cwd {
+            let _ = std::env::set_current_dir(dir);
+        }
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("TIRITH_LOG", v),
+                None => std::env::remove_var("TIRITH_LOG"),
+            }
+        }
+
+        let report = result.expect("restore_reported should run");
+        assert!(
+            !report.restored.contains(&name.to_string()),
+            "a symlinked destination must not be reported as restored: {report:?}"
+        );
+        assert!(
+            report.errors.iter().any(|(p, msg)| p == name
+                && (msg.contains("symlink") || msg.contains("symlinked"))),
+            "the symlinked destination must be recorded as an error: {report:?}"
+        );
+        // The link target outside the tree must be byte-for-byte untouched.
+        assert_eq!(
+            sentinel_after.as_deref(),
+            Some("SENTINEL DO NOT OVERWRITE"),
+            "restore must NOT write through the symlink to the outside target"
         );
     }
 

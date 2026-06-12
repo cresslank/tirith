@@ -5026,7 +5026,7 @@ Examples:
 enum PendingAction {
     /// List unresolved pending decisions
     List {
-        /// Alias for --format json
+        /// Output as JSON.
         #[arg(long)]
         json: bool,
     },

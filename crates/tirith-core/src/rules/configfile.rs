@@ -855,10 +855,16 @@ const AGENT_MEMORY_BASENAMES: &[&str] = &[
     "memories.json",
 ];
 
-/// Directory-anchored agent-memory locations: every file directly or deeply
-/// under one of these (root-anchored) component paths is in the memory subset.
-/// `.hermes/*` and `.claude/memory/*` are dedicated agent-memory stores.
-const AGENT_MEMORY_DIRS: &[&[&str]] = &[&[".hermes"], &[".claude", "memory"]];
+/// Directory-anchored agent-memory locations: `(dir_path_components,
+/// allowed_extensions)`. A file under one of these (root-anchored) component
+/// paths is in the memory subset ONLY when its extension is in the dir's allowed
+/// set. The extensions mirror the matching `KNOWN_CONFIG_DEEP_DIRS` entries so
+/// the content-scan surface never exceeds the known-config surface (e.g. a
+/// `.hermes/blob.bin` is recognized as config-tree but is NOT content-scanned).
+const AGENT_MEMORY_DIRS: &[(&[&str], &[&str])] = &[
+    (&[".hermes"], &["md", "json", "yaml", "yml"]),
+    (&[".claude", "memory"], &["md", "json"]),
+];
 
 /// `true` when `path` is an agent-memory / instruction file whose free-form
 /// CONTENT is worth scanning for smuggled payloads (long base64 blob, external
@@ -889,16 +895,26 @@ fn is_agent_memory_file(path: &Path) -> bool {
     }
 
     // Directory-anchored match: the path's leading components must equal one of
-    // the memory dirs (root-anchored, like KNOWN_CONFIG_DEEP_DIRS) and there
-    // must be at least one component (the file) beyond the dir prefix.
-    for dir in AGENT_MEMORY_DIRS {
+    // the memory dirs (root-anchored, like KNOWN_CONFIG_DEEP_DIRS), there must be
+    // at least one component (the file) beyond the dir prefix, AND the file's
+    // extension must be in the dir's allowed set (so the content-scan surface
+    // matches the extension-gated KNOWN_CONFIG_DEEP_DIRS surface, not every blob).
+    let ext_lower = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    for (dir, exts) in AGENT_MEMORY_DIRS {
         if components.len() > dir.len()
             && components[..dir.len()]
                 .iter()
                 .zip(dir.iter())
                 .all(|(a, b)| a == b)
         {
-            return true;
+            if let Some(ext) = ext_lower.as_deref() {
+                if exts.contains(&ext) {
+                    return true;
+                }
+            }
         }
     }
 
@@ -950,7 +966,15 @@ fn find_external_http_url(content: &str) -> Option<String> {
     let mut search_from = 0;
     while search_from < content.len() {
         let rest = &content[search_from..];
-        let rel = rest.find("http://").or_else(|| rest.find("https://"))?;
+        // Take the EARLIEST of the two scheme matches. `find("http://")` alone
+        // would return the `http://` index even when an `https://` occurs first,
+        // truncating the captured URL at the wrong scheme.
+        let rel = match (rest.find("http://"), rest.find("https://")) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => return None,
+        };
         let abs = search_from + rel;
         let tail = &content[abs..];
         let end = tail
@@ -2142,7 +2166,15 @@ mod tests {
         assert!(is_agent_memory_file(Path::new("agent-memory.json")));
         assert!(is_agent_memory_file(Path::new("memories.json")));
         assert!(is_agent_memory_file(Path::new(".hermes/notes.md")));
+        assert!(is_agent_memory_file(Path::new(".hermes/state.json")));
+        assert!(is_agent_memory_file(Path::new(".hermes/config.yaml")));
         assert!(is_agent_memory_file(Path::new(".claude/memory/prefs.md")));
+        assert!(is_agent_memory_file(Path::new(".claude/memory/store.json")));
+        // The directory-anchored match is extension-gated to the same surface as
+        // KNOWN_CONFIG_DEEP_DIRS: a non-allowed extension under a memory dir is
+        // NOT content-scanned (so `.hermes/blob.bin` stays out of the subset).
+        assert!(!is_agent_memory_file(Path::new(".hermes/blob.bin")));
+        assert!(!is_agent_memory_file(Path::new(".claude/memory/data.bin")));
         // NOT in subset: MCP / IDE config files that legitimately carry URLs.
         assert!(!is_agent_memory_file(Path::new("mcp.json")));
         assert!(!is_agent_memory_file(Path::new(".mcp.json")));
@@ -2187,6 +2219,21 @@ mod tests {
                 .iter()
                 .any(|f| f.rule_id == RuleId::ConfigSuspiciousIndicator),
             "external http(s) URL in a memory file must warn: {findings:?}",
+        );
+    }
+
+    #[test]
+    fn test_find_external_http_url_prefers_earliest_scheme() {
+        // An `https://` external URL that PRECEDES a later `http://` (here a
+        // local one) must be the match. The old `find("http://").or_else(find
+        // ("https://"))` returned the later `http://` index, captured the wrong
+        // (local) URL, and missed the earlier external `https://` entirely.
+        let content = "https://evil.example.com/a http://localhost/b";
+        let got = find_external_http_url(content);
+        assert_eq!(
+            got.as_deref(),
+            Some("https://evil.example.com/a"),
+            "earliest scheme (the external https URL) must win, not the later http one",
         );
     }
 

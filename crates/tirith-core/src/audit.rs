@@ -1294,6 +1294,7 @@ mod tests {
 
     // ── W4: tamper-evident audit chain ──────────────────────────────────────
 
+    #[cfg(unix)]
     fn chain_test_entry(action: &str) -> AuditEntry {
         AuditEntry {
             timestamp: "2026-06-12T00:00:00+00:00".to_string(),
@@ -1327,6 +1328,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn append_chain(log_path: &std::path::Path, actions: &[&str]) {
         for a in actions {
             let _ = append_to_audit_log(&chain_test_entry(a), Some(log_path.to_path_buf()));
@@ -1347,6 +1349,7 @@ mod tests {
         assert_eq!(h1, h2);
     }
 
+    #[cfg(unix)]
     #[test]
     fn audit_chain_append_then_verify_ok() {
         let _guard = crate::TEST_ENV_LOCK
@@ -1370,6 +1373,7 @@ mod tests {
         assert!(report.head_status.starts_with("head receipt OK"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn audit_chain_detects_edit() {
         let _guard = crate::TEST_ENV_LOCK
@@ -1390,6 +1394,7 @@ mod tests {
         assert!(report.problems.iter().any(|p| p.contains("chain break")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn audit_chain_detects_truncation() {
         let _guard = crate::TEST_ENV_LOCK
@@ -1413,6 +1418,7 @@ mod tests {
         assert!(report.head_status.contains("truncation"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn audit_chain_tolerates_legacy_prefix() {
         let _guard = crate::TEST_ENV_LOCK
@@ -1440,6 +1446,7 @@ mod tests {
         assert_eq!(report.chained_lines, 2);
     }
 
+    #[cfg(unix)]
     #[test]
     fn audit_verify_expected_head() {
         let _guard = crate::TEST_ENV_LOCK
@@ -1457,6 +1464,7 @@ mod tests {
         assert!(!verify_audit_log(&log, Some("deadbeef")).ok);
     }
 
+    #[cfg(unix)]
     #[test]
     fn audit_verify_tolerates_head_one_entry_behind() {
         // Simulate the documented crash window: the last log line synced to disk
@@ -1497,6 +1505,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn audit_verify_head_two_behind_is_truncation() {
         // A head pointing at NEITHER the last nor the second-to-last line is not

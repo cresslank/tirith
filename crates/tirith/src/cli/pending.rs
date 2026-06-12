@@ -88,26 +88,34 @@ pub fn resolve(id: &str, action: &str, reason: Option<String>) -> i32 {
         None
     };
 
+    // The restore-command guidance is independent of whether THIS call flipped
+    // the status: for a rollback it must surface even when the entry was already
+    // resolved, so an operator re-running the command still sees how to restore.
+    let print_rollback_hint = || {
+        if action == "rollback" {
+            match &checkpoint_id {
+                Some(cp) => {
+                    println!("To roll back, run:");
+                    println!("  tirith checkpoint restore {cp}");
+                }
+                None => {
+                    println!("No checkpoint reference recorded; nothing to restore automatically.");
+                }
+            }
+        }
+    };
+
     match pending::resolve(id, status, reason, Some("cli".to_string())) {
         Ok(true) => {
             println!("Resolved {id} ({action}).");
-            if action == "rollback" {
-                match checkpoint_id {
-                    Some(cp) => {
-                        println!("To roll back, run:");
-                        println!("  tirith checkpoint restore {cp}");
-                    }
-                    None => {
-                        println!(
-                            "No checkpoint reference recorded; nothing to restore automatically."
-                        );
-                    }
-                }
-            }
+            print_rollback_hint();
             0
         }
         Ok(false) => {
             eprintln!("tirith pending resolve: '{id}' not found or already resolved.");
+            // Still emit the rollback guidance: an already-resolved rollback whose
+            // checkpoint reference is known should not drop the restore command.
+            print_rollback_hint();
             1
         }
         Err(e) => {
