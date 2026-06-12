@@ -486,21 +486,10 @@ fn collect_files_recursive(
     }
 }
 
-/// Directories to skip during scanning.
+/// Directories to skip during scanning. Delegates to the shared built-in
+/// build-artifact skip set so the scanner and the correlation pass agree.
 fn should_skip_dir(name: &str) -> bool {
-    matches!(
-        name,
-        ".git"
-            | "node_modules"
-            | "target"
-            | "__pycache__"
-            | ".tox"
-            | "dist"
-            | "build"
-            | ".next"
-            | "vendor"
-            | ".cache"
-    )
+    crate::util_build_dirs::should_skip_dir(name)
 }
 
 /// Known AI config directories that should always be entered.
@@ -689,8 +678,41 @@ mod tests {
         assert!(should_skip_dir(".git"));
         assert!(should_skip_dir("node_modules"));
         assert!(should_skip_dir("target"));
+        // New build-artifact dirs from the shared skip set.
+        assert!(should_skip_dir("out"));
+        assert!(should_skip_dir(".turbo"));
+        assert!(should_skip_dir("coverage"));
+        assert!(should_skip_dir(".expo"));
         assert!(!should_skip_dir("src"));
         assert!(!should_skip_dir(".vscode"));
+    }
+
+    #[test]
+    fn test_new_build_artifact_dirs_skipped_in_walk() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let root = tmp.path();
+
+        // A source file that must be collected.
+        std::fs::write(root.join("keep.md"), "hello").unwrap();
+
+        // Build-artifact dirs whose contents must be skipped during the walk.
+        for dir in ["out", ".turbo", "coverage", ".expo"] {
+            let sub = root.join(dir);
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(sub.join("artifact.md"), "generated").unwrap();
+        }
+
+        let files = collect_files(root, true, &[], &[], &[]);
+        let names: Vec<&str> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+
+        assert!(names.contains(&"keep.md"), "keep.md should be collected");
+        assert!(
+            !names.contains(&"artifact.md"),
+            "files under out/.turbo/coverage/.expo should be skipped, got {names:?}"
+        );
     }
 
     #[test]

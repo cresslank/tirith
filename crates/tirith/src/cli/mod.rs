@@ -437,6 +437,7 @@ pub mod output_guard;
 pub mod package;
 pub mod paste;
 pub mod path;
+pub mod pending;
 pub mod persistence;
 pub mod policy;
 pub mod preview;

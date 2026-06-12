@@ -58,12 +58,18 @@ pub fn list_checkpoints(json: bool) -> i32 {
 }
 
 pub fn restore_checkpoint(id: &str, json: bool) -> i32 {
-    match checkpoint::restore(id) {
-        Ok(restored) => {
+    match checkpoint::restore_reported(id) {
+        Ok(report) => {
+            let restored_n = report.restored.len();
             if json {
                 let json_val = serde_json::json!({
-                    "restored": restored,
-                    "count": restored.len(),
+                    "checkpoint_id": report.checkpoint_id,
+                    "attempted": report.attempted,
+                    "restored": report.restored,
+                    "missing": report.missing,
+                    "corrupt": report.corrupt,
+                    "errors": report.errors,
+                    "count": restored_n,
                 });
                 println!(
                     "{}",
@@ -73,10 +79,31 @@ pub fn restore_checkpoint(id: &str, json: bool) -> i32 {
                     })
                 );
             } else {
-                println!("Restored {} file(s):", restored.len());
-                for path in &restored {
+                println!("Restored {restored_n} file(s):");
+                for path in &report.restored {
                     println!("  {path}");
                 }
+                if !report.missing.is_empty() {
+                    println!("Missing backup data ({}):", report.missing.len());
+                    for path in &report.missing {
+                        println!("  {path}");
+                    }
+                }
+                if !report.corrupt.is_empty() {
+                    println!("Corrupt backup data, skipped ({}):", report.corrupt.len());
+                    for path in &report.corrupt {
+                        println!("  {path}");
+                    }
+                }
+                if !report.errors.is_empty() {
+                    println!("Errors ({}):", report.errors.len());
+                    for (path, err) in &report.errors {
+                        println!("  {path}: {err}");
+                    }
+                }
+                println!(
+                    "Restored {restored_n} files. Database, cloud, and API side effects are not covered by checkpoint restore."
+                );
             }
             0
         }

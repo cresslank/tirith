@@ -4,8 +4,10 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
+use base64::Engine as _;
 use fs2::FileExt;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::verdict::Verdict;
 
@@ -83,6 +85,19 @@ pub struct AuditEntry {
     /// suppression-bounded and cannot weaken a verdict). Old logs parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_allowed_match: Option<String>,
+
+    /// W4 tamper-evidence: sha256 over the canonical JSON (with `sig` excluded)
+    /// of the PREVIOUS log line. `None` for the genesis entry and for legacy
+    /// entries written before chaining existed. Set under the audit lock inside
+    /// [`append_to_audit_log`], never by the constructors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_hash: Option<String>,
+
+    /// W4 optional ed25519 signature (base64) over the canonical JSON of this
+    /// entry INCLUDING `prev_hash` and EXCLUDING `sig`. Present only when audit
+    /// signing is enabled (a key file exists in `config_dir()`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
 }
 
 /// Outcome of an audit-log append. [`AuditWrite::Skipped`] is NOT an error
@@ -116,14 +131,8 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
         }
     }
 
-    let line = match serde_json::to_string(entry) {
-        Ok(l) => l,
-        Err(e) => {
-            let reason = format!("failed to serialize entry: {e}");
-            audit_diagnostic(format!("tirith: audit: {reason}"));
-            return AuditWrite::Failed(reason);
-        }
-    };
+    // The entry is serialized AFTER the exclusive lock is acquired (below), so
+    // the chain `prev_hash` is read from the on-disk tail atomically.
 
     // Refuse to follow symlinks — prevents an attacker with write access in the
     // log directory from redirecting audit output to an arbitrary file.
@@ -170,6 +179,39 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
         return AuditWrite::Failed(reason);
     }
 
+    // Under the exclusive lock: derive `prev_hash` from the actual on-disk tail
+    // (never trusting the head sidecar blindly, so it is crash-safe), set it on a
+    // clone, optionally sign, serialize, append, then refresh the head receipt.
+    let prev_hash = read_last_line(&path).as_deref().and_then(line_hash);
+    let head_before = read_head(&path);
+    let prev_count = match (&head_before, &prev_hash) {
+        (Some(h), Some(ph)) if &h.head_hash == ph => h.count,
+        _ => count_lines(&path),
+    };
+
+    let mut entry = entry.clone();
+    entry.prev_hash = prev_hash;
+    // Opt-in signing: sign the canonical form (`sig` excluded, `prev_hash`
+    // included) only when a signing key file exists.
+    if let Ok(mut unsigned) = serde_json::to_value(&entry) {
+        if let Some(o) = unsigned.as_object_mut() {
+            o.remove("sig");
+        }
+        let canon = canonical_json_string(&unsigned);
+        if let Some(sig) = sign_canonical(canon.as_bytes()) {
+            entry.sig = Some(sig);
+        }
+    }
+    let line = match serde_json::to_string(&entry) {
+        Ok(l) => l,
+        Err(e) => {
+            let reason = format!("failed to serialize entry: {e}");
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            let _ = fs2::FileExt::unlock(&file);
+            return AuditWrite::Failed(reason);
+        }
+    };
+
     let mut writer = std::io::BufWriter::new(&file);
     if let Err(e) = writeln!(writer, "{line}") {
         let reason = format!("write failed: {e}");
@@ -183,7 +225,7 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
         let _ = fs2::FileExt::unlock(&file);
         return AuditWrite::Failed(reason);
     }
-    // A failed `sync_all()` means the line is not durably on disk — the
+    // A failed `sync_all()` means the line is not durably on disk. The
     // recorded-transaction promise is unmet, so report it as a write failure.
     if let Err(e) = file.sync_all() {
         let reason = format!("sync failed: {e}");
@@ -191,9 +233,323 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
         let _ = fs2::FileExt::unlock(&file);
         return AuditWrite::Failed(reason);
     }
+    // Refresh the head receipt (the truncation anchor) while still under the lock.
+    if let Some(self_hash) = line_hash(&line) {
+        write_head(
+            &path,
+            &HeadReceipt {
+                head_hash: self_hash,
+                count: prev_count + 1,
+            },
+        );
+    }
     let _ = fs2::FileExt::unlock(&file);
 
     AuditWrite::Written(line)
+}
+
+// ── Tamper-evident audit chain (W4) ──────────────────────────────────────────
+//
+// Every entry carries `prev_hash` = sha256 over the canonical JSON (sorted keys,
+// `sig` excluded) of the PREVIOUS log line, so any edit or reorder of a retained
+// line breaks the chain. A per-log `<path>.head` receipt records the latest hash
+// + count so tail TRUNCATION is detectable (the chain alone cannot catch it).
+// Legacy lines without `prev_hash` are tolerated as an unchained prefix.
+
+/// Canonical JSON: object keys sorted recursively, compact, no whitespace, so a
+/// re-canonicalization on read reproduces the bytes hashed on write regardless
+/// of the stored line's key order.
+fn canonical_json_string(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    canon_write(v, &mut out);
+    out
+}
+
+fn canon_write(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::Object(map) => {
+            out.push('{');
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut first = true;
+            for k in keys {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                out.push_str(&serde_json::to_string(k).unwrap_or_default());
+                out.push(':');
+                canon_write(&map[k], out);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Array(arr) => {
+            out.push('[');
+            for (i, e) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                canon_write(e, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&serde_json::to_string(other).unwrap_or_default()),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+/// Hash of one audit line: parse JSON, drop `sig`, canonicalize, sha256-hex.
+/// `None` if the line is not valid JSON (a legacy/corrupt line yields no hash
+/// rather than crashing verification).
+fn line_hash(line: &str) -> Option<String> {
+    let mut v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("sig");
+    }
+    Some(sha256_hex(canonical_json_string(&v).as_bytes()))
+}
+
+/// Read the last non-empty line of `path` without loading the whole file.
+fn read_last_line(path: &std::path::Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len == 0 {
+        return None;
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    let mut pos = len;
+    let chunk = 4096u64;
+    loop {
+        let read_size = chunk.min(pos);
+        pos -= read_size;
+        f.seek(SeekFrom::Start(pos)).ok()?;
+        let mut tmp = vec![0u8; read_size as usize];
+        f.read_exact(&mut tmp).ok()?;
+        tmp.extend_from_slice(&buf);
+        buf = tmp;
+        let trimmed_end = if buf.last() == Some(&b'\n') {
+            buf.len() - 1
+        } else {
+            buf.len()
+        };
+        if let Some(nl) = buf[..trimmed_end].iter().rposition(|&b| b == b'\n') {
+            return Some(String::from_utf8_lossy(&buf[nl + 1..trimmed_end]).into_owned());
+        }
+        if pos == 0 {
+            return Some(String::from_utf8_lossy(&buf[..trimmed_end]).into_owned());
+        }
+    }
+}
+
+fn count_lines(path: &std::path::Path) -> u64 {
+    match fs::read(path) {
+        Ok(b) => b.iter().filter(|&&c| c == b'\n').count() as u64,
+        Err(_) => 0,
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct HeadReceipt {
+    head_hash: String,
+    count: u64,
+}
+
+fn head_path(log_path: &std::path::Path) -> PathBuf {
+    let mut p = log_path.as_os_str().to_owned();
+    p.push(".head");
+    PathBuf::from(p)
+}
+
+fn read_head(log_path: &std::path::Path) -> Option<HeadReceipt> {
+    let s = fs::read_to_string(head_path(log_path)).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+/// Refresh the per-log head receipt. Best-effort; we already hold the log's
+/// exclusive lock, so a partial write is replaced on the next append.
+fn write_head(log_path: &std::path::Path, receipt: &HeadReceipt) {
+    let hp = head_path(log_path);
+    let Ok(s) = serde_json::to_string(receipt) else {
+        return;
+    };
+    let mut tmp_os = hp.as_os_str().to_owned();
+    tmp_os.push(".tmp");
+    let tmp = PathBuf::from(tmp_os);
+    if fs::write(&tmp, s.as_bytes()).is_ok() {
+        let _ = fs::rename(&tmp, &hp);
+    }
+}
+
+/// Optional ed25519 signing secret key (32 raw bytes). Signing is OPT-IN: it
+/// happens only when this file exists.
+fn audit_signing_secret() -> Option<[u8; 32]> {
+    let p = crate::policy::config_dir()?.join("audit-signing.key");
+    let bytes = fs::read(&p).ok()?;
+    bytes.get(..32)?.try_into().ok()
+}
+
+/// Optional ed25519 verifying (public) key for `tirith audit verify`.
+fn audit_verify_key() -> Option<ed25519_dalek::VerifyingKey> {
+    let p = crate::policy::config_dir()?.join("audit-signing.pub");
+    let bytes = fs::read(&p).ok()?;
+    let arr: [u8; 32] = bytes.get(..32)?.try_into().ok()?;
+    ed25519_dalek::VerifyingKey::from_bytes(&arr).ok()
+}
+
+fn sign_canonical(canonical: &[u8]) -> Option<String> {
+    use ed25519_dalek::Signer;
+    let sk = ed25519_dalek::SigningKey::from_bytes(&audit_signing_secret()?);
+    let sig = sk.sign(canonical);
+    Some(base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()))
+}
+
+/// Result of verifying the audit chain over a log file.
+#[derive(Debug, Clone)]
+pub struct AuditVerifyReport {
+    pub total_lines: usize,
+    pub chained_lines: usize,
+    pub legacy_prefix: usize,
+    pub ok: bool,
+    pub head_status: String,
+    pub problems: Vec<String>,
+}
+
+/// Verify the tamper-evident chain over `log_path` by parsing RAW JSON lines
+/// (not the tolerant `AuditRecord`), recomputing each line's hash, checking each
+/// entry's `prev_hash` against the previous line, validating any ed25519 `sig`
+/// when a public key is configured, and comparing the tail to the `<path>.head`
+/// receipt (and `expected_head`, if given). Tolerates a leading legacy-unchained
+/// prefix and a head receipt that is one entry behind (a crash window).
+pub fn verify_audit_log(
+    log_path: &std::path::Path,
+    expected_head: Option<&str>,
+) -> AuditVerifyReport {
+    let mut report = AuditVerifyReport {
+        total_lines: 0,
+        chained_lines: 0,
+        legacy_prefix: 0,
+        ok: true,
+        head_status: String::new(),
+        problems: Vec::new(),
+    };
+    let content = match fs::read_to_string(log_path) {
+        Ok(c) => c,
+        Err(e) => {
+            report.ok = false;
+            report
+                .problems
+                .push(format!("cannot read {}: {e}", log_path.display()));
+            return report;
+        }
+    };
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    report.total_lines = lines.len();
+    let verify_key = audit_verify_key();
+    let mut hashes: Vec<String> = Vec::with_capacity(lines.len());
+    let mut chaining_started = false;
+
+    for (i, line) in lines.iter().enumerate() {
+        let val: serde_json::Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(e) => {
+                report.ok = false;
+                report
+                    .problems
+                    .push(format!("line {}: invalid JSON: {e}", i + 1));
+                hashes.push(String::new());
+                continue;
+            }
+        };
+        let prev = val.get("prev_hash").and_then(|v| v.as_str());
+        let this_hash = line_hash(line).unwrap_or_default();
+
+        if let Some(prev) = prev {
+            chaining_started = true;
+            report.chained_lines += 1;
+            if i == 0 {
+                report.ok = false;
+                report
+                    .problems
+                    .push("line 1: prev_hash present but no prior entry".to_string());
+            } else if hashes[i - 1] != prev {
+                report.ok = false;
+                report
+                    .problems
+                    .push(format!("line {}: chain break (prev_hash mismatch)", i + 1));
+            }
+            if let (Some(sig_b64), Some(vk)) =
+                (val.get("sig").and_then(|v| v.as_str()), verify_key.as_ref())
+            {
+                let mut unsigned = val.clone();
+                if let Some(o) = unsigned.as_object_mut() {
+                    o.remove("sig");
+                }
+                let canon = canonical_json_string(&unsigned);
+                let verified = base64::engine::general_purpose::STANDARD
+                    .decode(sig_b64)
+                    .ok()
+                    .and_then(|b| ed25519_dalek::Signature::from_slice(&b).ok())
+                    .map(|sig| {
+                        use ed25519_dalek::Verifier;
+                        vk.verify(canon.as_bytes(), &sig).is_ok()
+                    })
+                    .unwrap_or(false);
+                if !verified {
+                    report.ok = false;
+                    report
+                        .problems
+                        .push(format!("line {}: signature verification failed", i + 1));
+                }
+            }
+        } else if !chaining_started {
+            report.legacy_prefix += 1;
+        } else {
+            report.ok = false;
+            report.problems.push(format!(
+                "line {}: missing prev_hash after the chain started",
+                i + 1
+            ));
+        }
+        hashes.push(this_hash);
+    }
+
+    match read_head(log_path) {
+        Some(head) => {
+            let n = hashes.len();
+            if n > 0 && head.head_hash == hashes[n - 1] {
+                report.head_status = format!("head receipt OK (count {})", head.count);
+            } else if n > 1 && head.head_hash == hashes[n - 2] {
+                report.head_status =
+                    "head receipt is one entry behind (crash window); acceptable".to_string();
+            } else {
+                report.ok = false;
+                report.head_status =
+                    "head receipt does not match log tail (possible truncation)".to_string();
+                report.problems.push(report.head_status.clone());
+            }
+        }
+        None => {
+            report.head_status = "no head receipt (truncation cannot be detected)".to_string();
+        }
+    }
+
+    if let Some(exp) = expected_head {
+        let n = hashes.len();
+        if n == 0 || hashes[n - 1] != exp {
+            report.ok = false;
+            report
+                .problems
+                .push("expected-head does not match the computed tail hash".to_string());
+        }
+    }
+
+    report
 }
 
 /// Append a verdict entry to the audit log. Never panics or changes the verdict.
@@ -267,6 +623,9 @@ pub fn log_verdict_with_raw(
         agent_origin: verdict.agent_origin.clone(),
         // Audit-context only; never consulted for action.
         manifest_allowed_match: verdict.manifest_allowed_match.clone(),
+        // Chain fields are filled in under the lock in `append_to_audit_log`.
+        prev_hash: None,
+        sig: None,
     };
 
     let line = match append_to_audit_log(&entry, log_path) {
@@ -325,6 +684,8 @@ pub fn log_hook_event(
         // A hook event is a probe/heartbeat, not a verdict — no synthetic origin.
         agent_origin: None,
         manifest_allowed_match: None,
+        prev_hash: None,
+        sig: None,
     };
 
     // Best-effort: a write failure here is not surfaced to the user.
@@ -368,6 +729,8 @@ pub fn log_trust_change(
         // Trust changes are operator actions, not agent-attributed commands.
         agent_origin: None,
         manifest_allowed_match: None,
+        prev_hash: None,
+        sig: None,
     };
 
     // Best-effort: a write failure here is not surfaced to the user.
@@ -882,5 +1245,168 @@ mod tests {
     fn parse_finding_id_rejects_negative_index() {
         // `usize` cannot parse negatives.
         assert_eq!(parse_finding_id("evt:-1"), None);
+    }
+
+    // ── W4: tamper-evident audit chain ──────────────────────────────────────
+
+    fn chain_test_entry(action: &str) -> AuditEntry {
+        AuditEntry {
+            timestamp: "2026-06-12T00:00:00+00:00".to_string(),
+            session_id: "sess".to_string(),
+            action: action.to_string(),
+            rule_ids: vec![],
+            command_redacted: format!("cmd-{action}"),
+            bypass_requested: false,
+            bypass_honored: false,
+            interactive: false,
+            policy_path: None,
+            event_id: None,
+            tier_reached: 1,
+            entry_type: "verdict".to_string(),
+            event: None,
+            integration: None,
+            hook_type: None,
+            detail: None,
+            elapsed_ms: None,
+            raw_action: None,
+            raw_rule_ids: None,
+            trust_pattern: None,
+            trust_rule_id: None,
+            trust_action: None,
+            trust_ttl_expires: None,
+            trust_scope: None,
+            agent_origin: None,
+            manifest_allowed_match: None,
+            prev_hash: None,
+            sig: None,
+        }
+    }
+
+    fn append_chain(log_path: &std::path::Path, actions: &[&str]) {
+        for a in actions {
+            let _ = append_to_audit_log(&chain_test_entry(a), Some(log_path.to_path_buf()));
+        }
+    }
+
+    #[test]
+    fn canonical_json_sorts_keys_and_ignores_sig() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"b":1,"a":{"z":2,"y":[3,2,1]}}"#).unwrap();
+        assert_eq!(
+            canonical_json_string(&v),
+            r#"{"a":{"y":[3,2,1],"z":2},"b":1}"#
+        );
+        // line_hash is independent of key order and of the `sig` field.
+        let h1 = line_hash(r#"{"a":1,"b":2}"#).unwrap();
+        let h2 = line_hash(r#"{"b":2,"a":1,"sig":"whatever"}"#).unwrap();
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn audit_chain_append_then_verify_ok() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        append_chain(&log, &["Allow", "Block", "Warn"]);
+
+        let content = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(!lines[0].contains("prev_hash"));
+        assert!(lines[1].contains("prev_hash"));
+
+        let report = verify_audit_log(&log, None);
+        assert!(report.ok, "expected clean chain, got {:?}", report.problems);
+        assert_eq!(report.chained_lines, 2);
+        assert_eq!(report.legacy_prefix, 0);
+        assert!(report.head_status.starts_with("head receipt OK"));
+    }
+
+    #[test]
+    fn audit_chain_detects_edit() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        append_chain(&log, &["Allow", "Block", "Warn"]);
+
+        let content = std::fs::read_to_string(&log).unwrap();
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+        lines[0] = lines[0].replace("cmd-Allow", "cmd-EVIL");
+        std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+
+        let report = verify_audit_log(&log, None);
+        assert!(!report.ok, "edited line must break the chain");
+        assert!(report.problems.iter().any(|p| p.contains("chain break")));
+    }
+
+    #[test]
+    fn audit_chain_detects_truncation() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        append_chain(&log, &["Allow", "Block", "Warn"]);
+
+        // Drop the last line but leave the head receipt pointing at 3 entries.
+        let content = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        std::fs::write(&log, lines[..2].join("\n") + "\n").unwrap();
+
+        let report = verify_audit_log(&log, None);
+        assert!(
+            !report.ok,
+            "tail truncation must be caught by the head receipt"
+        );
+        assert!(report.head_status.contains("truncation"));
+    }
+
+    #[test]
+    fn audit_chain_tolerates_legacy_prefix() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        std::fs::write(
+            &log,
+            "{\"action\":\"Allow\",\"timestamp\":\"t1\"}\n{\"action\":\"Allow\",\"timestamp\":\"t2\"}\n",
+        )
+        .unwrap();
+        append_chain(&log, &["Block", "Warn"]);
+
+        let report = verify_audit_log(&log, None);
+        assert!(
+            report.ok,
+            "legacy prefix must not fail verification: {:?}",
+            report.problems
+        );
+        assert_eq!(report.legacy_prefix, 2);
+        assert_eq!(report.chained_lines, 2);
+    }
+
+    #[test]
+    fn audit_verify_expected_head() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        append_chain(&log, &["Allow", "Block"]);
+
+        let content = std::fs::read_to_string(&log).unwrap();
+        let last = content.lines().last().unwrap();
+        let head = line_hash(last).unwrap();
+        assert!(verify_audit_log(&log, Some(&head)).ok);
+        assert!(!verify_audit_log(&log, Some("deadbeef")).ok);
     }
 }

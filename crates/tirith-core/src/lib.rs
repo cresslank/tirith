@@ -43,6 +43,7 @@ pub mod output;
 pub mod package_risk;
 pub mod parse;
 pub mod path_audit;
+pub mod pending;
 pub mod persistence;
 pub mod policy;
 pub mod policy_client;
@@ -76,6 +77,7 @@ pub mod threatdb_feeds;
 pub mod tokenize;
 pub mod url_validate;
 pub mod util;
+pub mod util_build_dirs;
 pub mod verdict;
 pub mod webhook;
 

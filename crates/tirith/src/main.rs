@@ -517,6 +517,17 @@ Examples:
         action: CheckpointAction,
     },
 
+    /// Manage pending decisions (deferred, suppressed, restore)
+    #[command(after_help = "\
+Examples:
+  tirith pending list
+  tirith pending resolve <id> keep
+  tirith pending export")]
+    Pending {
+        #[command(subcommand)]
+        action: PendingAction,
+    },
+
     /// Initialize tirith shell hooks
     #[command(after_help = "\
 Examples:
@@ -4987,6 +4998,48 @@ Examples:
         #[arg(long, default_value = "verdict")]
         entry_type: String,
     },
+    /// Verify the tamper-evident audit chain (W4)
+    #[command(after_help = "\
+Examples:
+  tirith audit verify
+  tirith audit verify --expected-head <sha256>")]
+    Verify {
+        /// Expected head hash from a prior run (anchors truncation detection)
+        #[arg(long)]
+        expected_head: Option<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PendingAction {
+    /// List unresolved pending decisions
+    List {
+        /// Alias for --format json
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve a pending decision: keep | rollback | approve | deny
+    Resolve {
+        /// Pending decision id
+        id: String,
+        /// Resolution: keep | rollback | approve | deny
+        action: String,
+        /// Optional reason recorded with the resolution
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Export all pending decisions as JSON
+    Export {
+        /// Write to a file instead of stdout
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -6821,6 +6874,14 @@ fn run() {
                 };
                 cli::audit::report(format_str, since.as_deref(), &entry_type)
             }
+            AuditAction::Verify {
+                expected_head,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::audit::verify(expected_head.as_deref(), json)
+            }
         },
 
         Commands::Receipt { action } => match action {
@@ -6878,6 +6939,14 @@ fn run() {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::checkpoint::watch(&command, &paths, with_net_hints, json)
             }
+        },
+
+        Commands::Pending { action } => match action {
+            PendingAction::List { json } => cli::pending::list(json),
+            PendingAction::Resolve { id, action, reason } => {
+                cli::pending::resolve(&id, &action, reason)
+            }
+            PendingAction::Export { output } => cli::pending::export(output),
         },
 
         Commands::Activate { key } => cli::license_cmd::activate(&key),

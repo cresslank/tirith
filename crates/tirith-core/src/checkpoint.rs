@@ -262,8 +262,30 @@ fn validate_sha256_filename(sha: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Restore files from a checkpoint.
-pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
+/// Per-bucket outcome of a checkpoint restore.
+///
+/// Distinguishes files that were restored from those whose backup blob was
+/// missing, whose backup blob failed integrity verification (corrupt/tampered,
+/// and therefore deliberately NOT written back), and those that hit a
+/// copy/parent-dir error.
+#[derive(Debug, Clone, Serialize)]
+pub struct RestoreReport {
+    pub checkpoint_id: String,
+    pub attempted: usize,
+    pub restored: Vec<String>,
+    pub missing: Vec<String>,
+    pub corrupt: Vec<String>,
+    pub errors: Vec<(String, String)>,
+}
+
+/// Restore files from a checkpoint, returning a per-bucket report.
+///
+/// For each non-directory manifest entry: a missing backup blob lands in
+/// `missing`; a blob whose SHA-256 does not match the manifest lands in
+/// `corrupt` and is NOT copied (we never write back a tampered/corrupt blob);
+/// a copy or parent-dir failure lands in `errors`; success lands in `restored`.
+/// `attempted` counts the file (non-dir) entries processed.
+pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
     require_pro()?;
     let cp_dir = checkpoints_dir().join(checkpoint_id);
     if !cp_dir.exists() {
@@ -276,7 +298,14 @@ pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
         serde_json::from_str(&manifest_str).map_err(|e| format!("parse manifest: {e}"))?;
 
     let files_dir = cp_dir.join("files");
-    let mut restored = Vec::new();
+    let mut report = RestoreReport {
+        checkpoint_id: checkpoint_id.to_string(),
+        attempted: 0,
+        restored: Vec::new(),
+        missing: Vec::new(),
+        corrupt: Vec::new(),
+        errors: Vec::new(),
+    };
 
     for entry in &manifest {
         if entry.is_dir {
@@ -285,6 +314,7 @@ pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
 
         validate_restore_path(&entry.original_path)?;
         validate_sha256_filename(&entry.sha256)?;
+        report.attempted += 1;
 
         let src = files_dir.join(&entry.sha256);
         if !src.exists() {
@@ -292,24 +322,78 @@ pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
                 "tirith: checkpoint restore: missing data for {}",
                 entry.original_path
             );
+            report.missing.push(entry.original_path.clone());
             continue;
+        }
+
+        // Verify the backup blob's content matches the manifest SHA before
+        // restoring. A mismatch means the blob was corrupted or tampered with
+        // on disk; restoring it would overwrite the live file with bad data, so
+        // skip the copy and record it as corrupt.
+        match sha256_file(&src) {
+            Ok(actual) if actual == entry.sha256 => {}
+            Ok(_) => {
+                eprintln!(
+                    "tirith: checkpoint restore: corrupt backup for {} (sha mismatch), skipping",
+                    entry.original_path
+                );
+                report.corrupt.push(entry.original_path.clone());
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "tirith: checkpoint restore: cannot verify backup for {}: {e}, skipping",
+                    entry.original_path
+                );
+                report.corrupt.push(entry.original_path.clone());
+                continue;
+            }
         }
 
         let dst = Path::new(&entry.original_path);
         if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                format!(
-                    "restore {}: cannot create parent dir: {e}",
-                    entry.original_path
-                )
-            })?;
+            if let Err(e) = fs::create_dir_all(parent) {
+                report.errors.push((
+                    entry.original_path.clone(),
+                    format!("cannot create parent dir: {e}"),
+                ));
+                continue;
+            }
         }
 
-        fs::copy(&src, dst).map_err(|e| format!("restore {}: {e}", entry.original_path))?;
-        restored.push(entry.original_path.clone());
+        match fs::copy(&src, dst) {
+            Ok(_) => report.restored.push(entry.original_path.clone()),
+            Err(e) => report
+                .errors
+                .push((entry.original_path.clone(), e.to_string())),
+        }
     }
 
-    Ok(restored)
+    let detail = format!(
+        "checkpoint_id={checkpoint_id} attempted={} restored={} missing={} corrupt={} errors={}",
+        report.attempted,
+        report.restored.len(),
+        report.missing.len(),
+        report.corrupt.len(),
+        report.errors.len(),
+    );
+    crate::audit::log_hook_event(
+        "checkpoint",
+        "restore",
+        "snapshot_restore",
+        None,
+        Some(&detail),
+    );
+
+    Ok(report)
+}
+
+/// Restore files from a checkpoint, returning the restored paths.
+///
+/// Thin wrapper over `restore_reported` that preserves the historical return
+/// shape for existing callers.
+pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
+    restore_reported(checkpoint_id).map(|r| r.restored)
 }
 
 /// Get diff between checkpoint and current filesystem state.
@@ -925,6 +1009,115 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: DiffEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.status, DiffStatus::Deleted);
+    }
+
+    #[test]
+    fn test_restore_reported_missing_and_corrupt_buckets() {
+        // A restore must honestly bucket a missing backup blob into `missing`
+        // and a tampered backup blob into `corrupt`, and must NOT write the
+        // corrupt blob back over the live file.
+        //
+        // `validate_restore_path` rejects absolute original paths, so the
+        // checkpointed paths must be relative. We chdir into a temp workdir
+        // (serialized by TEST_ENV_LOCK, the same boundary the env mutation
+        // below relies on) and checkpoint by bare filename.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let workdir = tmpdir.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+
+        let state_dir = tmpdir.path().join("state");
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_cwd = std::env::current_dir().ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+
+        // Relative names that pass validate_restore_path; resolved against `workdir`.
+        let name_a = "a.txt";
+        let name_b = "b.txt";
+
+        let run = || -> Result<RestoreReport, String> {
+            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
+
+            fs::write(name_a, "alpha contents").map_err(|e| format!("write a: {e}"))?;
+            fs::write(name_b, "bravo contents").map_err(|e| format!("write b: {e}"))?;
+
+            let meta = create(&[name_a, name_b], Some("rm -rf project"))?;
+
+            let files_dir = checkpoints_dir().join(&meta.id).join("files");
+
+            // Look up each file's backup blob by its manifest SHA.
+            let manifest_str =
+                fs::read_to_string(checkpoints_dir().join(&meta.id).join("manifest.json"))
+                    .map_err(|e| format!("read manifest: {e}"))?;
+            let manifest: Vec<ManifestEntry> =
+                serde_json::from_str(&manifest_str).map_err(|e| format!("parse: {e}"))?;
+            let sha_for = |orig: &str| -> String {
+                manifest
+                    .iter()
+                    .find(|m| m.original_path == orig)
+                    .map(|m| m.sha256.clone())
+                    .expect("manifest entry for file")
+            };
+            let blob_a = files_dir.join(sha_for(name_a));
+            let blob_b = files_dir.join(sha_for(name_b));
+
+            // (a) delete one backup blob -> should bucket into `missing`.
+            fs::remove_file(&blob_a).map_err(|e| format!("rm blob_a: {e}"))?;
+            // (b) byte-corrupt the other blob -> should bucket into `corrupt`.
+            fs::write(&blob_b, "tampered bytes that do not match the sha")
+                .map_err(|e| format!("corrupt blob_b: {e}"))?;
+
+            // Overwrite the live files so a restore copy would be observable.
+            fs::write(name_a, "live a unchanged").map_err(|e| format!("write a: {e}"))?;
+            fs::write(name_b, "live b unchanged").map_err(|e| format!("write b: {e}"))?;
+
+            restore_reported(&meta.id)
+        };
+
+        let result = run();
+
+        // Read the live files back while cwd is still the workdir.
+        let live_a = fs::read_to_string(workdir.join(name_a)).ok();
+        let live_b = fs::read_to_string(workdir.join(name_b)).ok();
+
+        // Restore cwd and env before assertions so cleanup runs even on failure.
+        if let Some(dir) = prev_cwd {
+            let _ = std::env::set_current_dir(dir);
+        }
+        match prev_state {
+            Some(val) => unsafe { std::env::set_var("XDG_STATE_HOME", val) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
+
+        let report = result.expect("restore_reported should succeed");
+
+        assert_eq!(
+            report.attempted, 2,
+            "two file entries processed: {report:?}"
+        );
+        assert!(
+            report.restored.is_empty(),
+            "nothing should restore cleanly: {report:?}"
+        );
+        assert_eq!(report.missing, vec![name_a.to_string()], "{report:?}");
+        assert_eq!(report.corrupt, vec![name_b.to_string()], "{report:?}");
+        assert!(report.errors.is_empty(), "no copy errors: {report:?}");
+
+        // Neither the missing nor the corrupt file may be written back.
+        assert_eq!(
+            live_b.as_deref(),
+            Some("live b unchanged"),
+            "corrupt backup must not overwrite the live file"
+        );
+        assert_eq!(
+            live_a.as_deref(),
+            Some("live a unchanged"),
+            "missing backup must not change the live file"
+        );
     }
 
     #[test]

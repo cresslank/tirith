@@ -193,6 +193,56 @@ pub fn stats(session: Option<&str>, json: bool, entry_type: &str) -> i32 {
     0
 }
 
+/// Run the `tirith audit verify` subcommand: check the tamper-evident chain.
+pub fn verify(expected_head: Option<&str>, json: bool) -> i32 {
+    let Some(path) = tirith_core::audit::audit_log_path() else {
+        eprintln!("tirith: no audit log path available");
+        return 2;
+    };
+    if !path.exists() {
+        if json {
+            println!(r#"{{"ok":true,"total_lines":0,"note":"no audit log yet"}}"#);
+        } else {
+            println!("tirith audit verify: no audit log at {}", path.display());
+        }
+        return 0;
+    }
+    let report = tirith_core::audit::verify_audit_log(&path, expected_head);
+    if json {
+        let problems: Vec<serde_json::Value> = report
+            .problems
+            .iter()
+            .map(|p| serde_json::Value::String(p.clone()))
+            .collect();
+        let obj = serde_json::json!({
+            "ok": report.ok,
+            "total_lines": report.total_lines,
+            "chained_lines": report.chained_lines,
+            "legacy_prefix": report.legacy_prefix,
+            "head_status": report.head_status,
+            "problems": problems,
+        });
+        println!("{obj}");
+    } else {
+        println!(
+            "tirith audit verify: {} ({} lines, {} chained, {} legacy)",
+            if report.ok { "OK" } else { "FAILED" },
+            report.total_lines,
+            report.chained_lines,
+            report.legacy_prefix
+        );
+        println!("  {}", report.head_status);
+        for p in &report.problems {
+            println!("  problem: {p}");
+        }
+    }
+    if report.ok {
+        0
+    } else {
+        1
+    }
+}
+
 /// Run the `tirith audit report` subcommand.
 pub fn report(format: &str, since: Option<&str>, entry_type: &str) -> i32 {
     if entry_type != "verdict" {
