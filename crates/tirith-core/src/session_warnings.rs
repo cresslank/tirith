@@ -243,13 +243,15 @@ pub fn load(session_id: &str) -> SessionWarnings {
 /// a fresh cooldown and returns `false`. A suppressed hit is never dropped
 /// silently: it emits a compact `finding_suppressed` audit rollup.
 ///
-/// NOTE (W6 scoping): the production CALL SITE that collapses repeated Warn /
-/// WarnAck findings in the user-facing output is intentionally deferred to a
-/// later milestone (it is strictly a UX/output-layer change and must never
-/// suppress an `Action::Block` or feed back into detection). This function and
-/// its `finding_suppressed` audit-rollup contract are exercised end-to-end by
-/// `suppress_check_emits_finding_suppressed_rollup`, so the "never dropped
-/// silently" guarantee is verified even though no hot-path caller exists yet.
+/// CALL SITE (W6): this is wired at the `tirith check` DISPLAY path
+/// (`crate::cli::check` → `build_display_verdict`), which collapses repeated Warn
+/// / WarnAck findings in the user-facing `write_human` output only. It is strictly
+/// an output/UX-layer change: it NEVER suppresses an `Action::Block` (only
+/// findings that, classified alone, map to Warn/WarnAck are candidates), never
+/// feeds back into detection, and never alters the verdict, exit code, audit log,
+/// approval/ack files, or session accounting. The `finding_suppressed`
+/// audit-rollup contract (the "never dropped silently" guarantee) is exercised
+/// end-to-end by `suppress_check_emits_finding_suppressed_rollup`.
 pub fn suppress_check(
     session_id: &str,
     rule_id: &str,

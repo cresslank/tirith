@@ -7,7 +7,103 @@ use tirith_core::extract::ScanContext;
 use tirith_core::output;
 use tirith_core::threatdb_api::RuntimeThreatMode;
 use tirith_core::tokenize::ShellType;
-use tirith_core::verdict::{upgraded_action_from_findings, Action};
+use tirith_core::verdict::{action_from_findings, upgraded_action_from_findings, Action, Verdict};
+
+/// W6: build a DISPLAY-ONLY clone of `effective` whose repeated Warn / WarnAck
+/// findings (already surfaced earlier this session) are collapsed, and return how
+/// many findings were hidden.
+///
+/// This is strictly an output-layer transform: the caller passes the returned
+/// clone ONLY to `write_human` / `write_human_auto`. The unmodified `effective`
+/// verdict still drives the action, exit code, audit log, ack / approval files,
+/// `last_trigger`, the webhook, and session accounting (`record_*`). Nothing
+/// about the verdict itself changes here.
+///
+/// Suppression NEVER touches a finding that drives a block: a finding is a
+/// candidate only when, classified ALONE, it maps to [`Action::Warn`] /
+/// [`Action::WarnAck`] (i.e. Medium / Low severity). High / Critical (Block) and
+/// Info (Allow) findings are always kept. For each DISTINCT `(rule_id, target)`
+/// pair among the candidates, [`tirith_core::session_warnings::suppress_check`] is
+/// called EXACTLY once (it mutates session cooldown state and, on a suppressed
+/// hit, emits the `finding_suppressed` audit rollup so a collapsed warning is
+/// never dropped silently).
+fn build_display_verdict(
+    effective: &Verdict,
+    session_id: &str,
+    cooldown_secs: u64,
+) -> (Verdict, usize) {
+    // Suppression applies ONLY to an overall Warn/WarnAck verdict. If the command
+    // is Blocked (including a Warn escalated to Block by policy override,
+    // correlation, or deferral) the full finding set is always shown so the user
+    // sees WHY it was blocked, even on a repeat. This also keeps suppress_check
+    // (and its cooldown side effect) out of the Block path entirely.
+    if !matches!(effective.action, Action::Warn | Action::WarnAck) {
+        return (effective.clone(), 0);
+    }
+    // Distinct (rule_id, target) pairs whose action-class is Warn/WarnAck only.
+    // Order-preserving so suppress_check is invoked deterministically.
+    let mut pairs: Vec<(String, Option<String>)> = Vec::new();
+    for f in &effective.findings {
+        // Classify the finding ALONE: only Warn/WarnAck-class findings are
+        // candidates. High/Critical (Block) and Info (Allow) are never suppressed.
+        if !matches!(
+            action_from_findings(std::slice::from_ref(f)),
+            Action::Warn | Action::WarnAck
+        ) {
+            continue;
+        }
+        let rule_id = f.rule_id.to_string();
+        // Primary target/domain if one is readily available on the finding's
+        // evidence (scopes the cooldown per-domain, matching `cooldown_key`).
+        let target = tirith_core::session_warnings::extract_domains_from_evidence(&f.evidence)
+            .into_iter()
+            .next();
+        if !pairs.iter().any(|(r, t)| r == &rule_id && t == &target) {
+            pairs.push((rule_id, target));
+        }
+    }
+
+    // Call suppress_check ONCE per distinct pair (it mutates session state), and
+    // remember which pairs are now suppressed.
+    let mut suppressed: Vec<(String, Option<String>)> = Vec::new();
+    for (rule_id, target) in &pairs {
+        if tirith_core::session_warnings::suppress_check(
+            session_id,
+            rule_id,
+            target.as_deref(),
+            cooldown_secs,
+        ) {
+            suppressed.push((rule_id.clone(), target.clone()));
+        }
+    }
+
+    // Fast path: nothing suppressed, so hand back a clone unchanged.
+    if suppressed.is_empty() {
+        return (effective.clone(), 0);
+    }
+
+    let mut display = effective.clone();
+    let before = display.findings.len();
+    display.findings.retain(|f| {
+        // Keep everything that is not a suppressed Warn/WarnAck candidate. A
+        // Block/Critical/Info finding is never in `suppressed`, so it always stays.
+        if !matches!(
+            action_from_findings(std::slice::from_ref(f)),
+            Action::Warn | Action::WarnAck
+        ) {
+            return true;
+        }
+        let rule_id = f.rule_id.to_string();
+        let target = tirith_core::session_warnings::extract_domains_from_evidence(&f.evidence)
+            .into_iter()
+            .next();
+        !suppressed
+            .iter()
+            .any(|(r, t)| r == &rule_id && t == &target)
+    });
+    let hidden = before - display.findings.len();
+    (display, hidden)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -354,8 +450,25 @@ pub fn run(
     // In --approval-check mode, stdout holds ONLY the temp-file path(s) so
     // hooks can parse it line-by-line. Human output must go to stderr.
     if approval_check {
-        if output::write_human(&effective, warn_only, std::io::stderr().lock()).is_err() {
+        // W6: collapse repeated Warn/WarnAck findings in the DISPLAY only. The
+        // full `effective` verdict above already drove the action, exit code,
+        // audit log, ack file, last_trigger, and webhook; only this rendering is
+        // filtered. No per-rule cooldown field exists on Policy, so all rules use
+        // the default window.
+        let (display, suppressed_count) = build_display_verdict(
+            &effective,
+            &session_id,
+            tirith_core::suppression::DEFAULT_COOLDOWN_SECS,
+        );
+        if output::write_human(&display, warn_only, std::io::stderr().lock()).is_err() {
             eprintln!("tirith: failed to write approval output");
+        }
+        // If every displayable warning was collapsed, surface one compact notice
+        // (same stream `write_human` used here: stderr in approval-check mode).
+        if display.findings.is_empty() && suppressed_count > 0 {
+            eprintln!(
+                "tirith: {suppressed_count} repeated warning(s) suppressed this session (run `tirith warnings`)"
+            );
         }
 
         // Mode B (hook-driven strict_warn): write warn-ack temp file and exit 3.
@@ -410,8 +523,23 @@ pub fn run(
             eprintln!("tirith: failed to write JSON output");
         }
     } else {
-        if output::write_human_auto(&effective, warn_only).is_err() {
+        // W6: collapse repeated Warn/WarnAck findings in the DISPLAY only; the
+        // full `effective` verdict already drove every enforcement side effect
+        // above. `write_human_auto` writes the human verdict to stderr.
+        let (display, suppressed_count) = build_display_verdict(
+            &effective,
+            &session_id,
+            tirith_core::suppression::DEFAULT_COOLDOWN_SECS,
+        );
+        if output::write_human_auto(&display, warn_only).is_err() {
             eprintln!("tirith: failed to write output");
+        }
+        // If every displayable warning was collapsed, surface one compact notice
+        // on the same stream `write_human_auto` used (stderr).
+        if display.findings.is_empty() && suppressed_count > 0 {
+            eprintln!(
+                "tirith: {suppressed_count} repeated warning(s) suppressed this session (run `tirith warnings`)"
+            );
         }
         if output::write_safe_suggestions(&safe_suggestions, std::io::stderr().lock()).is_err() {
             eprintln!("tirith: failed to write safe-command suggestions");
