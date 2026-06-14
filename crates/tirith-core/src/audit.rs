@@ -200,30 +200,40 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
         .map(|h| h.signing_enabled)
         .unwrap_or(false);
     // Opt-in signing: sign the canonical form (`sig` excluded, `prev_hash`
-    // included) only when a signing key file exists.
+    // included) only when a signing key file exists. Attempt the signature first,
+    // THEN enforce the signed-log invariant unconditionally below, so a failure to
+    // produce a signature fails closed whether it came from `to_value` erroring OR
+    // from `sign_canonical` returning None, never falling through to an unsigned
+    // `to_string` write on a previously signed log.
     let mut signed_now = false;
-    if let Ok(mut unsigned) = serde_json::to_value(&entry) {
-        if let Some(o) = unsigned.as_object_mut() {
-            o.remove("sig");
-        }
-        let canon = canonical_json_string(&unsigned);
-        match sign_canonical(canon.as_bytes()) {
-            Some(sig) => {
-                entry.sig = Some(sig);
-                signed_now = true;
+    let signature = match serde_json::to_value(&entry) {
+        Ok(mut unsigned) => {
+            if let Some(o) = unsigned.as_object_mut() {
+                o.remove("sig");
             }
-            // The log carried signatures, but we cannot sign this entry (key
-            // gone / unreadable). Writing it unsigned would poison the log: on
-            // verify it is indistinguishable from a stripped signature. Refuse.
-            None if was_signed => {
-                let reason =
-                    "signing key unavailable for a previously signed audit log".to_string();
-                audit_diagnostic(format!("tirith: audit: {reason}"));
-                let _ = fs2::FileExt::unlock(&file);
-                return AuditWrite::Failed(reason);
-            }
-            None => {}
+            let canon = canonical_json_string(&unsigned);
+            sign_canonical(canon.as_bytes())
         }
+        // `to_value` failed: no signature could be produced. Treat exactly like a
+        // signing failure so the `was_signed` invariant below still fires.
+        Err(_) => None,
+    };
+    match signature {
+        Some(sig) => {
+            entry.sig = Some(sig);
+            signed_now = true;
+        }
+        // The log carried signatures, but we cannot sign this entry (key gone /
+        // unreadable, or the entry would not serialize). Writing it unsigned would
+        // poison the log: on verify it is indistinguishable from a stripped
+        // signature. Refuse BEFORE any unsigned write is attempted.
+        None if was_signed => {
+            let reason = "signing key unavailable for a previously signed audit log".to_string();
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            let _ = fs2::FileExt::unlock(&file);
+            return AuditWrite::Failed(reason);
+        }
+        None => {}
     }
     // Fail-safe: do NOT switch signing ON mid-stream over a non-empty log whose
     // prior chained entries are unsigned. Verification would then expect every
@@ -412,11 +422,30 @@ fn read_last_line(path: &std::path::Path) -> Option<String> {
     }
 }
 
+/// Count `b'\n'` occurrences in `path` by streaming fixed-size chunks rather than
+/// slurping the whole file. Semantics are identical to the previous `fs::read`
+/// implementation: a missing/unreadable file or any read error yields 0, an empty
+/// file yields 0, and the result is the number of newline bytes (so a file with no
+/// trailing newline counts one fewer than its visible line count, exactly as
+/// before). This runs under the exclusive audit lock on the fallback path, so it
+/// must not allocate the entire (possibly multi-GB) log.
 fn count_lines(path: &std::path::Path) -> u64 {
-    match fs::read(path) {
-        Ok(b) => b.iter().filter(|&&c| c == b'\n').count() as u64,
-        Err(_) => 0,
+    use std::io::Read;
+    let Ok(mut f) = fs::File::open(path) else {
+        return 0;
+    };
+    let mut buf = [0u8; 64 * 1024];
+    let mut count: u64 = 0;
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => count += buf[..n].iter().filter(|&&c| c == b'\n').count() as u64,
+            // A mid-stream read error matches the old behavior's all-or-nothing 0:
+            // the prior `fs::read` returned 0 on any failure, so do the same here.
+            Err(_) => return 0,
+        }
     }
+    count
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -585,8 +614,45 @@ fn open_head_tmp(hp: &std::path::Path) -> std::io::Result<(PathBuf, fs::File)> {
 
 /// Optional ed25519 signing secret key (32 raw bytes). Signing is OPT-IN: it
 /// happens only when this file exists.
+///
+/// On unix the key file is stat'd BEFORE it is read and REFUSED if it is not a
+/// regular file owned by the current effective user, or if it carries any group/
+/// other bits (`mode & 0o077 != 0`). A world/group-readable private key lets any
+/// local user read the 32-byte secret and forge audit signatures, so an insecure
+/// key makes signing unavailable (returns None) rather than reading it. This
+/// matches the `O_NOFOLLOW | 0o600` discipline used for the head temp file and the
+/// pending store. On non-unix the permission model differs, so the check is
+/// skipped and the key is read as before.
 fn audit_signing_secret() -> Option<[u8; 32]> {
     let p = crate::policy::config_dir()?.join("audit-signing.key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(&p).ok()?;
+        if !meta.file_type().is_file() {
+            audit_diagnostic(format!(
+                "tirith: audit: refusing signing key {} (not a regular file)",
+                p.display()
+            ));
+            return None;
+        }
+        if meta.mode() & 0o077 != 0 {
+            audit_diagnostic(format!(
+                "tirith: audit: refusing group/other-readable signing key {} (chmod 600 it)",
+                p.display()
+            ));
+            return None;
+        }
+        // SAFETY: geteuid is always-succeeds and thread-safe.
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            audit_diagnostic(format!(
+                "tirith: audit: refusing signing key {} (not owned by current user)",
+                p.display()
+            ));
+            return None;
+        }
+    }
     let bytes = fs::read(&p).ok()?;
     bytes.get(..32)?.try_into().ok()
 }
@@ -1137,6 +1203,21 @@ fn redact_command(cmd: &str, custom_patterns: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::verdict::{Action, Verdict};
+
+    /// Write a signing key to `path` with secure (0600, owner-only) permissions so
+    /// `audit_signing_secret`'s unix permission gate accepts it. A plain
+    /// `fs::write` would create the file with the process umask (commonly 0644 =
+    /// group/other readable), which the gate now correctly refuses. Tests that want
+    /// signing to be available must therefore store the key the secure way, which
+    /// is also how a real operator must store it.
+    fn write_signing_key(path: &std::path::Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
 
     #[test]
     fn test_tirith_log_disabled() {
@@ -1913,7 +1994,10 @@ mod tests {
         // Deterministic ed25519 keypair from fixed secret bytes.
         let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let vk = sk.verifying_key();
-        std::fs::write(cfg.join("tirith").join("audit-signing.key"), sk.to_bytes()).unwrap();
+        write_signing_key(
+            &cfg.join("tirith").join("audit-signing.key"),
+            &sk.to_bytes(),
+        );
         std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
 
         // SAFETY: serialized by TEST_ENV_LOCK across all modules.
@@ -1990,7 +2074,10 @@ mod tests {
         std::fs::create_dir_all(cfg.join("tirith")).unwrap();
         let sk = ed25519_dalek::SigningKey::from_bytes(&[17u8; 32]);
         let vk = sk.verifying_key();
-        std::fs::write(cfg.join("tirith").join("audit-signing.key"), sk.to_bytes()).unwrap();
+        write_signing_key(
+            &cfg.join("tirith").join("audit-signing.key"),
+            &sk.to_bytes(),
+        );
         std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
 
         // SAFETY: serialized by TEST_ENV_LOCK across all modules.
@@ -2070,7 +2157,10 @@ mod tests {
         std::fs::create_dir_all(cfg.join("tirith")).unwrap();
         let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         // Write ONLY the secret key (so appends sign) — deliberately NO pub key.
-        std::fs::write(cfg.join("tirith").join("audit-signing.key"), sk.to_bytes()).unwrap();
+        write_signing_key(
+            &cfg.join("tirith").join("audit-signing.key"),
+            &sk.to_bytes(),
+        );
 
         // SAFETY: serialized by TEST_ENV_LOCK across all modules.
         unsafe {
@@ -2125,7 +2215,7 @@ mod tests {
         std::fs::create_dir_all(cfg.join("tirith")).unwrap();
         let sk = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
         let key_path = cfg.join("tirith").join("audit-signing.key");
-        std::fs::write(&key_path, sk.to_bytes()).unwrap();
+        write_signing_key(&key_path, &sk.to_bytes());
 
         // SAFETY: serialized by TEST_ENV_LOCK across all modules.
         unsafe {
@@ -2201,7 +2291,7 @@ mod tests {
             // Now plant a signing key and attempt a THIRD append: signing would
             // turn on over a non-empty unsigned log, which must be refused.
             let sk = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
-            std::fs::write(&key_path, sk.to_bytes()).unwrap();
+            write_signing_key(&key_path, &sk.to_bytes());
             let third = append_to_audit_log(&chain_test_entry("Warn"), Some(log.clone()));
             assert!(
                 matches!(third, AuditWrite::Failed(_)),
@@ -2289,7 +2379,10 @@ mod tests {
         std::fs::create_dir_all(cfg.join("tirith")).unwrap();
         let sk = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
         let vk = sk.verifying_key();
-        std::fs::write(cfg.join("tirith").join("audit-signing.key"), sk.to_bytes()).unwrap();
+        write_signing_key(
+            &cfg.join("tirith").join("audit-signing.key"),
+            &sk.to_bytes(),
+        );
         std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
 
         // SAFETY: serialized by TEST_ENV_LOCK across all modules.
@@ -2384,7 +2477,10 @@ mod tests {
         std::fs::create_dir_all(cfg.join("tirith")).unwrap();
         let sk = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
         let vk = sk.verifying_key();
-        std::fs::write(cfg.join("tirith").join("audit-signing.key"), sk.to_bytes()).unwrap();
+        write_signing_key(
+            &cfg.join("tirith").join("audit-signing.key"),
+            &sk.to_bytes(),
+        );
         std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
 
         // SAFETY: serialized by TEST_ENV_LOCK across all modules.
@@ -2529,5 +2625,97 @@ mod tests {
         );
         assert_eq!(report.chained_lines, 0, "no chained lines");
         assert_eq!(report.legacy_prefix, 2, "both lines are legacy");
+    }
+
+    /// G1: the streaming `count_lines` returns the same newline count as the old
+    /// slurping implementation for the boundary cases (missing, empty, trailing
+    /// newline, no trailing newline, a span larger than one read chunk).
+    #[test]
+    fn count_lines_streams_with_identical_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Missing file -> 0.
+        let missing = dir.path().join("nope.jsonl");
+        assert_eq!(count_lines(&missing), 0, "missing file counts 0");
+
+        // Empty file -> 0.
+        let empty = dir.path().join("empty.jsonl");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(count_lines(&empty), 0, "empty file counts 0");
+
+        // Three lines, trailing newline -> 3 newline bytes.
+        let trailing = dir.path().join("trailing.jsonl");
+        std::fs::write(&trailing, b"a\nb\nc\n").unwrap();
+        assert_eq!(count_lines(&trailing), 3, "trailing newline counts 3");
+
+        // Three visible lines, NO trailing newline -> 2 newline bytes (matches the
+        // old fs::read behavior exactly: it counts bytes, not visible lines).
+        let no_trailing = dir.path().join("no_trailing.jsonl");
+        std::fs::write(&no_trailing, b"a\nb\nc").unwrap();
+        assert_eq!(
+            count_lines(&no_trailing),
+            2,
+            "no trailing newline counts newline bytes only"
+        );
+
+        // A file larger than one 64 KiB read chunk: 5000 lines must all be counted
+        // across multiple reads.
+        let big = dir.path().join("big.jsonl");
+        let mut content = Vec::new();
+        for i in 0..5000u32 {
+            content.extend_from_slice(format!("line-{i}-padding-padding-padding\n").as_bytes());
+        }
+        std::fs::write(&big, &content).unwrap();
+        assert_eq!(
+            count_lines(&big),
+            5000,
+            "lines spanning multiple read chunks must all be counted"
+        );
+    }
+
+    /// G3: a group/other-readable signing key is refused (signing unavailable), a
+    /// 0600 key owned by the current user is accepted. Unix-only because the
+    /// permission model is unix-specific.
+    #[cfg(unix)]
+    #[test]
+    fn signing_key_permissions_are_enforced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_home = dir.path().join("config");
+        // config_dir() resolves to <XDG_CONFIG_HOME>/tirith on unix (etcetera base
+        // strategy), so point it at our temp dir.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
+
+        let key_dir = cfg_home.join("tirith");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let key_path = key_dir.join("audit-signing.key");
+        std::fs::write(&key_path, [7u8; 32]).unwrap();
+
+        // 0644 (group/other readable) must be refused -> None.
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            audit_signing_secret().is_none(),
+            "a world/group-readable signing key must be refused"
+        );
+
+        // 0600 (owner-only) must be accepted -> Some(32 bytes).
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let secret = audit_signing_secret();
+        assert!(
+            secret.is_some(),
+            "a 0600 owner-only signing key must be accepted"
+        );
+        assert_eq!(
+            secret.unwrap(),
+            [7u8; 32],
+            "the 32-byte secret must round-trip"
+        );
+
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 }

@@ -236,6 +236,10 @@ fn now_rfc3339() -> String {
 /// If `decision.id` is empty an 8-char id is generated (retried on the rare
 /// chance of a collision with an existing entry). `created_at` is filled in
 /// when empty. The updated map is written atomically.
+///
+/// If `decision.id` is NON-empty and already present in the store, this returns
+/// `Err` rather than silently clobbering the existing entry (which would destroy
+/// its resolution history). The empty-id auto-generation path is unaffected.
 pub fn register(mut decision: PendingDecision) -> Result<String, String> {
     // The whole id-generation + insert + save runs under the cross-process lock,
     // so two concurrent registers cannot pick the same generated id off the same
@@ -247,6 +251,10 @@ pub fn register(mut decision: PendingDecision) -> Result<String, String> {
                 id = generate_id();
             }
             decision.id = id;
+        } else if map.contains_key(decision.id.trim()) {
+            // An explicit id that already exists must NOT overwrite the stored
+            // entry (that would silently drop its resolution history). Fail closed.
+            return Err(format!("pending id already exists: {}", decision.id.trim()));
         }
         if decision.created_at.trim().is_empty() {
             decision.created_at = now_rfc3339();
@@ -254,8 +262,8 @@ pub fn register(mut decision: PendingDecision) -> Result<String, String> {
 
         let id = decision.id.clone();
         map.insert(id.clone(), decision);
-        id
-    })
+        Ok(id)
+    })?
 }
 
 /// Resolve a pending decision idempotently.
@@ -566,6 +574,68 @@ mod tests {
             assert_eq!(
                 after, corrupt,
                 "the corrupt store must NOT be truncated/overwritten"
+            );
+        })();
+
+        match prev {
+            Some(val) => unsafe { std::env::set_var("XDG_STATE_HOME", val) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
+        result
+    }
+
+    #[test]
+    fn register_explicit_duplicate_id_errors_and_preserves_entry() {
+        // G4: registering a second decision with an already-present EXPLICIT id
+        // must return Err and must NOT clobber the existing entry (which would
+        // destroy its resolution history). The empty-id auto-generation path is
+        // unaffected and exercised elsewhere.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var("XDG_STATE_HOME").ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+
+        let result = (|| {
+            // Seed an entry under a fixed id, then resolve it so it carries history.
+            let mut first = sample(PendingSource::Restore, "high");
+            first.id = "fixed001".to_string();
+            assert_eq!(register(first).unwrap(), "fixed001");
+            assert!(
+                resolve(
+                    "fixed001",
+                    PendingStatus::Kept,
+                    Some("kept it".to_string()),
+                    Some("cli".to_string()),
+                )
+                .unwrap(),
+                "first resolve should transition the entry"
+            );
+
+            // A second register under the SAME explicit id must fail closed.
+            let mut clash = sample(PendingSource::Finding, "low");
+            clash.id = "fixed001".to_string();
+            clash.command_redacted = "different command".to_string();
+            let reg = register(clash);
+            assert!(
+                reg.is_err(),
+                "registering a duplicate explicit id must return Err: {reg:?}"
+            );
+
+            // The stored entry must be the ORIGINAL one, with its resolution intact.
+            let all = load_all().unwrap();
+            assert_eq!(all.len(), 1, "no second entry should have been inserted");
+            let stored = &all[0];
+            assert_eq!(stored.id, "fixed001");
+            assert_eq!(stored.source, PendingSource::Restore, "source unchanged");
+            assert_eq!(stored.status, PendingStatus::Kept, "resolution preserved");
+            assert_eq!(stored.reason.as_deref(), Some("kept it"));
+            assert_eq!(
+                stored.command_redacted, "curl https://example.com | sh",
+                "the original command must NOT be overwritten"
             );
         })();
 
