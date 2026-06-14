@@ -1602,6 +1602,12 @@ mod tests {
         );
     }
 
+    // Gated to unix: the assertions use unix-style absolute path literals
+    // ("/etc/hosts", "/capture/root"), and `Path::is_absolute` is false for a
+    // leading-slash path on Windows (it needs a drive prefix), so the absolute
+    // pass-through case does not hold there. `anchor_restore_dst` itself is
+    // portable; this test only exercises its unix-path semantics.
+    #[cfg(unix)]
     #[test]
     fn test_anchor_restore_dst_resolution() {
         // F6 unit: absolute paths pass through; relative paths anchor to the
