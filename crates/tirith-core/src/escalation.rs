@@ -742,13 +742,13 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
                 // segment's first path is kept as the representative metadata
                 // `path` (for display / back-compat).
                 if delete_path.is_none() {
-                    delete_path = first_path_arg(&args);
+                    delete_path = first_path_arg(leader_base.as_str(), &args);
                 }
                 // Count EVERY non-flag path arg (multi-path delete), so `rm a b c`
                 // is three deletions, and split the total into non-build paths so
                 // the mass-delete correlation never counts `dist/`/`node_modules/`.
-                delete_path_count += count_path_args(&args);
-                delete_non_build_count += count_non_build_path_args(&args);
+                delete_path_count += count_path_args(leader_base.as_str(), &args);
+                delete_non_build_count += count_non_build_path_args(leader_base.as_str(), &args);
             }
             "git" if git_is_force_push(&args) => is_force_push = true,
             "npm" | "pnpm" | "yarn" | "pip" | "pip3" | "cargo" | "brew" | "gem" | "go" | "apt"
@@ -902,65 +902,84 @@ fn command_base(name: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// The first non-flag argument, treated as a path. Conservative: returns the
-/// first token that does not start with `-`.
-fn first_path_arg(args: &[String]) -> Option<String> {
-    // A bare `--` ends option parsing: every token after it is a POSITIONAL path
-    // even when it begins with `-` (`rm -- -a` deletes a file literally named
-    // `-a`). Without this, a dash-led path after `--` is misread as a flag and the
-    // delete is never recorded.
-    let mut end_of_options = false;
-    args.iter()
-        .find(|a| {
-            if !end_of_options && a.as_str() == "--" {
-                end_of_options = true;
-                return false;
-            }
-            end_of_options || !a.starts_with('-')
-        })
-        .cloned()
+/// The value-taking options for a delete `tool` whose FOLLOWING token is a value,
+/// not a path. Only `shred` has any: `-n`/`--iterations <N>` and `-s`/`--size <N>`
+/// each consume the next token. `rm` and `unlink` have NONE (every non-flag token
+/// is a path), so they return an empty set and keep their original behavior. The
+/// joined `--iterations=3` / `--size=1M` forms consume no extra token and are
+/// handled by the leading-`-` flag test, not here.
+fn delete_value_flags_for(tool: &str) -> &'static [&'static str] {
+    const SHRED: &[&str] = &["-n", "--iterations", "-s", "--size"];
+    match tool {
+        "shred" => SHRED,
+        _ => &[],
+    }
 }
 
-/// The number of non-flag PATH arguments a delete command targets. The multi-path
-/// counterpart of [`first_path_arg`], using the SAME flag rule (a token is a path
-/// unless it starts with `-`): `rm a b c` -> 3, `rm -rf x y` -> 2, `rm -f` -> 0.
-/// Matching `first_path_arg`'s rule exactly guarantees this is >= 1 whenever
-/// `first_path_arg` found a path (so the recorded `count` is never 0 for an
-/// emitted FileDelete). The leader/wrappers are already peeled by the caller, so
-/// `args` is just the rm/unlink/shred operands.
-fn count_path_args(args: &[String]) -> usize {
-    // A bare `--` ends option parsing: every later token counts as a positional
-    // path even with a leading `-` (so `rm -f -- -a file` is two deletes, not one).
+/// Collect the positional PATH operands of a delete command, peeling off any value
+/// consumed by a value-taking option of `tool` (see [`delete_value_flags_for`]).
+/// A bare `--` ends option parsing: every later token is a POSITIONAL path even
+/// when it begins with `-` (`rm -- -a` deletes a file literally named `-a`), and
+/// value-flag skipping stops after `--`. This is the single source of truth the
+/// three counters share so their path rule cannot drift.
+///
+/// `shred -n 3 secret.txt` -> `[secret.txt]` (the `3` is `-n`'s value, not a path);
+/// `shred --iterations=3 a b` -> `[a, b]`; `rm a b c` -> `[a, b, c]`.
+fn delete_path_args<'a>(tool: &str, args: &'a [String]) -> Vec<&'a String> {
+    let value_flags = delete_value_flags_for(tool);
+    let mut paths = Vec::new();
     let mut end_of_options = false;
-    args.iter()
-        .filter(|a| {
-            if !end_of_options && a.as_str() == "--" {
-                end_of_options = true;
-                return false;
+    let mut skip_next = false;
+    for a in args {
+        if skip_next {
+            // This token is the value of a preceding value-taking option (e.g. the
+            // `3` after `shred -n`); it is not a path.
+            skip_next = false;
+            continue;
+        }
+        if !end_of_options && a.as_str() == "--" {
+            end_of_options = true;
+            continue;
+        }
+        if !end_of_options && a.starts_with('-') {
+            // A bare value-taking option consumes the NEXT token as its value; the
+            // joined `--iterations=3` form is self-contained (consumes nothing).
+            if value_flags.contains(&a.as_str()) {
+                skip_next = true;
             }
-            end_of_options || !a.starts_with('-')
-        })
-        .count()
+            continue;
+        }
+        paths.push(a);
+    }
+    paths
 }
 
-/// The number of non-flag path arguments that are NOT build artifacts, using the
-/// same flag rule as [`count_path_args`] plus
-/// `crate::util_build_dirs::is_build_artifact_path` on each path. `rm app.rs dist/x
-/// dist/y` -> 1; `rm dist/a dist/b` -> 0; `rm -rf src x` -> 2. This is what the
-/// mass-deletion correlation sums, so a mixed delete contributes exactly its real
-/// non-build paths instead of all-or-nothing on one sampled path.
-fn count_non_build_path_args(args: &[String]) -> usize {
-    // A bare `--` ends option parsing: every later token is a positional path even
-    // with a leading `-`, so the non-build delete count is not undercounted.
-    let mut end_of_options = false;
-    args.iter()
-        .filter(|a| {
-            if !end_of_options && a.as_str() == "--" {
-                end_of_options = true;
-                return false;
-            }
-            end_of_options || !a.starts_with('-')
-        })
+/// The first PATH operand of a delete command (the representative metadata path).
+/// `tool` selects the value-taking options to skip so a value is never returned as
+/// a path: `shred -n 3 secret.txt` yields `secret.txt`, not `3`. `rm`/`unlink`
+/// have no value-taking options, so this is the first non-flag token as before.
+fn first_path_arg(tool: &str, args: &[String]) -> Option<String> {
+    delete_path_args(tool, args).first().map(|s| (*s).clone())
+}
+
+/// The number of PATH operands a delete command targets, sharing [`delete_path_args`]
+/// so its rule matches [`first_path_arg`] exactly (the recorded `count` is never 0
+/// for an emitted FileDelete). `rm a b c` -> 3, `rm -rf x y` -> 2, `rm -f` -> 0,
+/// `shred -n 3 secret.txt` -> 1. The leader/wrappers are already peeled by the
+/// caller, so `args` is just the rm/unlink/shred operands.
+fn count_path_args(tool: &str, args: &[String]) -> usize {
+    delete_path_args(tool, args).len()
+}
+
+/// The number of PATH operands that are NOT build artifacts, using the same path
+/// rule as [`count_path_args`] plus `crate::util_build_dirs::is_build_artifact_path`
+/// on each path. `rm app.rs dist/x dist/y` -> 1; `rm dist/a dist/b` -> 0;
+/// `rm -rf src x` -> 2. This is what the mass-deletion correlation sums, so a mixed
+/// delete contributes exactly its real non-build paths instead of all-or-nothing on
+/// one sampled path.
+fn count_non_build_path_args(tool: &str, args: &[String]) -> usize {
+    delete_path_args(tool, args)
+        .into_iter()
         .filter(|a| !crate::util_build_dirs::is_build_artifact_path(a))
         .count()
 }
@@ -1012,9 +1031,11 @@ fn is_remote_url_host(host_token: &str) -> bool {
 fn value_flags_for(leader_base: &str) -> &'static [&'static str] {
     // Flags common to essentially every downloader (output, data, headers, auth,
     // proxy). Also serves as the conservative default for an unrecognised tool.
+    // Only TRUE value-taking flags belong here: a BOOLEAN flag (curl `-O`, httpie
+    // `-d`) takes no argument, so skipping the next token would eat the URL and
+    // suppress the Network event. `-O` is therefore intentionally absent.
     const COMMON: &[&str] = &[
         "-o",
-        "-O",
         "--output",
         "--output-document",
         "-d",
@@ -1035,9 +1056,12 @@ fn value_flags_for(leader_base: &str) -> &'static [&'static str] {
         "--proxy",
     ];
     // curl: many more value flags whose argument is a PATH/value, never a target.
+    // NOTE curl `-O`/`--remote-name` is BOOLEAN (write to a remote-derived
+    // filename, consumes NO token); it must NOT be listed or the URL after it
+    // (`curl -O https://example.com/x`) is misread as a consumed value and the
+    // Network event is lost. curl `-d`/`--data`, by contrast, IS value-taking.
     const CURL: &[&str] = &[
         "-o",
-        "-O",
         "--output",
         "-d",
         "--data",
@@ -1130,11 +1154,13 @@ fn value_flags_for(leader_base: &str) -> &'static [&'static str] {
         "--bind-address",
     ];
     // httpie (`http`/`https`/`xh`): value flags that take a path/value argument.
+    // NOTE httpie `-d`/`--download` is BOOLEAN (it switches on download mode and
+    // consumes NO token), UNLIKE curl `-d` which IS value-taking; this is exactly
+    // why the lists are tool-specific. Listing it here would eat the URL of
+    // `http --download example.com/x` and drop the Network event.
     const HTTPIE: &[&str] = &[
         "-o",
         "--output",
-        "-d",
-        "--download",
         "--max-redirects",
         "--timeout",
         "-a",
@@ -2323,6 +2349,70 @@ mod tests {
     }
 
     #[test]
+    fn derive_network_curl_remote_name_flag_is_not_value_taking() {
+        // D2: curl `-O`/`--remote-name` is BOOLEAN (consumes no token). It must NOT
+        // skip the following URL, or `curl -O https://example.com/x` records no
+        // Network event. The host must still be extracted.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        for cmd in [
+            "curl -O https://example.com/x",
+            "curl --remote-name https://example.com/x",
+        ] {
+            assert!(
+                network_invocation_has_remote_target(
+                    "curl",
+                    &["-O".into(), "https://example.com/x".into()]
+                ) || network_invocation_has_remote_target(
+                    "curl",
+                    &["--remote-name".into(), "https://example.com/x".into()]
+                ),
+                "curl boolean remote-name flag must not swallow the URL"
+            );
+            let events = derive_typed_events(cmd, &v);
+            assert!(
+                kinds(&events).contains(&EventKind::Network),
+                "{cmd} must record a Network event"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_network_httpie_download_flag_is_not_value_taking() {
+        // D2: httpie `-d`/`--download` is BOOLEAN (it enables download mode and
+        // consumes no token), UNLIKE curl `-d`. It must NOT skip the following
+        // target, or `http --download example.com/x` records no Network event.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        for cmd in ["http --download example.com/x", "http -d example.com/x"] {
+            let events = derive_typed_events(cmd, &v);
+            assert!(
+                kinds(&events).contains(&EventKind::Network),
+                "{cmd} must record a Network event"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_network_curl_data_flag_stays_value_taking() {
+        // D2 guard: curl `-d`/`--data` IS value-taking, so its value must still be
+        // skipped (not read as a host). `curl -d @payload example.com/x` is still a
+        // Network event because of the trailing host, but `curl -d secret.txt`
+        // alone (no host) records nothing.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        assert!(
+            kinds(&derive_typed_events(
+                "curl -d @payload https://example.com/x",
+                &v
+            ))
+            .contains(&EventKind::Network),
+            "trailing URL is still detected"
+        );
+        assert!(
+            !network_invocation_has_remote_target("curl", &["-d".into(), "host.example".into()]),
+            "curl -d value must be skipped, not read as a host"
+        );
+    }
+
+    #[test]
     fn derive_network_from_finding() {
         // Even without a curl/wget leader, a network-class finding records Network.
         let v = raw_verdict_with(
@@ -2775,6 +2865,75 @@ mod tests {
                 .get(crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY)
                 .map(String::as_str),
             Some("0")
+        );
+    }
+
+    #[test]
+    fn derive_file_delete_shred_skips_value_taking_option_values() {
+        // D1: `shred`'s `-n N` / `--iterations N` and `-s N` / `--size N` consume
+        // the NEXT token as a value, NOT a path. Treating that value as a path
+        // fabricates a delete of `3` and overcounts the mass-delete weight.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+
+        // `shred -n 3 secret.txt` deletes EXACTLY one path (`secret.txt`); the `3`
+        // is the iteration count, not a path.
+        let del = derive_typed_events("shred -n 3 secret.txt", &v)
+            .into_iter()
+            .find(|e| e.kind == EventKind::FileDelete)
+            .expect("`shred -n 3 secret.txt` must record a FileDelete");
+        assert_eq!(
+            del.metadata.get("path").map(String::as_str),
+            Some("secret.txt"),
+            "the representative path is the file, not the `-n` value"
+        );
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("1"),
+            "only secret.txt counts; the `3` after `-n` is a value, not a path"
+        );
+
+        // The joined `--iterations=3` form consumes no extra token, so both `a`
+        // and `b` are paths -> count 2.
+        let del = derive_typed_events("shred --iterations=3 a b", &v)
+            .into_iter()
+            .find(|e| e.kind == EventKind::FileDelete)
+            .expect("`shred --iterations=3 a b` must record a FileDelete");
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("2"),
+            "`--iterations=3` is self-contained; a and b are both paths"
+        );
+
+        // `-s`/`--size` is value-taking too: `shred -s 1M secret.txt` is one path.
+        let del = derive_typed_events("shred -s 1M secret.txt", &v)
+            .into_iter()
+            .find(|e| e.kind == EventKind::FileDelete)
+            .expect("`shred -s 1M secret.txt` must record a FileDelete");
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("1"),
+            "`1M` after `-s` is a size value, not a path"
+        );
+
+        // `rm` has NO value-taking options: every non-flag token stays a path, so a
+        // bare `-n`-looking token here would be a flag, and `rm 3 secret.txt` keeps
+        // counting both operands.
+        let del = derive_typed_events("rm 3 secret.txt", &v)
+            .into_iter()
+            .find(|e| e.kind == EventKind::FileDelete)
+            .expect("`rm 3 secret.txt` must record a FileDelete");
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("2"),
+            "rm has no value-taking options; both `3` and secret.txt are paths"
         );
     }
 

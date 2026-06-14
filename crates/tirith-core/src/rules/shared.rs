@@ -94,8 +94,12 @@ pub fn is_url_shortener(host: &str) -> bool {
 /// address), IPv6 `::1` (bracketed or bare), the unspecified address `0.0.0.0`,
 /// or any `*.localhost` name. Centralised so `transport.rs` (PlainHttpToSink) and
 /// `escalation.rs` (W7 Network-event derivation) share one definition and cannot
-/// drift. Matching is exact and case-sensitive on the already-lowercased host the
-/// callers pass.
+/// drift. Matching is CASE-INSENSITIVE: the host is lowercased internally, so
+/// callers may pass a raw host of any casing (`LOCALHOST`, `App.LocalHost`) and
+/// need not pre-lowercase. This matters because `transport.rs` passes the raw host
+/// straight from URL/SCP parsing (which does not lowercase), and an uppercase
+/// loopback host must still be recognised so it does not falsely fire
+/// `PlainHttpToSink`.
 ///
 /// The 127.0.0.0/8 case is gated on actually parsing as an IPv4 address: a bare
 /// `host.starts_with("127.")` would also match hostnames like `127.evil.example`,
@@ -103,8 +107,9 @@ pub fn is_url_shortener(host: &str) -> bool {
 /// `Ipv4Addr::is_loopback` is true for the whole 127.0.0.0/8 block and false for
 /// any non-address string.
 pub fn is_loopback_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
     matches!(
-        host,
+        host.as_str(),
         "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
     ) || host
         .parse::<std::net::Ipv4Addr>()
@@ -174,5 +179,18 @@ mod tests {
         // A non-loopback IPv4 address is not local.
         assert!(!is_loopback_host("10.0.0.1"));
         assert!(!is_loopback_host("128.0.0.1"));
+    }
+
+    #[test]
+    fn is_loopback_host_is_case_insensitive() {
+        // The host is lowercased internally, so any casing of a loopback name is
+        // recognised. This guards transport.rs, which passes the raw (un-lowercased)
+        // host and would otherwise fire PlainHttpToSink for an uppercase loopback.
+        assert!(is_loopback_host("LOCALHOST"));
+        assert!(is_loopback_host("Localhost"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("App.LocalHost"));
+        // A real remote host is still not loopback regardless of casing.
+        assert!(!is_loopback_host("Evil.example"));
     }
 }

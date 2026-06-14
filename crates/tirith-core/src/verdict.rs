@@ -702,7 +702,7 @@ pub enum RuleId {
     /// 30s. Critical, the canonical credential-exfiltration shape.
     SecretWriteThenNetwork,
     /// W7: a dependency manifest (package.json/Cargo.toml/requirements.txt/...)
-    /// was modified, then a network call ran within 60s. Warn, a poisoned-install
+    /// was modified, then a network call ran within 60s. Medium, a poisoned-install
     /// signal that is individually unremarkable but suspicious in sequence.
     DependencyChangeThenNetwork,
     /// W7: a file deletion was followed by a `git push --force` within 60s.

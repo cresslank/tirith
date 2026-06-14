@@ -148,4 +148,36 @@ mod tests {
         let findings = check_insecure_flags(&args, true);
         assert!(!findings.is_empty());
     }
+
+    #[test]
+    fn plain_http_loopback_suppressed_regardless_of_host_casing() {
+        // PlainHttpToSink must NOT fire for a loopback host in sink context. The
+        // url crate already lowercases the host of a Standard http URL, but the
+        // suppression now relies on is_loopback_host being case-insensitive
+        // internally, so this holds for any input casing of the loopback name.
+        for raw in [
+            "http://localhost:3000/x",
+            "http://LOCALHOST:3000/x",
+            "http://Localhost/y",
+            "http://127.0.0.1/a",
+            "http://app.LocalHost/b",
+        ] {
+            let url = crate::parse::parse_url(raw);
+            let findings = check(&url, true);
+            assert!(
+                !findings
+                    .iter()
+                    .any(|f| f.rule_id == RuleId::PlainHttpToSink),
+                "PlainHttpToSink should be suppressed for loopback host: {raw}"
+            );
+        }
+        // A genuine remote http host in sink context still fires.
+        let remote = crate::parse::parse_url("http://evil.example/x");
+        assert!(
+            check(&remote, true)
+                .iter()
+                .any(|f| f.rule_id == RuleId::PlainHttpToSink),
+            "PlainHttpToSink should fire for a remote http host"
+        );
+    }
 }
