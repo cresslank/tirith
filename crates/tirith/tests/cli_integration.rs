@@ -22,6 +22,12 @@ fn scrub_ambient_env(c: &mut Command) -> &mut Command {
         .env_remove("TIRITH_INTERACTIVE")
         .env_remove("TIRITH_THREATDB_PATH")
         .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH")
+        // TIRITH_LOG governs whether the audit log is written at all. An ambient
+        // `TIRITH_LOG=0` on the CI runner would silently stop the audit-verify
+        // seeding from producing a `log.jsonl`, making those tests environment-
+        // dependent. Scrub it here; tests that REQUIRE logging set TIRITH_LOG=1
+        // explicitly.
+        .env_remove("TIRITH_LOG")
 }
 
 /// A `tirith` command with the ambient policy / threat-DB / TTY-override env scrubbed (see
@@ -15295,6 +15301,9 @@ fn audit_verify_clean_chain_then_detects_tamper_and_expected_head() {
                 "--",
                 cmd,
             ])
+            // The scrub helper now removes TIRITH_LOG, so opt logging back ON
+            // explicitly: this test depends on a real audit log being written.
+            .env("TIRITH_LOG", "1")
             .env("XDG_DATA_HOME", &data)
             .env("XDG_STATE_HOME", &state)
             .env("XDG_CONFIG_HOME", &cfg)

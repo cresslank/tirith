@@ -727,8 +727,47 @@ fn audit_signing_secret() -> Option<[u8; 32]> {
 }
 
 /// Optional ed25519 verifying (public) key for `tirith audit verify`.
+///
+/// The PUBLIC key is the trust anchor for `verify`: if an attacker with local
+/// WRITE access to `config_dir()` can replace it, they can re-sign tampered log
+/// lines with the matching private key and make verification report `ok=true`.
+/// So on unix the file is gated the same way the private key is, EXCEPT the
+/// permission mask is `0o022` (world/group-WRITABLE) rather than `0o077`: a
+/// public key is meant to be world-READABLE, it just must not be world- or
+/// group-WRITABLE. A non-regular file (symlink, fifo) or a file not owned by the
+/// effective uid is also refused. On refusal we emit a diagnostic and return
+/// None, which makes `verify_audit_log` fail closed for a signed log (no
+/// verifying key available => not ok). Non-unix keeps the bare read.
 fn audit_verify_key() -> Option<ed25519_dalek::VerifyingKey> {
     let p = crate::policy::config_dir()?.join("audit-signing.pub");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(&p).ok()?;
+        if !meta.file_type().is_file() {
+            audit_diagnostic(format!(
+                "tirith: audit: refusing verifying key {} (not a regular file)",
+                p.display()
+            ));
+            return None;
+        }
+        if meta.mode() & 0o022 != 0 {
+            audit_diagnostic(format!(
+                "tirith: audit: refusing group/other-writable verifying key {} (chmod 644 it)",
+                p.display()
+            ));
+            return None;
+        }
+        // SAFETY: geteuid always succeeds and is thread-safe.
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            audit_diagnostic(format!(
+                "tirith: audit: refusing verifying key {} (not owned by current user)",
+                p.display()
+            ));
+            return None;
+        }
+    }
     let bytes = fs::read(&p).ok()?;
     let arr: [u8; 32] = bytes.get(..32)?.try_into().ok()?;
     ed25519_dalek::VerifyingKey::from_bytes(&arr).ok()
@@ -2159,6 +2198,90 @@ mod tests {
                     .any(|p| p.contains("signature downgrade")),
                 "a signature-downgrade problem must be reported: {:?}",
                 report.problems
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            std::env::remove_var("TIRITH_LOG");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_verify_key_refuses_world_writable_pubkey() {
+        // F1: the verifying (public) key is the trust anchor for `verify`. If an
+        // attacker with local WRITE access to config_dir() can replace it, they can
+        // re-sign tampered lines with the matching private key and forge an ok=true
+        // verdict. So a GROUP/OTHER-writable `.pub` must be refused. With the key
+        // refused, `audit_verify_key()` returns None and a SIGNED log fails closed
+        // ("no verifying key available"). A world-READABLE-but-not-writable 0o644
+        // `.pub` is still accepted, so a legitimate signed log verifies ok.
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
+        let vk = sk.verifying_key();
+        write_signing_key(
+            &cfg.join("tirith").join("audit-signing.key"),
+            &sk.to_bytes(),
+        );
+        let pub_path = cfg.join("tirith").join("audit-signing.pub");
+        std::fs::write(&pub_path, vk.to_bytes()).unwrap();
+
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("TIRITH_LOG", "1");
+            std::env::set_var("XDG_CONFIG_HOME", &cfg);
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            append_chain(&log, &["Allow", "Block", "Warn"]);
+
+            // (a) A secure 0o644 pubkey (world-readable, not world/group-writable) is
+            // ACCEPTED: the signed chain verifies ok.
+            std::fs::set_permissions(&pub_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let ok_report = verify_audit_log(&log, None);
+            assert!(
+                ok_report.ok,
+                "a signed log with a secure 0o644 pubkey must verify ok: {:?}",
+                ok_report.problems
+            );
+            assert!(
+                audit_verify_key().is_some(),
+                "a 0o644 pubkey must be accepted by audit_verify_key"
+            );
+
+            // (b) A world-WRITABLE 0o646 pubkey is REFUSED: audit_verify_key returns
+            // None, so the signed log can no longer be authenticated and verification
+            // FAILS CLOSED.
+            std::fs::set_permissions(&pub_path, std::fs::Permissions::from_mode(0o646)).unwrap();
+            assert!(
+                audit_verify_key().is_none(),
+                "a world-writable 0o646 pubkey must be refused by audit_verify_key"
+            );
+            let bad_report = verify_audit_log(&log, None);
+            assert!(
+                !bad_report.ok,
+                "a signed log whose pubkey is world-writable must fail closed (no usable key)"
+            );
+            assert!(
+                bad_report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("no verifying key")),
+                "fail-closed must cite the missing/unusable verifying key: {:?}",
+                bad_report.problems
             );
         });
 

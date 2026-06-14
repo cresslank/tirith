@@ -1350,6 +1350,41 @@ fn is_secret_file(basename: &str) -> bool {
     lower.starts_with(".env.")
 }
 
+/// Output-target flags whose FOLLOWING token is the file written by a downloader,
+/// keyed by tool. TOOL-AWARE on purpose: curl `-O`/`--remote-name` is BOOLEAN (the
+/// filename is derived from the URL, NOT the next token), so it is deliberately
+/// ABSENT for curl: listing it would make `curl -O -L https://x` swallow `-L` as
+/// the output path and break SecretWrite / manifest-FileWrite detection. wget
+/// `-O`/`--output-document` IS value-taking (the next token is the output file), so
+/// it is present for wget. (wget `-o` is the LOG file, not the download target, so
+/// it is intentionally excluded.) An unrecognised tool returns an empty set.
+fn output_target_value_flags(leader_base: &str) -> &'static [&'static str] {
+    const CURL: &[&str] = &["-o", "--output"];
+    const WGET: &[&str] = &["-O", "--output-document"];
+    const HTTPIE: &[&str] = &["-o", "--output"];
+    match leader_base {
+        "curl" => CURL,
+        "wget" => WGET,
+        "http" | "https" | "xh" => HTTPIE,
+        _ => &[],
+    }
+}
+
+/// Attached output-target prefixes (`--output=path`) per tool, mirroring
+/// [`output_target_value_flags`]. wget additionally accepts `--output-document=`.
+/// curl `-O` has no attached form (it is boolean), so none is listed for it.
+fn output_target_attached_prefixes(leader_base: &str) -> &'static [&'static str] {
+    const CURL: &[&str] = &["--output="];
+    const WGET: &[&str] = &["--output=", "--output-document="];
+    const HTTPIE: &[&str] = &["--output="];
+    match leader_base {
+        "curl" => CURL,
+        "wget" => WGET,
+        "http" | "https" | "xh" => HTTPIE,
+        _ => &[],
+    }
+}
+
 /// Detect a write target in a segment: a redirection (`> path` / `>> path`), a
 /// downloader output flag (`curl -o path`, `wget -O path`, `--output=path`), or
 /// a `cp`/`mv`/`tee`/`install` destination. Returns the written path WITHOUT
@@ -1361,30 +1396,32 @@ fn write_target(seg: &tokenize::Segment, leader_base: &str, args: &[String]) -> 
         return Some(path);
     }
 
-    // 2) Downloader output flag: `curl -o .env`, `wget -O id_rsa`. Includes the
-    // `https` HTTPie alias so it stays in sync with the network-leader match above
-    // (otherwise `https ... --output .env` would miss the SecretWrite event).
+    // 2) Downloader output flag: `curl -o .env`, `wget -O id_rsa`. The flag set is
+    // TOOL-AWARE (see `output_target_value_flags`): curl `-O`/`--remote-name` is
+    // boolean and must NOT consume the next token (`curl -O -L https://x` would
+    // otherwise misread `-L` as the output path), whereas wget `-O` IS value-taking.
+    // Includes the `https` HTTPie alias so it stays in sync with the network-leader
+    // match above (otherwise `https ... --output .env` would miss the SecretWrite).
     if matches!(leader_base, "curl" | "wget" | "http" | "https" | "xh") {
+        let value_flags = output_target_value_flags(leader_base);
+        let attached = output_target_attached_prefixes(leader_base);
         let mut want_value = false;
         for a in args {
             if want_value {
                 return Some(a.clone());
             }
-            match a.as_str() {
-                "-o" | "-O" | "--output" | "--output-document" => want_value = true,
-                _ => {
-                    // Attached forms: `--output=path` and wget's
-                    // `--output-document=path`. Both seed the same write target as
-                    // their separated counterparts above, so a download whose
-                    // destination is a secret/manifest file still emits the
-                    // SecretWrite/FileWrite that the W7 follow-on correlations need.
-                    if let Some(rest) = a
-                        .strip_prefix("--output=")
-                        .or_else(|| a.strip_prefix("--output-document="))
-                    {
-                        if !rest.is_empty() {
-                            return Some(rest.to_string());
-                        }
+            if value_flags.contains(&a.as_str()) {
+                want_value = true;
+                continue;
+            }
+            // Attached forms: `--output=path` and wget's `--output-document=path`.
+            // Both seed the same write target as their separated counterparts above,
+            // so a download whose destination is a secret/manifest file still emits
+            // the SecretWrite/FileWrite that the W7 follow-on correlations need.
+            for prefix in attached {
+                if let Some(rest) = a.strip_prefix(prefix) {
+                    if !rest.is_empty() {
+                        return Some(rest.to_string());
                     }
                 }
             }
@@ -2509,6 +2546,70 @@ mod tests {
         assert!(
             sep.iter().any(|e| e.kind == EventKind::SecretWrite),
             "the separated `-O .env` form must also record a SecretWrite"
+        );
+    }
+
+    #[test]
+    fn curl_remote_name_flag_is_not_an_output_target() {
+        // OUTPUT-TARGET parity with the network value-flag list: curl `-O`/
+        // `--remote-name` is BOOLEAN (the filename is derived from the URL, not the
+        // next token). So `curl -O -L https://x` must NOT treat the FOLLOWING token
+        // (`-L`) as the output path. Doing so would both fabricate a write target
+        // and, worse, suppress the real SecretWrite/manifest detection when a secret
+        // file is downloaded. The URL must still be detected as Network.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let events = derive_typed_events("curl -O -L https://example.com/x", &v);
+        let ks = kinds(&events);
+        assert!(
+            ks.contains(&EventKind::Network),
+            "the URL after a boolean -O must still be detected as Network: {ks:?}"
+        );
+        // No write target was named, so nothing may be recorded as a SecretWrite, and
+        // certainly not a flag token like `-L`.
+        assert!(
+            !events.iter().any(|e| e.kind == EventKind::SecretWrite),
+            "boolean curl -O must not synthesize an output target: {ks:?}"
+        );
+        assert!(
+            !events.iter().any(|e| {
+                matches!(e.kind, EventKind::SecretWrite | EventKind::FileWrite)
+                    && e.metadata.get("path").map(String::as_str) == Some("-L")
+            }),
+            "the boolean -O must not consume `-L` as an output path: {events:?}"
+        );
+
+        // And when a secret file genuinely is the curl OUTPUT (`-o`, value-taking),
+        // detection still works even with a boolean `-O` also present.
+        let with_secret = derive_typed_events("curl -O -o id_rsa https://example.com/k", &v);
+        assert!(
+            with_secret.iter().any(|e| e.kind == EventKind::SecretWrite),
+            "curl -o id_rsa (value-taking) must still record a SecretWrite alongside -O"
+        );
+    }
+
+    #[test]
+    fn wget_output_document_flag_is_value_taking() {
+        // The mirror of the curl case: wget `-O`/`--output-document` IS value-taking,
+        // so `wget -O <file> https://x` MUST capture the FOLLOWING token as the output
+        // target. Using a recognised secret basename (`.env`, matching `is_secret_file`)
+        // proves the token was consumed AND seeds the SecretWrite that the W7
+        // SecretWriteThenNetwork follow-on depends on. Tool-awareness is the whole
+        // point: the same `-O` spelling, the opposite arity, per tool (curl -O is
+        // boolean; see `curl_remote_name_flag_is_not_an_output_target`).
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let events = derive_typed_events("wget -O .env https://x.example", &v);
+        let secret = events
+            .iter()
+            .find(|e| e.kind == EventKind::SecretWrite)
+            .expect("wget -O .env must record a SecretWrite");
+        assert_eq!(
+            secret.metadata.get("path").map(String::as_str),
+            Some(".env"),
+            "wget -O must consume the next token as the output target"
+        );
+        assert!(
+            kinds(&events).contains(&EventKind::Network),
+            "the URL must still be detected as Network"
         );
     }
 
