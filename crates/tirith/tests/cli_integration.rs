@@ -2174,6 +2174,17 @@ expect eof
 }
 
 /// Build a tirith Command with session and state isolation.
+///
+/// `XDG_STATE_HOME` isolates the session JSON that `state_dir()` reads on EVERY OS
+/// (it reads `XDG_STATE_HOME` directly, not etcetera), so the persisted-session
+/// W6 state is host-independent. But `data_dir()`/`config_dir()` go through
+/// etcetera, which resolves `%APPDATA%`/`%LOCALAPPDATA%` on Windows (and ignores
+/// the XDG vars there); without pinning those, a subprocess that touches a
+/// data/config path would read the runner's real roaming/local app-data and the
+/// test would become host-dependent on Windows. Pin them alongside `state_dir`
+/// (the per-test temp root the caller owns) so all app-data resolution stays
+/// inside the tempdir on Windows too, matching the `XDG_DATA_HOME`/`APPDATA`
+/// pairing the data-dir tests already use.
 fn tirith_isolated(
     session_id: &str,
     state_dir: &std::path::Path,
@@ -2182,6 +2193,8 @@ fn tirith_isolated(
     let mut cmd = tirith();
     cmd.env("TIRITH_SESSION_ID", session_id)
         .env("XDG_STATE_HOME", state_dir)
+        .env("APPDATA", state_dir.join("appdata"))
+        .env("LOCALAPPDATA", state_dir.join("localappdata"))
         .env("TIRITH_LOG", "0")
         .current_dir(cwd);
     cmd

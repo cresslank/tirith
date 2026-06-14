@@ -1385,6 +1385,26 @@ fn output_target_attached_prefixes(leader_base: &str) -> &'static [&'static str]
     }
 }
 
+/// GLUED short output-target prefixes (`-o<value>` / `-O<value>` with no space),
+/// per tool, mirroring [`output_target_value_flags`]. The glued form spells the
+/// value INSIDE the same token, so `curl -oid_rsa` means `-o id_rsa`. TOOL-AWARE,
+/// exactly as the separated form: lowercase `-o` takes a value in curl/wget/httpie
+/// (so `-o<x>` is an output target in all three), but uppercase `-O` is value-
+/// taking ONLY for wget (`wget -O.env`); curl `-O`/`--remote-name` is boolean, so
+/// `curl -O.foo` is NOT `-O .foo` and must record no output target. An unrecognised
+/// tool returns an empty set.
+fn output_target_glued_prefixes(leader_base: &str) -> &'static [&'static str] {
+    const CURL: &[&str] = &["-o"];
+    const WGET: &[&str] = &["-o", "-O"];
+    const HTTPIE: &[&str] = &["-o"];
+    match leader_base {
+        "curl" => CURL,
+        "wget" => WGET,
+        "http" | "https" | "xh" => HTTPIE,
+        _ => &[],
+    }
+}
+
 /// Detect a write target in a segment: a redirection (`> path` / `>> path`), a
 /// downloader output flag (`curl -o path`, `wget -O path`, `--output=path`), or
 /// a `cp`/`mv`/`tee`/`install` destination. Returns the written path WITHOUT
@@ -1405,6 +1425,7 @@ fn write_target(seg: &tokenize::Segment, leader_base: &str, args: &[String]) -> 
     if matches!(leader_base, "curl" | "wget" | "http" | "https" | "xh") {
         let value_flags = output_target_value_flags(leader_base);
         let attached = output_target_attached_prefixes(leader_base);
+        let glued = output_target_glued_prefixes(leader_base);
         let mut want_value = false;
         for a in args {
             if want_value {
@@ -1425,13 +1446,36 @@ fn write_target(seg: &tokenize::Segment, leader_base: &str, args: &[String]) -> 
                     }
                 }
             }
+            // GLUED short forms: `curl -oid_rsa` (= `-o id_rsa`), `wget -O.env`
+            // (= `-O .env`). TOOL-AWARE via `output_target_glued_prefixes`: lowercase
+            // `-o<x>` is an output target for all three; uppercase `-O<x>` only for
+            // wget (curl `-O` is boolean, so `curl -O.foo` records no output target).
+            // The bare separated flag (`-o` exactly) was already consumed by the
+            // value_flags branch above, so an empty `rest` here cannot reach this.
+            for prefix in glued {
+                if let Some(rest) = a.strip_prefix(prefix) {
+                    if !rest.is_empty() {
+                        return Some(rest.to_string());
+                    }
+                }
+            }
         }
     }
 
-    // 3) Copy/move/tee/install destination. For cp/mv the destination is the
-    // LAST non-flag arg; for tee it is the first non-flag arg.
+    // 3) Copy/move/tee/install destination. For cp/mv/install the destination is
+    // normally the LAST non-flag arg; for tee it is the first non-flag arg.
     match leader_base {
         "cp" | "mv" | "install" => {
+            // `-t DIR` / `--target-directory=DIR` inverts the layout: the DIRECTORY
+            // is the write destination and EVERY positional is a SOURCE. Returning
+            // the last positional here would mis-flag a source (`cp -t /d a .env`
+            // would record `.env`), fabricating false FileWrite/SecretWrite and the
+            // W7 DependencyChange/SecretWrite-then-Network correlations. So when a
+            // target-directory flag is present, the target is its value and NO
+            // positional is a destination.
+            if let Some(dir) = cp_target_directory(args) {
+                return Some(dir);
+            }
             if let Some(dest) = args.iter().rev().find(|a| !a.starts_with('-')) {
                 return Some(dest.clone());
             }
@@ -1444,6 +1488,40 @@ fn write_target(seg: &tokenize::Segment, leader_base: &str, args: &[String]) -> 
         _ => {}
     }
 
+    None
+}
+
+/// The `-t`/`--target-directory` value for a cp/mv/install command, if present.
+/// Recognises the separated (`-t DIR`), attached short (`-t<dir>`), and long
+/// (`--target-directory=DIR`) spellings. When this returns `Some`, the directory
+/// is the write destination and every positional operand is a SOURCE, not a
+/// destination, so the caller must NOT also treat the last positional as a write
+/// target. Returns `None` (normal `cp src dst` layout) when no such flag appears.
+fn cp_target_directory(args: &[String]) -> Option<String> {
+    let mut want_value = false;
+    for a in args {
+        if want_value {
+            return Some(a.clone());
+        }
+        if a == "-t" || a == "--target-directory" {
+            want_value = true;
+            continue;
+        }
+        if let Some(rest) = a.strip_prefix("--target-directory=") {
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+        // Attached short form `-t<dir>` (e.g. `-t/dest`). Guard against the bare
+        // `-t` (handled above) and against long flags like `--target-directory`,
+        // which start with `--t`, not `-t<value>`: `strip_prefix("-t")` on `--t...`
+        // yields a leading `-`, so require the remainder to not itself start with `-`.
+        if let Some(rest) = a.strip_prefix("-t") {
+            if !rest.is_empty() && !rest.starts_with('-') {
+                return Some(rest.to_string());
+            }
+        }
+    }
     None
 }
 
@@ -2614,6 +2692,68 @@ mod tests {
     }
 
     #[test]
+    fn curl_glued_short_output_flag_detects_secret_target() {
+        // GLUED short form: `curl -oid_rsa https://x` means `-o id_rsa`. Lowercase
+        // `-o` is value-taking for curl, so the glued value is the output target and
+        // a secret basename must seed a SecretWrite the W7 follow-on can pair with.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let events = derive_typed_events("curl -oid_rsa https://x.example/k", &v);
+        let secret = events
+            .iter()
+            .find(|e| e.kind == EventKind::SecretWrite)
+            .expect("curl -oid_rsa must record a SecretWrite");
+        assert_eq!(
+            secret.metadata.get("path").map(String::as_str),
+            Some("id_rsa"),
+            "the glued -o<value> must be captured as the output target"
+        );
+        assert!(
+            kinds(&events).contains(&EventKind::Network),
+            "the URL must still be detected as Network"
+        );
+    }
+
+    #[test]
+    fn wget_glued_short_output_flag_detects_secret_target() {
+        // GLUED short form for wget's value-taking uppercase `-O`: `wget -O.env`
+        // means `-O .env`. The glued value is the output target, so `.env` records a
+        // SecretWrite that seeds SecretWriteThenNetwork.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let events = derive_typed_events("wget -O.env https://x.example", &v);
+        let secret = events
+            .iter()
+            .find(|e| e.kind == EventKind::SecretWrite)
+            .expect("wget -O.env must record a SecretWrite");
+        assert_eq!(
+            secret.metadata.get("path").map(String::as_str),
+            Some(".env"),
+            "the glued -O<value> must be captured as the output target"
+        );
+        assert!(kinds(&events).contains(&EventKind::Network));
+    }
+
+    #[test]
+    fn curl_glued_remote_name_flag_is_not_an_output_target() {
+        // TOOL-AWARE parity with the separated form: curl `-O` is BOOLEAN, so the
+        // glued `curl -O.foo https://x` is NOT `-O .foo`. `.foo` must NOT be recorded
+        // as an output target (no FileWrite / SecretWrite), and certainly `.env` must
+        // not be fabricated. The URL must still be detected as Network.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let events = derive_typed_events("curl -O.env https://example.com/x", &v);
+        let ks = kinds(&events);
+        assert!(
+            ks.contains(&EventKind::Network),
+            "the URL after a boolean glued -O must still be detected as Network: {ks:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::SecretWrite | EventKind::FileWrite)),
+            "boolean curl -O<value> must not synthesize an output target: {events:?}"
+        );
+    }
+
+    #[test]
     fn derive_non_secret_write_records_nothing() {
         // Writing an ordinary file is NOT recorded from the command string.
         let v = raw_verdict_with(Action::Allow, vec![], None);
@@ -2640,6 +2780,58 @@ mod tests {
             fw.metadata.get("path").map(String::as_str),
             Some("package.json")
         );
+    }
+
+    #[test]
+    fn cp_target_directory_flag_makes_positionals_sources() {
+        // `cp -t /dest DIR a .env`: `-t` makes `/dest` the write destination and
+        // EVERY positional a SOURCE. The last positional (`.env`) must NOT be flagged
+        // as a write target, or a real `cp -t` into a safe dir would fabricate a
+        // false SecretWrite (`.env`) / FileWrite (`package.json`) and the W7
+        // SecretWriteThenNetwork / DependencyChangeThenNetwork correlations with it.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        // `/dest` is neither a secret nor a manifest, so nothing is recorded; the
+        // key assertion is that the source operands are not misread as destinations.
+        for cmd in [
+            "cp -t /dest package.json .env",
+            "cp --target-directory=/dest package.json .env",
+            "cp -t/dest package.json .env",
+            // mv and install share the same `-t` semantics.
+            "mv -t /dest package.json .env",
+            "install -t /dest package.json .env",
+        ] {
+            let events = derive_typed_events(cmd, &v);
+            assert!(
+                !events.iter().any(|e| {
+                    matches!(e.kind, EventKind::SecretWrite | EventKind::FileWrite)
+                        && matches!(
+                            e.metadata.get("path").map(String::as_str),
+                            Some(".env") | Some("package.json")
+                        )
+                }),
+                "`{cmd}` must not flag a source operand as a write target: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cp_without_target_directory_keeps_last_positional_as_dest() {
+        // Without `-t`, the normal `cp src dst` layout is preserved: the LAST
+        // positional is the destination. A secret destination still records a
+        // SecretWrite (so the regression fix does not weaken ordinary detection).
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let events = derive_typed_events("cp a.txt .env", &v);
+        let secret = events
+            .iter()
+            .find(|e| e.kind == EventKind::SecretWrite)
+            .expect("cp a.txt .env must record a SecretWrite for the .env destination");
+        assert_eq!(
+            secret.metadata.get("path").map(String::as_str),
+            Some(".env"),
+            "the last positional must remain the destination when -t is absent"
+        );
+        // And a plain non-secret/non-manifest destination records nothing.
+        assert!(derive_typed_events("cp a.txt b.txt", &v).is_empty());
     }
 
     #[test]
