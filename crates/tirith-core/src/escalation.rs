@@ -567,8 +567,18 @@ pub fn post_process_verdict(
     // synthetic findings carry no URL evidence), then the action is RE-DERIVED
     // upward so a CRITICAL correlation escalates the verdict (it never downgrades
     // an action already set above the correlation's level).
+    // `correlate_session` surfaces fresh hits AND, in the same locked write,
+    // persists both each hit's de-dup signature and its `WarningEvent` (so
+    // `tirith warnings` / repeat-count logic see the first hit even though this
+    // runs AFTER `record_outcome`). There is no separate second write that could
+    // fail between marking a signature surfaced and recording its warning event.
     let correlation_hits = if recorded_event {
-        crate::session_warnings::correlate_session(session_id)
+        crate::session_warnings::correlate_session(
+            session_id,
+            cmd,
+            policy,
+            &policy.dlp_custom_patterns,
+        )
     } else {
         Vec::new()
     };
@@ -592,17 +602,6 @@ pub fn post_process_verdict(
                 custom_rule_id: None,
             });
         }
-        // Persist the freshly-surfaced correlation hits as warning events. This
-        // runs AFTER `record_outcome` above, so without it a correlation that
-        // upgraded an otherwise-Allow command would never reach SessionWarnings
-        // and `tirith warnings` / repeat-count logic would miss the first hit.
-        crate::session_warnings::record_correlation_findings(
-            session_id,
-            &correlation_hits,
-            cmd,
-            policy,
-            &policy.dlp_custom_patterns,
-        );
         // Re-derive the action from the augmented finding set, only ever raising
         // it (a correlation must never weaken an existing Block/Warn).
         effective.action =
@@ -705,6 +704,10 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
     let segments = tokenize::tokenize(cmd, ShellType::Posix);
     let mut leader_is_network = false;
     let mut delete_path: Option<String> = None;
+    // Number of distinct path arguments the delete command targets, so a single
+    // `rm a b c` records a FileDelete whose `count` is 3 (not 1). The mass-delete
+    // correlation sums this across events, so one multi-path command can trip it.
+    let mut delete_path_count: usize = 0;
     let mut is_force_push = false;
     let mut is_package_install = false;
     let mut secret_write_path: Option<String> = None;
@@ -727,6 +730,9 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
             }
             "rm" | "unlink" | "shred" if delete_path.is_none() => {
                 delete_path = first_path_arg(&args);
+                // Count EVERY non-flag path arg in this command (multi-path
+                // delete), so `rm a b c` is recorded as three deletions, not one.
+                delete_path_count = count_path_args(&args);
             }
             "git" if git_is_force_push(&args) => is_force_push = true,
             "npm" | "pnpm" | "yarn" | "pip" | "pip3" | "cargo" | "brew" | "gem" | "go" | "apt"
@@ -813,6 +819,14 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
     if let Some(path) = delete_path {
         let mut meta = BTreeMap::new();
         meta.insert("path".to_string(), path);
+        // Record how many paths this single delete command targets so the
+        // mass-deletion correlation can SUM real deleted paths across events
+        // rather than counting one event per command. `count` is always >= 1
+        // here (the path arm only runs when a path arg was found).
+        meta.insert(
+            crate::event_buffer::DELETE_COUNT_KEY.to_string(),
+            delete_path_count.max(1).to_string(),
+        );
         push(
             &mut events,
             &mut seen_kinds,
@@ -868,6 +882,17 @@ fn command_base(name: &str) -> String {
 /// first token that does not start with `-`.
 fn first_path_arg(args: &[String]) -> Option<String> {
     args.iter().find(|a| !a.starts_with('-')).cloned()
+}
+
+/// The number of non-flag PATH arguments a delete command targets. The multi-path
+/// counterpart of [`first_path_arg`], using the SAME flag rule (a token is a path
+/// unless it starts with `-`): `rm a b c` -> 3, `rm -rf x y` -> 2, `rm -f` -> 0.
+/// Matching `first_path_arg`'s rule exactly guarantees this is >= 1 whenever
+/// `first_path_arg` found a path (so the recorded `count` is never 0 for an
+/// emitted FileDelete). The leader/wrappers are already peeled by the caller, so
+/// `args` is just the rm/unlink/shred operands.
+fn count_path_args(args: &[String]) -> usize {
+    args.iter().filter(|a| !a.starts_with('-')).count()
 }
 
 /// True if a network downloader's args (`curl`/`wget`/`http`/`https`/`xh`) name
@@ -2252,6 +2277,103 @@ mod tests {
             kinds(&derive_typed_events("sudo rm /etc/important.conf", &v))
                 .contains(&EventKind::FileDelete)
         );
+    }
+
+    #[test]
+    fn derive_file_delete_records_multipath_count() {
+        // A single multi-path delete records ONE FileDelete event whose `count`
+        // metadatum is the number of path operands, so the mass-deletion
+        // correlation can weigh it by paths (4) rather than commands (1).
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let events = derive_typed_events("rm a b c d", &v);
+        let del = events
+            .iter()
+            .find(|e| e.kind == EventKind::FileDelete)
+            .expect("file delete event");
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("4")
+        );
+        // Flags are not counted as paths.
+        let with_flags = derive_typed_events("rm -rf x y", &v);
+        let del = with_flags
+            .iter()
+            .find(|e| e.kind == EventKind::FileDelete)
+            .expect("file delete event");
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("2")
+        );
+    }
+
+    /// W7 end-to-end: a SINGLE `rm a b c d` (four non-artifact paths) trips the
+    /// MassFileDeletion correlation through the real `post_process_verdict` path,
+    /// while `rm dist/x dist/y dist/z` (build artifacts) does not. This is the
+    /// behaviour the per-path counting fix delivers: one multi-path delete is
+    /// enough, no longer three separate delete commands.
+    #[cfg(unix)]
+    #[test]
+    fn correlation_single_multipath_rm_trips_mass_deletion() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let policy = crate::policy::Policy::default();
+
+            // Four real paths in one command -> MassFileDeletion fires.
+            let v = raw_verdict_with(Action::Allow, vec![], None);
+            let out = post_process_verdict(
+                &v,
+                &policy,
+                "rm a b c d",
+                "w7-mass-delete-multipath",
+                CallerContext::Cli,
+            );
+            assert!(
+                out.findings
+                    .iter()
+                    .any(|f| f.rule_id == RuleId::MassFileDeletion),
+                "a single rm of 4 paths must trip MassFileDeletion: {:?}",
+                out.findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
+            );
+
+            // Build-artifact paths in one command -> excluded, does not fire.
+            let v2 = raw_verdict_with(Action::Allow, vec![], None);
+            let out2 = post_process_verdict(
+                &v2,
+                &policy,
+                "rm dist/x dist/y dist/z",
+                "w7-mass-delete-artifacts",
+                CallerContext::Cli,
+            );
+            assert!(
+                !out2
+                    .findings
+                    .iter()
+                    .any(|f| f.rule_id == RuleId::MassFileDeletion),
+                "a multi-path delete of build artifacts must NOT trip MassFileDeletion"
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var("TIRITH_LOG");
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 
     #[test]

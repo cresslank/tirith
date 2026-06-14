@@ -80,6 +80,17 @@ impl TypedEvent {
     fn path(&self) -> Option<&str> {
         self.metadata.get("path").map(|s| s.as_str())
     }
+
+    /// How many deleted PATHS this [`EventKind::FileDelete`] event represents.
+    /// Reads the [`DELETE_COUNT_KEY`] metadatum, defaulting to 1 when absent or
+    /// unparsable (back-compat with single-path deletes and pre-existing events).
+    fn delete_count(&self) -> usize {
+        self.metadata
+            .get(DELETE_COUNT_KEY)
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(1)
+    }
 }
 
 /// A correlation that fired. Mirrors the shape of a [`crate::verdict::Finding`]
@@ -115,6 +126,13 @@ const MASS_DELETE_THRESHOLD: usize = 3;
 /// a dependency manifest. Lets the dependency-change correlation distinguish a
 /// manifest write from an arbitrary file write without a second event kind.
 pub const MANIFEST_FLAG_KEY: &str = "manifest";
+
+/// Metadata key on a [`EventKind::FileDelete`] event carrying how many PATHS that
+/// one delete command targeted (`rm a b c` -> "3"). [`mass_file_deletion`] sums
+/// this across events so a single multi-path delete is weighed by paths, not by
+/// command count. Absent or unparsable -> treated as 1 (back-compat with events
+/// recorded before this key existed, and with single-path deletes).
+pub const DELETE_COUNT_KEY: &str = "count";
 
 /// Returns true if `basename` (a file's final path component) is a recognised
 /// dependency manifest / lockfile. Conservative and exact-match where possible;
@@ -345,7 +363,14 @@ fn delete_then_force_push(events: &[TypedEvent], now_rfc3339: &str) -> Option<Co
     })
 }
 
-/// >= 3 FileDelete within 20s, EXCLUDING build-artifact paths -> CRITICAL.
+/// >= 3 deleted PATHS within 20s, EXCLUDING build-artifact paths -> CRITICAL.
+///
+/// Counts PATHS, not delete COMMANDS: each [`EventKind::FileDelete`] event carries
+/// a [`DELETE_COUNT_KEY`] metadatum (the number of path operands that one `rm`/
+/// `unlink`/`shred` targeted), and the threshold is checked against the SUM of
+/// those counts. So a single `rm a b c d` (one event, count 4) trips the rule,
+/// and three separate single-path deletes still do. Events without the key count
+/// as 1 (back-compat).
 fn mass_file_deletion(events: &[TypedEvent], now_rfc3339: &str) -> Option<CorrelationHit> {
     let cut = cutoff(now_rfc3339, MASS_DELETE_WINDOW_SECS)?;
     let matched: Vec<&TypedEvent> = events
@@ -361,7 +386,8 @@ fn mass_file_deletion(events: &[TypedEvent], now_rfc3339: &str) -> Option<Correl
                 .unwrap_or(true)
         })
         .collect();
-    let count = matched.len();
+    // Sum deleted PATHS across the matching events, not the event count.
+    let count: usize = matched.iter().map(|e| e.delete_count()).sum();
     if count >= MASS_DELETE_THRESHOLD {
         // Signature spans the latest contributing delete so a later burst (a
         // genuinely new mass deletion) re-surfaces while the same set does not.
@@ -414,6 +440,13 @@ mod tests {
     fn ev_path(timestamp: String, kind: EventKind, path: &str) -> TypedEvent {
         let mut e = ev(timestamp, kind);
         e.metadata.insert("path".to_string(), path.to_string());
+        e
+    }
+
+    fn ev_path_count(timestamp: String, kind: EventKind, path: &str, count: usize) -> TypedEvent {
+        let mut e = ev_path(timestamp, kind, path);
+        e.metadata
+            .insert(DELETE_COUNT_KEY.to_string(), count.to_string());
         e
     }
 
@@ -635,6 +668,84 @@ mod tests {
         ];
         let hits = correlate(&events, &base.to_rfc3339());
         assert!(!fired(&hits, RuleId::MassFileDeletion));
+    }
+
+    #[test]
+    fn mass_deletion_single_multipath_command_fires() {
+        // A SINGLE `rm a b c d` records ONE FileDelete event whose count is 4.
+        // Counting PATHS (not events) means it trips the >= 3 threshold on its
+        // own, which is the whole point of this fix.
+        let base = now();
+        let events = vec![ev_path_count(
+            ts(base, -5),
+            EventKind::FileDelete,
+            "src/a.rs",
+            4,
+        )];
+        let hits = correlate(&events, &base.to_rfc3339());
+        assert!(fired(&hits, RuleId::MassFileDeletion));
+    }
+
+    #[test]
+    fn mass_deletion_single_multipath_below_threshold_does_not_fire() {
+        // `rm a b` is one event, count 2: below the threshold of 3.
+        let base = now();
+        let events = vec![ev_path_count(
+            ts(base, -5),
+            EventKind::FileDelete,
+            "src/a.rs",
+            2,
+        )];
+        let hits = correlate(&events, &base.to_rfc3339());
+        assert!(!fired(&hits, RuleId::MassFileDeletion));
+    }
+
+    #[test]
+    fn mass_deletion_single_multipath_artifacts_does_not_fire() {
+        // `rm dist/x dist/y dist/z` records one event whose first path is a build
+        // artifact, so the event is excluded entirely even though its count is 3.
+        let base = now();
+        let events = vec![ev_path_count(
+            ts(base, -5),
+            EventKind::FileDelete,
+            "dist/x",
+            3,
+        )];
+        let hits = correlate(&events, &base.to_rfc3339());
+        assert!(!fired(&hits, RuleId::MassFileDeletion));
+    }
+
+    #[test]
+    fn mass_deletion_missing_count_key_treated_as_one() {
+        // Back-compat: events without the count key weigh 1 each, so three of
+        // them still trip the rule (the old behaviour) and two do not.
+        let base = now();
+        let two = vec![
+            ev_path(ts(base, -10), EventKind::FileDelete, "src/a.rs"),
+            ev_path(ts(base, -5), EventKind::FileDelete, "src/b.rs"),
+        ];
+        assert!(!fired(
+            &correlate(&two, &base.to_rfc3339()),
+            RuleId::MassFileDeletion
+        ));
+        let mut three = two;
+        three.push(ev_path(ts(base, -3), EventKind::FileDelete, "src/c.rs"));
+        assert!(fired(
+            &correlate(&three, &base.to_rfc3339()),
+            RuleId::MassFileDeletion
+        ));
+    }
+
+    #[test]
+    fn mass_deletion_sums_counts_across_events() {
+        // Two commands: `rm a b` (count 2) then `rm c` (count 1) = 3 paths total.
+        let base = now();
+        let events = vec![
+            ev_path_count(ts(base, -10), EventKind::FileDelete, "src/a.rs", 2),
+            ev_path_count(ts(base, -5), EventKind::FileDelete, "src/c.rs", 1),
+        ];
+        let hits = correlate(&events, &base.to_rfc3339());
+        assert!(fired(&hits, RuleId::MassFileDeletion));
     }
 
     // --- helpers + isolation -------------------------------------------------

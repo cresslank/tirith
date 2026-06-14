@@ -418,10 +418,35 @@ pub fn record_typed_event(session_id: &str, event: crate::event_buffer::TypedEve
 /// returned hit's [`signature`](crate::event_buffer::CorrelationHit::signature)
 /// (rule id + triggering-event timestamps) is recorded in the session's
 /// `surfaced_correlations` marker under the lock; a hit whose signature is
-/// already present is filtered out. Best-effort: an I/O failure means the marker
-/// is not persisted, so at worst a hit is surfaced again rather than lost.
-pub fn correlate_session(session_id: &str) -> Vec<crate::event_buffer::CorrelationHit> {
+/// already present is filtered out.
+///
+/// ATOMICITY: for each fresh hit, the de-dup signature AND the corresponding
+/// [`WarningEvent`] are persisted in the SAME locked mutation, before the lock is
+/// released. The signature marks the hit "already surfaced"; the `WarningEvent`
+/// is what `tirith warnings` and repeat-count logic read. Splitting these across
+/// two writes (the previous design) risked marking a hit surfaced while a second,
+/// best-effort write of its `WarningEvent` failed or never ran (process exit) —
+/// permanently dropping the first hit from `tirith warnings`. Doing both under one
+/// lock makes that impossible: either both land or neither does (a write failure
+/// leaves the whole session record unchanged, so the hit re-surfaces next time).
+///
+/// The post-override severity (the same value the verdict path applies via
+/// `policy.severity_override`) is persisted, so `tirith warnings` never disagrees
+/// with the verdict when a `severity_overrides` lever remapped a correlation rule.
+/// `cmd` is redacted + truncated OUTSIDE the lock to keep hold time short.
+/// Best-effort overall: if the single write fails, no marker is persisted, so at
+/// worst a hit re-surfaces rather than being lost.
+pub fn correlate_session(
+    session_id: &str,
+    cmd: &str,
+    policy: &crate::policy::Policy,
+    dlp_patterns: &[String],
+) -> Vec<crate::event_buffer::CorrelationHit> {
     let now = chrono::Utc::now().to_rfc3339();
+    // Redact + truncate the command once, outside the lock, to minimise hold time
+    // (mirrors `record_outcome`); it is identical for every hit this call surfaces.
+    let command_redacted = crate::redact::redact_command_text(cmd, dlp_patterns);
+    let command_redacted = crate::util::truncate_bytes(&command_redacted, 120);
     let mut fresh = Vec::new();
     with_session_locked(session_id, |session| {
         let events: Vec<crate::event_buffer::TypedEvent> =
@@ -432,88 +457,42 @@ pub fn correlate_session(session_id: &str) -> Vec<crate::event_buffer::Correlati
             .map(|s| s.as_str())
             .collect();
         let hits = crate::event_buffer::correlate(&events, &now);
-        let new_sigs: Vec<String> = hits
+        // Collect fresh hits (signature not yet surfaced) without mutating the
+        // session while `already` still borrows it.
+        let new_hits: Vec<crate::event_buffer::CorrelationHit> = hits
             .into_iter()
             .filter(|h| !already.contains(h.signature.as_str()))
-            .map(|h| {
-                let sig = h.signature.clone();
-                fresh.push(h);
-                sig
-            })
             .collect();
-        for sig in new_sigs {
-            session.surfaced_correlations.push_back(sig);
-        }
-        while session.surfaced_correlations.len() > MAX_SURFACED_CORRELATIONS {
-            session.surfaced_correlations.pop_front();
-        }
-    });
-    fresh
-}
-
-/// W7: persist freshly-surfaced cross-event correlation hits as warning events.
-///
-/// `correlate_session` only records the de-duplication *markers* (signatures) and
-/// returns the hits; the hits themselves are appended to the verdict's findings
-/// by the caller AFTER `record_outcome` has already run. Without this second
-/// pass, a correlation that upgrades an otherwise-`Allow` command to `Warn`/`Block`
-/// would never land in `SessionWarnings`, so `tirith warnings` and repeat-count
-/// logic would miss the first surfaced correlation hit. Recording them here as
-/// `WarningEvent`s closes that gap. Best-effort and off the hot path.
-pub fn record_correlation_findings(
-    session_id: &str,
-    hits: &[crate::event_buffer::CorrelationHit],
-    cmd: &str,
-    policy: &crate::policy::Policy,
-    dlp_patterns: &[String],
-) {
-    if hits.is_empty() {
-        return;
-    }
-
-    // Redact + truncate outside the lock to minimise hold time (mirrors
-    // `record_outcome`).
-    let command_redacted = crate::redact::redact_command_text(cmd, dlp_patterns);
-    let command_redacted = crate::util::truncate_bytes(&command_redacted, 120);
-    let now = chrono::Utc::now().to_rfc3339();
-
-    struct HitData {
-        rule_id: String,
-        severity: String,
-        title: String,
-    }
-    let hit_data: Vec<HitData> = hits
-        .iter()
-        .map(|h| {
-            // Persist the POST-override (effective) severity, the same value the
-            // verdict path applies via `policy.severity_override`. Recording the
-            // raw `h.severity` here would make `tirith warnings` disagree with the
-            // verdict whenever a `severity_overrides` lever remapped this rule.
-            let severity = policy.severity_override(&h.rule_id).unwrap_or(h.severity);
-            HitData {
-                rule_id: h.rule_id.to_string(),
-                severity: severity.to_string(),
-                title: crate::util::truncate_bytes(&h.title, 120),
-            }
-        })
-        .collect();
-
-    with_session_locked(session_id, |session| {
-        for hd in &hit_data {
+        drop(already);
+        for hit in new_hits {
+            // Mark the signature surfaced AND append the warning event in the same
+            // locked mutation, so the two can never diverge.
+            session
+                .surfaced_correlations
+                .push_back(hit.signature.clone());
+            // Persist the POST-override (effective) severity, matching the verdict.
+            let severity = policy
+                .severity_override(&hit.rule_id)
+                .unwrap_or(hit.severity);
             session.events.push_back(WarningEvent {
                 timestamp: now.clone(),
-                rule_id: hd.rule_id.clone(),
-                severity: hd.severity.clone(),
-                title: hd.title.clone(),
+                rule_id: hit.rule_id.to_string(),
+                severity: severity.to_string(),
+                title: crate::util::truncate_bytes(&hit.title, 120),
                 command_redacted: command_redacted.clone(),
                 domains: Vec::new(),
             });
             session.total_warnings = session.total_warnings.saturating_add(1);
+            fresh.push(hit);
+        }
+        while session.surfaced_correlations.len() > MAX_SURFACED_CORRELATIONS {
+            session.surfaced_correlations.pop_front();
         }
         while session.events.len() > MAX_EVENTS {
             session.events.pop_front();
         }
     });
+    fresh
 }
 
 /// Shared atomic lock-read-modify-write: open the session file, take an
@@ -1076,6 +1055,112 @@ mod tests {
         unsafe {
             std::env::remove_var("XDG_STATE_HOME");
             std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("TIRITH_LOG");
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// W7 atomicity: when `correlate_session` returns a fresh hit, the SAME
+    /// session record must ALREADY hold both the de-dup signature AND the
+    /// `WarningEvent` — with no second call. The previous design marked the
+    /// signature in one write and appended the warning event in a separate
+    /// best-effort write, so a crash between them dropped the hit from
+    /// `tirith warnings` forever. Folding both into one locked mutation closes it.
+    #[cfg(unix)]
+    #[test]
+    fn correlate_session_persists_marker_and_warning_atomically() {
+        use crate::event_buffer::{EventKind, TypedEvent};
+
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let session_id = "w7-atomic-correlation";
+            // Seed a SecretWrite THEN a strictly-later Network, both inside the
+            // 30s window, so `correlate` yields a SecretWriteThenNetwork hit.
+            let base = chrono::Utc::now();
+            let t_secret = (base - chrono::Duration::seconds(10)).to_rfc3339();
+            let t_net = (base - chrono::Duration::seconds(5)).to_rfc3339();
+            record_typed_event(
+                session_id,
+                TypedEvent::new(&t_secret, EventKind::SecretWrite, "secret_file_write"),
+            );
+            record_typed_event(
+                session_id,
+                TypedEvent::new(&t_net, EventKind::Network, "network_egress"),
+            );
+
+            let policy = crate::policy::Policy::default();
+            let hits =
+                correlate_session(session_id, "curl https://x.example -o .env", &policy, &[]);
+            let hit = hits
+                .iter()
+                .find(|h| h.rule_id == RuleId::SecretWriteThenNetwork)
+                .expect("the seeded sequence must surface a SecretWriteThenNetwork hit");
+            let signature = hit.signature.clone();
+
+            // Load the session FRESH (no further correlate call): both the marker
+            // and the warning event must already be persisted together.
+            let session = load(session_id);
+            assert!(
+                session
+                    .surfaced_correlations
+                    .iter()
+                    .any(|s| s == &signature),
+                "the de-dup signature must be persisted: {:?}",
+                session.surfaced_correlations
+            );
+            assert!(
+                session
+                    .events
+                    .iter()
+                    .any(|e| e.rule_id == RuleId::SecretWriteThenNetwork.to_string()),
+                "the WarningEvent must be persisted in the SAME record as the marker: {:?}",
+                session
+                    .events
+                    .iter()
+                    .map(|e| &e.rule_id)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                session.total_warnings, 1,
+                "the surfaced correlation must bump total_warnings exactly once"
+            );
+
+            // And the dedup holds: a second correlate over the same (still in
+            // window) ring surfaces nothing and adds no duplicate warning event.
+            let again =
+                correlate_session(session_id, "curl https://x.example -o .env", &policy, &[]);
+            assert!(
+                !again
+                    .iter()
+                    .any(|h| h.rule_id == RuleId::SecretWriteThenNetwork),
+                "an already-surfaced correlation must not re-emit"
+            );
+            let session = load(session_id);
+            assert_eq!(
+                session
+                    .events
+                    .iter()
+                    .filter(|e| e.rule_id == RuleId::SecretWriteThenNetwork.to_string())
+                    .count(),
+                1,
+                "the warning event must not be duplicated on a re-correlate"
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
             std::env::remove_var("TIRITH_LOG");
         }
         if let Err(e) = result {
