@@ -91,6 +91,34 @@ impl TypedEvent {
             .filter(|n| *n >= 1)
             .unwrap_or(1)
     }
+
+    /// How many of this delete event's paths are NON-build-artifacts, for the
+    /// mass-deletion correlation (which must not count `dist/`, `node_modules/`,
+    /// etc.).
+    ///
+    /// PREFERS the precomputed [`NON_BUILD_DELETE_COUNT_KEY`] metadatum, which the
+    /// deriver fills in by classifying EVERY path in the command individually. That
+    /// is the correct value for a MIXED command (`rm app.rs dist/x dist/y` -> 1),
+    /// which a single representative path cannot capture.
+    ///
+    /// FALLS BACK (events recorded before this key existed, or test-constructed
+    /// events) to the old single-representative-path heuristic: if the one recorded
+    /// `path` is a build artifact, the whole event contributes 0; otherwise it
+    /// contributes its [`delete_count`](Self::delete_count). An event with no path
+    /// is counted conservatively (cannot be proven a build artifact).
+    fn non_build_delete_count(&self) -> usize {
+        if let Some(n) = self
+            .metadata
+            .get(NON_BUILD_DELETE_COUNT_KEY)
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            return n;
+        }
+        match self.path() {
+            Some(p) if crate::util_build_dirs::is_build_artifact_path(p) => 0,
+            _ => self.delete_count(),
+        }
+    }
 }
 
 /// A correlation that fired. Mirrors the shape of a [`crate::verdict::Finding`]
@@ -133,6 +161,16 @@ pub const MANIFEST_FLAG_KEY: &str = "manifest";
 /// command count. Absent or unparsable -> treated as 1 (back-compat with events
 /// recorded before this key existed, and with single-path deletes).
 pub const DELETE_COUNT_KEY: &str = "count";
+
+/// Metadata key on a [`EventKind::FileDelete`] event carrying how many of that one
+/// delete command's paths are NON-build-artifacts (the deriver classifies each
+/// path with `crate::util_build_dirs::is_build_artifact_path`). [`mass_file_deletion`]
+/// SUMS this across events rather than re-deriving artifact status from a single
+/// representative path, which would misclassify a MIXED command (e.g.
+/// `rm app.rs dist/x dist/y` has one non-build path, not three or zero). Absent
+/// (older events / test fixtures) -> the consumer falls back to the per-path
+/// heuristic; see [`TypedEvent::non_build_delete_count`].
+pub const NON_BUILD_DELETE_COUNT_KEY: &str = "non_build_count";
 
 /// Returns true if `basename` (a file's final path component) is a recognised
 /// dependency manifest / lockfile. Conservative and exact-match where possible;
@@ -236,11 +274,16 @@ fn any_after<'a>(
     cutoff: &str,
     now_rfc3339: &str,
 ) -> Option<&'a TypedEvent> {
-    events.iter().find(|e| {
-        e.kind == b_kind
-            && within_window(&e.timestamp, cutoff, now_rfc3339)
-            && e.timestamp.as_str() > after_ts
-    })
+    // Return the EARLIEST matching B by timestamp, not the first by slice order, so
+    // the result is deterministic regardless of how the ring was filled.
+    events
+        .iter()
+        .filter(|e| {
+            e.kind == b_kind
+                && within_window(&e.timestamp, cutoff, now_rfc3339)
+                && e.timestamp.as_str() > after_ts
+        })
+        .min_by(|a, b| a.timestamp.cmp(&b.timestamp))
 }
 
 /// Build a stable de-dup signature for a correlation from its rule and the
@@ -363,14 +406,17 @@ fn delete_then_force_push(events: &[TypedEvent], now_rfc3339: &str) -> Option<Co
     })
 }
 
-/// >= 3 deleted PATHS within 20s, EXCLUDING build-artifact paths -> CRITICAL.
+/// >= 3 deleted NON-BUILD PATHS within 20s -> CRITICAL.
 ///
-/// Counts PATHS, not delete COMMANDS: each [`EventKind::FileDelete`] event carries
-/// a [`DELETE_COUNT_KEY`] metadatum (the number of path operands that one `rm`/
-/// `unlink`/`shred` targeted), and the threshold is checked against the SUM of
-/// those counts. So a single `rm a b c d` (one event, count 4) trips the rule,
-/// and three separate single-path deletes still do. Events without the key count
-/// as 1 (back-compat).
+/// Counts PATHS, not delete COMMANDS, and counts only NON-build-artifact paths.
+/// Each [`EventKind::FileDelete`] event reports its non-build path count via
+/// [`TypedEvent::non_build_delete_count`] (the precomputed
+/// [`NON_BUILD_DELETE_COUNT_KEY`] metadatum when present, else a per-path fallback),
+/// and the threshold is checked against the SUM of those counts across every
+/// matching event. So a single `rm a b c d` (one event, four non-build paths) trips
+/// the rule, three separate single-path source deletes still do, and a mixed
+/// `rm app.rs dist/x dist/y` contributes only its one non-build path, no longer
+/// letting the single sampled path decide for the whole batch.
 fn mass_file_deletion(events: &[TypedEvent], now_rfc3339: &str) -> Option<CorrelationHit> {
     let cut = cutoff(now_rfc3339, MASS_DELETE_WINDOW_SECS)?;
     let matched: Vec<&TypedEvent> = events
@@ -378,16 +424,11 @@ fn mass_file_deletion(events: &[TypedEvent], now_rfc3339: &str) -> Option<Correl
         .filter(|e| {
             e.kind == EventKind::FileDelete && within_window(&e.timestamp, &cut, now_rfc3339)
         })
-        // A delete with NO path is counted (conservative: we cannot prove it is
-        // a build artifact). A delete WITH a build-artifact path is excluded.
-        .filter(|e| {
-            e.path()
-                .map(|p| !crate::util_build_dirs::is_build_artifact_path(p))
-                .unwrap_or(true)
-        })
         .collect();
-    // Sum deleted PATHS across the matching events, not the event count.
-    let count: usize = matched.iter().map(|e| e.delete_count()).sum();
+    // Sum NON-BUILD deleted PATHS across the matching events: each event reports its
+    // own non-build path count, so a mixed command contributes exactly its real
+    // non-build paths rather than all-or-nothing on one representative path.
+    let count: usize = matched.iter().map(|e| e.non_build_delete_count()).sum();
     if count >= MASS_DELETE_THRESHOLD {
         // Signature spans the latest contributing delete so a later burst (a
         // genuinely new mass deletion) re-surfaces while the same set does not.
@@ -447,6 +488,24 @@ mod tests {
         let mut e = ev_path(timestamp, kind, path);
         e.metadata
             .insert(DELETE_COUNT_KEY.to_string(), count.to_string());
+        e
+    }
+
+    /// A FileDelete event carrying BOTH `count` (total paths) and `non_build_count`
+    /// (the precomputed non-build paths), as the real deriver records for a mixed
+    /// command. `path` is the representative first path (here a build artifact, to
+    /// prove the correlation uses non_build_count and NOT the representative path).
+    fn ev_mixed_delete(
+        timestamp: String,
+        path: &str,
+        total: usize,
+        non_build: usize,
+    ) -> TypedEvent {
+        let mut e = ev_path_count(timestamp, EventKind::FileDelete, path, total);
+        e.metadata.insert(
+            NON_BUILD_DELETE_COUNT_KEY.to_string(),
+            non_build.to_string(),
+        );
         e
     }
 
@@ -746,6 +805,83 @@ mod tests {
         ];
         let hits = correlate(&events, &base.to_rfc3339());
         assert!(fired(&hits, RuleId::MassFileDeletion));
+    }
+
+    #[test]
+    fn mass_deletion_prefers_non_build_count_over_representative_path() {
+        // A7: when an event carries `non_build_count`, the correlation SUMS that and
+        // ignores the representative `path`. A mixed `rm app.rs dist/x dist/y` is
+        // count=3 but non_build_count=1, and its representative path here is a build
+        // artifact: it must contribute 1, not 3 and not 0.
+        let base = now();
+        // One mixed event (1 non-build) is below the threshold on its own.
+        let one = vec![ev_mixed_delete(ts(base, -5), "dist/x", 3, 1)];
+        assert!(
+            !fired(
+                &correlate(&one, &base.to_rfc3339()),
+                RuleId::MassFileDeletion
+            ),
+            "a single mixed delete with one non-build path must NOT fire"
+        );
+        // Three such mixed events sum to 3 non-build paths and DO fire, even though
+        // every representative path is a build artifact (the old heuristic would
+        // have excluded them all and never fired).
+        let three = vec![
+            ev_mixed_delete(ts(base, -15), "dist/x", 3, 1),
+            ev_mixed_delete(ts(base, -10), "node_modules/y", 2, 1),
+            ev_mixed_delete(ts(base, -5), "target/z", 4, 1),
+        ];
+        assert!(
+            fired(
+                &correlate(&three, &base.to_rfc3339()),
+                RuleId::MassFileDeletion
+            ),
+            "three mixed deletes summing to 3 non-build paths must fire"
+        );
+        // An explicit non_build_count of 0 contributes nothing even with a non-build
+        // representative path and a large total count.
+        let all_build = vec![ev_mixed_delete(ts(base, -5), "src/keep.rs", 9, 0)];
+        assert!(
+            !fired(
+                &correlate(&all_build, &base.to_rfc3339()),
+                RuleId::MassFileDeletion
+            ),
+            "an explicit non_build_count of 0 must contribute nothing"
+        );
+    }
+
+    #[test]
+    fn any_after_returns_earliest_match_regardless_of_slice_order() {
+        // A8: with two valid B candidates after A, `any_after` (via the time-ordered
+        // correlations) must key on the EARLIEST B by timestamp, deterministically,
+        // not the first by slice order. Place the later B first in the slice.
+        let base = now();
+        let secret_ts = ts(base, -20);
+        let early_net = ts(base, -15);
+        let late_net = ts(base, -5);
+        let events = vec![
+            ev(secret_ts.clone(), EventKind::SecretWrite),
+            // Later B appears BEFORE the earlier B in slice order.
+            ev(late_net.clone(), EventKind::Network),
+            ev(early_net.clone(), EventKind::Network),
+        ];
+        let hits = correlate(&events, &base.to_rfc3339());
+        let hit = hits
+            .iter()
+            .find(|h| h.rule_id == RuleId::SecretWriteThenNetwork)
+            .expect("secret-then-network must fire");
+        // The de-dup signature embeds the chosen B timestamp; it must be the EARLIER
+        // network event, independent of slice order.
+        assert!(
+            hit.signature.contains(&early_net),
+            "the earliest matching B must be chosen: {}",
+            hit.signature
+        );
+        assert!(
+            !hit.signature.contains(&late_net),
+            "the later B must not be the chosen match: {}",
+            hit.signature
+        );
     }
 
     // --- helpers + isolation -------------------------------------------------

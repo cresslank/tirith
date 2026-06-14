@@ -206,13 +206,21 @@ pub fn verify(expected_head: Option<&str>, json: bool) -> i32 {
         // would let log deletion silently defeat the anchor.
         if expected_head.is_some() {
             if json {
-                println!(
-                    r#"{{"ok":false,"total_lines":0,"problems":["expected-head supplied but no audit log at {}"]}}"#,
-                    path.display()
-                );
+                // Build with serde_json so the path is escaped (a Windows path with
+                // backslashes, or one with quotes, would otherwise yield invalid
+                // JSON). Mirrors the success-path object shape below.
+                let obj = serde_json::json!({
+                    "ok": false,
+                    "total_lines": 0,
+                    "problems": [format!(
+                        "expected-head supplied but no audit log at {}",
+                        path.display()
+                    )],
+                });
+                println!("{obj}");
             } else {
                 eprintln!(
-                    "tirith audit verify: FAILED — expected-head supplied but no audit log at {}",
+                    "tirith audit verify: FAILED: expected-head supplied but no audit log at {}",
                     path.display()
                 );
             }

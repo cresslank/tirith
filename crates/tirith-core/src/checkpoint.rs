@@ -175,10 +175,20 @@ pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<Checkpoin
         total_bytes,
         file_count: manifest.len(),
         // Persist the capture-time cwd so a relative `original_path` restores
-        // against this root, independent of the cwd at restore time.
-        capture_root: std::env::current_dir()
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned()),
+        // against this root, independent of the cwd at restore time. Canonicalize
+        // it first: on macOS the cwd often contains a symlinked ancestor
+        // (`/tmp` -> `/private/tmp`, `/var` -> `/private/var`). Storing that
+        // symlinked form would make every relative entry anchor through a symlink,
+        // and `reject_symlinked_restore_dest` would then FALSELY reject a legitimate
+        // restore. Canonicalizing resolves the symlinks once at capture time. If
+        // canonicalize fails (e.g. the cwd was removed), fall back to the verbatim
+        // path rather than dropping the anchor.
+        capture_root: std::env::current_dir().ok().map(|p| {
+            fs::canonicalize(&p)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .into_owned()
+        }),
     };
 
     let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| format!("serialize: {e}"))?;
@@ -346,6 +356,23 @@ fn anchor_restore_dst(original_path: &str, capture_root: Option<&Path>) -> Resul
 /// if any existing ancestor component is a symlink. `symlink_metadata` does NOT
 /// follow links, so a missing component (yet to be created by `create_dir_all`)
 /// simply yields no metadata and is skipped. Only a present symlink trips this.
+/// Reject a checkpoint directory that is itself a symlink before reading anything
+/// under it. The lexical `cp_dir.parent() == store` check upstream does not catch
+/// a symlink AT `cp_dir` that redirects outside the store, so a planted link could
+/// otherwise make restore/diff read an attacker-controlled manifest and files.
+/// `symlink_metadata` does not follow the final component, so a real directory
+/// passes and only a symlink is refused.
+fn reject_symlinked_checkpoint_dir(cp_dir: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(cp_dir) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(format!(
+            "refusing to use a symlinked checkpoint directory: {}",
+            cp_dir.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("cannot stat checkpoint directory: {e}")),
+    }
+}
+
 fn reject_symlinked_restore_dest(dst: &Path) -> Result<(), String> {
     // The destination file: a symlink here would have `fs::copy` write through it.
     if let Ok(meta) = fs::symlink_metadata(dst) {
@@ -459,6 +486,12 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
     if !cp_dir.exists() {
         return Err(format!("checkpoint not found: {checkpoint_id}"));
     }
+    // The parent containment check above is LEXICAL: it confirms `cp_dir`'s parent
+    // path equals the store, but does not stop `cp_dir` ITSELF from being a symlink
+    // that redirects outside the store. Reading its manifest / restoring its files
+    // would then follow that link. Reject a symlinked checkpoint directory before
+    // any read. (`symlink_metadata` does not follow the final component.)
+    reject_symlinked_checkpoint_dir(&cp_dir)?;
 
     let manifest_str = fs::read_to_string(cp_dir.join("manifest.json"))
         .map_err(|e| format!("read manifest: {e}"))?;
@@ -620,6 +653,9 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
     if !cp_dir.exists() {
         return Err(format!("checkpoint not found: {checkpoint_id}"));
     }
+    // Same symlink guard as the restore path: a symlinked `cp_dir` could redirect
+    // the manifest/file reads outside the store. Reject it before any read.
+    reject_symlinked_checkpoint_dir(&cp_dir)?;
 
     let manifest_str = fs::read_to_string(cp_dir.join("manifest.json"))
         .map_err(|e| format!("read manifest: {e}"))?;
@@ -1447,6 +1483,81 @@ mod tests {
                 .unwrap_or(false),
             "restore audit detail must report restored=2: {v}"
         );
+    }
+
+    /// Security (A6): a checkpoint DIRECTORY that is itself a symlink must be
+    /// refused before its manifest is read. The lexical parent-containment check
+    /// does not catch a symlink AT `cp_dir`, so without this guard a planted link
+    /// could redirect the restore at an attacker-controlled manifest outside the
+    /// store. The restore must error out without reading through the link.
+    #[cfg(unix)]
+    #[test]
+    fn test_restore_refuses_symlinked_checkpoint_dir() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let state_dir = tmpdir.path().join("state");
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+
+        let outcome = std::panic::catch_unwind(|| {
+            let store = checkpoints_dir();
+            fs::create_dir_all(&store).expect("create store");
+
+            // An attacker-controlled checkpoint OUTSIDE the store, with a manifest
+            // that would restore to an arbitrary absolute path if followed.
+            let evil = tmpdir.path().join("evil-checkpoint");
+            fs::create_dir_all(evil.join("files")).expect("create evil dir");
+            let evil_manifest = serde_json::to_string(&vec![ManifestEntry {
+                original_path: "/tmp/should-not-be-written".to_string(),
+                sha256: empty_sha256(),
+                size: 0,
+                is_dir: false,
+            }])
+            .unwrap();
+            fs::write(evil.join("manifest.json"), evil_manifest).expect("write evil manifest");
+
+            // Plant `cp_dir` as a SYMLINK to the evil directory. Its lexical parent
+            // is still the store, so the parent-containment check alone passes.
+            let id = "symlinked-cp";
+            let cp_dir = store.join(id);
+            std::os::unix::fs::symlink(&evil, &cp_dir).expect("plant symlink cp_dir");
+            assert_eq!(
+                cp_dir.parent(),
+                Some(store.as_path()),
+                "the symlink's lexical parent is the store"
+            );
+
+            let res = restore_reported(id);
+            assert!(
+                res.is_err(),
+                "a symlinked checkpoint directory must be refused: {res:?}"
+            );
+            let msg = res.unwrap_err();
+            assert!(
+                msg.contains("symlinked checkpoint directory"),
+                "the error must name the symlink guard: {msg}"
+            );
+            // The guarded restore must NOT have written the evil target.
+            assert!(
+                !Path::new("/tmp/should-not-be-written").exists(),
+                "restore must not write through the symlinked checkpoint dir"
+            );
+        });
+
+        // SAFETY: serialized by crate::TEST_ENV_LOCK; restore regardless.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+        if let Err(e) = outcome {
+            std::panic::resume_unwind(e);
+        }
     }
 
     /// Security: a restore destination that has become a symlink (e.g. an

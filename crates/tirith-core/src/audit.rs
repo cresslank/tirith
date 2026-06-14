@@ -477,15 +477,23 @@ fn head_canonical_unsigned(receipt: &HeadReceipt) -> Option<String> {
 fn write_head(log_path: &std::path::Path, receipt: &HeadReceipt) -> std::io::Result<()> {
     let hp = head_path(log_path);
 
-    // Sign the receipt itself when the log is signed. Best-effort on the signing
-    // step (if the key is momentarily unavailable the receipt is written unsigned;
-    // verify then fails closed on a signed log with an unverifiable head, which is
-    // the safe direction). The line-write path already refuses to mark a log
-    // signed without a key, so in practice the key is present here.
+    // Sign the receipt itself when the log is signed. Signing here MUST succeed:
+    // writing an unsigned head over a signed log leaves verify with no head
+    // signature to check, which an attacker could exploit to mask a signing-state
+    // downgrade. So if the receipt is signed-expected but signing yields nothing
+    // (key gone / unreadable), fail the head write. The caller releases the lock
+    // and reports the append as Failed, so no head is written at all rather than an
+    // unsigned one. (The line-write path already refuses to mark a log signed
+    // without a key, so in practice the key is present here.)
     let to_write = if receipt.signing_enabled {
         let mut signed = receipt.clone();
         signed.sig =
             head_canonical_unsigned(&signed).and_then(|canon| sign_canonical(canon.as_bytes()));
+        if signed.sig.is_none() {
+            return Err(std::io::Error::other(
+                "cannot sign head receipt for a signed audit log (signing key unavailable)",
+            ));
+        }
         std::borrow::Cow::Owned(signed)
     } else {
         std::borrow::Cow::Borrowed(receipt)
@@ -687,13 +695,11 @@ pub fn verify_audit_log(
         let prev = val.get("prev_hash").and_then(|v| v.as_str());
         let this_hash = line_hash(line).unwrap_or_default();
 
-        // `is_chained` tracks whether THIS entry participates in the hash chain
-        // (carries `prev_hash`). The signature handling below runs for EVERY
-        // entry that carries a `sig`, chained or not, so the genesis/first signed
-        // entry (which has no `prev_hash`) is authenticated and counted too.
-        let mut is_chained = false;
+        // The signature handling below runs for EVERY entry independent of whether
+        // it carries `prev_hash` (is chained), so the genesis/first signed entry
+        // (which has no `prev_hash`) is authenticated, counted, and downgrade-
+        // checked just like a chained line.
         if let Some(prev) = prev {
-            is_chained = true;
             if !chaining_started && i > 0 && report.legacy_prefix > 0 && hashes[i - 1] == prev {
                 // The immediately preceding unchained line is this chain's
                 // genesis (its root), not a legacy entry, so it does not count
@@ -731,13 +737,17 @@ pub fn verify_audit_log(
         let sig_present = val.get("sig").and_then(|v| v.as_str());
         if sig_present.is_some() {
             report.signed_lines += 1;
-        } else if report.signing_expected && is_chained {
+        } else if report.signing_expected {
             // This log is signed (per the head receipt OR a still-signed line
-            // observed in the pre-scan), but this chained entry has no `sig`.
-            // Because `sig` is excluded from the chain hash, stripping it
-            // leaves the chain intact and is otherwise invisible, so flag it
-            // as a signature downgrade. A legitimately unsigned legacy/unchained
-            // line (no `prev_hash`) is NOT a downgrade, so it is exempt.
+            // observed in the pre-scan), but this entry has no `sig`. Because `sig`
+            // is excluded from the chain hash, stripping it leaves the chain intact
+            // and is otherwise invisible, so flag it as a signature downgrade. This
+            // runs for EVERY entry, NOT just chained ones: a signed log signs from
+            // its genesis (signing cannot be enabled mid-stream over a non-empty
+            // log), so stripping `sig` from the FIRST (genesis/root) entry, which
+            // has no `prev_hash` and so is unchained, is just as much a downgrade as
+            // stripping it from a later line. Gating on `is_chained` here would let
+            // that first-entry strip pass undetected.
             report.ok = false;
             report.problems.push(format!(
                 "line {}: missing signature on a signed log (possible signature downgrade)",
@@ -2344,6 +2354,89 @@ mod tests {
             assert_eq!(
                 report.signed_lines, 1,
                 "the genesis line still carries a sig and must be counted"
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            std::env::remove_var("TIRITH_LOG");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_genesis_signature_strip_is_detected_as_downgrade() {
+        // A4: stripping `sig` from the FIRST (genesis/root) entry of a signed log,
+        // while LATER lines stay signed, must be flagged as a signature downgrade.
+        // The genesis has no `prev_hash` (it is unchained), so a downgrade check
+        // gated on `is_chained` would miss it and reopen the bypass on the first
+        // entry. The check now fires whenever signing is expected and a sig is
+        // absent, regardless of chaining.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
+        let vk = sk.verifying_key();
+        std::fs::write(cfg.join("tirith").join("audit-signing.key"), sk.to_bytes()).unwrap();
+        std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
+
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("TIRITH_LOG", "1");
+            std::env::set_var("XDG_CONFIG_HOME", &cfg);
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            // Three signed entries: line 1 is the genesis (no prev_hash), lines 2-3
+            // are chained. All are signed.
+            append_chain(&log, &["Allow", "Block", "Warn"]);
+
+            let clean = verify_audit_log(&log, None);
+            assert!(
+                clean.ok,
+                "a signed, intact chain must verify ok: {:?}",
+                clean.problems
+            );
+            assert!(clean.signing_expected, "signing must be expected");
+
+            // Strip `sig` from the FIRST line only, leaving lines 2-3 signed and the
+            // chain otherwise intact. `any_line_signed` keeps signing_expected true.
+            let content = std::fs::read_to_string(&log).unwrap();
+            let mut lines: Vec<String> = content.lines().map(String::from).collect();
+            assert!(lines.len() >= 3, "expected at least three lines");
+            assert!(
+                !lines[0].contains("prev_hash"),
+                "line 1 is the genesis (no prev_hash)"
+            );
+            let mut v: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+            assert!(
+                v.get("sig").is_some(),
+                "precondition: the genesis line was signed"
+            );
+            v.as_object_mut().unwrap().remove("sig");
+            lines[0] = serde_json::to_string(&v).unwrap();
+            std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+
+            let report = verify_audit_log(&log, None);
+            assert!(
+                !report.ok,
+                "stripping the genesis signature on a signed log must fail verification"
+            );
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| { p.contains("line 1") && p.contains("signature downgrade") }),
+                "a genesis signature-downgrade problem must be reported for line 1: {:?}",
+                report.problems
             );
         });
 

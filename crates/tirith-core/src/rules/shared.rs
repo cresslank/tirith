@@ -90,16 +90,26 @@ pub fn is_url_shortener(host: &str) -> bool {
 }
 
 /// `true` when `host` is a loopback / local target that never leaves the
-/// machine: `localhost`, the `127.0.0.0/8` loopback block (`127.*`), IPv6 `::1`
-/// (bracketed or bare), the unspecified address `0.0.0.0`, or any `*.localhost`
-/// name. Centralised so `transport.rs` (PlainHttpToSink) and `escalation.rs`
-/// (W7 Network-event derivation) share one definition and cannot drift. Matching
-/// is exact and case-sensitive on the already-lowercased host the callers pass.
+/// machine: `localhost`, the `127.0.0.0/8` loopback block (a real IPv4 loopback
+/// address), IPv6 `::1` (bracketed or bare), the unspecified address `0.0.0.0`,
+/// or any `*.localhost` name. Centralised so `transport.rs` (PlainHttpToSink) and
+/// `escalation.rs` (W7 Network-event derivation) share one definition and cannot
+/// drift. Matching is exact and case-sensitive on the already-lowercased host the
+/// callers pass.
+///
+/// The 127.0.0.0/8 case is gated on actually parsing as an IPv4 address: a bare
+/// `host.starts_with("127.")` would also match hostnames like `127.evil.example`,
+/// marking a real REMOTE host as local and excluding it from network detection.
+/// `Ipv4Addr::is_loopback` is true for the whole 127.0.0.0/8 block and false for
+/// any non-address string.
 pub fn is_loopback_host(host: &str) -> bool {
     matches!(
         host,
         "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
-    ) || host.starts_with("127.")
+    ) || host
+        .parse::<std::net::Ipv4Addr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
         || host.ends_with(".localhost")
 }
 
@@ -143,5 +153,26 @@ mod tests {
         assert!(!is_critical_label("test"));
         assert!(!is_critical_label("p2"));
         assert!(!is_critical_label(""));
+    }
+
+    #[test]
+    fn is_loopback_host_only_matches_real_loopback() {
+        // Named and IPv6 local targets.
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("app.localhost"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("[::1]"));
+        assert!(is_loopback_host("0.0.0.0"));
+        // The whole 127.0.0.0/8 block parses as an IPv4 loopback address.
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.1.2.3"));
+        assert!(is_loopback_host("127.255.255.254"));
+        // A hostname that merely STARTS WITH "127." is NOT loopback: it is a real
+        // remote host and must stay in network detection (no evasion via prefix).
+        assert!(!is_loopback_host("127.evil.example"));
+        assert!(!is_loopback_host("127.0.0.1.evil.example"));
+        // A non-loopback IPv4 address is not local.
+        assert!(!is_loopback_host("10.0.0.1"));
+        assert!(!is_loopback_host("128.0.0.1"));
     }
 }

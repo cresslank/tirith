@@ -86,38 +86,35 @@ fn store_path() -> Option<PathBuf> {
     crate::policy::state_dir().map(|d| d.join("pending.json"))
 }
 
-/// Load the full map from disk. A missing file is treated as an empty map.
-/// A corrupt file is reported and treated as empty so the CLI stays usable.
-fn load_map() -> BTreeMap<String, PendingDecision> {
+/// Load the full map from disk. A missing file (or no state dir) is treated as an
+/// empty map. Any OTHER read error, or a parse error, is returned as `Err` so the
+/// caller FAILS CLOSED: a mutating caller must not save an empty snapshot over a
+/// real-but-unreadable store, and a read-only caller should surface "cannot read
+/// store" rather than print an empty list as if the store were genuinely empty.
+fn load_map() -> Result<BTreeMap<String, PendingDecision>, String> {
     let Some(path) = store_path() else {
-        return BTreeMap::new();
+        return Ok(BTreeMap::new());
     };
     let contents = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         // A missing file is the normal "no decisions yet" case: empty map, silent.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         // Any OTHER read error (permission denied, transient I/O) must NOT be
-        // collapsed silently: a subsequent save under `with_store_locked` would
-        // then overwrite a real `pending.json` with an empty snapshot. Report it
-        // (matching the parse-error branch below) and stay usable with an empty map.
+        // collapsed to an empty map: a subsequent save under `with_store_locked`
+        // would then overwrite a real `pending.json`. Fail closed.
         Err(e) => {
-            eprintln!("tirith: pending: cannot read store {}: {e}", path.display());
-            return BTreeMap::new();
+            return Err(format!("cannot read pending store {}: {e}", path.display()));
         }
     };
     if contents.trim().is_empty() {
-        return BTreeMap::new();
+        return Ok(BTreeMap::new());
     }
-    match serde_json::from_str(&contents) {
-        Ok(map) => map,
-        Err(e) => {
-            eprintln!(
-                "tirith: pending: ignoring unreadable store {}: {e}",
-                path.display()
-            );
-            BTreeMap::new()
-        }
-    }
+    serde_json::from_str(&contents).map_err(|e| {
+        format!(
+            "cannot parse pending store {} (refusing to overwrite it): {e}",
+            path.display()
+        )
+    })
 }
 
 /// Atomically persist the map to `state_dir()/pending.json` via a temp file +
@@ -198,8 +195,18 @@ where
         .lock_exclusive()
         .map_err(|e| format!("lock pending store {}: {e}", lp.display()))?;
 
-    // Critical section: load, mutate, save — all while the lock is held.
-    let mut map = load_map();
+    // Critical section: load, mutate, save, all while the lock is held. A load
+    // failure (unreadable or corrupt store) FAILS CLOSED here: we release the lock
+    // and return the error WITHOUT saving, so a real-but-unreadable store is never
+    // clobbered with an empty snapshot.
+    let load_result = load_map();
+    let mut map = match load_result {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = FileExt::unlock(&lock_file);
+            return Err(e);
+        }
+    };
     let out = mutate(&mut map);
     let save_result = save_map(&map);
 
@@ -315,22 +322,27 @@ pub fn expire_older_than(secs: i64) -> Result<usize, String> {
 }
 
 /// All decisions, newest first (by `created_at`, then id for stability).
-pub fn load_all() -> Vec<PendingDecision> {
-    let mut all: Vec<PendingDecision> = load_map().into_values().collect();
+///
+/// Returns `Err` when the store exists but cannot be read or parsed, so callers
+/// surface "cannot read store" rather than printing an empty list as if the store
+/// were genuinely empty. A missing store (no decisions yet) is `Ok(empty)`.
+pub fn load_all() -> Result<Vec<PendingDecision>, String> {
+    let mut all: Vec<PendingDecision> = load_map()?.into_values().collect();
     all.sort_by(|a, b| {
         b.created_at
             .cmp(&a.created_at)
             .then_with(|| a.id.cmp(&b.id))
     });
-    all
+    Ok(all)
 }
 
-/// Only the still-`Pending` decisions, newest first.
-pub fn list_unresolved() -> Vec<PendingDecision> {
-    load_all()
+/// Only the still-`Pending` decisions, newest first. Propagates a store read/parse
+/// error (see [`load_all`]).
+pub fn list_unresolved() -> Result<Vec<PendingDecision>, String> {
+    Ok(load_all()?
         .into_iter()
         .filter(|d| !d.status.is_resolved())
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -374,11 +386,11 @@ mod tests {
             assert_eq!(id.len(), 8, "generated id must be 8 chars");
 
             // load_all / list_unresolved see the new entry.
-            let all = load_all();
+            let all = load_all().unwrap();
             assert_eq!(all.len(), 1);
             assert_eq!(all[0].id, id);
             assert!(!all[0].created_at.is_empty());
-            assert_eq!(list_unresolved().len(), 1);
+            assert_eq!(list_unresolved().unwrap().len(), 1);
 
             // first resolve transitions the entry.
             let first = resolve(
@@ -399,15 +411,15 @@ mod tests {
             assert!(!resolve("deadbeef", PendingStatus::Kept, None, None).unwrap());
 
             // resolved entry drops out of the unresolved list but stays in load_all.
-            assert_eq!(list_unresolved().len(), 0);
-            let all = load_all();
+            assert_eq!(list_unresolved().unwrap().len(), 0);
+            let all = load_all().unwrap();
             assert_eq!(all.len(), 1);
             assert_eq!(all[0].status, PendingStatus::Kept);
             assert_eq!(all[0].reason.as_deref(), Some("looks fine"));
             assert!(all[0].resolved_at.is_some());
 
             // export shape: pretty JSON of load_all() must round-trip.
-            let exported = serde_json::to_string_pretty(&load_all()).unwrap();
+            let exported = serde_json::to_string_pretty(&load_all().unwrap()).unwrap();
             let parsed: Vec<PendingDecision> = serde_json::from_str(&exported).unwrap();
             assert_eq!(parsed.len(), 1);
             assert_eq!(parsed[0].id, id);
@@ -454,7 +466,7 @@ mod tests {
                 }
             });
 
-            let all = load_all();
+            let all = load_all().unwrap();
             assert_eq!(
                 all.len(),
                 THREADS * PER_THREAD,
@@ -481,9 +493,9 @@ mod tests {
         unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
 
         let result = (|| {
-            // No file yet: every reader tolerates the missing store.
-            assert!(load_all().is_empty());
-            assert!(list_unresolved().is_empty());
+            // No file yet: every reader tolerates the missing store (Ok(empty)).
+            assert!(load_all().unwrap().is_empty());
+            assert!(list_unresolved().unwrap().is_empty());
 
             // Seed one entry with an ancient created_at directly through the
             // map so we control the timestamp.
@@ -491,14 +503,14 @@ mod tests {
 
             // Nothing older than a day yet: expiry is a no-op.
             assert_eq!(expire_older_than(86_400).unwrap(), 0);
-            assert_eq!(list_unresolved().len(), 1);
+            assert_eq!(list_unresolved().unwrap().len(), 1);
 
             // Everything older than 0 seconds expires the lone pending entry.
             // (created_at is "now", so allow a tiny negative window.)
             let n = expire_older_than(-1).unwrap();
             assert_eq!(n, 1, "the single pending entry should expire");
 
-            let all = load_all();
+            let all = load_all().unwrap();
             assert_eq!(all.len(), 1);
             assert_eq!(all[0].id, id);
             assert_eq!(all[0].status, PendingStatus::Expired);
@@ -506,6 +518,55 @@ mod tests {
 
             // Re-running expiry does not double-count the now-terminal entry.
             assert_eq!(expire_older_than(-1).unwrap(), 0);
+        })();
+
+        match prev {
+            Some(val) => unsafe { std::env::set_var("XDG_STATE_HOME", val) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
+        result
+    }
+
+    #[test]
+    fn corrupt_store_fails_closed_and_is_not_truncated() {
+        // A10: an unparseable `pending.json` must make a mutating op (register)
+        // return Err and must NOT be overwritten with an empty snapshot. Read-only
+        // callers (load_all/list_unresolved) must surface the error too.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var("XDG_STATE_HOME").ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+
+        let result = (|| {
+            // Plant a corrupt store at the exact path load_map() reads.
+            let path = store_path().expect("store path under XDG_STATE_HOME");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let corrupt = b"{ this is not valid json";
+            std::fs::write(&path, corrupt).unwrap();
+
+            // Read-only callers fail closed (Err), not an empty Ok.
+            assert!(load_all().is_err(), "load_all must surface the parse error");
+            assert!(
+                list_unresolved().is_err(),
+                "list_unresolved must surface the parse error"
+            );
+
+            // A mutating op must fail closed AND leave the corrupt bytes intact
+            // (no empty-snapshot overwrite).
+            let reg = register(sample(PendingSource::Restore, "high"));
+            assert!(
+                reg.is_err(),
+                "register over a corrupt store must fail closed: {reg:?}"
+            );
+            let after = std::fs::read(&path).unwrap();
+            assert_eq!(
+                after, corrupt,
+                "the corrupt store must NOT be truncated/overwritten"
+            );
         })();
 
         match prev {

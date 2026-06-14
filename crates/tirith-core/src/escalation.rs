@@ -704,10 +704,18 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
     let segments = tokenize::tokenize(cmd, ShellType::Posix);
     let mut leader_is_network = false;
     let mut delete_path: Option<String> = None;
-    // Number of distinct path arguments the delete command targets, so a single
-    // `rm a b c` records a FileDelete whose `count` is 3 (not 1). The mass-delete
-    // correlation sums this across events, so one multi-path command can trip it.
+    // Path-operand counts accumulated across ALL rm/unlink/shred segments in this
+    // ONE command (e.g. `rm a && rm b c`, or a wrapped delete), so a multi-segment
+    // delete is weighed by its real paths, not just the first segment's. The
+    // mass-delete correlation sums these across events.
+    //   * `delete_path_count` = total path operands (the existing `count`).
+    //   * `delete_non_build_count` = path operands that are NOT build artifacts
+    //     (`dist/`, `node_modules/`, ...). Classifying EVERY path here, rather than
+    //     testing one representative path in the correlation, is what keeps a MIXED
+    //     command (`rm app.rs dist/x dist/y` -> 1 non-build) from being all-or-
+    //     nothing on the single sampled path.
     let mut delete_path_count: usize = 0;
+    let mut delete_non_build_count: usize = 0;
     let mut is_force_push = false;
     let mut is_package_install = false;
     let mut secret_write_path: Option<String> = None;
@@ -728,11 +736,19 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
             {
                 leader_is_network = true;
             }
-            "rm" | "unlink" | "shred" if delete_path.is_none() => {
-                delete_path = first_path_arg(&args);
-                // Count EVERY non-flag path arg in this command (multi-path
-                // delete), so `rm a b c` is recorded as three deletions, not one.
-                delete_path_count = count_path_args(&args);
+            "rm" | "unlink" | "shred" => {
+                // Accumulate across EVERY delete segment, not just the first: a
+                // command can carry more than one rm/unlink/shred. The first
+                // segment's first path is kept as the representative metadata
+                // `path` (for display / back-compat).
+                if delete_path.is_none() {
+                    delete_path = first_path_arg(&args);
+                }
+                // Count EVERY non-flag path arg (multi-path delete), so `rm a b c`
+                // is three deletions, and split the total into non-build paths so
+                // the mass-delete correlation never counts `dist/`/`node_modules/`.
+                delete_path_count += count_path_args(&args);
+                delete_non_build_count += count_non_build_path_args(&args);
             }
             "git" if git_is_force_push(&args) => is_force_push = true,
             "npm" | "pnpm" | "yarn" | "pip" | "pip3" | "cargo" | "brew" | "gem" | "go" | "apt"
@@ -819,13 +835,21 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
     if let Some(path) = delete_path {
         let mut meta = BTreeMap::new();
         meta.insert("path".to_string(), path);
-        // Record how many paths this single delete command targets so the
-        // mass-deletion correlation can SUM real deleted paths across events
-        // rather than counting one event per command. `count` is always >= 1
-        // here (the path arm only runs when a path arg was found).
+        // Record how many paths this command targets (across all delete segments)
+        // so the mass-deletion correlation can SUM real deleted paths across events
+        // rather than counting one event per command. `count` is always >= 1 here
+        // (the path arm only set `delete_path` when a path arg was found).
         meta.insert(
             crate::event_buffer::DELETE_COUNT_KEY.to_string(),
             delete_path_count.max(1).to_string(),
+        );
+        // Persist the precomputed NON-build path count so the correlation does not
+        // re-derive artifact status from a single representative path (which
+        // misclassifies a mixed command). This can legitimately be 0 (an all-build
+        // delete like `rm dist/x dist/y`), which then contributes nothing.
+        meta.insert(
+            crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY.to_string(),
+            delete_non_build_count.to_string(),
         );
         push(
             &mut events,
@@ -893,6 +917,19 @@ fn first_path_arg(args: &[String]) -> Option<String> {
 /// `args` is just the rm/unlink/shred operands.
 fn count_path_args(args: &[String]) -> usize {
     args.iter().filter(|a| !a.starts_with('-')).count()
+}
+
+/// The number of non-flag path arguments that are NOT build artifacts, using the
+/// same flag rule as [`count_path_args`] plus
+/// `crate::util_build_dirs::is_build_artifact_path` on each path. `rm app.rs dist/x
+/// dist/y` -> 1; `rm dist/a dist/b` -> 0; `rm -rf src x` -> 2. This is what the
+/// mass-deletion correlation sums, so a mixed delete contributes exactly its real
+/// non-build paths instead of all-or-nothing on one sampled path.
+fn count_non_build_path_args(args: &[String]) -> usize {
+    args.iter()
+        .filter(|a| !a.starts_with('-'))
+        .filter(|a| !crate::util_build_dirs::is_build_artifact_path(a))
+        .count()
 }
 
 /// Split a `scheme://rest` argument into its lowercased scheme and the raw host
@@ -2436,6 +2473,13 @@ mod tests {
                 .map(String::as_str),
             Some("4")
         );
+        // All four are non-build, so non_build_count is also 4.
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("4")
+        );
         // Flags are not counted as paths.
         let with_flags = derive_typed_events("rm -rf x y", &v);
         let del = with_flags
@@ -2447,6 +2491,50 @@ mod tests {
                 .get(crate::event_buffer::DELETE_COUNT_KEY)
                 .map(String::as_str),
             Some("2")
+        );
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn derive_file_delete_mixed_paths_counts_only_non_build() {
+        // A7: a MIXED delete records total `count` for every path but a
+        // `non_build_count` that excludes build artifacts. `rm app.rs dist/x dist/y`
+        // is 3 paths total, 1 non-build, so it must NOT trip mass-deletion alone.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let del = derive_typed_events("rm app.rs dist/x dist/y", &v)
+            .into_iter()
+            .find(|e| e.kind == EventKind::FileDelete)
+            .expect("file delete event");
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("3"),
+            "total path count includes the build artifacts"
+        );
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("1"),
+            "only app.rs is a non-build path"
+        );
+
+        // An ALL-build delete records 0 non-build paths (contributes nothing).
+        let del = derive_typed_events("rm node_modules/a target/b", &v)
+            .into_iter()
+            .find(|e| e.kind == EventKind::FileDelete)
+            .expect("file delete event");
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("0")
         );
     }
 
@@ -2503,6 +2591,26 @@ mod tests {
                     .iter()
                     .any(|f| f.rule_id == RuleId::MassFileDeletion),
                 "a multi-path delete of build artifacts must NOT trip MassFileDeletion"
+            );
+
+            // A7: a MIXED delete (`rm app.rs dist/a dist/b`) has only ONE non-build
+            // path, so it must NOT trip on its own even though it targets 3 paths.
+            // The single representative path no longer decides for the whole batch.
+            let v3 = raw_verdict_with(Action::Allow, vec![], None);
+            let out3 = post_process_verdict(
+                &v3,
+                &policy,
+                "rm app.rs dist/a dist/b",
+                "w7-mass-delete-mixed",
+                CallerContext::Cli,
+            );
+            assert!(
+                !out3
+                    .findings
+                    .iter()
+                    .any(|f| f.rule_id == RuleId::MassFileDeletion),
+                "a mixed delete with one non-build path must NOT trip MassFileDeletion: {:?}",
+                out3.findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
             );
         });
 

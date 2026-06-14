@@ -20,7 +20,14 @@ pub fn list(format_json: bool) -> i32 {
     // store does not accumulate forever (best-effort; an error here is non-fatal
     // to listing).
     let _ = pending::expire_older_than(PENDING_RETENTION_SECS);
-    let entries = pending::list_unresolved();
+    let entries = match pending::list_unresolved() {
+        Ok(e) => e,
+        // A real-but-unreadable store must surface as an error, not an empty list.
+        Err(e) => {
+            eprintln!("tirith pending list: {e}");
+            return 2;
+        }
+    };
     if format_json {
         // Serialize through the shared helper so a broken pipe (EPIPE) returns a
         // non-zero exit instead of panicking, and the exit code follows the write.
@@ -76,8 +83,12 @@ pub fn resolve(id: &str, action: &str, reason: Option<String>) -> i32 {
 
     // For rollback, surface the restore command (if any) before mutating, so
     // the operator sees it even when the entry is already resolved.
+    // Best-effort lookup of the restore-command hint. If the store cannot be read
+    // here, the authoritative `pending::resolve` call below still fails closed; we
+    // just cannot surface the checkpoint id, so fall back to no hint.
     let checkpoint_id = if action == "rollback" {
         pending::load_all()
+            .unwrap_or_default()
             .into_iter()
             .find(|d| d.id == id)
             .and_then(|d| d.refs.get("checkpoint_id").cloned())
@@ -124,7 +135,15 @@ pub fn resolve(id: &str, action: &str, reason: Option<String>) -> i32 {
 
 /// Export all pending decisions as pretty JSON to a file or stdout.
 pub fn export(output: Option<PathBuf>) -> i32 {
-    let all = pending::load_all();
+    let all = match pending::load_all() {
+        Ok(a) => a,
+        // Surface "cannot read store" rather than exporting an empty list that
+        // could be mistaken for a genuinely empty store.
+        Err(e) => {
+            eprintln!("tirith pending export: {e}");
+            return 2;
+        }
+    };
 
     match output {
         Some(path) => {
