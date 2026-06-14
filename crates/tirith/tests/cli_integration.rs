@@ -12,20 +12,38 @@ fn tirith() -> Command {
     cmd
 }
 
-/// A `tirith` command rooted at `proj` with `TIRITH_POLICY_ROOT` cleared, so an inherited
-/// `TIRITH_POLICY_ROOT` from the test runner's environment cannot redirect policy / repo-root
-/// discovery away from the temp project (M13 PR #132 finding P).
+/// Scrub the ambient policy / threat-DB / TTY-override env vars that the test runner may
+/// have inherited, so a value leaking in from the parent process cannot redirect policy /
+/// repo-root discovery (`TIRITH_POLICY_ROOT`), flip `url.reputation` behavior
+/// (`TIRITH_THREATDB_PATH` / `TIRITH_THREATDB_SUPPLEMENTAL_PATH`), or override TTY detection
+/// (`TIRITH_INTERACTIVE`). Shared by every isolated builder below (CodeRabbit M13; PR #132).
+fn scrub_ambient_env(c: &mut Command) -> &mut Command {
+    c.env_remove("TIRITH_POLICY_ROOT")
+        .env_remove("TIRITH_INTERACTIVE")
+        .env_remove("TIRITH_THREATDB_PATH")
+        .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH")
+}
+
+/// A `tirith` command with the ambient policy / threat-DB / TTY-override env scrubbed (see
+/// [`scrub_ambient_env`]) but NO working directory forced, for tests that drive their own
+/// `XDG_*` isolation and rely on the process cwd. Without this, an inherited
+/// `TIRITH_POLICY_ROOT` / `TIRITH_THREATDB_*` can flip the expected exit code or persisted
+/// state of the deferred / pending / audit cases below. (Distinct from the 3-arg
+/// `tirith_isolated` builder further down, which also pins a session id / cwd.)
+fn tirith_scrubbed() -> Command {
+    let mut c = tirith();
+    scrub_ambient_env(&mut c);
+    c
+}
+
+/// A `tirith` command rooted at `proj` with the ambient policy / threat-DB / TTY-override env
+/// scrubbed (see [`scrub_ambient_env`]), so an inherited `TIRITH_POLICY_ROOT` from the test
+/// runner's environment cannot redirect policy / repo-root discovery away from the temp
+/// project (M13 PR #132 finding P).
 fn tirith_in_proj(proj: &std::path::Path) -> Command {
     let mut c = tirith();
-    c.current_dir(proj)
-        .env_remove("TIRITH_POLICY_ROOT")
-        // This file uses `TIRITH_INTERACTIVE` as a TTY-detection override seam (CodeRabbit M13;
-        // PR #132; R8-4).
-        .env_remove("TIRITH_INTERACTIVE")
-        // Clear the threat-DB override env vars so these builders always run with the DEFAULT
-        // threat-DB / `url.reputation` behavior (CodeRabbit M13; PR #132).
-        .env_remove("TIRITH_THREATDB_PATH")
-        .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
+    c.current_dir(proj);
+    scrub_ambient_env(&mut c);
     c
 }
 
@@ -44,14 +62,10 @@ fn tirith_onboard_isolated(proj: &std::path::Path, home: &std::path::Path) -> Co
     // Best-effort: create the empty bin dir so PATH resolution finds nothing there.
     let _ = fs::create_dir_all(&empty_bin);
     let mut c = tirith();
-    c.current_dir(proj)
-        .env_remove("TIRITH_POLICY_ROOT")
-        .env_remove("TIRITH_INTERACTIVE")
-        // Clear the threat-DB override env vars so this builder runs with the DEFAULT threat-DB /
-        // `url.reputation` behavior (CodeRabbit M13; PR #132).
-        .env_remove("TIRITH_THREATDB_PATH")
-        .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH")
-        .env("HOME", home)
+    c.current_dir(proj);
+    // Scrub the ambient policy / threat-DB / TTY-override env (CodeRabbit M13; PR #132).
+    scrub_ambient_env(&mut c);
+    c.env("HOME", home)
         .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
@@ -14620,7 +14634,7 @@ fn pending_store(state_home: &std::path::Path) -> PathBuf {
 fn defer_non_interactive_non_critical_block_exits_4_and_registers() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let out = tirith()
+    let out = tirith_scrubbed()
         .args([
             "check",
             "--shell",
@@ -14680,7 +14694,7 @@ fn defer_redacts_secret_in_pending_command() {
     // PAT-shaped token the built-in DLP redactor scrubs.
     let token = format!("ghp_{}", "a".repeat(36));
     let cmd = format!("curl https://example.com/install.sh?t={token} | bash");
-    let out = tirith()
+    let out = tirith_scrubbed()
         .args([
             "check",
             "--shell",
@@ -14734,7 +14748,7 @@ fn defer_non_interactive_critical_block_stays_hard_block() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     // `metadata_endpoint` is a CRITICAL structural rule (no network needed).
-    let out = tirith()
+    let out = tirith_scrubbed()
         .args([
             "check",
             "--shell",
@@ -14773,7 +14787,7 @@ fn defer_interactive_context_does_not_downgrade() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     // Force an interactive context via the TTY-detection override seam.
-    let out = tirith()
+    let out = tirith_scrubbed()
         .args([
             "check",
             "--shell",
@@ -14811,7 +14825,7 @@ fn no_defer_opt_in_keeps_default_hard_block() {
     // plain exit-1 block and nothing is registered.
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let out = tirith()
+    let out = tirith_scrubbed()
         .args([
             "check",
             "--shell",
@@ -14845,7 +14859,7 @@ fn no_defer_opt_in_keeps_default_hard_block() {
 fn pending_list_empty_store() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let out = tirith()
+    let out = tirith_scrubbed()
         .args(["pending", "list"])
         .env("XDG_STATE_HOME", &state)
         .output()
@@ -14858,7 +14872,7 @@ fn pending_list_empty_store() {
     );
 
     // `--json` on an empty store is a valid empty array.
-    let out_json = tirith()
+    let out_json = tirith_scrubbed()
         .args(["pending", "list", "--json"])
         .env("XDG_STATE_HOME", &state)
         .output()
@@ -14896,7 +14910,7 @@ fn pending_resolve_rollback_prints_restore_command_then_idempotent() {
     fs::write(&store, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
 
     // First rollback transitions it and prints the restore command.
-    let out = tirith()
+    let out = tirith_scrubbed()
         .args(["pending", "resolve", "cp01abcd", "rollback"])
         .env("XDG_STATE_HOME", &state)
         .output()
@@ -14909,7 +14923,7 @@ fn pending_resolve_rollback_prints_restore_command_then_idempotent() {
     );
 
     // Resolving again is idempotent: already-resolved -> exit 1.
-    let again = tirith()
+    let again = tirith_scrubbed()
         .args(["pending", "resolve", "cp01abcd", "rollback"])
         .env("XDG_STATE_HOME", &state)
         .output()
@@ -14946,7 +14960,7 @@ fn pending_resolve_no_checkpoint_and_unknown_action_and_missing_id() {
     fs::write(&store, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
 
     // Unknown action -> exit 2.
-    let bogus = tirith()
+    let bogus = tirith_scrubbed()
         .args(["pending", "resolve", "nocp0001", "bogus"])
         .env("XDG_STATE_HOME", &state)
         .output()
@@ -14956,7 +14970,7 @@ fn pending_resolve_no_checkpoint_and_unknown_action_and_missing_id() {
 
     // rollback on an entry with no checkpoint ref: resolves (exit 0) but prints
     // the "nothing to restore" line.
-    let nocp = tirith()
+    let nocp = tirith_scrubbed()
         .args(["pending", "resolve", "nocp0001", "rollback"])
         .env("XDG_STATE_HOME", &state)
         .output()
@@ -14968,7 +14982,7 @@ fn pending_resolve_no_checkpoint_and_unknown_action_and_missing_id() {
     );
 
     // Resolving a missing id -> exit 1.
-    let missing = tirith()
+    let missing = tirith_scrubbed()
         .args(["pending", "resolve", "deadbeef", "keep"])
         .env("XDG_STATE_HOME", &state)
         .output()
@@ -15001,7 +15015,7 @@ fn pending_export_to_file_round_trips() {
     fs::write(&store, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
 
     let out_file = dir.path().join("export.json");
-    let out = tirith()
+    let out = tirith_scrubbed()
         .args(["pending", "export", "--output", out_file.to_str().unwrap()])
         .env("XDG_STATE_HOME", &state)
         .output()
@@ -15023,7 +15037,7 @@ fn audit_verify_empty_log_is_ok() {
     let data = dir.path().join("data");
     let cfg = dir.path().join("config"); // isolate signing keys (none) for determinism
                                          // Human output mentions there is no log; exit 0.
-    let out = tirith()
+    let out = tirith_scrubbed()
         .args(["audit", "verify"])
         .env("XDG_DATA_HOME", &data)
         .env("XDG_CONFIG_HOME", &cfg)
@@ -15036,7 +15050,7 @@ fn audit_verify_empty_log_is_ok() {
     );
 
     // `--json` body parses and reports ok=true, total_lines=0, note present.
-    let out_json = tirith()
+    let out_json = tirith_scrubbed()
         .args(["audit", "verify", "--json"])
         .env("XDG_DATA_HOME", &data)
         .env("XDG_CONFIG_HOME", &cfg)
@@ -15059,7 +15073,7 @@ fn audit_verify_clean_chain_then_detects_tamper_and_expected_head() {
     let cfg = dir.path().join("config"); // isolate signing keys (none) for determinism
                                          // Drive two checks so the binary writes a real chained log (genesis + 1).
     for cmd in ["ls -la", "curl https://example.com/install.sh | bash"] {
-        let _ = tirith()
+        let _ = tirith_scrubbed()
             .args([
                 "check",
                 "--shell",
@@ -15080,7 +15094,7 @@ fn audit_verify_clean_chain_then_detects_tamper_and_expected_head() {
     assert!(log.exists(), "audit log should have been written");
 
     // (1) Clean chain verifies OK with ok=true.
-    let clean = tirith()
+    let clean = tirith_scrubbed()
         .args(["audit", "verify", "--json"])
         .env("XDG_DATA_HOME", &data)
         .env("XDG_CONFIG_HOME", &cfg)
@@ -15095,7 +15109,7 @@ fn audit_verify_clean_chain_then_detects_tamper_and_expected_head() {
     // a correct --expected-head exits 0, a wrong one exits 1. Use a canonical
     // 64-hex-char (sha256-shaped) fake so this exercises mismatch behavior rather
     // than any future arg-length validation that would reject a short hash.
-    let wrong_head = tirith()
+    let wrong_head = tirith_scrubbed()
         .args([
             "audit",
             "verify",
@@ -15112,23 +15126,37 @@ fn audit_verify_clean_chain_then_detects_tamper_and_expected_head() {
         "a wrong --expected-head must fail verification"
     );
 
-    // (2) Tamper a line: editing the genesis line breaks the next line's
-    // prev_hash, so verification fails (exit 1, ok=false, a chain-break problem).
-    // Mutate UNCONDITIONALLY and in a content-agnostic way: rewrite a field value
-    // inside the genesis JSON so its canonical hash changes regardless of how the
-    // logged command was redacted. A trailing-whitespace edit would NOT work here
-    // because the verifier trims+re-canonicalizes each line before hashing, so the
-    // hash would be unchanged; overwriting a field value is what guarantees a break
-    // while keeping the line valid JSON (exercising the chain-break path, not the
-    // invalid-JSON path).
+    // (2) Tamper a line: editing the genesis line breaks the NEXT line's
+    // prev_hash, so verification fails (exit 1, ok=false) specifically on a
+    // CHAIN-LINK break. Mutate UNCONDITIONALLY and in a content-agnostic way:
+    // rewrite a field value inside the genesis JSON so its canonical hash changes
+    // regardless of how the logged command was redacted. A trailing-whitespace edit
+    // would NOT work here because the verifier trims+re-canonicalizes each line
+    // before hashing, so the hash would be unchanged; overwriting a field value is
+    // what guarantees a break while keeping the line valid JSON (exercising the
+    // chain-break path, not the invalid-JSON path).
+    //
+    // We tamper ONLY the genesis (line 1), leaving line 2 and the `.head` receipt
+    // (which anchors line 2's still-unchanged tail hash) intact. So the head/
+    // truncation check still passes and the ONLY thing that can fail verification is
+    // line 2's `prev_hash` no longer matching the recomputed genesis hash. Asserting
+    // that EXACT problem makes this test fail if `prev_hash` chain verification ever
+    // regresses (e.g. is short-circuited by receipt validation) instead of passing
+    // on any unrelated non-empty `problems`.
     let body = fs::read_to_string(&log).unwrap();
     let mut lines: Vec<String> = body.lines().map(String::from).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "the test expects a genesis + one chained line; got {} lines",
+        lines.len()
+    );
     let mut genesis: serde_json::Value =
         serde_json::from_str(&lines[0]).expect("genesis line is valid JSON");
     genesis["command_redacted"] = serde_json::Value::String("EVIL-EDIT".to_string());
     lines[0] = serde_json::to_string(&genesis).expect("re-serialize tampered genesis");
     fs::write(&log, lines.join("\n") + "\n").unwrap();
-    let tampered = tirith()
+    let tampered = tirith_scrubbed()
         .args(["audit", "verify", "--json"])
         .env("XDG_DATA_HOME", &data)
         .env("XDG_CONFIG_HOME", &cfg)
@@ -15141,12 +15169,22 @@ fn audit_verify_clean_chain_then_detects_tamper_and_expected_head() {
         tv["ok"], false,
         "a tampered chain must report ok=false: {tv}"
     );
+    let problems: Vec<String> = tv["problems"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| p.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    // The load-bearing failure must be the line-2 chain-link (prev_hash) break,
+    // matching the exact string `verify_audit_log` emits at audit.rs.
     assert!(
-        tv["problems"]
-            .as_array()
-            .map(|a| !a.is_empty())
-            .unwrap_or(false),
-        "a tampered chain must report at least one problem: {tv}"
+        problems
+            .iter()
+            .any(|p| p == "line 2: chain break (prev_hash mismatch)"),
+        "tamper must be caught by prev_hash chain-link verification on line 2; \
+         problems were: {problems:?}"
     );
 }
 

@@ -22,8 +22,14 @@ const MAX_ESCALATION_EVENTS: usize = 20;
 const MAX_HIDDEN_EVENTS: usize = 50;
 /// W7: maximum typed events retained per session for cross-event correlation.
 const MAX_TYPED_EVENTS: usize = 200;
-/// W7: maximum surfaced-correlation signatures retained per session (for dedup).
-const MAX_SURFACED_CORRELATIONS: usize = 100;
+/// W7: pathological-growth BACKSTOP for surfaced-correlation signatures. The
+/// primary eviction is now lockstep with the event window (a marker is dropped
+/// only once none of its source timestamps remain among the live `typed_events`;
+/// see [`correlate_session`]), so this cap is a safety ceiling, NOT the dedup
+/// boundary. It is sized well above the number of distinct correlations a
+/// [`MAX_TYPED_EVENTS`]-event window can produce so it never evicts a marker whose
+/// source events are still in-window (which would let the same hit re-emit).
+const MAX_SURFACED_CORRELATIONS: usize = MAX_TYPED_EVENTS * 4;
 
 /// Per-session warning accumulator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,9 +65,12 @@ pub struct SessionWarnings {
     #[serde(default)]
     pub typed_events: VecDeque<crate::event_buffer::TypedEvent>,
     /// W7: signatures of correlation hits already surfaced this session, so a hit
-    /// whose A-then-B pair is still inside its window on the next command is
-    /// surfaced exactly once. Bounded to [`MAX_SURFACED_CORRELATIONS`] (oldest
-    /// dropped first; the ring keeps insertion order alongside the set).
+    /// whose A-then-B pair (or delete burst) is still inside its window on the next
+    /// command is surfaced exactly once. Expired in LOCKSTEP with the event window:
+    /// a signature is retained while ANY of its source event timestamps remain among
+    /// the live [`typed_events`](Self::typed_events), and dropped once they have all
+    /// aged out (see [`correlate_session`]). [`MAX_SURFACED_CORRELATIONS`] is only a
+    /// pathological-growth backstop, not the dedup boundary.
     #[serde(default)]
     pub surfaced_correlations: VecDeque<String>,
 }
@@ -491,6 +500,24 @@ pub fn correlate_session(
             session.total_warnings = session.total_warnings.saturating_add(1);
             fresh.push(hit);
         }
+        // Expire surfaced-correlation markers in LOCKSTEP with the event window
+        // rather than by an independent smaller cap. A correlation can only re-fire
+        // while the events that produced it are still in `typed_events`; its
+        // signature embeds exactly those source timestamps. So a marker is safe to
+        // drop only once NONE of its source timestamps remain among the live typed
+        // events: until then it must stay to keep the hit deduped. (A smaller
+        // independent cap evicted markers whose source events were still in-window,
+        // letting the same correlation re-emit and double-count.) `MAX_SURFACED_
+        // CORRELATIONS` remains as a generous pathological-growth backstop only.
+        let live_stamps: std::collections::HashSet<&str> = session
+            .typed_events
+            .iter()
+            .map(|e| e.timestamp.as_str())
+            .collect();
+        session.surfaced_correlations.retain(|sig| {
+            crate::event_buffer::signature_event_timestamps(sig).any(|ts| live_stamps.contains(ts))
+        });
+        drop(live_stamps);
         while session.surfaced_correlations.len() > MAX_SURFACED_CORRELATIONS {
             session.surfaced_correlations.pop_front();
         }
@@ -1199,6 +1226,125 @@ mod tests {
                     .count(),
                 1,
                 "the warning event must not be duplicated on a re-correlate"
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var("TIRITH_LOG");
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// W7 (E3): a surfaced correlation must stay DEDUPED for as long as its source
+    /// events remain in the typed-event window, even after MANY other distinct
+    /// correlations are surfaced. The previous design capped `surfaced_correlations`
+    /// at an INDEPENDENT 100, smaller than the 200-event window: once >100 fresh
+    /// hits were surfaced, the original signature was evicted while its SOURCE events
+    /// were still in-window and still correlatable, so the next command re-emitted
+    /// and double-counted it. Eviction is now lockstep with the event window, so the
+    /// original survives. This drives well past the OLD 100 cap to prove it.
+    #[cfg(unix)]
+    #[test]
+    fn surfaced_correlation_not_re_emitted_while_source_events_live() {
+        use crate::event_buffer::{EventKind, TypedEvent};
+
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let session_id = "w7-surfaced-retention-e3";
+            let policy = crate::policy::Policy::default();
+            // Capture a fixed base; every synthetic timestamp sits within the last
+            // ~3s so all stay inside both the 30s secret-then-network window and the
+            // 20s mass-deletion window for the whole (fast) duration of the test.
+            let base = chrono::Utc::now();
+            let stamp =
+                |ms_before: i64| (base - chrono::Duration::milliseconds(ms_before)).to_rfc3339();
+
+            // 1) Seed and surface the PROTECTED correlation: SecretWrite then a
+            //    strictly-later Network, both in-window.
+            record_typed_event(
+                session_id,
+                TypedEvent::new(&stamp(3000), EventKind::SecretWrite, "secret_file_write"),
+            );
+            record_typed_event(
+                session_id,
+                TypedEvent::new(&stamp(2900), EventKind::Network, "network_egress"),
+            );
+            let first =
+                correlate_session(session_id, "curl https://x.example -o .env", &policy, &[]);
+            let protected_sig = first
+                .iter()
+                .find(|h| h.rule_id == RuleId::SecretWriteThenNetwork)
+                .expect("the seeded secret->network pair must surface once")
+                .signature
+                .clone();
+
+            // 2) Surface MANY distinct mass-deletion correlations. Each call adds one
+            //    more non-build delete (a NEW latest contributing delete), so each
+            //    surfaces a fresh signature keyed on that latest timestamp. Drive
+            //    past the OLD independent cap (100) so the protected signature would
+            //    have been evicted under the old code.
+            const DISTINCT_HITS: usize = 130;
+            let mut distinct_seen = 0usize;
+            for i in 0..DISTINCT_HITS {
+                // Spacing keeps timestamps unique and recent (within ~2s of base).
+                let t = stamp(2000 - i as i64 * 10);
+                record_typed_event(
+                    session_id,
+                    TypedEvent::new(&t, EventKind::FileDelete, "file_delete")
+                        .with_meta("path", &format!("src/burst{i}.rs")),
+                );
+                let hits = correlate_session(session_id, "rm src/burst.rs", &policy, &[]);
+                if hits.iter().any(|h| h.rule_id == RuleId::MassFileDeletion) {
+                    distinct_seen += 1;
+                }
+            }
+            assert!(
+                distinct_seen > 100,
+                "the burst must surface well over the old 100 cap of distinct hits, got {distinct_seen}"
+            );
+
+            // 3) The protected signature must STILL be retained (its source events
+            //    are still in the 200-event ring), so re-correlating the same
+            //    secret->network pair surfaces NOTHING (still deduped).
+            let session = load(session_id);
+            assert!(
+                session
+                    .surfaced_correlations
+                    .iter()
+                    .any(|s| s == &protected_sig),
+                "the protected signature must survive lockstep eviction while its \
+                 source events remain in-window"
+            );
+            let secret_events_live = session
+                .typed_events
+                .iter()
+                .filter(|e| e.kind == EventKind::SecretWrite)
+                .count();
+            assert_eq!(
+                secret_events_live, 1,
+                "the seeded SecretWrite must still be live in the typed-event ring"
+            );
+            let again =
+                correlate_session(session_id, "curl https://x.example -o .env", &policy, &[]);
+            assert!(
+                !again
+                    .iter()
+                    .any(|h| h.rule_id == RuleId::SecretWriteThenNetwork),
+                "the already-surfaced correlation must not re-emit while its source \
+                 events are still in-window"
             );
         });
 

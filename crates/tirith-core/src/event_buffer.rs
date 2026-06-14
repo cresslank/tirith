@@ -297,6 +297,18 @@ fn signature(rule_id: RuleId, parts: &[&str]) -> String {
     sig
 }
 
+/// The `|`-delimited timestamp parts a signature was built from (everything after
+/// the leading `{rule_id:?}` segment). Every [`signature`] call site passes ONLY
+/// event timestamps as `parts`, so these are exactly the timestamps of the events
+/// that triggered the correlation. A session-level consumer uses this to expire a
+/// surfaced signature in lockstep with the event window: once NONE of these source
+/// timestamps remain among the live typed events, the correlation can never
+/// re-derive, so its dedup marker is safe to drop. Returns an empty iterator for a
+/// signature with no `|` (defensive; never produced by [`signature`]).
+pub fn signature_event_timestamps(sig: &str) -> impl Iterator<Item = &str> {
+    sig.split('|').skip(1)
+}
+
 /// SecretWrite THEN Network within 30s -> CRITICAL.
 fn secret_then_network(events: &[TypedEvent], now_rfc3339: &str) -> Option<CorrelationHit> {
     let cut = cutoff(now_rfc3339, SECRET_THEN_NETWORK_WINDOW_SECS)?;
@@ -430,9 +442,17 @@ fn mass_file_deletion(events: &[TypedEvent], now_rfc3339: &str) -> Option<Correl
     // non-build paths rather than all-or-nothing on one representative path.
     let count: usize = matched.iter().map(|e| e.non_build_delete_count()).sum();
     if count >= MASS_DELETE_THRESHOLD {
-        // Signature spans the latest contributing delete so a later burst (a
+        // Signature spans the latest CONTRIBUTING delete so a later burst (a
         // genuinely new mass deletion) re-surfaces while the same set does not.
-        let mut stamps: Vec<&str> = matched.iter().map(|e| e.timestamp.as_str()).collect();
+        // Only deletes that actually contribute a non-build path are eligible: a
+        // zero-contribution artifact-only delete (`rm dist/x`) landing later in the
+        // window must NOT change the signature, or it would let the SAME already
+        // surfaced non-build burst be re-emitted on a pure artifact-cleanup command.
+        let mut stamps: Vec<&str> = matched
+            .iter()
+            .filter(|e| e.non_build_delete_count() > 0)
+            .map(|e| e.timestamp.as_str())
+            .collect();
         stamps.sort_unstable();
         Some(CorrelationHit {
             rule_id: RuleId::MassFileDeletion,
@@ -847,6 +867,58 @@ mod tests {
                 RuleId::MassFileDeletion
             ),
             "an explicit non_build_count of 0 must contribute nothing"
+        );
+    }
+
+    #[test]
+    fn mass_deletion_signature_ignores_zero_contribution_deletes() {
+        // A zero-contribution artifact-only delete landing LATER in the window must
+        // not change the de-dup signature: otherwise the SAME already-surfaced
+        // non-build burst would be re-emitted as a fresh hit on a pure artifact
+        // cleanup (`rm dist/x`), double-counting it. The signature must span only the
+        // latest CONTRIBUTING (non-build) delete.
+        let base = now();
+        // A real >= 3 non-build burst, with `t-5` the latest contributing delete.
+        let burst = vec![
+            ev_path(ts(base, -15), EventKind::FileDelete, "src/a.rs"),
+            ev_path(ts(base, -10), EventKind::FileDelete, "src/b.rs"),
+            ev_path(ts(base, -5), EventKind::FileDelete, "src/c.rs"),
+        ];
+        let first = correlate(&burst, &base.to_rfc3339());
+        let sig_before = first
+            .iter()
+            .find(|h| h.rule_id == RuleId::MassFileDeletion)
+            .expect("the burst must surface MassFileDeletion")
+            .signature
+            .clone();
+
+        // Now a later pure-artifact `rm dist/x` (0 non-build) enters the window. The
+        // burst is unchanged, so the signature must be identical and the
+        // session-level dedup would treat it as already surfaced (not re-emitted).
+        let mut with_artifact = burst.clone();
+        with_artifact.push(ev_path(ts(base, -2), EventKind::FileDelete, "dist/x"));
+        let second = correlate(&with_artifact, &base.to_rfc3339());
+        let sig_after = second
+            .iter()
+            .find(|h| h.rule_id == RuleId::MassFileDeletion)
+            .expect("the burst still tallies >= 3 non-build paths")
+            .signature
+            .clone();
+
+        assert_eq!(
+            sig_before, sig_after,
+            "a zero-contribution artifact delete must not change the signature \
+             (would let the same burst re-emit): {sig_before} vs {sig_after}"
+        );
+        // The signature must anchor on the latest CONTRIBUTING delete (`t-5`), not the
+        // later artifact-only delete (`t-2`).
+        assert!(
+            sig_after.contains(&ts(base, -5)),
+            "signature must span the latest non-build delete: {sig_after}"
+        );
+        assert!(
+            !sig_after.contains(&ts(base, -2)),
+            "signature must NOT span the zero-contribution artifact delete: {sig_after}"
         );
     }
 

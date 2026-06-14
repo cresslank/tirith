@@ -1373,7 +1373,15 @@ fn write_target(seg: &tokenize::Segment, leader_base: &str, args: &[String]) -> 
             match a.as_str() {
                 "-o" | "-O" | "--output" | "--output-document" => want_value = true,
                 _ => {
-                    if let Some(rest) = a.strip_prefix("--output=") {
+                    // Attached forms: `--output=path` and wget's
+                    // `--output-document=path`. Both seed the same write target as
+                    // their separated counterparts above, so a download whose
+                    // destination is a secret/manifest file still emits the
+                    // SecretWrite/FileWrite that the W7 follow-on correlations need.
+                    if let Some(rest) = a
+                        .strip_prefix("--output=")
+                        .or_else(|| a.strip_prefix("--output-document="))
+                    {
                         if !rest.is_empty() {
                             return Some(rest.to_string());
                         }
@@ -2474,6 +2482,34 @@ mod tests {
             "https --output .env must record a SecretWrite: {ks:?}"
         );
         assert!(ks.contains(&EventKind::Network));
+    }
+
+    #[test]
+    fn derive_secret_write_from_wget_output_document_attached() {
+        // wget's ATTACHED `--output-document=path` form must record the same
+        // SecretWrite (and target path) as the separated `-O path` form. Without it,
+        // `wget --output-document=.env https://x` emits only a Network event and the
+        // W7 SecretWriteThenNetwork follow-on never seeds.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let events = derive_typed_events("wget --output-document=.env https://x.example", &v);
+        let secret = events
+            .iter()
+            .find(|e| e.kind == EventKind::SecretWrite)
+            .expect("wget --output-document=.env must record a SecretWrite");
+        assert_eq!(
+            secret.metadata.get("path").map(String::as_str),
+            Some(".env"),
+            "the attached --output-document target path must be captured"
+        );
+        // Same network egress as the `-O` form, so the correlation can pair them.
+        assert!(kinds(&events).contains(&EventKind::Network));
+
+        // Parity check: the separated `-O .env` form yields the same SecretWrite.
+        let sep = derive_typed_events("wget -O .env https://x.example", &v);
+        assert!(
+            sep.iter().any(|e| e.kind == EventKind::SecretWrite),
+            "the separated `-O .env` form must also record a SecretWrite"
+        );
     }
 
     #[test]
