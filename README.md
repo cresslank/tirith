@@ -133,7 +133,7 @@ Nothing. Zero output. You forget tirith is running.
 
 ## What it catches
 
-**110+ detection rules across 16 categories.**
+**221 detection rules across 34 categories.**
 
 | Category | What it stops |
 |----------|--------------|
@@ -155,6 +155,12 @@ Nothing. Zero output. You forget tirith is running.
 | **Path analysis** | Non-ASCII paths, homoglyphs in paths, double-encoding |
 | **Rendered content** | Hidden CSS/color content, hidden HTML attributes, comment content analysis (prompt injection at High, destructive commands at Medium) |
 | **Cloaking detection** | Server-side cloaking (bot vs browser), clipboard hidden content, PDF hidden text |
+| **Windows / PowerShell** | `Set-ExecutionPolicy Bypass` / `-ep`, Windows Defender exclusions (`Add-MpPreference -Exclusion*`), inline `iex (iwr ...)` download-execute |
+| **Terminal output defense** | OSC 52 clipboard writes, fake prompts, OSC 8 hyperlink and title / clear-screen manipulation, and prompt injection inside command or MCP tool output |
+| **Operational context** | Destructive commands against labeled-prod cloud / k8s contexts and SSH hosts, Terraform / Pulumi / OpenTofu `apply` without a matching saved plan, risky sudo escalation, privileged `docker run` |
+| **Workstation & persistence** | Loose-permission credential files and plaintext tokens (`~/.ssh`, `~/.aws`, `.npmrc`), persistence footholds (shell rc, `authorized_keys`, crontab, LaunchAgents, git `core.hooksPath`), PATH-hijack ordering, executable provenance, risky aliases, and sensitive env-var lifecycle |
+| **Blast radius & correlation** | Deletes that escape the repo, mass deletions, executing files downloaded from risky sources, and session chains such as secret-write then network or delete then `git push --force` |
+| **Trust, attestation & provenance** | Signed command-card mismatch, canary honeytoken touches, paste source-host mismatch, caller-origin (agent) policy denials, MCP lockfile drift, and AI-config drift versus a known-safe snapshot |
 
 ---
 
@@ -385,6 +391,32 @@ Detects content invisible to humans but readable by AI in HTML, Markdown, and PD
 ### Cloaking detection
 
 `tirith fetch` compares server responses across 6 user-agents (Chrome, ClaudeBot, ChatGPT-User, PerplexityBot, Googlebot, curl) to detect when servers serve different content to AI bots vs browsers.
+
+---
+
+## Operational context & workstation guards
+
+Beyond single commands, several command groups extend the gate to your operating context and workstation state. The ones that touch the hot path are opt-in (a policy flag); the rest run on demand.
+
+**Operational context** (`tirith context`, `ssh`, `iac`, `sudo`). Label your production cloud / Kubernetes contexts and SSH hosts once, and tirith escalates the commands that matter: a destructive command against a labeled-prod context, an SSH to a labeled-prod host, a Terraform / Pulumi / OpenTofu `apply` with no matching saved plan, or a sudo escalation without a reasoned session window. Labels live in `~/.config/tirith/context-labels.yaml` and `ssh-host-labels.yaml` (or the repo-scoped equivalents under `.tirith/`).
+
+**Workstation hygiene** (`tirith hygiene`, `persistence`, `aliases`, `env`, `exec`, `path`, `hooks`). Scan for loose-permission credential files and plaintext tokens (`~/.ssh`, `~/.aws`, `~/.kube`, `.npmrc`, `.pypirc`), diff the persistence footholds an attacker uses (shell rc, `authorized_keys`, crontab, LaunchAgents / systemd-user units, git `core.hooksPath`), flag aliases that shadow critical commands or read credentials, audit `$PATH` for hijack ordering, and report a binary's provenance (package owner, code signature, whether it shadows a system command).
+
+**Blast radius & isolation** (`tirith preview`, `watch`, `temp-run`, `taint`, `intend`, `baseline`). Preview the filesystem impact of a destructive command before you run it, diff what a command actually changed afterward, run an untrusted command in a throwaway directory, and track files downloaded from risky sources so executing one later fires a finding. `temp-run` changes only the working directory; it is file isolation, not a sandbox.
+
+## Trust, attestation & incident response
+
+- **Command attestations** (`tirith command-card`) sign a known-good command with an ed25519 key; a trusted card that no longer matches the command fires High.
+- **Repo command manifest** (`tirith commands`) is a `.tirith/commands.yaml` allowlist that quiets the unknown-command note for cleared commands and adds an elevation-only `dangerous[]` list (it can tighten a verdict, never weaken one).
+- **Honeytokens** (`tirith canary`) plant clearly-synthetic canary tokens; a touch in any checked command, paste, or tool output fires High. Detection is a local store lookup, not a shape match.
+- **Secret rotation** (`tirith secret`) reads recent credential findings from your audit log and prints provider-specific rotate / revoke steps for 11 providers. It never rotates anything itself and makes no network calls.
+- **Incident mode** (`tirith incident`) declares an "under attack" posture: it forces `fail_mode: closed`, disables the `TIRITH=0` bypass, and elevates the credential-sweep, decode-execute, and suspicious-binary rules until you stop it.
+
+## Output, paste & sharing safety
+
+- **Output-direction defense** (`tirith view`, `tirith output`, `gateway run --filter-output`, `mcp-server --sanitize-tool-output`) neutralizes terminal-deception escapes in command and MCP tool output: OSC 52 clipboard writes, fake prompts, OSC 8 hyperlink mismatch, and title / clear-screen manipulation.
+- **Audience-aware redaction** (`tirith share`, `tirith redact`, `tirith logs`) strips secrets and customer / tenant IDs before you paste into a GitHub issue, Slack, an LLM, or a public paste.
+- **Paste provenance** (`tirith paste --with-source`, `tirith browser`). With the companion Chrome native-messaging host installed, tirith attributes a pasted command to its source page and flags a paste whose source host differs from where the command runs.
 
 ---
 
@@ -642,12 +674,12 @@ Every finding carries a per-rule remediation: a short, accurate "how to make
 this safe" line, shown under each finding (`Fix:`) and in `--format json`.
 `tirith explain --rule <id> --fix` prints that remediation on its own.
 
-When a command is blocked or warned, `tirith check --suggest-safe-command`
+When a command is blocked or warned, `tirith check --suggest`
 additionally prints a concrete safer rewrite of the *actual* command — but only
 where a transformation is genuinely safer and correct:
 
 ```bash
-tirith check --suggest-safe-command -- 'curl https://example-cli.dev/i.sh | bash'
+tirith check --suggest -- 'curl https://example-cli.dev/i.sh | bash'
 # → try: curl -fsSL -o /tmp/tirith-review.sh https://example-cli.dev/i.sh \
 #        && less /tmp/tirith-review.sh && bash /tmp/tirith-review.sh
 ```
@@ -675,49 +707,28 @@ tirith daemon stop
 
 ## Commands
 
+The everyday commands:
+
 | Command | What it does |
 |---------|-------------|
-| `tirith check -- <cmd>` | Analyze a command without executing it (`--suggest-safe-command` adds a concrete safer rewrite) |
+| `tirith check -- <cmd>` | Analyze a command without executing it (`--suggest` adds a safer rewrite) |
 | `tirith paste` | Check pasted content (called automatically by shell hooks) |
-| `tirith scan [path]` | Scan files/directories with `--include`, `--exclude`, `--profile`, `--format sarif`, `--ci` |
-| `tirith threat-db update` | Download, verify, and install the signed threat database |
-| `tirith threat-db status` | Show DB age, signature status, version, and entry counts |
-| `tirith threat-db explain <indicator>` | Explain what the threat DB knows about a domain, package, or IP |
-| `tirith threat-db sources` | List the threat-intelligence sources the DB is built from |
-| `tirith threat-db health` | Report threat DB health: install, signature, staleness, entry counts |
-| `tirith threat-db diff --since <ver\|date>` | Summarize threat-DB count changes since a version or date |
-| `tirith package risk <eco> <name>` | Score a package's provenance / maintainer risk (offline by default; `--path` inspects local content; `--online` adds registry-API provenance signals) |
-| `tirith package explain <eco> <name>` | Show the deterministic factor-by-factor derivation of a package's risk score (`--online` adds the registry-API factors) |
-| `tirith explain --rule <id>` | Show documentation, examples, and remediation for any detection rule (`--fix` shows just the remediation) |
-| `tirith policy init` | Generate a starter `.tirith/policy.yaml` (`--template individual\|ci-strict\|ai-agent-heavy` for curated presets) |
-| `tirith policy validate` | Validate policy YAML for syntax, schema, and conflicts |
-| `tirith policy test <cmd>` | Dry-run a command or file against your policy with match trace |
-| `tirith policy tune --from-audit` | Suggest conservative policy adjustments from your audit log (suggest-only — never edits the policy) |
-| `tirith run <url>` | Safe `curl \| bash` replacement. Downloads, analyzes, reviews, then executes (Unix only) |
-| `tirith install <npm\|pip\|cargo\|url> <args>` | Recorded install transaction: analyzes a package install's supply-chain risk, presents the verdict, checkpoints + audit-logs the transaction, then runs the real install after your go-ahead. Pre-execution risk analysis — not a sandbox. (`--online`, `--no-exec`, `--yes`) |
-| `tirith score <url>` | Break down a URL's trust signals (`--explain` shows the deterministic factor-by-factor score derivation) |
-| `tirith diff <url>` | Byte-level comparison showing where suspicious characters hide |
-| `tirith fetch <url>` | Detect server-side cloaking (different content for bots vs browsers) (Unix only) |
-| `tirith why` | Explain the last rule that triggered |
-| `tirith doctor` | Diagnose installation, hooks, and policy |
-| `tirith doctor --fix` | Auto-fix detected issues (hooks, policy, AI tool setup) |
-| `tirith doctor --compat` | Shell/terminal compatibility report (detected shell, bash mode, install checks, co-installed hook-interacting tools) |
-| `tirith verify-self` | Verify the running binary is the genuine, unmodified official release (checksum + cosign signature); reports honestly when it cannot |
-| `tirith update` | Update tirith to the latest release — defers to your package manager for PM installs, atomic signature-verified self-replace for `install.sh`/standalone installs (signature mandatory by default; `--allow-unsigned`, `--rollback`, `--dry-run`) |
-| `tirith version --provenance` | Show version, build info, detected install method, and verification status |
-| `tirith daemon start` | Start background daemon for faster checks (Unix) |
-| `tirith receipt {last,list,verify}` | Track and verify scripts run through `tirith run` |
-| `tirith checkpoint {create,restore,diff}` | Snapshot files before risky operations, roll back if needed |
-| `tirith setup <tool>` | One-command setup for AI coding tools (see [AI Agent Integrations](#ai-agent-integrations)) |
-| `tirith gateway run` | MCP gateway proxy for intercepting AI agent shell tool calls |
-| `tirith warnings` | Show accumulated session warnings, suggest trust entries. `--summary` for shell exit hooks |
-| `tirith trust {add,list,explain,diff,remove,gc}` | Manage trusted patterns: narrow scope and a 30-day TTL by default, scope visualization, `trust explain`, `trust diff` |
-| `tirith audit {export,stats,report}` | Audit log management for compliance |
-| `tirith init` | Print the shell hook for your shell profile |
-| `tirith mcp-server` | Run as MCP server over JSON-RPC stdio |
-| `tirith mcp lock` | Inventory the repo's MCP servers into a deterministic `.tirith/mcp.lock` lockfile |
-| `tirith mcp verify` | Gate on MCP drift — exit 1 when the current inventory no longer matches `.tirith/mcp.lock` |
-| `tirith mcp diff` | Show the drift between the current MCP inventory and `.tirith/mcp.lock` (informational — exits 0 with or without drift; a usage error such as a missing lockfile still exits 2) |
+| `tirith scan [path]` | Scan files, directories, and configs (`--profile`, `--format sarif`, `--ci`) |
+| `tirith run <url>` | Safe `curl \| bash` replacement: download, analyze, review, then execute (Unix) |
+| `tirith fix -- <cmd>` | Interactively rewrite a risky command into a safer form |
+| `tirith score <url>` / `diff <url>` | Break down a URL's trust signals, or show where suspicious characters hide |
+| `tirith explain --rule <id>` / `why` | Rule docs and remediation, or explain the last trigger |
+| `tirith status` / `doctor` | Are you protected? Diagnose install, hooks, and policy (`--fix`, `--quick`) |
+| `tirith setup <tool>` / `init` | One-command AI-tool setup, or print the shell hook |
+| `tirith policy {init,validate,test}` | Scaffold, validate, and dry-run your policy |
+| `tirith trust {add,list,remove}` | Manage trusted patterns (narrow scope, 30-day TTL by default) |
+| `tirith threat-db update` | Download and verify the signed threat database |
+| `tirith package risk <eco> <name>` | Score a package's supply-chain risk |
+| `tirith ecosystem scan [path]` | Score every declared dependency in a project |
+| `tirith mcp {lock,verify}` | Pin and gate a repo's MCP servers |
+| `tirith daemon start` | Background daemon for faster checks (Unix) |
+
+That is the daily-driver set. tirith ships 74 commands in all, in 8 groups: scan & analyze, status & health, setup, policy & trust, shell & system guards (`hygiene`, `persistence`, `exec`, `path`, `context`, `ssh`, `sudo`, `iac`), supply-chain, AI-agent integrations, and forensics & response. Run `tirith --help` for the categorized list, or see the **[full command reference](docs/commands.md)**. The global `--quiet` flag (or `TIRITH_QUIET=1`) silences advisory output without hiding errors, verdicts, or security notices.
 
 ---
 
@@ -750,6 +761,10 @@ tirith daemon stop
   schedule above. Daemon mode adds network-aware URL resolution. Optional
   webhook and policy-server integrations can also make outbound requests when
   configured. Core detection itself does not phone home.
+- **Egress guard on fetches.** `tirith run`, `fetch --save`, and `command-card
+  fetch` refuse private, loopback, and cloud-metadata hosts by default, and an
+  SSRF guard re-checks every redirect hop. Set `TIRITH_ALLOW_PRIVATE_FETCH=1` to
+  allow them.
 
 ---
 
@@ -766,9 +781,13 @@ tirith policy test "curl https://example.com | bash"  # dry-run against policy
 `tirith policy init` accepts `--template <name>` for a curated starter policy:
 
 ```bash
-tirith policy init --template individual      # solo developer defaults
+tirith policy init --template individual      # solo developer defaults (alias: personal)
 tirith policy init --template ci-strict       # fail-closed, no bypass, scan fail-on
 tirith policy init --template ai-agent-heavy  # tuned for heavy AI-agent use
+tirith policy init --template oss-maintainer  # reviewing contributor-controllable risk
+tirith policy init --template startup         # small-team balance
+tirith policy init --template enterprise      # strict, with an active package_policy block
+tirith policy init --template mcp-strict      # locked-down MCP server and tool trust
 ```
 
 Each template is a well-commented, schema-valid policy you can edit further.
@@ -873,6 +892,40 @@ On shell exit, a one-line summary is printed if any warnings were recorded durin
 
 More examples in [docs/cookbook.md](docs/cookbook.md).
 
+### Custom detection rules
+
+Author your own rules in `.tirith/policy.yaml` under `custom_rules:`. Each rule is either a `pattern:` (regex) or a `when:` semantic predicate tree, plus a `context:` (`exec`, `paste`, or `file`), a `severity:`, and a `title:`.
+
+```yaml
+custom_rules:
+  - id: no_internal_pastebin
+    context: exec
+    severity: high
+    title: "Internal pastebin is not allowed for piped execution"
+    when:
+      all:
+        - command.has_pipeline_to: [bash, sh]
+        - url.host_matches: "paste\\.corp\\.example$"
+```
+
+The `when:` DSL combines `all:` / `any:` / `not:` over predicates like `command.has_pipeline_to`, `command.uses_sudo`, `url.host`, `url.host_matches`, `url.reputation`, `url.domain_not_in`, `package.ecosystem`, `package.name_matches`, `package.reputation`, and `file.path_matches`. Reputation predicates read the local signed threat database, so a custom rule still makes no network call on the hot path. Validate and dry-run before committing:
+
+```bash
+tirith rule validate                          # check every custom rule: shape + context coverage
+tirith rule test --rule no_internal_pastebin --input "echo hi | bash"
+tirith rule explain --rule no_internal_pastebin
+```
+
+### More policy controls
+
+Other policy keys, all with safe defaults (`tirith policy init` writes the fully-commented set):
+
+- `package_policy:` thresholds turn supply-chain signals into block or warn verdicts (`block_typosquat_distance`, `warn_low_downloads_below`, `block_newer_than_days`, `block_not_found`).
+- `agent_rules:` `allow:` / `deny:` match a command's caller origin (`{ kind, name }`); a `deny` match forces a block. `scan.trusted_mcp_servers` and `scan.mcp_allowed_tools` accept specific MCP servers and per-server tools.
+- Opt-in guards, default off: `env_guard_enabled`, `exec_guard_enabled`, `hooks_guard_enabled`, `baseline_enabled`, plus `iac_require_plan_before_apply`, `sudo_require_reason`, and `allowed_install_domains`.
+
+Repo-scoped `.tirith/policy.yaml` files can only tighten, never weaken: a repo policy that tries to widen an allowlist, lower a severity, or disable a guard is neutralized, and `tirith policy effective` shows which fields were dropped. Only user-level and org-level (`TIRITH_POLICY_ROOT`) policies can relax a default.
+
 ### Strict warn mode
 
 With `strict_warn: true` (or `--strict-warn` on the CLI), medium-risk findings prompt for explicit acknowledgement in interactive terminals instead of silently warning:
@@ -919,6 +972,7 @@ Disable: `export TIRITH_LOG=0`
 
 ## Docs
 
+- [Command reference](docs/commands.md): every subcommand, grouped by category
 - [Threat model](docs/threat-model.md) — what tirith defends against and what it doesn't
 - [Cookbook](docs/cookbook.md) — policy examples for common setups
 - [Troubleshooting](docs/troubleshooting.md) — shell quirks, latency, false positives
@@ -926,9 +980,20 @@ Disable: `export TIRITH_LOG=0`
 - [Security policy](SECURITY.md) — vulnerability reporting
 - [Uninstall](docs/uninstall.md) — clean removal per shell and package manager
 
+Feature guides:
+
+- [Agent governance](docs/agent-governance-design.md) (caller-origin attribution and `agent_rules`)
+- [MCP output filter](docs/mcp-output-filter.md) (the gateway and MCP output-sanitization contract)
+- [Doctor modes](docs/doctor-modes.md) (full vs `--quick`, and the JSON snapshot schema)
+- [LSP and editor profiles](docs/lsp-profiles.md) (inline editor diagnostics)
+- [Browser native messaging](docs/browser-native-messaging.md) (clipboard-provenance host and extension)
+- [Paste provenance](docs/paste-provenance.md) (the `paste_source_mismatch` rule)
+- [Canary formats](docs/canary-formats.md) (synthetic honeytoken formats)
+- [Prompt integration](docs/prompt-integration.md) (wiring `tirith prompt-status` into your shell prompt)
+
 ## License
 
-**Core security coverage ships in the open-source tree.** All 110+ detection rules and the MCP server are available from source. The repository still contains legacy licensing and policy-server code paths, so avoid assuming that every runtime path is already tier-free.
+**Core security coverage ships in the open-source tree.** All 221 detection rules and the MCP server are available from source. The repository still contains legacy licensing and policy-server code paths, so avoid assuming that every runtime path is already tier-free.
 
 tirith is dual-licensed:
 
