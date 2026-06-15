@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -198,6 +198,23 @@ pub fn session_state_path(session_id: &str) -> Option<PathBuf> {
     }
     let state = crate::policy::state_dir()?;
     Some(state.join("sessions").join(format!("{session_id}.json")))
+}
+
+/// Path to the cross-process lock file guarding a session: `<session_id>.json.lock`.
+///
+/// A DEDICATED lock file (stable inode) is locked rather than the session JSON
+/// itself, because [`with_session_locked`] now replaces the data file via an atomic
+/// temp+rename. Locking the data file and then renaming over it would leave the
+/// lock on the stale (old) inode, so a second writer could acquire the lock on the
+/// new inode and clobber the first. Locking a separate file that is never renamed
+/// keeps writers serialized across the whole read/modify/write while the rename
+/// stays crash-atomic. Mirrors the pending store's `pending.json.lock`.
+fn session_lock_path(session_id: &str) -> Option<PathBuf> {
+    session_state_path(session_id).map(|p| {
+        let mut name = p.file_name().unwrap_or_default().to_os_string();
+        name.push(".lock");
+        p.with_file_name(name)
+    })
 }
 
 /// Load session warnings from disk; empty accumulator on any error. Takes a
@@ -530,14 +547,31 @@ pub fn correlate_session(
     fresh
 }
 
-/// Shared atomic lock-read-modify-write: open the session file, take an
-/// exclusive lock, read-or-create state, run `mutate`, write back, unlock, GC.
-/// All I/O is best-effort; failures are logged and never panic.
+/// Shared atomic lock-read-modify-write: take an exclusive cross-process lock on a
+/// DEDICATED `<session>.json.lock` file, read-or-create state from the session JSON,
+/// run `mutate`, then persist the new JSON CRASH-ATOMICALLY (temp file in the same
+/// dir, fsync, atomic rename over the session file, best-effort parent-dir fsync),
+/// unlock, GC.
+///
+/// The persist is via temp+rename rather than an in-place `set_len(0)` truncate so a
+/// crash / ENOSPC after truncation can never leave the session file empty or
+/// partial: the old file stays intact until the rename publishes the fully-written
+/// replacement. Because the rename swaps the data file's inode, the serializing lock
+/// is taken on a SEPARATE lock file (stable inode) instead of the data file, exactly
+/// like the pending store; locking the data file and renaming over it would orphan
+/// the lock on the old inode and let a concurrent writer clobber it.
+///
+/// All I/O is best-effort; failures are logged and never panic. The read path is
+/// unchanged: a missing/empty/corrupt session resets to a fresh accumulator.
 fn with_session_locked<F>(session_id: &str, mutate: F)
 where
     F: FnOnce(&mut SessionWarnings),
 {
     let path = match session_state_path(session_id) {
+        Some(p) => p,
+        None => return,
+    };
+    let lock_path = match session_lock_path(session_id) {
         Some(p) => p,
         None => return,
     };
@@ -552,7 +586,9 @@ where
         }
     }
 
-    // Refuse to follow symlinks (Unix).
+    // Refuse to follow symlinks at the session file (Unix). The temp+rename writes a
+    // brand-new inode, but a planted symlink at `path` would still be read below and
+    // (post-rename) replaced; reject it before any read, matching the prior guard.
     #[cfg(unix)]
     {
         match std::fs::symlink_metadata(&path) {
@@ -567,46 +603,49 @@ where
         }
     }
 
-    let mut open_opts = OpenOptions::new();
-    open_opts.read(true).write(true).create(true);
+    // Open (creating if needed) and exclusively lock the DEDICATED lock file. The
+    // lock (not the data file) serializes the whole read/modify/write so the
+    // atomic rename below stays correct.
+    let mut lock_opts = OpenOptions::new();
+    lock_opts.read(true).write(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        open_opts.mode(0o600);
-        open_opts.custom_flags(libc::O_NOFOLLOW);
+        lock_opts.mode(0o600);
     }
-
-    let file = match open_opts.open(&path) {
+    let lock_file = match lock_opts.open(&lock_path) {
         Ok(f) => f,
         Err(e) => {
             crate::audit::audit_diagnostic(format!(
-                "tirith: session: cannot open {} — escalation may be impaired: {e}",
-                path.display()
+                "tirith: session: cannot open lock {}; escalation may be impaired: {e}",
+                lock_path.display()
             ));
             return;
         }
     };
-
-    // Harden permissions on existing files.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-    }
-
-    // Lock BEFORE reading — this is the atomicity guarantee.
-    let locked = file.lock_exclusive().is_ok() || file.try_lock_exclusive().is_ok();
+    let locked = lock_file.lock_exclusive().is_ok() || lock_file.try_lock_exclusive().is_ok();
     if !locked {
         crate::audit::audit_diagnostic(format!(
-            "tirith: session: cannot lock {} — recording skipped",
-            path.display()
+            "tirith: session: cannot lock {}; recording skipped",
+            lock_path.display()
         ));
         return;
     }
 
-    use std::io::Read;
-    let mut content = String::new();
-    let _ = (&file).read_to_string(&mut content);
+    // Read the existing session by path WHILE holding the lock. A missing file is the
+    // normal "fresh session" case; any other read error (or empty/corrupt content)
+    // resets to a fresh accumulator, preserving the previous read-path behavior.
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            crate::audit::audit_diagnostic(format!(
+                "tirith: session: cannot read {}; resetting: {e}",
+                path.display()
+            ));
+            String::new()
+        }
+    };
     let mut session: SessionWarnings = if content.is_empty() {
         SessionWarnings::new(session_id)
     } else {
@@ -627,38 +666,52 @@ where
             crate::audit::audit_diagnostic(format!(
                 "tirith: session: failed to serialize warnings: {e}"
             ));
-            let _ = fs2::FileExt::unlock(&file);
+            let _ = fs2::FileExt::unlock(&lock_file);
             return;
         }
     };
 
-    // Truncate + write under the same lock.
-    use std::io::Seek;
-    if file.set_len(0).is_err() || (&file).seek(std::io::SeekFrom::Start(0)).is_err() {
+    if let Err(e) = write_session_atomic(&path, json.as_bytes()) {
         crate::audit::audit_diagnostic(format!(
-            "tirith: session: truncate/seek failed for {} — skipping write",
-            path.display()
-        ));
-        let _ = fs2::FileExt::unlock(&file);
-        return;
-    }
-    let mut writer = std::io::BufWriter::new(&file);
-    if let Err(e) = writer.write_all(json.as_bytes()) {
-        crate::audit::audit_diagnostic(format!(
-            "tirith: session: write failed for {}: {e}",
+            "tirith: session: atomic write failed for {}: {e}",
             path.display()
         ));
     }
-    if let Err(e) = writer.flush() {
-        crate::audit::audit_diagnostic(format!(
-            "tirith: session: flush failed for {}: {e}",
-            path.display()
-        ));
-    }
-    let _ = file.sync_all();
-    let _ = fs2::FileExt::unlock(&file);
+
+    let _ = fs2::FileExt::unlock(&lock_file);
 
     opportunistic_gc();
+}
+
+/// Crash-atomically replace the session file at `path` with `bytes`: write to a temp
+/// file in the SAME directory, fsync it, atomically rename it over `path`, then
+/// best-effort fsync the parent directory so the new directory entry is durable.
+/// Mirrors the pending store's `save_map`. The caller holds the session lock, so the
+/// rename cannot race a concurrent writer.
+fn write_session_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tempfile::NamedTempFile;
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("session path has no parent dir"))?;
+    let mut tmp = NamedTempFile::new_in(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tmp
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    tmp.write_all(bytes)?;
+    // fsync the temp file BEFORE the rename so a crash between write and rename can
+    // never publish an empty/partial session: the old file stays until the rename.
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)
+        .map_err(|e: tempfile::PersistError| e.error)?;
+    // fsync the parent dir so the rename's new name -> inode entry is crash-durable.
+    // The publish already succeeded, so a dir-fsync failure is LOGGED, not propagated
+    // (Windows: opening a directory as a File fails, where this helper is a no-op).
+    crate::util::fsync_parent_dir_logged(path, "session state write");
+    Ok(())
 }
 
 /// Extract hostnames from finding evidence.
@@ -1129,6 +1182,88 @@ mod tests {
             std::env::remove_var("XDG_STATE_HOME");
             std::env::remove_var("XDG_DATA_HOME");
             std::env::remove_var("TIRITH_LOG");
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// H12 crash-atomic write: after a `with_session_locked` mutation the session
+    /// file must be FULLY replaced (parses, carries the mutation) via temp+rename,
+    /// leaving NO stray temp sibling in the sessions dir; and a SECOND mutation on
+    /// the same session must still apply (the dedicated-lock-file + atomic-rename
+    /// design keeps concurrent-safe semantics). The old in-place truncate could
+    /// leave the file empty after a crash between `set_len(0)` and the write.
+    #[cfg(unix)]
+    #[test]
+    fn with_session_locked_write_is_atomic_and_leaves_no_temp() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_log = std::env::var("TIRITH_LOG").ok();
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let sid = "h12-atomic-session";
+            // First mutation: starts a cooldown (writes `curl_pipe_shell` -> expiry).
+            assert!(!suppress_check(sid, "curl_pipe_shell", None, 3600));
+
+            let path = session_state_path(sid).expect("session path");
+            let sessions_dir = path.parent().expect("sessions dir").to_path_buf();
+
+            // The session file is fully written: it parses and carries the mutation.
+            let body = std::fs::read_to_string(&path).expect("session file written");
+            let parsed: SessionWarnings = serde_json::from_str(&body).expect("session file parses");
+            assert!(
+                parsed.cooldowns.contains_key("curl_pipe_shell"),
+                "the mutation (cooldown) must be present in the persisted session"
+            );
+
+            // No leftover temp sibling from the temp+rename remains in the dir: a
+            // `NamedTempFile` that was written but never `persist`ed (the crash/error
+            // path) would survive as a `.tmpXXXXXX` file. (`.last_gc`, the session
+            // JSON, and the `.json.lock` are legitimate persistent entries.)
+            let temp_leaks: Vec<_> = std::fs::read_dir(&sessions_dir)
+                .expect("read sessions dir")
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(".tmp"))
+                .collect();
+            assert!(
+                temp_leaks.is_empty(),
+                "no temp sibling must remain after the atomic rename: {temp_leaks:?}"
+            );
+
+            // A SECOND mutation in the same session still applies: a second distinct
+            // rule starts its own cooldown, and the first cooldown is preserved.
+            assert!(!suppress_check(sid, "dotfile_overwrite", None, 3600));
+            let body2 = std::fs::read_to_string(&path).expect("session file rewritten");
+            let parsed2: SessionWarnings =
+                serde_json::from_str(&body2).expect("rewritten session parses");
+            assert!(
+                parsed2.cooldowns.contains_key("curl_pipe_shell")
+                    && parsed2.cooldowns.contains_key("dotfile_overwrite"),
+                "the second mutation must apply without dropping the first: {:?}",
+                parsed2.cooldowns
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("TIRITH_LOG", v),
+                None => std::env::remove_var("TIRITH_LOG"),
+            }
         }
         if let Err(e) = result {
             std::panic::resume_unwind(e);

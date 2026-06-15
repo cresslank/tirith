@@ -725,7 +725,18 @@ pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
 /// Get diff between checkpoint and current filesystem state.
 pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
     require_pro()?;
-    let cp_dir = checkpoints_dir().join(checkpoint_id);
+    // The id is an UNCONSTRAINED CLI argument: mirror `restore_reported` exactly so
+    // `tirith checkpoint diff /tmp/evil` (or a `..`-bearing / absolute id) cannot
+    // read a manifest OUTSIDE the store. Validate the single-component basename,
+    // assert lexical containment, then reject a symlinked checkpoint dir.
+    validate_checkpoint_id(checkpoint_id)?;
+    let base_dir = checkpoints_dir();
+    let cp_dir = base_dir.join(checkpoint_id);
+    if cp_dir.parent() != Some(base_dir.as_path()) {
+        return Err(format!(
+            "checkpoint id resolves outside the checkpoints store: {checkpoint_id}"
+        ));
+    }
     if !cp_dir.exists() {
         return Err(format!("checkpoint not found: {checkpoint_id}"));
     }
@@ -737,6 +748,16 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
         .map_err(|e| format!("read manifest: {e}"))?;
     let manifest: Vec<ManifestEntry> =
         serde_json::from_str(&manifest_str).map_err(|e| format!("parse manifest: {e}"))?;
+
+    // F6: anchor RELATIVE manifest paths to the capture-time root (read from
+    // meta.json) exactly as `restore_reported` does, rather than resolving them
+    // against the caller's cwd. A missing/corrupt meta or a pre-F6 checkpoint yields
+    // None, which makes a relative entry non-anchorable (skipped below).
+    let capture_root: Option<PathBuf> = fs::read_to_string(cp_dir.join("meta.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<CheckpointMeta>(&s).ok())
+        .and_then(|m| m.capture_root)
+        .map(PathBuf::from);
 
     let files_dir = cp_dir.join("files");
     let mut diffs = Vec::new();
@@ -760,7 +781,14 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
             continue;
         }
 
-        let current_path = Path::new(&entry.original_path);
+        // Anchor through the SAME helper restore uses: an absolute entry passes
+        // through, a relative entry is anchored to the recorded `capture_root`, and
+        // a relative entry with NO recorded root is non-anchorable -> skip it rather
+        // than read a cwd-relative path. `DiffEntry.path` keeps the display path.
+        let current_path = match anchor_restore_dst(&entry.original_path, capture_root.as_deref()) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
         if !current_path.exists() {
             diffs.push(DiffEntry {
                 path: entry.original_path.clone(),
@@ -772,7 +800,7 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
             continue;
         }
 
-        match sha256_file(current_path) {
+        match sha256_file(&current_path) {
             Ok(current_sha) => {
                 if current_sha != entry.sha256 {
                     diffs.push(DiffEntry {
@@ -1958,6 +1986,131 @@ mod tests {
         assert!(
             !leaked_b,
             "restore must NOT write into the caller's cwd (dir B); it leaked there"
+        );
+    }
+
+    /// H2: `diff()` must validate the CLI `checkpoint_id` like `restore_reported`
+    /// does. An id containing `/`, a `..` component, or an absolute path could read
+    /// a manifest OUTSIDE the store; `validate_checkpoint_id` rejects all three
+    /// before any join, so each returns an `Err`.
+    #[cfg(unix)]
+    #[test]
+    fn test_diff_rejects_traversal_ids() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmpdir = tempfile::tempdir().unwrap();
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_log = std::env::var("TIRITH_LOG").ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmpdir.path());
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            assert!(
+                diff("../escape").is_err(),
+                "a `..`-bearing id must be rejected"
+            );
+            assert!(
+                diff("sub/evil").is_err(),
+                "an id containing a path separator must be rejected"
+            );
+            assert!(
+                diff("/tmp/evil").is_err(),
+                "an absolute id must be rejected"
+            );
+        });
+
+        // SAFETY: serialized by crate::TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("TIRITH_LOG", v),
+                None => std::env::remove_var("TIRITH_LOG"),
+            }
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// H2: a checkpoint created with a RELATIVE manifest path must be DIFFED against
+    /// the capture-time root, NOT the caller's cwd at diff time. Capturing in dir A
+    /// (where the live file is MODIFIED after capture) and running `diff` while cwd
+    /// is dir B must read A/<name> and report it Modified. The old
+    /// `Path::new(&entry.original_path)` resolved against the diff cwd (dir B, where
+    /// no such file exists), so it would have mis-reported the entry as Deleted.
+    #[cfg(unix)]
+    #[test]
+    fn test_diff_relative_path_anchors_to_capture_root() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        // Canonicalize so the macOS /var -> /private/var symlink does not trip the
+        // symlinked-ancestor guard (same rationale as the restore anchoring test).
+        let base = fs::canonicalize(tmpdir.path()).unwrap();
+        let dir_a = base.join("capture_here");
+        let dir_b = base.join("diff_from_here");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let state_dir = base.join("state");
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_log = std::env::var("TIRITH_LOG").ok();
+        let prev_cwd = std::env::current_dir().ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &state_dir);
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let name = "note.txt";
+        let run = || -> Result<Vec<DiffEntry>, String> {
+            // Capture in dir A with a RELATIVE name (capture_root := dir A).
+            std::env::set_current_dir(&dir_a).map_err(|e| format!("chdir A: {e}"))?;
+            fs::write(name, "captured bytes").map_err(|e| format!("write: {e}"))?;
+            let meta = create(&[name], Some("rm -rf ."))?;
+            // Mutate the live file in A so a correctly-anchored diff sees Modified.
+            fs::write(name, "MUTATED").map_err(|e| format!("rewrite: {e}"))?;
+            // Diff from a DIFFERENT cwd (dir B), where no `note.txt` exists.
+            std::env::set_current_dir(&dir_b).map_err(|e| format!("chdir B: {e}"))?;
+            diff(&meta.id)
+        };
+
+        let result = run();
+
+        if let Some(dir) = prev_cwd {
+            let _ = std::env::set_current_dir(dir);
+        }
+        // SAFETY: serialized by crate::TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("TIRITH_LOG", v),
+                None => std::env::remove_var("TIRITH_LOG"),
+            }
+        }
+
+        let diffs = result.expect("diff should succeed");
+        let entry = diffs
+            .iter()
+            .find(|d| d.path == name)
+            .expect("the relative entry must appear in the diff");
+        assert_eq!(
+            entry.status,
+            DiffStatus::Modified,
+            "anchored to the capture root (dir A), the mutated file reads as Modified, \
+             not Deleted (which is what resolving against the diff cwd dir B would give): {diffs:?}"
         );
     }
 
