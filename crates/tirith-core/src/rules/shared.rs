@@ -5,6 +5,17 @@
 /// `configfile.rs`.
 pub const MIN_BASE64_BLOB_LEN: usize = 96;
 
+/// Upper bound on how many bytes of a single candidate base64 run are actually
+/// fed to the (up to four) decoders. An untrusted file can contain an enormous
+/// base64-shaped blob (e.g. a 10 MB run); decoding it in full four times is a CPU
+/// and allocation DoS, and pointless: a few KB is already conclusive that a run is a
+/// real encoded payload. So a run longer than this cap is validated by decoding
+/// only its leading `MAX_BASE64_VALIDATE_LEN` bytes (rounded DOWN to a multiple of
+/// 4 so the prefix is itself well-formed base64). The detection is preserved for
+/// real embedded secrets, which are far smaller than the cap; a giant blob still
+/// matches (its prefix decodes) but bounds the work.
+const MAX_BASE64_VALIDATE_LEN: usize = 8 * 1024;
+
 /// Whether `content` contains a long base64 run that actually decodes (standard
 /// or URL-safe, padded or not): the shape of an encoded payload smuggled into a
 /// text field. Returns the matched run passed through `truncate` when found.
@@ -37,17 +48,28 @@ pub fn find_base64_blob_with(
         }
         let run = &content[start..end];
         if run.len() >= MIN_BASE64_BLOB_LEN {
+            // Cap the bytes actually decoded so a giant base64-shaped blob cannot
+            // force four full decodes (DoS). For an over-cap run, validate only a
+            // leading prefix; cut on a byte boundary that is a multiple of 4 (and
+            // BEFORE any `=` padding, which is only valid at the very end) so the
+            // prefix is itself well-formed base64. `run` is ASCII base64-alphabet
+            // bytes, so byte indices are char boundaries.
+            let to_validate = if run.len() > MAX_BASE64_VALIDATE_LEN {
+                &run[..MAX_BASE64_VALIDATE_LEN - (MAX_BASE64_VALIDATE_LEN % 4)]
+            } else {
+                run
+            };
             let decodes = base64::engine::general_purpose::STANDARD
-                .decode(run)
+                .decode(to_validate)
                 .is_ok()
                 || base64::engine::general_purpose::URL_SAFE
-                    .decode(run)
+                    .decode(to_validate)
                     .is_ok()
                 || base64::engine::general_purpose::STANDARD_NO_PAD
-                    .decode(run)
+                    .decode(to_validate)
                     .is_ok()
                 || base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(run)
+                    .decode(to_validate)
                     .is_ok();
             if decodes {
                 return Some(truncate(run, 64));
@@ -132,6 +154,32 @@ pub fn is_critical_label(label: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_base64_blob_caps_giant_run() {
+        // A multi-MB base64 run must NOT trigger four full decodes (DoS). The cap
+        // validates only a bounded prefix, so this returns quickly AND still detects
+        // the blob (a giant encoded payload is, if anything, more suspicious).
+        let identity = |s: &str, _max: usize| s.to_string();
+        let giant = "A".repeat(4 * 1024 * 1024); // 4 MiB of a valid base64 char
+        let found = find_base64_blob_with(&giant, identity);
+        assert!(
+            found.is_some(),
+            "a multi-MB base64 run must still be detected within the cap"
+        );
+        // A real, small embedded payload below the cap is still detected (the cap
+        // does not weaken ordinary detection).
+        use base64::Engine as _;
+        let small = base64::engine::general_purpose::STANDARD.encode("x".repeat(120));
+        assert!(
+            find_base64_blob_with(&small, identity).is_some(),
+            "a real small base64 payload must still match"
+        );
+        // A long run of NON-base64-alphabet bytes never forms a candidate run, so the
+        // cap path is never even entered.
+        let dots = ".".repeat(4 * 1024 * 1024);
+        assert!(find_base64_blob_with(&dots, identity).is_none());
+    }
 
     #[test]
     fn is_url_shortener_basic() {

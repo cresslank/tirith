@@ -826,92 +826,107 @@ pub fn verify_audit_log(
     // truncation / invalid-JSON failure. Open once, lock_shared, read the log
     // through THAT handle, then read the sidecar, then unlock. A missing log is the
     // genuine "cannot read" case and is reported as before.
-    let (content, head) = {
-        let log_file = match fs::File::open(log_path) {
-            Ok(f) => f,
-            Err(e) => {
-                report.ok = false;
-                report
-                    .problems
-                    .push(format!("cannot read {}: {e}", log_path.display()));
-                return report;
-            }
-        };
-        // A shared lock can fail (e.g. unsupported fs); treat that as unreadable and
-        // fail closed rather than reading without the lock.
-        if let Err(e) = fs2::FileExt::lock_shared(&log_file) {
+    // C2: open the log, take the SHARED lock, read the head receipt, and STREAM the
+    // log line-by-line under that lock. The lock is the same one `append_to_audit_log`
+    // takes exclusively, so the data we read and the head receipt are mutually
+    // consistent (no half-written tail, no interleaved N vs N+1 receipt read).
+    let log_file = match fs::File::open(log_path) {
+        Ok(f) => f,
+        Err(e) => {
             report.ok = false;
             report
                 .problems
-                .push(format!("cannot lock {}: {e}", log_path.display()));
+                .push(format!("cannot read {}: {e}", log_path.display()));
             return report;
         }
-        let read_result = {
-            use std::io::Read;
-            let mut buf = String::new();
-            (&log_file).read_to_string(&mut buf).map(|_| buf)
-        };
-        let content = match read_result {
-            Ok(c) => c,
+    };
+    // A shared lock can fail (e.g. unsupported fs); treat that as unreadable and
+    // fail closed rather than reading without the lock.
+    if let Err(e) = fs2::FileExt::lock_shared(&log_file) {
+        report.ok = false;
+        report
+            .problems
+            .push(format!("cannot lock {}: {e}", log_path.display()));
+        return report;
+    }
+    // Read the head receipt once while STILL holding the shared lock so it is
+    // consistent with the log content streamed below: its `signing_enabled` flag
+    // tells us whether a chained entry missing `sig` is a downgrade (signature
+    // stripped) rather than a legitimately unsigned line.
+    let head = read_head(log_path);
+    let verify_key = audit_verify_key();
+
+    // Stream the log instead of slurping it into a String + Vec<&str> + Vec<String>
+    // of per-line hashes: a large log.jsonl would otherwise burn memory proportional
+    // to the file size (and worse, to the 64-hex hash strings). Verification only
+    // needs ROLLING state: the previous line's hash (for the chain link), the line
+    // BEFORE it (for the head one-behind crash-window check), the running counts,
+    // and whether any line is signed. So we keep just `prev_hash` / `prev_prev_hash`
+    // and scalar counters here, not the whole file.
+    use std::io::BufRead;
+    let reader = std::io::BufReader::new(&log_file);
+    let mut chaining_started = false;
+    // Rolling tail hashes: `prev_hash` is line (i-1)'s hash, `prev_prev_hash` is
+    // line (i-2)'s. These replace the old `hashes[i-1]` / `hashes[n-1]` / `hashes[n-2]`
+    // indexing. `last_hash`/`second_last_hash` snapshot the final tail for the head
+    // and `--expected-head` checks after the loop.
+    let mut prev_hash = String::new();
+    let mut prev_prev_hash = String::new();
+    // "Signatures required" must NOT rest solely on the mutable `<log>.head` sidecar:
+    // an attacker could strip every `sig` AND rewrite the receipt to `signing_enabled:
+    // false`. So anchor the signal in the (hash-chained) log data too: if ANY retained
+    // line still carries a `sig`, signing was enabled and every entry is expected to be
+    // signed. The old code pre-scanned all lines for this; streaming, we compute it
+    // incrementally. `signing_expected` flips true the moment a signed line is seen.
+    // Because a signed log signs from its genesis (signing cannot be enabled mid-stream
+    // over a non-empty log), the realistic case flips on line 0. The ONLY way a signed
+    // line appears after unsigned ones is a tampered log whose earlier `sig`s were
+    // stripped; those earlier lines are buffered in `early_unsigned` and flagged as
+    // downgrades at the transition, preserving the exact problems-in-line-order output
+    // the pre-scan produced. For a genuinely unsigned log `signing_expected` stays
+    // false and the buffer is discarded (no downgrade flags), as before.
+    let mut signing_expected = head.as_ref().map(|h| h.signing_enabled).unwrap_or(false);
+    let mut early_unsigned: Vec<usize> = Vec::new();
+    let mut i = 0usize;
+    let mut read_error: Option<std::io::Error> = None;
+
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(l) => l,
             Err(e) => {
-                let _ = fs2::FileExt::unlock(&log_file);
-                report.ok = false;
-                report
-                    .problems
-                    .push(format!("cannot read {}: {e}", log_path.display()));
-                return report;
+                read_error = Some(e);
+                break;
             }
         };
-        // Read the head receipt once while STILL holding the shared lock so it is
-        // consistent with the log content just read: its `signing_enabled` flag
-        // tells us whether a chained entry missing `sig` is a downgrade (signature
-        // stripped) rather than a legitimately unsigned line.
-        let head = read_head(log_path);
-        let _ = fs2::FileExt::unlock(&log_file);
-        (content, head)
-    };
-    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-    report.total_lines = lines.len();
-    let verify_key = audit_verify_key();
-    // "Signatures required" must NOT rest solely on the mutable `<log>.head`
-    // sidecar: an attacker could strip every `sig` AND rewrite the receipt to
-    // `signing_enabled: false`. So anchor the signal in the (hash-chained) log
-    // data too — if ANY retained line still carries a `sig`, signing was enabled
-    // and every chained line is expected to be signed. Stripping a single sig
-    // then becomes detectable from the lines that remain signed, independent of
-    // the sidecar. (The pre-scan is over the same lines we re-read below.)
-    let any_line_signed = lines.iter().any(|l| {
-        serde_json::from_str::<serde_json::Value>(l.trim())
-            .ok()
-            .and_then(|v| v.get("sig").and_then(|s| s.as_str()).map(|s| !s.is_empty()))
-            .unwrap_or(false)
-    });
-    report.signing_expected =
-        head.as_ref().map(|h| h.signing_enabled).unwrap_or(false) || any_line_signed;
-    let mut hashes: Vec<String> = Vec::with_capacity(lines.len());
-    let mut chaining_started = false;
+        if line.trim().is_empty() {
+            continue;
+        }
 
-    for (i, line) in lines.iter().enumerate() {
-        let val: serde_json::Value = match serde_json::from_str(line.trim()) {
+        let trimmed = line.trim();
+        let val: serde_json::Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
                 report.ok = false;
                 report
                     .problems
                     .push(format!("line {}: invalid JSON: {e}", i + 1));
-                hashes.push(String::new());
+                // An invalid line still occupies a chain slot, so its hash is the
+                // empty string (as the old `hashes.push(String::new())` recorded),
+                // breaking any chain link that points at it.
+                prev_prev_hash = std::mem::take(&mut prev_hash);
+                i += 1;
                 continue;
             }
         };
         let prev = val.get("prev_hash").and_then(|v| v.as_str());
-        let this_hash = line_hash(line).unwrap_or_default();
+        let this_hash = line_hash(trimmed).unwrap_or_default();
 
         // The signature handling below runs for EVERY entry independent of whether
         // it carries `prev_hash` (is chained), so the genesis/first signed entry
         // (which has no `prev_hash`) is authenticated, counted, and downgrade-
         // checked just like a chained line.
         if let Some(prev) = prev {
-            if !chaining_started && i > 0 && report.legacy_prefix > 0 && hashes[i - 1] == prev {
+            if !chaining_started && i > 0 && report.legacy_prefix > 0 && prev_hash == prev {
                 // The immediately preceding unchained line is this chain's
                 // genesis (its root), not a legacy entry, so it does not count
                 // toward the legacy prefix.
@@ -924,7 +939,7 @@ pub fn verify_audit_log(
                 report
                     .problems
                     .push("line 1: prev_hash present but no prior entry".to_string());
-            } else if hashes[i - 1] != prev {
+            } else if prev_hash != prev {
                 report.ok = false;
                 report
                     .problems
@@ -947,23 +962,44 @@ pub fn verify_audit_log(
         // signed entry unauthenticated and undercounted.
         let sig_present = val.get("sig").and_then(|v| v.as_str());
         if sig_present.is_some() {
+            // A `sig` field is present (counted exactly as the old `is_some()` did,
+            // including an empty `sig: ""`, which is counted but is NOT a real
+            // signature). Only a NON-EMPTY sig anchors `signing_expected` (matching
+            // the old `any_line_signed` pre-scan, which required `!s.is_empty()`).
             report.signed_lines += 1;
-        } else if report.signing_expected {
-            // This log is signed (per the head receipt OR a still-signed line
-            // observed in the pre-scan), but this entry has no `sig`. Because `sig`
-            // is excluded from the chain hash, stripping it leaves the chain intact
-            // and is otherwise invisible, so flag it as a signature downgrade. This
-            // runs for EVERY entry, NOT just chained ones: a signed log signs from
-            // its genesis (signing cannot be enabled mid-stream over a non-empty
-            // log), so stripping `sig` from the FIRST (genesis/root) entry, which
-            // has no `prev_hash` and so is unchained, is just as much a downgrade as
-            // stripping it from a later line. Gating on `is_chained` here would let
-            // that first-entry strip pass undetected.
+            if sig_present.map(|s| !s.is_empty()).unwrap_or(false) && !signing_expected {
+                // First REAL signed line: signing IS expected. Flush any earlier
+                // unsigned lines buffered before this point as downgrades, IN LINE
+                // ORDER (a signed line after unsigned ones means those earlier `sig`s
+                // were stripped, e.g. a stripped genesis). After this `signing_expected`
+                // stays true, so later unsigned lines flag immediately below.
+                signing_expected = true;
+                for ln in early_unsigned.drain(..) {
+                    report.ok = false;
+                    report.problems.push(format!(
+                        "line {ln}: missing signature on a signed log (possible signature downgrade)"
+                    ));
+                }
+            }
+        } else if signing_expected {
+            // No `sig` field, but this log is signed (per the head receipt OR an
+            // already-observed `sig`). Because `sig` is excluded from the chain hash,
+            // stripping it leaves the chain intact and is otherwise invisible, so flag
+            // it as a signature downgrade. This runs for EVERY entry, NOT just chained
+            // ones: a signed log signs from its genesis, so stripping `sig` from the
+            // FIRST (genesis/root) entry is just as much a downgrade as from a later
+            // line.
             report.ok = false;
             report.problems.push(format!(
                 "line {}: missing signature on a signed log (possible signature downgrade)",
                 i + 1
             ));
+        } else {
+            // No `sig` field while signing is NOT YET known to be expected (head says
+            // unsigned and no real signed line seen yet). Buffer its number: if a
+            // signed line appears later it is retroactively flagged above; otherwise
+            // the log is genuinely unsigned and the buffer is discarded after the loop.
+            early_unsigned.push(i + 1);
         }
         if let (Some(sig_b64), Some(vk)) = (sig_present, verify_key.as_ref()) {
             let mut unsigned = val.clone();
@@ -987,8 +1023,33 @@ pub fn verify_audit_log(
                     .push(format!("line {}: signature verification failed", i + 1));
             }
         }
-        hashes.push(this_hash);
+        // Advance the rolling tail: line i becomes the new "previous", and the old
+        // "previous" becomes "previous-previous" (kept for the head one-behind check).
+        prev_prev_hash = std::mem::replace(&mut prev_hash, this_hash);
+        i += 1;
     }
+
+    // Surface a mid-stream read error (e.g. a truncated/non-UTF-8 line) the same way
+    // the old `read_to_string` failure did: fail closed.
+    if let Some(e) = read_error {
+        let _ = fs2::FileExt::unlock(&log_file);
+        report.ok = false;
+        report
+            .problems
+            .push(format!("cannot read {}: {e}", log_path.display()));
+        return report;
+    }
+    let _ = fs2::FileExt::unlock(&log_file);
+
+    // Finalize the streamed state into the shape the post-loop checks expect.
+    report.total_lines = i;
+    report.signing_expected = signing_expected;
+    // The final tail hashes (replacing the old `hashes[n-1]` / `hashes[n-2]`). After
+    // the loop, `prev_hash` is the LAST line's hash and `prev_prev_hash` the one
+    // before it; for n < 2 the unused one stays empty, matching the old `n > 1` guards.
+    let last_hash = prev_hash;
+    let second_last_hash = prev_prev_hash;
+    let n = i;
 
     // Fail CLOSED when a signed log cannot actually be authenticated. If
     // signatures are expected (head receipt OR an observed `sig`) but no public
@@ -1040,14 +1101,14 @@ pub fn verify_audit_log(
 
     match head {
         Some(head) => {
-            let n = hashes.len();
             // The head `count` is the TOTAL number of log lines the receipt covers
             // (set as `prev_count + 1` in `write_head`, where `prev_count` starts
             // from `count_lines` over the whole file including any legacy-unchained
             // prefix). So a clean tail must match BOTH the tail hash AND the line
             // count: a stale/rewritten receipt that reuses an old hash but reports
             // the wrong count is otherwise accepted, hiding a rollback/replace.
-            if n > 0 && head.head_hash == hashes[n - 1] {
+            // `last_hash` is the streamed equivalent of the old `hashes[n - 1]`.
+            if n > 0 && head.head_hash == last_hash {
                 if head.count == n as u64 {
                     report.head_status = format!("head receipt OK (count {})", head.count);
                 } else {
@@ -1058,7 +1119,7 @@ pub fn verify_audit_log(
                     );
                     report.problems.push(report.head_status.clone());
                 }
-            } else if n > 1 && head.head_hash == hashes[n - 2] {
+            } else if n > 1 && head.head_hash == second_last_hash {
                 // The documented crash window: the last line synced but the receipt
                 // still points one entry back, so its count must be exactly n - 1.
                 if head.count == (n - 1) as u64 {
@@ -1111,8 +1172,8 @@ pub fn verify_audit_log(
     }
 
     if let Some(exp) = expected_head {
-        let n = hashes.len();
-        if n == 0 || hashes[n - 1] != exp {
+        // `last_hash` is the streamed tail hash (old `hashes[n - 1]`).
+        if n == 0 || last_hash != exp {
             report.ok = false;
             report
                 .problems

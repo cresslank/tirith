@@ -156,7 +156,10 @@ pub fn export(output: Option<PathBuf>) -> i32 {
                     return 2;
                 }
             };
-            match std::fs::write(&path, json.as_bytes()) {
+            // Write atomically (temp + fsync + rename) so a crash/ENOSPC mid-write
+            // cannot leave a half-written export at `path`; a reader sees either the
+            // old file or the complete new one. `overwrite = true`: export replaces.
+            match super::write_file_atomic(&path, json.as_bytes(), true) {
                 Ok(()) => {
                     println!(
                         "Wrote {} pending decision(s) to {}",

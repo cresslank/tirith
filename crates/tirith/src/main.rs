@@ -1027,13 +1027,15 @@ Examples:
         action: RuleAction,
     },
 
-    /// Audit log management: export, stats, compliance reports (Team)
+    /// Audit log management: export, stats, compliance reports, verify (Team)
     #[command(after_help = "\
 Examples:
   tirith audit export
   tirith audit export --format csv --since 2025-01-01
   tirith audit stats --format json
-  tirith audit report --format html > report.html")]
+  tirith audit report --format html > report.html
+  tirith audit verify
+  tirith audit verify --expected-head <sha256>")]
     Audit {
         #[command(subcommand)]
         action: AuditAction,

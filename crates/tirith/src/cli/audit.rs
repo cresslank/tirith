@@ -196,7 +196,20 @@ pub fn stats(session: Option<&str>, json: bool, entry_type: &str) -> i32 {
 /// Run the `tirith audit verify` subcommand: check the tamper-evident chain.
 pub fn verify(expected_head: Option<&str>, json: bool) -> i32 {
     let Some(path) = tirith_core::audit::audit_log_path() else {
-        eprintln!("tirith: no audit log path available");
+        // Keep `--json` machine-readable on the path-resolution failure: emit the
+        // same `{ ok, total_lines, problems }` error shape as the other JSON paths
+        // in this handler (built via serde_json so it is always valid), and PRESERVE
+        // the exit code (2) so callers still distinguish it from a verify failure (1).
+        if json {
+            let obj = serde_json::json!({
+                "ok": false,
+                "total_lines": 0,
+                "problems": ["no audit log path available"],
+            });
+            println!("{obj}");
+        } else {
+            eprintln!("tirith: no audit log path available");
+        }
         return 2;
     };
     if !path.exists() {

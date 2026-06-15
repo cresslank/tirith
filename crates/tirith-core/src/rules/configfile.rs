@@ -519,7 +519,17 @@ pub fn check(
         check_invisible_unicode(content, is_known || is_mcp, &mut findings);
     }
 
-    if is_known {
+    // The ASCII-only rule (`check_non_ascii`) treats a known `.json` as ASCII-only.
+    // The W3 FREE-FORM memory JSON files (agent-memory.json, memories.json,
+    // .hermes/*.json, .claude/memory/*.json) legitimately carry arbitrary non-ASCII
+    // memory content, so the ASCII-only check would false-positive on them. EXCLUDE
+    // exactly those (NOT .cursorrules/.clinerules, which are instruction rules where
+    // a homoglyph IS suspicious and must still be flagged); they keep the base64 /
+    // external-URL content scan below, which is the signal that matters for them.
+    let skip_ascii_only = file_path
+        .map(|p| is_freeform_memory_json(p, repo_root))
+        .unwrap_or(false);
+    if is_known && !skip_ascii_only {
         check_non_ascii(content, file_path, &mut findings);
     }
 
@@ -876,37 +886,9 @@ const AGENT_MEMORY_DIRS: &[(&[&str], &[&str])] = &[
 /// files (mcp.json, settings.json, ...) are excluded so their legitimate URLs
 /// do not false-positive.
 fn is_agent_memory_file(path: &Path, repo_root: Option<&Path>) -> bool {
-    // Directory-anchored matches below (`.hermes`, `.claude/memory`) are
-    // ROOT-ANCHORED: the memory dir must be the path's LEADING component(s). An
-    // absolute path carries the repo's own folder components first (e.g.
-    // `/home/me/repo/.hermes/notes.md`), so the anchor would never line up. Strip
-    // the repo root first when the path is absolute and the root is known, so an
-    // absolute and a repo-relative path normalize to the same component list.
-    let normalized: &Path = if path.is_absolute() {
-        match repo_root {
-            Some(root) => path.strip_prefix(root).unwrap_or(path),
-            None => path,
-        }
-    } else {
-        path
-    };
-
-    // Normalize to forward components, dropping any prefix/root so the check is
-    // the same for repo-relative and absolute paths. ParentDir/Prefix bail out.
-    let mut components: Vec<String> = Vec::new();
-    for c in normalized.components() {
-        match c {
-            Component::CurDir | Component::RootDir => continue,
-            Component::Prefix(_) | Component::ParentDir => return false,
-            Component::Normal(os) => match os.to_str() {
-                Some(s) => components.push(s.to_ascii_lowercase()),
-                None => return false,
-            },
-        }
-    }
-    if components.is_empty() {
+    let Some(components) = normalized_lower_components(path, repo_root) else {
         return false;
-    }
+    };
 
     let basename = &components[components.len() - 1];
     if AGENT_MEMORY_BASENAMES.contains(&basename.as_str()) {
@@ -918,26 +900,95 @@ fn is_agent_memory_file(path: &Path, repo_root: Option<&Path>) -> bool {
     // at least one component (the file) beyond the dir prefix, AND the file's
     // extension must be in the dir's allowed set (so the content-scan surface
     // matches the extension-gated KNOWN_CONFIG_DEEP_DIRS surface, not every blob).
-    let ext_lower = normalized
+    let ext_lower = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
-    for (dir, exts) in AGENT_MEMORY_DIRS {
+    dir_anchored_ext_match(&components, ext_lower.as_deref(), AGENT_MEMORY_DIRS)
+}
+
+/// Normalize `path` to lowercased forward components (repo-root-stripped when
+/// absolute and the root is known), so a repo-relative and an absolute path map to
+/// the same component list. Returns `None` when the path is empty, escapes via
+/// `..`, carries a drive `Prefix`, or has a non-UTF-8 component (fail closed).
+fn normalized_lower_components(path: &Path, repo_root: Option<&Path>) -> Option<Vec<String>> {
+    // ROOT-ANCHORED dir matches (`.hermes`, `.claude/memory`) need the memory dir
+    // as the LEADING component(s). An absolute path carries the repo's own folders
+    // first, so strip the known repo root so the anchor lines up.
+    let normalized: &Path = if path.is_absolute() {
+        match repo_root {
+            Some(root) => path.strip_prefix(root).unwrap_or(path),
+            None => path,
+        }
+    } else {
+        path
+    };
+    let mut components: Vec<String> = Vec::new();
+    for c in normalized.components() {
+        match c {
+            Component::CurDir | Component::RootDir => continue,
+            Component::Prefix(_) | Component::ParentDir => return None,
+            Component::Normal(os) => components.push(os.to_str()?.to_ascii_lowercase()),
+        }
+    }
+    if components.is_empty() {
+        None
+    } else {
+        Some(components)
+    }
+}
+
+/// True when `components`' leading entries equal one of the `(dir, exts)` prefixes
+/// (root-anchored), there is at least one component beyond the prefix, and `ext`
+/// is in that prefix's allowed extension set. Shared by the memory-file matchers.
+fn dir_anchored_ext_match(
+    components: &[String],
+    ext: Option<&str>,
+    dirs: &[(&[&str], &[&str])],
+) -> bool {
+    for (dir, exts) in dirs {
         if components.len() > dir.len()
             && components[..dir.len()]
                 .iter()
                 .zip(dir.iter())
                 .all(|(a, b)| a == b)
         {
-            if let Some(ext) = ext_lower.as_deref() {
-                if exts.contains(&ext) {
+            if let Some(e) = ext {
+                if exts.contains(&e) {
                     return true;
                 }
             }
         }
     }
-
     false
+}
+
+/// `true` ONLY for the W3 FREE-FORM memory JSON files whose content legitimately
+/// carries arbitrary non-ASCII text: the exact basenames `agent-memory.json` /
+/// `memories.json`, or a `.json` file under the root-anchored `.hermes/` or
+/// `.claude/memory/` dirs. This is a STRICT subset of [`is_agent_memory_file`]:
+/// `.cursorrules` / `.clinerules` (instruction rules where a homoglyph IS
+/// suspicious) are deliberately NOT included, so they remain ASCII-checked.
+fn is_freeform_memory_json(path: &Path, repo_root: Option<&Path>) -> bool {
+    const FREEFORM_MEMORY_JSON_BASENAMES: &[&str] = &["agent-memory.json", "memories.json"];
+    // The JSON-only slice of AGENT_MEMORY_DIRS (these dirs already allow `json`).
+    const FREEFORM_MEMORY_JSON_DIRS: &[(&[&str], &[&str])] = &[
+        (&[".hermes"], &["json"]),
+        (&[".claude", "memory"], &["json"]),
+    ];
+
+    let Some(components) = normalized_lower_components(path, repo_root) else {
+        return false;
+    };
+    let basename = &components[components.len() - 1];
+    if FREEFORM_MEMORY_JSON_BASENAMES.contains(&basename.as_str()) {
+        return true;
+    }
+    let ext_lower = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    dir_anchored_ext_match(&components, ext_lower.as_deref(), FREEFORM_MEMORY_JSON_DIRS)
 }
 
 /// Whether `content` contains a long base64 run that actually decodes: the
@@ -971,10 +1022,11 @@ fn is_local_host(host: &str) -> bool {
     // matches `rules::shared::is_loopback_host`, which the W7 deriver uses; without
     // it a `http://app.localhost/...` config value fired a false external-URL
     // signal. (A bare `localhost` is handled above; this covers the subdomain
-    // form.) Checked case-insensitively for parity with the exact match above.
-    if h.len() > ".localhost".len()
-        && h[h.len() - ".localhost".len()..].eq_ignore_ascii_case(".localhost")
-    {
+    // form.) Use a CHAR-SAFE suffix check on a lowercased copy: a byte-offset slice
+    // (`h[h.len() - 10..]`) panics when the host carries a leading multibyte char
+    // (e.g. an attacker-supplied `\u{e9}abcde12345`) because the offset can land off
+    // a UTF-8 boundary. `ends_with` operates on whole chars and never panics.
+    if h.to_ascii_lowercase().ends_with(".localhost") {
         return true;
     }
     if let Ok(v4) = h.parse::<std::net::Ipv4Addr>() {
@@ -1967,6 +2019,42 @@ mod tests {
     }
 
     #[test]
+    fn test_non_ascii_in_memory_json_is_not_flagged() {
+        // W3 free-form memory JSON legitimately carries non-ASCII content, so the
+        // ASCII-only rule must NOT fire on it (it is a KNOWN .json config, which
+        // would otherwise route into check_non_ascii). The base64 / external-URL
+        // content scan still applies; plain non-ASCII prose is not a signal.
+        let content = "{\"note\": \"Привет, this is a saved memory\"}"; // Cyrillic
+        for name in ["memories.json", "agent-memory.json"] {
+            let findings = check(content, Some(Path::new(name)), None, false, &[]);
+            assert!(
+                !findings.iter().any(|f| f.rule_id == RuleId::ConfigNonAscii),
+                "non-ASCII in {name} must NOT raise a non-ASCII finding: {findings:?}"
+            );
+        }
+        // Dir-anchored memory JSON is likewise excluded.
+        let findings = check(
+            content,
+            Some(Path::new(".claude/memory/notes.json")),
+            None,
+            false,
+            &[],
+        );
+        assert!(
+            !findings.iter().any(|f| f.rule_id == RuleId::ConfigNonAscii),
+            ".claude/memory/*.json must NOT raise a non-ASCII finding: {findings:?}"
+        );
+        // But an instruction-rule dotfile (.cursorrules) is NOT free-form memory and
+        // a homoglyph there must still be flagged.
+        let homoglyph = "Use TypeScr\u{0456}pt"; // Cyrillic 'і'
+        let findings = check(homoglyph, Some(Path::new(".cursorrules")), None, false, &[]);
+        assert!(
+            findings.iter().any(|f| f.rule_id == RuleId::ConfigNonAscii),
+            ".cursorrules must still flag a homoglyph (not excluded as memory)"
+        );
+    }
+
+    #[test]
     fn test_non_ascii_in_cursorrules_dotfile() {
         // Path::extension() returns None for dotfiles like .cursorrules,
         // so this exercises the basename-based fallback in check_non_ascii.
@@ -2423,6 +2511,19 @@ mod tests {
             find_external_http_url("endpoint = http://app.localhost:3000/x"),
             None,
             "an app.localhost URL must NOT be treated as external",
+        );
+
+        // A host with a LEADING multibyte char must not panic on the suffix check
+        // (the old byte-offset slice could land off a UTF-8 boundary) and is NOT a
+        // `.localhost` subdomain, so it is classified as external (not local).
+        assert!(
+            !is_local_host("\u{e9}abcde12345"),
+            "a multibyte-leading host is neither a panic nor local"
+        );
+        // The same with a `.localhost` suffix IS local, still without panicking.
+        assert!(
+            is_local_host("\u{e9}pp.localhost"),
+            "a multibyte-leading .localhost subdomain is local"
         );
     }
 

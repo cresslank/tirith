@@ -106,8 +106,18 @@ fn load_map() -> Result<BTreeMap<String, PendingDecision>, String> {
             return Err(format!("cannot read pending store {}: {e}", path.display()));
         }
     };
+    // A PRESENT-but-empty / whitespace-only file is CORRUPTION, not "no decisions":
+    // a missing store already returned an empty map via the NotFound branch above,
+    // so reaching here with blank contents means an existing `pending.json` was
+    // truncated (a crashed/partial write). Parsing it as `{}` would let the next
+    // `with_store_locked` save overwrite that truncated store, masking the loss.
+    // Fail closed like the parse-error case so a mutating op aborts and leaves the
+    // bytes intact for inspection.
     if contents.trim().is_empty() {
-        return Ok(BTreeMap::new());
+        return Err(format!(
+            "pending store {} is empty/truncated (refusing to overwrite it)",
+            path.display()
+        ));
     }
     serde_json::from_str(&contents).map_err(|e| {
         format!(
@@ -599,6 +609,45 @@ mod tests {
         assert_eq!(
             after, corrupt,
             "the corrupt store must NOT be truncated/overwritten"
+        );
+    }
+
+    #[test]
+    fn blank_store_fails_closed_and_is_not_truncated() {
+        // A present-but-whitespace-only `pending.json` is a TRUNCATED store (a
+        // crashed/partial write), not "no decisions": a missing file already returns
+        // Ok(empty). It must fail closed exactly like the unparseable case so the
+        // next save does not overwrite the truncated store. (A missing file is the
+        // ONLY empty-Ok path; this is the regression that distinguishes them.)
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _xdg = XdgStateGuard::set(tmp.path());
+
+        let path = store_path().expect("store path under XDG_STATE_HOME");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Whitespace-only contents (e.g. a half-flushed write left only newlines).
+        let blank = b"   \n\t\n";
+        std::fs::write(&path, blank).unwrap();
+
+        // Read-only callers fail closed (Err), not an empty Ok.
+        assert!(
+            load_all().is_err(),
+            "load_all over a blank store must fail closed"
+        );
+
+        // A mutating op must fail closed AND leave the blank bytes intact.
+        let reg = register(sample(PendingSource::Restore, "high"));
+        assert!(
+            reg.is_err(),
+            "register over a blank store must fail closed: {reg:?}"
+        );
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            after, blank,
+            "the blank store must NOT be truncated/overwritten"
         );
     }
 

@@ -760,11 +760,13 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
             _ => {}
         }
 
-        // A write target: a redirection (`> path`), a downloader output flag
-        // (`curl -o path`), or a `cp`/`mv`/`tee`/`install` destination. Classify
-        // the written path: a secret file is a SecretWrite, a dependency manifest
-        // is a (flagged) FileWrite. An ordinary file is intentionally ignored.
-        if let Some(path) = write_target(seg, &leader_base, &args) {
+        // Write targets: a redirection (`> path`), a downloader output flag
+        // (`curl -o path`), or a `cp`/`mv`/`tee`/`install` destination. A
+        // `cp -t DIR a b` writes `DIR/a` and `DIR/b`, so several targets can come
+        // from one segment. Classify each written path: a secret file is a
+        // SecretWrite, a dependency manifest is a (flagged) FileWrite. An ordinary
+        // file is intentionally ignored.
+        for path in write_targets(seg, &leader_base, &args) {
             if is_secret_path(&path) {
                 if secret_write_path.is_none() {
                     secret_write_path = Some(path);
@@ -1388,14 +1390,19 @@ fn output_target_attached_prefixes(leader_base: &str) -> &'static [&'static str]
 /// GLUED short output-target prefixes (`-o<value>` / `-O<value>` with no space),
 /// per tool, mirroring [`output_target_value_flags`]. The glued form spells the
 /// value INSIDE the same token, so `curl -oid_rsa` means `-o id_rsa`. TOOL-AWARE,
-/// exactly as the separated form: lowercase `-o` takes a value in curl/wget/httpie
-/// (so `-o<x>` is an output target in all three), but uppercase `-O` is value-
-/// taking ONLY for wget (`wget -O.env`); curl `-O`/`--remote-name` is boolean, so
-/// `curl -O.foo` is NOT `-O .foo` and must record no output target. An unrecognised
-/// tool returns an empty set.
+/// exactly as the separated form: lowercase `-o<x>` is an output target for curl
+/// and httpie, but for wget `-o<x>` is the LOG file (NOT the download target), so
+/// wget's only glued output target is uppercase `-O<file>` (`wget -O.env`). curl
+/// `-O`/`--remote-name` is boolean, so `curl -O.foo` is NOT `-O .foo` and must
+/// record no output target. An unrecognised tool returns an empty set.
 fn output_target_glued_prefixes(leader_base: &str) -> &'static [&'static str] {
     const CURL: &[&str] = &["-o"];
-    const WGET: &[&str] = &["-o", "-O"];
+    // wget `-o<x>` is the LOG file, NOT the download target (mirrors
+    // `output_target_value_flags`, which excludes wget `-o`): only `-O<file>`
+    // (and `--output-document`) writes the download. Listing `-o` here would make
+    // `wget -opackage.json https://x` fabricate a manifest write from a log path
+    // and falsely seed DependencyChangeThenNetwork.
+    const WGET: &[&str] = &["-O"];
     const HTTPIE: &[&str] = &["-o"];
     match leader_base {
         "curl" => CURL,
@@ -1405,15 +1412,17 @@ fn output_target_glued_prefixes(leader_base: &str) -> &'static [&'static str] {
     }
 }
 
-/// Detect a write target in a segment: a redirection (`> path` / `>> path`), a
-/// downloader output flag (`curl -o path`, `wget -O path`, `--output=path`), or
-/// a `cp`/`mv`/`tee`/`install` destination. Returns the written path WITHOUT
-/// classifying it; the caller decides whether it is a secret file, a dependency
-/// manifest, or ordinary (ignored). Conservative best-effort token scan.
-fn write_target(seg: &tokenize::Segment, leader_base: &str, args: &[String]) -> Option<String> {
+/// Detect the write target(s) in a segment: a redirection (`> path` / `>> path`),
+/// a downloader output flag (`curl -o path`, `wget -O path`, `--output=path`), or
+/// a `cp`/`mv`/`tee`/`install` destination. Returns the written path(s) WITHOUT
+/// classifying them; the caller decides whether each is a secret file, a
+/// dependency manifest, or ordinary (ignored). Usually a single target, but a
+/// `cp -t DIR a b` writes `DIR/a` and `DIR/b`, so several can be returned.
+/// Conservative best-effort token scan.
+fn write_targets(seg: &tokenize::Segment, leader_base: &str, args: &[String]) -> Vec<String> {
     // 1) Shell redirection target anywhere in the raw segment: `> ~/.npmrc`.
     if let Some(path) = redirection_target(&seg.raw) {
-        return Some(path);
+        return vec![path];
     }
 
     // 2) Downloader output flag: `curl -o .env`, `wget -O id_rsa`. The flag set is
@@ -1429,7 +1438,7 @@ fn write_target(seg: &tokenize::Segment, leader_base: &str, args: &[String]) -> 
         let mut want_value = false;
         for a in args {
             if want_value {
-                return Some(a.clone());
+                return vec![a.clone()];
             }
             if value_flags.contains(&a.as_str()) {
                 want_value = true;
@@ -1442,20 +1451,21 @@ fn write_target(seg: &tokenize::Segment, leader_base: &str, args: &[String]) -> 
             for prefix in attached {
                 if let Some(rest) = a.strip_prefix(prefix) {
                     if !rest.is_empty() {
-                        return Some(rest.to_string());
+                        return vec![rest.to_string()];
                     }
                 }
             }
             // GLUED short forms: `curl -oid_rsa` (= `-o id_rsa`), `wget -O.env`
             // (= `-O .env`). TOOL-AWARE via `output_target_glued_prefixes`: lowercase
-            // `-o<x>` is an output target for all three; uppercase `-O<x>` only for
-            // wget (curl `-O` is boolean, so `curl -O.foo` records no output target).
-            // The bare separated flag (`-o` exactly) was already consumed by the
-            // value_flags branch above, so an empty `rest` here cannot reach this.
+            // `-o<x>` is an output target for curl/httpie; for wget `-o<x>` is the
+            // log file, so only `-O<x>` writes the download. curl `-O` is boolean, so
+            // `curl -O.foo` records no output target. The bare separated flag (`-o`
+            // exactly) was already consumed by the value_flags branch above, so an
+            // empty `rest` here cannot reach this.
             for prefix in glued {
                 if let Some(rest) = a.strip_prefix(prefix) {
                     if !rest.is_empty() {
-                        return Some(rest.to_string());
+                        return vec![rest.to_string()];
                     }
                 }
             }
@@ -1467,28 +1477,67 @@ fn write_target(seg: &tokenize::Segment, leader_base: &str, args: &[String]) -> 
     match leader_base {
         "cp" | "mv" | "install" => {
             // `-t DIR` / `--target-directory=DIR` inverts the layout: the DIRECTORY
-            // is the write destination and EVERY positional is a SOURCE. Returning
-            // the last positional here would mis-flag a source (`cp -t /d a .env`
-            // would record `.env`), fabricating false FileWrite/SecretWrite and the
-            // W7 DependencyChange/SecretWrite-then-Network correlations. So when a
-            // target-directory flag is present, the target is its value and NO
-            // positional is a destination.
+            // is the destination and EVERY positional is a SOURCE. The actual writes
+            // are `DIR/<basename(source)>` for each source, so we must classify THOSE
+            // paths, never the directory itself: returning the bare directory fed its
+            // basename to is_secret_path/path_is_manifest, so `cp -t .env src` or
+            // `cp -t package.json src` fabricated a SecretWrite/FileWrite and the W7
+            // DependencyChange/SecretWrite-then-Network correlations off it. Joining
+            // the source basename onto the dir recovers the real target (so
+            // `cp -t /backups package.json` correctly flags `/backups/package.json`).
             if let Some(dir) = cp_target_directory(args) {
-                return Some(dir);
+                return cp_target_directory_writes(&dir, args);
             }
             if let Some(dest) = args.iter().rev().find(|a| !a.starts_with('-')) {
-                return Some(dest.clone());
+                return vec![dest.clone()];
             }
         }
         "tee" => {
             if let Some(p) = args.iter().find(|a| !a.starts_with('-')) {
-                return Some(p.clone());
+                return vec![p.clone()];
             }
         }
         _ => {}
     }
 
-    None
+    Vec::new()
+}
+
+/// Compute the per-source write targets for a `cp -t DIR a b ...` (or mv/install)
+/// command: each SOURCE operand is written to `DIR/<basename(source)>`, so those
+/// are the paths to classify, NOT the bare directory. A source operand is any
+/// positional that is not the `-t` flag's own value (the separated `-t DIR` form
+/// puts the dir among the args) and is not itself a flag. Sources whose basename
+/// cannot be derived (e.g. a trailing-separator path) are skipped. Returns an
+/// empty vec when no source operands remain (e.g. `cp -t /dest` alone), so nothing
+/// is fabricated.
+fn cp_target_directory_writes(dir: &str, args: &[String]) -> Vec<String> {
+    use std::path::Path;
+    let mut targets = Vec::new();
+    let mut skip_next_value = false;
+    for a in args {
+        // The separated `-t DIR`: skip DIR itself, it is the destination, not a
+        // source. Attached/long spellings carry the dir inside the same token and
+        // are filtered out below by the flag check.
+        if skip_next_value {
+            skip_next_value = false;
+            continue;
+        }
+        if a == "-t" || a == "--target-directory" {
+            skip_next_value = true;
+            continue;
+        }
+        if a.starts_with('-') {
+            continue; // any other flag (incl. `-t<dir>` / `--target-directory=DIR`)
+        }
+        // A source operand: the real write is DIR/<basename(source)>. Use the
+        // source's file name so a path source (`cp -t /d sub/.env`) still flags the
+        // written `.env`, not the source directory.
+        if let Some(name) = Path::new(a).file_name().and_then(|n| n.to_str()) {
+            targets.push(format!("{}/{}", dir.trim_end_matches('/'), name));
+        }
+    }
+    targets
 }
 
 /// The `-t`/`--target-directory` value for a cp/mv/install command, if present.
@@ -2477,20 +2526,26 @@ mod tests {
         // skip the following URL, or `curl -O https://example.com/x` records no
         // Network event. The host must still be extracted.
         let v = raw_verdict_with(Action::Allow, vec![], None);
+        // Assert each spelling INDEPENDENTLY: a single `||` would stay green if one
+        // of `-O` / `--remote-name` regressed while the other still worked.
+        assert!(
+            network_invocation_has_remote_target(
+                "curl",
+                &["-O".into(), "https://example.com/x".into()]
+            ),
+            "curl -O must not swallow the URL"
+        );
+        assert!(
+            network_invocation_has_remote_target(
+                "curl",
+                &["--remote-name".into(), "https://example.com/x".into()]
+            ),
+            "curl --remote-name must not swallow the URL"
+        );
         for cmd in [
             "curl -O https://example.com/x",
             "curl --remote-name https://example.com/x",
         ] {
-            assert!(
-                network_invocation_has_remote_target(
-                    "curl",
-                    &["-O".into(), "https://example.com/x".into()]
-                ) || network_invocation_has_remote_target(
-                    "curl",
-                    &["--remote-name".into(), "https://example.com/x".into()]
-                ),
-                "curl boolean remote-name flag must not swallow the URL"
-            );
             let events = derive_typed_events(cmd, &v);
             assert!(
                 kinds(&events).contains(&EventKind::Network),
@@ -2784,14 +2839,15 @@ mod tests {
 
     #[test]
     fn cp_target_directory_flag_makes_positionals_sources() {
-        // `cp -t /dest DIR a .env`: `-t` makes `/dest` the write destination and
-        // EVERY positional a SOURCE. The last positional (`.env`) must NOT be flagged
-        // as a write target, or a real `cp -t` into a safe dir would fabricate a
-        // false SecretWrite (`.env`) / FileWrite (`package.json`) and the W7
-        // SecretWriteThenNetwork / DependencyChangeThenNetwork correlations with it.
+        // `cp -t /dest package.json .env`: `-t` makes `/dest` the destination DIR and
+        // EVERY positional a SOURCE, written to `/dest/<basename>`. The DIRECTORY
+        // basename must NOT itself be classified (so `cp -t .env src` / `cp -t
+        // package.json src` must not fabricate a SecretWrite/FileWrite), and a source
+        // operand must be flagged at its REAL target `/dest/<basename>`, not bare.
         let v = raw_verdict_with(Action::Allow, vec![], None);
-        // `/dest` is neither a secret nor a manifest, so nothing is recorded; the
-        // key assertion is that the source operands are not misread as destinations.
+        // `/dest` is neither a secret nor a manifest, so the source basenames join to
+        // `/dest/package.json` and `/dest/.env`; `.env` IS a secret, so a SecretWrite
+        // at that joined path is expected, but never a write keyed on `/dest` alone.
         for cmd in [
             "cp -t /dest package.json .env",
             "cp --target-directory=/dest package.json .env",
@@ -2801,17 +2857,61 @@ mod tests {
             "install -t /dest package.json .env",
         ] {
             let events = derive_typed_events(cmd, &v);
+            // The destination directory `/dest` must never be a write target.
             assert!(
                 !events.iter().any(|e| {
                     matches!(e.kind, EventKind::SecretWrite | EventKind::FileWrite)
-                        && matches!(
-                            e.metadata.get("path").map(String::as_str),
-                            Some(".env") | Some("package.json")
-                        )
+                        && e.metadata.get("path").map(String::as_str) == Some("/dest")
                 }),
-                "`{cmd}` must not flag a source operand as a write target: {events:?}"
+                "`{cmd}` must not flag the destination dir `/dest` as a write: {events:?}"
+            );
+            // The .env SOURCE is written to /dest/.env, which IS a secret target.
+            let secret = events.iter().find(|e| e.kind == EventKind::SecretWrite);
+            assert_eq!(
+                secret
+                    .and_then(|e| e.metadata.get("path"))
+                    .map(String::as_str),
+                Some("/dest/.env"),
+                "`{cmd}` must flag the joined source target /dest/.env: {events:?}"
             );
         }
+    }
+
+    #[test]
+    fn cp_target_directory_yields_directory_basename_not_a_write() {
+        // The reported regression: `cp -t .env src.txt` / `cp -t package.json src.txt`
+        // must NOT synthesize a secret/manifest write FROM THE DIRECTORY basename. The
+        // real write is `.env/src.txt` (basename `src.txt`, ordinary), so nothing is
+        // recorded; and a source whose basename IS a manifest joins onto the dir.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        // Directory basename is a secret/manifest, source is ordinary -> no event.
+        for cmd in ["cp -t .env src.txt", "cp -t package.json src.txt"] {
+            let events = derive_typed_events(cmd, &v);
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e.kind, EventKind::SecretWrite | EventKind::FileWrite)),
+                "`{cmd}` must not fabricate a write from the directory basename: {events:?}"
+            );
+        }
+        // A manifest SOURCE into a safe dir flags the joined manifest target.
+        let events = derive_typed_events("cp -t /backups package.json", &v);
+        let fw = events
+            .iter()
+            .find(|e| e.kind == EventKind::FileWrite)
+            .expect("cp -t /backups package.json must flag /backups/package.json");
+        assert_eq!(
+            fw.metadata.get("path").map(String::as_str),
+            Some("/backups/package.json"),
+            "the source basename must join onto the destination directory"
+        );
+        assert_eq!(
+            fw.metadata
+                .get(crate::event_buffer::MANIFEST_FLAG_KEY)
+                .map(String::as_str),
+            Some("true"),
+            "the joined manifest target must carry the manifest flag"
+        );
     }
 
     #[test]

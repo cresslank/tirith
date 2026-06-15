@@ -196,13 +196,14 @@ pub fn is_dependency_manifest(basename: &str) -> bool {
         "pipfile.lock",
         "gemfile.lock",
         "composer.lock",
+        // pnpm lockfile (both YAML extensions); matched EXACTLY like the others so
+        // a `contains("pnpm-lock")` does not also catch `notes-pnpm-lock-backup.txt`.
+        "pnpm-lock.yaml",
+        "pnpm-lock.yml",
+        "npm-shrinkwrap.json",
     ];
     let lower = basename.to_ascii_lowercase();
-    if EXACT.contains(&lower.as_str()) {
-        return true;
-    }
-    // Lockfile families whose prefix varies (pnpm-lock.yaml, npm-shrinkwrap.json).
-    lower.contains("pnpm-lock") || lower == "npm-shrinkwrap.json"
+    EXACT.contains(&lower.as_str())
 }
 
 /// Compute the RFC 3339 cutoff string for `now_rfc3339 - window_secs`. Returns
@@ -985,9 +986,14 @@ mod tests {
         assert!(is_dependency_manifest("requirements.txt"));
         assert!(is_dependency_manifest("go.mod"));
         assert!(is_dependency_manifest("pnpm-lock.yaml"));
+        assert!(is_dependency_manifest("pnpm-lock.yml"));
         assert!(is_dependency_manifest("package-lock.json"));
         assert!(!is_dependency_manifest("main.rs"));
         assert!(!is_dependency_manifest("README.md"));
+        // A `contains("pnpm-lock")` would wrongly match a backup-named file; the
+        // exact-match family must reject anything but the real lockfile basename.
+        assert!(!is_dependency_manifest("notes-pnpm-lock-backup.txt"));
+        assert!(!is_dependency_manifest("pnpm-lock.yaml.bak"));
     }
 
     #[test]
