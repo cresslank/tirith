@@ -28,6 +28,12 @@ fn scrub_ambient_env(c: &mut Command) -> &mut Command {
         // dependent. Scrub it here; tests that REQUIRE logging set TIRITH_LOG=1
         // explicitly.
         .env_remove("TIRITH_LOG")
+        // TIRITH_DEFER opts a non-critical `check` block into exit 4 (deferred,
+        // pending review) instead of exit 1, and writes pending state. An ambient
+        // `TIRITH_DEFER=1` would flip the exit code and persisted state of tests
+        // that are not exercising deferral. Scrub it; the defer tests set it
+        // explicitly.
+        .env_remove("TIRITH_DEFER")
 }
 
 /// A `tirith` command with the ambient policy / threat-DB / TTY-override env scrubbed (see
