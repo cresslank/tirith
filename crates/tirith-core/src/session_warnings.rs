@@ -226,7 +226,20 @@ pub fn load(session_id: &str) -> SessionWarnings {
         None => return SessionWarnings::new(session_id),
     };
 
-    let file = match fs::File::open(&path) {
+    // Open WITHOUT following a symlink (Unix). `load` is the PUBLIC read path used by
+    // `tirith warnings`; a symlink planted at the session JSON must not redirect the
+    // read to a foreign file (the writer path is already O_NOFOLLOW-hardened, so this
+    // closes the read side of the same surface). O_NOFOLLOW rejects a planted symlink
+    // atomically (ELOOP); any open error degrades to the empty accumulator, exactly
+    // as a missing file does.
+    let mut open_opts = OpenOptions::new();
+    open_opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match open_opts.open(&path) {
         Ok(f) => f,
         Err(_) => return SessionWarnings::new(session_id),
     };
@@ -1513,6 +1526,58 @@ mod tests {
             match prev_log {
                 Some(v) => std::env::set_var("TIRITH_LOG", v),
                 None => std::env::remove_var("TIRITH_LOG"),
+            }
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// Security: `load()` is the PUBLIC read path (`tirith warnings`). A SYMLINK
+    /// planted at the session JSON must NOT be followed to a foreign file; the
+    /// O_NOFOLLOW open refuses it and `load` returns a fresh (empty) accumulator, so
+    /// `tirith warnings` never renders an outside session's contents.
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_symlinked_session_file() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let sid = "symlink-read";
+            let path = session_state_path(sid).expect("session path");
+            let sessions_dir = path.parent().expect("sessions dir").to_path_buf();
+            std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+            // An OUTSIDE session JSON with a recognizable marker; the session path is
+            // a symlink to it. A FOLLOWED read would surface total_warnings = 4242.
+            let outside = dir.path().join("outside-session.json");
+            std::fs::write(
+                &outside,
+                r#"{"session_id":"foreign","session_start":"2020-01-01T00:00:00+00:00","total_warnings":4242,"events":[]}"#,
+            )
+            .expect("write outside session");
+            std::os::unix::fs::symlink(&outside, &path).expect("plant session symlink");
+
+            let loaded = load(sid);
+            assert_eq!(
+                loaded.total_warnings, 0,
+                "load() must refuse a symlinked session file, not surface the foreign session"
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
             }
         }
         if let Err(e) = result {
