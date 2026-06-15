@@ -217,50 +217,47 @@ fn session_lock_path(session_id: &str) -> Option<PathBuf> {
     })
 }
 
-/// Load session warnings from disk; empty accumulator on any error. Takes a
-/// shared lock so readers never observe the transient empty state during a
-/// `record_warning()` truncate+rewrite.
+/// Upper bound on a session JSON we will read. A real session (bounded warning
+/// events, cooldowns, and a 200-entry typed-event ring) is far smaller; the cap
+/// bounds the read so a malicious or runaway file is not slurped, and pairs with the
+/// regular-file + no-follow refusal in [`crate::util::read_text_no_follow_capped`].
+const SESSION_FILE_READ_CAP: u64 = 8 * 1024 * 1024;
+
+/// Load session warnings from disk; a fresh (empty) accumulator on any error.
+///
+/// Reads via [`crate::util::read_text_no_follow_capped`] (the same helper the policy
+/// and scan read paths use): O_NOFOLLOW refuses a symlinked session file, O_NONBLOCK
+/// plus an fd-based regular-file check refuses a FIFO / device / socket (so a planted
+/// non-regular file cannot hang `tirith warnings`), and a size cap refuses an
+/// oversized file before any read. `with_session_locked` writes via an atomic
+/// temp+rename, so a reader sees a complete old-or-new file and needs no shared lock
+/// to avoid a transient empty state.
 pub fn load(session_id: &str) -> SessionWarnings {
     let path = match session_state_path(session_id) {
         Some(p) => p,
         None => return SessionWarnings::new(session_id),
     };
 
-    // Open WITHOUT following a symlink (Unix). `load` is the PUBLIC read path used by
-    // `tirith warnings`; a symlink planted at the session JSON must not redirect the
-    // read to a foreign file (the writer path is already O_NOFOLLOW-hardened, so this
-    // closes the read side of the same surface). O_NOFOLLOW rejects a planted symlink
-    // atomically (ELOOP); any open error degrades to the empty accumulator, exactly
-    // as a missing file does.
-    let mut open_opts = OpenOptions::new();
-    open_opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        open_opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = match open_opts.open(&path) {
-        Ok(f) => f,
-        Err(_) => return SessionWarnings::new(session_id),
+    let bytes = match crate::util::read_text_no_follow_capped(&path, SESSION_FILE_READ_CAP) {
+        Ok(b) => b,
+        // Missing is the normal "no session yet" (silent).
+        Err(crate::util::OpenRegularError::NotFound) => return SessionWarnings::new(session_id),
+        // A symlink / FIFO / device / oversized / unreadable file: never block, never
+        // read a foreign inode; degrade to a fresh accumulator with a diagnostic.
+        Err(_) => {
+            crate::audit::audit_diagnostic(format!(
+                "tirith: session: refusing non-regular, oversized, or unreadable {}; using fresh state",
+                path.display()
+            ));
+            return SessionWarnings::new(session_id);
+        }
     };
-
-    if fs2::FileExt::lock_shared(&file).is_err() && fs2::FileExt::try_lock_shared(&file).is_err() {
+    if bytes.is_empty() {
         return SessionWarnings::new(session_id);
     }
-
-    use std::io::Read;
-    let mut content = String::new();
-    let result = (&file).read_to_string(&mut content);
-    let _ = fs2::FileExt::unlock(&file);
-
-    if result.is_err() || content.is_empty() {
-        return SessionWarnings::new(session_id);
-    }
-
-    serde_json::from_str::<SessionWarnings>(&content).unwrap_or_else(|e| {
+    serde_json::from_slice::<SessionWarnings>(&bytes).unwrap_or_else(|e| {
         crate::audit::audit_diagnostic(format!(
-            "tirith: session: corrupt state for '{}': {e} — resetting",
-            session_id
+            "tirith: session: corrupt state for '{session_id}': {e}; resetting"
         ));
         SessionWarnings::new(session_id)
     })
@@ -672,38 +669,19 @@ where
         return;
     }
 
-    // Read the existing session WHILE holding the lock, refusing to follow a symlink
-    // at `path` ATOMICALLY via O_NOFOLLOW. The earlier `symlink_metadata` pre-check is
-    // a fast reject, but a symlink planted between it and this open would be followed
-    // by a path-based `read_to_string`; the no-follow open closes that TOCTOU (a
-    // planted link is rejected by the open itself with ELOOP). A missing file is the
-    // normal "fresh session" case; a corrupt/empty read resets to a fresh accumulator;
-    // any other open failure refuses (fail closed) so a foreign inode is never read.
-    use std::io::Read as _;
-    let mut sess_opts = OpenOptions::new();
-    sess_opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        sess_opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    let content = match sess_opts.open(&path) {
-        Ok(mut f) => {
-            let mut s = String::new();
-            if let Err(e) = f.read_to_string(&mut s) {
-                crate::audit::audit_diagnostic(format!(
-                    "tirith: session: cannot read {}; resetting: {e}",
-                    path.display()
-                ));
-                String::new()
-            } else {
-                s
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
+    // Read the existing session WHILE holding the lock, via the no-follow + regular-
+    // file + size-capped helper. O_NOFOLLOW refuses a symlinked `path`, O_NONBLOCK plus
+    // an fstat regular-file check refuses a FIFO / device / socket (so a planted
+    // non-regular file cannot block the writer), and the cap bounds the read. A missing
+    // file is the normal "fresh session" case; any other refusal skips the mutation
+    // (fail closed; the lock is released when this function returns) rather than read or
+    // overwrite a foreign / non-regular file.
+    let content = match crate::util::read_text_no_follow_capped(&path, SESSION_FILE_READ_CAP) {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(crate::util::OpenRegularError::NotFound) => String::new(),
+        Err(_) => {
             crate::audit::audit_diagnostic(format!(
-                "tirith: session: refusing to open {} (possible symlink): {e}",
+                "tirith: session: refusing non-regular, oversized, or unreadable {}; recording skipped",
                 path.display()
             ));
             return;
@@ -1578,6 +1556,126 @@ mod tests {
             match prev_state {
                 Some(v) => std::env::set_var("XDG_STATE_HOME", v),
                 None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// Security: `load()` must refuse a NON-REGULAR session file (FIFO / device /
+    /// socket) and never block. A FIFO at the session path would hang a plain blocking
+    /// read; the no-follow + O_NONBLOCK + regular-file helper returns immediately and
+    /// `load` yields a fresh accumulator. (This test would HANG if the fix regressed.)
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_fifo_session_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let sid = "fifo-read";
+            let path = session_state_path(sid).expect("session path");
+            let sessions_dir = path.parent().expect("sessions dir").to_path_buf();
+            std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+            // Plant a FIFO at the session path; a blocking read would hang here.
+            let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("cstring");
+            assert_eq!(
+                unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+                0,
+                "mkfifo failed"
+            );
+
+            let loaded = load(sid);
+            assert_eq!(
+                loaded.total_warnings, 0,
+                "a FIFO session file must yield a fresh accumulator, not hang or be read"
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// Security: `with_session_locked` (the writer path) must likewise refuse a
+    /// NON-REGULAR session file, so a planted FIFO cannot block `record_warning` /
+    /// `suppress_check`. The mutation is skipped (no hang; the FIFO is not written
+    /// through and the path stays a FIFO).
+    #[cfg(unix)]
+    #[test]
+    fn with_session_locked_refuses_fifo_session_file() {
+        use crate::event_buffer::{EventKind, TypedEvent};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_log = std::env::var("TIRITH_LOG").ok();
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let sid = "fifo-write";
+            let path = session_state_path(sid).expect("session path");
+            let sessions_dir = path.parent().expect("sessions dir").to_path_buf();
+            std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+            let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("cstring");
+            assert_eq!(
+                unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+                0,
+                "mkfifo failed"
+            );
+
+            record_typed_event(
+                sid,
+                TypedEvent::new(
+                    &chrono::Utc::now().to_rfc3339(),
+                    EventKind::Network,
+                    "network_egress",
+                ),
+            );
+
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .expect("path meta")
+                    .file_type()
+                    .is_fifo(),
+                "the session path must remain the (refused) FIFO; the mutation was skipped"
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("TIRITH_LOG", v),
+                None => std::env::remove_var("TIRITH_LOG"),
             }
         }
         if let Err(e) = result {
