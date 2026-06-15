@@ -47,9 +47,67 @@ blocklist: []
 #     min_findings: 3
 #     action: block
 
-# Glob patterns to ignore during scan
+# Scan configuration overrides.
 scan:
+  # Glob patterns to ignore during scan
   ignore_patterns: []
+
+  # MCP server names you trust. A name listed here suppresses every
+  # per-server MCP config finding (insecure transport, raw IP, suspicious
+  # args, wildcard tools, duplicate name) and exempts the server from
+  # drift detection via `tirith mcp verify` / the `mcp_server_drift` rule.
+  # Run `tirith mcp policy init` to scaffold this list from `.tirith/mcp.lock`.
+  # trusted_mcp_servers:
+  #   - my-trusted-server
+
+  # Per-server allowed tools. Keys are MCP server names; values are the
+  # tool names that server may expose. A tool the lockfile records that
+  # is NOT in this set raises a High-severity `mcp_server_drift` finding,
+  # and drift that adds a tool outside the set upgrades the drift finding
+  # from Medium to High. Servers not listed here are unconstrained.
+  # mcp_allowed_tools:
+  #   my-trusted-server:
+  #     - read_only
+
+# Per-agent governance rules — M4 item 8 (enforcement).
+#
+# `agent_rules` lets a policy declare which AgentOrigin variants it
+# allows or denies, where `AgentOrigin` is the recorded caller — Human,
+# Agent, Mcp, Gateway, Ci, or Ide. A `deny` match forces the verdict to
+# Block and appends an `agent_denied_by_policy` finding naming the
+# matched origin and policy file; a `deny` entry beats any matching
+# `allow` entry, mirroring how `blocklist` beats `allowlist`. `allow`
+# is NOT a bypass — a verdict the engine already blocked stays blocked
+# even if the caller is on the allow list. See `rule_explanations.toml`
+# (`agent_denied_by_policy`) for the operator-facing description.
+#
+# Enforcement scope: `apply_agent_rules` runs on every analysis path —
+# `tirith check`, the gateway request / notification paths, `tirith
+# paste`, `tirith install`, `tirith ecosystem scan`, and all MCP
+# `tools/call_check_*` handlers (`call_check_command`, `call_check_url`,
+# `call_check_paste`). The interactive `TIRITH=0` bypass currently
+# skips `apply_agent_rules` (pinned by
+# `agent_rules_deny_skipped_under_tirith_bypass_today`); revisit that
+# semantic in M5.
+#
+# Trust caveat: every signal feeding AgentOrigin is OPERATOR-TRUST,
+# never adversary-resistant — TIRITH_INTEGRATION, MCP clientInfo, CI
+# env vars are all settable by any process running as the user. Use
+# `agent_rules` for operator-trust scoping ("I do not run my MCP
+# server's commands on traffic my CI ran"), not adversarial security;
+# layer real authentication elsewhere if the decision must withstand a
+# hostile environment.
+#
+# Run `tirith agent policy init` to scaffold this block from the local
+# audit log's observed origins.
+# agent_rules:
+#   allow:
+#     - kind: agent
+#       name: claude-code
+#     - kind: human
+#   deny:
+#     - kind: agent
+#       name: untrusted-tool
 "#;
 
 const MINIMAL_TEMPLATE: &str = r#"fail_mode: open
@@ -58,183 +116,62 @@ allowlist: []
 blocklist: []
 "#;
 
-/// `individual` — sensible defaults for a single developer on their own machine.
-/// Stays out of the way (fail-open, paranoia 1) but escalates the noisiest
-/// pipe-to-shell rule and ships an empty allowlist ready to fill in.
-const TEMPLATE_INDIVIDUAL: &str = r#"# Tirith security policy — "individual" template
-# Sensible defaults for a single developer on their own machine.
-# Documentation: https://tirith.dev/docs/policy
+/// `individual` — defaults for a single developer (fail-open, paranoia 1, the
+/// noisiest pipe-to-shell rule escalated, empty allowlist). Body lives in
+/// `assets/policy_templates/individual.yaml`, resolved via `include_str!` so the
+/// on-disk `.yaml` is the single source of truth (shared with the validity test).
+const TEMPLATE_INDIVIDUAL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/policy_templates/individual.yaml"
+));
 
-# Fail mode: "open" (allow on error) keeps tirith out of your way if it
-# ever fails internally. A solo machine does not need fail-closed.
-fail_mode: open
+/// `ci-strict` — locked-down CI settings: fail-closed, no bypass, strict warn,
+/// and a `scan.fail_on` threshold that fails the build on high-severity findings.
+const TEMPLATE_CI_STRICT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/policy_templates/ci-strict.yaml"
+));
 
-# Paranoia level (1-4): 1 is the recommended default for daily use.
-paranoia: 1
+/// `ai-agent-heavy` — for environments where AI agents run many commands.
+/// Fail-open (so an agent isn't wedged by an internal error) but raised
+/// paranoia, no non-interactive bypass, approval for the highest-risk rules, and
+/// escalation on repeated warnings.
+const TEMPLATE_AI_AGENT_HEAVY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/policy_templates/ai-agent-heavy.yaml"
+));
 
-# Allow the per-command `TIRITH=0` bypass in interactive terminals — handy
-# when you knowingly run something tirith flags.
-allow_bypass_env: true
+/// `oss-maintainer` — for a public OSS repo maintainer. Moderate (paranoia 2,
+/// fail-open) with the untrusted-contributor threat model in focus: typosquat,
+/// install-script, and untrusted-registry rules escalated.
+const TEMPLATE_OSS_MAINTAINER: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/policy_templates/oss-maintainer.yaml"
+));
 
-# Do NOT allow the bypass in non-interactive shells (scripts, CI-like runs).
-allow_bypass_env_noninteractive: false
+/// `startup` — for a small fast team: a notch stricter than `individual`
+/// (paranoia 2, strict-warn on, noisiest pipe-to-shell rules escalated) but not
+/// fail-closed.
+const TEMPLATE_STARTUP: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/policy_templates/startup.yaml"
+));
 
-# Warn findings are shown but do not require an explicit acknowledgement.
-strict_warn: false
+/// `enterprise` — strict, audit-friendly defaults: fail-closed, no bypass,
+/// paranoia 3, and (uniquely) an ACTIVE `package_policy:` block with strict
+/// supply-chain thresholds out of the box.
+const TEMPLATE_ENTERPRISE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/policy_templates/enterprise.yaml"
+));
 
-# Severity overrides per rule. shortened_url is upgraded so link-shortened
-# install URLs stand out; everything else keeps its built-in severity.
-severity_overrides:
-  shortened_url: HIGH
-
-# URL / host patterns that always pass analysis. Add the install sources you
-# trust here instead of reaching for `TIRITH=0`. Examples:
-#   - "sh.rustup.rs"
-#   - "get.docker.com"
-allowlist: []
-
-# URL / host patterns that are always blocked (overrides allowlist).
-blocklist: []
-
-# Per-rule allowlist scoping — trust a source for ONE rule only.
-# allowlist_rules:
-#   - rule_id: curl_pipe_shell
-#     patterns:
-#       - "get.docker.com"
-
-# Glob patterns to ignore during `tirith scan`.
-scan:
-  ignore_patterns:
-    - "node_modules"
-    - "target"
-    - ".git"
-"#;
-
-/// `ci-strict` — locked-down settings for an automated CI environment.
-/// Fail-closed, no bypass at all, strict warn handling, and a `scan.fail_on`
-/// threshold so `tirith scan` fails the build on high-severity findings.
-const TEMPLATE_CI_STRICT: &str = r#"# Tirith security policy — "ci-strict" template
-# Locked-down settings for an automated CI environment.
-# Documentation: https://tirith.dev/docs/policy
-
-# Fail mode: "closed" — if tirith cannot evaluate a command it blocks rather
-# than allowing it. CI should never silently let an unanalysed command run.
-fail_mode: closed
-
-# Paranoia level (1-4): 2 enables stricter detection than the daily default.
-paranoia: 2
-
-# Disable the `TIRITH=0` bypass entirely — interactive AND non-interactive.
-# A bypass in CI is a permanent hole, so neither form is permitted.
-allow_bypass_env: false
-allow_bypass_env_noninteractive: false
-
-# Require explicit acknowledgement for warn findings. In non-interactive CI
-# this means a warn cannot be silently passed through.
-strict_warn: true
-
-# Escalate the most common remote-execution rules to CRITICAL so they are
-# unmistakable in CI logs.
-severity_overrides:
-  shortened_url: HIGH
-  plain_http_to_sink: CRITICAL
-  curl_pipe_shell: CRITICAL
-  wget_pipe_shell: CRITICAL
-  pipe_to_interpreter: HIGH
-
-# Force specific rules to always block, regardless of their default action.
-# Only "block" is supported (escalation can upgrade, never downgrade).
-action_overrides:
-  shortened_url: block
-
-# URL / host patterns that always pass analysis. Keep this list short and
-# reviewed — every entry is a trusted hole in CI.
-allowlist: []
-
-# URL / host patterns that are always blocked (overrides allowlist).
-blocklist: []
-
-# `tirith scan` configuration. fail_on sets the severity threshold at which
-# a scan exits non-zero and fails the CI job.
-scan:
-  fail_on: high
-  ignore_patterns:
-    - "node_modules"
-    - "target"
-    - ".git"
-"#;
-
-/// `ai-agent-heavy` — tuned for environments where AI agents run many
-/// commands. Keeps fail-open so an agent is not wedged by an internal error,
-/// but raises paranoia, disables the non-interactive bypass (an agent must not
-/// be able to bypass tirith), requires approval for the highest-risk rules,
-/// and escalates on repeated warnings.
-const TEMPLATE_AI_AGENT_HEAVY: &str = r#"# Tirith security policy — "ai-agent-heavy" template
-# Tuned for environments where AI agents run many shell commands.
-# Documentation: https://tirith.dev/docs/policy
-
-# Fail mode: "open" — an internal tirith error should not wedge an agent
-# mid-task. Risk is managed below via paranoia, approval, and escalation.
-fail_mode: open
-
-# Paranoia level (1-4): 3 — agents paste and run far more untrusted input
-# than a human, so detection is turned up.
-paranoia: 3
-
-# A human may bypass interactively, but an AI agent (non-interactive) must
-# never be able to set TIRITH=0 to skip analysis.
-allow_bypass_env: true
-allow_bypass_env_noninteractive: false
-
-# Require explicit acknowledgement for warn findings.
-strict_warn: true
-
-# Escalate remote-execution and Docker-registry rules — the patterns agents
-# most often produce from hallucinated or copy-pasted instructions.
-severity_overrides:
-  curl_pipe_shell: CRITICAL
-  wget_pipe_shell: CRITICAL
-  pipe_to_interpreter: HIGH
-  shortened_url: HIGH
-  docker_untrusted_registry: HIGH
-
-# Approval rules: a command matching any listed rule pauses for human
-# approval before it runs. fallback is what happens on timeout.
-approval_rules:
-  - rule_ids:
-      - curl_pipe_shell
-      - wget_pipe_shell
-      - pipe_to_interpreter
-    timeout_secs: 120
-    fallback: block
-
-# Escalation: upgrade to a block when an agent keeps re-trying flagged work.
-escalation:
-  # Block any rule that fires 5+ times within an hour.
-  - trigger: repeat_count
-    rule_ids: ["*"]
-    threshold: 5
-    window_minutes: 60
-    action: block
-  # Block when one command produces 3+ medium-or-higher findings at once.
-  - trigger: multi_medium
-    min_findings: 3
-    action: block
-
-# URL / host patterns that always pass analysis. Keep this list tight — an
-# over-broad allowlist lets an agent route around tirith.
-allowlist: []
-
-# URL / host patterns that are always blocked (overrides allowlist).
-blocklist: []
-
-# Glob patterns to ignore during `tirith scan`.
-scan:
-  ignore_patterns:
-    - "node_modules"
-    - "target"
-    - ".git"
-"#;
+/// `mcp-strict` — locked-down for MCP-heavy environments: fail-closed,
+/// paranoia 3, every MCP config rule (insecure / untrusted / overly-permissive /
+/// suspicious-args / drift) escalated.
+const TEMPLATE_MCP_STRICT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/policy_templates/mcp-strict.yaml"
+));
 
 /// A curated starter policy selected via `tirith policy init --template`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,16 +179,63 @@ pub enum PolicyTemplate {
     Individual,
     CiStrict,
     AiAgentHeavy,
+    OssMaintainer,
+    Startup,
+    Enterprise,
+    McpStrict,
 }
 
 impl PolicyTemplate {
-    /// Parse a `--template` value. Returns `None` for an unrecognized name.
+    /// Every variant, in canonical display order. The single source of truth for
+    /// "which templates exist" (R20): the `--template` help list is built from
+    /// this via [`PolicyTemplate::canonical_name`], so it can never go stale.
+    pub const ALL: &'static [PolicyTemplate] = &[
+        Self::Individual,
+        Self::CiStrict,
+        Self::AiAgentHeavy,
+        Self::OssMaintainer,
+        Self::Startup,
+        Self::Enterprise,
+        Self::McpStrict,
+    ];
+
+    /// Comma-separated canonical template names for help/error text, derived from
+    /// [`PolicyTemplate::ALL`] so it stays in lock-step with the enum.
+    fn names_csv() -> String {
+        Self::ALL
+            .iter()
+            .map(|t| t.canonical_name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Parse a `--template` value (`None` if unrecognized). `personal` is an alias
+    /// for `individual` (the shipping name); both resolve to the same body.
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
-            "individual" => Some(Self::Individual),
+            "individual" | "personal" => Some(Self::Individual),
             "ci-strict" | "ci_strict" => Some(Self::CiStrict),
             "ai-agent-heavy" | "ai_agent_heavy" => Some(Self::AiAgentHeavy),
+            "oss-maintainer" | "oss_maintainer" => Some(Self::OssMaintainer),
+            "startup" => Some(Self::Startup),
+            "enterprise" => Some(Self::Enterprise),
+            "mcp-strict" | "mcp_strict" => Some(Self::McpStrict),
             _ => None,
+        }
+    }
+
+    /// The canonical hyphenated name. Round-trips through [`PolicyTemplate::parse`]
+    /// so `tirith onboard` can pass it to `policy init --template <name>`. The
+    /// `personal` alias maps to `Individual`, so its canonical name is `individual`.
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Individual => "individual",
+            Self::CiStrict => "ci-strict",
+            Self::AiAgentHeavy => "ai-agent-heavy",
+            Self::OssMaintainer => "oss-maintainer",
+            Self::Startup => "startup",
+            Self::Enterprise => "enterprise",
+            Self::McpStrict => "mcp-strict",
         }
     }
 
@@ -261,19 +245,24 @@ impl PolicyTemplate {
             Self::Individual => TEMPLATE_INDIVIDUAL,
             Self::CiStrict => TEMPLATE_CI_STRICT,
             Self::AiAgentHeavy => TEMPLATE_AI_AGENT_HEAVY,
+            Self::OssMaintainer => TEMPLATE_OSS_MAINTAINER,
+            Self::Startup => TEMPLATE_STARTUP,
+            Self::Enterprise => TEMPLATE_ENTERPRISE,
+            Self::McpStrict => TEMPLATE_MCP_STRICT,
         }
     }
 }
 
 pub fn init(force: bool, minimal: bool, template: Option<&str>) -> i32 {
-    // Resolve the template selection before touching the filesystem so a typo
-    // fails fast with the list of valid names.
+    // Resolve the template before touching the filesystem so a typo fails fast.
     let selected_template = match template {
         Some(name) => match PolicyTemplate::parse(name) {
             Some(t) => Some(t),
             None => {
                 eprintln!("tirith policy init: unknown template '{name}'");
-                eprintln!("  valid templates: individual, ci-strict, ai-agent-heavy");
+                // Derived from `PolicyTemplate::ALL` so it can't drift (R20).
+                eprintln!("  valid templates: {}", PolicyTemplate::names_csv());
+                eprintln!("  ('personal' is accepted as an alias of 'individual')");
                 return 1;
             }
         },
@@ -295,7 +284,7 @@ fn init_with_template(force: bool, minimal: bool, template: Option<PolicyTemplat
     let repo_root = match tirith_core::policy::find_repo_root(cwd.as_deref()) {
         Some(r) => r,
         None => {
-            // No git repo — fall back to cwd so `tirith policy init` still works.
+            // No git repo — fall back to cwd.
             match std::env::current_dir() {
                 Ok(d) => d,
                 Err(e) => {
@@ -317,12 +306,19 @@ fn init_with_template(force: bool, minimal: bool, template: Option<PolicyTemplat
         return 1;
     }
 
+    // If we create `.tirith` on a fresh repo, its new entry in `repo_root` must be
+    // fsync'd too, or a crash could lose it — `write_file_atomic` only fsyncs
+    // `.tirith` (policy.yaml's parent), not `repo_root`. CodeRabbit R13b.
+    let tirith_dir_existed = tirith_dir.exists();
     if let Err(e) = std::fs::create_dir_all(&tirith_dir) {
         eprintln!(
             "tirith policy init: cannot create {}: {e}",
             tirith_dir.display()
         );
         return 1;
+    }
+    if !tirith_dir_existed {
+        tirith_core::util::fsync_parent_dir_logged(&tirith_dir, "policy .tirith directory");
     }
 
     let template_body = match (template, minimal) {
@@ -331,7 +327,11 @@ fn init_with_template(force: bool, minimal: bool, template: Option<PolicyTemplat
         (None, false) => FULL_TEMPLATE,
     };
 
-    if let Err(e) = std::fs::write(&policy_path, template_body) {
+    // Write the policy ATOMICALLY (temp → fsync → rename → parent fsync), so a
+    // crash mid-write never loses the prior policy. Without `--force`,
+    // `overwrite=false` makes it no-clobber, so a policy created in the race window
+    // after the `exists()` check surfaces as a write error instead of being lost.
+    if let Err(e) = super::write_file_atomic(&policy_path, template_body.as_bytes(), force) {
         eprintln!(
             "tirith policy init: cannot write {}: {e}",
             policy_path.display()
@@ -343,6 +343,10 @@ fn init_with_template(force: bool, minimal: bool, template: Option<PolicyTemplat
         Some(PolicyTemplate::Individual) => " (individual template)",
         Some(PolicyTemplate::CiStrict) => " (ci-strict template)",
         Some(PolicyTemplate::AiAgentHeavy) => " (ai-agent-heavy template)",
+        Some(PolicyTemplate::OssMaintainer) => " (oss-maintainer template)",
+        Some(PolicyTemplate::Startup) => " (startup template)",
+        Some(PolicyTemplate::Enterprise) => " (enterprise template)",
+        Some(PolicyTemplate::McpStrict) => " (mcp-strict template)",
         None if minimal => " (minimal template)",
         None => "",
     };
@@ -491,6 +495,8 @@ fn test_command(command: &str, json: bool) -> i32 {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
+        clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
 
     let mut verdict = engine::analyze(&ctx);
@@ -515,10 +521,16 @@ fn test_file(file_path: &str, json: bool) -> i32 {
         return 1;
     }
 
-    let result = match scan::scan_single_file(&path) {
-        Some(r) => r,
-        None => {
+    // Guarded so a crafted file that panics a rule reports an error instead of
+    // crashing the process.
+    let result = match scan::scan_single_file_guarded(&path) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
             eprintln!("tirith policy test: could not read file: {file_path}");
+            return 1;
+        }
+        Err(scan::RulePanic) => {
+            eprintln!("tirith policy test: internal error scanning {file_path}: a rule panicked");
             return 1;
         }
     };
@@ -537,19 +549,14 @@ fn test_file(file_path: &str, json: bool) -> i32 {
     if result.findings.is_empty() {
         0
     } else if result.findings.iter().any(|f| f.severity >= Severity::High) {
-        // Block-equivalent exit code for high+ severity.
-        1
+        1 // block-equivalent
     } else {
-        // Warn-equivalent exit code for medium/low severity.
-        2
+        2 // warn-equivalent
     }
 }
 
-/// Run `tirith policy tune --from-audit`.
-///
-/// Reads the local audit log, rolls up per-rule statistics, and prints
-/// conservative, deterministic tuning suggestions. It never edits the policy —
-/// the user reviews each suggestion and applies it by hand.
+/// Run `tirith policy tune --from-audit`: roll up per-rule audit-log statistics
+/// and print deterministic tuning suggestions. Never edits the policy.
 pub fn tune(from_audit: bool, json: bool) -> i32 {
     if !from_audit {
         eprintln!("tirith policy tune: specify a source — currently only --from-audit");
@@ -577,10 +584,8 @@ pub fn tune(from_audit: bool, json: bool) -> i32 {
     let result = match tirith_core::audit_aggregator::read_log(&log_path) {
         Ok(r) => r,
         Err(e) => {
-            // `read_log` only fails on an I/O error reading the file (malformed
-            // JSONL lines are skipped, not errored), so name the path and the
-            // likely cause. Re-probe the file to distinguish a permissions
-            // problem — the one a user can actually act on — from other I/O.
+            // `read_log` only fails on an I/O error (malformed lines are skipped),
+            // so re-probe to distinguish an actionable permissions problem.
             eprintln!(
                 "tirith policy tune: could not read the audit log at {}",
                 log_path.display()
@@ -610,7 +615,7 @@ pub fn tune(from_audit: bool, json: bool) -> i32 {
         );
     }
 
-    // Every rule tirith can emit — used to point out rules that never fired.
+    // Every rule tirith can emit — to point out rules that never fired.
     let known_rules: Vec<&str> = tirith_core::rule_explanations::list_all()
         .iter()
         .map(|r| r.id)
@@ -676,6 +681,140 @@ fn print_tune_human(report: &tirith_core::audit_tune::TuneReport) {
     }
 
     eprintln!("  tirith did not change your policy. Apply any suggestion by editing your .tirith/policy.yaml.");
+}
+
+/// The fully-resolved local policy plus its provenance, as gathered for
+/// `tirith policy effective`. Factored out of [`effective`] so the gathering is
+/// unit-testable without capturing stdout (the rendering is a thin function of
+/// these fields).
+struct EffectivePolicy {
+    /// Source file the policy was loaded from, or `None` for built-in defaults.
+    source_path: Option<String>,
+    /// Discovery scope (which branch matched) — drives the trust framing below.
+    scope: tirith_core::policy::PolicyScope,
+    /// The resolved policy itself (repo-scope sanitization already applied).
+    policy: Policy,
+}
+
+/// Map a [`PolicyScope`] to its lowercase label for output. The single mapping
+/// point shared by both the JSON `scope` field and the human framing.
+///
+/// [`PolicyScope`]: tirith_core::policy::PolicyScope
+fn scope_label(scope: tirith_core::policy::PolicyScope) -> &'static str {
+    scope.as_str()
+}
+
+/// Gather the effective local policy for `cwd`: its source path + scope (via
+/// [`discover_local_policy_path_scoped`]) and the fully-resolved policy (via
+/// [`Policy::discover_local_only`], which runs LOCAL resolution + repo-scope
+/// sanitize and NEVER fetches remotely). Discovery-only; no network.
+///
+/// [`discover_local_policy_path_scoped`]: tirith_core::policy::discover_local_policy_path_scoped
+fn gather_effective(cwd: Option<&str>) -> EffectivePolicy {
+    let (source_path, scope) = match tirith_core::policy::discover_local_policy_path_scoped(cwd) {
+        Some((path, scope)) => (Some(path.display().to_string()), scope),
+        None => (None, tirith_core::policy::PolicyScope::Default),
+    };
+    let policy = Policy::discover_local_only(cwd);
+    EffectivePolicy {
+        source_path,
+        scope,
+        policy,
+    }
+}
+
+/// `tirith policy effective` — a transparency surface that prints the FULLY-
+/// RESOLVED effective policy for the current directory, where it came from, and
+/// (for a repo-scoped policy) which weakening fields were neutralized down to
+/// tightening-only. Discovery-only: no path argument, no network fetch (uses
+/// [`Policy::discover_local_only`], not [`Policy::discover`]).
+pub fn effective(json: bool) -> i32 {
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+
+    let info = gather_effective(cwd.as_deref());
+
+    if json {
+        print_effective_json(&info)
+    } else {
+        print_effective_human(&info)
+    }
+}
+
+fn print_effective_json(info: &EffectivePolicy) -> i32 {
+    #[derive(serde::Serialize)]
+    struct Output<'a> {
+        source_path: Option<&'a str>,
+        scope: &'a str,
+        neutralized_fields: &'a [&'static str],
+        policy: &'a Policy,
+    }
+
+    let output = Output {
+        source_path: info.source_path.as_deref(),
+        scope: scope_label(info.scope),
+        neutralized_fields: &info.policy.neutralized_fields,
+        policy: &info.policy,
+    };
+
+    if super::write_json_stdout(
+        &output,
+        "tirith policy effective: failed to write JSON output",
+    ) {
+        0
+    } else {
+        1
+    }
+}
+
+fn print_effective_human(info: &EffectivePolicy) -> i32 {
+    use tirith_core::policy::PolicyScope;
+
+    eprintln!(
+        "tirith policy effective: source = {}",
+        info.source_path
+            .as_deref()
+            .unwrap_or("(none — built-in defaults)")
+    );
+    eprintln!("  scope: {}", scope_label(info.scope));
+    eprintln!();
+
+    // Render the resolved policy as readable YAML (the crate already depends on
+    // serde_yaml; the policy is `Serialize`). On the unlikely serialize error,
+    // fall back to a note rather than failing the command — the provenance and
+    // neutralization sections below are the load-bearing transparency output.
+    match serde_yaml::to_string(&info.policy) {
+        Ok(yaml) => {
+            eprintln!("  effective policy:");
+            for line in yaml.lines() {
+                eprintln!("    {line}");
+            }
+        }
+        Err(e) => {
+            eprintln!("  (could not render effective policy as YAML: {e})");
+        }
+    }
+    eprintln!();
+
+    let neutralized = &info.policy.neutralized_fields;
+    match info.scope {
+        PolicyScope::Repo if !neutralized.is_empty() => {
+            eprintln!(
+                "  Neutralized (this repo policy is tightening-only; these weakening fields \
+                 were ignored): {}",
+                neutralized.join(", ")
+            );
+        }
+        PolicyScope::Repo => {
+            eprintln!("  No weakening fields — this repo policy only tightens.");
+        }
+        _ => {
+            eprintln!("  Operator-scoped policy — all fields honored (nothing neutralized).");
+        }
+    }
+
+    0
 }
 
 #[derive(serde::Serialize)]
@@ -838,11 +977,9 @@ fn resolve_policy_path(explicit: Option<&str>) -> Option<PathBuf> {
         return None;
     }
 
-    // Existence-based local discovery — the same resolver the engine and
-    // `doctor` use. `Policy::discover` would parse the policy and, on a parse
-    // error, drop the path, so `validate` could not even locate a corrupt
-    // policy to report on; it would also resolve to an unreadable `remote:` URL
-    // when a remote policy server is configured.
+    // Existence-based local discovery (same resolver engine/`doctor` use).
+    // `Policy::discover` would drop the path on a parse error, so `validate` could
+    // not locate a corrupt policy to report on, and could resolve a `remote:` URL.
     tirith_core::policy::discover_local_policy_path(None)
 }
 
@@ -851,9 +988,9 @@ mod tests {
     use super::*;
     use tirith_core::policy_validate::{self, IssueLevel};
 
-    /// Every curated template must pass `tirith policy validate` cleanly —
-    /// no errors AND no warnings (warnings include the unknown-field typo
-    /// guard, so this also proves every key is a real schema key).
+    /// Every curated template must validate cleanly — no errors AND no warnings
+    /// (warnings include the unknown-field typo guard, so this proves every key
+    /// is a real schema key).
     fn assert_template_valid(name: &str, body: &str) {
         let issues = policy_validate::validate(body);
         let errors: Vec<_> = issues
@@ -880,6 +1017,33 @@ mod tests {
         assert_template_valid("individual", TEMPLATE_INDIVIDUAL);
     }
 
+    // R20: the help/error list is derived from `PolicyTemplate::ALL`, so assert
+    // the CSV contains every canonical name and each round-trips through `parse`.
+    #[test]
+    fn template_names_csv_covers_every_variant() {
+        let csv = PolicyTemplate::names_csv();
+        for t in PolicyTemplate::ALL {
+            let name = t.canonical_name();
+            assert!(
+                csv.split(", ").any(|n| n == name),
+                "names_csv ({csv:?}) must list the canonical name {name:?} for {t:?}"
+            );
+        }
+        // Every comma-separated entry is a real, parseable canonical name.
+        for entry in csv.split(", ") {
+            assert!(
+                PolicyTemplate::parse(entry).is_some(),
+                "names_csv entry {entry:?} must parse back to a PolicyTemplate variant"
+            );
+        }
+        // The count matches: no duplicates, no extras.
+        assert_eq!(
+            csv.split(", ").count(),
+            PolicyTemplate::ALL.len(),
+            "names_csv must have exactly one entry per variant"
+        );
+    }
+
     #[test]
     fn ci_strict_template_validates() {
         assert_template_valid("ci-strict", TEMPLATE_CI_STRICT);
@@ -888,6 +1052,26 @@ mod tests {
     #[test]
     fn ai_agent_heavy_template_validates() {
         assert_template_valid("ai-agent-heavy", TEMPLATE_AI_AGENT_HEAVY);
+    }
+
+    #[test]
+    fn oss_maintainer_template_validates() {
+        assert_template_valid("oss-maintainer", TEMPLATE_OSS_MAINTAINER);
+    }
+
+    #[test]
+    fn startup_template_validates() {
+        assert_template_valid("startup", TEMPLATE_STARTUP);
+    }
+
+    #[test]
+    fn enterprise_template_validates() {
+        assert_template_valid("enterprise", TEMPLATE_ENTERPRISE);
+    }
+
+    #[test]
+    fn mcp_strict_template_validates() {
+        assert_template_valid("mcp-strict", TEMPLATE_MCP_STRICT);
     }
 
     #[test]
@@ -919,6 +1103,60 @@ mod tests {
             PolicyTemplate::parse(" ai_agent_heavy "),
             Some(PolicyTemplate::AiAgentHeavy)
         );
+        // M13 ch2 — the four new templates.
+        assert_eq!(
+            PolicyTemplate::parse("oss-maintainer"),
+            Some(PolicyTemplate::OssMaintainer)
+        );
+        assert_eq!(
+            PolicyTemplate::parse("oss_maintainer"),
+            Some(PolicyTemplate::OssMaintainer)
+        );
+        assert_eq!(
+            PolicyTemplate::parse("startup"),
+            Some(PolicyTemplate::Startup)
+        );
+        assert_eq!(
+            PolicyTemplate::parse("Enterprise"),
+            Some(PolicyTemplate::Enterprise)
+        );
+        assert_eq!(
+            PolicyTemplate::parse("mcp-strict"),
+            Some(PolicyTemplate::McpStrict)
+        );
+        assert_eq!(
+            PolicyTemplate::parse("mcp_strict"),
+            Some(PolicyTemplate::McpStrict)
+        );
+    }
+
+    #[test]
+    fn template_parse_personal_is_alias_for_individual() {
+        // `personal` is the spec word; `individual` is the shipping name. The
+        // alias resolves to the same variant — and therefore the same body.
+        assert_eq!(
+            PolicyTemplate::parse("personal"),
+            Some(PolicyTemplate::Individual)
+        );
+        assert_eq!(
+            PolicyTemplate::parse(" PERSONAL "),
+            Some(PolicyTemplate::Individual)
+        );
+        // The alias' canonical name is the shipping name, so `tirith onboard`
+        // never emits `personal`.
+        assert_eq!(
+            PolicyTemplate::parse("personal").unwrap().canonical_name(),
+            "individual"
+        );
+        // Byte-for-byte: the alias writes exactly the individual body.
+        assert_eq!(
+            PolicyTemplate::parse("personal").unwrap().body(),
+            TEMPLATE_INDIVIDUAL
+        );
+        assert_eq!(
+            PolicyTemplate::Individual.body(),
+            PolicyTemplate::parse("personal").unwrap().body()
+        );
     }
 
     #[test]
@@ -927,6 +1165,96 @@ mod tests {
         assert_eq!(PolicyTemplate::parse("windows-enterprise"), None);
         assert_eq!(PolicyTemplate::parse(""), None);
         assert_eq!(PolicyTemplate::parse("default"), None);
+    }
+
+    /// Every template body must deserialize through the same
+    /// `serde_yaml::from_str::<Policy>` path `Policy::load` uses (not just the
+    /// validator).
+    #[test]
+    fn all_templates_deserialize_into_policy() {
+        // Iterate `PolicyTemplate::ALL` (R20) so a new template is auto-covered.
+        for t in PolicyTemplate::ALL {
+            let body = t.body();
+            let parsed: Result<tirith_core::policy::Policy, _> = serde_yaml::from_str(body);
+            assert!(
+                parsed.is_ok(),
+                "{} template must deserialize into Policy: {:?}",
+                t.canonical_name(),
+                parsed.err()
+            );
+        }
+    }
+
+    #[test]
+    fn oss_maintainer_template_is_moderate_fail_open() {
+        // Contract of oss-maintainer: moderate (paranoia 2), still fail-open,
+        // and a human may bypass interactively.
+        let p: tirith_core::policy::Policy = serde_yaml::from_str(TEMPLATE_OSS_MAINTAINER).unwrap();
+        assert_eq!(p.fail_mode, tirith_core::policy::FailMode::Open);
+        assert_eq!(p.paranoia, 2);
+        assert!(p.allow_bypass_env);
+        assert!(!p.allow_bypass_env_noninteractive);
+    }
+
+    #[test]
+    fn startup_template_is_balanced_strict_warn() {
+        // Contract of startup: a notch stricter than individual — paranoia 2,
+        // strict-warn on, fail-open, no non-interactive bypass.
+        let p: tirith_core::policy::Policy = serde_yaml::from_str(TEMPLATE_STARTUP).unwrap();
+        assert_eq!(p.fail_mode, tirith_core::policy::FailMode::Open);
+        assert_eq!(p.paranoia, 2);
+        assert!(p.strict_warn);
+        assert!(!p.allow_bypass_env_noninteractive);
+    }
+
+    #[test]
+    fn enterprise_template_is_strict_with_active_package_policy() {
+        // Contract of enterprise: fail-closed, no bypass at all, AND an
+        // ACTIVE (uncommented) package_policy block with strict defaults.
+        // This is the M13 ch2 acceptance pin (M6_TO_M14_PLAN.md).
+        let p: tirith_core::policy::Policy = serde_yaml::from_str(TEMPLATE_ENTERPRISE).unwrap();
+        assert_eq!(p.fail_mode, tirith_core::policy::FailMode::Closed);
+        assert!(!p.allow_bypass_env);
+        assert!(!p.allow_bypass_env_noninteractive);
+        // The active package_policy block — not defaults, real strict values.
+        assert!(
+            p.package_policy.block_not_found,
+            "enterprise must ship block_not_found: true"
+        );
+        assert_eq!(
+            p.package_policy.block_osv_min_cvss,
+            Some(7.0),
+            "enterprise must ship block_osv_min_cvss: 7.0"
+        );
+        assert_eq!(p.package_policy.block_newer_than_days, Some(7));
+        assert_eq!(p.package_policy.block_typosquat_distance, Some(1));
+        assert!(p.package_policy.block_repo_mismatch);
+    }
+
+    #[test]
+    fn mcp_strict_template_escalates_mcp_rules() {
+        // Contract of mcp-strict: fail-closed and every MCP config rule
+        // escalated; the two highest-risk MCP rules are forced to block.
+        let p: tirith_core::policy::Policy = serde_yaml::from_str(TEMPLATE_MCP_STRICT).unwrap();
+        assert_eq!(p.fail_mode, tirith_core::policy::FailMode::Closed);
+        for rule in [
+            "mcp_insecure_server",
+            "mcp_untrusted_server",
+            "mcp_overly_permissive",
+            "mcp_suspicious_args",
+            "mcp_server_drift",
+        ] {
+            assert!(
+                p.severity_overrides.contains_key(rule),
+                "mcp-strict must escalate {rule}"
+            );
+        }
+        assert_eq!(
+            p.action_overrides
+                .get("mcp_untrusted_server")
+                .map(String::as_str),
+            Some("block")
+        );
     }
 
     #[test]
@@ -945,5 +1273,65 @@ mod tests {
         assert!(!p.allow_bypass_env_noninteractive);
         assert!(!p.approval_rules.is_empty());
         assert!(!p.escalation.is_empty());
+    }
+
+    /// `policy effective` transparency contract: for a REPO-scoped policy that
+    /// declares a weakening field (a non-empty `allowlist`), the gathered data
+    /// must name the source path, classify the scope as `repo`, and list
+    /// `allowlist` among the neutralized fields (repo policies are tightening-
+    /// only). Drives [`gather_effective`] directly so no stdout capture is
+    /// needed — the renderer is a thin function of these fields.
+    #[test]
+    fn effective_repo_scope_lists_neutralized_allowlist() {
+        use crate::cli::test_harness::{with_fake_env, EnvGuard};
+
+        with_fake_env(true, |_home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            // Isolate machine-level policy sources so only our repo policy is
+            // discovered (these are not faked by `with_fake_env`).
+            let _root = EnvGuard::remove("TIRITH_POLICY_ROOT");
+            let _xdg = EnvGuard::remove("XDG_CONFIG_HOME");
+
+            // A repo checkout: `.git` makes the walk-up stamp PolicyScope::Repo,
+            // which triggers repo-scope sanitization of the weakening `allowlist`.
+            std::fs::create_dir_all(cwd.join(".git")).unwrap();
+            std::fs::create_dir_all(cwd.join(".tirith")).unwrap();
+            std::fs::write(
+                cwd.join(".tirith").join("policy.yaml"),
+                "fail_mode: open\nallowlist:\n  - evil.example\n",
+            )
+            .unwrap();
+
+            let info = gather_effective(cwd.to_str());
+
+            // Source path: the repo-root policy we just wrote.
+            let expected_path = cwd
+                .join(".tirith")
+                .join("policy.yaml")
+                .display()
+                .to_string();
+            assert_eq!(
+                info.source_path.as_deref(),
+                Some(expected_path.as_str()),
+                "effective must name the repo-root policy as the source",
+            );
+
+            // Scope: repo (and its lowercase label).
+            assert_eq!(info.scope, tirith_core::policy::PolicyScope::Repo);
+            assert_eq!(scope_label(info.scope), "repo");
+
+            // The weakening `allowlist` was neutralized AND recorded — this is the
+            // drop list `policy effective` surfaces.
+            assert!(
+                info.policy.neutralized_fields.contains(&"allowlist"),
+                "allowlist must be listed as neutralized for a repo policy; got {:?}",
+                info.policy.neutralized_fields,
+            );
+            // And the value itself was actually reset to tightening-only default.
+            assert!(
+                info.policy.allowlist.is_empty(),
+                "the repo allowlist must be reset (neutralized), not honored",
+            );
+        });
     }
 }

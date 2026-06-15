@@ -9,7 +9,6 @@ mod webhook_verify;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
@@ -53,10 +52,19 @@ async fn main() {
     spawn_dead_letter_retry_task(db.clone(), Arc::new(config.clone()), http_client);
     spawn_backup_task(config.clone());
 
+    // No permissive CORS. Receipts (`/receipt/lookup`, `/receipt/{secret}`)
+    // deliver one-time license tokens / API keys and are viewed same-origin in
+    // a browser. The previous global `CorsLayer::permissive()` reflected any
+    // Origin and set `Access-Control-Allow-Origin: *`, which would have let a
+    // malicious cross-origin page read a victim's receipt via fetch(). With no
+    // CORS layer the browser default — same-origin only — applies to every
+    // route, blocking cross-origin reads. None of the other endpoints need
+    // cross-origin access: the Polar webhook is server-to-server and license
+    // refresh is called by the CLI (neither is subject to browser CORS), and
+    // health is trivial.
     let app = routes::router()
         .with_state(state)
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive());
+        .layer(TraceLayer::new_for_http());
 
     let addr = format!("0.0.0.0:{port}");
     info!("listening on {addr}");
@@ -129,14 +137,23 @@ async fn retry_dead_letters(
         if let (Some(ref dl_occurred), Some(ref sub_last)) =
             (&entry.occurred_at, &entry.last_event_at)
         {
-            if dl_occurred < sub_last {
-                info!(
-                    dead_letter_id = entry.id,
-                    sub_id = %sub_id,
-                    "dead letter older than latest event, removing stale entry"
-                );
-                let _ = db.delete_dead_letter(entry.id).await;
-                continue;
+            // Compare as instants, not raw strings — a different UTC offset or
+            // fractional-second encoding sorts incorrectly lexicographically. If
+            // either timestamp fails to parse, keep the dead letter: its retry
+            // reconciles against the CURRENT subscription state, which is safe.
+            if let (Ok(dl_ts), Ok(sub_ts)) = (
+                chrono::DateTime::parse_from_rfc3339(dl_occurred),
+                chrono::DateTime::parse_from_rfc3339(sub_last),
+            ) {
+                if dl_ts < sub_ts {
+                    info!(
+                        dead_letter_id = entry.id,
+                        sub_id = %sub_id,
+                        "dead letter older than latest event, removing stale entry"
+                    );
+                    let _ = db.delete_dead_letter(entry.id).await;
+                    continue;
+                }
             }
         }
 

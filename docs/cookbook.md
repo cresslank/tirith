@@ -180,6 +180,45 @@ Pin to a known hash:
 tirith run --sha256 abc123... https://example.com/install.sh
 ```
 
+### Using tirith install (recorded install transaction)
+
+`tirith install` wraps a real package install with pre-execution
+supply-chain risk analysis and records the transaction. It analyzes first,
+presents a verdict, takes a working-directory checkpoint and an audit entry,
+then runs the real `npm install` / `pip install` / `cargo install` (or the
+downloaded script for the `url` form) only after the analysis and your
+go-ahead:
+
+```bash
+# Instead of: npm install left-pad
+tirith install npm left-pad
+```
+
+A block refuses the install (bypassable per policy with `TIRITH=0`); a warn
+asks for acknowledgement; an allow proceeds. tirith's own flags go *before*
+the source — everything after the source is passed verbatim to the package
+manager:
+
+```bash
+# --online adds registry-API provenance signals; --save-dev goes to npm
+tirith install --online npm some-pkg --save-dev
+
+# Analyze and record only — do not run the real install
+tirith install --no-exec pip requests
+
+# Proceed past warnings without the interactive prompt
+tirith install --yes cargo ripgrep
+
+# The url form delegates to `tirith run`'s safe download-and-run machinery
+tirith install url https://get.example-tool.sh
+```
+
+`tirith install` is pre-execution install-**risk analysis** plus a recorded
+transaction. It does **not** sandbox or isolate the install — the real
+install runs with your full privileges. The checkpoint is a before/after
+record (`tirith checkpoint diff <id>`), not an automatic rollback. Runtime
+sandboxing is an explicit tirith non-goal.
+
 ### Using vet (external, cross-platform)
 
 [vet](https://getvet.sh) is an external tool for safer remote-script workflows (see getvet.sh for details):

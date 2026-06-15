@@ -20,6 +20,30 @@ if [[ -z "${TIRITH_SESSION_ID:-}" ]]; then
   export TIRITH_SESSION_ID
 fi
 
+# M9 ch4 — record a shell-start environment snapshot for `tirith env diff`.
+# We exec a hidden tirith subcommand that reads ITS OWN inherited environment
+# and writes ONLY variable names + an 8-char value-hash prefix (never raw
+# values, never a recoverable hash) to <state-dir>/env_snapshot.json. The child
+# inherits this shell's exported env, so no value ever crosses an argv boundary
+# or a temp file. Interactive-only and backgrounded (&) so it never blocks the
+# prompt. The hook is sourced once per session (guarded above), so this runs
+# once per shell start.
+if [[ -o interactive ]]; then
+  command tirith env snapshot >/dev/null 2>&1 &!
+fi
+
+# M8 ch2 — surface "this shell is on the remote side of an SSH session" to
+# `tirith prompt-status` (planned for M8 ch6) and any other downstream
+# consumer. Set NOW so chunk 6 can read it without a follow-up hook patch.
+# Standard SSH env vars: SSH_CONNECTION, SSH_CLIENT, SSH_TTY. Setting at
+# every hook source is idempotent — if the parent already exported it
+# (e.g. a nested sub-shell on the remote side), we keep the parent value.
+if [[ -z "${TIRITH_SSH_REMOTE:-}" ]] \
+   && { [[ -n "${SSH_CONNECTION:-}" ]] || [[ -n "${SSH_CLIENT:-}" ]] || [[ -n "${SSH_TTY:-}" ]]; }; then
+  TIRITH_SSH_REMOTE=1
+  export TIRITH_SSH_REMOTE
+fi
+
 # Output helper: write to stderr by default.
 # Override via TIRITH_OUTPUT=tty to write to /dev/tty instead.
 _tirith_output() {
@@ -114,7 +138,7 @@ _tirith_accept_line() {
   # Run tirith check with approval workflow (stdout=approval file path, stderr=human output)
   local errfile=$(mktemp)
   local approval_path
-  approval_path=$(command tirith check --approval-check --non-interactive --interactive --shell posix -- "$buf" 2>"$errfile")
+  approval_path=$(_TIRITH_HOOK=1 command tirith check --approval-check --non-interactive --interactive --shell posix -- "$buf" 2>"$errfile")
   local rc=$?
   local output=$(<"$errfile")
   command rm -f "$errfile"
@@ -233,9 +257,6 @@ _tirith_bracketed_paste() {
   local old_cursor="$CURSOR"
   zle _tirith_original_bracketed_paste 2>/dev/null || zle .bracketed-paste
 
-  # Honor explicit TIRITH=0 bypass: skip paste scanning
-  [[ "${TIRITH:-}" == "0" ]] && return
-
   # The new content is what was added to BUFFER
   local new_buffer="$BUFFER"
   local pasted="${new_buffer:$old_cursor:$((${#new_buffer} - ${#old_buffer}))}"
@@ -243,7 +264,7 @@ _tirith_bracketed_paste() {
   if [[ -n "$pasted" ]]; then
     # Pipe pasted content to tirith paste, use temp file to prevent tty leakage
     local tmpfile=$(mktemp)
-    echo -n "$pasted" | command tirith paste --shell posix --interactive >"$tmpfile" 2>&1
+    echo -n "$pasted" | _TIRITH_HOOK=1 command tirith paste --shell posix --interactive >"$tmpfile" 2>&1
     local rc=$?
     local output=$(<"$tmpfile")
     command rm -f "$tmpfile"
@@ -296,3 +317,21 @@ autoload -Uz add-zsh-hook 2>/dev/null && add-zsh-hook zshexit _tirith_exit_summa
 if [[ -o interactive ]]; then
   TIRITH_STATUS="blocks"
 fi
+
+# ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────
+# Opt-in output-direction wrapper. Commented out by default in this embedded
+# hook copy; `tirith output wrap on` writes an active copy of the function
+# into the user's shell-profile separately. This block is kept here as the
+# canonical source so a user reading the hook understands the surface area.
+#
+# Scope honesty: this wraps INDIVIDUAL commands invoked via `tirith-out
+# <cmd>`. It does NOT intercept output from anything run outside the wrapper.
+#
+# tirith-output-guard-wrap() {
+#   if [[ "$#" -eq 0 ]]; then
+#     printf 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]\n' >&2
+#     return 2
+#   fi
+#   "$@" 2>&1 | command tirith view --max-bytes 16777216 -
+# }
+# alias tirith-out='tirith-output-guard-wrap'

@@ -2,7 +2,7 @@ use std::io::{BufRead, Read, Write};
 
 use serde_json::{json, Value};
 
-use super::{resources, tools, types::*};
+use super::{output_filter, resources, tools, types::*};
 
 /// Server state machine.
 enum State {
@@ -11,16 +11,36 @@ enum State {
     Ready,
 }
 
-/// Run the MCP server loop over stdio.
+/// Per-run options for the MCP server dispatcher.
 ///
-/// Reads JSON-RPC messages from `input` (one per line), writes responses to
-/// `output`. Logs go to `log` (typically stderr). Returns exit code 0 on clean
-/// shutdown (EOF on input).
-pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write) -> i32 {
+/// `sanitize_tool_output` (M7 ch4) routes every `tools/call` return through
+/// [`crate::mcp::output_filter::filter_tool_result`] so a malicious tool result
+/// cannot smuggle OSC52 / hyperlink-mismatch payloads to the calling agent.
+/// Default `false` (opt-in). When enabled the dispatcher fails closed (denies on
+/// truncation / rule error), stricter than the gateway default.
+#[derive(Debug, Clone, Default)]
+pub struct DispatcherOptions {
+    pub sanitize_tool_output: bool,
+}
+
+/// Run the MCP server loop over stdio with default options. Reads JSON-RPC
+/// messages from `input` (one per line), writes responses to `output`, logs to
+/// `log`. Exit code 0 on clean shutdown (EOF).
+pub fn run(input: impl BufRead, output: impl Write, log: impl Write) -> i32 {
+    run_with_options(input, output, log, DispatcherOptions::default())
+}
+
+/// Like [`run`] but takes [`DispatcherOptions`] (M7 ch4 `--sanitize-tool-output`).
+/// `run` stays as a back-compat wrapper.
+pub fn run_with_options(
+    mut input: impl BufRead,
+    mut output: impl Write,
+    mut log: impl Write,
+    options: DispatcherOptions,
+) -> i32 {
     let mut state = State::AwaitingInit;
 
-    /// Maximum line size: 10 MiB. Prevents a single huge JSON-RPC message
-    /// from consuming unbounded memory.
+    /// Max line size (caps memory from a single huge JSON-RPC message).
     const MAX_LINE_BYTES: usize = 10 * 1024 * 1024;
 
     let mut line = String::new();
@@ -36,7 +56,7 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
                     log,
                     "tirith mcp-server: line exceeds {MAX_LINE_BYTES} byte limit, dropping"
                 );
-                // Drain remainder of this oversized line without unbounded allocation
+                // Drain the rest of the oversized line without unbounded alloc.
                 if !line.ends_with('\n') {
                     let mut byte = [0u8; 1];
                     loop {
@@ -62,7 +82,7 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
             continue;
         }
 
-        // Cap individual message size at 10 MiB to prevent DoS
+        // Cap individual message size to prevent DoS.
         const MAX_LINE_LEN: usize = 10 * 1024 * 1024;
         if trimmed.len() > MAX_LINE_LEN {
             let _ = writeln!(
@@ -110,12 +130,11 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
             }
         };
 
-        // JSON-RPC envelope validation: failures here are invalid-request (-32600).
-        // Extract id first so error responses can echo it when the client's id was recoverable.
+        // Envelope validation: failures are invalid-request (-32600). Extract id
+        // first so error responses can echo a recoverable client id.
         let raw_id = raw.get("id").cloned();
 
-        // Recover a usable id: JSON-RPC allows string, number, or null — reject
-        // object/array/bool.
+        // JSON-RPC allows string/number/null for id — reject object/array/bool.
         let usable_id = match &raw_id {
             None => None, // notification (no id field at all)
             Some(Value::Null) | Some(Value::Number(_)) | Some(Value::String(_)) => raw_id.clone(),
@@ -227,7 +246,14 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
                     JsonRpcResponse::ok(id, json!({ "tools": tools }))
                 }
                 "tools/call" => {
-                    let result = handle_tools_call(&params);
+                    let mut result = handle_tools_call(&params);
+                    if options.sanitize_tool_output {
+                        // M7 ch4 — fail closed (deny on truncation), stricter than
+                        // the gateway default: the calling agent is the
+                        // highest-privilege consumer of these results.
+                        let outcome = output_filter::filter_tool_result(&mut result, true);
+                        write_filter_audit(&mut log, &outcome);
+                    }
                     match serde_json::to_value(result) {
                         Ok(v) => JsonRpcResponse::ok(id, v),
                         Err(e) => JsonRpcResponse::err(
@@ -266,6 +292,16 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
     0
 }
 
+/// Pull `clientInfo` out of an `initialize` request's raw `params`, independent
+/// of `InitializeParams` deserialization — so a non-conforming `protocolVersion`
+/// still surfaces a well-formed `clientInfo`. Malformed `clientInfo` → `None`.
+fn extract_client_info(params: &Option<Value>) -> Option<ClientInfo> {
+    params
+        .as_ref()
+        .and_then(|p| p.get("clientInfo"))
+        .and_then(|ci| serde_json::from_value::<ClientInfo>(ci.clone()).ok())
+}
+
 fn handle_initialize(params: &Option<Value>) -> Value {
     let requested_version = params
         .as_ref()
@@ -275,6 +311,13 @@ fn handle_initialize(params: &Option<Value>) -> Value {
 
     let version = negotiate_version(requested_version);
     let pkg_version = env!("CARGO_PKG_VERSION");
+
+    // M4 item 8 ch1 — observation-only. Capture caller `clientInfo` (from raw
+    // JSON, so an unrelated `InitializeParams` deser failure does not strip a
+    // valid `clientInfo`) so tool calls can stamp `AgentOrigin::Mcp`. A malformed
+    // `clientInfo` records `"unknown-mcp-client"`. Never gates the response.
+    let client_info = extract_client_info(params);
+    super::origin::set_from_initialize(client_info.as_ref());
 
     let result = InitializeResult {
         protocol_version: version,
@@ -359,6 +402,35 @@ fn handle_resources_read(id: Value, params: &Option<Value>) -> JsonRpcResponse {
     }
 }
 
+/// Emit a best-effort JSONL audit line for an output-filter pass to `log`
+/// (typically stderr — the dispatcher's diagnostic channel). Dropped silently on
+/// failure; the audit-module log is for verdict-tagged events, and the dispatcher
+/// has no `command` to log here.
+fn write_filter_audit(log: &mut impl Write, outcome: &output_filter::FilterOutcome) {
+    let entry = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "kind": "mcp_output_filter",
+        "decision": match outcome.action {
+            crate::verdict::Action::Block => "block",
+            crate::verdict::Action::Warn | crate::verdict::Action::WarnAck => "warn",
+            crate::verdict::Action::Allow => "allow",
+        },
+        "event_id": outcome.event_id,
+        "rule_ids": outcome.rule_ids,
+        "findings_count": outcome.rule_ids.len(),
+        "highest_severity": outcome
+            .max_severity
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "NONE".to_string()),
+        "elapsed_ms": outcome.elapsed_ms,
+        "truncated": outcome.truncated,
+        "fail_mode_triggered": outcome.fail_mode_triggered,
+    });
+    if let Ok(json) = serde_json::to_string(&entry) {
+        let _ = writeln!(log, "{json}");
+    }
+}
+
 /// Write a JSON-RPC response. Returns false if the output is broken (caller should exit).
 fn write_response(output: &mut impl Write, resp: &JsonRpcResponse) -> bool {
     match serde_json::to_string(resp) {
@@ -369,8 +441,8 @@ fn write_response(output: &mut impl Write, resp: &JsonRpcResponse) -> bool {
             true
         }
         Err(_) => {
-            // Should not happen with well-formed types. Try to send an internal
-            // error response as a fallback so the client isn't left hanging.
+            // Should not happen with well-formed types; send a fallback so the
+            // client isn't left hanging.
             let fallback = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal serialization error"}}"#;
             let _ = writeln!(output, "{fallback}");
             let _ = output.flush();
@@ -384,11 +456,30 @@ mod tests {
     use super::*;
     use std::io::BufReader;
 
+    /// Drive a full dispatcher session over an in-memory transport. Acquires the
+    /// origin-store serial lock for the session (an `initialize` writes
+    /// `MCP_ORIGIN`, must not race `mcp::origin::tests::*`).
     fn run_session(input: &str) -> (String, String) {
+        let _serial = super::super::origin::serial_lock();
         let reader = BufReader::new(input.as_bytes());
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = run(reader, &mut stdout, &mut stderr);
+        assert_eq!(code, 0, "Server should exit cleanly");
+        (
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+        )
+    }
+
+    /// Like [`run_session`] but threads [`DispatcherOptions`] through. Used by
+    /// the M7 ch4 `--sanitize-tool-output` regression tests.
+    fn run_session_with_options(input: &str, options: DispatcherOptions) -> (String, String) {
+        let _serial = super::super::origin::serial_lock();
+        let reader = BufReader::new(input.as_bytes());
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with_options(reader, &mut stdout, &mut stderr, options);
         assert_eq!(code, 0, "Server should exit cleanly");
         (
             String::from_utf8(stdout).unwrap(),
@@ -507,6 +598,29 @@ mod tests {
             .contains("finding"));
         // Should have structuredContent with verdict
         assert!(result["structuredContent"].is_object());
+    }
+
+    /// M4 item 8 ch1 — the dispatcher must capture `initialize.clientInfo` and
+    /// surface it as `agent_origin` on every tool call.
+    #[test]
+    fn test_mcp_origin_is_stamped_on_tool_verdict() {
+        let input = format!(
+            "{}\n{}\n",
+            init_msg(1, "2025-11-25"),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tirith_check_command","arguments":{"command":"echo hi"}}}"#,
+        );
+
+        let (stdout, _) = run_session(&input);
+        let resps = parse_responses(&stdout);
+        let structured = &resps[1]["result"]["structuredContent"];
+        let origin = &structured["agent_origin"];
+        assert!(
+            origin.is_object(),
+            "verdict must carry agent_origin: got {structured}"
+        );
+        assert_eq!(origin["kind"], "mcp", "structuredContent: {structured}");
+        assert_eq!(origin["client_name"], "test");
+        assert_eq!(origin["client_version"], "1.0");
     }
 
     #[test]
@@ -653,5 +767,95 @@ mod tests {
         assert_eq!(resps.len(), 2);
         assert_eq!(resps[1]["id"], Value::Null);
         assert_eq!(resps[1]["result"], json!({}));
+    }
+
+    /// M7 ch4 `--sanitize-tool-output` smoke test: when enabled, every
+    /// `tools/call` writes a JSONL audit line to stderr (kind =
+    /// "mcp_output_filter"). Only verifies the filter ran; the content contract is
+    /// pinned by `output_filter::tests` and the gateway integration test.
+    #[test]
+    fn test_sanitize_tool_output_emits_audit_line() {
+        let input = format!(
+            "{}\n{}\n",
+            init_msg(1, "2025-11-25"),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tirith_check_command","arguments":{"command":"echo hi"}}}"#,
+        );
+        let (_stdout, stderr) = run_session_with_options(
+            &input,
+            DispatcherOptions {
+                sanitize_tool_output: true,
+            },
+        );
+        assert!(
+            stderr.contains("\"kind\":\"mcp_output_filter\""),
+            "sanitize_tool_output=true must emit one audit line per tools/call; got stderr:\n{stderr}"
+        );
+    }
+
+    /// Default `sanitize_tool_output = false` MUST NOT emit a filter audit
+    /// line — preserves the pre-M7-ch4 behavior. Counterpart to the
+    /// positive smoke test above.
+    #[test]
+    fn test_default_sanitize_tool_output_off_does_not_filter() {
+        let input = format!(
+            "{}\n{}\n",
+            init_msg(1, "2025-11-25"),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tirith_check_command","arguments":{"command":"echo hi"}}}"#,
+        );
+        // Default options (filter off).
+        let (_stdout, stderr) = run_session_with_options(&input, DispatcherOptions::default());
+        assert!(
+            !stderr.contains("\"kind\":\"mcp_output_filter\""),
+            "default behavior must NOT engage the output filter; got stderr:\n{stderr}"
+        );
+    }
+
+    /// CodeRabbit Minor (cid 3292343379): an `initialize` payload that fails the
+    /// full `InitializeParams` deser for an unrelated reason (non-conforming
+    /// `protocolVersion`) must still surface its `clientInfo`.
+    #[test]
+    fn extract_client_info_survives_malformed_protocol_version() {
+        // protocolVersion is an integer; the wrapping `InitializeParams`
+        // would fail to deserialize. clientInfo itself is valid.
+        let raw = json!({
+            "protocolVersion": 12345,
+            "capabilities": {},
+            "clientInfo": {"name": "Cursor", "version": "0.42"}
+        });
+        let params = Some(raw.clone());
+        let ci = extract_client_info(&params).expect("clientInfo should be extracted");
+        assert_eq!(ci.name, "Cursor");
+        assert_eq!(ci.version.as_deref(), Some("0.42"));
+
+        // Sanity: confirm the wider parse would indeed have failed.
+        assert!(
+            serde_json::from_value::<InitializeParams>(raw).is_err(),
+            "the regression this guards is the full parse failing"
+        );
+    }
+
+    #[test]
+    fn extract_client_info_returns_none_when_absent() {
+        let params = Some(json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {}
+        }));
+        assert!(extract_client_info(&params).is_none());
+    }
+
+    #[test]
+    fn extract_client_info_returns_none_for_malformed_client_info() {
+        // clientInfo present but shape doesn't match (`name` is wrong type).
+        let params = Some(json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": 42}
+        }));
+        assert!(extract_client_info(&params).is_none());
+    }
+
+    #[test]
+    fn extract_client_info_returns_none_for_none_params() {
+        assert!(extract_client_info(&None).is_none());
     }
 }

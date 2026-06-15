@@ -27,8 +27,8 @@ const ALLOWED_EXACT: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ksh", "fish", "deno", "bun", "nodejs",
 ];
 
-/// Interpreter families that may have version suffixes (python3, python3.11, ruby3.2, node18, perl5.38).
-/// Matches: exact name OR name + digits[.digits]* suffix.
+/// Interpreter families allowed with an optional `digits[.digits]*` version
+/// suffix (python3, python3.11, ruby3.2, node18, perl5.38).
 const ALLOWED_FAMILIES: &[&str] = &["python", "ruby", "perl", "node"];
 
 fn is_allowed_interpreter(interpreter: &str) -> bool {
@@ -52,9 +52,7 @@ fn is_allowed_interpreter(interpreter: &str) -> bool {
     false
 }
 
-/// Check if a suffix is a valid version string: digits (.digits)*
-/// Valid: "3", "3.11", "3.2.1"
-/// Invalid: "", ".3", "3.", "3..11", "evil"
+/// A valid version suffix is `digits (.digits)*` ("3", "3.11"); rejects "", ".3", "3.", "evil".
 fn is_valid_version_suffix(s: &str) -> bool {
     if s.is_empty() {
         return false;
@@ -68,17 +66,31 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         return Err("tirith run requires an interactive terminal or --no-exec flag".to_string());
     }
 
+    // F6: validate the first hop up front so an SSRF target gives a fast, clear
+    // error instead of a connect failure. The connect-time DNS guard below is
+    // the rebinding backstop; this is the pre-flight check.
+    crate::url_validate::validate_fetch_url(&opts.url)?;
+
     let mut redirects: Vec<String> = Vec::new();
     let redirect_list = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let redirect_list_clone = redirect_list.clone();
 
     let client = reqwest::blocking::Client::builder()
+        .dns_resolver(crate::ssrf_guard::fetch_resolver())
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if let Ok(mut list) = redirect_list_clone.lock() {
                 list.push(attempt.url().to_string());
             }
+            // Guard redirect *targets* against SSRF (the user-chosen initial URL
+            // is intentional and not re-validated here). Fail with `error`, not
+            // `stop` — `stop` would surface the 3xx as a success and let its
+            // body be processed as the download.
             if attempt.previous().len() >= 10 {
-                attempt.stop()
+                attempt.error("too many redirects")
+            } else if let Err(reason) =
+                crate::url_validate::validate_fetch_url(attempt.url().as_str())
+            {
+                attempt.error(reason)
             } else {
                 attempt.follow()
             }
@@ -155,8 +167,16 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         }
         tmp.write_all(&content)
             .map_err(|e| format!("write cache: {e}"))?;
+        // fsync bytes before rename so a crash can't leave a partial cache entry.
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| format!("sync cache: {e}"))?;
         tmp.persist(&cached_path)
             .map_err(|e| format!("persist cache: {e}"))?;
+        // Also fsync the parent dir so the rename itself is crash-durable
+        // (CodeRabbit R9 #B). Best-effort: persist already succeeded, so a
+        // dir-fsync failure is logged not propagated (R13 #5). Unix-only.
+        crate::util::fsync_parent_dir_logged(&cached_path, "run cache");
     }
 
     let content_str = match String::from_utf8(content.clone()) {
@@ -170,8 +190,7 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     let interpreter = script_analysis::detect_interpreter(&content_str);
     let analysis = script_analysis::analyze(&content_str, interpreter);
 
-    // Interpreter allowlist is only enforced when we might execute. With
-    // --no-exec the user has already committed to inspecting the script.
+    // Allowlist is only enforced when we might execute (--no-exec is inspect-only).
     if !opts.no_exec && !is_allowed_interpreter(interpreter) {
         return Err(format!(
             "interpreter '{interpreter}' is not in the allowed list",
@@ -211,7 +230,6 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         });
     }
 
-    // Show analysis summary
     eprintln!(
         "tirith: downloaded {} bytes (SHA256: {})",
         content.len(),
@@ -228,7 +246,6 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         eprintln!("tirith: WARNING: script uses base64");
     }
 
-    // Confirm from /dev/tty
     let tty = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -255,7 +272,6 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         });
     }
 
-    // Execute
     receipt.save().map_err(|e| format!("save receipt: {e}"))?;
 
     let status = Command::new(interpreter)
@@ -267,6 +283,146 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         receipt,
         executed: true,
         exit_code: status.code(),
+    })
+}
+
+/// Outcome of [`download_to_path`].
+pub struct DownloadResult {
+    /// The path the content was written to (the caller-supplied destination).
+    pub path: std::path::PathBuf,
+    /// SHA-256 of the downloaded content.
+    pub sha256: String,
+    /// Final URL after redirects.
+    pub final_url: String,
+    /// Number of bytes written.
+    pub size: u64,
+    /// Detected interpreter from the shebang (best-effort, for display).
+    pub interpreter: String,
+}
+
+/// Download `url` to `dest` WITHOUT executing it (the primitive behind
+/// `tirith fetch --save`). Shares [`run`]'s redirect / 30s-timeout / 10 MiB-cap
+/// policy, verifies `expected_sha256`, and writes atomically (sibling temp +
+/// rename, `0600`). Caller marks `dest` tainted (see `crate::taint`).
+pub fn download_to_path(
+    url: &str,
+    dest: &std::path::Path,
+    expected_sha256: Option<&str>,
+) -> Result<DownloadResult, String> {
+    // F6: validate the first hop up front (see `run()` — same pre-flight check;
+    // the connect-time DNS guard below is the rebinding backstop).
+    crate::url_validate::validate_fetch_url(url)?;
+
+    let redirect_list = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let redirect_list_clone = redirect_list.clone();
+
+    let client = reqwest::blocking::Client::builder()
+        .dns_resolver(crate::ssrf_guard::fetch_resolver())
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if let Ok(mut list) = redirect_list_clone.lock() {
+                list.push(attempt.url().to_string());
+            }
+            // Guard redirect *targets* against SSRF (the user-chosen initial URL
+            // is intentional and not re-validated here). Fail with `error`, not
+            // `stop` — `stop` would surface the 3xx as a success and let its
+            // body be processed as the download.
+            if attempt.previous().len() >= 10 {
+                attempt.error("too many redirects")
+            } else if let Err(reason) =
+                crate::url_validate::validate_fetch_url(attempt.url().as_str())
+            {
+                attempt.error(reason)
+            } else {
+                attempt.follow()
+            }
+        }))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+
+    let response = client
+        .get(url)
+        .send()
+        .map_err(|e| format!("download failed: {e}"))?;
+
+    let final_url = response.url().to_string();
+
+    const MAX_BODY: u64 = 10 * 1024 * 1024; // 10 MiB
+
+    if let Some(len) = response.content_length() {
+        if len > MAX_BODY {
+            return Err(format!(
+                "response too large: {len} bytes (max {} MiB)",
+                MAX_BODY / 1024 / 1024
+            ));
+        }
+    }
+
+    use std::io::Read;
+    let mut buf = Vec::new();
+    response
+        .take(MAX_BODY + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read body: {e}"))?;
+    if buf.len() as u64 > MAX_BODY {
+        return Err(format!(
+            "response body exceeds {} MiB limit",
+            MAX_BODY / 1024 / 1024
+        ));
+    }
+    let content = buf;
+
+    let mut hasher = Sha256::new();
+    hasher.update(&content);
+    let sha256 = format!("{:x}", hasher.finalize());
+
+    if let Some(expected) = expected_sha256 {
+        let expected_lower = expected.to_lowercase();
+        if sha256 != expected_lower {
+            return Err(format!(
+                "SHA-256 mismatch: expected {expected_lower}, got {sha256}"
+            ));
+        }
+    }
+
+    // Atomic write: sibling temp + rename, 0600.
+    let dir = dest.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = dir {
+        fs::create_dir_all(parent).map_err(|e| format!("create dest dir: {e}"))?;
+    }
+    let tmp_dir = dir.unwrap_or_else(|| std::path::Path::new("."));
+    {
+        use tempfile::NamedTempFile;
+        let mut tmp = NamedTempFile::new_in(tmp_dir).map_err(|e| format!("tempfile: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("permissions: {e}"))?;
+        }
+        tmp.write_all(&content)
+            .map_err(|e| format!("write download: {e}"))?;
+        // fsync bytes before rename so a crash can't leave a partial file at dest.
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| format!("sync download: {e}"))?;
+        tmp.persist(dest)
+            .map_err(|e| format!("persist download: {e}"))?;
+        // Also fsync the parent dir so the rename survives a crash (CodeRabbit
+        // R9 #B). Best-effort: a dir-fsync failure is logged not propagated (R13 #5).
+        crate::util::fsync_parent_dir_logged(dest, "downloaded script");
+    }
+
+    let content_str = String::from_utf8_lossy(&content);
+    let interpreter = script_analysis::detect_interpreter(&content_str).to_string();
+
+    Ok(DownloadResult {
+        path: dest.to_path_buf(),
+        sha256,
+        final_url,
+        size: content.len() as u64,
+        interpreter,
     })
 }
 
@@ -393,14 +549,12 @@ mod tests {
             tmp.persist(&cached_path).unwrap();
         }
 
-        // No predictable temp file should remain
         let entries: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
 
-        // Should only contain the final cached file
         assert_eq!(
             entries.len(),
             1,

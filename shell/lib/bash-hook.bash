@@ -30,6 +30,28 @@ if [[ -z "${TIRITH_SESSION_ID:-}" ]]; then
   export TIRITH_SESSION_ID
 fi
 
+# M8 ch2 — surface "this shell is on the remote side of an SSH session" to
+# `tirith prompt-status` (planned for M8 ch6) and any other downstream
+# consumer. Set NOW so chunk 6 can read it without a follow-up hook patch.
+# Standard SSH env vars: SSH_CONNECTION, SSH_CLIENT, SSH_TTY.
+if [[ -z "${TIRITH_SSH_REMOTE:-}" ]] \
+   && { [[ -n "${SSH_CONNECTION:-}" ]] || [[ -n "${SSH_CLIENT:-}" ]] || [[ -n "${SSH_TTY:-}" ]]; }; then
+  TIRITH_SSH_REMOTE=1
+  export TIRITH_SSH_REMOTE
+fi
+
+# M9 ch4 — record a shell-start environment snapshot for `tirith env diff`.
+# Exec a hidden tirith subcommand that reads ITS OWN inherited environment and
+# writes ONLY variable names + an 8-char value-hash prefix (never raw values,
+# never a recoverable hash) to <state-dir>/env_snapshot.json. The child
+# inherits this shell's exported env, so no value crosses an argv boundary or a
+# temp file. Interactive-only and backgrounded so it never blocks the prompt.
+# Sourced once per session (guarded above), so this runs once per shell start.
+if [[ $- == *i* ]]; then
+  command tirith env snapshot >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+fi
+
 # Output helper: write to stderr by default.
 # Override via TIRITH_OUTPUT=tty to write to /dev/tty instead.
 _tirith_output() {
@@ -980,13 +1002,6 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         fi
       done
 
-      # Honor explicit TIRITH=0 bypass: skip paste scanning
-      if [[ "${TIRITH:-}" == "0" ]]; then
-        READLINE_LINE="${READLINE_LINE:0:$READLINE_POINT}${pasted}${READLINE_LINE:$READLINE_POINT}"
-        READLINE_POINT=$((READLINE_POINT + ${#pasted}))
-        return
-      fi
-
       if [[ -n "$pasted" ]]; then
         # Check with tirith paste, use temp file to prevent tty leakage
         local tmpfile=$(mktemp)
@@ -1057,3 +1072,21 @@ unset _tirith_prev_exit_trap
 if [[ "$_TIRITH_BASH_MODE" == "preexec" ]] && [[ $- == *i* ]]; then
   _tirith_install_debug_trap
 fi
+
+# ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────
+# Opt-in output-direction wrapper. Commented out by default in this embedded
+# hook copy; `tirith output wrap on` writes an active copy of the function
+# into the user's shell-profile separately. This block is kept here as the
+# canonical source so a user reading the hook understands the surface area.
+#
+# Scope honesty: this wraps INDIVIDUAL commands invoked via `tirith-out
+# <cmd>`. It does NOT intercept output from anything run outside the wrapper.
+#
+# tirith-output-guard-wrap() {
+#   if [[ "$#" -eq 0 ]]; then
+#     printf 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]\n' >&2
+#     return 2
+#   fi
+#   "$@" 2>&1 | command tirith view --max-bytes 16777216 -
+# }
+# alias tirith-out='tirith-output-guard-wrap'

@@ -1,0 +1,37 @@
+# Prompt-injection seed strings — M7 ch5.
+#
+# One regex per line, applied case-insensitively against agent output.
+# These are well-known instruction-override / jailbreak markers — the rule
+# catches the easy cases, NOT a complete defense. See the module docs at
+# `crates/tirith-core/src/rules/prompt_injection.rs` for the full disclaimer.
+#
+# Lines beginning with `#` are comments; blank lines are ignored.
+#
+# ── "ignore previous instructions" family → IgnorePreviousInstructions ──
+ignore (all )?previous instructions
+disregard (above|previous)
+ignore the above
+forget the above
+ignore your training
+override your instructions
+new instructions:
+#
+# ── role-override / jailbreak family → PromptInjectionInOutput ─────────
+act as <role>
+you are now
+system:
+do anything now
+DAN mode
+#
+# Contextual override openers. Anchored to a following directive word so prose
+# like "from now on the build is faster" or "act as if nothing happened" in a
+# changelog does not match. "from now on" needs a tier-1 paste fragment in
+# build.rs (the "act as" fragment already covers "act as if").
+\bfrom now on,?\s+(you|act|ignore|respond)\b
+# "act as if you ..." gated on a following jailbreak directive / privileged role
+# / alternate-persona token. Benign roleplay prose ("act as if you are reviewing
+# the changelog", "act as if you are a senior engineer documenting the API")
+# lacks that continuation and no longer matches. Real injections ("act as if you
+# are DAN", "act as if you have no restrictions", "act as if you are an
+# unrestricted AI") still fire.
+\bact as if you(?:'re| are)?(?:\s+(?:an?|the|my|our))?\s+(?:dan\b|jailbroken|jailbreak|unrestricted|unfiltered|uncensored|unlimited|root\b|administrator|admin\b|developer mode|sudo|godmode|god mode|no longer bound|free from your|not bound by|without (?:any )?(?:restrictions|filters|limits|rules|guardrails|guidelines)|(?:have|with) no (?:restrictions|filters|limits|rules|guardrails|guidelines)|a different (?:ai|assistant|model|persona|chatbot)|an? (?:evil|malicious|unrestricted|unfiltered|uncensored) (?:ai|assistant|model|persona))

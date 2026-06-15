@@ -1,0 +1,156 @@
+# Tirith security policy — "ai-agent-heavy" template
+# Tuned for environments where AI agents run many shell commands.
+# Documentation: https://tirith.dev/docs/policy
+
+# Fail mode: "open" — an internal tirith error should not wedge an agent
+# mid-task. Risk is managed below via paranoia, approval, and escalation.
+fail_mode: open
+
+# Paranoia level (1-4): 3 — agents paste and run far more untrusted input
+# than a human, so detection is turned up.
+paranoia: 3
+
+# Disable the `TIRITH=0` bypass entirely — interactive AND non-interactive.
+# An agent-heavy profile is opting into hardened defaults, so neither a human
+# at a TTY nor a non-interactive agent may skip analysis. Set
+# `allow_bypass_env: true` yourself if you want a local human escape hatch.
+allow_bypass_env: false
+allow_bypass_env_noninteractive: false
+
+# Require explicit acknowledgement for warn findings.
+strict_warn: true
+
+# Escalate remote-execution and Docker-registry rules — the patterns agents
+# most often produce from hallucinated or copy-pasted instructions.
+severity_overrides:
+  curl_pipe_shell: CRITICAL
+  wget_pipe_shell: CRITICAL
+  httpie_pipe_shell: CRITICAL
+  xh_pipe_shell: CRITICAL
+  pipe_to_interpreter: HIGH
+  shortened_url: HIGH
+  docker_untrusted_registry: HIGH
+
+# Approval rules: a command matching any listed rule pauses for human
+# approval before it runs. fallback is what happens on timeout.
+approval_rules:
+  - rule_ids:
+      - curl_pipe_shell
+      - wget_pipe_shell
+      - httpie_pipe_shell
+      - xh_pipe_shell
+      - pipe_to_interpreter
+    timeout_secs: 120
+    fallback: block
+
+# Escalation: upgrade to a block when an agent keeps re-trying flagged work.
+escalation:
+  # Block when a GENUINELY-RISKY rule fires 5+ times within an hour.
+  #
+  # `rule_ids` is a curated list rather than `["*"]` on purpose: the
+  # repeat_count trigger has no severity gate (it matches purely on rule_ids —
+  # see `EscalationRule::RepeatCount` in tirith-core/src/escalation.rs), so a
+  # wildcard would escalate EVERY repeated finding, including informational
+  # notes like `repo_command_unknown` and other Info-severity annotations.
+  # Normal agent churn (5 repeats of a benign-but-uncatalogued command) would
+  # then become a hard block. The list below is the pipe-to-shell /
+  # install-script / typosquat / secret / remote-exec family — the same
+  # families already escalated via severity_overrides and approval_rules above.
+  # Add a rule id here if you want repeated attempts at it to hard-block.
+  - trigger: repeat_count
+    rule_ids:
+      # Pipe-to-shell (curl/wget/httpie/xh | sh) + generic pipe-to-interpreter.
+      - curl_pipe_shell
+      - wget_pipe_shell
+      - httpie_pipe_shell
+      - xh_pipe_shell
+      - pipe_to_interpreter
+      # Install-script / package execution risks.
+      - pip_url_install
+      - npm_url_install
+      - package_script_dangerous
+      - package_policy_unknown_package_with_install_scripts
+      # Typosquat / dependency-confusion (hallucinated or look-alike names).
+      - git_typosquat
+      - threat_package_typosquat
+      - package_policy_typosquat_distance
+      - package_dependency_confusion
+      # Secret / credential exfiltration.
+      - credential_file_sweep
+      - sensitive_env_export
+      - data_exfiltration
+      - high_entropy_secret
+      - private_key_exposed
+      - credential_in_text
+      # Remote-exec / untrusted registry.
+      - docker_untrusted_registry
+      - base64_decode_execute
+    threshold: 5
+    window_minutes: 60
+    action: block
+  # Block when one command produces 3+ medium-or-higher findings at once.
+  - trigger: multi_medium
+    min_findings: 3
+    action: block
+
+# URL / host patterns that always pass analysis. Keep this list tight — an
+# over-broad allowlist lets an agent route around tirith.
+allowlist: []
+
+# URL / host patterns that are always blocked (overrides allowlist).
+blocklist: []
+
+# `tirith scan` configuration.
+scan:
+  # MCP server names you trust. Agents that load arbitrary MCP servers from
+  # their environment make a tight `trusted_mcp_servers` list especially
+  # valuable — every untrusted server raises findings, and drift on a
+  # trusted server is silent. Scaffold from `tirith mcp policy init`.
+  # trusted_mcp_servers: []
+
+  # Per-server allowed tools — pin the exact tool set you accept for each
+  # MCP server an agent may use. A new tool outside the set surfaces as a
+  # High-severity drift finding. See `tirith mcp policy init`.
+  # mcp_allowed_tools: {}
+
+# Per-agent governance (enforcement).
+# An agent-heavy environment benefits most from per-origin policy.
+# `tirith agent sessions` shows which agents have invoked tirith;
+# `tirith agent policy init` scaffolds this block from observed
+# origins. A `deny` match forces the verdict to Block and appends an
+# `agent_denied_by_policy` finding; `deny` beats any matching `allow`,
+# and `allow` is NOT a bypass — a verdict the engine already blocked
+# stays blocked even if the caller is on the allow list. Enforcement is
+# active on every analysis path: `tirith check`, the gateway, `paste`,
+# `install`, `ecosystem scan`, and all MCP `tools/call_check_*`
+# handlers. Note: the interactive `TIRITH=0` bypass currently skips
+# `agent_rules`.
+# agent_rules:
+#   allow:
+#     - kind: agent
+#       name: claude-code
+#     - kind: agent
+#       name: cursor
+#   deny:
+#     - kind: agent
+#       name: untrusted-agent
+
+# Package-policy section. AI-agent environments benefit from
+# tight package-reputation gates: agents are most likely to hallucinate
+# package names that don't exist, or to grab brand-new packages without
+# vetting. Recommended thresholds below.
+# package_policy:
+#   block_not_found: true
+#   block_newer_than_days: 7
+#   warn_newer_than_days: 30
+#   warn_low_downloads_below: 1000
+#   block_install_scripts_for_unknown_packages: true
+#   block_typosquat_distance: 2
+#   block_aggregate_score: 76
+#   warn_aggregate_score: 51
+#   block_osv_min_cvss: 7.0
+#   block_repo_mismatch: true
+#   warn_install_script_network_call: true
+#   block_dependency_confusion: true
+#   internal_package_names: []                # [{ ecosystem: npm, name: "@my-co/*" }]
+#   repo_mismatch_check_max_packages: 50

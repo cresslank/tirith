@@ -8,11 +8,21 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  # Serialize manual + scheduled runs: each run pushes the manifest to main and
+  # mutates the single rolling release, so overlapping runs must not interleave.
+  group: threatdb-build
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build-threatdb:
+    # Hard guard: this job mutates GitHub releases and pushes HEAD:main, so it
+    # must be impossible from any non-default branch (e.g. a feature-branch
+    # workflow_dispatch). schedule/dispatch always use main's copy anyway.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     env:
       # github.run_id and github.run_attempt are GitHub-controlled numeric
@@ -63,31 +73,52 @@ jobs:
             --cisa-kev /tmp/cisa-kev.json \
             --sequence "${RUN_ID}" \
             --sign-key-env TIRITH_THREATDB_SIGNING_KEY \
-            --output tirith-threatdb.dat
+            --output "tirith-threatdb-${RUN_ID}-${RUN_ATTEMPT}.dat"
 
       # Generate + sign manifest for client discovery
       - name: Generate signed manifest
         env:
           TIRITH_THREATDB_SIGNING_KEY: ${{ secrets.THREATDB_SIGNING_KEY }}
         run: |
-          SHA=$(sha256sum tirith-threatdb.dat | cut -d' ' -f1)
-          SIZE=$(stat -c%s tirith-threatdb.dat)
-          URL="https://github.com/sheeki03/tirith/releases/download/threatdb-${RUN_ID}-${RUN_ATTEMPT}/tirith-threatdb.dat"
+          set -euo pipefail
+          DB_ASSET="tirith-threatdb-${RUN_ID}-${RUN_ATTEMPT}.dat"
+          SHA=$(sha256sum "$DB_ASSET" | cut -d' ' -f1)
+          SIZE=$(stat -c%s "$DB_ASSET")
+          URL="https://github.com/sheeki03/tirith/releases/download/threatdb-latest/${DB_ASSET}"
+          # PAYLOAD MUST stay byte-identical to the client's canonical_payload() in
+          # crates/tirith/src/cli/threatdb_cmd.rs (alphabetical keys, compact, no
+          # spaces) — only the $URL value differs from older versions. The signature
+          # is over these literal bytes; a stray space breaks every client. Guarded
+          # by the canonical_payload_* unit tests and the self-check below.
           PAYLOAD="{\"sha256\":\"$SHA\",\"size\":$SIZE,\"url\":\"$URL\",\"version\":${RUN_ID}}"
+          CANON=$(printf '%s' "$PAYLOAD" | jq -cS .)
+          if [ "$PAYLOAD" != "$CANON" ]; then
+            echo "::error::PAYLOAD is not in canonical form. got=$PAYLOAD want=$CANON"
+            exit 1
+          fi
           SIG=$(./target/release/tirith-threatdb-compile sign-payload \
             --payload "$PAYLOAD" --key-env TIRITH_THREATDB_SIGNING_KEY)
           cat > threatdb-manifest.json <<EEOF
           {"version":${RUN_ID},"sha256":"$SHA","size":$SIZE,"url":"$URL","signature":"$SIG"}
           EEOF
 
-      # Publish DB as release
+      # Publish to ONE rolling prerelease so the daily DB builds stop burying the
+      # v* binary releases past page 1 of the releases feed (issue #140). The .dat
+      # is run-scoped (immutable, never overwritten) to avoid an asset-swap race;
+      # the manifest is overwritten in place. The tag stays pinned where it was
+      # first created (we deliberately do NOT set target_commitish).
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: threatdb-${{ github.run_id }}-${{ github.run_attempt }}
+          tag_name: threatdb-latest
+          prerelease: true
           make_latest: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          name: "Threat DB (rolling)"
+          body: "Auto-updated threat-intelligence database (prerelease channel). Not a versioned download; tirith resolves it via the signed manifest. See #140."
           files: |
-            tirith-threatdb.dat
+            tirith-threatdb-${{ github.run_id }}-${{ github.run_attempt }}.dat
             threatdb-manifest.json
 
       # Push manifest update directly to main. Branch is unprotected and the
@@ -107,3 +138,32 @@ jobs:
           # Absorb any commits that landed on main during the build, then push.
           git pull --rebase --autostash origin main
           git push origin HEAD:main
+
+      # Keep only the newest N run-scoped DB assets on the rolling release so it
+      # doesn't accumulate one asset per day forever. Never touches the manifest.
+      # N=3 leaves slack for an in-flight client still holding a prior manifest.
+      - name: Prune old threatdb assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: "3"
+        run: |
+          set -euo pipefail
+          mapfile -t STALE < <(
+            gh release view threatdb-latest --repo "${{ github.repository }}" \
+              --json assets \
+              --jq '.assets[].name | select(test("^tirith-threatdb-[0-9]+-[0-9]+\\.dat$"))' \
+            | sort -t- -k3,3nr -k4,4nr \
+            | tail -n +"$((KEEP + 1))"
+          )
+          if [ "${#STALE[@]}" -eq 0 ]; then
+            echo "Prune: nothing to delete."
+            exit 0
+          fi
+          for asset in "${STALE[@]}"; do
+            case "$asset" in
+              threatdb-manifest.json) continue ;;
+            esac
+            echo "Pruning stale asset: $asset"
+            gh release delete-asset threatdb-latest "$asset" \
+              --repo "${{ github.repository }}" --yes
+          done

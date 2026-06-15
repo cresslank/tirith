@@ -1,39 +1,19 @@
 //! Deterministic, fully explainable risk scoring.
 //!
-//! tirith's risk score is **not** a learned model, a statistical classifier, or
-//! any black box. It is a fixed sum of named, inspectable factors. Every score
-//! is reproducible by hand from the finding set: read the breakdown, add the
-//! per-factor contributions, clamp to 100, done.
+//! Not a learned model — a fixed sum of named, inspectable factors, reproducible
+//! by hand. The score for a URL/command is:
 //!
-//! ## The factor model
+//! 1. **Base severity** — the highest-severity finding sets a base (`Critical`
+//!    90, `High` 70, `Medium` 40, `Low` 15, `Info`/none 0).
+//! 2. **Additional findings** — each *substantive* finding beyond the first adds
+//!    +5. Note-only Info annotations are excluded (CodeRabbit R11 #3).
+//! 3. **Threat-intel corroboration** (additive, +5) — fires only when a
+//!    local-threat-DB hit sits alongside another finding; never on its own.
 //!
-//! The score for a URL/command is the sum of:
-//!
-//! 1. **Base severity** — the single highest-severity finding sets a base value
-//!    (`Critical` 90, `High` 70, `Medium` 40, `Low` 15, `Info`/none 0). This is
-//!    the dominant term: one critical finding alone scores 90.
-//! 2. **Additional findings** — each finding *beyond the first* adds a flat +5.
-//!    More independent problems mean more risk, but secondarily to severity.
-//! 3. **Threat-intel corroboration** (context-aware, additive) — if at least
-//!    one finding comes from the local threat-intelligence database (a known-bad
-//!    package / IP / URL / typosquat) *and* there is at least one other finding,
-//!    add +5. A threat-DB hit is an unambiguous, deterministic external
-//!    corroboration that the other findings are not a false positive. It is
-//!    additive only and never fires on its own, so it cannot push a clean URL
-//!    up — it only sharpens an already-flagged one.
-//!
-//! The final score is `min(100, sum)`. The clamp itself is reported as a factor
-//! when it bites, so the breakdown still sums exactly to the displayed number.
-//!
-//! Factors 1 and 2 reproduce the historical `severity_to_score` formula exactly,
-//! so adding the breakdown changed no existing score. Factor 3 is the only new
-//! term and is purely additive.
-//!
-//! ## Relationship to the verdict
-//!
-//! The score is advisory. It is derived *from* a [`Verdict`] but never changes
-//! one: `Action`, exit codes, and audit logs are untouched. `tirith score` is an
-//! inspection command, not an enforcement path.
+//! Final score is `min(100, sum)`; the clamp is reported as a factor so the
+//! breakdown sums exactly. Factors 1+2 reproduce the historical
+//! `severity_to_score` formula. The score is advisory — it never changes the
+//! verdict's `Action`, exit codes, or audit logs.
 
 use serde::Serialize;
 
@@ -53,18 +33,47 @@ fn severity_base(sev: Severity) -> u32 {
 /// Flat contribution for each finding beyond the first.
 const ADDITIONAL_FINDING_WEIGHT: u32 = 5;
 
+/// `true` for note-only Info findings that annotate a command without being an
+/// independent risk signal, so they must not inflate `additional_findings`
+/// (CodeRabbit R11 #3). Only the card/manifest/paste-source metadata rules:
+/// `CommandCardVerified`, `CommandCardUnverified`, `RepoCommandUnknown`, and
+/// `PasteSourceMismatch` (only at Info — its High case is a real signal, kept
+/// counted by the severity gate in [`is_excluded_note`]).
+///
+/// Deliberately NOT note-only (real signals): `CommandCardMismatch`,
+/// `RepoCommandDangerousPattern`, `CanaryTokenTouched`, and the `Anomaly*`
+/// baseline-novelty rules.
+fn is_note_only_rule(rule: RuleId) -> bool {
+    matches!(
+        rule,
+        RuleId::CommandCardVerified
+            | RuleId::CommandCardUnverified
+            | RuleId::RepoCommandUnknown
+            | RuleId::PasteSourceMismatch
+    )
+}
+
+/// Whether a finding is an excluded note — a note-only rule still at `Info`
+/// severity, dropped from the substantive-findings count (factors 2 and 3).
+///
+/// The severity check matters (CodeRabbit R15 #6): `severity_overrides` can
+/// PROMOTE a note-only rule, and once promoted the operator has declared it
+/// risk-relevant, so it must be counted. Exempt ONLY while severity is `Info`.
+fn is_excluded_note(finding: &Finding) -> bool {
+    is_note_only_rule(finding.rule_id) && finding.severity == Severity::Info
+}
+
 /// Contribution when a threat-intel finding corroborates other findings.
 const THREAT_INTEL_CORROBORATION_WEIGHT: u32 = 5;
 
 /// The maximum possible score. Scores are clamped here.
 pub const MAX_SCORE: u32 = 100;
 
-/// Whether a rule id belongs to the threat-intelligence family — i.e. it fired
-/// because the local threat-DB matched a known-bad indicator, not because of a
-/// structural heuristic.
+/// Whether a rule fired because the local threat-DB matched a known-bad
+/// indicator (vs a structural heuristic).
 ///
-/// Exhaustive `match` (no wildcard arm) on purpose: a new `RuleId` variant
-/// forces a compile error here so this classification is never silently stale.
+/// Exhaustive `match` (no wildcard) on purpose: a new `RuleId` forces a compile
+/// error here so this classification never goes silently stale.
 pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
     match rule_id {
         RuleId::ThreatMaliciousPackage
@@ -120,6 +129,11 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::CredentialFileSweep
         | RuleId::Base64DecodeExecute
         | RuleId::DataExfiltration
+        // M13 — structural obfuscation heuristic, not a threat-DB hit.
+        | RuleId::WrapperChainTooDeep
+        | RuleId::PsSetExecutionPolicyBypass
+        | RuleId::PsDefenderExclusion
+        | RuleId::PsInlineDownloadExecute
         | RuleId::DynamicCodeExecution
         | RuleId::ObfuscatedPayload
         | RuleId::SuspiciousCodeExfiltration
@@ -141,6 +155,7 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::McpDuplicateServerName
         | RuleId::McpOverlyPermissive
         | RuleId::McpSuspiciousArgs
+        | RuleId::McpServerDrift
         | RuleId::GitTyposquat
         | RuleId::DockerUntrustedRegistry
         | RuleId::PipUrlInstall
@@ -148,6 +163,24 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::Web3RpcEndpoint
         | RuleId::Web3AddressInUrl
         | RuleId::VetNotConfigured
+        | RuleId::RepoAddFromPipe
+        | RuleId::UnsignedRepoTrust
+        | RuleId::GpgCheckDisabled
+        | RuleId::KubectlApplyRemote
+        | RuleId::HelmUntrustedRepo
+        | RuleId::TerraformRemoteModule
+        | RuleId::BrewUntrustedTap
+        | RuleId::WorkflowUnpinnedAction
+        | RuleId::WorkflowDangerousTrigger
+        | RuleId::WorkflowCurlPipeShell
+        | RuleId::WorkflowUntrustedInput
+        | RuleId::DockerfileUnpinnedImage
+        | RuleId::PackageScriptDangerous
+        | RuleId::NotebookHiddenContent
+        | RuleId::NotebookSuspiciousOutput
+        | RuleId::AgentInstructionHidden
+        | RuleId::SvgScriptEmbedded
+        | RuleId::SvgExternalReference
         | RuleId::HiddenCssContent
         | RuleId::HiddenColorContent
         | RuleId::HiddenHtmlAttribute
@@ -160,8 +193,138 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::HighEntropySecret
         | RuleId::PrivateKeyExposed
         | RuleId::PolicyBlocklisted
+        | RuleId::AgentDeniedByPolicy
         | RuleId::CustomRuleMatch
-        | RuleId::LicenseRequired => false,
+        | RuleId::LicenseRequired
+        // M6 ch6 — package reputation signals (registry-API/snapshot driven),
+        // not threat-DB hits.
+        | RuleId::PackageNotFoundInRegistry
+        | RuleId::PackageMaintainerChangeRecent
+        | RuleId::PackageOwnershipTransferred
+        | RuleId::PackageOsvAdvisoryActive
+        | RuleId::PackageDependencyConfusion
+        | RuleId::PackageInstallScriptNetworkCall
+        | RuleId::PackageRepoMismatch
+        // M6 ch7 — package-policy gated rules (policy thresholds), not threat-DB.
+        | RuleId::PackagePolicyNewerThanDays
+        | RuleId::PackagePolicyLowDownloads
+        | RuleId::PackagePolicyTyposquatDistance
+        | RuleId::PackagePolicyUnknownPackageWithInstallScripts
+        | RuleId::PackagePolicyNotFound
+        // M7 ch1 — output-direction (escape-sequence) rules, not threat-DB.
+        | RuleId::OutputOsc52ClipboardWrite
+        | RuleId::OutputHiddenText
+        | RuleId::OutputFakePrompt
+        | RuleId::OutputTerminalHyperlinkMismatch
+        | RuleId::OutputTitleManipulation
+        | RuleId::OutputClearScreen
+        | RuleId::OutputTruncatedEscapeSequence
+        // M7 ch5 — prompt-injection seed phrases (text matching), not threat-DB.
+        | RuleId::PromptInjectionInOutput
+        | RuleId::IgnorePreviousInstructions
+        // M8 ch1 — operational-context rules (verbs vs operator labels).
+        | RuleId::ContextProdDestructiveCommand
+        | RuleId::ContextProdWriteOperation
+        | RuleId::ContextProdCredentialChange
+        // M8 ch2 — SSH operational-context rules (args + operator labels).
+        | RuleId::SshRemoteDestructiveOnLabeledHost
+        | RuleId::SshRemoteShellOnLabeledHost
+        // M8 ch3 — IaC operational-context rules (CLI args + labels).
+        | RuleId::IacApplyWithoutPlan
+        | RuleId::IacApplyAutoApprove
+        | RuleId::IacApplyAutoApproveProd
+        | RuleId::IacDestroyProd
+        | RuleId::IacPlanHighRiskChanges
+        | RuleId::IacPlanHashMismatch
+        // M8 ch4 — sudo-escalation rules (parsed sudo invocation).
+        | RuleId::SudoShellSpawn
+        | RuleId::SudoEnvPreserveSensitive
+        | RuleId::SudoTeeSystemFile
+        | RuleId::SudoDownloadInstall
+        | RuleId::SudoRecursivePermsBroadPath
+        // M8 ch5 — container-runtime rules (docker/podman args + labels).
+        | RuleId::DockerRunPrivileged
+        | RuleId::DockerRunSensitiveBindMount
+        | RuleId::DockerExecProdContainer
+        // M9 ch1 — workstation hygiene rules (filesystem checks).
+        | RuleId::HygienePrivateKeyLoosePerms
+        | RuleId::HygieneEnvWorldReadable
+        | RuleId::HygieneKubeconfigGroupReadable
+        | RuleId::HygieneNpmrcPlaintextToken
+        | RuleId::HygienePypircPlaintextToken
+        | RuleId::HygieneSshConfigUnsafeInclude
+        | RuleId::HygieneGitCredentialHelperStore
+        | RuleId::HygieneShellHistorySecretLike
+        | RuleId::HygieneCloudCredsBadPerms
+        | RuleId::HygieneDbDumpInRepo
+        // M9 ch2 — persistence state-change rules (snapshot-diff).
+        | RuleId::PersistenceShellRcModified
+        | RuleId::PersistenceAuthorizedKeysNewEntry
+        | RuleId::PersistenceCrontabModified
+        | RuleId::PersistenceLaunchAgentAdded
+        | RuleId::PersistenceSshConfigInclude
+        | RuleId::PersistenceDirenvNewEnvrc
+        // M9 ch3 — shell-alias/function risk rules (parsed bodies).
+        | RuleId::AliasOverridesCriticalCommand
+        | RuleId::AliasContainsNetworkCall
+        | RuleId::AliasContainsCredentialRead
+        | RuleId::AliasRecentlyAdded
+        // M9 ch4 — env-variable lifecycle rules (command shape + rc scan).
+        | RuleId::EnvSensitiveExposedToUnknownScript
+        | RuleId::EnvSensitivePersistedInShellRc
+        | RuleId::EnvPrintenvToNetworkSink
+        // M9 ch5 — exec-provenance + PATH-shadowing rules (stat/path/sig).
+        | RuleId::ExecInTmp
+        | RuleId::ExecRecentlyModified
+        | RuleId::ExecWorldWritable
+        | RuleId::ExecShadowsSystemCommand
+        | RuleId::ExecUnsigned
+        | RuleId::ExecInRepoBin
+        | RuleId::PathWritableDirBeforeSystem
+        | RuleId::PathDuplicateCommandName
+        | RuleId::PathDirInRepo
+        | RuleId::PathDirInTmp
+        // M9 ch6 — repo-hook/automation guard rules (body-content).
+        | RuleId::RepoHookNetworkCall
+        | RuleId::RepoHookCredentialRead
+        | RuleId::RepoHookSudo
+        | RuleId::RepoHookSuspiciousShellPattern
+        | RuleId::RepoHookExternalFetch
+        // M10 ch1 — blast-radius rules (structural/simulation).
+        | RuleId::BlastDeletesOutsideRepo
+        | RuleId::BlastWritesSystemPath
+        | RuleId::BlastSymlinkTraversal
+        | RuleId::BlastEmptyVarGlob
+        | RuleId::BlastFindDelete
+        | RuleId::BlastRsyncDelete
+        | RuleId::BlastLargeFileCount
+        // M10 ch2 — post-run shell-rc modification (snapshot-diff).
+        | RuleId::PostRunShellRcModified
+        // M10 ch3 — tainted-content tracking (local taint store).
+        | RuleId::ExecOfTaintedFile
+        | RuleId::CommandSourcedFromTaintedFile
+        // M10 ch5 — anomaly-detection rules (baseline novelty).
+        | RuleId::AnomalyFirstTimeInThisRepo
+        | RuleId::AnomalyRareInBaseline
+        // M11 ch1 — command-card attestation (local ed25519 check).
+        | RuleId::CommandCardVerified
+        | RuleId::CommandCardUnverified
+        | RuleId::CommandCardMismatch
+        // M11 ch2 — repo command-manifest rules (commands.yaml match).
+        | RuleId::RepoCommandUnknown
+        | RuleId::RepoCommandDangerousPattern
+        // M11 ch3 — honeytoken/canary (local store lookup).
+        | RuleId::CanaryTokenTouched
+        // M12 ch1 — paste provenance (companion-file hash + host compare).
+        | RuleId::PasteSourceMismatch
+        // M13 ch5 — AI-config drift rules (snapshot-vs-current diff).
+        | RuleId::AiConfigHiddenInstructionAdded
+        | RuleId::AiConfigToolUseEscalation
+        // W7: cross-event correlation rules (session/post-process sequence match).
+        | RuleId::SecretWriteThenNetwork
+        | RuleId::DependencyChangeThenNetwork
+        | RuleId::DeleteThenForcePush
+        | RuleId::MassFileDeletion => false,
     }
 }
 
@@ -172,19 +335,15 @@ pub struct ScoreFactor {
     pub id: &'static str,
     /// Human-readable label (e.g. `"Highest-severity finding"`).
     pub label: String,
-    /// Points this factor contributes to the score. Always >= 0 except the
-    /// `clamp` factor, which is <= 0 and brings an over-100 sum back to 100.
+    /// Points this factor contributes. >= 0 except the `clamp` factor (<= 0).
     pub points: i32,
-    /// Plain-language explanation of why this factor has this value, written so
-    /// the reader can verify it by hand.
+    /// Plain-language explanation, verifiable by hand.
     pub detail: String,
 }
 
-/// A complete, reproducible explanation of how a risk score was derived.
+/// A reproducible explanation of how a risk score was derived.
 ///
-/// Invariant: `factors.iter().map(|f| f.points).sum() == score as i32`. The
-/// `verify` method asserts this; `score_verdict` always produces a breakdown
-/// that satisfies it.
+/// Invariant (checked by [`verify`](Self::verify)): the factors sum to `score`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScoreBreakdown {
     /// Final risk score, 0..=100.
@@ -196,23 +355,18 @@ pub struct ScoreBreakdown {
 }
 
 impl ScoreBreakdown {
-    /// Sum of all factor contributions. Equal to `score` for any breakdown
-    /// produced by [`score_verdict`].
+    /// Sum of all factor contributions (equals `score`).
     pub fn factor_sum(&self) -> i32 {
         self.factors.iter().map(|f| f.points).sum()
     }
 
-    /// Returns `true` iff the factors sum exactly to the final score — the
-    /// reproducible-by-hand contract. Used by tests and as a debug assert.
+    /// `true` iff the factors sum exactly to the final score.
     pub fn verify(&self) -> bool {
         self.factor_sum() == self.score as i32
     }
 }
 
-/// Map a numeric score to its risk-level bucket.
-///
-/// Thresholds are fixed and match the historical `tirith score` buckets so the
-/// breakdown does not reclassify any URL.
+/// Map a numeric score to its risk-level bucket (fixed historical thresholds).
 pub fn risk_level(score: u32) -> &'static str {
     match score {
         0..=20 => "low",
@@ -222,23 +376,18 @@ pub fn risk_level(score: u32) -> &'static str {
     }
 }
 
-/// Compute the deterministic risk score and its full factor breakdown for a
-/// verdict's findings.
-///
-/// This is the single source of truth for the `tirith score` number. The
-/// breakdown it returns always satisfies `breakdown.verify()`.
+/// Compute the deterministic risk score and full factor breakdown for a
+/// verdict's findings — the single source of truth for `tirith score`.
 pub fn score_verdict(verdict: &Verdict) -> ScoreBreakdown {
     score_findings(&verdict.findings)
 }
 
-/// Compute the score breakdown from a raw finding slice.
-///
-/// Separated from [`score_verdict`] so tests can drive it with synthetic
-/// findings without constructing a whole [`Verdict`].
+/// Compute the score breakdown from a raw finding slice. Separated from
+/// [`score_verdict`] so tests can drive it with synthetic findings.
 pub fn score_findings(findings: &[Finding]) -> ScoreBreakdown {
     let mut factors: Vec<ScoreFactor> = Vec::new();
 
-    // Factor 1 — base severity. The highest-severity finding sets the floor.
+    // Factor 1 — base severity (highest-severity finding sets the floor).
     let max_severity = findings
         .iter()
         .map(|f| f.severity)
@@ -259,16 +408,18 @@ pub fn score_findings(findings: &[Finding]) -> ScoreBreakdown {
         detail: base_detail,
     });
 
-    // Factor 2 — additional findings. Each finding past the first adds +5.
-    let extra = findings.len().saturating_sub(1) as u32;
+    // Factor 2 — additional findings (+5 each past the first). Note-only Info
+    // annotations are excluded (CodeRabbit R11 #3); a promotion above Info makes
+    // them count (CodeRabbit R15 #6), picked up via `is_excluded_note`.
+    let substantive = findings.iter().filter(|f| !is_excluded_note(f)).count();
+    let extra = substantive.saturating_sub(1) as u32;
     let extra_points = extra * ADDITIONAL_FINDING_WEIGHT;
-    let extra_detail = match findings.len() {
+    let extra_detail = match substantive {
         0 | 1 => format!(
-            "{} finding(s) — no additional-finding points (the first finding is already counted by base severity).",
-            findings.len()
+            "{substantive} substantive finding(s) — no additional-finding points (the first is already counted by base severity; note-only card/manifest annotations are excluded)."
         ),
         n => format!(
-            "{n} findings total; {extra} beyond the first × {ADDITIONAL_FINDING_WEIGHT} points each = {extra_points}."
+            "{n} substantive findings; {extra} beyond the first × {ADDITIONAL_FINDING_WEIGHT} points each = {extra_points} (note-only card/manifest annotations excluded)."
         ),
     };
     factors.push(ScoreFactor {
@@ -278,13 +429,15 @@ pub fn score_findings(findings: &[Finding]) -> ScoreBreakdown {
         detail: extra_detail,
     });
 
-    // Factor 3 — threat-intel corroboration (context-aware, additive). Only
-    // fires when a threat-DB finding sits alongside at least one other finding.
+    // Factor 3 — threat-intel corroboration (+5). Fires only when a threat-DB
+    // finding sits alongside another SUBSTANTIVE finding; note-only annotations
+    // must not corroborate (CodeRabbit R12 #D). Threat rules are themselves
+    // substantive, so `substantive > 1` means "threat hit + another finding".
     let threat_hits: Vec<&Finding> = findings
         .iter()
         .filter(|f| is_threat_intel_rule(f.rule_id))
         .collect();
-    let corroborates = !threat_hits.is_empty() && findings.len() > 1;
+    let corroborates = !threat_hits.is_empty() && substantive > 1;
     if corroborates {
         let rule_list = threat_hits
             .iter()
@@ -303,9 +456,8 @@ pub fn score_findings(findings: &[Finding]) -> ScoreBreakdown {
         });
     }
 
-    // Sum and clamp. When the raw sum exceeds MAX_SCORE, the overflow is
-    // reported as an explicit negative `clamp` factor so the breakdown still
-    // sums exactly to the displayed score.
+    // Sum and clamp. Overflow past MAX_SCORE is reported as an explicit negative
+    // `clamp` factor so the breakdown still sums exactly.
     let raw_sum: i32 = factors.iter().map(|f| f.points).sum();
     let score = raw_sum.clamp(0, MAX_SCORE as i32) as u32;
     if raw_sum > MAX_SCORE as i32 {
@@ -407,9 +559,125 @@ mod tests {
     }
 
     #[test]
+    fn note_only_card_findings_do_not_change_score() {
+        // CodeRabbit R11 #3: a note-only Info finding must not inflate the score
+        // (lone note scores 0; alongside real findings it adds nothing).
+        for note in [
+            RuleId::CommandCardVerified,
+            RuleId::CommandCardUnverified,
+            RuleId::RepoCommandUnknown,
+        ] {
+            // (a) Lone note → identical to no findings at all (score 0).
+            let lone = score_findings(&[finding(note, Severity::Info)]);
+            assert_eq!(lone.score, 0, "a lone {note:?} note must score 0");
+            assert!(lone.verify());
+
+            // (b) A real High finding + the note scores the SAME as the High
+            // finding alone — the note adds no additional-finding points.
+            let without = score_findings(&[finding(RuleId::PlainHttpToSink, Severity::High)]);
+            let with = score_findings(&[
+                finding(RuleId::PlainHttpToSink, Severity::High),
+                finding(note, Severity::Info),
+            ]);
+            assert_eq!(
+                with.score, without.score,
+                "{note:?} must not change the score (with={}, without={})",
+                with.score, without.score
+            );
+            assert_eq!(with.score, 70, "High alone is 70; the note adds nothing");
+            assert!(with.verify());
+        }
+    }
+
+    #[test]
+    fn paste_source_mismatch_info_is_note_only_but_high_is_counted() {
+        // M12 ch1: the Info host-mismatch case is advisory metadata (lone scores
+        // 0; adds nothing alongside a real High).
+        let lone = score_findings(&[finding(RuleId::PasteSourceMismatch, Severity::Info)]);
+        assert_eq!(lone.score, 0, "a lone Info paste-source mismatch scores 0");
+        assert!(lone.verify());
+
+        let with_info = score_findings(&[
+            finding(RuleId::PlainHttpToSink, Severity::High),
+            finding(RuleId::PasteSourceMismatch, Severity::Info),
+        ]);
+        assert_eq!(
+            with_info.score, 70,
+            "an Info paste-source mismatch must not add an additional-finding point"
+        );
+
+        // The High case is a real signal: alongside another High it adds +5
+        // (70 → 75), kept counted by the severity gate in `is_excluded_note`.
+        let with_high = score_findings(&[
+            finding(RuleId::PlainHttpToSink, Severity::High),
+            finding(RuleId::PasteSourceMismatch, Severity::High),
+        ]);
+        assert_eq!(
+            with_high.score, 75,
+            "a High paste-source mismatch must count as an additional finding"
+        );
+        assert!(with_high.verify());
+    }
+
+    #[test]
+    fn canary_touched_is_counted_not_note_only() {
+        // Contrast: CanaryTokenTouched (High) is a real signal — 70 + 5 = 75.
+        let b = score_findings(&[
+            finding(RuleId::CanaryTokenTouched, Severity::High),
+            finding(RuleId::PlainHttpToSink, Severity::High),
+        ]);
+        assert_eq!(b.score, 75, "canary-touched must still count as a finding");
+        assert!(b.verify());
+    }
+
+    #[test]
+    fn promoted_note_only_rule_is_counted_but_info_one_is_not() {
+        // CodeRabbit R15 #6: a note-only rule is exempt only at Info; an operator
+        // promotion via `severity_overrides` makes it count.
+        //
+        // (1) An Info CommandCardVerified note adds nothing (stays 70).
+        let at_info = score_findings(&[
+            finding(RuleId::PlainHttpToSink, Severity::High),
+            finding(RuleId::CommandCardVerified, Severity::Info),
+        ]);
+        assert_eq!(
+            at_info.score, 70,
+            "an Info note-only finding must not add an additional-finding point"
+        );
+        assert!(at_info.verify());
+
+        // (2) The same rule promoted to Medium is counted: alongside the High it
+        // adds +5 (70 → 75; base stays High).
+        let promoted = score_findings(&[
+            finding(RuleId::PlainHttpToSink, Severity::High),
+            finding(RuleId::CommandCardVerified, Severity::Medium),
+        ]);
+        assert_eq!(
+            promoted.score, 75,
+            "a promoted (Medium) CommandCardVerified must count as an additional finding"
+        );
+        assert!(promoted.verify());
+        assert!(
+            promoted.score > at_info.score,
+            "promotion must raise the score relative to the Info note (75 > 70)"
+        );
+
+        // A lone promoted note scores on its own severity (Medium = 40), not 0.
+        let lone_promoted =
+            score_findings(&[finding(RuleId::CommandCardVerified, Severity::Medium)]);
+        assert_eq!(
+            lone_promoted.score, 40,
+            "a lone promoted note scores on its (Medium) severity, not 0"
+        );
+        assert!(lone_promoted.verify());
+        // Contrast: a lone Info note still scores 0.
+        let lone_info = score_findings(&[finding(RuleId::CommandCardVerified, Severity::Info)]);
+        assert_eq!(lone_info.score, 0, "a lone Info note still scores 0");
+    }
+
+    #[test]
     fn matches_historical_formula_for_non_threat_findings() {
-        // Reproduces the old severity_to_score(max, count) for a spread of
-        // inputs — proves the breakdown changed no pre-existing score.
+        // Reproduces the old severity_to_score(max, count) for a spread of inputs.
         fn historical(max: Severity, count: usize) -> u32 {
             let base = match max {
                 Severity::Critical => 90,
@@ -488,6 +756,50 @@ mod tests {
     }
 
     #[test]
+    fn note_only_finding_does_not_corroborate_threat_intel() {
+        // CodeRabbit R12 #D: a note-only Info annotation must not corroborate a
+        // threat-intel hit — corroboration requires another substantive finding.
+        for note in [
+            RuleId::CommandCardVerified,
+            RuleId::CommandCardUnverified,
+            RuleId::RepoCommandUnknown,
+        ] {
+            let with_note = score_findings(&[
+                finding(RuleId::ThreatMaliciousIp, Severity::High),
+                finding(note, Severity::Info),
+            ]);
+            assert!(
+                with_note
+                    .factors
+                    .iter()
+                    .all(|f| f.id != "threat_intel_corroboration"),
+                "{note:?} must NOT corroborate a threat-intel hit"
+            );
+            // Identical to the lone threat hit (the note is excluded everywhere).
+            let lone = score_findings(&[finding(RuleId::ThreatMaliciousIp, Severity::High)]);
+            assert_eq!(
+                with_note.score, lone.score,
+                "a note alongside a lone threat hit must not change the score (note={note:?})"
+            );
+            assert_eq!(with_note.score, 70);
+            assert!(with_note.verify());
+        }
+
+        // Sanity: a substantive second finding does still corroborate (+5).
+        let real_pair = score_findings(&[
+            finding(RuleId::ThreatMaliciousIp, Severity::High),
+            finding(RuleId::PlainHttpToSink, Severity::High),
+        ]);
+        assert!(
+            real_pair
+                .factors
+                .iter()
+                .any(|f| f.id == "threat_intel_corroboration"),
+            "a substantive second finding must still corroborate"
+        );
+    }
+
+    #[test]
     fn score_is_clamped_to_100_with_explicit_clamp_factor() {
         // 5 critical findings: 90 + 4*5 = 110 raw → clamps to 100.
         let findings: Vec<Finding> = (0..5)
@@ -508,7 +820,7 @@ mod tests {
 
     #[test]
     fn every_breakdown_verifies_for_wide_input_range() {
-        // Exhaustive-ish: every severity, finding counts 0..=8, threat or not.
+        // Every severity, finding counts 0..=8, threat or not.
         for count in 0..=8usize {
             for sev in [
                 Severity::Info,
@@ -546,5 +858,31 @@ mod tests {
         assert!(!is_threat_intel_rule(RuleId::CurlPipeShell));
         assert!(!is_threat_intel_rule(RuleId::PolicyBlocklisted));
         assert!(!is_threat_intel_rule(RuleId::NonAsciiHostname));
+    }
+
+    #[test]
+    fn ai_config_drift_rules_are_not_threat_intel() {
+        // CodeRabbit M13 round-24: the M13 ch5 AI-config drift rules are
+        // structural snapshot-diff signals, not threat-DB hits — pin them in the
+        // `=> false` arm so the corroboration factor never fires off them.
+        assert!(
+            !is_threat_intel_rule(RuleId::AiConfigHiddenInstructionAdded),
+            "AiConfigHiddenInstructionAdded is structural drift, not threat-intel"
+        );
+        assert!(
+            !is_threat_intel_rule(RuleId::AiConfigToolUseEscalation),
+            "AiConfigToolUseEscalation is structural drift, not threat-intel"
+        );
+
+        // They are also not note-only — an AI-config drift is an independent
+        // risk signal, so it stays counted.
+        assert!(
+            !is_note_only_rule(RuleId::AiConfigHiddenInstructionAdded),
+            "AiConfigHiddenInstructionAdded is a substantive signal, not a note-only annotation"
+        );
+        assert!(
+            !is_note_only_rule(RuleId::AiConfigToolUseEscalation),
+            "AiConfigToolUseEscalation is a substantive signal, not a note-only annotation"
+        );
     }
 }

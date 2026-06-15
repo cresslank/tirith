@@ -16,6 +16,20 @@ pub enum ScanContext {
     FileScan,
 }
 
+impl std::str::FromStr for ScanContext {
+    type Err = String;
+    /// Parse the strict lowercase tokens (`exec`/`paste`/`file_scan`).
+    /// Case-sensitive on purpose so a typo surfaces as a hard parse error.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "exec" => Ok(ScanContext::Exec),
+            "paste" => Ok(ScanContext::Paste),
+            "file_scan" => Ok(ScanContext::FileScan),
+            other => Err(format!("unknown scan context: {other}")),
+        }
+    }
+}
+
 // Include generated Tier 1 patterns from build.rs declarative pattern table.
 #[allow(dead_code)]
 mod tier1_generated {
@@ -70,17 +84,14 @@ pub struct ByteFinding {
 }
 
 impl ByteScanResult {
-    /// Return a filtered view where findings whose offset falls inside `ignore`
-    /// are removed, and the `has_*` flags are re-derived from the survivors so
-    /// downstream tier-1/tier-3 gates stay consistent.
-    ///
-    /// Used by the inspection-subcommand carveout: bytes inside the inert arg
-    /// span of `tirith diff/score/why/...` commands shouldn't trigger Unicode-
-    /// style rules. `has_invalid_utf8` is a whole-input property and is left
-    /// unchanged.
+    /// Return a filtered view dropping findings whose offset falls inside
+    /// `ignore`, with `has_*` flags re-derived from the survivors so tier-1/
+    /// tier-3 gates stay consistent. Used by the inspection-subcommand carveout
+    /// (inert arg span of `tirith diff/score/why/...`). `has_invalid_utf8` is a
+    /// whole-input property and is left unchanged.
     pub fn with_ignored_range(mut self, ignore: &std::ops::Range<usize>) -> Self {
         self.details.retain(|d| !ignore.contains(&d.offset));
-        // Re-derive flags from surviving details. Matched on description
+        // Re-derive flags from surviving details, matched on the description
         // prefixes that correspond to each branch in `scan_bytes`.
         self.has_ansi_escapes = false;
         self.has_control_chars = false;
@@ -157,9 +168,8 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
     while i < len {
         let b = input[i];
 
-        // Escape sequences: CSI (\e[), OSC (\e]), APC (\e_), DCS (\eP)
         if b == 0x1b {
-            // CSI (\e[), OSC (\e]), APC (\e_), DCS (\eP) are the escape-sequence
+            // CSI (\e[), OSC (\e]), APC (\e_), DCS (\eP): escape-sequence
             // introducers used for terminal injection attacks.
             if i + 1 < len {
                 let next = input[i + 1];
@@ -338,6 +348,606 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
     result
 }
 
+// Output-stream byte scanning (M7 ch1): a streaming scanner for terminal
+// output escape sequences (OSC 52 clipboard write, OSC 8 hyperlink, OSC 0/2
+// title, CSI 2J/H screen clear, SGR `\e[...m`). Callers feed 64 KiB chunks and
+// the small (non-full-VT) state machine carries partial-sequence context across
+// chunk boundaries (e.g. `\e]52;` split between two chunks).
+
+/// A single OSC 8 hyperlink span recovered from output (uri + visible label).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputHyperlinkHit {
+    pub offset: usize,
+    pub uri: String,
+    pub visible: String,
+}
+
+/// A single SGR escape sequence (`\e[...m`) recovered from output, with its
+/// parsed numeric params. Used by the hidden-text rule to spot `fg == bg`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputSgrHit {
+    pub offset: usize,
+    pub params: Vec<u32>,
+}
+
+/// Rolling state for [`scan_output_chunk`], persisted across chunks so OSC/CSI/
+/// SGR sequences split across chunks are detected end-to-end. Zero-width runs
+/// are chunk-local (the v1 hidden-text threshold is well within a 64 KiB window).
+#[derive(Debug, Default, Clone)]
+pub struct OutputScanState {
+    /// Absolute byte offset of the *next* byte to be fed in, so emitted offsets
+    /// are file-wide. The streaming driver bumps this by each chunk's length.
+    pub byte_offset: usize,
+    phase: OutputPhase,
+    osc_buf: Vec<u8>,
+    /// OSC introducer (`0`, `2`, `52`, `8`): accumulate digits, dispatch on `;`.
+    osc_introducer: Vec<u8>,
+    sgr_buf: Vec<u8>,
+    /// Reserved (unused): the chunk-boundary lone-`\e` case is already handled
+    /// via `OutputPhase::AfterEsc` carrying across chunks. Kept to preserve
+    /// struct ABI for callers constructing this manually. See code-reviewer #4.
+    #[allow(dead_code)]
+    saw_lone_esc: bool,
+    /// Set when, inside [`OutputPhase::InOsc`], we saw `\e` — the next byte may
+    /// be the OSC ST terminator (`\\`); if so we finalize, else resume payload.
+    osc_pending_st: bool,
+    /// For OSC 8: after `\e]8;PARAMS;URI<ST>` we collect the visible text until
+    /// the `\e]8;;<ST>` closer.
+    osc8_active_uri: Option<String>,
+    osc8_visible_buf: Vec<u8>,
+    osc8_uri_start_offset: usize,
+}
+
+/// Hard cap on payload bytes buffered inside one escape sequence; a larger
+/// sequence is aborted back to copy-through mode (legit OSC 8 URIs are KiB-sized).
+const OUTPUT_OSC_CAP: usize = 16 * 1024;
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+enum OutputPhase {
+    #[default]
+    Idle,
+    /// Just saw `\e`, waiting for next byte.
+    AfterEsc,
+    /// Inside `\e[…` waiting for a final byte in 0x40..=0x7E.
+    InCsi,
+    /// Inside `\e]…` (OSC): collecting the introducer + payload.
+    InOsc,
+    /// OSC 8 link open: collecting visible text between `\e]8;…<ST>` and
+    /// the closing `\e]8;;<ST>`.
+    InOsc8Visible,
+}
+
+/// Aggregate results from one or more streamed chunks (offsets are file-wide).
+#[derive(Debug, Default, Clone)]
+pub struct OutputScanResult {
+    /// OSC 52 clipboard write sequences.
+    pub osc52: Vec<OutputOscHit>,
+    /// OSC 0 / OSC 2 title-set sequences.
+    pub title_set: Vec<OutputOscHit>,
+    /// Explicit `\e[2J` / `\e[H` screen-clear sequences.
+    pub screen_clear: Vec<OutputOscHit>,
+    /// OSC 8 hyperlinks with their visible label captured.
+    pub hyperlinks: Vec<OutputHyperlinkHit>,
+    /// SGR sequences (used by the hidden-text rule).
+    pub sgr: Vec<OutputSgrHit>,
+    /// Runs of zero-width characters longer than the v1 threshold (8 chars).
+    pub zero_width_runs: Vec<OutputZeroWidthRun>,
+}
+
+/// One generic OSC hit (file-wide offset + decoded payload).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputOscHit {
+    pub offset: usize,
+    pub payload: String,
+}
+
+/// A run of >8 consecutive zero-width characters detected by the output scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputZeroWidthRun {
+    pub offset: usize,
+    pub count: usize,
+}
+
+/// Streaming output scanner — drive with 64 KiB chunks; `state` carries across
+/// calls so a sequence split on a chunk boundary is still detected end-to-end.
+/// Findings are *appended* to `result`; `engine::analyze_output_*` translates
+/// it into `Finding`s after all chunks are fed.
+pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut OutputScanResult) {
+    // Track consecutive zero-width chars within THIS chunk only — runs that
+    // straddle a chunk boundary intentionally do NOT count (the >8 v1 threshold
+    // is well within a 64 KiB window), keeping the state machine compact.
+    let mut zw_run_start: Option<usize> = None;
+    let mut zw_run_count: usize = 0;
+    let chunk_start_offset = state.byte_offset;
+
+    let mut byte_idx = 0;
+    while byte_idx < chunk.len() {
+        let b = chunk[byte_idx];
+
+        // Handle phase transitions first.
+        match state.phase {
+            OutputPhase::Idle | OutputPhase::InOsc8Visible => {
+                if b == 0x1B {
+                    state.phase = OutputPhase::AfterEsc;
+                    state.saw_lone_esc = false;
+                    byte_idx += 1;
+                    continue;
+                }
+                if state.phase == OutputPhase::InOsc8Visible {
+                    state.osc8_visible_buf.push(b);
+                    if state.osc8_visible_buf.len() > OUTPUT_OSC_CAP {
+                        // Bail — visible text is unreasonably large, abort the link.
+                        state.phase = OutputPhase::Idle;
+                        state.osc8_active_uri = None;
+                        state.osc8_visible_buf.clear();
+                    }
+                }
+            }
+            OutputPhase::AfterEsc => {
+                match b {
+                    b'[' => {
+                        state.phase = OutputPhase::InCsi;
+                        state.sgr_buf.clear();
+                    }
+                    b']' => {
+                        state.phase = OutputPhase::InOsc;
+                        state.osc_introducer.clear();
+                        state.osc_buf.clear();
+                    }
+                    b'\\' => {
+                        // Standalone `\e\\` (ST in idle context) — no-op.
+                        state.phase = OutputPhase::Idle;
+                    }
+                    _ => {
+                        // Bail to idle on any non-control byte (not a full VT100 parser).
+                        state.phase = OutputPhase::Idle;
+                    }
+                }
+                byte_idx += 1;
+                continue;
+            }
+            OutputPhase::InCsi => {
+                // SGR sequences end with `m`; we only care about parameter
+                // bytes (0x30..=0x3F) and final bytes (0x40..=0x7E).
+                if (0x40..=0x7E).contains(&b) {
+                    // `-2` for `\e[`. `saturating_sub` clamps to 0 for the
+                    // cross-chunk case (the `\e[` in chunk N, final byte in N+1)
+                    // where the naive subtraction would underflow usize.
+                    let abs_offset = (chunk_start_offset + byte_idx)
+                        .saturating_sub(state.sgr_buf.len())
+                        .saturating_sub(2);
+                    if b == b'm' {
+                        // Parse SGR params: ";"-separated decimal ints; empty = 0.
+                        let params = parse_sgr_params(&state.sgr_buf);
+                        result.sgr.push(OutputSgrHit {
+                            offset: abs_offset,
+                            params,
+                        });
+                    } else if b == b'J' && state.sgr_buf == b"2" {
+                        result.screen_clear.push(OutputOscHit {
+                            offset: abs_offset,
+                            payload: "\\e[2J".to_string(),
+                        });
+                    } else if b == b'H' && state.sgr_buf.is_empty() {
+                        result.screen_clear.push(OutputOscHit {
+                            offset: abs_offset,
+                            payload: "\\e[H".to_string(),
+                        });
+                    }
+                    state.phase = OutputPhase::Idle;
+                    state.sgr_buf.clear();
+                } else {
+                    state.sgr_buf.push(b);
+                    if state.sgr_buf.len() > 64 {
+                        // Unreasonable CSI length — bail.
+                        state.phase = OutputPhase::Idle;
+                        state.sgr_buf.clear();
+                    }
+                }
+                byte_idx += 1;
+                continue;
+            }
+            OutputPhase::InOsc => {
+                // Terminators: BEL (\a, 0x07) or ST (\e\\). Also tolerant of
+                // bare 0x9C (8-bit ST, rare in modern terminals).
+                let is_bel = b == 0x07;
+                let is_st_8bit = b == 0x9C;
+                let is_st_start = b == 0x1B;
+
+                // Were we waiting for the ST tail (`\\`) after a `\e`?
+                if state.osc_pending_st {
+                    state.osc_pending_st = false;
+                    if b == b'\\' {
+                        finalize_osc(state, result, chunk_start_offset, byte_idx);
+                        byte_idx += 1;
+                        continue;
+                    }
+                    // False alarm: that `\e` was a stray payload byte (an
+                    // attempted terminator). Drop it as protocol noise, keep going.
+                }
+
+                if is_bel || is_st_8bit {
+                    finalize_osc(state, result, chunk_start_offset, byte_idx);
+                    byte_idx += 1;
+                    continue;
+                }
+                if is_st_start {
+                    // Stay InOsc; flip the pending-ST flag and wait one byte.
+                    state.osc_pending_st = true;
+                    byte_idx += 1;
+                    continue;
+                }
+                if state.osc_introducer.contains(&b';') {
+                    // Past the introducer separator — accumulate payload.
+                    state.osc_buf.push(b);
+                    if state.osc_buf.len() > OUTPUT_OSC_CAP {
+                        state.phase = OutputPhase::Idle;
+                        state.osc_buf.clear();
+                        state.osc_introducer.clear();
+                    }
+                } else {
+                    state.osc_introducer.push(b);
+                    if state.osc_introducer.len() > 32 {
+                        state.phase = OutputPhase::Idle;
+                        state.osc_buf.clear();
+                        state.osc_introducer.clear();
+                    }
+                }
+                byte_idx += 1;
+                continue;
+            }
+        }
+
+        // Idle-mode zero-width tracking (multi-byte chars).
+        if state.phase == OutputPhase::Idle && b >= 0xc0 {
+            let remaining = &chunk[byte_idx..];
+            if let Some(ch) = std::str::from_utf8(remaining)
+                .ok()
+                .or_else(|| std::str::from_utf8(&remaining[..remaining.len().min(4)]).ok())
+                .and_then(|s| s.chars().next())
+            {
+                if is_zero_width(ch) || is_unicode_tag(ch) {
+                    if zw_run_start.is_none() {
+                        zw_run_start = Some(chunk_start_offset + byte_idx);
+                    }
+                    zw_run_count += 1;
+                    byte_idx += ch.len_utf8();
+                    continue;
+                }
+            }
+        }
+
+        // Non-ZW byte — flush any in-flight run.
+        if zw_run_count > 8 {
+            if let Some(off) = zw_run_start {
+                result.zero_width_runs.push(OutputZeroWidthRun {
+                    offset: off,
+                    count: zw_run_count,
+                });
+            }
+        }
+        zw_run_start = None;
+        zw_run_count = 0;
+
+        byte_idx += 1;
+    }
+
+    // End-of-chunk ZW flush.
+    if zw_run_count > 8 {
+        if let Some(off) = zw_run_start {
+            result.zero_width_runs.push(OutputZeroWidthRun {
+                offset: off,
+                count: zw_run_count,
+            });
+        }
+    }
+
+    // Advance global offset for next chunk.
+    state.byte_offset = chunk_start_offset + chunk.len();
+}
+
+/// Whole-buffer wrapper for the streaming scanner (used by `engine::analyze_output`).
+pub fn scan_output_bytes(input: &[u8]) -> OutputScanResult {
+    let mut state = OutputScanState::default();
+    let mut result = OutputScanResult::default();
+    scan_output_chunk(input, &mut state, &mut result);
+    // Flush any trailing in-flight sequence so a truncated `\e]52;…` at EOF
+    // is detected instead of silently dropped.
+    finalize_scan_state(&mut state);
+    result
+}
+
+/// End-of-stream scanner status. Lets the output filter (and `tirith view`)
+/// flag an unterminated escape sequence — fail-closed callers must DENY then.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OutputScanFinalize {
+    /// `true` when an OSC / CSI / OSC8-visible sequence was in-flight at EOF.
+    /// Worst case: a truncated `\e]52;…` (partial clipboard write) the original
+    /// implementation silently dropped.
+    pub truncated_escape: bool,
+    /// `true` when the truncation was an OSC `52;` (clipboard write); callers
+    /// can elevate severity.
+    pub truncated_osc52: bool,
+}
+
+/// Finalize scanner state at EOF: reset transient state for reuse and report
+/// what (if anything) was in-flight. Called by `scan_output_bytes` and
+/// `engine::analyze_output_finalize`.
+///
+/// Silent-failure fix (Sev-5): pre-fix the scanner ended in `InOsc` /
+/// `InOsc8Visible` silently on truncation and the output filter accepted it;
+/// callers can now emit an `OutputTruncatedEscapeSequence` finding.
+pub fn finalize_scan_state(state: &mut OutputScanState) -> OutputScanFinalize {
+    let mut out = OutputScanFinalize::default();
+    let in_flight = !matches!(state.phase, OutputPhase::Idle);
+    if in_flight {
+        out.truncated_escape = true;
+        // The introducer accumulates digits until the first `;`, so a leading
+        // "52" is a definitive clipboard-write signal even mid-payload.
+        if matches!(state.phase, OutputPhase::InOsc) {
+            let head: Vec<u8> = state
+                .osc_introducer
+                .iter()
+                .copied()
+                .take_while(|b| *b != b';')
+                .collect();
+            if head.starts_with(b"52") {
+                out.truncated_osc52 = true;
+            }
+        }
+        // Reset transient state so re-use of `state` is safe.
+        state.phase = OutputPhase::Idle;
+        state.osc_buf.clear();
+        state.osc_introducer.clear();
+        state.sgr_buf.clear();
+        state.saw_lone_esc = false;
+        state.osc_pending_st = false;
+        state.osc8_active_uri = None;
+        state.osc8_visible_buf.clear();
+    }
+    out
+}
+
+/// Parse an SGR parameter byte string (e.g. `b"38;5;208;48;5;240"`) into a
+/// list of integers. Empty fields default to 0, matching xterm semantics.
+fn parse_sgr_params(buf: &[u8]) -> Vec<u32> {
+    let s = std::str::from_utf8(buf).unwrap_or("");
+    s.split(';')
+        .map(|tok| tok.trim().parse::<u32>().unwrap_or(0))
+        .collect()
+}
+
+/// Finalize an in-progress OSC sequence (terminator hit). Dispatches on the
+/// introducer (`0`, `2`, `8`, `52`) and either records the finding or opens
+/// the OSC 8 visible-text capture.
+fn finalize_osc(
+    state: &mut OutputScanState,
+    result: &mut OutputScanResult,
+    chunk_start_offset: usize,
+    byte_idx: usize,
+) {
+    state.osc_pending_st = false;
+    // Offset of the introducing `\e]`: subtract the bytes consumed since it.
+    // saturating_sub handles the cross-chunk case (opener in N, terminator in N+1).
+    let consumed = state.osc_introducer.len() + state.osc_buf.len() + 2; // +2 for `\e]`
+    let abs_offset = (chunk_start_offset + byte_idx).saturating_sub(consumed);
+
+    // Split introducer on the first `;` into numeric head + payload params.
+    let mut head_buf: Vec<u8> = Vec::new();
+    let mut rest_buf: Vec<u8> = Vec::new();
+    let mut seen_semi = false;
+    for &b in &state.osc_introducer {
+        if !seen_semi && b == b';' {
+            seen_semi = true;
+            continue;
+        }
+        if seen_semi {
+            rest_buf.push(b);
+        } else {
+            head_buf.push(b);
+        }
+    }
+
+    let head = std::str::from_utf8(&head_buf).unwrap_or("").trim();
+    let payload_str = std::str::from_utf8(&state.osc_buf)
+        .unwrap_or("")
+        .to_string();
+    let rest_str = std::str::from_utf8(&rest_buf).unwrap_or("");
+
+    match head {
+        "0" | "2" => {
+            result.title_set.push(OutputOscHit {
+                offset: abs_offset,
+                payload: format!("{rest_str}{payload_str}"),
+            });
+            state.phase = OutputPhase::Idle;
+            state.osc_introducer.clear();
+            state.osc_buf.clear();
+        }
+        "52" => {
+            result.osc52.push(OutputOscHit {
+                offset: abs_offset,
+                payload: payload_str,
+            });
+            state.phase = OutputPhase::Idle;
+            state.osc_introducer.clear();
+            state.osc_buf.clear();
+        }
+        "8" => {
+            // OSC 8 shape: `\e]8;params;uri\e\\<visible>\e]8;;\e\\`. Our
+            // split-on-first-semi leaves the payload as `;uri`; strip one
+            // leading `;` so the URI handed to the rule layer is clean. (On the
+            // closer `\e]8;;\e\\` payload_str is `";"`/empty — ignored below.)
+            let stripped_uri = payload_str
+                .strip_prefix(';')
+                .unwrap_or(&payload_str)
+                .to_string();
+            let uri = stripped_uri;
+            if state.osc8_active_uri.is_some() {
+                // This is the CLOSER — emit the captured link.
+                let visible = std::str::from_utf8(&state.osc8_visible_buf)
+                    .unwrap_or("")
+                    .to_string();
+                let captured_uri = state.osc8_active_uri.take().unwrap_or_default();
+                result.hyperlinks.push(OutputHyperlinkHit {
+                    offset: state.osc8_uri_start_offset,
+                    uri: captured_uri,
+                    visible,
+                });
+                state.osc8_visible_buf.clear();
+                state.phase = OutputPhase::Idle;
+            } else {
+                // OPENER — start collecting the visible label.
+                state.osc8_active_uri = Some(uri);
+                state.osc8_uri_start_offset = abs_offset;
+                state.osc8_visible_buf.clear();
+                state.phase = OutputPhase::InOsc8Visible;
+            }
+            state.osc_introducer.clear();
+            state.osc_buf.clear();
+        }
+        _ => {
+            // Unknown OSC code — ignore (no finding) but reset state.
+            state.phase = OutputPhase::Idle;
+            state.osc_introducer.clear();
+            state.osc_buf.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_scan_tests {
+    use super::*;
+
+    #[test]
+    fn detects_osc52_clipboard_write() {
+        let input = b"hello\x1b]52;c;aGVsbG8=\x07world";
+        let result = scan_output_bytes(input);
+        assert_eq!(result.osc52.len(), 1, "should detect OSC 52");
+        // Payload format: `<selector>;<base64>` — `c` = clipboard
+        assert_eq!(result.osc52[0].payload, "c;aGVsbG8=");
+    }
+
+    #[test]
+    fn detects_osc52_with_st_terminator() {
+        let input = b"hello\x1b]52;c;aGVsbG8=\x1b\\world";
+        let result = scan_output_bytes(input);
+        assert_eq!(
+            result.osc52.len(),
+            1,
+            "should detect OSC 52 with ST terminator"
+        );
+    }
+
+    #[test]
+    fn detects_title_set() {
+        let input = b"\x1b]0;Untitled\x07rest";
+        let result = scan_output_bytes(input);
+        assert_eq!(result.title_set.len(), 1);
+        assert_eq!(result.title_set[0].payload, "Untitled");
+    }
+
+    #[test]
+    fn detects_screen_clear() {
+        let input = b"banner\x1b[2Jfresh\x1b[H";
+        let result = scan_output_bytes(input);
+        assert_eq!(result.screen_clear.len(), 2);
+    }
+
+    #[test]
+    fn detects_osc8_hyperlink_with_mismatch() {
+        let input = b"click \x1b]8;;https://evil.example\x1b\\github.com\x1b]8;;\x1b\\!";
+        let result = scan_output_bytes(input);
+        assert_eq!(result.hyperlinks.len(), 1, "should detect OSC 8");
+        assert_eq!(result.hyperlinks[0].uri, "https://evil.example");
+        assert_eq!(result.hyperlinks[0].visible, "github.com");
+    }
+
+    #[test]
+    fn streaming_split_on_osc_boundary() {
+        // Split `\x1b]52;c;aGVsbG8=\x07` between `\x1b]` and `52;…\x07`.
+        let mut state = OutputScanState::default();
+        let mut result = OutputScanResult::default();
+        scan_output_chunk(b"hello\x1b]", &mut state, &mut result);
+        scan_output_chunk(b"52;c;aGVsbG8=\x07world", &mut state, &mut result);
+        assert_eq!(
+            result.osc52.len(),
+            1,
+            "OSC 52 must be detected even when split across chunks"
+        );
+        assert_eq!(result.osc52[0].payload, "c;aGVsbG8=");
+    }
+
+    #[test]
+    fn finalize_flags_truncated_osc52() {
+        // Sev-5 silent-failure regression: a `\e]52;…` that ends mid-payload
+        // (no BEL / no ST) used to leave `phase=InOsc` and produce no
+        // finding. `finalize_scan_state` must flag it.
+        let mut state = OutputScanState::default();
+        let mut result = OutputScanResult::default();
+        scan_output_chunk(b"hello\x1b]52;c;aGVsbG8", &mut state, &mut result);
+        let fin = finalize_scan_state(&mut state);
+        assert!(fin.truncated_escape, "truncated OSC must flag in-flight");
+        assert!(
+            fin.truncated_osc52,
+            "OSC introducer 52 → osc52-specific flag"
+        );
+        assert_eq!(result.osc52.len(), 0, "no terminator → no OSC52 hit");
+    }
+
+    #[test]
+    fn finalize_clean_eof_is_no_op() {
+        let mut state = OutputScanState::default();
+        let mut result = OutputScanResult::default();
+        scan_output_chunk(b"hello world\n", &mut state, &mut result);
+        let fin = finalize_scan_state(&mut state);
+        assert!(!fin.truncated_escape);
+        assert!(!fin.truncated_osc52);
+    }
+
+    #[test]
+    fn finalize_flags_non_osc52_truncation() {
+        // CSI sequence that never reaches a final byte.
+        let mut state = OutputScanState::default();
+        let mut result = OutputScanResult::default();
+        scan_output_chunk(b"prefix\x1b[31", &mut state, &mut result);
+        let fin = finalize_scan_state(&mut state);
+        assert!(fin.truncated_escape);
+        assert!(!fin.truncated_osc52, "CSI != OSC52");
+    }
+
+    #[test]
+    fn captures_sgr_params() {
+        let input = b"\x1b[37;47mhidden\x1b[0m";
+        let result = scan_output_bytes(input);
+        assert_eq!(result.sgr.len(), 2, "should capture both SGRs");
+        assert_eq!(result.sgr[0].params, vec![37, 47]);
+        assert_eq!(result.sgr[1].params, vec![0]);
+    }
+
+    #[test]
+    fn detects_zero_width_run() {
+        let mut input = b"abc".to_vec();
+        for _ in 0..10 {
+            input.extend_from_slice("\u{200B}".as_bytes());
+        }
+        input.extend_from_slice(b"def");
+        let result = scan_output_bytes(&input);
+        assert_eq!(result.zero_width_runs.len(), 1);
+        assert_eq!(result.zero_width_runs[0].count, 10);
+    }
+
+    #[test]
+    fn clean_text_no_findings() {
+        let result = scan_output_bytes(b"hello world\n");
+        assert!(result.osc52.is_empty());
+        assert!(result.title_set.is_empty());
+        assert!(result.screen_clear.is_empty());
+        assert!(result.hyperlinks.is_empty());
+        assert!(result.zero_width_runs.is_empty());
+    }
+}
+
 /// Check if a character is a bidi control.
 fn is_bidi_control(ch: char) -> bool {
     matches!(
@@ -397,10 +1007,9 @@ fn is_invisible_math_operator(ch: char) -> bool {
     ('\u{2061}'..='\u{2064}').contains(&ch)
 }
 
-/// Check if a character is a stealth-encoding whitespace variant.
-/// These are Unicode spaces used in steganographic encoding (e.g. st3gg confusable
-/// whitespace). Layout spaces (U+00A0 NBSP, U+202F Narrow NBSP, U+3000 Ideographic)
-/// are deliberately excluded — they appear legitimately in localized prose.
+/// Stealth-encoding whitespace variant (steganographic spaces). Layout spaces
+/// (U+00A0 NBSP, U+202F Narrow NBSP, U+3000 Ideographic) are excluded — they
+/// appear legitimately in localized prose.
 fn is_invisible_whitespace(ch: char) -> bool {
     matches!(
         ch,
@@ -419,8 +1028,7 @@ fn is_invisible_whitespace(ch: char) -> bool {
     )
 }
 
-/// Tier 3: Extract URL-like patterns from a command string.
-/// Uses shell-aware tokenization, then extracts URLs from each segment.
+/// Tier 3: shell-aware tokenize, then extract URL-like patterns per segment.
 pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
     let segments = tokenize::tokenize(input, shell);
     let mut results = Vec::new();
@@ -431,16 +1039,14 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
 
         // Suppress URL extraction ONLY for the arg span of a first-segment
         // tirith inspection subcommand — not the whole segment. Leading env
-        // assignments and wrapper tokens (sudo/env/time) must still be
-        // analyzed; `FOO=https://evil.com tirith diff safe` must still flag
-        // FOO. Since `resolved` can come through a wrapper, we first locate
-        // where the literal "tirith" word lives in the segment.
+        // assignments and wrapper tokens (sudo/env/time) must still be analyzed
+        // (`FOO=https://evil.com tirith diff safe` must still flag FOO), so first
+        // locate where the literal "tirith" word lives in the segment.
         let inspection_skip_args_from: Option<usize> = if seg_idx == 0 {
             resolved.as_ref().and_then(|cmd| {
                 if cmd.name != "tirith" {
                     return None;
                 }
-                // Locate the tirith word within the tokenized segment.
                 let start_from: usize =
                     if segment.command.as_deref().map(command_base_name).as_deref()
                         == Some("tirith")
@@ -455,8 +1061,7 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
                     } else {
                         return None;
                     };
-                // Skip flags (e.g. `--quiet`) after the tirith word to land
-                // on the subcommand token.
+                // Skip flags (e.g. `--quiet`) to land on the subcommand token.
                 let mut i = start_from;
                 while i < segment.args.len() {
                     let clean = strip_quotes(&segment.args[i]);
@@ -477,16 +1082,14 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
             None
         };
 
-        // Extract standard URLs from command + args plus leading env-assignment values.
-        // Keep the raw-text expansion targeted so output/auth false-positive suppression
-        // still applies to the command/arg path.
+        // Extract URLs from command + args + leading env-assignment values.
         let mut url_sources: Vec<&str> = Vec::new();
         if let Some(ref cmd) = segment.command {
             url_sources.push(cmd.as_str());
         }
         for (arg_idx, arg) in segment.args.iter().enumerate() {
             // For tirith inspection subcommands, the subcommand word and all
-            // later args form the inert arg span — don't extract URLs from them.
+            // later args are the inert arg span — skip URL extraction there.
             if let Some(skip_from) = inspection_skip_args_from {
                 if arg_idx >= skip_from {
                     break;
@@ -507,31 +1110,43 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
             push_urls_from_source(source, seg_idx, sink_context, &mut results);
         }
 
-        // Check for schemeless URLs in sink contexts
-        // Skip for docker/podman/nerdctl commands since their args are handled as DockerRef
+        // Schemeless URLs in sink contexts. Skip docker/podman/nerdctl — their
+        // args are handled as DockerRef below.
         let is_docker_cmd = resolved
             .as_ref()
             .is_some_and(|cmd| matches!(cmd.name.as_str(), "docker" | "podman" | "nerdctl"));
         if sink_context && !is_docker_cmd {
             if let Some(cmd) = resolved.as_ref() {
-                // scp/rsync arguments are either (a) remote specs (handled by
-                // parse_scp_remote_spec below) or (b) local file paths — never
-                // schemeless domain candidates. Skip the schemeless heuristic
-                // for these commands; scheme-full URLs still get caught by
-                // URL_REGEX earlier. Without this skip, `scp test.asdf
-                // host:/home/user/` trips on both the local filename (`.asdf`
-                // TLD shape) and the remote spec (`host:path` shape).
+                // scp/rsync args are remote specs (parse_scp_remote_spec below)
+                // or local file paths — never schemeless domains. Skip the
+                // heuristic here; scheme-full URLs still hit URL_REGEX earlier.
                 let is_remote_copy = matches!(cmd.name.as_str(), "scp" | "rsync");
+                // M6 ch1 — `go install/get <module>` takes a module path that
+                // looks schemeless (`github.com/spf13/cobra`), so carve out args
+                // AFTER the `install`/`get` subcommand to avoid a forced WARN on
+                // every `go install`. Scheme-full URLs still hit URL_REGEX.
+                let go_install_skip_from = if cmd.name == "go" {
+                    cmd.args
+                        .iter()
+                        .position(|a| matches!(a.to_lowercase().as_str(), "install" | "get"))
+                        .map(|pos| pos + 1)
+                } else {
+                    None
+                };
                 for (arg_idx, arg) in cmd.args.iter().enumerate() {
                     // Skip args that are output-file flag values
                     if is_output_flag_value(&cmd.name, cmd.args, arg_idx) {
                         continue;
                     }
+                    if let Some(skip_from) = go_install_skip_from {
+                        if arg_idx >= skip_from {
+                            continue;
+                        }
+                    }
                     let clean = strip_quotes(arg);
                     if is_remote_copy {
-                        // Validate the spec shape when present, so downstream
-                        // policy can consume it later, but don't emit schemeless
-                        // for either remote specs or local files.
+                        // Validate the spec shape (for downstream policy) but
+                        // never emit schemeless for remote specs or local files.
                         let _ = parse_scp_remote_spec(&clean, shell);
                         continue;
                     }
@@ -598,7 +1213,7 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
                             }
                         }
                     } else if subcmd_lower == "image" {
-                        // `docker image pull/push/...` — the real subcommand is args[1].
+                        // `docker image pull/push/...` — real subcommand is args[1].
                         if let Some(image_subcmd) = cmd.args.get(1) {
                             let image_subcmd_lower = image_subcmd.to_lowercase();
                             if matches!(
@@ -800,24 +1415,14 @@ fn resolve_named_command<'a>(command: &str, args: &'a [String]) -> Option<Resolv
     }
 }
 
-/// Resolve through a `sudo`/`doas` wrapper to the real command.
-///
-/// Handles common sudo flag shapes:
-/// - `sudo cmd args…`                                  → cmd with args
-/// - `sudo -u user cmd args…` / `sudo --user=user cmd` → cmd after the flag(s)
-/// - `sudo -E -H cmd args…`                            → cmd after flags
-/// - `sudo VAR=val cmd args…`                          → env assignment, cmd after
-///
-/// Unknown value-taking flags aren't special-cased; we honor only the common
-/// ones. Deliberately conservative: if we can't unambiguously resolve the
-/// command, return None and let the caller fall back to the literal first token.
+/// Resolve through a `sudo`/`doas` wrapper to the real command, handling the
+/// common flag shapes (`-u user`, `--user=user`, `-E -H`, leading `VAR=val`).
+/// Conservative: returns None when the command can't be unambiguously resolved,
+/// so the caller falls back to the literal first token.
 fn resolve_sudo_wrapper(args: &[String]) -> Option<ResolvedCommand<'_>> {
-    // Short sudo(8) flags that take a value.
-    //
-    // Boolean-only flags (-S stdin, -A askpass, -B bell, -E -H -K -L -l -n -P
-    // -s -V -v, and -h which is short for --help, not --host) must NOT be on
-    // this list — treating them as value-taking would eat the next token and
-    // break wrapped-command resolution.
+    // Short sudo(8) flags that take a VALUE. Boolean-only flags (-S -A -B -E -H
+    // -K -L -l -n -P -s -V -v, and -h=--help not --host) must NOT be here —
+    // treating them as value-taking would eat the next token.
     const SUDO_VALUE_FLAGS: &[&str] = &["-u", "-g", "-p", "-C", "-D", "-U", "-r", "-t"];
     // Long flags that take a value unless combined with `=`.
     const SUDO_LONG_VALUE_FLAGS: &[&str] = &[
@@ -966,36 +1571,22 @@ fn resolve_tirith_command(args: &[String]) -> Option<ResolvedCommand<'_>> {
     }
 }
 
-/// Whether a tirith subcommand is an "inspection" command — i.e. one whose
-/// purpose is to describe/score a suspicious input that the user deliberately
-/// typed (not execute it). For these, we suppress URL extraction and the
-/// exec-context byte-scan carveout.
-///
-/// **Deliberately narrow** — only the "here's a suspicious input, tell me
-/// about it" commands. Adding anything else (e.g. `doctor`, `init`, `setup`,
-/// `version`) requires a motivating false-positive fixture.
+/// Whether a tirith subcommand is an "inspection" command (describe/score a
+/// deliberately-typed suspicious input, not execute it), for which URL
+/// extraction and the exec-context byte-scan are suppressed. Deliberately
+/// narrow — adding anything else requires a motivating false-positive fixture.
 fn is_tirith_inspection_subcommand(sub: &str) -> bool {
     matches!(sub, "diff" | "score" | "why" | "receipt" | "explain")
 }
 
-/// Resolve the first segment of `input` as a potential tirith inspection
-/// subcommand. When matched, return the byte range (within `input`) of the
-/// arg span that follows the subcommand word — the inert region that should
-/// be skipped by URL extraction and Unicode-style byte scans.
+/// Resolve the first segment as a tirith inspection subcommand and, when
+/// matched, return the byte range of the arg span after the subcommand word —
+/// the inert region skipped by URL extraction and Unicode-style byte scans.
 ///
-/// Returns `None` for:
-/// - non-tirith commands
-/// - `tirith run` (a sink — URL analysis still applies)
-/// - tirith subcommands not on the narrow inspection list
-/// - inputs where the first segment doesn't tokenize cleanly
-///
-/// Resolves through `env`, `command`, `time`, and `sudo`-style wrappers by
-/// delegating to `resolve_named_command`. Leading flags like
-/// `tirith --quiet diff URL` are handled — the subcommand word is the first
-/// non-flag argument.
-///
-/// Only the FIRST segment's arg span is returned; later pipeline segments
-/// (`tirith diff foo | grep bar`) are still analyzed normally.
+/// Returns `None` for non-tirith commands, `tirith run` (a sink — URL analysis
+/// still applies), non-inspection subcommands, and inputs that don't tokenize
+/// cleanly. Resolves through env/command/time/sudo wrappers; leading flags
+/// (`tirith --quiet diff URL`) are handled. Only the FIRST segment is covered.
 pub fn tirith_inert_arg_range(input: &str, shell: ShellType) -> Option<std::ops::Range<usize>> {
     let segments = tokenize::tokenize(input, shell);
     let first = segments.first()?;
@@ -1006,8 +1597,8 @@ pub fn tirith_inert_arg_range(input: &str, shell: ShellType) -> Option<std::ops:
         return None;
     }
 
-    // Find the first non-flag arg (the subcommand). Start from args[0] because
-    // resolve_tirith_command already strips wrapper prefixes.
+    // First non-flag arg is the subcommand (resolve_tirith_command already
+    // stripped wrapper prefixes, so start from args[0]).
     let mut sub_idx = 0;
     while sub_idx < resolved.args.len() {
         let clean = strip_quotes(&resolved.args[sub_idx]);
@@ -1023,11 +1614,9 @@ pub fn tirith_inert_arg_range(input: &str, shell: ShellType) -> Option<std::ops:
         return None;
     }
 
-    // The inert range is everything after the subcommand word within this
-    // segment. Locate the subcommand token inside the segment's byte range
-    // by scanning for a whitespace-delimited match, not a raw substring find.
-    // Otherwise `tirith --config=diff diff URL` would match the `diff` inside
-    // `--config=diff` and the inert range would start too early.
+    // Inert range = everything after the subcommand word in this segment.
+    // Locate the token by whitespace-delimited match (not raw substring), else
+    // `tirith --config=diff diff URL` would match `diff` inside `--config=diff`.
     let seg_slice = input.get(first.byte_range.clone())?;
     let sub_rel = find_subcommand_token(seg_slice, sub_arg.as_str())?;
     let inert_start = first.byte_range.start + sub_rel + sub_arg.len();
@@ -1049,8 +1638,7 @@ fn find_subcommand_token(haystack: &str, needle: &str) -> Option<usize> {
         let abs = search_from + rel;
         let preceded_by_ws_or_start =
             abs == 0 || matches!(bytes.get(abs - 1), Some(b) if b.is_ascii_whitespace());
-        // Also require that the match end is a word boundary (whitespace or EOS),
-        // so `differ` doesn't match `diff`.
+        // Require a word boundary at the end too, so `differ` doesn't match `diff`.
         let followed_by_ws_or_end = abs + n == bytes.len()
             || matches!(bytes.get(abs + n), Some(b) if b.is_ascii_whitespace());
         if preceded_by_ws_or_start && followed_by_ws_or_end {
@@ -1119,51 +1707,33 @@ fn is_source_command(cmd: &str) -> bool {
     )
 }
 
-/// Parsed scp/rsync remote spec of shape `[user@]host:path`. Not currently
-/// consumed beyond the parser existence check (which validates the shape),
-/// but this is what downstream policy consumers (e.g. network_deny for remote
-/// scp targets) will want — writing an actual parser instead of a substring
-/// check makes the drive-letter guard verifiable and the logic auditable.
-///
-/// Shell-aware: the Windows drive-letter guard is narrow on Posix/Fish
-/// (single-letter SSH aliases like `scp file x:/tmp/` are legitimate there),
-/// wider on PowerShell/Cmd so drive letters do not masquerade as remote specs.
-/// Parsed scp/rsync remote spec of shape `[user@]host:path`. Returned by
-/// [`parse_scp_remote_spec`] so callers (e.g. `network_deny` enforcement) can
-/// route on the host without re-parsing. `path` is kept as the literal
-/// remainder after the first `:`, no normalization.
+/// Parsed scp/rsync remote spec of shape `[user@]host:path`, returned by
+/// [`parse_scp_remote_spec`] so callers (e.g. `network_deny`) can route on the
+/// host without re-parsing. `path` is the literal remainder after the first
+/// `:`, unnormalized. A real parser (vs a substring check) keeps the
+/// shell-aware Windows drive-letter guard verifiable.
 pub struct ScpRemoteSpec {
     pub user: Option<String>,
     pub host: String,
     pub path: String,
 }
 
-/// Parse `[user@]host:path` from an scp/rsync argument.
+/// Parse `[user@]host:path` from an scp/rsync argument. Accepts `host:path` and
+/// `user@host:path`; rejects flags, `://` URLs, `:` preceded by `/` (absolute
+/// local path), empty/`/`-containing hosts, and Windows drive-letter shapes.
 ///
-/// Accepts `host:path` and `user@host:path`. Rejects:
-/// - tokens without `:` → plain local path
-/// - tokens starting with `-` → flag
-/// - tokens containing `://` → URL scheme
-/// - `:` preceded by `/` → absolute local path that happens to contain `:`
-/// - empty host part, or host containing `/`
-/// - Windows drive-letter shapes (see below)
-///
-/// Windows drive-letter guard — deliberately narrow so it doesn't break
-/// legitimate one-letter SSH aliases (e.g. `scp file x:/tmp/`):
-/// - `X:\...` — reject ALWAYS; backslash after a drive letter is never scp.
-/// - `X:/...` — reject ONLY on PowerShell/Cmd; POSIX treats this as an alias.
-/// - `X:foo`  — ACCEPT everywhere; ambiguous with scp's `x:relative-path`,
-///   and preserving back-compat here beats over-rejection.
+/// Windows drive-letter guard — narrow so it doesn't break legitimate one-letter
+/// SSH aliases (`scp file x:/tmp/`): `X:\...` rejected ALWAYS; `X:/...` rejected
+/// only on PowerShell/Cmd (POSIX treats it as an alias); `X:foo` accepted
+/// everywhere (ambiguous with scp's `x:relative-path`; back-compat wins).
 pub fn parse_scp_remote_spec(arg: &str, shell: ShellType) -> Option<ScpRemoteSpec> {
     if arg.is_empty() || arg.starts_with('-') || arg.contains("://") {
         return None;
     }
 
-    // Two accepted shapes:
-    //   1. `user@host[:path]` — the colon is optional. Strict scp requires it,
-    //      but we also accept bare `user@host` to suppress a false positive
-    //      where `looks_like_schemeless_host` would otherwise flag it.
-    //   2. `host:path` — no `@`, colon required.
+    // Two shapes: (1) `user@host[:path]` — colon optional; we accept bare
+    // `user@host` to suppress a `looks_like_schemeless_host` false positive.
+    // (2) `host:path` — no `@`, colon required.
     if let Some(at_pos) = arg.find('@') {
         let before_at = &arg[..at_pos];
         let after_at = &arg[at_pos + 1..];
@@ -1172,8 +1742,7 @@ pub fn parse_scp_remote_spec(arg: &str, shell: ShellType) -> Option<ScpRemoteSpe
         }
         let (host, path) = match after_at.find(':') {
             Some(colon_pos) => {
-                // `:` preceded by `/` in after_at means a colon inside a path, not
-                // a host:path boundary. Unusual but safe to reject.
+                // `:` preceded by `/` is a colon inside a path, not a boundary.
                 if colon_pos > 0 && after_at.as_bytes()[colon_pos - 1] == b'/' {
                     return None;
                 }
@@ -1205,8 +1774,8 @@ pub fn parse_scp_remote_spec(arg: &str, shell: ShellType) -> Option<ScpRemoteSpe
         return None;
     }
 
-    // Windows drive-letter guard — only applies when host is a single ASCII
-    // letter AND `user@` is absent (see module doc above for shape breakdown).
+    // Windows drive-letter guard — only when host is a single ASCII letter and
+    // `user@` is absent (see fn doc for the shape breakdown).
     if host.len() == 1 && host.chars().next().unwrap().is_ascii_alphabetic() {
         let first_after = after_colon.chars().next();
         match first_after {
@@ -1272,9 +1841,8 @@ fn is_interpreter(cmd: &str) -> bool {
     )
 }
 
-/// Check if an arg at the given index is the value of an output-file or credential flag
-/// for the given command. Returns true if this arg should be skipped during schemeless
-/// URL detection (output filenames and auth credentials can look like domains).
+/// Whether the arg at `arg_index` is an output-file/credential flag value (which
+/// can look like a domain) and should be skipped during schemeless URL detection.
 fn is_output_flag_value(cmd: &str, args: &[String], arg_index: usize) -> bool {
     let cmd_lower = cmd.to_lowercase();
     let cmd_base = cmd_lower.rsplit('/').next().unwrap_or(&cmd_lower);
@@ -1369,24 +1937,20 @@ fn strip_quotes(s: &str) -> String {
 }
 
 fn looks_like_schemeless_host(s: &str) -> bool {
-    // Must contain a dot, not start with -, not be a flag
     if s.starts_with('-') || !s.contains('.') {
         return false;
     }
-    // Dotfiles and hidden files (e.g., .gitignore, .env.example) are not URLs
+    // Dotfiles (.gitignore, .env.example) are not URLs.
     if s.starts_with('.') {
         return false;
     }
-    // First component before / or end should look like a domain
     let host_part = s.split('/').next().unwrap_or(s);
     if !host_part.contains('.') || host_part.contains(' ') {
         return false;
     }
-    // Exclude args where the host part looks like a file (e.g., "install.sh")
-    // BUT only when there is no meaningful path component — if there IS a non-empty
-    // path (e.g., evil.zip/payload), the host part is likely a real domain even if its
-    // TLD overlaps a file extension. A trailing slash alone (file.sh/) does NOT count
-    // as a meaningful path — it's still a filename, not a domain.
+    // Exclude file-looking host parts (e.g. "install.sh") ONLY when there is no
+    // meaningful path. With a real path (evil.zip/payload) the host is likely a
+    // domain even if its TLD overlaps a file ext; a trailing slash alone doesn't count.
     let host_lower = host_part.to_lowercase();
     let has_meaningful_path = s.find('/').is_some_and(|idx| {
         let after_slash = &s[idx + 1..];
@@ -1476,12 +2040,12 @@ fn looks_like_schemeless_host(s: &str) -> bool {
             return false;
         }
     }
-    // Must have at least 2 labels (e.g., "example.com" not just "file.txt")
+    // Need at least 2 labels ("example.com", not "file.txt").
     let labels: Vec<&str> = host_part.split('.').collect();
     if labels.len() < 2 {
         return false;
     }
-    // Last label (TLD) should be 2-63 alphabetic chars (DNS label max)
+    // TLD must be 2-63 alphabetic chars (DNS label max).
     let tld = labels.last().unwrap();
     tld.len() >= 2 && tld.len() <= 63 && tld.chars().all(|c| c.is_ascii_alphabetic())
 }

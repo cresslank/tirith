@@ -1,6 +1,6 @@
 //! URL validation for outbound HTTP requests — SSRF protection.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
 type HostResolver = dyn Fn(&str, u16) -> Result<Vec<IpAddr>, String>;
 
@@ -10,18 +10,14 @@ enum UrlValidationMode {
     Fetch,
 }
 
-/// Validate that a server URL is safe for outbound requests.
-///
-/// Requires HTTPS unless `TIRITH_ALLOW_HTTP=1` is set, and blocks private,
-/// loopback, link-local, metadata, documentation, and other non-public targets.
+/// Validate a server URL for outbound requests: HTTPS unless `TIRITH_ALLOW_HTTP=1`,
+/// and block private / loopback / link-local / metadata / non-public targets.
 pub fn validate_server_url(url: &str) -> Result<(), String> {
     validate_outbound_url_with_resolver(url, UrlValidationMode::Server, &resolve_host).map(|_| ())
 }
 
-/// Validate that a fetch/cloaking URL is safe for outbound requests.
-///
-/// Allows `http` and `https`, but blocks embedded credentials and non-public
-/// network destinations after DNS resolution.
+/// Validate a fetch/cloaking URL: allows http/https but blocks embedded
+/// credentials and non-public destinations (after DNS resolution).
 pub fn validate_fetch_url(url: &str) -> Result<url::Url, String> {
     validate_outbound_url_with_resolver(url, UrlValidationMode::Fetch, &resolve_host)
 }
@@ -56,12 +52,11 @@ fn validate_parsed_url_with_resolver(
         .trim_end_matches('.')
         .to_ascii_lowercase();
 
-    if host_label == "localhost" || host_label.ends_with(".localhost") {
-        return Err(format!(
-            "refusing to connect to localhost destination: {host_label}"
-        ));
-    }
-
+    // Cloud metadata HOST NAMES are rejected first, BEFORE resolution and BEFORE
+    // the private-fetch carve-out, so the opt-in can never reach a metadata host
+    // (and so the rejection works offline, without a DNS lookup). These
+    // endpoints expose IAM credentials and instance config — never a legitimate
+    // "internal dev" target.
     if is_cloud_metadata_host(&host_label) {
         return Err(format!(
             "refusing to connect to cloud metadata endpoint: {host_label}"
@@ -72,18 +67,53 @@ fn validate_parsed_url_with_resolver(
         .port_or_known_default()
         .ok_or_else(|| format!("unsupported URL scheme: {}", parsed.scheme()))?;
 
-    match host {
-        url::Host::Ipv4(ip) => validate_resolved_ip(&host_label, &IpAddr::V4(ip))?,
-        url::Host::Ipv6(ip) => validate_resolved_ip(&host_label, &IpAddr::V6(ip))?,
+    // Resolve the host (or take the literal IP) once, up front, so the metadata
+    // and forbidden-IP screens below see the same address set.
+    let addrs: Vec<IpAddr> = match host {
+        url::Host::Ipv4(ip) => vec![IpAddr::V4(ip)],
+        url::Host::Ipv6(ip) => vec![IpAddr::V6(ip)],
         url::Host::Domain(domain) => {
             let resolved = resolver(domain, port)?;
             if resolved.is_empty() {
                 return Err(format!("failed to resolve host: {host_label}"));
             }
-            for ip in resolved {
-                validate_resolved_ip(&host_label, &ip)?;
-            }
+            resolved
         }
+    };
+
+    // Cloud metadata IP addresses are likewise rejected BEFORE the carve-out —
+    // the opt-in relaxes private/loopback/link-local, but a metadata IP
+    // (169.254.169.254, 100.100.100.200, fd00:ec2::254, or any encoded form) is
+    // never permitted. Screening the resolved set also catches a domain that
+    // resolves to a metadata IP (DNS-rebind into IMDS).
+    for ip in &addrs {
+        if is_cloud_metadata_ip(ip) {
+            return Err(format!(
+                "refusing to connect to cloud metadata endpoint: {host_label} -> {ip}"
+            ));
+        }
+    }
+
+    // Fetch paths honor an explicit opt-in to reach private/loopback/RFC1918/
+    // link-local destinations (fetching a command card or script from an
+    // internal registry, and tests that serve from 127.0.0.1). It is gated
+    // behind a user-set env var, so an attacker who only controls the URL
+    // cannot enable it. Server paths and the default fetch path stay locked to
+    // public destinations. The scheme, embedded-credential, and cloud-metadata
+    // checks above still apply — the carve-out only relaxes the remaining
+    // private/loopback/link-local classification, never metadata.
+    if matches!(mode, UrlValidationMode::Fetch) && allow_private_fetch() {
+        return Ok(());
+    }
+
+    if host_label == "localhost" || host_label.ends_with(".localhost") {
+        return Err(format!(
+            "refusing to connect to localhost destination: {host_label}"
+        ));
+    }
+
+    for ip in &addrs {
+        validate_resolved_ip(&host_label, ip)?;
     }
 
     Ok(())
@@ -145,14 +175,76 @@ fn validate_resolved_ip(host: &str, ip: &IpAddr) -> Result<(), String> {
     }
 }
 
-fn is_cloud_metadata_host(host: &str) -> bool {
+/// Whether a resolved socket address points at a routable, public destination.
+///
+/// This is the single source of truth for the private/loopback/link-local/
+/// metadata/reserved CIDR classification used by both the URL validators (which
+/// resolve via `to_socket_addrs`) and the connect-time DNS guard in
+/// [`crate::ssrf_guard`]. Returns `false` for any address the validators would
+/// reject as non-public.
+pub fn is_public_addr(addr: &SocketAddr) -> bool {
+    !is_forbidden_ip(&addr.ip())
+}
+
+/// Whether a resolved socket address is a cloud-metadata (IMDS) endpoint.
+///
+/// `SocketAddr` adapter over [`is_cloud_metadata_ip`], used by the connect-time
+/// DNS guard in [`crate::ssrf_guard`] to drop metadata addresses even on the
+/// `TIRITH_ALLOW_PRIVATE_FETCH`-relaxed path (where [`is_public_addr`] is not
+/// applied). Metadata is never reachable, carve-out or not.
+pub fn is_cloud_metadata_addr(addr: &SocketAddr) -> bool {
+    is_cloud_metadata_ip(&addr.ip())
+}
+
+/// Whether fetch paths may reach private/loopback/link-local destinations, gated
+/// behind an explicit `TIRITH_ALLOW_PRIVATE_FETCH=1` opt-in (mirrors
+/// `TIRITH_ALLOW_HTTP`). Only honored for [`UrlValidationMode::Fetch`]; server
+/// paths stay locked. An attacker controls the fetched URL, not the user's
+/// environment, so a malicious command card or instruction cannot enable it.
+///
+/// This opt-in NEVER relaxes the cloud-metadata block (see
+/// `is_cloud_metadata_host` / `is_cloud_metadata_ip`): those endpoints expose
+/// instance credentials and are rejected ahead of the carve-out regardless.
+pub fn allow_private_fetch() -> bool {
+    std::env::var("TIRITH_ALLOW_PRIVATE_FETCH").ok().as_deref() == Some("1")
+}
+
+/// Canonical cloud-metadata host names. Reused by both the URL validators and
+/// the connect-time DNS guard so the carve-out can never reach a metadata host.
+pub(crate) fn is_cloud_metadata_host(host: &str) -> bool {
     matches!(
-        host,
+        host.trim_end_matches('.').to_ascii_lowercase().as_str(),
         "metadata.google.internal"
             | "metadata.google.com"
             | "instance-data"
             | "instance-data.ec2.internal"
     )
+}
+
+/// Canonical cloud-metadata IP addresses (the link-local/ULA IMDS endpoints that
+/// expose instance credentials). This is the single source of truth reused by
+/// both the URL validators and the connect-time DNS guard so the
+/// `TIRITH_ALLOW_PRIVATE_FETCH` carve-out — which otherwise relaxes private /
+/// loopback / link-local destinations — can never reach a metadata IP.
+///
+/// Mirrors the IPv4 set in `rules::command::METADATA_ENDPOINTS`
+/// (`169.254.169.254` AWS/GCP/Azure, `100.100.100.200` Alibaba) and adds the AWS
+/// IPv6 IMDS address `fd00:ec2::254`. IPv4-mapped / NAT64 / 6to4 / Teredo
+/// encodings of those IPv4 metadata addresses are decoded via
+/// [`embedded_ipv4_in_v6`] so a translated form can't slip past.
+pub(crate) fn is_cloud_metadata_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            matches!(v4.octets(), [169, 254, 169, 254] | [100, 100, 100, 200])
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = embedded_ipv4_in_v6(v6) {
+                return is_cloud_metadata_ip(&IpAddr::V4(v4));
+            }
+            // AWS IPv6 instance metadata service: fd00:ec2::254.
+            v6.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+        }
+    }
 }
 
 fn is_forbidden_ip(ip: &IpAddr) -> bool {
@@ -208,6 +300,29 @@ fn embedded_ipv4_in_v6(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
     if octets.starts_with(&NAT64_WELL_KNOWN_PREFIX) {
         return Some(Ipv4Addr::new(
             octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+
+    // 6to4 (`2002::/16`, RFC 3056): the embedded IPv4 is octets [2..6]. A
+    // literal like `2002:7f00:1::` tunnels 127.0.0.1, so without decoding it
+    // would otherwise pass the v6 checks as a "public" address. We decode the
+    // embedded IPv4 (rather than blanket-blocking the whole /16) so a 6to4
+    // address wrapping a genuinely public IPv4 is still allowed. The IPv4
+    // forbidden check is the single source of truth either way.
+    if octets[0] == 0x20 && octets[1] == 0x02 {
+        return Some(Ipv4Addr::new(octets[2], octets[3], octets[4], octets[5]));
+    }
+
+    // Teredo (`2001:0000::/32`, RFC 4380): the server (client external) IPv4 is
+    // the LAST 4 octets, each XORed with 0xFF (obfuscated). Decode and apply the
+    // same IPv4 check so a Teredo address embedding a private/loopback IPv4
+    // can't be used as an SSRF bounce.
+    if octets[0] == 0x20 && octets[1] == 0x01 && octets[2] == 0x00 && octets[3] == 0x00 {
+        return Some(Ipv4Addr::new(
+            octets[12] ^ 0xff,
+            octets[13] ^ 0xff,
+            octets[14] ^ 0xff,
+            octets[15] ^ 0xff,
         ));
     }
 
@@ -394,7 +509,7 @@ mod tests {
 
     #[test]
     fn test_bypass_mapped_cloud_metadata() {
-        // ::ffff:169.254.169.254 — AWS metadata endpoint via IPv4-mapped.
+        // AWS metadata endpoint via IPv4-mapped IPv6.
         let result = validate_outbound_url_with_resolver(
             "https://[::ffff:169.254.169.254]/latest/meta-data/",
             UrlValidationMode::Server,
@@ -549,5 +664,301 @@ mod tests {
             &resolver_with("2607:f8b0:4004:800::200e".parse().unwrap()),
         );
         assert!(result.is_ok(), "Resolved public IPv6 must be allowed");
+    }
+
+    // 6to4 (2002::/16) and Teredo (2001:0000::/32) embed an IPv4 the v6 checks
+    // would otherwise miss. The embedded IPv4 is decoded and run through the
+    // IPv4-forbidden check.
+
+    #[test]
+    fn test_rejects_6to4_encoded_loopback() {
+        // 2002:7f00:1:: is the 6to4 wrapping of 127.0.0.1.
+        let result = validate_outbound_url_with_resolver(
+            "https://[2002:7f00:1::]/",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(result.is_err(), "6to4-encoded loopback must be blocked");
+        assert!(result.unwrap_err().contains("non-public"));
+    }
+
+    #[test]
+    fn test_allows_6to4_encoded_public_ipv4() {
+        // 2002:0808:0808:: wraps 8.8.8.8 (public) — must stay allowed.
+        let result = validate_outbound_url_with_resolver(
+            "https://[2002:0808:0808::]/",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(result.is_ok(), "6to4-encoded public IPv4 should be allowed");
+    }
+
+    #[test]
+    fn test_rejects_teredo_encoded_private_ipv4() {
+        // Teredo address whose embedded server IPv4 is 192.168.1.1: the last 32
+        // bits are the server IPv4 XOR 0xff per octet (0x3f57:fefe).
+        let result = validate_outbound_url_with_resolver(
+            "https://[2001:0:0:0:0:0:3f57:fefe]/",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(
+            result.is_err(),
+            "Teredo-encoded private IPv4 must be blocked"
+        );
+        assert!(result.unwrap_err().contains("non-public"));
+    }
+
+    #[test]
+    fn test_normal_public_ipv6_still_allowed_after_carveout() {
+        // A genuine public v6 (Cloudflare DNS) must not collide with the 6to4 or
+        // Teredo prefixes added by the carve-out.
+        let result = validate_outbound_url_with_resolver(
+            "https://[2606:4700:4700::1111]/",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(
+            result.is_ok(),
+            "Public IPv6 must still be allowed after the 6to4/Teredo carve-out"
+        );
+    }
+
+    // F6: `validate_fetch_url` must reject IP-literal SSRF targets up front
+    // (these are the fast-clear-error cases the runner pre-check relies on).
+
+    #[test]
+    fn test_fetch_rejects_loopback_literal() {
+        let result = validate_fetch_url("http://127.0.0.1");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-public"));
+    }
+
+    #[test]
+    fn test_fetch_rejects_metadata_literal() {
+        let result = validate_fetch_url("http://169.254.169.254");
+        assert!(result.is_err());
+        // Metadata IPs are now rejected by the dedicated metadata gate (ahead of
+        // the generic non-public check) so the error names the metadata endpoint.
+        assert!(result.unwrap_err().contains("cloud metadata endpoint"));
+    }
+
+    #[test]
+    fn test_fetch_rejects_ipv6_loopback_literal() {
+        let result = validate_fetch_url("http://[::1]");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-public"));
+    }
+
+    #[test]
+    fn test_fetch_rejects_private_10_literal() {
+        let result = validate_fetch_url("http://10.0.0.1");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-public"));
+    }
+
+    // is_public_addr: the shared classifier reused by the DNS guard.
+
+    fn sock(ip: &str) -> SocketAddr {
+        SocketAddr::new(ip.parse().unwrap(), 443)
+    }
+
+    #[test]
+    fn test_is_public_addr_rejects_private() {
+        assert!(!is_public_addr(&sock("10.0.0.1")));
+        assert!(!is_public_addr(&sock("172.16.0.1")));
+        assert!(!is_public_addr(&sock("192.168.1.1")));
+    }
+
+    #[test]
+    fn test_is_public_addr_rejects_loopback() {
+        assert!(!is_public_addr(&sock("127.0.0.1")));
+        assert!(!is_public_addr(&sock("::1")));
+    }
+
+    #[test]
+    fn test_is_public_addr_rejects_link_local() {
+        assert!(!is_public_addr(&sock("169.254.1.1")));
+        assert!(!is_public_addr(&sock("fe80::1")));
+    }
+
+    #[test]
+    fn test_is_public_addr_rejects_metadata() {
+        assert!(!is_public_addr(&sock("169.254.169.254")));
+    }
+
+    #[test]
+    fn test_is_public_addr_rejects_mapped_ipv6() {
+        assert!(!is_public_addr(&sock("::ffff:127.0.0.1")));
+        assert!(!is_public_addr(&sock("::ffff:169.254.169.254")));
+    }
+
+    #[test]
+    fn test_is_public_addr_accepts_public() {
+        assert!(is_public_addr(&sock("93.184.216.34")));
+        assert!(is_public_addr(&sock("8.8.8.8")));
+        assert!(is_public_addr(&sock("2607:f8b0:4004:800::200e")));
+    }
+
+    // is_cloud_metadata_ip: the dedicated metadata-IP classifier the carve-out
+    // is screened against.
+
+    #[test]
+    fn test_is_cloud_metadata_ip_matches_known_endpoints() {
+        assert!(is_cloud_metadata_ip(&"169.254.169.254".parse().unwrap()));
+        assert!(is_cloud_metadata_ip(&"100.100.100.200".parse().unwrap()));
+        assert!(is_cloud_metadata_ip(&"fd00:ec2::254".parse().unwrap()));
+        // Encoded forms of the IPv4 metadata address are decoded and matched.
+        assert!(is_cloud_metadata_ip(
+            &"::ffff:169.254.169.254".parse().unwrap()
+        ));
+        assert!(is_cloud_metadata_ip(
+            &"64:ff9b::169.254.169.254".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_is_cloud_metadata_ip_ignores_non_metadata() {
+        // Other private/link-local addresses are NOT metadata (the carve-out may
+        // permit these) — only the IMDS endpoints above are metadata.
+        assert!(!is_cloud_metadata_ip(&"169.254.1.1".parse().unwrap()));
+        assert!(!is_cloud_metadata_ip(&"127.0.0.1".parse().unwrap()));
+        assert!(!is_cloud_metadata_ip(&"10.0.0.1".parse().unwrap()));
+        assert!(!is_cloud_metadata_ip(&"100.100.100.201".parse().unwrap()));
+        assert!(!is_cloud_metadata_ip(&"8.8.8.8".parse().unwrap()));
+        assert!(!is_cloud_metadata_ip(&"fd00:ec2::255".parse().unwrap()));
+    }
+
+    // TIRITH_ALLOW_PRIVATE_FETCH carve-out: the opt-in relaxes private/loopback/
+    // link-local fetch targets, but must NEVER reach a cloud-metadata endpoint.
+    // `TEST_ENV_LOCK` serializes these env-mutating tests; `EnvVarGuard` restores
+    // the prior value on drop.
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
+    fn test_private_fetch_carveout_still_blocks_metadata_ip_literal() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarGuard::set("TIRITH_ALLOW_PRIVATE_FETCH", "1");
+
+        // Even with the carve-out set, the AWS/GCP/Azure IMDS IP stays blocked.
+        let result = validate_fetch_url("http://169.254.169.254/latest/meta-data/");
+        assert!(
+            result.is_err(),
+            "metadata IP must stay blocked under TIRITH_ALLOW_PRIVATE_FETCH"
+        );
+        assert!(result.unwrap_err().contains("cloud metadata endpoint"));
+
+        // Alibaba Cloud metadata IP, likewise.
+        let result = validate_fetch_url("http://100.100.100.200/");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cloud metadata endpoint"));
+    }
+
+    #[test]
+    fn test_private_fetch_carveout_still_blocks_metadata_hostname() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarGuard::set("TIRITH_ALLOW_PRIVATE_FETCH", "1");
+
+        let result = validate_fetch_url("http://metadata.google.internal/");
+        assert!(
+            result.is_err(),
+            "metadata hostname must stay blocked under TIRITH_ALLOW_PRIVATE_FETCH"
+        );
+        assert!(result.unwrap_err().contains("cloud metadata endpoint"));
+    }
+
+    #[test]
+    fn test_private_fetch_carveout_still_blocks_ipv6_metadata_literal() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarGuard::set("TIRITH_ALLOW_PRIVATE_FETCH", "1");
+
+        // AWS IPv6 IMDS address.
+        let result = validate_fetch_url("http://[fd00:ec2::254]/latest/meta-data/");
+        assert!(
+            result.is_err(),
+            "IPv6 metadata literal must stay blocked under TIRITH_ALLOW_PRIVATE_FETCH"
+        );
+        assert!(result.unwrap_err().contains("cloud metadata endpoint"));
+    }
+
+    #[test]
+    fn test_private_fetch_carveout_still_blocks_domain_resolving_to_metadata() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarGuard::set("TIRITH_ALLOW_PRIVATE_FETCH", "1");
+
+        // A hostname (DNS-rebind style) that resolves to the metadata IP must be
+        // rejected even though the carve-out otherwise permits private targets.
+        let result = validate_outbound_url_with_resolver(
+            "http://internal.example.com/latest/meta-data/",
+            UrlValidationMode::Fetch,
+            &resolver_with("169.254.169.254".parse().unwrap()),
+        );
+        assert!(
+            result.is_err(),
+            "domain resolving to metadata IP must stay blocked under the carve-out"
+        );
+        assert!(result.unwrap_err().contains("cloud metadata endpoint"));
+    }
+
+    #[test]
+    fn test_private_fetch_carveout_allows_genuine_private_hosts() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarGuard::set("TIRITH_ALLOW_PRIVATE_FETCH", "1");
+
+        // The carve-out still does its job: loopback and RFC1918 are reachable.
+        assert!(
+            validate_fetch_url("http://127.0.0.1/card.json").is_ok(),
+            "loopback must be allowed under TIRITH_ALLOW_PRIVATE_FETCH"
+        );
+        assert!(
+            validate_fetch_url("http://10.0.0.1/card.json").is_ok(),
+            "RFC1918 host must be allowed under TIRITH_ALLOW_PRIVATE_FETCH"
+        );
+    }
+
+    #[test]
+    fn test_private_fetch_carveout_does_not_apply_to_server_metadata() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarGuard::set("TIRITH_ALLOW_PRIVATE_FETCH", "1");
+
+        // Server paths never honor the carve-out at all, metadata or otherwise.
+        let result = validate_server_url("https://169.254.169.254/latest/meta-data/");
+        assert!(
+            result.is_err(),
+            "server path must ignore the fetch carve-out"
+        );
     }
 }

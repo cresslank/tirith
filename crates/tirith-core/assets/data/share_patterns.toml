@@ -1,0 +1,57 @@
+# M7 ch2 — `tirith share` / `tirith redact` audience-aware patterns.
+#
+# This file is the static, repo-internal data driving
+# `redact::redact_for_audience`. It is NOT user-configurable; the
+# user-configurable surface lives on `policy.share.customer_id_patterns` and
+# is merged at call time inside `redact.rs`.
+#
+# Each `[[pattern]]` entry describes one redactable signal:
+#   id        : stable label emitted in the JSON `redactions[].label` field.
+#   regex     : the regex applied to the input. Use Rust `regex` crate syntax.
+#   audiences : list of audiences that should redact this pattern.
+#               Valid values: github-issue, slack, llm, public-paste, generic.
+#               Omit `llm` / `generic` to PRESERVE the signal (e.g. repo paths,
+#               stack traces — an LLM benefits from these for debugging).
+#
+# Audience policy at a glance (the prose contract — code must match):
+#   - public-paste  : MOST aggressive. Internal hostnames, /home/<user> /
+#                     /Users/<user> paths, private IPs in hostname context,
+#                     plus all credentials and customer IDs.
+#   - llm           : strips credentials; PRESERVES stack traces + line numbers
+#                     + repo paths. Treated identically to `generic`.
+#   - slack         : strips credentials + internal hostnames; PRESERVES
+#                     repo-relative paths.
+#   - github-issue  : strips credentials + internal hostnames; PRESERVES
+#                     repo-relative paths.
+#   - generic       : same as `llm`.
+#
+# Private-IPv4 redaction (RFC1918 only) is handled inline in
+# `redact.rs::apply_private_ipv4` because its context-sensitivity (preceded
+# by `server`/`host`/`connect`/`at` within 20 chars, OR on its own line)
+# does not lend itself to a single static regex. See that helper for the
+# detection rules.
+
+# ── Internal hostname classes ─────────────────────────────────────────────
+#
+# Corporate DNS suffixes that almost certainly belong to a private network.
+# We redact them on every audience EXCEPT llm/generic (where the hostname
+# may be context the operator wants to keep for debugging).
+
+[[pattern]]
+id = "internal_hostname"
+# Match a host label followed by `.corp`, `.internal`, `.local`, or `.lan`.
+# We accept one or more sub-labels in front to handle `srv1.eng.corp` etc.
+regex = '\b[a-zA-Z][a-zA-Z0-9-]*(?:\.[a-zA-Z0-9-]+)*\.(?:corp|internal|local|lan)\b'
+audiences = ["github-issue", "slack", "public-paste"]
+
+# ── User home paths (public-paste only) ───────────────────────────────────
+#
+# Posix /home/<user>/ and macOS /Users/<user>/ leak the operator's
+# username. Slack/GitHub teammates already have that handle (the user
+# typed the message); LLMs benefit from the path. Only redact on
+# public-paste.
+
+[[pattern]]
+id = "home_path"
+regex = '(?:/home|/Users)/[a-zA-Z][a-zA-Z0-9_.\-]*'
+audiences = ["public-paste"]

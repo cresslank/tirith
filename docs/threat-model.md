@@ -38,6 +38,30 @@
 - **Privileged attacker defense**: a root/admin user can bypass tirith trivially
 - **Anti-debugging**: tirith does not resist analysis or reverse engineering
 
+### `tirith temp-run` is file isolation, NOT a sandbox
+
+`tirith temp-run` (M10 ch6; the `sandbox-dir` word is a hidden alias) runs a
+command in a fresh `mkdtemp` working directory and diffs the files it touched.
+This does **not** contradict the runtime-sandboxing non-goal above, and the
+command says so loudly on every surface — help text, every human output banner,
+and a machine-readable `"isolation_kind": "file_only_not_a_sandbox"` field in
+its JSON envelope:
+
+> file isolation only; not a sandbox. The command runs with full user
+> privileges and can read your keychain, ssh keys, AWS creds, and the network.
+> Use this for filesystem-impact preview ONLY.
+
+The ONLY thing `temp-run` changes is the working directory, so files the
+command *writes* land in the temp dir instead of polluting your tree. It is a
+file-isolation workflow for previewing filesystem impact — not a containment
+boundary. A malicious command run under `temp-run` can still read every secret
+on the machine, reach the network, and modify anything outside the temp dir
+(e.g. `$HOME`) exactly as it could if run directly. `--strip-env` trims the
+child environment to a small allowlist (HOME, PATH, USER, LANG, TERM) as a
+convenience, but a trimmed environment is likewise not a security control.
+Real kernel sandboxing (`bwrap`, `sandbox-exec`, seccomp) remains a deliberate
+non-goal.
+
 ## Trust Boundaries
 
 1. **Shell hook to tirith binary**: the hook passes the command string; tirith trusts the hook to provide the actual command

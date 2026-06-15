@@ -1,4 +1,5 @@
 use crate::parse::UrlLike;
+use crate::rules::shared::is_loopback_host;
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 /// Run transport rules against a parsed URL.
@@ -25,14 +26,6 @@ pub fn check(url: &UrlLike, in_sink_context: bool) -> Vec<Finding> {
     }
 
     findings
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    matches!(
-        host,
-        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
-    ) || host.starts_with("127.")
-        || host.ends_with(".localhost")
 }
 
 fn check_plain_http_to_sink(url: &UrlLike, in_sink: bool, findings: &mut Vec<Finding>) {
@@ -63,19 +56,8 @@ fn check_plain_http_to_sink(url: &UrlLike, in_sink: bool, findings: &mut Vec<Fin
 }
 
 fn check_shortened_url(url: &UrlLike, findings: &mut Vec<Finding>) {
-    let shorteners = [
-        "bit.ly",
-        "t.co",
-        "tinyurl.com",
-        "is.gd",
-        "v.gd",
-        "goo.gl",
-        "ow.ly",
-    ];
-
     if let Some(host) = url.host() {
-        let host_lower = host.to_lowercase();
-        if shorteners.iter().any(|s| host_lower == *s) {
+        if crate::rules::shared::is_url_shortener(host) {
             findings.push(Finding {
                 rule_id: RuleId::ShortenedUrl,
                 severity: Severity::Medium,
@@ -165,5 +147,37 @@ mod tests {
         let args = vec!["-k".to_string()];
         let findings = check_insecure_flags(&args, true);
         assert!(!findings.is_empty());
+    }
+
+    #[test]
+    fn plain_http_loopback_suppressed_regardless_of_host_casing() {
+        // PlainHttpToSink must NOT fire for a loopback host in sink context. The
+        // url crate already lowercases the host of a Standard http URL, but the
+        // suppression now relies on is_loopback_host being case-insensitive
+        // internally, so this holds for any input casing of the loopback name.
+        for raw in [
+            "http://localhost:3000/x",
+            "http://LOCALHOST:3000/x",
+            "http://Localhost/y",
+            "http://127.0.0.1/a",
+            "http://app.LocalHost/b",
+        ] {
+            let url = crate::parse::parse_url(raw);
+            let findings = check(&url, true);
+            assert!(
+                !findings
+                    .iter()
+                    .any(|f| f.rule_id == RuleId::PlainHttpToSink),
+                "PlainHttpToSink should be suppressed for loopback host: {raw}"
+            );
+        }
+        // A genuine remote http host in sink context still fires.
+        let remote = crate::parse::parse_url("http://evil.example/x");
+        assert!(
+            check(&remote, true)
+                .iter()
+                .any(|f| f.rule_id == RuleId::PlainHttpToSink),
+            "PlainHttpToSink should fire for a remote http host"
+        );
     }
 }

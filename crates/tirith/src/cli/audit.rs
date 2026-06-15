@@ -193,6 +193,139 @@ pub fn stats(session: Option<&str>, json: bool, entry_type: &str) -> i32 {
     0
 }
 
+/// Run the `tirith audit verify` subcommand: check the tamper-evident chain.
+pub fn verify(expected_head: Option<&str>, json: bool) -> i32 {
+    let Some(path) = tirith_core::audit::audit_log_path() else {
+        // Keep `--json` machine-readable on the path-resolution failure: emit the
+        // same `{ ok, total_lines, problems }` error shape as the other JSON paths
+        // in this handler (built via serde_json so it is always valid), and PRESERVE
+        // the exit code (2) so callers still distinguish it from a verify failure (1).
+        if json {
+            let obj = serde_json::json!({
+                "ok": false,
+                "total_lines": 0,
+                "problems": ["no audit log path available"],
+            });
+            println!("{obj}");
+        } else {
+            eprintln!("tirith: no audit log path available");
+        }
+        return 2;
+    };
+    // `try_exists()` (not `exists()`) so a log we CANNOT stat (permission denied,
+    // etc.) is not silently collapsed into "missing" and reported as a vacuous
+    // success. Fail closed on the metadata error: emit the JSON/text error shape
+    // and return non-zero rather than exit 0.
+    let log_exists = match path.try_exists() {
+        Ok(exists) => exists,
+        Err(e) => {
+            if json {
+                let obj = serde_json::json!({
+                    "ok": false,
+                    "total_lines": 0,
+                    "problems": [format!(
+                        "could not access audit log at {}: {e}",
+                        path.display()
+                    )],
+                });
+                println!("{obj}");
+            } else {
+                eprintln!(
+                    "tirith audit verify: FAILED: could not access audit log at {}: {e}",
+                    path.display()
+                );
+            }
+            return 1;
+        }
+    };
+    if !log_exists {
+        // When the caller anchors verification with --expected-head, a missing
+        // log is a FAILURE, not a vacuous pass: the operator asserted a specific
+        // tail hash that an absent log cannot satisfy. Reporting success here
+        // would let log deletion silently defeat the anchor.
+        if expected_head.is_some() {
+            if json {
+                // Build with serde_json so the path is escaped (a Windows path with
+                // backslashes, or one with quotes, would otherwise yield invalid
+                // JSON). Mirrors the success-path object shape below.
+                let obj = serde_json::json!({
+                    "ok": false,
+                    "total_lines": 0,
+                    "problems": [format!(
+                        "expected-head supplied but no audit log at {}",
+                        path.display()
+                    )],
+                });
+                println!("{obj}");
+            } else {
+                eprintln!(
+                    "tirith audit verify: FAILED: expected-head supplied but no audit log at {}",
+                    path.display()
+                );
+            }
+            return 1;
+        }
+        if json {
+            println!(r#"{{"ok":true,"total_lines":0,"note":"no audit log yet"}}"#);
+        } else {
+            println!("tirith audit verify: no audit log at {}", path.display());
+        }
+        return 0;
+    }
+    let report = tirith_core::audit::verify_audit_log(&path, expected_head);
+    if json {
+        let problems: Vec<serde_json::Value> = report
+            .problems
+            .iter()
+            .map(|p| serde_json::Value::String(p.clone()))
+            .collect();
+        let obj = serde_json::json!({
+            "ok": report.ok,
+            "total_lines": report.total_lines,
+            "chained_lines": report.chained_lines,
+            "legacy_prefix": report.legacy_prefix,
+            "head_status": report.head_status,
+            "signed_lines": report.signed_lines,
+            "signing_expected": report.signing_expected,
+            "problems": problems,
+        });
+        println!("{obj}");
+    } else {
+        println!(
+            "tirith audit verify: {} ({} lines, {} chained, {} legacy)",
+            if report.ok { "OK" } else { "FAILED" },
+            report.total_lines,
+            report.chained_lines,
+            report.legacy_prefix
+        );
+        println!("  {}", report.head_status);
+        if report.signing_expected {
+            println!(
+                "  signing: enabled ({} signed line(s))",
+                report.signed_lines
+            );
+        } else {
+            // Honest limitation: for an UNSIGNED log there is no key, so local
+            // verification cannot prove signing was never enabled. A fully local
+            // attacker could strip signatures and rewrite the head to look
+            // unsigned. Detecting that requires an external anchor (a signed log,
+            // or an out-of-band --expected-head). See the audit.rs module note.
+            println!(
+                "  signing: not enabled (local verification cannot prove signing was \
+                 never enabled on an unsigned log without an external anchor)"
+            );
+        }
+        for p in &report.problems {
+            println!("  problem: {p}");
+        }
+    }
+    if report.ok {
+        0
+    } else {
+        1
+    }
+}
+
 /// Run the `tirith audit report` subcommand.
 pub fn report(format: &str, since: Option<&str>, entry_type: &str) -> i32 {
     if entry_type != "verdict" {
@@ -276,4 +409,45 @@ pub fn report(format: &str, since: Option<&str>, entry_type: &str) -> i32 {
     }
 
     0
+}
+
+#[cfg(test)]
+mod tests {
+    // Use the CRATE-WIDE env lock + RAII guard from the test harness so this test
+    // serializes against the other env-mutating bin tests (trust.rs, dashboard.rs,
+    // doctor.rs) that also touch HOME/XDG_DATA_HOME. A module-local lock would let
+    // those race this test on the same process-global env vars.
+    use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+
+    /// F8: `tirith audit verify --expected-head <hash>` must FAIL (non-zero) when
+    /// the log is missing — an asserted tail hash cannot be satisfied by an absent
+    /// log, so reporting success would let log deletion silently defeat the anchor.
+    /// A plain `verify` (no anchor) on a missing log still succeeds (0).
+    #[cfg(unix)]
+    #[test]
+    fn verify_missing_log_with_expected_head_fails() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty_home");
+        std::fs::create_dir_all(&empty).unwrap();
+
+        // Point BOTH the XDG data dir (Linux) and HOME (macOS, via etcetera's
+        // Apple strategy) at a fresh empty dir, so `audit_log_path()` resolves to a
+        // file that does not exist on either platform. EnvGuard restores on Drop.
+        let _home = EnvGuard::set("HOME", &empty);
+        let _xdg = EnvGuard::set("XDG_DATA_HOME", &empty);
+
+        let with_anchor = super::verify(Some("deadbeefcafe"), true);
+        let without_anchor = super::verify(None, true);
+
+        assert_eq!(
+            with_anchor, 1,
+            "verify --expected-head on a missing log must return non-zero"
+        );
+        assert_eq!(
+            without_anchor, 0,
+            "verify with no anchor on a missing log stays a vacuous success"
+        );
+    }
 }

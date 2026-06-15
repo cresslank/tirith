@@ -30,6 +30,10 @@ pub struct ScanResult {
     pub skipped_count: usize,
     pub truncated: bool,
     pub truncation_reason: Option<String>,
+    /// Files skipped specifically because a rule panicked while scanning them
+    /// (a subset of `skipped_count`). Surfaced separately so an incomplete scan
+    /// is distinguishable from benign size/IO skips and never reads as clean.
+    pub panic_files: Vec<PathBuf>,
 }
 
 /// Result of scanning a single file.
@@ -39,10 +43,8 @@ pub struct FileScanResult {
     pub is_config_file: bool,
 }
 
-/// Known AI config file basenames (scanned first for priority ordering).
-/// Only includes names specific to AI tooling — generic names like settings.json
-/// are only prioritized when found inside a known config directory (handled by
-/// `is_priority_path` checking the parent directory).
+/// AI-specific config basenames scanned first. Generic names (settings.json)
+/// are prioritized only inside a known config dir (via the parent-dir check).
 const PRIORITY_BASENAMES: &[&str] = &[
     ".cursorrules",
     ".cursorignore",
@@ -83,7 +85,6 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
         &config.exclude_patterns,
     );
 
-    // Sort: known config files first, then lexicographic
     files.sort_by(|a, b| {
         let a_priority = is_priority_file(a);
         let b_priority = is_priority_file(b);
@@ -98,7 +99,6 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     let mut truncation_reason = None;
     let mut skipped_count = 0;
 
-    // Caller-provided safety cap; not a license gate.
     if let Some(max) = config.max_files {
         if files.len() > max {
             skipped_count = files.len() - max;
@@ -111,13 +111,19 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     }
 
     let mut file_results = Vec::new();
+    let mut panic_files = Vec::new();
     for file_path in &files {
         // Panic in any rule is bounded to its file; the rest of the walk
-        // continues. Single-file callers (CLI, MCP, `policy test`) bypass
-        // this guard on purpose so panics still surface honestly there.
+        // continues. A panic is recorded in `panic_files` (not just folded into
+        // `skipped_count`) so callers can tell an incomplete scan from benign
+        // size/IO skips.
         match catch_panic_scanning(file_path, || scan_single_file(file_path)) {
             Some(Some(result)) => file_results.push(result),
-            Some(None) | None => skipped_count += 1,
+            Some(None) => skipped_count += 1,
+            None => {
+                skipped_count += 1;
+                panic_files.push(file_path.clone());
+            }
         }
     }
 
@@ -126,39 +132,51 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
         skipped_count,
         truncated,
         truncation_reason,
+        panic_files,
         file_results,
     }
 }
 
+/// Maximum analyzable content size: 10 MiB. Large enough for any realistic
+/// config/source file, small enough that a hostile `.git/objects/pack-*.pack`
+/// (or a huge editor buffer opened via the LSP server) won't blow us up.
+/// Exposed so the file-scan path here and the in-memory LSP document path
+/// (`tirith` crate `cli::lsp`) enforce the SAME ceiling from one definition.
+pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
 /// Scan a single file and return its results.
 pub fn scan_single_file(file_path: &Path) -> Option<FileScanResult> {
-    // 10 MiB cap — large enough for any realistic config/source file but
-    // small enough that a hostile `.git/objects/pack-*.pack` won't blow us up.
-    const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
-
-    let metadata = match std::fs::metadata(file_path) {
-        Ok(m) => m,
-        Err(e) => {
+    // Read race-free, refusing to FOLLOW a symlinked final component (so a planted
+    // symlink at a matched path can't redirect the read onto a file outside the
+    // tree) and enforcing the same `MAX_FILE_SIZE` ceiling in one open-then-fstat.
+    // Every failure (absent, non-regular, symlinked, oversized, I/O) is a benign
+    // skip → `None`, preserving the `skipped_count` / `scan_single_file_guarded`
+    // `Ok(None)` contract.
+    let raw_bytes = match crate::util::read_text_no_follow_capped(file_path, MAX_FILE_SIZE) {
+        Ok(b) => b,
+        Err(crate::util::OpenRegularError::TooLarge) => {
             eprintln!(
-                "tirith: scan: cannot read metadata for {}: {e}",
+                "tirith: scan: skipping {} (exceeds {}B limit)",
+                file_path.display(),
+                MAX_FILE_SIZE
+            );
+            return None;
+        }
+        Err(crate::util::OpenRegularError::NotFound) => {
+            eprintln!(
+                "tirith: scan: cannot read {} (not found)",
                 file_path.display()
             );
             return None;
         }
-    };
-    if metadata.len() > MAX_FILE_SIZE {
-        eprintln!(
-            "tirith: scan: skipping {} ({}B exceeds {}B limit)",
-            file_path.display(),
-            metadata.len(),
-            MAX_FILE_SIZE
-        );
-        return None;
-    }
-
-    let raw_bytes = match std::fs::read(file_path) {
-        Ok(b) => b,
-        Err(e) => {
+        Err(crate::util::OpenRegularError::NotRegularFile) => {
+            eprintln!(
+                "tirith: scan: skipping {} (symlink or non-regular file)",
+                file_path.display()
+            );
+            return None;
+        }
+        Err(crate::util::OpenRegularError::Io(e)) => {
             eprintln!("tirith: scan: cannot read {}: {e}", file_path.display());
             return None;
         }
@@ -182,6 +200,8 @@ pub fn scan_single_file(file_path: &Path) -> Option<FileScanResult> {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
+        clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -197,22 +217,11 @@ pub fn scan_single_file(file_path: &Path) -> Option<FileScanResult> {
     })
 }
 
-/// Wrap `f` in `catch_unwind` for the directory-walk code path. On panic,
-/// log a skip message to stderr and return `None`; the caller then bumps
-/// `skipped_count` so the rest of the walk continues.
-///
-/// **Contract notes:**
-/// - The default Rust panic hook fires *before* unwinding, so the panic
-///   payload + backtrace will already be on stderr before our skip line.
-///   We deliberately don't install a custom panic hook — that would mutate
-///   process-global state and affect every other caller.
-/// - Only effective in `panic = "unwind"` builds (the workspace default).
-///   `panic = "abort"` builds bypass `catch_unwind` entirely.
-/// - `AssertUnwindSafe` is asserted because the closure type does not
-///   auto-impl `UnwindSafe`. Today the closure captures only `&Path` and
-///   a function pointer, both trivially safe; if a future refactor expands
-///   the closure body to capture mutable state, that state must remain
-///   unused after the panic to keep the assertion sound.
+/// Wrap `f` in `catch_unwind` for the directory walk: on panic, log a skip and
+/// return `None` so the caller bumps `skipped_count` and the walk continues.
+/// Only effective in `panic = "unwind"` builds. `AssertUnwindSafe` is sound only
+/// while the closure captures no mutable state used after a panic (today: `&Path`
+/// + a fn pointer).
 fn catch_panic_scanning<T>(file_path: &Path, f: impl FnOnce() -> T) -> Option<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(v) => Some(v),
@@ -224,6 +233,26 @@ fn catch_panic_scanning<T>(file_path: &Path, f: impl FnOnce() -> T) -> Option<T>
             None
         }
     }
+}
+
+/// A rule panicked while scanning a file (already reported on stderr by the
+/// panic hook + [`catch_panic_scanning`]). Returned by
+/// [`scan_single_file_guarded`] so callers can degrade gracefully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RulePanic;
+
+/// Scan a single file with the same per-file panic guard the directory walk
+/// uses, for long-lived/server callers (the MCP server, `policy test`) that must
+/// not crash on a crafted file:
+/// - `Ok(Some(result))` — the file was scanned;
+/// - `Ok(None)` — skipped (too large / unreadable);
+/// - `Err(RulePanic)` — a rule panicked; the caller should degrade to an error
+///   instead of unwinding.
+///
+/// One-shot CLI `scan <file>` deliberately does NOT use this — a panic there
+/// surfaces honestly as a process crash (see the directory-walk comment above).
+pub fn scan_single_file_guarded(file_path: &Path) -> Result<Option<FileScanResult>, RulePanic> {
+    catch_panic_scanning(file_path, || scan_single_file(file_path)).ok_or(RulePanic)
 }
 
 /// Scan content from stdin (no file path).
@@ -242,6 +271,8 @@ pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
+        clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -257,17 +288,14 @@ pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
     }
 }
 
-/// Check if a path matches a priority config file.
-/// Matches either by AI-specific basename or by being inside a known config directory.
+/// Priority if the basename is AI-specific, or the file sits in a known config dir.
 fn is_priority_file(path: &Path) -> bool {
     let basename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-    // Direct AI-specific basename match
     if PRIORITY_BASENAMES.contains(&basename) {
         return true;
     }
 
-    // Generic filenames are priority only inside known config dirs
     if let Some(parent) = path.parent() {
         let parent_name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if PRIORITY_PARENT_DIRS.contains(&parent_name) {
@@ -308,6 +336,22 @@ fn collect_files(
     files
 }
 
+/// Enumerate every AI-CONFIG file under `root` — the instruction / config
+/// surface (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.claude/*`,
+/// `.cursor/rules/*`, `.mcp.json`, …) that `tirith ai snapshot|diff` track.
+/// Reuses the standard scan walk (so it honors the same skip-dir / known-config-
+/// dir rules), then keeps only paths [`crate::rules::aifile::is_ai_config_file`]
+/// recognises. Always recursive. Returns absolute-or-`root`-relative paths
+/// deduplicated and sorted for stable output (independent of the walk's order).
+/// A single file `root` that is itself an AI-config file yields just that file.
+pub fn collect_ai_config_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = collect_files(root, true, &[], &[], &[]);
+    files.retain(|p| crate::rules::aifile::is_ai_config_file(p));
+    files.sort();
+    files.dedup();
+    files
+}
+
 fn collect_files_recursive(
     root: &Path,
     dir: &Path,
@@ -339,8 +383,26 @@ fn collect_files_recursive(
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-        // Skip hidden dirs (except known config dirs) and common non-useful dirs
-        if path.is_dir() {
+        // Classify the entry WITHOUT following symlinks (`entry.file_type()` reports
+        // the link itself, not its target). A symlink — to a directory OR a file —
+        // is skipped outright so traversal can neither recurse through a symlinked
+        // directory out of the tree (e.g. a planted `node_modules -> /`) nor read a
+        // file through a symlink that escapes the scan root.
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "tirith: scan: cannot stat entry {}: {e} (skipped)",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if file_type.is_dir() {
             if should_skip_dir(name) && !is_known_config_dir(name) {
                 continue;
             }
@@ -358,12 +420,10 @@ fn collect_files_recursive(
             continue;
         }
 
-        // Skip binary/non-text files by extension
         if is_binary_extension(name) {
             continue;
         }
 
-        // Apply ignore patterns against basename and relative path
         let rel_path = path
             .strip_prefix(root)
             .ok()
@@ -376,8 +436,9 @@ fn collect_files_recursive(
             continue;
         }
 
-        // Apply include patterns with negation support.
-        // Patterns prefixed with `!` act as excludes within the include set.
+        // Include patterns with negation support: `!`-prefixed patterns exclude
+        // from the include set. A file passes if it matches a positive include
+        // (or there are none) AND matches no negated pattern.
         if !include_patterns.is_empty() {
             let mut included = false;
             let mut negated = false;
@@ -385,29 +446,25 @@ fn collect_files_recursive(
 
             for pat in include_patterns {
                 if let Some(stripped) = pat.strip_prefix('!') {
-                    // Negation: exclude from the include set
+                    // Negation: exclude from the include set.
                     if matches_ignore_pattern(name, stripped)
                         || matches_ignore_pattern(rel_path, stripped)
                     {
                         negated = true;
                     }
                 } else {
-                    // Positive: file must match at least one
+                    // Positive: file must match at least one.
                     if matches_ignore_pattern(name, pat) || matches_ignore_pattern(rel_path, pat) {
                         included = true;
                     }
                 }
             }
 
-            // A file passes include if:
-            // - No positive includes OR matches at least one positive include
-            // - AND does not match any negated include
             if negated || (has_positive && !included) {
                 continue;
             }
         }
 
-        // Apply exclude patterns: skip matching files
         if exclude_patterns
             .iter()
             .any(|pat| matches_ignore_pattern(name, pat) || matches_ignore_pattern(rel_path, pat))
@@ -415,25 +472,24 @@ fn collect_files_recursive(
             continue;
         }
 
+        // Final containment gate: the file's REAL location (resolving every
+        // intermediate directory) must stay inside the selected scan root. The
+        // per-entry symlink skip above stops a symlinked leaf or directory, but an
+        // intermediate-directory symlink planted higher in the walk could still let
+        // a regular leaf resolve outside `root`; `canonical_within` (fail-closed)
+        // rejects that.
+        if !crate::util::canonical_within(&path, root) {
+            continue;
+        }
+
         files.push(path);
     }
 }
 
-/// Directories to skip during scanning.
+/// Directories to skip during scanning. Delegates to the shared built-in
+/// build-artifact skip set so the scanner and the correlation pass agree.
 fn should_skip_dir(name: &str) -> bool {
-    matches!(
-        name,
-        ".git"
-            | "node_modules"
-            | "target"
-            | "__pycache__"
-            | ".tox"
-            | "dist"
-            | "build"
-            | ".next"
-            | "vendor"
-            | ".cache"
-    )
+    crate::util_build_dirs::should_skip_dir(name)
 }
 
 /// Known AI config directories that should always be entered.
@@ -453,37 +509,35 @@ fn is_known_config_dir(name: &str) -> bool {
 }
 
 /// File extensions that indicate binary content (skip scanning).
+///
+/// `.svg` is deliberately NOT here: an SVG is XML text and can carry an
+/// active payload (`<script>`, an `on*` event handler) or an external
+/// reference — the `aifile` rules scan it for hidden / smuggled content.
 fn is_binary_extension(name: &str) -> bool {
     let binary_exts = [
-        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".svg", ".webp", ".mp3", ".mp4", ".wav",
-        ".avi", ".mov", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".exe", ".dll", ".so",
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".mp3", ".mp4", ".wav", ".avi",
+        ".mov", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".exe", ".dll", ".so",
         ".dylib", ".o", ".a", ".wasm", ".pyc", ".class", ".jar",
     ];
     let name_lower = name.to_lowercase();
     binary_exts.iter().any(|ext| name_lower.ends_with(ext))
 }
 
-/// Match a filename against an ignore pattern.
-/// Supports simple glob patterns: `*.ext` (suffix), `prefix*` (prefix),
-/// `*middle*` (contains), and exact matches. Falls back to substring
-/// matching for patterns without `*`.
+/// Match a filename against a simple glob: `*.ext`, `prefix*`, `pre*suf`,
+/// `*middle*`, or exact. Patterns without `*` fall back to substring match.
 pub fn matches_ignore_pattern(name: &str, pattern: &str) -> bool {
     if pattern.contains('*') {
         let parts: Vec<&str> = pattern.split('*').collect();
         match parts.as_slice() {
-            // "*.ext" — suffix match
             [prefix, suffix] if prefix.is_empty() && !suffix.is_empty() => name.ends_with(suffix),
-            // "prefix*" — prefix match
             [prefix, suffix] if !prefix.is_empty() && suffix.is_empty() => name.starts_with(prefix),
-            // "pre*suf" — prefix + suffix match
             [prefix, suffix] if !prefix.is_empty() && !suffix.is_empty() => {
                 name.starts_with(prefix)
                     && name.ends_with(suffix)
                     && name.len() >= prefix.len() + suffix.len()
             }
-            // "*" alone matches everything
             [_, _] => true,
-            // Fallback for multiple wildcards: all parts must appear in order
+            // Multiple wildcards: all parts must appear in order.
             _ => {
                 let mut remaining = name;
                 for (i, part) in parts.iter().enumerate() {
@@ -505,7 +559,6 @@ pub fn matches_ignore_pattern(name: &str, pattern: &str) -> bool {
             }
         }
     } else {
-        // No wildcard: substring match (backwards compatible)
         name.contains(pattern)
     }
 }
@@ -536,19 +589,15 @@ mod tests {
         assert_eq!(result, Some(42));
     }
 
-    /// Serializes any test that mutates the global panic hook. Without this,
-    /// a parallel test that panics during the hook-swap window inherits the
-    /// empty hook, and concurrent hook swaps race each other's restore.
-    /// Tolerates poisoning so a single panic doesn't cascade.
+    /// Serializes tests that mutate the global panic hook so concurrent swaps
+    /// don't race each other's restore. Tolerates poisoning.
     static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn catch_panic_scanning_returns_none_on_panic() {
         let _lock = PANIC_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = Path::new("dummy");
-        // Suppress the default panic-hook output for this test only — we're
-        // intentionally inducing a panic and don't want it cluttering stderr.
-        // The hook is restored before the lock guard drops.
+        // Suppress the default panic-hook output for this intentional panic.
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result: Option<i32> = catch_panic_scanning(path, || {
@@ -559,11 +608,53 @@ mod tests {
     }
 
     #[test]
+    fn scan_single_file_guarded_non_panic_paths() {
+        // A readable file scans to Ok(Some(_)); the panic arm (Err(())) is
+        // exercised by `catch_panic_scanning_returns_none_on_panic` above, which
+        // covers the only branch that yields Err.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let file_path = tmp.path().join("note.md");
+        std::fs::write(&file_path, "hello world").expect("write temp file");
+        assert!(matches!(scan_single_file_guarded(&file_path), Ok(Some(_))));
+
+        // An unreadable/missing file is a benign skip: Ok(None), not Err.
+        let missing = tmp.path().join("does_not_exist.md");
+        assert!(matches!(scan_single_file_guarded(&missing), Ok(None)));
+    }
+
+    #[test]
     fn test_binary_extension_skip() {
         assert!(is_binary_extension("image.png"));
         assert!(is_binary_extension("archive.tar.gz"));
         assert!(!is_binary_extension("config.json"));
         assert!(!is_binary_extension("CLAUDE.md"));
+        // SVG is XML text — it must NOT be skipped as binary, so the
+        // `aifile` rules can scan it for active / hidden content.
+        assert!(!is_binary_extension("logo.svg"));
+        assert!(!is_binary_extension("ICON.SVG"));
+    }
+
+    #[test]
+    fn test_svg_active_content_visible_in_scan() {
+        // An SVG carrying a <script> must be collected (not skipped as binary)
+        // and flagged by the aifile rules.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let file_path = tmp.path().join("evil.svg");
+        std::fs::write(
+            &file_path,
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><script>fetch('/x')</script></svg>"#,
+        )
+        .expect("write temp file");
+
+        let result = scan_single_file(&file_path).expect("scan should succeed");
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|f| f.rule_id == crate::verdict::RuleId::SvgScriptEmbedded),
+            "SVG with embedded script should be flagged: {:?}",
+            result.findings
+        );
     }
 
     #[test]
@@ -587,8 +678,41 @@ mod tests {
         assert!(should_skip_dir(".git"));
         assert!(should_skip_dir("node_modules"));
         assert!(should_skip_dir("target"));
+        // New build-artifact dirs from the shared skip set.
+        assert!(should_skip_dir("out"));
+        assert!(should_skip_dir(".turbo"));
+        assert!(should_skip_dir("coverage"));
+        assert!(should_skip_dir(".expo"));
         assert!(!should_skip_dir("src"));
         assert!(!should_skip_dir(".vscode"));
+    }
+
+    #[test]
+    fn test_new_build_artifact_dirs_skipped_in_walk() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let root = tmp.path();
+
+        // A source file that must be collected.
+        std::fs::write(root.join("keep.md"), "hello").unwrap();
+
+        // Build-artifact dirs whose contents must be skipped during the walk.
+        for dir in ["out", ".turbo", "coverage", ".expo"] {
+            let sub = root.join(dir);
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(sub.join("artifact.md"), "generated").unwrap();
+        }
+
+        let files = collect_files(root, true, &[], &[], &[]);
+        let names: Vec<&str> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+
+        assert!(names.contains(&"keep.md"), "keep.md should be collected");
+        assert!(
+            !names.contains(&"artifact.md"),
+            "files under out/.turbo/coverage/.expo should be skipped, got {names:?}"
+        );
     }
 
     #[test]
@@ -630,8 +754,7 @@ mod tests {
 
     #[test]
     fn test_variation_selector_visible_in_scan() {
-        // Write a temp file with a variation selector (U+FE0F = EF B8 8F in UTF-8)
-        // into a temp directory with no local policy so paranoia is deterministic.
+        // Variation selector U+FE0F (EF B8 8F) in a temp dir with no policy.
         let tmp = tempfile::tempdir().expect("create temp dir");
         let file_path = tmp.path().join("test_vs.txt");
         std::fs::write(&file_path, b"A\xef\xb8\x8f").expect("write temp file");
@@ -679,6 +802,65 @@ mod tests {
         assert!(
             !names.contains(&"c.rs"),
             "c.rs should not match *.md include"
+        );
+    }
+
+    /// F15: a SYMLINKED directory under the scan root must NOT be traversed, so a
+    /// planted `subdir -> /outside` cannot pull files from outside the tree into
+    /// the walk.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directory_is_not_traversed() {
+        let root = tempfile::tempdir().expect("create scan root");
+        let outside = tempfile::tempdir().expect("create outside tree");
+        // A uniquely-named file OUTSIDE the scan root.
+        std::fs::write(outside.path().join("escaped_unique_name.md"), "secret").unwrap();
+        // A real in-tree file that SHOULD be collected.
+        std::fs::write(root.path().join("inside.md"), "ok").unwrap();
+        // root/link_dir -> <outside>.
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link_dir")).unwrap();
+
+        let files = collect_files(root.path(), true, &[], &[], &[]);
+        let names: Vec<&str> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+        assert!(
+            names.contains(&"inside.md"),
+            "the in-tree file must be collected"
+        );
+        assert!(
+            !names.contains(&"escaped_unique_name.md"),
+            "a file reached only via a symlinked directory must not be collected: {names:?}"
+        );
+    }
+
+    /// F15: a SYMLINKED file is skipped by the walk, and a direct
+    /// `scan_single_file` on a symlink refuses to read THROUGH it (`O_NOFOLLOW`),
+    /// so neither path discloses a file the link points at outside the tree.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_file_is_not_read_through() {
+        let root = tempfile::tempdir().expect("create scan root");
+        let outside = tempfile::tempdir().expect("create outside tree");
+        let target = outside.path().join("leak.md");
+        std::fs::write(&target, "SECRET_LEAK_CONTENT").unwrap();
+        // root/leak.md -> <outside>/leak.md.
+        let link = root.path().join("leak.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // The walk skips the symlinked leaf entirely.
+        let files = collect_files(root.path(), true, &[], &[], &[]);
+        assert!(
+            files
+                .iter()
+                .all(|p| p.file_name().and_then(|n| n.to_str()) != Some("leak.md")),
+            "a symlinked file must not be collected by the walk: {files:?}"
+        );
+        // And reading the symlink path directly is refused (no read-through).
+        assert!(
+            scan_single_file(&link).is_none(),
+            "scan_single_file must refuse to read through a symlinked final component"
         );
     }
 

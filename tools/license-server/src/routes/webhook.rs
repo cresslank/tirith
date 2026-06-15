@@ -150,7 +150,8 @@ async fn handle_order_paid(
         tier,
         product_id,
         occurred_at: created_at,
-        checkout_id,
+        // order.paid always carries a checkout_id (enforced above).
+        checkout_id: Some(checkout_id),
         key_hash: creds.key_hash,
         token: Some(creds.token),
         token_expires_at: creds.token_expires_at,
@@ -236,6 +237,9 @@ async fn handle_sub_active(
             UpdatedOutcome::ActiveNoKey => {
                 warn!(sub_id = %sub_id, "subscription.active — key check race, no key found in update");
             }
+            UpdatedOutcome::StaleIgnored => {
+                warn!(sub_id = %sub_id, "stale subscription.active ignored — older than last processed event, key state preserved");
+            }
             UpdatedOutcome::Duplicate => {
                 info!(event_id = %event_id, "duplicate event, skipped");
             }
@@ -269,8 +273,6 @@ async fn handle_sub_active(
             }
         };
 
-        let cid = checkout_id.unwrap_or_else(|| "unknown".to_string());
-
         let creds = provision_credentials(state, &tier_str)?;
 
         let created_data = CreatedData {
@@ -282,7 +284,10 @@ async fn handle_sub_active(
             tier: tier_str,
             product_id: product_id.unwrap_or_default(),
             occurred_at: created_at,
-            checkout_id: cid,
+            // None for checkout-less subscriptions — process_subscription_created
+            // then skips the pending_receipts row instead of keying it by a
+            // guessable id that /receipt/lookup could race.
+            checkout_id,
             key_hash: creds.key_hash,
             token: Some(creds.token),
             token_expires_at: creds.token_expires_at,
@@ -496,6 +501,9 @@ async fn handle_sub_past_due(
         UpdatedOutcome::TerminalIgnored => {
             warn!(sub_id = %sub_id, "past_due absorbed by terminal revoked state");
         }
+        UpdatedOutcome::StaleIgnored => {
+            warn!(sub_id = %sub_id, "stale subscription.past_due ignored — older than last processed event");
+        }
         UpdatedOutcome::Duplicate => {
             info!(event_id = %event_id, "duplicate event, skipped");
         }
@@ -570,6 +578,9 @@ async fn handle_sub_uncanceled(
         }
         UpdatedOutcome::TerminalIgnored => {
             warn!(sub_id = %sub_id, "uncanceled absorbed by terminal revoked state");
+        }
+        UpdatedOutcome::StaleIgnored => {
+            warn!(sub_id = %sub_id, "stale subscription.uncanceled ignored — older than last processed event, key state preserved");
         }
         UpdatedOutcome::Duplicate => {
             info!(event_id = %event_id, "duplicate event, skipped");

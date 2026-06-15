@@ -1,0 +1,91 @@
+# Tirith security policy — "oss-maintainer" template
+# For a maintainer of a public open-source repository.
+# Documentation: https://tirith.dev/docs/policy
+
+# Fail mode: "open" (allow on error) keeps tirith out of your way if it ever
+# fails internally. A maintainer's own machine does not need fail-closed.
+fail_mode: open
+
+# Paranoia level (1-4): 2 — a touch stricter than the solo default. You review
+# untrusted contributor branches and run their build/install steps, so detection
+# is turned up one notch above daily use.
+paranoia: 2
+
+# Allow the per-command `TIRITH=0` bypass in interactive terminals — handy when
+# you knowingly run something tirith flags on your own work.
+allow_bypass_env: true
+
+# Do NOT allow the bypass in non-interactive shells (CI-like runs, scripts that
+# build a contributor's branch). A contributed Makefile / script must not be
+# able to wave tirith off.
+allow_bypass_env_noninteractive: false
+
+# Warn findings are shown but do not require an explicit acknowledgement.
+strict_warn: false
+
+# Severity overrides per rule. An OSS maintainer's threat model is the untrusted
+# contributor: typosquatted dependencies, install scripts pulled from a fork, a
+# pull-request that adds a new package registry, and link-shortened install URLs.
+# These are escalated so they stand out while reviewing a branch.
+severity_overrides:
+  shortened_url: HIGH
+  git_typosquat: HIGH
+  threat_package_typosquat: HIGH
+  package_install_script_network_call: HIGH
+  helm_untrusted_repo: HIGH
+  brew_untrusted_tap: HIGH
+  repo_add_from_pipe: HIGH
+
+# URL / host patterns that always pass analysis. Add the install sources your
+# project legitimately uses here. Examples:
+#   - "sh.rustup.rs"
+#   - "get.docker.com"
+allowlist: []
+
+# URL / host patterns that are always blocked (overrides allowlist).
+blocklist: []
+
+# Per-rule allowlist scoping — trust a source for ONE rule only.
+# allowlist_rules:
+#   - rule_id: curl_pipe_shell
+#     patterns:
+#       - "get.docker.com"
+
+# Scan configuration.
+scan:
+  # MCP server names you trust — suppresses per-server MCP config findings
+  # and drift detection for those names. See `tirith mcp policy init`.
+  # trusted_mcp_servers: []
+
+  # Per-server allowed tools — see `tirith mcp policy init` to scaffold.
+  # mcp_allowed_tools: {}
+
+# Per-agent governance (enforcement).
+# `tirith agent sessions` shows which AgentOrigin variants you see in
+# practice; `tirith agent policy init` scaffolds this block. A `deny`
+# match forces the verdict to Block and appends an
+# `agent_denied_by_policy` finding; `deny` beats any matching `allow`.
+# Note: the interactive `TIRITH=0` bypass currently skips `agent_rules`.
+# agent_rules:
+#   allow:
+#     - kind: human
+
+# Package-policy section. A maintainer benefits from surfacing
+# brand-new and low-reputation dependencies that show up in a contributor's
+# branch. The block-on-typosquat / install-script knobs below are the
+# highest-value ones to enable; uncomment to opt in.
+# package_policy:
+#   block_not_found: false                    # block on registry HTTP 404 (--online only)
+#   block_newer_than_days:                    # block when first publication is <= N days
+#   warn_newer_than_days: 14                  # warn when a dep is <= 14 days old
+#   warn_low_downloads_below: 100             # warn on near-unused packages
+#   block_install_scripts_for_unknown_packages: true   # block Unknown + script signal
+#   block_typosquat_distance: 1               # block one-character typosquats
+#   block_aggregate_score: 76                 # baseline; lower to tighten
+#   warn_aggregate_score: 51                  # baseline; lower to surface earlier
+#   block_osv_min_cvss: 7.0                   # any OSV >= this CVSS escalates to Block
+#   block_repo_mismatch: false                # elevate `package_repo_mismatch` to Block
+#   warn_install_script_network_call: true    # disable to silence install-script signal
+#   block_dependency_confusion: true          # disable to demote dep-confusion to Warn
+#   internal_package_names: []                # [{ ecosystem: npm, name: "@my-co/*" }]
+#   repo_mismatch_check_max_packages: 50      # cap on packages checked under --online

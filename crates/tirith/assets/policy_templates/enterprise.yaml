@@ -1,0 +1,96 @@
+# Tirith security policy — "enterprise" template
+# Strict, audit-friendly defaults for a larger organization.
+# Documentation: https://tirith.dev/docs/policy
+
+# Fail mode: "closed" — if tirith cannot evaluate a command it blocks rather
+# than allowing it. An enterprise should never silently let an unanalysed
+# command run on a managed machine.
+fail_mode: closed
+
+# Paranoia level (1-4): 3 — high detection sensitivity across the org.
+paranoia: 3
+
+# Disable the `TIRITH=0` bypass entirely — interactive AND non-interactive.
+# In a managed fleet a bypass is a permanent hole, so neither form is permitted.
+allow_bypass_env: false
+allow_bypass_env_noninteractive: false
+
+# Require explicit acknowledgement for warn findings.
+strict_warn: true
+
+# Raise the severity (risk) of the highest-risk remote-execution, registry, and
+# supply-chain rules so they are unmistakable in logs and reports. NOTE:
+# severity_overrides only escalate severity — they do NOT by themselves force a
+# block. The action_overrides block below (shortened_url, curl_pipe_shell,
+# wget_pipe_shell) is what forces those rules to block.
+severity_overrides:
+  shortened_url: HIGH
+  plain_http_to_sink: CRITICAL
+  curl_pipe_shell: CRITICAL
+  wget_pipe_shell: CRITICAL
+  pipe_to_interpreter: HIGH
+  docker_untrusted_registry: HIGH
+  git_typosquat: HIGH
+  threat_package_typosquat: CRITICAL
+
+# Force specific rules to always block, regardless of their default action.
+# Only "block" is supported (escalation can upgrade, never downgrade).
+action_overrides:
+  shortened_url: block
+  curl_pipe_shell: block
+  wget_pipe_shell: block
+
+# URL / host patterns that always pass analysis. Keep this list short and
+# reviewed — every entry is a trusted hole in the fleet.
+allowlist: []
+
+# URL / host patterns that are always blocked (overrides allowlist).
+blocklist: []
+
+# `tirith scan` configuration. fail_on sets the severity threshold at which a
+# scan exits non-zero — wire this into your build / pre-merge gate.
+scan:
+  fail_on: high
+
+  # MCP server names the organization trusts. Keep this tight — a trusted name
+  # silences every per-server MCP config finding and exempts the server from
+  # drift detection. Generate from `tirith mcp policy init`.
+  # trusted_mcp_servers: []
+
+  # Per-server allowed tools — a guardrail against an agent or a merge
+  # smuggling a new MCP tool past the lockfile. See `tirith mcp policy init`.
+  # mcp_allowed_tools: {}
+
+# Per-agent governance (enforcement).
+# An enterprise typically declares the callers it expects (CI provider, the
+# sanctioned coding agent) and denies everything else by review. A `deny`
+# match forces the verdict to Block and appends an `agent_denied_by_policy`
+# finding; `deny` beats any matching `allow`, and `allow` is NOT a bypass — a
+# verdict the engine already blocked stays blocked. `tirith agent sessions`
+# shows the AgentOrigins your fleet actually sees.
+# agent_rules:
+#   allow:
+#     - kind: ci
+#       name: github-actions
+#     - kind: agent
+#       name: claude-code
+
+# Package-policy section. UNLIKE the other templates, the enterprise
+# template ships this block ACTIVE (uncommented) with strict defaults: an
+# enterprise wants supply-chain gates enforced out of the box, not opt-in.
+# Tune the thresholds to your risk tolerance.
+package_policy:
+  block_not_found: true                     # block on registry HTTP 404 (--online only)
+  block_newer_than_days: 7                  # reject brand-new packages (<= 7 days old)
+  warn_newer_than_days: 30                  # warn on recently-published packages
+  warn_low_downloads_below: 1000            # warn on low-reputation packages
+  block_install_scripts_for_unknown_packages: true   # block Unknown + script signal
+  block_typosquat_distance: 1               # block one-character typosquats
+  block_aggregate_score: 60                 # stricter than the baseline of 76
+  warn_aggregate_score: 40                  # surface risk earlier than the baseline 51
+  block_osv_min_cvss: 7.0                   # any OSV >= this CVSS escalates to Block
+  block_repo_mismatch: true                 # elevate `package_repo_mismatch` to Block
+  warn_install_script_network_call: true    # keep the install-script signal on
+  block_dependency_confusion: true          # keep dep-confusion at Block
+  internal_package_names: []                # [{ ecosystem: npm, name: "@my-co/*" }]
+  repo_mismatch_check_max_packages: 50      # cap on packages checked under --online

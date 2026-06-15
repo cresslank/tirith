@@ -3,9 +3,8 @@ use std::io::{self, BufRead, Write};
 
 use serde::{Deserialize, Serialize};
 
-/// Default TTL applied to a `trust add` when the caller passes neither
-/// `--ttl` nor `--permanent`. Trust is meant to expire by default so a stale
-/// allow does not linger forever; permanent trust must be chosen explicitly.
+/// Default TTL for a `trust add` with neither `--ttl` nor `--permanent`. Trust
+/// expires by default; permanent trust must be chosen explicitly.
 const DEFAULT_TTL: &str = "30d";
 
 /// A single entry in trust.json.
@@ -39,11 +38,8 @@ impl Default for TrustStore {
     }
 }
 
-/// How broad a trust pattern is. Ordered narrowest → broadest; a broader
-/// classification means the entry trusts more and is riskier.
-///
-/// The variants are declared narrowest-first, so the derived `PartialOrd`/`Ord`
-/// agree with that prose contract: `ScopeKind::Exact < ScopeKind::BareTld`.
+/// How broad a trust pattern is, declared narrowest-first so the derived `Ord`
+/// agrees: `ScopeKind::Exact < ScopeKind::BareTld` (broader = riskier).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeKind {
@@ -100,10 +96,9 @@ impl ScopeKind {
     }
 }
 
-/// A small, conservative set of public suffixes used only to recognise a
-/// pattern that is a *bare* TLD (`com`) versus a registrable domain
-/// (`example.com`). Not a full public-suffix list — it just needs to catch the
-/// common foot-guns so `trust add com` is rejected by default.
+/// Small set of public suffixes to distinguish a *bare* TLD (`com`) from a
+/// registrable domain (`example.com`). Not a full PSL — just enough to reject
+/// `trust add com` by default.
 const KNOWN_TLDS: &[&str] = &[
     "com", "net", "org", "io", "dev", "sh", "co", "ai", "app", "xyz", "info", "biz", "me", "us",
     "uk", "de", "fr", "ru", "cn", "jp", "in", "br", "ca", "au", "eu", "gov", "edu", "mil", "tv",
@@ -114,7 +109,6 @@ const KNOWN_TLDS: &[&str] = &[
 pub fn classify_scope(pattern: &str) -> ScopeKind {
     let p = pattern.trim().to_lowercase();
 
-    // Wildcard domains are explicit.
     if let Some(rest) = p.strip_prefix("*.") {
         // `*.com` is a bare-TLD wildcard — still the worst case.
         if !rest.contains('.') && KNOWN_TLDS.contains(&rest) {
@@ -123,14 +117,12 @@ pub fn classify_scope(pattern: &str) -> ScopeKind {
         return ScopeKind::Wildcard;
     }
 
-    // Anything with a scheme, path, query, or fragment is treated as an exact
-    // literal — it pins a specific URL/resource rather than a whole host.
+    // A scheme, path, query, or fragment pins a specific URL/resource → Exact.
     if p.contains("://") || p.contains('/') || p.contains('?') || p.contains('#') {
         return ScopeKind::Exact;
     }
 
-    // A bare token with no dot: either a bare TLD or just a non-domain
-    // substring fragment.
+    // Bare token, no dot: a bare TLD or a non-domain substring fragment.
     if !p.contains('.') {
         if KNOWN_TLDS.contains(&p.as_str()) {
             return ScopeKind::BareTld;
@@ -138,14 +130,12 @@ pub fn classify_scope(pattern: &str) -> ScopeKind {
         return ScopeKind::Substring;
     }
 
-    // Has at least one dot and no path: a `host.tld`-shaped domain pattern.
-    // A two-label form whose last label is a known TLD is a registrable
-    // domain; the policy matcher treats it as "domain + all subdomains".
+    // At least one dot, no path: a `host.tld`-shaped registrable domain.
     let labels: Vec<&str> = p.split('.').filter(|l| !l.is_empty()).collect();
     if labels.len() >= 2 {
         ScopeKind::Domain
     } else {
-        // e.g. a trailing-dot oddity — fall back to substring.
+        // Trailing-dot oddity → substring.
         ScopeKind::Substring
     }
 }
@@ -180,10 +170,9 @@ fn print_trust_error(subcmd: &str, err: &str, hint_pattern: Option<&str>) {
     }
 }
 
-/// Serialize `value` as pretty JSON to stdout. Returns `0` on success and `1`
-/// on a serialization failure. A JSON consumer must be able to tell that the
-/// output is incomplete, so a failure surfaces as a non-zero exit rather than
-/// a misleading exit-0 with a literal `{}`/`[]` printed in place of real data.
+/// Serialize `value` as pretty JSON to stdout. Returns `0` on success, `1` on a
+/// serialization failure — surfaced as a non-zero exit so a consumer can tell
+/// the output is incomplete rather than a misleading exit-0.
 #[must_use]
 fn print_json(value: &impl Serialize) -> i32 {
     match serde_json::to_string_pretty(value) {
@@ -284,12 +273,9 @@ fn parse_ttl(ttl: &str) -> Result<String, String> {
     Ok(expires.to_rfc3339())
 }
 
-/// Check if an entry is expired.
-///
-/// Backward-compatible: an entry with no `ttl_expires` (every entry written by
-/// an older tirith, and every `--permanent` entry) never expires. An entry
-/// whose `ttl_expires` cannot be parsed is treated as **not** expired so a
-/// malformed timestamp never silently revokes a user's trust.
+/// Check if an entry is expired. No `ttl_expires` (older/`--permanent` entries)
+/// never expires; an unparseable `ttl_expires` is treated as NOT expired so a
+/// malformed timestamp never silently revokes trust.
 fn is_expired(entry: &TrustEntry) -> bool {
     if let Some(ref exp) = entry.ttl_expires {
         if let Ok(expiry) = chrono::DateTime::parse_from_rfc3339(exp) {
@@ -327,8 +313,7 @@ fn validate_pattern(pattern: &str, policy: &tirith_core::policy::Policy) -> Resu
     if pattern.is_empty() {
         return Err("pattern must not be empty".to_string());
     }
-    // Reject control characters (bytes < 0x20) except tab to stop users from
-    // smuggling ANSI escapes or NULs into trust-store entries.
+    // Reject control chars (< 0x20, except tab) to stop ANSI escapes / NULs in entries.
     for (i, b) in pattern.bytes().enumerate() {
         if b < 0x20 && b != b'\t' {
             return Err(format!(
@@ -366,16 +351,15 @@ pub fn add(
         return 1;
     }
 
-    // --ttl and --permanent are mutually exclusive (clap also enforces this,
-    // but guard here too for the library-call path).
+    // --ttl and --permanent are mutually exclusive (clap enforces it too; guard
+    // here for the library-call path).
     if permanent && ttl.is_some() {
         eprintln!("tirith: trust add: --permanent cannot be combined with --ttl");
         return 1;
     }
 
-    // Narrow-trust-by-default: a broad pattern (whole domain / wildcard / bare
-    // TLD) requires an explicit `--broad` opt-in. This nudges users toward the
-    // narrowest scope that works (a specific URL, path, or rule-scoped entry).
+    // Narrow-trust-by-default: a broad pattern (domain/wildcard/bare-TLD) requires
+    // an explicit `--broad` opt-in.
     let scope_kind = classify_scope(pattern);
     if scope_kind.is_broad() && !broad {
         eprintln!(
@@ -754,34 +738,257 @@ pub fn remove(pattern: &str, rule_id: Option<&str>, scope: &str) -> i32 {
     0
 }
 
-/// `tirith trust last` -- show last trigger and offer to trust.
-pub fn last() -> i32 {
-    let data_dir = match tirith_core::policy::data_dir() {
-        Some(d) => d,
-        None => {
-            eprintln!("tirith: cannot determine data directory");
-            return 1;
-        }
-    };
-
+/// Read and JSON-parse `last_trigger.json` from the data dir.
+///
+/// Shared by `last()` (interactive prompt) and `from_last_trigger()` (suggest
+/// ready-to-run commands). Returns the parsed value so each caller can pull the
+/// fields it needs without re-reading the file. `Ok(None)` means there is no
+/// recent trigger on disk (missing file); `Err` is a real read/parse failure.
+fn load_last_trigger_value() -> Result<Option<serde_json::Value>, String> {
+    let data_dir = tirith_core::policy::data_dir()
+        .ok_or_else(|| "cannot determine data directory".to_string())?;
     let path = data_dir.join("last_trigger.json");
     if !path.exists() {
-        eprintln!("tirith: no recent trigger found");
-        return 1;
+        return Ok(None);
+    }
+    let content =
+        fs::read_to_string(&path).map_err(|e| format!("failed to read last trigger: {e}"))?;
+    let val: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("failed to parse last trigger: {e}"))?;
+    Ok(Some(val))
+}
+
+/// Extract `(target, rule_id)` PAIRS from a parsed `last_trigger.json`.
+///
+/// Pairing is PER FINDING: each finding carries its OWN `rule_id` and its own
+/// `evidence`, so a target pulled from a finding's evidence is paired with THAT
+/// finding's `rule_id` — never the flat top-level `rule_ids` array. Pairing
+/// against the top-level array would form a cartesian product, so for a
+/// multi-finding trigger `--apply` could trust URL A under rule B even though
+/// rule B fired for a DIFFERENT target.
+///
+/// Each target prefers a FULL URL when the evidence carries one (a `raw` string
+/// with a scheme that parses) so the suggested trust can be narrow; it falls
+/// back to a bare host/domain otherwise. Per-finding `raw` is read before
+/// `raw_host`, mirroring how `last()` walks findings. A finding with no
+/// extractable rule_id yields `(target, None)`. Results are de-duped on the full
+/// `(target, rule_id)` pair, so the same URL flagged by two different rules
+/// keeps both pairings.
+fn extract_target_rule_pairs(val: &serde_json::Value) -> Vec<(String, Option<String>)> {
+    let mut pairs: Vec<(String, Option<String>)> = Vec::new();
+    let push = |t: String, rid: &Option<String>, pairs: &mut Vec<(String, Option<String>)>| {
+        if t.is_empty() {
+            return;
+        }
+        let pair = (t, rid.clone());
+        if !pairs.contains(&pair) {
+            pairs.push(pair);
+        }
+    };
+    if let Some(findings) = val.get("findings").and_then(|v| v.as_array()) {
+        for finding in findings {
+            // THIS finding's own rule id — paired with every target it produces.
+            let rule_id = finding
+                .get("rule_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            if let Some(evidence) = finding.get("evidence").and_then(|v| v.as_array()) {
+                for ev in evidence {
+                    if let Some(raw) = ev.get("raw").and_then(|v| v.as_str()) {
+                        // Prefer the full URL when `raw` is one; else fall back
+                        // to the bare host so we still have something to trust.
+                        if raw.contains("://") && url::Url::parse(raw).is_ok() {
+                            push(raw.to_string(), &rule_id, &mut pairs);
+                        } else if let Some(host) = extract_host(raw) {
+                            push(host, &rule_id, &mut pairs);
+                        }
+                    }
+                    if let Some(host) = ev.get("raw_host").and_then(|v| v.as_str()) {
+                        push(host.to_string(), &rule_id, &mut pairs);
+                    }
+                }
+            }
+        }
     }
 
-    let content = match fs::read_to_string(&path) {
-        Ok(c) => c,
+    pairs
+}
+
+/// Normalize a per-finding target to the bare host `last()` displays and
+/// prompts on. `extract_target_rule_pairs` may yield a FULL URL or a bare host;
+/// `last()`'s `domains` list is always a bare host (via `extract_host` /
+/// `raw_host`). Reduce a URL target to its host so a pair can be matched back to
+/// the host the user was actually asked about; a target that is already a bare
+/// host (or any non-URL) maps to itself.
+fn target_host(target: &str) -> String {
+    extract_host(target).unwrap_or_else(|| target.to_string())
+}
+
+/// The rule_id(s) that actually fired for a single host in the last trigger.
+///
+/// Reuses `extract_target_rule_pairs` (the same per-finding source
+/// `from_last_trigger` uses) as the single source of truth, then keeps only the
+/// rules whose finding targeted `host`, never the flat top-level `rule_ids`
+/// array. This is what stops `last()`'s rule-scoped choice from granting one
+/// host every rule in the whole verdict. Results are de-duped, preserving order.
+fn rules_for_host(val: &serde_json::Value, host: &str) -> Vec<String> {
+    let mut rules: Vec<String> = Vec::new();
+    for (target, rule_id) in extract_target_rule_pairs(val) {
+        if target_host(&target) != host {
+            continue;
+        }
+        if let Some(rid) = rule_id {
+            if !rules.contains(&rid) {
+                rules.push(rid);
+            }
+        }
+    }
+    rules
+}
+
+/// Read + parse + extract in one step: per-finding `(target, rule_id)` pairs.
+///
+/// Each target prefers a full URL, else a bare domain (see
+/// `extract_target_rule_pairs`). `Err` covers both "no recent trigger" (so
+/// callers can print a friendly note) and real read/parse failures.
+fn read_last_trigger() -> Result<Vec<(String, Option<String>)>, String> {
+    match load_last_trigger_value()? {
+        Some(val) => Ok(extract_target_rule_pairs(&val)),
+        None => Err("no recent trigger found".into()),
+    }
+}
+
+/// Build the ready-to-run `tirith trust add` suggestion lines for each
+/// per-finding `(target, rule_id)` pair. A full-URL target is narrow, so it is
+/// suggested without `--broad`; a bare domain needs `--broad` because
+/// `trust add` rejects broad scopes without the opt-in (see `add()` /
+/// `classify_scope`). Each pair carries ITS OWN rule id, so a rule is never
+/// suggested for a target it didn't fire on.
+fn suggestion_lines(pairs: &[(String, Option<String>)]) -> Vec<String> {
+    pairs
+        .iter()
+        .map(|(target, rule_id)| {
+            // A target that classifies as broad (bare domain/wildcard/TLD) needs
+            // `--broad`; a full URL (or any narrow pattern) does not.
+            let needs_broad = classify_scope(target).is_broad();
+            format_add_line(target, rule_id.as_deref(), needs_broad)
+        })
+        .collect()
+}
+
+fn format_add_line(target: &str, rule_id: Option<&str>, needs_broad: bool) -> String {
+    // The target is attacker-controlled (a URL/host pulled from the trigger's
+    // finding evidence) and this line is printed for the operator to copy/paste
+    // into a shell. Scrub terminal-control bytes first, then shell-single-quote.
+    // The scrub (`sanitize_text_str`, same filter `output.rs::write_block_advisories`
+    // applies to blocklist URLs) strips ANSI/OSC/zero-width bytes so the target
+    // cannot repaint the operator's terminal at suggest time. The single-quote
+    // then keeps a target carrying `$( )`, backticks, `;`, spaces, a `>` redirect,
+    // or a glob from executing on paste. If it can't be safely quoted (e.g. it
+    // contains a newline), do NOT emit a runnable command — print a safe
+    // manual-trust note instead. The `--rule <rid>` is a snake_case enum Display
+    // (not attacker-controlled), so it needs no quoting. The printed `--ttl` uses
+    // `DEFAULT_TTL`, the same value `--apply` resolves to (see `from_last_trigger`),
+    // so the suggestion and the applied entry can't drift.
+    let scrubbed = tirith_core::mcp::output_filter::sanitize_text_str(target);
+    let Some(quoted) = tirith_core::safe_command::shell_single_quote(&scrubbed) else {
+        return "# trust this target manually with `tirith trust add` \
+                (it contains characters unsafe to embed in a suggested command)."
+            .to_string();
+    };
+    let broad = if needs_broad { " --broad" } else { "" };
+    match rule_id {
+        Some(rid) => format!("tirith trust add {quoted}{broad} --rule {rid} --ttl {DEFAULT_TTL}"),
+        None => format!("tirith trust add {quoted}{broad} --ttl {DEFAULT_TTL}"),
+    }
+}
+
+/// `tirith trust from-last-trigger [--apply]` -- turn the most recent trigger
+/// into trust commands. Default (suggest) prints ready-to-run `trust add`
+/// lines so the operator can copy/paste the narrowest one; `--apply` runs them.
+///
+/// Print-only by default mirrors the codebase's `policy tune` stance: suggest,
+/// don't mutate.
+pub fn from_last_trigger(apply: bool) -> i32 {
+    let pairs = match read_last_trigger() {
+        Ok(v) => v,
+        // A missing/empty trigger is not an error for this command -- it is the
+        // common "nothing happened yet" case, so exit 0 with a friendly note.
+        Err(e) if e == "no recent trigger found" => {
+            eprintln!("tirith: no recent trigger to trust");
+            return 0;
+        }
         Err(e) => {
-            eprintln!("tirith: failed to read last trigger: {e}");
+            eprintln!("tirith: trust from-last-trigger: {e}");
             return 1;
         }
     };
 
-    let val: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
+    if pairs.is_empty() {
+        eprintln!("tirith: no recent trigger to trust");
+        return 0;
+    }
+
+    if !apply {
+        eprintln!("Suggested trust commands (run the narrowest one that fits):");
+        eprintln!();
+        for line in suggestion_lines(&pairs) {
+            println!("{line}");
+        }
+        eprintln!();
+        eprintln!("Re-run with --apply to add these automatically.");
+        return 0;
+    }
+
+    // --apply: actually add each per-finding entry, pairing each target with ITS
+    // OWN rule id (never a rule that fired on a different target). A bare-domain
+    // target is broad, so pass `broad = true`; a full-URL (narrow) one does not.
+    let mut added = 0;
+    let mut failed = 0;
+    for (target, rule_id) in &pairs {
+        let broad = classify_scope(target).is_broad();
+        // Pass DEFAULT_TTL explicitly (not None) so the applied entry uses the
+        // same source the printed suggestion's `--ttl {DEFAULT_TTL}` does. `add()`
+        // would resolve None to DEFAULT_TTL anyway, but sharing the one constant
+        // keeps suggest and apply from drifting on separate literals.
+        if add(
+            target,
+            rule_id.as_deref(),
+            Some(DEFAULT_TTL),
+            false,
+            broad,
+            None,
+            "user",
+            false,
+        ) == 0
+        {
+            added += 1;
+        } else {
+            failed += 1;
+        }
+    }
+
+    eprintln!("tirith: added {added} trust entry/entries from last trigger");
+    // A partial apply (some entries rejected by `add()`, e.g. a blocklisted or
+    // control-char target) must NOT exit 0 and masquerade as a clean success --
+    // surface the count and fail loud so the operator knows not every entry stuck.
+    if failed > 0 {
+        eprintln!("tirith: {failed} trust entry/entries could not be added");
+        return 1;
+    }
+    0
+}
+
+/// `tirith trust last` -- show last trigger and offer to trust.
+pub fn last() -> i32 {
+    let val = match load_last_trigger_value() {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            eprintln!("tirith: no recent trigger found");
+            return 1;
+        }
         Err(e) => {
-            eprintln!("tirith: failed to parse last trigger: {e}");
+            eprintln!("tirith: {e}");
             return 1;
         }
     };
@@ -824,16 +1031,6 @@ pub fn last() -> i32 {
         return 0;
     }
 
-    let rule_ids: Vec<String> = val
-        .get("rule_ids")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
     for domain in &domains {
         eprintln!();
         eprint!("Trust {domain}? [y/N/r(rule-scoped)/t(temporary 7d)] ");
@@ -853,11 +1050,16 @@ pub fn last() -> i32 {
                 add(domain, None, None, false, true, None, "user", false);
             }
             "r" | "rule" => {
-                if rule_ids.is_empty() {
-                    eprintln!("tirith: no rule IDs in last trigger, adding global trust");
+                // Pair this host with ONLY the rule(s) that actually fired for
+                // it (per-finding, from `extract_target_rule_pairs`), not every
+                // top-level rule in the verdict. Trusting one host under a rule
+                // that fired on a DIFFERENT target would be over-broad.
+                let host_rules = rules_for_host(&val, domain);
+                if host_rules.is_empty() {
+                    eprintln!("tirith: no rule IDs for {domain}, adding global trust");
                     add(domain, None, None, false, true, None, "user", false);
                 } else {
-                    for rid in &rule_ids {
+                    for rid in &host_rules {
                         // Rule-scoped trust is narrow by construction.
                         add(domain, Some(rid), None, false, true, None, "user", false);
                     }
@@ -880,8 +1082,22 @@ pub fn last() -> i32 {
 /// `--expired` is the default and only collection mode today; it is accepted
 /// explicitly so the command reads clearly and leaves room for future modes.
 pub fn gc(expired: bool, scope: &str, json: bool) -> i32 {
+    gc_with_action("gc", expired, scope, json)
+}
+
+/// `tirith trust prune` — spec-named alias for `gc` (M6 ch3). Both
+/// invoke the same backing implementation; only the audit `trust_action`
+/// field differs so an operator can tell which command the user actually
+/// typed.
+pub fn prune(expired: bool, scope: &str, json: bool) -> i32 {
+    gc_with_action("prune", expired, scope, json)
+}
+
+fn gc_with_action(action_label: &str, expired: bool, scope: &str, json: bool) -> i32 {
     if !matches!(scope, "user" | "repo" | "all") {
-        eprintln!("tirith: trust gc: unknown scope '{scope}' (use 'user', 'repo', or 'all')");
+        eprintln!(
+            "tirith: trust {action_label}: unknown scope '{scope}' (use 'user', 'repo', or 'all')",
+        );
         return 1;
     }
     // `--expired` is currently the only mode; if a caller explicitly passes
@@ -901,7 +1117,7 @@ pub fn gc(expired: bool, scope: &str, json: bool) -> i32 {
             Ok(p) => p,
             Err(e) => {
                 if scope != "all" {
-                    print_trust_error("gc", &e, None);
+                    print_trust_error(action_label, &e, None);
                     return 1;
                 }
                 continue;
@@ -915,21 +1131,40 @@ pub fn gc(expired: bool, scope: &str, json: bool) -> i32 {
         let mut store = match load_store(&path) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("tirith: trust gc: {e}");
+                eprintln!("tirith: trust {action_label}: {e}");
                 return 1;
             }
         };
         let before = store.entries.len();
+        // Capture removed entries so each lands in the audit log under the right
+        // `trust_action` (M6 ch3) — otherwise gc/prune sweeps are invisible there.
+        let expired_entries: Vec<TrustEntry> = store
+            .entries
+            .iter()
+            .filter(|entry| is_expired(entry))
+            .cloned()
+            .collect();
         store.entries.retain(|entry| !is_expired(entry));
         let removed = before - store.entries.len();
 
         if removed > 0 {
             if let Err(e) = write_store(&path, &store) {
-                eprintln!("tirith: trust gc: {e}");
+                eprintln!("tirith: trust {action_label}: {e}");
                 return 1;
             }
+            for entry in &expired_entries {
+                tirith_core::audit::log_trust_change(
+                    &entry.pattern,
+                    entry.rule_id.as_deref(),
+                    action_label,
+                    entry.ttl_expires.as_deref(),
+                    s,
+                );
+            }
             if !json {
-                eprintln!("tirith: gc: removed {removed} expired entries from {s} scope");
+                eprintln!(
+                    "tirith: {action_label}: removed {removed} expired entries from {s} scope",
+                );
             }
         }
 
@@ -948,7 +1183,7 @@ pub fn gc(expired: bool, scope: &str, json: bool) -> i32 {
         return print_json(&out);
     }
     if total_removed == 0 {
-        eprintln!("tirith: gc: no expired entries found");
+        eprintln!("tirith: {action_label}: no expired entries found");
     }
 
     0
@@ -1197,13 +1432,10 @@ fn current_trust_snapshot() -> TrustSnapshot {
     }
 }
 
-/// Load all retained trust snapshots, oldest first. Unparseable lines skipped.
-///
-/// Returns `(snapshots, read_error)`. A missing history file is legitimate
-/// (no snapshots yet) and yields an empty list with no error. A history file
-/// that *exists* but cannot be read (permissions, I/O fault) yields an empty
-/// list **and** a `Some(message)` so `diff` can say "could not read history"
-/// rather than falsely reporting "first observation".
+/// Load all retained trust snapshots, oldest first (unparseable lines skipped).
+/// Returns `(snapshots, read_error)`: a missing file → empty + `None`; a file
+/// that exists but can't be read → empty + `Some(msg)` so `diff` can say "could
+/// not read history" instead of falsely reporting "first observation".
 fn load_trust_history() -> (Vec<TrustSnapshot>, Option<String>) {
     let Some(path) = trust_history_path() else {
         return (Vec::new(), None);
@@ -1230,9 +1462,8 @@ fn load_trust_history() -> (Vec<TrustSnapshot>, Option<String>) {
     (snapshots, None)
 }
 
-/// Atomic write: write to a temp file in the same directory, then rename, so a
-/// torn write can never leave a partial snapshot history behind. Mirrors
-/// `threatdb_cmd::record_snapshot`'s atomic write of its sibling history file.
+/// Atomic write (temp file + rename) so a torn write can never leave a partial
+/// snapshot history. Mirrors `threatdb_cmd::record_snapshot`.
 fn atomic_write(dest: &std::path::Path, data: &[u8]) -> Result<(), String> {
     let parent = dest
         .parent()
@@ -1257,11 +1488,9 @@ fn record_trust_snapshot(snapshot: &TrustSnapshot) {
     let Some(path) = trust_history_path() else {
         return;
     };
-    // The read-error note is irrelevant here: recording is best-effort and
-    // rewrites the whole file regardless.
+    // Read-error note is irrelevant: recording rewrites the whole file regardless.
     let (mut history, _) = load_trust_history();
-    // Dedup on entry set: re-running `trust list` against an unchanged trust
-    // set must not append a near-identical line every invocation.
+    // Dedup on entry set so an unchanged trust set doesn't append a line every call.
     if history
         .last()
         .map(|s| s.entries == snapshot.entries)
@@ -1281,7 +1510,6 @@ fn record_trust_snapshot(snapshot: &TrustSnapshot) {
             body.push('\n');
         }
     }
-    // Atomic write so a torn write can never lose the snapshot history.
     let _ = atomic_write(&path, body.as_bytes());
 }
 
@@ -1325,17 +1553,161 @@ fn diff_entry_of(key: &str) -> DiffEntry {
     }
 }
 
+/// `tirith trust audit` — show recorded trust-store mutations (M6 ch3).
+///
+/// Walks the audit-log JSONL and filters entries with
+/// `entry_type == "trust_change"`. Optionally trims the window with
+/// `--since <duration>` (e.g. `7d`, `24h`, `15m`).
+pub fn audit(since: Option<&str>, json: bool) -> i32 {
+    let cutoff = match since {
+        Some(s) => match parse_relative_duration(s) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("tirith: trust audit: invalid --since value: {e}");
+                return 1;
+            }
+        },
+        None => None,
+    };
+
+    let Some(log_path) = tirith_core::audit::audit_log_path() else {
+        eprintln!("tirith: trust audit: cannot resolve audit log path (no data dir)");
+        return 1;
+    };
+
+    if !log_path.exists() {
+        if json {
+            // Same envelope shape as the normal path so consumers never special-case
+            // "no log yet": `entries` always an array, `skipped_lines` always present.
+            let _ = print_json(&serde_json::json!({"entries": [], "skipped_lines": 0_usize}));
+        } else {
+            eprintln!(
+                "tirith: trust audit: no audit log yet at {}",
+                log_path.display()
+            );
+        }
+        return 0;
+    }
+
+    // Reuse the superset reader so missing fields on older entries parse cleanly.
+    let result = match tirith_core::audit_aggregator::read_log(&log_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "tirith: trust audit: cannot read audit log at {}: {e}",
+                log_path.display(),
+            );
+            return 1;
+        }
+    };
+
+    // Surface malformed-line skips so a corrupted log isn't invisible to an
+    // operator chasing a missing entry. JSON shape includes it in the envelope below.
+    if result.skipped_lines > 0 && !json {
+        eprintln!(
+            "tirith: trust audit: skipped {} malformed audit log line(s) at {}",
+            result.skipped_lines,
+            log_path.display(),
+        );
+    }
+
+    #[derive(Serialize)]
+    struct TrustAuditRow {
+        timestamp: String,
+        action: String,
+        scope: String,
+        pattern: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rule_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ttl_expires: Option<String>,
+    }
+
+    let mut rows: Vec<TrustAuditRow> = Vec::new();
+    for entry in result.records {
+        if entry.entry_type != "trust_change" {
+            continue;
+        }
+        if let Some(cutoff_ts) = cutoff {
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&entry.timestamp) {
+                if ts.to_utc() < cutoff_ts {
+                    continue;
+                }
+            }
+        }
+        rows.push(TrustAuditRow {
+            timestamp: entry.timestamp,
+            action: entry.trust_action.unwrap_or_else(|| "?".to_string()),
+            scope: entry.trust_scope.unwrap_or_else(|| "?".to_string()),
+            pattern: entry.trust_pattern.unwrap_or_default(),
+            rule_id: entry.trust_rule_id,
+            ttl_expires: entry.trust_ttl_expires,
+        });
+    }
+
+    if json {
+        // Skipped-line count lets a JSON consumer detect a corrupted log without parsing stderr.
+        return print_json(&serde_json::json!({
+            "entries": rows,
+            "skipped_lines": result.skipped_lines,
+        }));
+    }
+
+    if rows.is_empty() {
+        eprintln!("tirith: trust audit: no trust-store mutations recorded");
+        return 0;
+    }
+    println!("{:<26} {:<8} {:<6} pattern", "timestamp", "action", "scope");
+    for r in &rows {
+        let rule_suffix = match &r.rule_id {
+            Some(rid) => format!("  [rule: {rid}]"),
+            None => String::new(),
+        };
+        println!(
+            "{:<26} {:<8} {:<6} {}{}",
+            r.timestamp, r.action, r.scope, r.pattern, rule_suffix
+        );
+    }
+    0
+}
+
+/// Parse a relative-duration string (`7d`, `24h`, `15m`) into the UTC
+/// timestamp that the duration is "ago from now".
+fn parse_relative_duration(s: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty duration".into());
+    }
+    let (num_str, unit) = s.split_at(
+        s.find(|c: char| !c.is_ascii_digit())
+            .ok_or_else(|| format!("missing unit suffix (use e.g. '7d', '24h', '15m'): {s}"))?,
+    );
+    let n: i64 = num_str
+        .parse()
+        .map_err(|_| format!("not a number: {num_str:?}"))?;
+    let seconds = match unit {
+        "d" => n.checked_mul(86_400),
+        "h" => n.checked_mul(3_600),
+        "m" => n.checked_mul(60),
+        "s" => Some(n),
+        other => {
+            return Err(format!(
+                "unknown duration unit {other:?} (use 'd', 'h', 'm', or 's')",
+            ))
+        }
+    }
+    .ok_or_else(|| format!("duration overflow: {s}"))?;
+    Ok(chrono::Utc::now() - chrono::Duration::seconds(seconds))
+}
+
 /// `tirith trust diff` — show what changed in the trust set since the previous
 /// recorded snapshot.
 pub fn diff(json: bool) -> i32 {
     let (history, history_read_error) = load_trust_history();
     let current = current_trust_snapshot();
 
-    // The baseline is simply the most recent recorded snapshot. If it equals
-    // the current set the diff is empty; otherwise it shows the delta. Using
-    // the literal last snapshot (not "last that differs") keeps repeated
-    // `trust diff` calls idempotent — once the post-change state is recorded,
-    // a later diff against an unchanged set reports "no changes".
+    // Baseline = the literal last recorded snapshot (not "last that differs"),
+    // which keeps repeated `trust diff` calls idempotent.
     let baseline = history.last();
 
     let report = match baseline {
@@ -1830,5 +2202,419 @@ mod tests {
         let removed: Vec<_> = base.difference(&cur).collect();
         assert_eq!(added, vec![&"C"]);
         assert_eq!(removed, vec![&"A"]);
+    }
+
+    /// Plant a `last_trigger.json` under a temp data dir and run `f` with
+    /// `data_dir()` pointed at it. Holds `ENV_LOCK` (process-global env mutation)
+    /// and restores `XDG_DATA_HOME` / `APPDATA` on Drop. `data_dir()` honors
+    /// `XDG_DATA_HOME` on Unix but `%APPDATA%` on Windows (etcetera), so set both.
+    fn with_seeded_last_trigger<F: FnOnce()>(json: &str, f: F) {
+        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _xdg = EnvGuard::set("XDG_DATA_HOME", dir.path());
+        let _appdata = EnvGuard::set("APPDATA", dir.path());
+
+        let tirith_data = dir.path().join("tirith");
+        fs::create_dir_all(&tirith_data).expect("create data dir");
+        fs::write(tirith_data.join("last_trigger.json"), json).expect("write last_trigger.json");
+
+        f();
+    }
+
+    /// Same env isolation, but plant NO `last_trigger.json` (empty data dir).
+    fn with_empty_data_dir<F: FnOnce()>(f: F) {
+        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _xdg = EnvGuard::set("XDG_DATA_HOME", dir.path());
+        let _appdata = EnvGuard::set("APPDATA", dir.path());
+        f();
+    }
+
+    /// A full-URL evidence target is suggested NARROW: a copy/paste-ready
+    /// `tirith trust add '<url>' --rule <rule_id> --ttl 30d` line (URL
+    /// single-quoted) with NO `--broad`.
+    #[test]
+    fn from_last_trigger_suggests_narrow_url_without_broad() {
+        let json = r#"{
+            "rule_ids": ["shortened_url"],
+            "severity": "high",
+            "command_redacted": "curl https://example.com/install.sh | sh",
+            "timestamp": "2026-06-10T00:00:00Z",
+            "findings": [
+                {
+                    "rule_id": "shortened_url",
+                    "title": "Shortened URL",
+                    "evidence": [
+                        { "raw": "https://example.com/install.sh" }
+                    ]
+                }
+            ]
+        }"#;
+
+        with_seeded_last_trigger(json, || {
+            // read_last_trigger prefers the FULL URL as the target and pairs it
+            // with THAT finding's rule_id.
+            let pairs = read_last_trigger().expect("read_last_trigger");
+            assert_eq!(
+                pairs,
+                vec![(
+                    "https://example.com/install.sh".to_string(),
+                    Some("shortened_url".to_string())
+                )]
+            );
+
+            // The suggested line is the narrow, single-quoted, no-`--broad` form.
+            let lines = suggestion_lines(&pairs);
+            let expected =
+                "tirith trust add 'https://example.com/install.sh' --rule shortened_url --ttl 30d";
+            assert!(
+                lines.iter().any(|l| l == expected),
+                "expected narrow single-quoted URL suggestion {expected:?}, got: {lines:?}"
+            );
+            assert!(
+                lines.iter().all(|l| !l.contains("--broad")),
+                "a full-URL target must NOT be suggested with --broad: {lines:?}"
+            );
+
+            // The real entry point runs clean in suggest (print-only) mode.
+            assert_eq!(from_last_trigger(false), 0);
+        });
+    }
+
+    /// A bare-domain target (only `raw_host`, no URL) needs `--broad` because
+    /// `trust add` rejects broad scopes without the opt-in.
+    #[test]
+    fn from_last_trigger_bare_domain_gets_broad() {
+        let json = r#"{
+            "rule_ids": ["homograph"],
+            "findings": [
+                { "rule_id": "homograph", "title": "Homograph", "evidence": [ { "raw_host": "example.com" } ] }
+            ]
+        }"#;
+
+        with_seeded_last_trigger(json, || {
+            let pairs = read_last_trigger().expect("read_last_trigger");
+            assert_eq!(
+                pairs,
+                vec![("example.com".to_string(), Some("homograph".to_string()))]
+            );
+
+            let lines = suggestion_lines(&pairs);
+            let expected = "tirith trust add 'example.com' --broad --rule homograph --ttl 30d";
+            assert!(
+                lines.iter().any(|l| l == expected),
+                "expected single-quoted bare-domain suggestion with --broad {expected:?}, got: {lines:?}"
+            );
+        });
+    }
+
+    /// F2 (P1): a MULTI-finding trigger must pair each target with ITS OWN
+    /// finding's rule_id — never the cartesian product of all targets × all
+    /// top-level `rule_ids`. Here finding A (rule `shortened_url`) fired for
+    /// `https://a.example/x`, finding B (rule `plain_http_to_sink`) for
+    /// `http://b.example/y`. The wrong (old) behavior would suggest trusting A
+    /// under `plain_http_to_sink` and B under `shortened_url`.
+    #[test]
+    fn from_last_trigger_pairs_each_target_with_its_own_rule() {
+        let json = r#"{
+            "rule_ids": ["shortened_url", "plain_http_to_sink"],
+            "findings": [
+                {
+                    "rule_id": "shortened_url",
+                    "title": "Shortened URL",
+                    "evidence": [ { "raw": "https://a.example/x" } ]
+                },
+                {
+                    "rule_id": "plain_http_to_sink",
+                    "title": "Plain HTTP",
+                    "evidence": [ { "raw": "http://b.example/y" } ]
+                }
+            ]
+        }"#;
+
+        with_seeded_last_trigger(json, || {
+            let pairs = read_last_trigger().expect("read_last_trigger");
+            assert_eq!(
+                pairs,
+                vec![
+                    (
+                        "https://a.example/x".to_string(),
+                        Some("shortened_url".to_string())
+                    ),
+                    (
+                        "http://b.example/y".to_string(),
+                        Some("plain_http_to_sink".to_string())
+                    ),
+                ],
+                "each target must keep its own finding's rule_id (no cartesian product)"
+            );
+
+            let lines = suggestion_lines(&pairs);
+            // Exactly the two correct pairings — and NO cross-paired line.
+            assert!(
+                lines.iter().any(|l| l
+                    == "tirith trust add 'https://a.example/x' --rule shortened_url --ttl 30d"),
+                "A must pair with shortened_url: {lines:?}"
+            );
+            assert!(
+                lines.iter().any(|l| l
+                    == "tirith trust add 'http://b.example/y' --rule plain_http_to_sink --ttl 30d"),
+                "B must pair with plain_http_to_sink: {lines:?}"
+            );
+            assert_eq!(
+                lines.len(),
+                2,
+                "exactly two lines, no cartesian product: {lines:?}"
+            );
+            assert!(
+                !lines.iter().any(
+                    |l| l.contains("'https://a.example/x'") && l.contains("plain_http_to_sink")
+                ),
+                "A must NOT be cross-paired with plain_http_to_sink: {lines:?}"
+            );
+            assert!(
+                !lines
+                    .iter()
+                    .any(|l| l.contains("'http://b.example/y'") && l.contains("shortened_url")),
+                "B must NOT be cross-paired with shortened_url: {lines:?}"
+            );
+        });
+    }
+
+    /// `--apply` must fail loud on a PARTIAL apply: if `add()` rejects even one
+    /// entry, the command exits non-zero instead of 0, so a partial result never
+    /// masquerades as a clean success. Here the first finding's target is a valid
+    /// narrow URL (`add()` accepts it -> stored), while the second's `raw_host`
+    /// carries a control byte (0x07 BEL) that `validate_pattern` rejects ->
+    /// `add()` returns 1 for that entry. Both reach the apply loop, so one
+    /// succeeds and one fails: the overall exit must be 1.
+    #[test]
+    fn from_last_trigger_apply_partial_failure_returns_one() {
+        let json = "{\
+            \"rule_ids\": [\"shortened_url\", \"homograph\"],\
+            \"findings\": [\
+                {\
+                    \"rule_id\": \"shortened_url\",\
+                    \"title\": \"Shortened URL\",\
+                    \"evidence\": [ { \"raw\": \"https://good.example/install.sh\" } ]\
+                },\
+                {\
+                    \"rule_id\": \"homograph\",\
+                    \"title\": \"Homograph\",\
+                    \"evidence\": [ { \"raw_host\": \"evil.example\\u0007\" } ]\
+                }\
+            ]\
+        }";
+
+        with_seeded_last_trigger(json, || {
+            // Both targets survive extraction: the good URL and the control-char
+            // host (raw_host is pushed verbatim, no validation at read time).
+            let pairs = read_last_trigger().expect("read_last_trigger");
+            assert_eq!(
+                pairs,
+                vec![
+                    (
+                        "https://good.example/install.sh".to_string(),
+                        Some("shortened_url".to_string())
+                    ),
+                    (
+                        "evil.example\u{0007}".to_string(),
+                        Some("homograph".to_string())
+                    ),
+                ],
+                "both entries must reach the apply loop so one can succeed and one fail"
+            );
+
+            // Suggest (print-only) still exits 0 -- it never calls `add()`.
+            assert_eq!(from_last_trigger(false), 0);
+
+            // --apply: the good URL is stored, the control-char host is rejected
+            // by `validate_pattern` inside `add()`. A partial apply must exit 1.
+            assert_eq!(
+                from_last_trigger(true),
+                1,
+                "a partial apply (one entry rejected by add) must fail loud, not exit 0"
+            );
+        });
+    }
+
+    /// F1 (HIGH): the suggestion line is copy/paste-ready, so a hostile target
+    /// carrying shell metacharacters must be single-quoted; a target that can't
+    /// be safely quoted (newline) must NOT yield a runnable command.
+    #[test]
+    fn from_last_trigger_shell_quotes_hostile_target() {
+        // `extract_host` is applied to a schemeless `raw`; use `raw_host` so the
+        // hostile bytes survive verbatim into the suggested line.
+        let json = r#"{
+            "rule_ids": ["confusable_domain"],
+            "findings": [
+                {
+                    "rule_id": "confusable_domain",
+                    "title": "Confusable",
+                    "evidence": [ { "raw_host": "evil.example/$(touch X)" } ]
+                }
+            ]
+        }"#;
+        with_seeded_last_trigger(json, || {
+            let pairs = read_last_trigger().expect("read_last_trigger");
+            let lines = suggestion_lines(&pairs);
+            let line = lines
+                .iter()
+                .find(|l| l.contains("tirith trust add"))
+                .expect("a suggestion line");
+            assert!(
+                line.contains("'evil.example/$(touch X)'"),
+                "hostile target must be single-quoted so $(touch X) cannot execute: {line}"
+            );
+            assert!(
+                !line.replace("'evil.example/$(touch X)'", "").contains("$("),
+                "no bare $( may survive outside the quoted token: {line}"
+            );
+        });
+
+        // A target with a newline cannot be single-quoted as one token → no
+        // runnable command, just the safe manual-trust note.
+        assert_eq!(
+            format_add_line("evil.example/a\nrm -rf ~", Some("confusable_domain"), true),
+            "# trust this target manually with `tirith trust add` \
+             (it contains characters unsafe to embed in a suggested command)."
+        );
+
+        // Defense-in-depth: ANSI/OSC escape bytes in the target are scrubbed
+        // BEFORE quoting (single-quoting blocks shell execution, but a raw ESC
+        // could still spoof the operator's terminal as the line is printed). The
+        // emitted line must carry no raw ESC (0x1B) byte.
+        let osc = format_add_line(
+            "evil.example/\u{1b}]0;pwned\u{7}\u{1b}[31m",
+            Some("confusable_domain"),
+            true,
+        );
+        assert!(
+            !osc.contains('\u{1b}'),
+            "ESC (0x1B) must be scrubbed before the suggestion is printed: {osc:?}"
+        );
+        // The scrub strips the control bytes but keeps the printable remainder,
+        // so this is still a runnable (single-quoted) trust command.
+        assert!(
+            osc.contains("tirith trust add"),
+            "scrubbed target should still yield a runnable trust line: {osc:?}"
+        );
+    }
+
+    /// `last()`'s rule-scoped ("r") choice must trust a host under ONLY the
+    /// rule(s) that fired for THAT host, never every top-level rule in the
+    /// verdict. `rules_for_host` is the per-host lookup that branch uses; here
+    /// finding A (rule `shortened_url`) fired for `a.example`, finding B (rule
+    /// `plain_http_to_sink`) for `b.example`. The old `last()` would have added
+    /// BOTH rules to BOTH hosts (over-broad). `rules_for_host` must return each
+    /// host's own single rule.
+    #[test]
+    fn rules_for_host_returns_only_that_hosts_rules() {
+        let val: serde_json::Value = serde_json::from_str(
+            r#"{
+            "rule_ids": ["shortened_url", "plain_http_to_sink"],
+            "findings": [
+                {
+                    "rule_id": "shortened_url",
+                    "title": "Shortened URL",
+                    "evidence": [ { "raw": "https://a.example/x" } ]
+                },
+                {
+                    "rule_id": "plain_http_to_sink",
+                    "title": "Plain HTTP",
+                    "evidence": [ { "raw": "http://b.example/y" } ]
+                }
+            ]
+        }"#,
+        )
+        .unwrap();
+
+        // The display loop / prompt key on the bare host (via `extract_host`).
+        assert_eq!(rules_for_host(&val, "a.example"), vec!["shortened_url"]);
+        assert_eq!(
+            rules_for_host(&val, "b.example"),
+            vec!["plain_http_to_sink"]
+        );
+        // A host that did not trigger gets no rules (falls back to global trust).
+        assert!(rules_for_host(&val, "c.example").is_empty());
+    }
+
+    /// When ONE host triggers MULTIPLE rules, the rule-scoped choice must add
+    /// each of that host's own rules (and de-dupe), not collapse to one.
+    #[test]
+    fn rules_for_host_returns_all_own_rules_deduped() {
+        let val: serde_json::Value = serde_json::from_str(
+            r#"{
+            "rule_ids": ["shortened_url", "plain_http_to_sink", "homograph"],
+            "findings": [
+                {
+                    "rule_id": "shortened_url",
+                    "evidence": [ { "raw": "https://a.example/x" }, { "raw_host": "a.example" } ]
+                },
+                {
+                    "rule_id": "plain_http_to_sink",
+                    "evidence": [ { "raw": "http://a.example/y" } ]
+                },
+                {
+                    "rule_id": "homograph",
+                    "evidence": [ { "raw_host": "b.example" } ]
+                }
+            ]
+        }"#,
+        )
+        .unwrap();
+
+        // a.example fired on two distinct rules across its findings; both are
+        // returned, de-duped despite the repeated `raw`/`raw_host` evidence.
+        assert_eq!(
+            rules_for_host(&val, "a.example"),
+            vec!["shortened_url", "plain_http_to_sink"],
+            "a host with multiple rules keeps all of its own rules, deduped"
+        );
+        // b.example's unrelated rule must NOT leak onto a.example.
+        assert_eq!(rules_for_host(&val, "b.example"), vec!["homograph"]);
+    }
+
+    /// A finding with evidence but no `rule_id` yields a host with no rules, so
+    /// the rule-scoped branch falls back to global trust for that host. (Mirrors
+    /// the old "no rule IDs in last trigger" path, now scoped per-host.)
+    #[test]
+    fn rules_for_host_empty_when_finding_has_no_rule_id() {
+        let val: serde_json::Value = serde_json::from_str(
+            r#"{
+            "findings": [
+                { "title": "Mystery", "evidence": [ { "raw_host": "a.example" } ] }
+            ]
+        }"#,
+        )
+        .unwrap();
+        assert!(rules_for_host(&val, "a.example").is_empty());
+    }
+
+    /// A missing/empty trigger is the common "nothing happened yet" case:
+    /// `from_last_trigger` returns 0 (friendly note), not an error.
+    #[test]
+    fn from_last_trigger_missing_returns_zero() {
+        with_empty_data_dir(|| {
+            assert_eq!(from_last_trigger(false), 0);
+            // read_last_trigger surfaces the no-trigger sentinel for callers.
+            assert_eq!(
+                read_last_trigger().unwrap_err(),
+                "no recent trigger found".to_string()
+            );
+        });
+    }
+
+    /// The refactor must keep `last()` behavior identical: with no trigger on
+    /// disk it still returns 1 (its non-interactive, stdin-free path).
+    #[test]
+    fn last_unchanged_without_trigger_returns_one() {
+        with_empty_data_dir(|| {
+            assert_eq!(last(), 1);
+        });
     }
 }

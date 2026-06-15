@@ -17,6 +17,30 @@ if not set -q TIRITH_SESSION_ID
     set -gx TIRITH_SESSION_ID (printf '%x-%x' %self (date +%s))
 end
 
+# M8 ch2 — surface "this shell is on the remote side of an SSH session" to
+# `tirith prompt-status` (planned for M8 ch6) and any other downstream
+# consumer. Set NOW so chunk 6 can read it without a follow-up hook patch.
+# Standard SSH env vars: SSH_CONNECTION, SSH_CLIENT, SSH_TTY.
+if not set -q TIRITH_SSH_REMOTE
+    and begin
+        set -q SSH_CONNECTION
+        or set -q SSH_CLIENT
+        or set -q SSH_TTY
+    end
+    set -gx TIRITH_SSH_REMOTE 1
+end
+
+# M9 ch4 — record a shell-start environment snapshot for `tirith env diff`.
+# Exec a hidden tirith subcommand that reads ITS OWN inherited environment and
+# writes ONLY variable names + an 8-char value-hash prefix (never raw values,
+# never a recoverable hash) to <state-dir>/env_snapshot.json. The child
+# inherits this shell's exported env, so no value crosses an argv boundary or a
+# temp file. Interactive-only and backgrounded so it never blocks the prompt.
+if status is-interactive
+    command tirith env snapshot >/dev/null 2>&1 &
+    disown 2>/dev/null
+end
+
 # Output helper: write to stderr by default.
 # Override via TIRITH_OUTPUT=tty to write to /dev/tty instead.
 function _tirith_output
@@ -114,12 +138,6 @@ if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish
     functions -c fish_clipboard_paste _tirith_original_fish_clipboard_paste
 
     function fish_clipboard_paste
-        # Honor TIRITH=0 bypass: skip paste scanning
-        if test "$TIRITH" = "0"
-            _tirith_original_fish_clipboard_paste
-            return
-        end
-
         set -l content (_tirith_original_fish_clipboard_paste | string collect)
 
         if test -z "$content"
@@ -127,7 +145,7 @@ if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish
         end
 
         set -l tmpfile (mktemp)
-        echo -n "$content" | command tirith paste --shell fish --interactive >$tmpfile 2>&1
+        echo -n "$content" | env _TIRITH_HOOK=1 command tirith paste --shell fish --interactive >$tmpfile 2>&1
         set -l rc $status
         set -l output (string collect < $tmpfile)
         command rm -f $tmpfile
@@ -175,7 +193,7 @@ function _tirith_check_command
     # and command substitution (set -l x (cmd)) can hang in that context.
     set -l outfile (mktemp)
     set -l errfile (mktemp)
-    command tirith check --approval-check --non-interactive --interactive --shell fish -- "$cmd" >$outfile 2>$errfile
+    env _TIRITH_HOOK=1 command tirith check --approval-check --non-interactive --interactive --shell fish -- "$cmd" >$outfile 2>$errfile
     set -l rc $status
     # Read stdout lines: line 1 = approval path, line 2 = warn-ack path (exit code 3 only)
     set -l approval_path ""
@@ -344,3 +362,21 @@ end
 if status is-interactive
     set -g TIRITH_STATUS blocks
 end
+
+# ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────
+# Opt-in output-direction wrapper. Commented out by default in this embedded
+# hook copy; `tirith output wrap on` writes an active copy of the function
+# into the user's shell-profile separately. This block is kept here as the
+# canonical source so a user reading the hook understands the surface area.
+#
+# Scope honesty: this wraps INDIVIDUAL commands invoked via `tirith-out
+# <cmd>`. It does NOT intercept output from anything run outside the wrapper.
+#
+# function tirith-output-guard-wrap
+#     if test (count $argv) -eq 0
+#         echo 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]' >&2
+#         return 2
+#     end
+#     $argv 2>&1 | tirith view --max-bytes 16777216 -
+# end
+# alias tirith-out 'tirith-output-guard-wrap'

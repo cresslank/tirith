@@ -1,7 +1,6 @@
-/// Server-side cloaking detection — Unix only.
-///
-/// Fetches a URL with multiple user-agents and compares responses to detect
-/// content differentiation (serving different content to AI bots vs browsers).
+/// Server-side cloaking detection (Unix only): fetch a URL with multiple
+/// user-agents and compare responses to detect content differentiation (e.g.
+/// serving different content to AI bots vs browsers).
 #[cfg(unix)]
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
@@ -44,10 +43,71 @@ pub struct DiffPair {
     pub diff_text: Option<String>,
 }
 
+/// Why a single user-agent fetch failed.
+///
+/// `Connect` means the host could not be reached at all (DNS resolution or TCP
+/// connect failure, or a connect-phase timeout) — that failure is identical for
+/// every user-agent, so the caller short-circuits the loop. Every other failure
+/// (`Other`) is treated as agent-specific and the caller keeps trying the
+/// remaining user-agents, because a fetch that *reaches* the server but fails
+/// (or returns a different status) for one UA and not another IS the cloaking
+/// signal we are looking for. An HTTP error response is not a `FetchErr` at all:
+/// it is returned as `Ok((status, body))` so status differences stay visible.
+#[cfg(unix)]
+enum FetchErr {
+    /// Host unreachable for everyone (DNS/connect failure or connect timeout).
+    Connect(String),
+    /// Anything else: redirect/SSRF rejection, oversized/unreadable body, etc.
+    Other(String),
+}
+
+#[cfg(unix)]
+impl FetchErr {
+    /// True only for an unambiguous host-unreachable failure. Be conservative:
+    /// anything uncertain returns false so cloaking is never under-tested.
+    fn is_host_unreachable(&self) -> bool {
+        matches!(self, FetchErr::Connect(_))
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            FetchErr::Connect(m) | FetchErr::Other(m) => m,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for FetchErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+/// Classify a `reqwest::Error` from the request/connect phase.
+///
+/// A connect failure means the host is unreachable regardless of user-agent →
+/// `Connect` (short-circuit). reqwest folds DNS resolution failures into the
+/// connect phase, so `is_connect()` covers the "host does not resolve" case too.
+///
+/// A TIMEOUT is deliberately NOT host-unreachable. A reachable but malicious
+/// server can accept the connection and then stall the RESPONSE for one
+/// user-agent past the client timeout (`is_timeout()` true, `is_connect()`
+/// false); short-circuiting there would skip the remaining user-agents and miss
+/// exactly the cloaking the detector exists to catch (Codex Security, PR #139).
+/// So a timeout — like a redirect-policy error or an HTTP-level failure — is
+/// `Other`, and the caller keeps probing the other user-agents.
+#[cfg(unix)]
+fn classify_reqwest_err(e: &reqwest::Error) -> FetchErr {
+    if e.is_connect() {
+        FetchErr::Connect(format!("request failed: {e}"))
+    } else {
+        FetchErr::Other(format!("request failed: {e}"))
+    }
+}
+
 #[cfg(unix)]
 impl CloakingResult {
-    /// Serialize to JSON. When `include_diff_text` is true (Pro tier), diff text
-    /// is included in the output; otherwise it is omitted.
+    /// Serialize to JSON; diff text is included only when `include_diff_text`.
     pub fn to_json(&self, include_diff_text: bool) -> serde_json::Value {
         serde_json::json!({
             "url": self.url,
@@ -111,7 +171,17 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
             }
             Err(e) => {
                 eprintln!("tirith: cloaking: {name} fetch failed: {e}");
+                // A host-unreachable failure (DNS/connect) is identical for every
+                // user-agent, so retrying the rest just burns ~5 more timeouts on
+                // the same dead host. Stop now; the `successful_count == 0` guard
+                // below still yields the honest "all fetches failed" error. Other
+                // failures are agent-specific (e.g. a 403/redirect block to one UA
+                // but not another IS the cloaking signal) so we keep probing.
+                let unreachable = e.is_host_unreachable();
                 responses.push((name.to_string(), 0, String::new()));
+                if unreachable {
+                    break;
+                }
             }
         }
     }
@@ -121,27 +191,23 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
         return Err("all user-agent fetches failed — cannot perform cloaking analysis".to_string());
     }
 
-    // chrome is the baseline (USER_AGENTS[0]); other agents are compared against it.
+    // chrome (USER_AGENTS[0]) is the baseline; others compare against it.
     let baseline_idx = 0;
     let baseline_body = &responses[baseline_idx].2;
 
-    // If the baseline fetch failed we'd otherwise flag every successful agent as cloaked.
+    // The baseline (chrome) is the reference every other user-agent is diffed
+    // against. If it never loaded (its fetch failed, or returned an empty body)
+    // there is nothing to compare to, so the check could not actually run. This
+    // is only reachable when the baseline UA specifically failed while some other
+    // UA succeeded; an all-failed run already returned the `successful_count == 0`
+    // error above. Report it as inconclusive (Err) rather than `cloaking_detected:
+    // false`. Claiming "no cloaking" off an absent baseline is a false negative,
+    // and a cloaking site that serves chrome an empty/blocked page is exactly the
+    // case we must not silently pass.
     if baseline_body.is_empty() {
-        let agent_responses: Vec<AgentResponse> = responses
-            .iter()
-            .map(|(name, status, body)| AgentResponse {
-                agent_name: name.clone(),
-                status_code: *status,
-                content_length: body.len(),
-            })
-            .collect();
-        return Ok(CloakingResult {
-            url: url.to_string(),
-            cloaking_detected: false,
-            findings: Vec::new(),
-            agent_responses,
-            diff_pairs: Vec::new(),
-        });
+        return Err("baseline (chrome) fetch failed or returned an empty body, \
+             cloaking analysis inconclusive (no reference to compare against)"
+            .to_string());
     }
 
     let baseline_normalized = normalize_html(baseline_body);
@@ -224,38 +290,45 @@ fn fetch_with_ua(
     url: &str,
     ua: &str,
     max_body: usize,
-) -> Result<(u16, String), String> {
+) -> Result<(u16, String), FetchErr> {
+    // Only the request/connect phase can yield a host-unreachable error; an HTTP
+    // error response still resolves to `Ok` here and is reported with its status.
+    // Redirect-policy errors (our SSRF re-validation, too-many-redirects) also
+    // surface from `.send()` but classify as `Other`, so they never short-circuit.
     let response = client
         .get(url)
         .header("User-Agent", ua)
         .send()
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(|e| classify_reqwest_err(&e))?;
 
     let status = response.status().as_u16();
 
     if let Some(len) = response.content_length() {
         if len > max_body as u64 {
-            return Err(format!("response too large: {len} bytes"));
+            return Err(FetchErr::Other(format!("response too large: {len} bytes")));
         }
     }
 
-    // Belt-and-braces cap on the actual stream — Content-Length may be missing or lying.
+    // Cap the actual stream too — Content-Length may be missing or lying.
     use std::io::Read as _;
     let mut body_bytes = Vec::with_capacity(max_body.min(1024 * 1024));
     response
         .take((max_body as u64) + 1)
         .read_to_end(&mut body_bytes)
-        .map_err(|e| format!("read body: {e}"))?;
+        .map_err(|e| FetchErr::Other(format!("read body: {e}")))?;
     if body_bytes.len() > max_body {
-        return Err(format!("response too large: {} bytes", body_bytes.len()));
+        return Err(FetchErr::Other(format!(
+            "response too large: {} bytes",
+            body_bytes.len()
+        )));
     }
 
     let body = String::from_utf8_lossy(&body_bytes).into_owned();
     Ok((status, body))
 }
 
-/// Normalize HTML for comparison — strip volatile content that changes
-/// between requests (scripts, styles, CSRF tokens, nonces, timestamps).
+/// Normalize HTML for comparison — strip content that varies between requests
+/// (scripts, styles, CSRF tokens, nonces).
 #[cfg(unix)]
 fn normalize_html(input: &str) -> String {
     use once_cell::sync::Lazy;
@@ -287,8 +360,8 @@ fn word_counts(s: &str) -> std::collections::HashMap<&str, usize> {
     counts
 }
 
-/// Generate a human-readable summary of word-level differences between two texts.
-/// Shows words present in one response but not the other (capped at 500 chars).
+/// Human-readable summary of word-level differences (words in one response but
+/// not the other), capped at 500 chars.
 #[cfg(unix)]
 fn generate_diff_text(baseline: &str, other: &str) -> String {
     let counts_a = word_counts(baseline);
@@ -342,7 +415,7 @@ fn generate_diff_text(baseline: &str, other: &str) -> String {
         }
     }
 
-    // Char-safe truncation — slicing on a byte boundary inside a UTF-8 codepoint panics.
+    // Char-safe truncation (byte-slicing mid-codepoint panics).
     if result.len() > 500 {
         let truncated: String = result.chars().take(497).collect();
         result = format!("{truncated}...");
@@ -350,11 +423,8 @@ fn generate_diff_text(baseline: &str, other: &str) -> String {
     result
 }
 
-/// Simple word-level diff size in characters.
-///
-/// Counts total characters in words that are in one string but not the other.
-/// This is a rough measure — not a proper edit distance, but sufficient for
-/// detecting meaningful content differences vs. cosmetic variations.
+/// Rough word-level diff size in characters (chars in words present in one
+/// string but not the other) — enough to tell content from cosmetic differences.
 #[cfg(unix)]
 fn word_diff_size(a: &str, b: &str) -> usize {
     let counts_a = word_counts(a);
@@ -402,8 +472,8 @@ mod tests {
 
     #[test]
     fn test_normalize_html_strips_nonces() {
-        // Test on a non-script element — the SCRIPT regex would otherwise strip the
-        // whole `<script>` tag before NONCE runs and the assertion would pass vacuously.
+        // Non-script element: the SCRIPT regex would otherwise strip a `<script>`
+        // before NONCE runs, passing vacuously.
         let input = r#"<div nonce="abc123">Content</div><p>More</p>"#;
         let normalized = normalize_html(input);
         assert!(
@@ -443,9 +513,222 @@ mod tests {
 
     #[test]
     fn test_cloaking_rejects_localhost_target_before_fetch() {
+        // Serialize with the empty-baseline test below: that test sets
+        // `TIRITH_ALLOW_PRIVATE_FETCH=1` process-wide, which (if it overlapped)
+        // would relax the very localhost rejection this test asserts.
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match check("http://localhost/") {
             Ok(_) => panic!("expected localhost target to be rejected"),
             Err(err) => assert!(err.contains("localhost")),
+        }
+    }
+
+    /// A real connect refusal (loopback port 1, nothing listening — no external
+    /// network, no DNS) must classify as `Connect` so the caller short-circuits.
+    /// This drives `classify_reqwest_err` with a genuine `reqwest::Error` whose
+    /// `is_connect()` is set, which is exactly the loop's break condition.
+    #[test]
+    fn test_classify_connect_refusal_short_circuits() {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("client");
+        // Port 1 on loopback is reserved and unbound: the kernel refuses the TCP
+        // connect immediately (ECONNREFUSED) without any network egress.
+        let err = client
+            .get("http://127.0.0.1:1/")
+            .send()
+            .expect_err("connection to an unbound loopback port must fail");
+        assert!(
+            err.is_connect(),
+            "expected a connect-phase error, got: {err:?}"
+        );
+
+        let classified = classify_reqwest_err(&err);
+        assert!(
+            classified.is_host_unreachable(),
+            "a connect/DNS failure must short-circuit the user-agent loop"
+        );
+        assert!(matches!(classified, FetchErr::Connect(_)));
+    }
+
+    /// A reachable server that ACCEPTS the connection but stalls the RESPONSE past
+    /// the client timeout produces `is_timeout() == true` / `is_connect() == false`.
+    /// That is NOT host-unreachable: short-circuiting there would skip the remaining
+    /// user-agents and miss exactly the cloaking the detector exists to catch (Codex
+    /// Security, PR #139). Assert it classifies as `Other` so the loop keeps probing.
+    #[test]
+    fn test_response_timeout_does_not_short_circuit() {
+        use std::io::Read as _;
+        use std::net::TcpListener;
+
+        // Loopback listener that ACCEPTS the TCP connect (so this is NOT a connect
+        // failure) but never writes a response, forcing a RESPONSE-phase timeout.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 64];
+                let _ = sock.read(&mut buf);
+                std::thread::sleep(std::time::Duration::from_millis(800));
+            }
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .expect("client");
+        let err = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .expect_err("a stalled response must time out");
+        assert!(
+            err.is_timeout() && !err.is_connect(),
+            "expected a response-phase timeout, not a connect failure, got: {err:?}"
+        );
+
+        let classified = classify_reqwest_err(&err);
+        assert!(
+            !classified.is_host_unreachable(),
+            "a response timeout from a REACHABLE server must NOT short-circuit the \
+             user-agent sweep (cloaking evasion guard)"
+        );
+        assert!(matches!(classified, FetchErr::Other(_)));
+
+        let _ = handle.join();
+    }
+
+    /// The non-connect path must NOT short-circuit, so the loop keeps probing the
+    /// remaining user-agents. We assert the mapping directly: `FetchErr::Other`
+    /// (oversized/unreadable body, redirect/SSRF rejection, etc.) reports
+    /// `is_host_unreachable() == false`.
+    #[test]
+    fn test_other_fetch_error_does_not_short_circuit() {
+        let other = FetchErr::Other("response too large: 999 bytes".to_string());
+        assert!(
+            !other.is_host_unreachable(),
+            "a non-connect failure must NOT short-circuit — cloaking stays fully tested"
+        );
+    }
+
+    /// An HTTP error response is never a `FetchErr`: `fetch_with_ua` returns it as
+    /// `Ok((status, body))`, so a 403-to-one-UA vs 200-to-another stays visible to
+    /// the diff logic and is never mistaken for a host-unreachable short-circuit.
+    /// Guard the contract: only `FetchErr::Connect` is host-unreachable.
+    #[test]
+    fn test_http_status_is_not_a_fetch_error() {
+        // Status differences travel through the Ok branch as a u16, not FetchErr.
+        let ok: Result<(u16, String), FetchErr> = Ok((403, "Forbidden".to_string()));
+        assert!(matches!(ok, Ok((403, _))));
+
+        // And of the two error variants, only Connect is treated as unreachable.
+        assert!(FetchErr::Connect(String::new()).is_host_unreachable());
+        assert!(!FetchErr::Other(String::new()).is_host_unreachable());
+    }
+
+    /// Snapshot an env var and restore it on `Drop`.
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    /// When the BASELINE (chrome, USER_AGENTS[0]) returns an empty body but other
+    /// user-agents succeed, there is no reference to diff against and the check
+    /// could not actually run. It MUST come back inconclusive (`Err`), never
+    /// `Ok { cloaking_detected: false }`. Claiming "no cloaking" off an absent
+    /// baseline is the false negative this guards. A cloaking site that serves
+    /// chrome an empty/blocked page while serving bots real content is exactly
+    /// this case, so a silent "no cloaking" would be the worst possible answer.
+    ///
+    /// Driven end-to-end against a loopback server that returns an empty 200 to
+    /// the chrome UA and real content to everyone else. `successful_count` is
+    /// therefore > 0 (chrome's empty 200 still counts as a successful fetch), so
+    /// the `successful_count == 0` guard does NOT fire and execution reaches the
+    /// empty-baseline branch under test.
+    #[test]
+    fn test_empty_baseline_is_inconclusive_not_no_cloaking() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        // Loopback fetches are SSRF-blocked by default; the carve-out opt-in is
+        // process-wide, so serialize with other env-sensitive cloaking tests.
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _allow_private = EnvVarGuard::set("TIRITH_ALLOW_PRIVATE_FETCH", "1");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+
+        // Serve one connection per user-agent. Chrome (the baseline) gets an empty
+        // 200; every other UA gets a non-empty body. `Connection: close` keeps each
+        // request on its own connection so the accept loop stays deterministic.
+        let n_agents = USER_AGENTS.len();
+        let server = std::thread::spawn(move || {
+            for _ in 0..n_agents {
+                let (mut sock, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                // Read the request head; the User-Agent line tells us who is asking.
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let is_chrome = req
+                    .lines()
+                    .filter_map(|l| l.split_once(':'))
+                    .any(|(k, v)| k.eq_ignore_ascii_case("user-agent") && v.contains("Chrome/"));
+
+                let body = if is_chrome {
+                    String::new()
+                } else {
+                    "<html><body>Real content served to this agent.</body></html>".to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+
+        let result = check(&format!("http://{addr}/"));
+        let _ = server.join();
+
+        // The contract: an empty baseline is inconclusive (Err), NOT a successful
+        // `cloaking_detected: false`. Before the fix this returned exactly that
+        // false-negative Ok value.
+        match result {
+            Ok(r) => panic!(
+                "empty baseline must be inconclusive (Err), got Ok with \
+                 cloaking_detected={}",
+                r.cloaking_detected
+            ),
+            Err(msg) => assert!(
+                msg.contains("baseline") && msg.contains("inconclusive"),
+                "error should name the empty baseline as inconclusive, got: {msg}"
+            ),
         }
     }
 }

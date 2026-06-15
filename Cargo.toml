@@ -3,13 +3,13 @@ members = ["crates/tirith-core", "crates/tirith", "tools/sign-license", "tools/l
 resolver = "2"
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license = "AGPL-3.0-only"
 rust-version = "1.83"
 
 [workspace.dependencies]
-tirith-core = { version = "0.3.1", path = "crates/tirith-core" }
+tirith-core = { version = "0.3.2", path = "crates/tirith-core" }
 clap = { version = "4", features = ["derive"] }
 url = "2"
 regex = "1"
@@ -46,6 +46,18 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "signal", "macros"]
 lopdf = "0.34"
 owo-colors = "4"
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+# arboard 3.x — cross-platform clipboard (X11/Wayland/macOS NSPasteboard/Windows).
+# Used by `tirith clipboard {copy,scan,daemon}` (M7 ch3). Returns
+# `Err` gracefully on headless Linux (no X/Wayland), which the CLI maps
+# to a "no clipboard backend" envelope rather than a panic.
+arboard = { version = "3", default-features = false }
+# tiny_http 0.12 — a SYNCHRONOUS (blocking, thread-per-accept) HTTP/1.1 server.
+# Used ONLY by the CLI `tirith dashboard serve` loopback path (M13 ch3); not by
+# tirith-core. Chosen because it needs no async runtime — the serve loop is a
+# plain blocking accept loop, which keeps the dependency surface tiny
+# (ascii / chunked_transfer / httpdate, all MSRV-clean). It is never bound to
+# anything but 127.0.0.1.
+tiny_http = "0.12"
 
 [profile.release]
 lto = "thin"

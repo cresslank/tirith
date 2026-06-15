@@ -6,11 +6,11 @@ use std::time::Duration;
 pub enum PolicyFetchError {
     /// Network-level error (DNS, connection refused, timeout, etc.).
     NetworkError(String),
-    /// Authentication failure (401/403). Always treated as fatal.
+    /// Authentication failure (401/403); always fatal.
     AuthError(u16),
     /// Server returned an error status code.
     ServerError(String),
-    /// Response body could not be read or is not valid YAML.
+    /// Response body unreadable or not valid YAML.
     InvalidResponse(String),
 }
 
@@ -25,19 +25,21 @@ impl fmt::Display for PolicyFetchError {
     }
 }
 
-/// Fetch remote policy YAML from the policy server.
-///
-/// Uses 5s connect timeout and 10s total timeout. The server endpoint
-/// is `{url}/api/policy/fetch` and requires Bearer token authentication.
+/// Fetch remote policy YAML from `{url}/api/policy/fetch` (Bearer auth, 5s
+/// connect / 10s total timeout).
 pub fn fetch_remote_policy(url: &str, api_key: &str) -> Result<String, PolicyFetchError> {
-    // SSRF protection: validate the URL before connecting
+    // SSRF protection: validate the URL before connecting.
     if let Err(reason) = crate::url_validate::validate_server_url(url) {
         return Err(PolicyFetchError::NetworkError(reason));
     }
 
     let client = reqwest::blocking::Client::builder()
+        .dns_resolver(crate::ssrf_guard::ssrf_guard_resolver())
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
+        // F7: re-validate every redirect target and cap the hop count; the
+        // implicit default would silently follow up to 10 hops into anywhere.
+        .redirect(crate::ssrf_guard::server_redirect_policy())
         .build()
         .map_err(|e| PolicyFetchError::NetworkError(e.to_string()))?;
 

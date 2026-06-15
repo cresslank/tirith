@@ -45,15 +45,18 @@ pub struct InitializeParams {
     pub protocol_version: String,
     #[allow(dead_code)]
     pub capabilities: Value,
-    #[allow(dead_code)]
+    /// MCP `initialize.clientInfo`, read by the dispatcher to populate
+    /// [`AgentOrigin::Mcp`](crate::agent_origin::AgentOrigin::Mcp).
     pub client_info: Option<ClientInfo>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ClientInfo {
-    #[allow(dead_code)]
+    /// Caller-claimed client name (`"Claude Code"`, `"cursor"`, …). Not
+    /// verified; sanitized before it lands in
+    /// [`AgentOrigin::Mcp`](crate::agent_origin::AgentOrigin::Mcp).
     pub name: String,
-    #[allow(dead_code)]
+    /// Caller-claimed client version. Optional and sanitized.
     pub version: Option<String>,
 }
 
@@ -98,17 +101,19 @@ pub struct ToolCallParams {
     pub arguments: Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallResult {
     pub content: Vec<ContentItem>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    // M7 ch4: deserialized for the output-filter path; default false so an
+    // upstream that omits `isError` reads as "no error".
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub is_error: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub structured_content: Option<Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ContentItem {
     #[serde(rename = "type")]
     pub content_type: String,
@@ -149,8 +154,7 @@ pub fn negotiate_version(requested: &str) -> String {
     if SUPPORTED_VERSIONS.contains(&requested) {
         requested.to_string()
     } else {
-        // Unknown version from client — respond with our preferred version and
-        // let the client decide whether to continue.
+        // Unknown version — respond with our preferred and let the client decide.
         SUPPORTED_VERSIONS[0].to_string()
     }
 }
