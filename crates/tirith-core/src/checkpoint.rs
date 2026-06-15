@@ -117,6 +117,38 @@ pub fn checkpoints_dir() -> PathBuf {
     }
 }
 
+/// Persist a checkpoint metadata/manifest file crash-atomically: write to a temp
+/// file in the SAME directory, fsync it, atomically rename into place, then fsync
+/// the parent dir (best-effort, no-op on non-unix). Mirrors `pending.rs::save_map`
+/// and `write_file_atomic` so a crash mid-write can never leave a torn `meta.json`
+/// / `manifest.json` (which would strand the backup blobs). The temp file is
+/// created 0600 on unix to match the rest of the state store.
+fn write_checkpoint_file_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let mut tmp = match dir {
+        Some(d) => tempfile::NamedTempFile::new_in(d)?,
+        None => tempfile::NamedTempFile::new()?,
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tmp
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    tmp.write_all(contents)?;
+    // fsync the temp file's bytes BEFORE the rename so the published name can never
+    // point at a partially written file after a crash.
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    // fsync the parent dir so the new name -> inode entry from the rename is durable.
+    // The publish already succeeded, so a dir-fsync failure is LOGGED, not
+    // propagated (matches `write_file_atomic`); no-op on non-unix.
+    crate::util::fsync_parent_dir_logged(path, "checkpoint file write");
+    Ok(())
+}
+
 /// Create a checkpoint of the given paths.
 pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<CheckpointMeta, String> {
     require_pro()?;
@@ -191,12 +223,21 @@ pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<Checkpoin
         }),
     };
 
+    // meta.json and manifest.json are the ONLY durable record mapping the backup
+    // blobs in `files/` to their original paths. A torn/partial `fs::write` from a
+    // crash mid-write is unrecoverable: the blobs survive but the mapping is gone
+    // (a blank/truncated manifest fails the restore parse, stranding the data;
+    // a truncated meta drops `capture_root`, making every relative entry
+    // non-anchorable). Write each crash-atomically (temp -> fsync -> rename, parent
+    // dir fsync best-effort) the same way `pending.rs` persists its store, so a
+    // crash leaves either the old absence or the complete new file, never a torn one.
     let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| format!("serialize: {e}"))?;
-    fs::write(cp_dir.join("meta.json"), meta_json).map_err(|e| format!("write meta: {e}"))?;
+    write_checkpoint_file_atomic(&cp_dir.join("meta.json"), meta_json.as_bytes())
+        .map_err(|e| format!("write meta: {e}"))?;
 
     let manifest_json =
         serde_json::to_string_pretty(&manifest).map_err(|e| format!("serialize: {e}"))?;
-    fs::write(cp_dir.join("manifest.json"), manifest_json)
+    write_checkpoint_file_atomic(&cp_dir.join("manifest.json"), manifest_json.as_bytes())
         .map_err(|e| format!("write manifest: {e}"))?;
 
     Ok(meta)
@@ -2358,6 +2399,123 @@ mod tests {
             fs::read_to_string(&dst_full).unwrap(),
             "verified bytes",
             "after rewind, the copy writes the same bytes that were hashed"
+        );
+    }
+
+    #[test]
+    fn write_checkpoint_file_atomic_publishes_whole_file_and_leaves_no_temp() {
+        // The crash-atomic write must publish the COMPLETE bytes under the target
+        // name and leave NO temp sibling behind (proving it used temp+rename, not
+        // an in-place `fs::write` that a crash mid-write could truncate). It must
+        // also fully replace any pre-existing content rather than appending.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let target = tmpdir.path().join("manifest.json");
+
+        // A pre-existing (e.g. previous/partial) file must be fully replaced.
+        fs::write(
+            &target,
+            "STALE PARTIAL CONTENT that must be replaced wholesale",
+        )
+        .unwrap();
+
+        let payload = br#"[{"original_path":"a.txt","sha256":"00","size":1,"is_dir":false}]"#;
+        write_checkpoint_file_atomic(&target, payload).expect("atomic write must succeed");
+
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            payload,
+            "the target must hold exactly the new bytes (no truncation, no append)"
+        );
+
+        // The directory must contain ONLY the target file. A NamedTempFile that
+        // was renamed into place leaves nothing behind, so a leftover `.tmp` would
+        // mean the publish was not a clean rename.
+        let leftovers: Vec<String> = fs::read_dir(tmpdir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "manifest.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp file must remain after an atomic publish, found: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn create_writes_complete_parseable_meta_and_manifest() {
+        // Regression: `create()` previously wrote meta.json / manifest.json with a
+        // plain `fs::write`, so a crash mid-write could strand the backup blobs
+        // behind a torn manifest (unparseable -> restore fails) or a torn meta
+        // (missing `capture_root` -> relative entries non-anchorable). With the
+        // crash-atomic write, the published files are always whole: assert both
+        // parse, the manifest covers every captured file, meta carries a
+        // `capture_root`, and the checkpoint dir has no stray temp siblings.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let workdir = tmpdir.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let state_dir = tmpdir.path().join("state");
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_cwd = std::env::current_dir().ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+
+        let run = || -> Result<(CheckpointMeta, PathBuf), String> {
+            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
+            fs::write("a.txt", "alpha").map_err(|e| format!("write a: {e}"))?;
+            fs::write("b.txt", "bravo").map_err(|e| format!("write b: {e}"))?;
+            let meta = create(&["a.txt", "b.txt"], Some("rm -rf project"))?;
+            let cp_dir = checkpoints_dir().join(&meta.id);
+            Ok((meta, cp_dir))
+        };
+        let result = run();
+
+        if let Some(dir) = prev_cwd {
+            let _ = std::env::set_current_dir(dir);
+        }
+        match prev_state {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
+
+        let (meta, cp_dir) = result.expect("create should succeed");
+
+        // meta.json parses fully and carries a capture_root (needed to anchor any
+        // relative restore entry).
+        let meta_str = fs::read_to_string(cp_dir.join("meta.json")).expect("meta.json readable");
+        let parsed_meta: CheckpointMeta =
+            serde_json::from_str(&meta_str).expect("meta.json must parse (not torn)");
+        assert_eq!(parsed_meta.id, meta.id);
+        assert!(
+            parsed_meta.capture_root.is_some(),
+            "meta.json must carry a capture_root so relative entries stay anchorable"
+        );
+
+        // manifest.json parses fully and covers both captured files.
+        let manifest_str =
+            fs::read_to_string(cp_dir.join("manifest.json")).expect("manifest.json readable");
+        let manifest: Vec<ManifestEntry> =
+            serde_json::from_str(&manifest_str).expect("manifest.json must parse (not torn)");
+        assert_eq!(
+            manifest.len(),
+            2,
+            "the manifest must record every captured file: {manifest:?}"
+        );
+
+        // No stray temp file from the atomic writes remains in the checkpoint dir.
+        let stray: Vec<String> = fs::read_dir(&cp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "meta.json" && n != "manifest.json" && n != "files")
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "no temp file must remain after atomic meta/manifest writes, found: {stray:?}"
         );
     }
 }
