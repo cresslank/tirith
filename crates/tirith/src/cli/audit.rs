@@ -212,7 +212,33 @@ pub fn verify(expected_head: Option<&str>, json: bool) -> i32 {
         }
         return 2;
     };
-    if !path.exists() {
+    // `try_exists()` (not `exists()`) so a log we CANNOT stat (permission denied,
+    // etc.) is not silently collapsed into "missing" and reported as a vacuous
+    // success. Fail closed on the metadata error: emit the JSON/text error shape
+    // and return non-zero rather than exit 0.
+    let log_exists = match path.try_exists() {
+        Ok(exists) => exists,
+        Err(e) => {
+            if json {
+                let obj = serde_json::json!({
+                    "ok": false,
+                    "total_lines": 0,
+                    "problems": [format!(
+                        "could not access audit log at {}: {e}",
+                        path.display()
+                    )],
+                });
+                println!("{obj}");
+            } else {
+                eprintln!(
+                    "tirith audit verify: FAILED: could not access audit log at {}: {e}",
+                    path.display()
+                );
+            }
+            return 1;
+        }
+    };
+    if !log_exists {
         // When the caller anchors verification with --expected-head, a missing
         // log is a FAILURE, not a vacuous pass: the operator asserted a specific
         // tail hash that an absent log cannot satisfy. Reporting success here
@@ -387,13 +413,11 @@ pub fn report(format: &str, since: Option<&str>, entry_type: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
-    // Local env lock: `tirith_core::TEST_ENV_LOCK` is pub(crate) and unreachable
-    // here, so this module serializes its own env mutation. (tirith bin tests run
-    // as a separate process from tirith-core lib tests, so the two locks need not
-    // coordinate.)
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Use the CRATE-WIDE env lock + RAII guard from the test harness so this test
+    // serializes against the other env-mutating bin tests (trust.rs, dashboard.rs,
+    // doctor.rs) that also touch HOME/XDG_DATA_HOME. A module-local lock would let
+    // those race this test on the same process-global env vars.
+    use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
 
     /// F8: `tirith audit verify --expected-head <hash>` must FAIL (non-zero) when
     /// the log is missing — an asserted tail hash cannot be satisfied by an absent
@@ -408,31 +432,14 @@ mod tests {
         let empty = tmp.path().join("empty_home");
         std::fs::create_dir_all(&empty).unwrap();
 
-        let prev_home = std::env::var("HOME").ok();
-        let prev_xdg_data = std::env::var("XDG_DATA_HOME").ok();
         // Point BOTH the XDG data dir (Linux) and HOME (macOS, via etcetera's
         // Apple strategy) at a fresh empty dir, so `audit_log_path()` resolves to a
-        // file that does not exist on either platform.
-        // SAFETY: serialized via ENV_LOCK above.
-        unsafe {
-            std::env::set_var("HOME", &empty);
-            std::env::set_var("XDG_DATA_HOME", &empty);
-        }
+        // file that does not exist on either platform. EnvGuard restores on Drop.
+        let _home = EnvGuard::set("HOME", &empty);
+        let _xdg = EnvGuard::set("XDG_DATA_HOME", &empty);
 
         let with_anchor = super::verify(Some("deadbeefcafe"), true);
         let without_anchor = super::verify(None, true);
-
-        // SAFETY: serialized via ENV_LOCK; restore regardless of outcome.
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match prev_xdg_data {
-                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                None => std::env::remove_var("XDG_DATA_HOME"),
-            }
-        }
 
         assert_eq!(
             with_anchor, 1,

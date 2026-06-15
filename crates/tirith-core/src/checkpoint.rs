@@ -231,14 +231,20 @@ pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<Checkpoin
     // non-anchorable). Write each crash-atomically (temp -> fsync -> rename, parent
     // dir fsync best-effort) the same way `pending.rs` persists its store, so a
     // crash leaves either the old absence or the complete new file, never a torn one.
-    let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| format!("serialize: {e}"))?;
-    write_checkpoint_file_atomic(&cp_dir.join("meta.json"), meta_json.as_bytes())
-        .map_err(|e| format!("write meta: {e}"))?;
-
+    //
+    // ORDER MATTERS: `list()` keys off `meta.json` as the checkpoint marker, so
+    // `meta.json` must be published LAST. Writing the manifest first means a crash
+    // (or a manifest write error) before `meta.json` exists leaves the checkpoint
+    // INVISIBLE to `list()`/restore rather than listed-but-unrestorable (manifest
+    // missing). So write `manifest.json` first, then publish `meta.json`.
     let manifest_json =
         serde_json::to_string_pretty(&manifest).map_err(|e| format!("serialize: {e}"))?;
     write_checkpoint_file_atomic(&cp_dir.join("manifest.json"), manifest_json.as_bytes())
         .map_err(|e| format!("write manifest: {e}"))?;
+
+    let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| format!("serialize: {e}"))?;
+    write_checkpoint_file_atomic(&cp_dir.join("meta.json"), meta_json.as_bytes())
+        .map_err(|e| format!("write meta: {e}"))?;
 
     Ok(meta)
 }
@@ -664,27 +670,38 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
             }
         }
 
-        // F5 (TOCTOU): the symlink pre-check above ran BEFORE `create_dir_all`, so
-        // an attacker could have repointed `dst` (or swapped in a symlink) in the
-        // window between. Re-validate the parent chain immediately before the
-        // write, AND perform the write through a no-follow open on unix so a
-        // symlink planted at the final component is refused atomically by the open
-        // itself (`fs::copy` would instead follow it and write through). The
-        // pre-check still runs for an early, cheap rejection and to cover non-unix.
-        if let Err(e) = reject_symlinked_restore_dest(dst) {
-            report.errors.push((entry.original_path.clone(), e));
-            continue;
-        }
         // Rewind the blob handle to the start and copy from THIS verified handle
         // (not a fresh open by path), so the bytes written are exactly the bytes
         // just hashed (CodeRabbit C4 TOCTOU). A seek failure means we cannot
         // guarantee that, so bucket it as an error rather than risk an unverified
-        // or partial write.
+        // or partial write. Do the rewind FIRST so the final symlink re-check below
+        // sits immediately before the copy, minimizing the parent-swap window.
         if let Err(e) = blob.seek(SeekFrom::Start(0)) {
             report.errors.push((
                 entry.original_path.clone(),
                 format!("cannot rewind verified backup: {e}"),
             ));
+            continue;
+        }
+        // F5 (TOCTOU): the symlink pre-check above ran BEFORE `create_dir_all`, so
+        // an attacker could have repointed `dst` (or swapped in a symlink) in the
+        // window between. Re-validate the parent chain immediately before the write
+        // (this is the LAST statement before the copy, so the window is just the
+        // syscalls inside `copy_no_follow_from_reader`'s open), AND perform the
+        // write through a no-follow open on unix so a symlink planted at the FINAL
+        // component is refused atomically by the open itself (`fs::copy` would
+        // instead follow it and write through). The first pre-check still runs for
+        // an early, cheap rejection and to cover non-unix.
+        //
+        // RESIDUAL: `O_NOFOLLOW` only protects the leaf, and this re-check resolves
+        // PARENT components by path, so a sufficiently fast attacker who swaps an
+        // intermediate parent dir for a symlink in the (now minimal) window between
+        // this check and the open could still redirect the write. Fully closing it
+        // needs an `openat`-with-pinned-dir-fds traversal of the whole path, which
+        // is a larger, platform-specific change deferred here; this bounded
+        // re-validation shrinks the window to the smallest practical size.
+        if let Err(e) = reject_symlinked_restore_dest(dst) {
+            report.errors.push((entry.original_path.clone(), e));
             continue;
         }
         match copy_no_follow_from_reader(&mut blob, dst) {
@@ -1640,6 +1657,12 @@ mod tests {
         // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
         unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
 
+        // A tempdir-scoped absolute target the manifest would restore to if the
+        // symlink guard regressed. Scoping it under `tmpdir` (instead of a fixed
+        // `/tmp/...` path) avoids both shared-runner collisions and touching a
+        // global path. Computed outside the closure so the assertion below sees it.
+        let evil_target = tmpdir.path().join("should-not-be-written");
+
         let outcome = std::panic::catch_unwind(|| {
             let store = checkpoints_dir();
             fs::create_dir_all(&store).expect("create store");
@@ -1649,7 +1672,7 @@ mod tests {
             let evil = tmpdir.path().join("evil-checkpoint");
             fs::create_dir_all(evil.join("files")).expect("create evil dir");
             let evil_manifest = serde_json::to_string(&vec![ManifestEntry {
-                original_path: "/tmp/should-not-be-written".to_string(),
+                original_path: evil_target.to_string_lossy().into_owned(),
                 sha256: empty_sha256(),
                 size: 0,
                 is_dir: false,
@@ -1680,7 +1703,7 @@ mod tests {
             );
             // The guarded restore must NOT have written the evil target.
             assert!(
-                !Path::new("/tmp/should-not-be-written").exists(),
+                !evil_target.exists(),
                 "restore must not write through the symlinked checkpoint dir"
             );
         });

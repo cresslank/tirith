@@ -603,6 +603,24 @@ where
         }
     }
 
+    // Refuse to follow a symlink at the LOCK file too (Unix), matching the session
+    // file's guard above. A symlinked lock path could redirect lock IDENTITY to an
+    // attacker-chosen inode, so two writers lock different files and the
+    // serialization guarantee for the read/modify/write below is lost.
+    #[cfg(unix)]
+    {
+        match std::fs::symlink_metadata(&lock_path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                crate::audit::audit_diagnostic(format!(
+                    "tirith: session: refusing to follow symlink at lock {}",
+                    lock_path.display()
+                ));
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // Open (creating if needed) and exclusively lock the DEDICATED lock file. The
     // lock (not the data file) serializes the whole read/modify/write so the
     // atomic rename below stays correct.
@@ -612,6 +630,10 @@ where
     {
         use std::os::unix::fs::OpenOptionsExt;
         lock_opts.mode(0o600);
+        // No-follow on the final component closes the pre-check -> open TOCTOU: a
+        // symlink planted at `lock_path` between the check above and this open is
+        // refused atomically by the open itself (ELOOP).
+        lock_opts.custom_flags(libc::O_NOFOLLOW);
     }
     let lock_file = match lock_opts.open(&lock_path) {
         Ok(f) => f,
@@ -1251,6 +1273,77 @@ mod tests {
                     && parsed2.cooldowns.contains_key("dotfile_overwrite"),
                 "the second mutation must apply without dropping the first: {:?}",
                 parsed2.cooldowns
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("TIRITH_LOG", v),
+                None => std::env::remove_var("TIRITH_LOG"),
+            }
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// Security: a SYMLINK planted at the session LOCK path must be refused, so
+    /// lock identity cannot be redirected to an attacker-chosen inode (which would
+    /// break the serialization guarantee for concurrent writers). The guarded
+    /// `with_session_locked` must skip the mutation entirely: it neither writes
+    /// through the symlink nor persists the session data file.
+    #[cfg(unix)]
+    #[test]
+    fn with_session_locked_refuses_symlinked_lock() {
+        use crate::event_buffer::{EventKind, TypedEvent};
+
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_log = std::env::var("TIRITH_LOG").ok();
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let sid = "symlinked-lock-session";
+            let path = session_state_path(sid).expect("session path");
+            let lock_path = session_lock_path(sid).expect("lock path");
+            let sessions_dir = path.parent().expect("sessions dir").to_path_buf();
+            std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+            // A sentinel OUTSIDE the sessions dir; the lock symlink targets it, so a
+            // followed open would create/clobber it instead of the real lock inode.
+            let outside = dir.path().join("outside-lock-target");
+            std::os::unix::fs::symlink(&outside, &lock_path).expect("plant lock symlink");
+
+            // Drive a locked mutation. The symlinked lock must be refused, so the
+            // mutation is skipped: no session data file is written.
+            record_typed_event(
+                sid,
+                TypedEvent::new(
+                    &chrono::Utc::now().to_rfc3339(),
+                    EventKind::Network,
+                    "network_egress",
+                ),
+            );
+
+            assert!(
+                !path.exists(),
+                "a refused symlinked lock must skip the mutation: session file must not be written"
+            );
+            assert!(
+                !outside.exists(),
+                "the lock open must not have been followed through the symlink to the sentinel"
             );
         });
 

@@ -280,14 +280,22 @@ pub fn register(mut decision: PendingDecision) -> Result<String, String> {
                 id = generate_id();
             }
             decision.id = id;
-        } else if map.contains_key(decision.id.trim()) {
-            // An explicit id that already exists must NOT overwrite the stored
-            // entry (that would silently drop its resolution history). Fail closed.
-            // No insert happened, so the map was NOT mutated and must not be saved.
-            return (
-                Err(format!("pending id already exists: {}", decision.id.trim())),
-                false,
-            );
+        } else {
+            // Normalize the explicit id ONCE (trim surrounding whitespace) and use
+            // the normalized value for BOTH the duplicate check and the stored key.
+            // Otherwise `"fixed001 "` (inserted untrimmed) and a later `"fixed001"`
+            // become two distinct entries the CLI cannot disambiguate.
+            decision.id = decision.id.trim().to_string();
+            if map.contains_key(&decision.id) {
+                // An explicit id that already exists must NOT overwrite the stored
+                // entry (that would silently drop its resolution history). Fail
+                // closed: no insert happened, so the map was NOT mutated and must
+                // not be saved.
+                return (
+                    Err(format!("pending id already exists: {}", decision.id)),
+                    false,
+                );
+            }
         }
         if decision.created_at.trim().is_empty() {
             decision.created_at = now_rfc3339();
@@ -761,5 +769,41 @@ mod tests {
             stored.command_redacted, "curl https://example.com | sh",
             "the original command must NOT be overwritten"
         );
+    }
+
+    #[test]
+    fn register_explicit_id_is_whitespace_normalized() {
+        // An explicit id is trimmed ONCE and the trimmed value is used for both the
+        // stored key and the dup-check, so `"fixed001 "` and `"fixed001"` are the
+        // SAME entry: the second register collides (fails closed) instead of
+        // inserting an ambiguous duplicate.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _xdg = XdgStateGuard::set(tmp.path());
+
+        // Register with surrounding whitespace; the stored id must be trimmed.
+        let mut first = sample(PendingSource::Restore, "high");
+        first.id = "fixed001 ".to_string();
+        assert_eq!(
+            register(first).unwrap(),
+            "fixed001",
+            "the returned (and stored) id must be trimmed"
+        );
+
+        // The trimmed form must register as a DUPLICATE, not a new entry.
+        let mut clash = sample(PendingSource::Finding, "low");
+        clash.id = "fixed001".to_string();
+        assert!(
+            register(clash).is_err(),
+            "the trimmed form must collide with the whitespace-padded one"
+        );
+
+        // Exactly one entry exists, keyed by the trimmed id.
+        let all = load_all().unwrap();
+        assert_eq!(all.len(), 1, "the two ids must resolve to a single entry");
+        assert_eq!(all[0].id, "fixed001");
     }
 }

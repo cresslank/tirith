@@ -910,7 +910,14 @@ fn is_agent_memory_file(path: &Path, repo_root: Option<&Path>) -> bool {
 /// Normalize `path` to lowercased forward components (repo-root-stripped when
 /// absolute and the root is known), so a repo-relative and an absolute path map to
 /// the same component list. Returns `None` when the path is empty, escapes via
-/// `..`, carries a drive `Prefix`, or has a non-UTF-8 component (fail closed).
+/// `..`, or carries a drive `Prefix`. A non-UTF-8 component is rendered LOSSILY
+/// (U+FFFD) rather than aborting the whole classification: otherwise a known
+/// `agent-memory.json` / `.hermes/*.json` whose PARENT happens to be non-UTF-8
+/// would lose its memory classification and fall through to the ASCII-only rule
+/// elsewhere (a false positive on legitimate non-ASCII memory content). The lossy
+/// rendering only affects the non-UTF-8 component itself; a non-UTF-8 BASENAME or
+/// root-anchor component still cannot equal an exact ASCII memory name, so it does
+/// not widen the matched set.
 fn normalized_lower_components(path: &Path, repo_root: Option<&Path>) -> Option<Vec<String>> {
     // ROOT-ANCHORED dir matches (`.hermes`, `.claude/memory`) need the memory dir
     // as the LEADING component(s). An absolute path carries the repo's own folders
@@ -928,7 +935,10 @@ fn normalized_lower_components(path: &Path, repo_root: Option<&Path>) -> Option<
         match c {
             Component::CurDir | Component::RootDir => continue,
             Component::Prefix(_) | Component::ParentDir => return None,
-            Component::Normal(os) => components.push(os.to_str()?.to_ascii_lowercase()),
+            // Lossy (not `to_str()?`) so a non-UTF-8 PARENT cannot strip a known
+            // memory file's classification; see the fn doc for why this stays
+            // fail-closed toward the memory exemption.
+            Component::Normal(os) => components.push(os.to_string_lossy().to_ascii_lowercase()),
         }
     }
     if components.is_empty() {
@@ -2387,6 +2397,40 @@ mod tests {
             Path::new("/home/me/repo/.hermes/blob.bin"),
             Some(root)
         ));
+    }
+
+    // A known memory BASENAME under a NON-UTF-8 PARENT directory must still be
+    // classified as memory (and as free-form JSON), so its legitimate non-ASCII
+    // content keeps the ASCII-only-rule exemption. A `to_str()?` on the parent
+    // would abort the whole classification and let it fall through to the ASCII
+    // rule (a false positive); the lossy rendering keeps it fail-closed here.
+    #[cfg(unix)]
+    #[test]
+    fn test_memory_file_under_non_utf8_parent_still_classified() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::PathBuf;
+
+        // `<non-utf8>/agent-memory.json`: an invalid UTF-8 byte (0x80) names the
+        // parent dir, the basename is a known free-form memory file.
+        let mut p = PathBuf::from(OsStr::from_bytes(b"\x80bad"));
+        p.push("agent-memory.json");
+        assert!(
+            is_agent_memory_file(&p, None),
+            "agent-memory.json under a non-UTF-8 parent must classify as memory"
+        );
+        assert!(
+            is_freeform_memory_json(&p, None),
+            "agent-memory.json under a non-UTF-8 parent must classify as free-form JSON"
+        );
+
+        // A NON-memory basename under the same non-UTF-8 parent must NOT be
+        // widened into the memory set by the lossy rendering.
+        let mut q = PathBuf::from(OsStr::from_bytes(b"\x80bad"));
+        q.push("settings.json");
+        assert!(
+            !is_agent_memory_file(&q, None),
+            "a non-memory basename must not become memory via a lossy parent"
+        );
     }
 
     #[test]
