@@ -12,6 +12,10 @@
 
 [Website](https://tirith.sh) | [Docs](https://tirith.sh/docs) | [SKILL.md](SKILL.md) | [Changelog](https://github.com/sheeki03/tirith/releases)
 
+<a href="https://vercel.com/open-source-program">
+  <img alt="Vercel OSS Program" src="https://vercel.com/oss/program-badge-2026.svg" />
+</a>
+
 ---
 
 Can you spot the difference?
