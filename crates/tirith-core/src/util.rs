@@ -518,6 +518,35 @@ pub fn fsync_parent_dir_logged(path: &Path, context: &str) {
     }
 }
 
+/// Create `dir` (and any missing ancestors) and, ONLY when THIS call actually
+/// created `dir`, fsync its parent so the new directory entry is crash-durable.
+///
+/// The "did we create it" signal is `create_dir`'s own result, NOT a separate
+/// `exists()` probe, so there is no `exists()`-then-`create_dir_all` TOCTOU where
+/// a concurrent removal in that window would leave the freshly re-created entry
+/// unsynced. An already-present `dir` costs a single `mkdir` syscall (EEXIST) and
+/// no fsync. Like [`fsync_parent_dir_logged`], the fsync is best-effort (logged,
+/// not propagated) and a no-op on non-unix; this does NOT recursively fsync a
+/// fully fresh ancestor chain (higher ancestors normally pre-exist).
+pub fn create_dir_durable(dir: &Path) -> std::io::Result<()> {
+    match std::fs::create_dir(dir) {
+        // We created the leaf: make its new entry in the parent durable.
+        Ok(()) => {
+            fsync_parent_dir_logged(dir, "durable dir create");
+            Ok(())
+        }
+        // Already present (the steady-state path): nothing created, nothing to sync.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        // Ancestors missing (or a transient error): create the whole chain. Success
+        // means we created `dir`, so fsync; otherwise propagate the original error.
+        Err(_) => {
+            std::fs::create_dir_all(dir)?;
+            fsync_parent_dir_logged(dir, "durable dir create");
+            Ok(())
+        }
+    }
+}
+
 /// Resolve the effective atomic-rewrite target for `path` (CodeRabbit R13b).
 /// When `path` is a symlink to an existing target, returns the canonicalized
 /// target so a `temp → rename` writes THROUGH the link (preserving it) instead of
@@ -1118,6 +1147,22 @@ mod write_file_atomic_tests {
             leftovers.is_empty(),
             "no temp file must remain after an atomic publish, found: {leftovers:?}"
         );
+    }
+
+    #[test]
+    fn create_dir_durable_creates_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Missing ancestors -> exercises the create_dir_all fallback branch.
+        let nested = tmp.path().join("a").join("b");
+        super::create_dir_durable(&nested).expect("create nested");
+        assert!(nested.is_dir());
+        // Already-present -> Ok and idempotent (the no-fsync steady-state path).
+        super::create_dir_durable(&nested).expect("idempotent on existing dir");
+        assert!(nested.is_dir());
+        // Single missing leaf under an existing parent -> the create_dir Ok path.
+        let leaf = tmp.path().join("c");
+        super::create_dir_durable(&leaf).expect("create leaf");
+        assert!(leaf.is_dir());
     }
 }
 
