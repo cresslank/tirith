@@ -535,6 +535,49 @@ pub fn resolve_symlink_target(path: &Path) -> std::path::PathBuf {
     }
 }
 
+/// Write `bytes` to `path` crash-atomically with `0600` permissions: write to a
+/// randomly named temp file in the SAME directory (`O_EXCL` via
+/// `NamedTempFile`), fsync its body, then atomically rename it onto `path`,
+/// finally fsync the parent dir so the new name -> inode entry is durable. The
+/// caller sees either the old file or the whole new file, never a torn one.
+///
+/// Two security properties fall out of the random temp name plus the rename:
+/// there is no predictable temp path an attacker could pre-create or race, and
+/// `rename` replaces whatever is at `path` (including a symlink) WITHOUT
+/// following it, so a planted symlink at `path` cannot redirect the write onto a
+/// sensitive file. (Contrast a fixed `path.with_extension("tmp")` opened without
+/// `O_NOFOLLOW`, which both leaks a predictable name and follows a symlink.)
+///
+/// On unix the temp file is chmod'd `0600` best-effort before the rename (the
+/// `NamedTempFile` default is already `0600`, this just matches the checkpoint
+/// helper's belt-and-suspenders tightening). Mirrors
+/// `checkpoint::write_checkpoint_file_atomic`.
+pub fn write_file_atomic_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let mut tmp = match dir {
+        Some(d) => tempfile::NamedTempFile::new_in(d)?,
+        None => tempfile::NamedTempFile::new()?,
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tmp
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    tmp.write_all(bytes)?;
+    // fsync the body BEFORE the rename so the published name can never point at a
+    // partially written file after a crash.
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    // fsync the parent dir so the rename's name -> inode entry is durable. The
+    // publish already succeeded, so a dir-fsync failure is LOGGED, not propagated;
+    // no-op on non-unix.
+    fsync_parent_dir_logged(path, "atomic file write");
+    Ok(())
+}
+
 /// Truncate a string to a maximum number of bytes without breaking UTF-8.
 /// Returns the original string if it is already within the limit.
 pub fn truncate_bytes(s: &str, max_bytes: usize) -> String {
@@ -1029,6 +1072,52 @@ mod fsync_parent_dir_tests {
     fn root_path_with_no_parent_is_noop_ok() {
         // The no-parent case (`/`) stays a vacuous `Ok(())` no-op.
         fsync_parent_dir(Path::new("/")).expect("a path with no parent is a vacuous Ok no-op");
+    }
+}
+
+#[cfg(test)]
+mod write_file_atomic_tests {
+    use super::write_file_atomic_0600;
+
+    #[test]
+    fn publishes_whole_file_and_leaves_no_temp() {
+        // The crash-atomic write must publish the COMPLETE bytes under the target
+        // name and leave NO temp sibling behind (proving it used temp+rename, not
+        // an in-place write a crash mid-write could truncate). It must also fully
+        // replace any pre-existing content rather than appending. Mirrors the
+        // checkpoint helper's publish test.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let target = tmpdir.path().join("data.bin");
+
+        // A pre-existing (e.g. stale/partial) file must be fully replaced.
+        std::fs::write(
+            &target,
+            "STALE PARTIAL CONTENT that must be replaced wholesale",
+        )
+        .unwrap();
+
+        let payload = b"the complete new payload bytes";
+        write_file_atomic_0600(&target, payload).expect("atomic write must succeed");
+
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            payload,
+            "the target must hold exactly the new bytes (no truncation, no append)"
+        );
+
+        // The directory must contain ONLY the target file. A NamedTempFile that was
+        // renamed into place leaves nothing behind, so a leftover temp sibling would
+        // mean the publish was not a clean rename.
+        let leftovers: Vec<String> = std::fs::read_dir(tmpdir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "data.bin")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp file must remain after an atomic publish, found: {leftovers:?}"
+        );
     }
 }
 
