@@ -356,6 +356,20 @@ mod tests {
             format!("{sentinel_id}\n"),
             "the symlink target must be byte-for-byte unchanged"
         );
+        // The fallback path itself must now be a REGULAR file (the atomic rename
+        // replaced the symlink), holding exactly the regenerated id. Without this
+        // the test could pass even if the best-effort write had failed and left
+        // the planted symlink in place.
+        let meta = std::fs::symlink_metadata(&path).expect("fallback path exists");
+        assert!(
+            !meta.file_type().is_symlink(),
+            "the planted symlink must be replaced by a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{id}\n"),
+            "the fallback file must contain the regenerated id"
+        );
 
         unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }

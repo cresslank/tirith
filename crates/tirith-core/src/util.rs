@@ -548,10 +548,11 @@ pub fn resolve_symlink_target(path: &Path) -> std::path::PathBuf {
 /// sensitive file. (Contrast a fixed `path.with_extension("tmp")` opened without
 /// `O_NOFOLLOW`, which both leaks a predictable name and follows a symlink.)
 ///
-/// On unix the temp file is chmod'd `0600` best-effort before the rename (the
-/// `NamedTempFile` default is already `0600`, this just matches the checkpoint
-/// helper's belt-and-suspenders tightening). Mirrors
-/// `checkpoint::write_checkpoint_file_atomic`.
+/// On unix the temp file is chmod'd `0600` before the rename and the chmod error
+/// is propagated, so the `_0600` contract holds rather than silently publishing a
+/// wider-mode file. The `NamedTempFile` default is already `0600`, so this is a
+/// defensive re-assert that should never fail on a freshly created, owned temp.
+/// Structured like `checkpoint::write_checkpoint_file_atomic`.
 pub fn write_file_atomic_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
@@ -562,9 +563,8 @@ pub fn write_file_atomic_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = tmp
-            .as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600));
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     tmp.write_all(bytes)?;
     // fsync the body BEFORE the rename so the published name can never point at a
