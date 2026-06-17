@@ -1264,7 +1264,7 @@ impl Policy {
     /// LEFT INTACT (tightening-only or inert at repo scope, each verified):
     /// * `blocklist`, `network_deny` — only ADD blocks.
     /// * `approval_rules` — only ADD an approval gate.
-    /// * `action_overrides` — upgrade-only ("block"), validated at load.
+    /// * `action_overrides` — upgrade-only ("block"), validated by `tirith policy validate`.
     /// * `escalation` — `EscalationAction` is Block-only (never a downgrade).
     /// * `custom_rules` — only ADD detections.
     /// * `paranoia` — `retain_by_paranoia` keeps Medium+ at any tier; raising it

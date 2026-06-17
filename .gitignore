@@ -50,3 +50,11 @@ fix_categories.py
 generate_charts.py
 generate_research_charts.py
 data_collect_log*.txt
+
+# Local audit / review artifacts (untracked, not part of the project tree)
+scan/
+SECURITY_AUDIT_2026-04-10.md
+tirith security.rtf
+aos-dashboard-initial.png
+aos-dashboard-mobile.png
+assets/tirith-share-explainer.png
