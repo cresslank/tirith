@@ -6182,6 +6182,37 @@ fn paste_surfaces_bad_injection_seed_to_stderr() {
     );
 }
 
+/// The check CLI path must also surface an invalid `injection_seeds_custom` regex.
+/// The warn is UNCONDITIONAL (not gated on the local/daemon split), so the same
+/// call covers both the local path and the daemon client path (where `policy` is
+/// the client-side `Policy::discover`). Uses `--no-daemon` for determinism.
+#[cfg(unix)]
+#[test]
+fn check_surfaces_bad_injection_seed_to_stderr() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let policy_root = tmp.path().join("repo");
+    let tirith_dir = policy_root.join(".tirith");
+    fs::create_dir_all(&tirith_dir).expect("create .tirith dir");
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "injection_seeds_custom:\n  - \"(unclosed\"\n",
+    )
+    .expect("write policy");
+
+    let out = tirith()
+        .env("TIRITH_POLICY_ROOT", &policy_root)
+        .env("TIRITH_LOG", "0")
+        .args(["check", "--shell", "posix", "--no-daemon", "--", "ls"])
+        .output()
+        .expect("run tirith check");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid injection_seeds_custom regex") && stderr.contains("(unclosed"),
+        "check must surface a bad injection_seeds_custom regex to stderr: {stderr}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn paste_audit_entry_with_agent_rules_deny_forces_block() {
