@@ -622,6 +622,11 @@ pub struct OutputAnalyzerState {
     /// M11 ch3 — canary ids already fired this stream, so a token spanning/repeated
     /// across chunks fires at most once.
     canary_seen: std::collections::HashSet<String>,
+    /// Extra prompt-injection seeds (e.g. compiled from policy
+    /// `injection_seeds_custom`), scanned alongside the built-in corpus on every
+    /// chunk and at finalize. Empty by default; a later commit populates it from
+    /// the discovered policy at construction time.
+    extra_injection_seeds: crate::rules::prompt_injection::CompiledSeeds,
 }
 
 const OUTPUT_TAIL_KEEP: usize = 16 * 1024;
@@ -667,27 +672,41 @@ pub(crate) fn analyze_output_chunk_at(
         &mut state.scan_result,
     );
 
-    // Decide whether to scan canaries BEFORE `append_tail` truncates the tail.
-    // A no-canary machine pays one `store_nonempty()` stat and nothing else.
-    // When we WILL scan, capture the retained tail NOW so the scan can join it
-    // with the FULL chunk (CodeRabbit R15 #5): a token anywhere in a chunk larger
-    // than the tail window would otherwise be dropped before being scanned.
+    // Capture the retained tail BEFORE `append_tail` truncates it, so both the
+    // prompt-injection scan and the canary scan can join it with the FULL chunk
+    // (CodeRabbit R15 #5): a seed/token straddling the chunk boundary, or anywhere
+    // in a chunk larger than the tail window, would otherwise be dropped. The
+    // injection scan now ALWAYS runs (cross-boundary seed detection), so the tail
+    // clone is taken unconditionally; it is bounded to ≤16 KiB.
+    let prior_tail = state.tail_text.clone();
     let will_scan_canaries = canary_store.is_some() || crate::canary::store_nonempty();
-    let prior_tail_for_canary = if will_scan_canaries {
-        Some(state.tail_text.clone()) // bounded: ≤16 KiB
-    } else {
-        None
-    };
 
     state.append_tail(chunk);
 
     let mut findings = before.new_findings(&state.scan_result);
 
+    // `prior_tail + chunk` overlap text, shared by the injection and canary scans
+    // so the bounded prior-tail clone is reused (no second allocation). On the
+    // first chunk `prior_tail` is empty, so we scan the chunk alone.
+    let joined_scan_text;
+    let scan_text: &str = if prior_tail.is_empty() {
+        chunk
+    } else {
+        let mut s = String::with_capacity(prior_tail.len() + chunk.len());
+        s.push_str(&prior_tail);
+        s.push_str(chunk);
+        joined_scan_text = s;
+        &joined_scan_text
+    };
+
     // Code-reviewer Critical-1: scan prompt-injection per-chunk so seeds in the
     // EARLY part of a >32 KiB stream are caught (finalize only sees the last
-    // 16 KiB). Dedupe by `(rule_id, title)`; accumulate into `state` so finalize
-    // folds them in for streaming callers that discard return values.
-    for f in crate::rules::prompt_injection::check(chunk) {
+    // 16 KiB). Scan `prior_tail + chunk` so a seed split across the chunk boundary
+    // still fires. Dedupe by `(rule_id, title)` (which makes the overlap re-scan
+    // harmless); accumulate into `state` so finalize folds them in for streaming
+    // callers that discard return values. Also scans deobfuscated forms + policy
+    // seeds via `check_with`.
+    for f in crate::rules::prompt_injection::check_with(scan_text, &state.extra_injection_seeds) {
         let key = format!("{}:{}", f.rule_id, f.title);
         if state.prompt_injection_seen.insert(key) {
             state.accumulated_chunk_findings.push(f.clone());
@@ -700,28 +719,15 @@ pub(crate) fn analyze_output_chunk_at(
     // tail) so a canary anywhere in an oversized chunk still fires (CodeRabbit
     // R15 #5). Dedupe by id (`canary_seen`). The opt-in callback fires with
     // context "output" (never the token value; non-blocking).
-    let canary_hits = match prior_tail_for_canary {
-        // No store: the no-canary hot path took no clone/allocation.
-        None => Vec::new(),
-        Some(prior_tail) => {
-            // Scan the chunk alone on the first chunk, else `prior_tail + chunk`.
-            let joined;
-            let scan_text: &str = if prior_tail.is_empty() {
-                chunk
-            } else {
-                let mut s = String::with_capacity(prior_tail.len() + chunk.len());
-                s.push_str(&prior_tail);
-                s.push_str(chunk);
-                joined = s;
-                &joined
-            };
-            match canary_store {
-                // Test seam: explicit (tempdir) store, already known non-empty.
-                Some(store) => crate::canary::detect_at(store, scan_text),
-                // Production default store (confirmed non-empty above).
-                None => crate::redact::detect_canaries(scan_text),
-            }
+    let canary_hits = if will_scan_canaries {
+        match canary_store {
+            // Test seam: explicit (tempdir) store, already known non-empty.
+            Some(store) => crate::canary::detect_at(store, scan_text),
+            // Production default store (confirmed non-empty above).
+            None => crate::redact::detect_canaries(scan_text),
         }
+    } else {
+        Vec::new()
     };
     for hit in canary_hits {
         if state.canary_seen.insert(hit.id.clone()) {
@@ -792,8 +798,10 @@ pub fn analyze_output_finalize_mut(state: &mut OutputAnalyzerState) -> Verdict {
     // M7 ch5 — prompt-injection seeds on the captured tail (the output pipeline
     // bypasses PATTERN_TABLE, so this is unconditionally reachable). Dedupe
     // against `prompt_injection_seen`; the tail-scan covers seeds straddling a
-    // chunk boundary.
-    for f in crate::rules::prompt_injection::check(&state.tail_text) {
+    // chunk boundary. Also scans deobfuscated forms + policy seeds via `check_with`.
+    for f in
+        crate::rules::prompt_injection::check_with(&state.tail_text, &state.extra_injection_seeds)
+    {
         let key = format!("{}:{}", f.rule_id, f.title);
         if state.prompt_injection_seen.insert(key) {
             findings.push(f);
@@ -2133,8 +2141,16 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
                 findings.extend(clipboard_findings);
             }
 
-            // M7 ch5 — prompt-injection seeds in pasted content.
-            findings.extend(crate::rules::prompt_injection::check(&ctx.input));
+            // M7 ch5 — prompt-injection seeds in pasted content. Scans raw +
+            // deobfuscated forms via `check_with`. The `policy` local discovered at
+            // the top of this function (NOT `ctx.policy`, which does not exist) is
+            // the future source of custom seeds.
+            // TODO(commit 6): compile from policy.injection_seeds_custom; that
+            // field does not exist yet, so for now pass an empty extra-seed set.
+            findings.extend(crate::rules::prompt_injection::check_with(
+                &ctx.input,
+                &crate::rules::prompt_injection::CompiledSeeds::empty(),
+            ));
         }
 
         if ctx.scan_context == ScanContext::Exec {

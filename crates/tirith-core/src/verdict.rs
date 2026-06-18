@@ -270,6 +270,13 @@ pub enum RuleId {
     /// phrase ("ignore previous instructions", "override your instructions", …).
     /// High severity.
     IgnorePreviousInstructions,
+    /// A prompt-injection seed phrase that matched ONLY after deobfuscation
+    /// (base64/hex decode, confusable skeleton, invisible-char strip, NFKC,
+    /// character-spacing collapse, or leetspeak fold) and did NOT match the raw
+    /// text. Obfuscation of an injection phrase is itself a malice signal, so this
+    /// is a distinct High finding from the raw `PromptInjectionInOutput` /
+    /// `IgnorePreviousInstructions` rules. Names the defeated technique in evidence.
+    PromptInjectionObfuscated,
 
     // Operational-context rules (M8 ch1) — fire from `rules::context` when the
     // leader is a cloud/k8s CLI (kubectl, helm, aws, gcloud, az, …) and the active

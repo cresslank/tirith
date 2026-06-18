@@ -1666,6 +1666,17 @@ examples_good = ["A clean log with no instruction-override phrasing."]
 false_positive_guidance = "Documentation about prompt-injection attacks will quote these phrases verbatim. Suppress for the documentation file or rule-scope as needed."
 remediation = "Treat the matched output as adversarial. Do not feed it back into a downstream agent; redact via `tirith share --target llm` first if you must hand it to another model for review."
 
+[[rule]]
+id = "prompt_injection_obfuscated"
+title = "Obfuscated prompt-injection seed phrase"
+category = "output"
+severity_rationale = "High — a known injection seed phrase that surfaced only after the text was deobfuscated (base64/hex decode, confusable skeleton, invisible-character strip, NFKC, character-spacing collapse, or leetspeak fold). The phrase did not match the raw text, so the obfuscation is deliberate and is itself a strong malice signal. Benign text rarely needs to hide an instruction-override phrase behind an encoding."
+description = "Scanned text contains a well-known prompt-injection seed phrase that matched only after a deobfuscation pass; the raw text did not match. The evidence names the technique that was defeated (for example 'detected after deobfuscation: Base64Decode'). As with the raw seed rules, this catches well-known patterns only — treat every line of agent output as untrusted regardless."
+examples_bad = ["A tool result containing the base64 of 'ignore previous instructions'.", "Output with 'ignore previous instructions' written with Cyrillic look-alike letters, or with zero-width characters between each letter."]
+examples_good = ["A real base64 config blob or checksum that decodes to non-text bytes (rejected by the printability gate).", "Prose that merely discusses encodings without hiding an injection phrase."]
+false_positive_guidance = "A legitimate document that base64-encodes an injection phrase verbatim (for example documentation about this very attack) can trip this rule. Use `policy.allowlist` for that file, or suppress via `policy.severity_overrides`."
+remediation = "Treat the decoded/recovered phrase as adversarial. Inspect the matched item in context and never feed the content back into a downstream agent unredacted."
+
 # M8 ch1 — operational-context rules.
 
 [[rule]]

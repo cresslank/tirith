@@ -1038,6 +1038,7 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     // M7 ch5 — prompt-injection seed phrases.
     ("prompt_injection_in_output", "PromptInjectionInOutput"),
     ("ignore_previous_instructions", "IgnorePreviousInstructions"),
+    ("prompt_injection_obfuscated", "PromptInjectionObfuscated"),
     // Operational-context rules (M8 ch1).
     (
         "context_prod_destructive_command",

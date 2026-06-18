@@ -659,6 +659,7 @@ const ALL_RULE_IDS: &[&str] = &[
     // Prompt-injection rules (M7 ch5)
     "prompt_injection_in_output",
     "ignore_previous_instructions",
+    "prompt_injection_obfuscated",
     // Operational-context rules (M8 ch1)
     "context_prod_destructive_command",
     "context_prod_write_operation",
@@ -843,6 +844,10 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // `output.toml`) and from `analyze` for Paste/FileScan (covered by CLI smoke tests).
     "prompt_injection_in_output",
     "ignore_previous_instructions",
+    // The obfuscated variant fires only after a deobfuscation pass; the
+    // guaranteed-reachable case is an OUTPUT-context base64 seed (output bypasses
+    // tier-1). Covered by `output.toml` + `test_output_rule_ids_have_fixture_coverage`.
+    "prompt_injection_obfuscated",
     // M8 ch1 — operational-context rules need both an active provider context
     // (`context_detect`) AND a labels file; covered by unit + integration tests below.
     "context_prod_destructive_command",
@@ -1075,6 +1080,7 @@ fn test_output_rule_ids_have_fixture_coverage() {
         // M7 ch5
         "prompt_injection_in_output",
         "ignore_previous_instructions",
+        "prompt_injection_obfuscated",
     ];
     let missing: Vec<&str> = required
         .iter()
@@ -1188,7 +1194,7 @@ rule_id_variant_registry! {
     OutputOsc52ClipboardWrite, OutputHiddenText, OutputFakePrompt, OutputTerminalHyperlinkMismatch,
     OutputTitleManipulation, OutputClearScreen, OutputTruncatedEscapeSequence,
     // Prompt-injection rules (M7 ch5)
-    PromptInjectionInOutput, IgnorePreviousInstructions,
+    PromptInjectionInOutput, IgnorePreviousInstructions, PromptInjectionObfuscated,
     // Operational-context rules (M8 ch1)
     ContextProdDestructiveCommand, ContextProdWriteOperation, ContextProdCredentialChange,
     // SSH operational-context rules (M8 ch2)
