@@ -170,6 +170,21 @@ pub struct Policy {
     #[serde(default)]
     pub dlp_custom_patterns: Vec<String>,
 
+    /// Extra prompt-injection seed regexes, layered on top of the built-in
+    /// corpus. TIGHTENING: a repo may only ADD seeds (more detection), so this
+    /// is KEPT by [`Self::sanitize_repo_scoped`] — never reset. Bad regexes are
+    /// reported by `tirith policy validate` and skipped gracefully at compile
+    /// time (see `prompt_injection::compile_seeds`); they never hard-fail load.
+    #[serde(default)]
+    pub injection_seeds_custom: Vec<String>,
+
+    /// Opt-in: downgrade an injection-ONLY MCP `Block` to a redacted `Warn`
+    /// instead of blocking the whole tool result. WEAKENING (it relaxes the
+    /// default block), so this is RESET by [`Self::sanitize_repo_scoped`] — only
+    /// a user/org-scope policy may enable it; a repo policy cannot.
+    #[serde(default)]
+    pub mcp_redact_injection: bool,
+
     /// Require explicit acknowledgement for warn findings in interactive mode.
     #[serde(default)]
     pub strict_warn: bool,
@@ -875,6 +890,8 @@ impl Default for Policy {
             allowlist_rules: Vec::new(),
             custom_rules: Vec::new(),
             dlp_custom_patterns: Vec::new(),
+            injection_seeds_custom: Vec::new(),
+            mcp_redact_injection: false,
             strict_warn: false,
             action_overrides: HashMap::new(),
             escalation: Vec::new(),
@@ -1363,10 +1380,19 @@ impl Policy {
             self.policy_server_api_key.is_some()
         );
         record!("dlp_custom_patterns", dlp_custom_patterns);
+        // `mcp_redact_injection` WEAKENS protection (it downgrades an injection-only
+        // MCP Block to a redacted Warn), so a repo must not be able to turn it on.
+        // It defaults FALSE, so a `true` is an explicit weakening and IS recorded
+        // (mirrors `allow_bypass_env_noninteractive`). `injection_seeds_custom` is
+        // deliberately NOT touched here: adding seeds only TIGHTENS detection, so it
+        // is KEPT like `custom_rules` (recording it would wrongly report a surviving
+        // setting as IGNORED via `neutralized_fields`).
+        record!("mcp_redact_injection", mcp_redact_injection);
         self.webhooks = defaults.webhooks;
         self.policy_server_url = None;
         self.policy_server_api_key = None;
         self.dlp_custom_patterns = defaults.dlp_custom_patterns;
+        self.mcp_redact_injection = defaults.mcp_redact_injection;
 
         // Guard-disable suppression — a repo must not be able to turn OFF a guard
         // that defaults ON, demote/silence supply-chain findings, disable threat
@@ -3167,6 +3193,7 @@ custom_rules:
             policy_server_url: Some("https://attacker.example/policy".into()),
             policy_server_api_key: Some("planted".into()),
             dlp_custom_patterns: vec!["secret-[0-9]+".into()],
+            mcp_redact_injection: true,
             context_guard_enabled: false,
             package_policy: PackagePolicy {
                 block_dependency_confusion: false,
@@ -3214,6 +3241,7 @@ custom_rules:
                 description: String::new(),
                 action: None,
             }],
+            injection_seeds_custom: vec!["evil-seed".into()],
             paranoia: 4,
             strict_warn: true,
             iac_require_plan_before_apply: true,
@@ -3273,6 +3301,7 @@ custom_rules:
             policy_server_url,
             policy_server_api_key,
             dlp_custom_patterns,
+            mcp_redact_injection,
             context_guard_enabled,
             package_policy,
             threat_intel,
@@ -3285,6 +3314,7 @@ custom_rules:
             action_overrides,
             escalation,
             custom_rules,
+            injection_seeds_custom,
             paranoia,
             strict_warn,
             iac_require_plan_before_apply,
@@ -3357,6 +3387,14 @@ custom_rules:
             "RESET: dlp_custom_patterns"
         );
         assert_eq!(
+            mcp_redact_injection, d.mcp_redact_injection,
+            "RESET: mcp_redact_injection (weakening; a repo cannot downgrade an injection MCP Block to a Warn)"
+        );
+        assert!(
+            !mcp_redact_injection,
+            "RESET: mcp_redact_injection must be back to false after sanitize"
+        );
+        assert_eq!(
             context_guard_enabled, d.context_guard_enabled,
             "RESET: context_guard_enabled (false would disable the context guard)"
         );
@@ -3415,6 +3453,11 @@ custom_rules:
         );
         assert_eq!(escalation.len(), 1, "KEPT: escalation (Block-only upgrade)");
         assert_eq!(custom_rules.len(), 1, "KEPT: custom_rules");
+        assert_eq!(
+            injection_seeds_custom,
+            vec!["evil-seed".to_string()],
+            "KEPT: injection_seeds_custom (adding seeds only tightens detection)"
+        );
         assert_eq!(paranoia, 4, "KEPT: paranoia (higher only keeps more)");
         assert!(strict_warn, "KEPT: strict_warn");
         assert!(

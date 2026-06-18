@@ -51,6 +51,7 @@ pub fn validate(yaml: &str) -> Vec<PolicyIssue> {
     validate_severity_overrides(&policy, &mut issues);
     validate_allowlist_blocklist_overlap(&policy, &mut issues);
     validate_custom_rules(&policy, &mut issues);
+    validate_injection_seeds(&policy, &mut issues);
     validate_approval_rules(&policy, &mut issues);
     validate_fail_mode_fields(&policy, &mut issues);
     validate_scan_config(&policy, &mut issues);
@@ -263,6 +264,53 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
                     });
                 }
             }
+        }
+    }
+}
+
+/// Validate `injection_seeds_custom` entries (C5). Each entry is a prompt-injection
+/// seed regex layered on top of the built-in corpus via `compile_seeds`. Mirrors the
+/// custom-rule regex checks: error on an empty pattern, a pattern over the 1024-CHAR
+/// cap, or one that fails to compile. Bad seeds are SKIPPED at compile time (not a
+/// hard load error, see `policy.rs::try_parse_yaml`), so this lenient `policy
+/// validate` path is where the operator is told about them. A blank/`#`-comment line
+/// is a deliberate skip in `compile_seeds`, so it is not flagged here either.
+fn validate_injection_seeds(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {
+    for (i, pattern) in policy.injection_seeds_custom.iter().enumerate() {
+        let trimmed = pattern.trim();
+        // Blank / comment lines are intentionally ignored by `compile_seeds`; do not
+        // flag them. A pattern that is non-blank but whitespace-padded is validated
+        // on its trimmed form (that is what `compile_seeds` compiles).
+        if trimmed.is_empty() {
+            if pattern.is_empty() {
+                issues.push(PolicyIssue {
+                    level: IssueLevel::Error,
+                    message: format!("injection_seeds_custom[{i}]: empty seed pattern"),
+                    field: Some(format!("injection_seeds_custom[{i}]")),
+                });
+            }
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        // Length cap in CHARACTERS not BYTES, mirroring the custom-rule pattern cap.
+        let pattern_chars = trimmed.chars().count();
+        if pattern_chars > 1024 {
+            issues.push(PolicyIssue {
+                level: IssueLevel::Error,
+                message: format!(
+                    "injection_seeds_custom[{i}]: seed too long ({pattern_chars} chars, max 1024)"
+                ),
+                field: Some(format!("injection_seeds_custom[{i}]")),
+            });
+        } else if let Err(e) = regex::Regex::new(trimmed) {
+            // Regex must compile (checked last, after the cap, like custom rules).
+            issues.push(PolicyIssue {
+                level: IssueLevel::Error,
+                message: format!("injection_seeds_custom[{i}]: invalid regex '{trimmed}': {e}"),
+                field: Some(format!("injection_seeds_custom[{i}]")),
+            });
         }
     }
 }
@@ -724,6 +772,8 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
         "allowlist_rules",
         "custom_rules",
         "dlp_custom_patterns",
+        "injection_seeds_custom",
+        "mcp_redact_injection",
         "strict_warn",
         "action_overrides",
         "escalation",
@@ -1157,6 +1207,45 @@ custom_rules:
         assert!(
             !issues.iter().any(|i| i.level == IssueLevel::Error),
             "a valid regex rule must produce no errors: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_injection_seeds_custom_invalid_regex_rejected() {
+        // C5: a bad `injection_seeds_custom` regex is reported by `policy validate`
+        // (it is skipped, not hard-failed, at compile time). The two new keys must
+        // ALSO be known top-level fields (no "unknown field" warning).
+        let yaml = "injection_seeds_custom:\n  - \"(unclosed\"\nmcp_redact_injection: true\n";
+        let issues = validate(yaml);
+        assert!(
+            issues.iter().any(|i| i.level == IssueLevel::Error
+                && i.message.contains("injection_seeds_custom[0]")
+                && i.message.contains("invalid regex")),
+            "a bad injection_seeds_custom regex must produce a validation error: {issues:?}"
+        );
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.message.contains("unknown field 'injection_seeds_custom'")),
+            "injection_seeds_custom must be a known top-level field: {issues:?}"
+        );
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.message.contains("unknown field 'mcp_redact_injection'")),
+            "mcp_redact_injection must be a known top-level field: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_injection_seeds_custom_valid_accepted() {
+        // A valid seed regex and the bool flag produce no errors.
+        let yaml =
+            "injection_seeds_custom:\n  - \"my-secret-phrase\"\nmcp_redact_injection: false\n";
+        let issues = validate(yaml);
+        assert!(
+            !issues.iter().any(|i| i.level == IssueLevel::Error),
+            "a valid injection_seeds_custom entry must produce no errors: {issues:?}"
         );
     }
 
