@@ -14,7 +14,10 @@ pub const MIN_BASE64_BLOB_LEN: usize = 96;
 /// 4 so the prefix is itself well-formed base64). The detection is preserved for
 /// real embedded secrets, which are far smaller than the cap; a giant blob still
 /// matches (its prefix decodes) but bounds the work.
-const MAX_BASE64_VALIDATE_LEN: usize = 8 * 1024;
+///
+/// `pub(crate)` so `deobfuscate`'s short-blob decoder reuses the same upper bound
+/// (it scans a much lower 16-char floor but must cap decode work identically).
+pub(crate) const MAX_BASE64_VALIDATE_LEN: usize = 8 * 1024;
 
 /// Whether `content` contains a long base64 run that actually decodes (standard
 /// or URL-safe, padded or not): the shape of an encoded payload smuggled into a

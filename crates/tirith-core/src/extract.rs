@@ -1028,6 +1028,30 @@ fn is_invisible_whitespace(ch: char) -> bool {
     )
 }
 
+/// Drop every invisible / hidden character from `s`, returning the visible
+/// residue. A character is dropped when ANY of the seven detection predicates
+/// above classifies it as invisible: bidi controls, zero-width joiners, Unicode
+/// tags, variation selectors, invisible math operators, stealth whitespace, and
+/// Hangul fillers. Used by `deobfuscate` to recover the underlying text from a
+/// zero-width-interspersed payload (e.g. `i<ZWSP>g<ZWSP>n<ZWSP>o<ZWSP>r<ZWSP>e`).
+///
+/// This intentionally strips a SUPERSET of what `mcp::output_filter::sanitize_text_str`
+/// strips: detection must see through everything, whereas display sanitization
+/// only neutralizes what corrupts a terminal. Keep them separate.
+pub(crate) fn strip_invisible(s: &str) -> String {
+    s.chars()
+        .filter(|&ch| {
+            !(is_bidi_control(ch)
+                || is_zero_width(ch)
+                || is_unicode_tag(ch)
+                || is_variation_selector(ch)
+                || is_invisible_math_operator(ch)
+                || is_invisible_whitespace(ch)
+                || is_hangul_filler(ch))
+        })
+        .collect()
+}
+
 /// Tier 3: shell-aware tokenize, then extract URL-like patterns per segment.
 pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
     let segments = tokenize::tokenize(input, shell);
