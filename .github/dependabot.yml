@@ -1,0 +1,16 @@
+# Keep the SHA-pinned GitHub Actions current. Every action in .github/workflows
+# is pinned to a full commit SHA (supply-chain hardening against tag retargeting);
+# Dependabot bumps the SHA and the trailing `# vN` comment when a new release is
+# published, grouped into a single weekly PR to limit noise.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
