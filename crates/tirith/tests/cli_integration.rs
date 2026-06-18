@@ -6182,10 +6182,12 @@ fn paste_surfaces_bad_injection_seed_to_stderr() {
     );
 }
 
-/// The check CLI path must also surface an invalid `injection_seeds_custom` regex.
-/// The warn is UNCONDITIONAL (not gated on the local/daemon split), so the same
-/// call covers both the local path and the daemon client path (where `policy` is
-/// the client-side `Policy::discover`). Uses `--no-daemon` for determinism.
+/// The check CLI (local path) must surface an invalid `injection_seeds_custom`
+/// regex. `--no-daemon` forces local execution for determinism, so this pins the
+/// LOCAL call site only. The `check.rs` warn is unconditional (the daemon client
+/// path runs the same line, with `policy` from the client-side `Policy::discover`),
+/// but the suite has no daemon-spawn harness, so the daemon path is not exercised
+/// end-to-end here.
 #[cfg(unix)]
 #[test]
 fn check_surfaces_bad_injection_seed_to_stderr() {
