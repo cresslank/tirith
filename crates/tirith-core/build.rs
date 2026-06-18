@@ -718,12 +718,14 @@ const PATTERN_TABLE: &[PatternEntry] = &[
             r"<\|im_start\|>",
             r"<\|im_end\|>",
             r"<<SYS>>",
-            // OWASP LLM01 (M7 ch5): system-prompt-extraction leaders. Coarse gates
-            // only control Paste reachability; the precise gated regex (which keeps
-            // benign "print instructions to the console" from firing) runs in tier 3.
-            r"(?i)\breveal\b",
-            r"(?i)\bprint\b",
-            r"(?i)\brepeat\b",
+            // OWASP LLM01 (M7 ch5): system-prompt-extraction leaders. These mirror
+            // the precise seeds in `rules::prompt_injection` (extraction context
+            // only), so a bare `print(...)`, a JSON `"repeat"`, or "reveal the
+            // answer" in a paste does NOT force tier-3. Each fragment is a SUPERSET
+            // of its seed, so the seed stays Paste-reachable.
+            r"(?i)\breveal (?:your |your system |system |the system )(?:prompt|instructions)\b",
+            r"(?i)\bprint (?:your |the )?(?:system )?(?:prompt|instructions)\b",
+            r"(?i)\brepeat (?:the )?(?:words|text) above\b",
         ],
         notes: "Prompt-injection seed phrases — coarse tier-1 gate for the paste context. \
                 The precise multi-word regex lives in `rules::prompt_injection`.",

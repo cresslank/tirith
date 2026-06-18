@@ -981,6 +981,9 @@ mod tests {
             "The plot twist will reveal your true motivations.",
             "Click to reveal the answer to the puzzle.",
             "This test will reveal your strengths and weaknesses.",
+            // Regression: "reveal the instructions" (bare "the", no your/system
+            // framing) is benign and must not fire (Greptile/PR-147 review).
+            "Click to reveal the instructions for the puzzle.",
         ];
         for input in benign {
             assert!(
