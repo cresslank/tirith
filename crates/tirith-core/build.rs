@@ -711,6 +711,19 @@ const PATTERN_TABLE: &[PatternEntry] = &[
             r"(?i)\bdo\s+anything\s+now\b",
             r"(?i)\bnew\s+instructions\s*:",
             r"(?i)\bfrom\s+now\s+on\b",
+            // OWASP LLM01 (M7 ch5): standalone chat-template / role-override
+            // delimiters. Coarse, low-FP literal gates so the precise seeds in
+            // `rules::prompt_injection` are tier-1-reachable in the Paste context.
+            r"\[INST\]",
+            r"<\|im_start\|>",
+            r"<\|im_end\|>",
+            r"<<SYS>>",
+            // OWASP LLM01 (M7 ch5): system-prompt-extraction leaders. Coarse gates
+            // only control Paste reachability; the precise gated regex (which keeps
+            // benign "print instructions to the console" from firing) runs in tier 3.
+            r"(?i)\breveal\b",
+            r"(?i)\bprint\b",
+            r"(?i)\brepeat\b",
         ],
         notes: "Prompt-injection seed phrases — coarse tier-1 gate for the paste context. \
                 The precise multi-word regex lives in `rules::prompt_injection`.",

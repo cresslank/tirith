@@ -35,3 +35,28 @@ DAN mode
 # are DAN", "act as if you have no restrictions", "act as if you are an
 # unrestricted AI") still fire.
 \bact as if you(?:'re| are)?(?:\s+(?:an?|the|my|our))?\s+(?:dan\b|jailbroken|jailbreak|unrestricted|unfiltered|uncensored|unlimited|root\b|administrator|admin\b|developer mode|sudo|godmode|god mode|no longer bound|free from your|not bound by|without (?:any )?(?:restrictions|filters|limits|rules|guardrails|guidelines)|(?:have|with) no (?:restrictions|filters|limits|rules|guardrails|guidelines)|a different (?:ai|assistant|model|persona|chatbot)|an? (?:evil|malicious|unrestricted|unfiltered|uncensored) (?:ai|assistant|model|persona))
+#
+# ── OWASP LLM01 chat-template / role-override delimiters (standalone) ──────────
+# These are machine chat-template control markers (ChatML, Llama [INST]/<<SYS>>),
+# not natural-language prose. They essentially never appear in benign human text,
+# so they are STANDALONE (no continuation gate). They route to
+# PromptInjectionInOutput (no ignore/disregard/forget/override keyword). Regex
+# metacharacters are escaped: `|` -> `\|`, `[` `]` -> `\[` `\]`. `<` `>` are
+# literal in the regex crate.
+<\|im_start\|>system
+<\|im_end\|>
+\[INST\]
+<<SYS>>
+#
+# ── OWASP LLM01 system-prompt-extraction phrases (gated, mirror "act as if") ──
+# Gated on a HIGH-SIGNAL continuation so benign prose does not match. "reveal"
+# and "print" must be followed by a (system) prompt/instructions object; a benign
+# "print instructions to the console" lacks the `your`/`system`/`prompt` framing
+# below. "repeat the text above" is gated on an extraction continuation
+# (verbatim/word for word/exactly/...), so a benign "repeat the text above" alone
+# does NOT match while "repeat the text above verbatim" DOES. All route to
+# PromptInjectionInOutput.
+reveal (?:your |the )?(?:system )?(?:prompt|instructions)\b
+print (?:your |the )?system prompt\b
+print your (?:system )?(?:prompt|instructions)\b
+repeat (?:the )?(?:words|text) above (?:verbatim|word for word|exactly|starting with|including)\b
