@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Evasion-resistant prompt-injection detection:** a shared `deobfuscate` text-normalization pass (zero-width / invisible strip, Unicode confusable skeleton, NFKC, inter-character whitespace collapse, bounded leetspeak fold, and short base64 / hex decode behind a printable gate). Prompt-injection and config-file scanning now run against these normalized variants in addition to the raw input; raw scanning is never replaced. Typoglycemia (character transposition) is out of scope for now.
+- **`PromptInjectionObfuscated`** (High): a new rule for an injection seed that matches only after deobfuscation, where the obfuscation itself is the signal. Raw matches still fire `IgnorePreviousInstructions` / `PromptInjectionInOutput`.
+- **`OutputDataExfiltration`** (High, MITRE T1041): a new `exfil` rule for markdown / URL beacons carrying a secret-shaped token or canary, secret-shaped URL query values, and "read a sensitive path then send / post / upload" directives (including the "do not tell the user" stealth directive).
+- **`injection_seeds_custom`** policy field: add your own prompt-injection seed regexes via `.tirith/policy.yaml`, user, or org policy. A repo-scoped policy may add seeds (it can only tighten). Invalid regexes are reported by `tirith policy validate` and skipped rather than failing the load.
+- **`mcp_redact_injection`** policy field (default off): opt-in to downgrade an injection-only MCP tool-output block to a redacted warning, blanking the seed spans and forwarding the rest. Only user / org scope can enable it (a repo-scoped policy cannot weaken this), and it refuses to downgrade when any non-injection finding blocks or when structured content is present.
+- **threatdb `ExfilEndpoint` source** (Primary tier): a known-exfiltration-endpoint hostname source, populated from the CI threat feed.
+
 ## [0.3.2] - 2026-06-16
 
 ### Added
