@@ -524,7 +524,10 @@ jobs:
           mkdir -p scoop-tirith/bucket
           cp source/packaging/scoop/tirith.json scoop-tirith/bucket/tirith.json
           sed -i "s/\"version\": \"[0-9.]*\"/\"version\": \"${VER}\"/" scoop-tirith/bucket/tirith.json
-          sed -i "s|releases/download/v[0-9.]*|releases/download/${VERSION}|" scoop-tirith/bucket/tirith.json
+          # Require >= 1 digit after `v` so this only rewrites the version-pinned
+          # URL and never the autoupdate template's literal `v$version` (a bare
+          # `v[0-9.]*` matched zero digits and produced `v0.3.2$version`).
+          sed -i "s|releases/download/v[0-9][0-9.]*|releases/download/${VERSION}|" scoop-tirith/bucket/tirith.json
           sed -i "s/\"hash\": \"PLACEHOLDER\"/\"hash\": \"${HASH}\"/" scoop-tirith/bucket/tirith.json
 
       - name: Push manifest
@@ -640,10 +643,25 @@ jobs:
           cp shell/lib/*.fish crates/tirith/assets/shell/lib/
           cp shell/lib/*.ps1 crates/tirith/assets/shell/lib/
 
-      - name: Build release binary into crate-local target
+      - name: Download canonical Linux x64 release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tirith-x86_64-unknown-linux-gnu
+          path: canonical
+
+      # Package the SAME binary that ships in the tarball and that `tirith
+      # verify-self` compares against, instead of a separate rebuild. A separate
+      # build is not byte-identical, which made apt-installed binaries fail
+      # verify-self (issue #146). cargo-deb --no-build picks up target/release/tirith.
+      - name: Stage canonical binary for cargo-deb
         run: |
-          cd crates/tirith
-          CARGO_TARGET_DIR=target cargo build --release --locked
+          set -euo pipefail
+          mkdir -p crates/tirith/target/release
+          tar xzf canonical/tirith-x86_64-unknown-linux-gnu.tar.gz \
+            -C crates/tirith/target/release tirith
+          chmod +x crates/tirith/target/release/tirith
+          echo "Packaging canonical binary:"
+          sha256sum crates/tirith/target/release/tirith
 
       - name: Generate completions and manpage for .deb
         run: |
@@ -657,8 +675,35 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           cd crates/tirith
-          CARGO_TARGET_DIR=target cargo deb --no-build
+          # --no-strip: package the staged canonical binary byte-for-byte (it is
+          # already stripped by [profile.release]); stripping again could perturb
+          # bytes and re-break verify-self byte-identity (issue #146).
+          CARGO_TARGET_DIR=target cargo deb --no-build --no-strip
           mv target/debian/*.deb ../../tirith_${VERSION}_amd64.deb
+
+      # Guard against issue #146 regressing: the binary inside the .deb MUST be
+      # byte-identical to the canonical release binary, or apt users fail
+      # `tirith verify-self`.
+      - name: Verify .deb binary matches the canonical release binary
+        run: |
+          set -euo pipefail
+          mkdir -p deb-extract
+          dpkg-deb -x tirith_*.deb deb-extract
+          DEB_BIN=$(find deb-extract -type f -name tirith | head -1)
+          if [ -z "$DEB_BIN" ]; then
+            echo "ERROR: no tirith binary found inside the .deb"
+            exit 1
+          fi
+          DEB_SHA=$(sha256sum "$DEB_BIN" | cut -d' ' -f1)
+          CANON_SHA=$(sha256sum crates/tirith/target/release/tirith | cut -d' ' -f1)
+          echo "deb binary:       $DEB_SHA  ($DEB_BIN)"
+          echo "canonical binary: $CANON_SHA"
+          if [ "$DEB_SHA" != "$CANON_SHA" ]; then
+            echo "ERROR: .deb binary does not match the canonical release binary;"
+            echo "       apt-installed tirith would fail 'tirith verify-self' (issue #146)."
+            exit 1
+          fi
+          echo "OK: .deb packages the canonical release binary byte-for-byte"
 
       - name: Generate .deb checksum
         run: |
@@ -693,7 +738,12 @@ jobs:
             curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             source $HOME/.cargo/env
 
-            # Build release binary
+            # Build release binary IN the Rocky container (do NOT swap in the
+            # generic ubuntu-built release binary): the .rpm targets RHEL/Rocky 9
+            # (glibc 2.34) and the canonical binary is built on ubuntu-22.04
+            # (glibc 2.35), which would not run there. The .rpm is therefore
+            # intentionally NOT byte-identical to the tarball; `tirith verify-self`
+            # carves out Dnf installs as source/distro-built (issue #146).
             cargo build --release --locked -p tirith
 
             # Generate completions and manpage

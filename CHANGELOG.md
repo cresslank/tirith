@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`mcp_redact_injection`** policy field (default off): opt-in to downgrade an injection-only MCP tool-output block to a redacted warning, blanking the seed spans and forwarding the rest. Only user / org scope can enable it (a repo-scoped policy cannot weaken this), and it refuses to downgrade when any non-injection finding blocks or when structured content is present.
 - **threatdb `ExfilEndpoint` source** (Primary tier): a known-exfiltration-endpoint hostname source, populated from the CI threat feed.
 
+### Fixed
+
+- **`.deb` / `verify-self` byte mismatch (issue #146):** the Debian package now ships the exact canonical release binary instead of a separate rebuild, so an apt-installed tirith passes `tirith verify-self`. A release CI guard asserts the `.deb` binary is byte-identical to the published tarball binary. The `.rpm` is still rebuilt against the target distro's glibc (so it keeps running on RHEL / Rocky 9) and is intentionally not byte-identical.
+- **`verify-self` no longer falsely flags source-built installs:** `cargo install`, AUR, and the distribution `.rpm` are compiled from source or against a different libc, so they cannot be byte-compared to the generic release binary. They now report an honest "unverified" (exit 0) rather than a false "modified or replaced" failure, and AUR installs on Arch and its derivatives are detected as such.
+- **Scoop autoupdate URL:** the release workflow no longer corrupts the manifest's autoupdate template (a loose version-matching pattern was rewriting the literal `v$version` to `v0.3.2$version`).
+
 ## [0.3.2] - 2026-06-16
 
 ### Added
