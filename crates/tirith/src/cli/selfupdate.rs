@@ -313,6 +313,36 @@ fn source_built_unverified_reason(method: &InstallMethod) -> Option<String> {
     }
 }
 
+/// On a byte-compare MISMATCH (running binary differs from the verified release
+/// artifact), decide whether it is expected-and-benign vs tampering. Only Homebrew
+/// reaches here with a benign mismatch: homebrew-core builds tirith from source
+/// (distributed as a bottle), so its binary is not the prebuilt release artifact,
+/// while the `sheeki03/tap` formula pours the prebuilt binary and matches above
+/// (VERIFIED). Every other method that reaches here ships the canonical prebuilt
+/// binary (.deb/apt, npm, Scoop, self-managed), so for them a mismatch IS tampering
+/// and stays `Failed`; the always-source-built methods (cargo/aur/dnf) are
+/// pre-empted before the network fetch by `source_built_unverified_reason` and
+/// never reach here. Exhaustive (no `_`) so a new method forces a decision.
+fn benign_mismatch_reason(method: &InstallMethod) -> Option<String> {
+    match method {
+        InstallMethod::Homebrew => Some(
+            "installed via Homebrew; the homebrew-core formula builds tirith from source \
+             (distributed as a bottle), so the binary is not byte-identical to the prebuilt \
+             release artifact. `brew install sheeki03/tap/tirith` pours the prebuilt, signed \
+             binary that verifies."
+                .to_string(),
+        ),
+        InstallMethod::SelfManaged
+        | InstallMethod::Npm
+        | InstallMethod::Scoop
+        | InstallMethod::Apt
+        | InstallMethod::Cargo
+        | InstallMethod::Aur
+        | InstallMethod::Dnf
+        | InstallMethod::Unknown => None,
+    }
+}
+
 /// Core of `verify-self`: the networked verification, kept separate so the
 /// emit/exit logic is trivially correct.
 fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
@@ -452,6 +482,15 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
     };
 
     if !selfupdate::digest_eq(&extracted_sha, &binary_sha) {
+        // A mismatch is normally tampering. Homebrew is the exception: homebrew-core
+        // builds from source (bottled) so it legitimately mismatches, while the
+        // sheeki03/tap bottle is the prebuilt binary and matches above. Downgrade
+        // only the Homebrew mismatch to an honest Unverified; for every other method
+        // here the binary should be the canonical prebuilt one, so a mismatch stays
+        // Failed.
+        if let Some(reason) = benign_mismatch_reason(&prov.install_method) {
+            return VerifySelfOutcome::verdict(VerificationStatus::Unverified { reason });
+        }
         return VerifySelfOutcome::verdict(VerificationStatus::Failed {
             reason: format!(
                 "the running binary at {} (sha256 {}) does NOT match the official {} release \
@@ -1768,6 +1807,33 @@ mod tests {
             !outcome.operational_error,
             "source-built Unverified is benign and must not exit non-zero"
         );
+    }
+
+    #[test]
+    fn benign_mismatch_reason_is_homebrew_only() {
+        // Homebrew is the only ship-or-build-ambiguous method: a byte-compare
+        // mismatch there is the source-built homebrew-core formula (bottled), not
+        // tampering, so it downgrades to Unverified with a reason naming the tap.
+        let hb = benign_mismatch_reason(&InstallMethod::Homebrew);
+        assert!(hb.is_some());
+        assert!(hb.unwrap().contains("sheeki03/tap/tirith"));
+        // Every other method ships the canonical prebuilt binary (or is pre-empted
+        // earlier), so a mismatch is tampering and MUST stay Failed.
+        for m in [
+            InstallMethod::SelfManaged,
+            InstallMethod::Npm,
+            InstallMethod::Scoop,
+            InstallMethod::Apt,
+            InstallMethod::Cargo,
+            InstallMethod::Aur,
+            InstallMethod::Dnf,
+            InstallMethod::Unknown,
+        ] {
+            assert!(
+                benign_mismatch_reason(&m).is_none(),
+                "{m:?} mismatch must stay Failed (tampering), not downgrade"
+            );
+        }
     }
 
     /// `--rollback` property: restoring from the backup recovers the original.
