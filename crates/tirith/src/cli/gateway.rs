@@ -406,6 +406,31 @@ pub fn run_gateway_with_options(
     // M7 ch4: route policy.fail_mode into the output filter so `fail_mode: closed`
     // fails closed on the output direction too (default "open" stays compatible).
     let fail_mode_closed = config.policy.fail_mode == "closed";
+
+    // C3a — MCP policy seam (gateway). The gateway's own `PolicyConfig` is
+    // unrelated to the core `Policy`; discover a core policy ONCE at init
+    // (OFFLINE via `discover_local_only`, which neutralizes a repo-scoped
+    // `mcp_redact_injection`), compile the operator's `injection_seeds_custom`,
+    // and read the redact flag into an `OutputFilterContext` shared with the
+    // upstream-reader thread. Built only under `--filter-output`. A bad custom
+    // seed is reported by `tirith policy validate`, so the bad-list is dropped.
+    let filter_ctx: Arc<output_filter::OutputFilterContext> = Arc::new(if filter_output {
+        let policy = tirith_core::policy::Policy::discover_local_only(
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .as_deref(),
+        );
+        let (custom_seeds, _bad) =
+            tirith_core::rules::prompt_injection::compile_seeds(&policy.injection_seeds_custom);
+        output_filter::OutputFilterContext {
+            custom_seeds,
+            redact_injection: policy.mcp_redact_injection,
+        }
+    } else {
+        output_filter::OutputFilterContext::default()
+    });
+    let fc2 = Arc::clone(&filter_ctx);
     let t_upstream = thread::spawn(move || {
         let mut reader = BufReader::new(child_stdout);
         loop {
@@ -417,7 +442,7 @@ pub fn run_gateway_with_options(
                     // Filter first (a block short-circuits warn-augmentation), then
                     // warn-augment residual content.
                     let after_filter = if filter_output {
-                        filter_if_pending(&line, &pf2, fail_mode_closed).unwrap_or(line)
+                        filter_if_pending(&line, &pf2, fail_mode_closed, &fc2).unwrap_or(line)
                     } else {
                         line
                     };
@@ -1332,6 +1357,7 @@ fn filter_if_pending(
     line: &[u8],
     pending: &Mutex<HashMap<Value, Instant>>,
     fail_mode_closed: bool,
+    filter_ctx: &output_filter::OutputFilterContext,
 ) -> Option<Vec<u8>> {
     let parsed: Value = serde_json::from_slice(line).ok()?;
     let resp_id = parsed.get("id")?;
@@ -1348,7 +1374,7 @@ fn filter_if_pending(
         map.remove(resp_id)?;
     }
 
-    apply_output_filter_to_response(parsed, fail_mode_closed)
+    apply_output_filter_to_response(parsed, fail_mode_closed, filter_ctx)
 }
 
 /// Parse `parsed["result"]` as a `ToolCallResult`, filter it, and re-serialize.
@@ -1356,7 +1382,11 @@ fn filter_if_pending(
 /// synthesizes a block envelope under `fail_mode_closed` (else passes through with
 /// a `parse_error` audit line); a `result`-less JSON-RPC error envelope has its
 /// `error.message`/`error.data` sanitized for OSC52/hyperlink payloads (Greptile P1).
-fn apply_output_filter_to_response(mut parsed: Value, fail_mode_closed: bool) -> Option<Vec<u8>> {
+fn apply_output_filter_to_response(
+    mut parsed: Value,
+    fail_mode_closed: bool,
+    filter_ctx: &output_filter::OutputFilterContext,
+) -> Option<Vec<u8>> {
     // Error-response path: error envelopes lack a top-level `result`. Pre-fix this
     // returned `None`, letting an upstream embed OSC52 in `error.message`.
     if parsed.get("result").is_none() {
@@ -1424,7 +1454,7 @@ fn apply_output_filter_to_response(mut parsed: Value, fail_mode_closed: bool) ->
         }
     };
 
-    let outcome = output_filter::filter_tool_result(&mut tool_result, fail_mode_closed);
+    let outcome = output_filter::filter_tool_result(&mut tool_result, fail_mode_closed, filter_ctx);
     write_filter_audit_line(&outcome);
 
     // Re-serialize (camelCase) and splice back into the response.
@@ -2623,7 +2653,13 @@ policy:
         });
         let line = serde_json::to_vec(&upstream).unwrap();
 
-        let filtered = filter_if_pending(&line, &pending, false).expect("OSC52 must be filtered");
+        let filtered = filter_if_pending(
+            &line,
+            &pending,
+            false,
+            &output_filter::OutputFilterContext::default(),
+        )
+        .expect("OSC52 must be filtered");
         let v: Value = serde_json::from_slice(&filtered).unwrap();
 
         // Envelope preserved (id echoed); block contract is isError + a single placeholder.
@@ -2665,7 +2701,13 @@ policy:
         });
         let line = serde_json::to_vec(&upstream).unwrap();
 
-        let filtered = filter_if_pending(&line, &pending, false).expect("must process pending id");
+        let filtered = filter_if_pending(
+            &line,
+            &pending,
+            false,
+            &output_filter::OutputFilterContext::default(),
+        )
+        .expect("must process pending id");
         let v: Value = serde_json::from_slice(&filtered).unwrap();
 
         // Allow path: content identical. `isError` is omitted when false
@@ -2691,7 +2733,13 @@ policy:
             "result": {"content": [{"type": "text", "text": "ok"}]}
         });
         let line = serde_json::to_vec(&upstream).unwrap();
-        assert!(filter_if_pending(&line, &pending, false).is_none());
+        assert!(filter_if_pending(
+            &line,
+            &pending,
+            false,
+            &output_filter::OutputFilterContext::default()
+        )
+        .is_none());
     }
 
     #[test]
@@ -2708,7 +2756,13 @@ policy:
         });
         let line = serde_json::to_vec(&upstream).unwrap();
         // Sanitizer returned no-op → None to caller → pass through.
-        assert!(filter_if_pending(&line, &pending, false).is_none());
+        assert!(filter_if_pending(
+            &line,
+            &pending,
+            false,
+            &output_filter::OutputFilterContext::default()
+        )
+        .is_none());
         assert!(pending.lock().unwrap().is_empty());
     }
 
@@ -2729,8 +2783,13 @@ policy:
             }
         });
         let line = serde_json::to_vec(&upstream).unwrap();
-        let filtered = filter_if_pending(&line, &pending, false)
-            .expect("error-path sanitization must rewrite the envelope");
+        let filtered = filter_if_pending(
+            &line,
+            &pending,
+            false,
+            &output_filter::OutputFilterContext::default(),
+        )
+        .expect("error-path sanitization must rewrite the envelope");
         let v: Value = serde_json::from_slice(&filtered).unwrap();
         let msg = v["error"]["message"].as_str().unwrap();
         assert!(
@@ -2755,8 +2814,13 @@ policy:
             "result": "just-a-string-not-a-tool-result-shape",
         });
         let line = serde_json::to_vec(&upstream).unwrap();
-        let filtered = filter_if_pending(&line, &pending, /*fail_mode_closed=*/ true)
-            .expect("fail-closed must synthesize a block envelope on parse error");
+        let filtered = filter_if_pending(
+            &line,
+            &pending,
+            /*fail_mode_closed=*/ true,
+            &output_filter::OutputFilterContext::default(),
+        )
+        .expect("fail-closed must synthesize a block envelope on parse error");
         let v: Value = serde_json::from_slice(&filtered).unwrap();
         assert_eq!(v["result"]["isError"], true);
         let placeholder = v["result"]["content"][0]["text"].as_str().unwrap();
@@ -2789,7 +2853,12 @@ policy:
             }
         });
         let line = serde_json::to_vec(&upstream).unwrap();
-        let Some(filtered) = filter_if_pending(&line, &pending, false) else {
+        let Some(filtered) = filter_if_pending(
+            &line,
+            &pending,
+            false,
+            &output_filter::OutputFilterContext::default(),
+        ) else {
             // Rule landed at a different severity in this build — not a
             // contract failure for this test. Skip.
             return;
@@ -2824,7 +2893,12 @@ policy:
             }
         });
         let line = serde_json::to_vec(&upstream).unwrap();
-        let filtered = filter_if_pending(&line, &pending, false);
+        let filtered = filter_if_pending(
+            &line,
+            &pending,
+            false,
+            &output_filter::OutputFilterContext::default(),
+        );
         assert!(filtered.is_some(), "missing isError must not be fatal");
     }
 }

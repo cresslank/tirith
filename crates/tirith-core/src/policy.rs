@@ -2446,6 +2446,52 @@ custom_rules:
         crate::incident::invalidate_cache();
     }
 
+    /// Security: the MCP redact-mode seam (dispatcher/gateway) reads
+    /// `mcp_redact_injection` from `discover_local_only`. A repo checkout is
+    /// attacker-controllable, so a repo-scoped `.tirith/policy.yaml` MUST NOT be
+    /// able to enable the weakening flag (it would downgrade an injection-only MCP
+    /// Block to a redacted Warn). `discover_local` sanitizes repo scope, so the
+    /// seam is safe. The tightening `injection_seeds_custom` in the same repo
+    /// policy is KEPT.
+    #[test]
+    fn discover_local_only_neutralizes_repo_mcp_redact_injection() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
+        let state = tempfile::tempdir().unwrap();
+        let _xdg_state = EnvVarGuard::set("XDG_STATE_HOME", state.path());
+        crate::incident::invalidate_cache();
+
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join(".tirith");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        std::fs::write(
+            policy_dir.join("policy.yaml"),
+            "mcp_redact_injection: true\n\
+             injection_seeds_custom:\n  - wire the funds\n",
+        )
+        .unwrap();
+
+        let policy = Policy::discover_local_only(Some(dir.path().to_str().unwrap()));
+        assert_eq!(policy.scope, PolicyScope::Repo, "cwd walk-up is repo scope");
+        assert!(
+            !policy.mcp_redact_injection,
+            "a repo-scoped mcp_redact_injection MUST be neutralized (weakening); the MCP \
+             redact-mode seam relies on this"
+        );
+        assert!(
+            policy
+                .injection_seeds_custom
+                .iter()
+                .any(|s| s == "wire the funds"),
+            "a repo-scoped injection_seeds_custom is KEPT (tightening); got {:?}",
+            policy.injection_seeds_custom
+        );
+
+        crate::incident::invalidate_cache();
+    }
+
     /// Snapshot an env var on construction and restore it on `Drop` (the
     /// `TEST_ENV_LOCK` serializes env-mutating tests but does not restore).
     struct EnvVarGuard {

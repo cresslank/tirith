@@ -25,9 +25,30 @@
 use serde::{Deserialize, Serialize};
 
 use crate::engine::{analyze_output, OutputContext};
+use crate::rules::prompt_injection::CompiledSeeds;
 use crate::verdict::{Action, Finding, Severity};
 
 use super::types::{ContentItem, ToolCallResult};
+
+/// Policy-derived context for [`filter_tool_result`], built once at MCP
+/// server/gateway init from a [`crate::policy::Policy`] discovered OFFLINE
+/// ([`crate::policy::Policy::discover_local_only`], which also neutralizes a
+/// repo-scoped `mcp_redact_injection`). Carries the operator's compiled
+/// `injection_seeds_custom` and the `mcp_redact_injection` flag.
+///
+/// `redact_injection` is carried but NOT yet read here — a later commit adds the
+/// opt-in redact-mode logic. The default (`OutputFilterContext::default()`) holds
+/// no custom seeds and `redact_injection = false`, preserving built-in-only
+/// behavior for callers that have no policy context.
+#[derive(Debug, Clone, Default)]
+pub struct OutputFilterContext {
+    /// Extra prompt-injection seeds compiled from policy `injection_seeds_custom`.
+    pub custom_seeds: CompiledSeeds,
+    /// User/org opt-in to downgrade an injection-only Block to a redacted Warn.
+    /// Repo-scoped `true` is neutralized by `discover_local_only`. Read by a later
+    /// commit; carried here so the seam is in place.
+    pub redact_injection: bool,
+}
 
 /// Per-call scan cap. Beyond it the result is marked truncated and only the first
 /// `MAX_SCAN_BYTES` of concatenated text is scanned. Never drop content silently.
@@ -63,8 +84,14 @@ impl FilterOutcome {
 /// Run the output filter on `result` in place, returning a [`FilterOutcome`] for
 /// audit + routing. `fail_mode_closed`: `true` degrades an analysis error to
 /// BLOCK (default for `mcp-server --sanitize-tool-output`); `false` (gateway
-/// default) degrades to ALLOW.
-pub fn filter_tool_result(result: &mut ToolCallResult, fail_mode_closed: bool) -> FilterOutcome {
+/// default) degrades to ALLOW. `ctx` carries the operator's compiled
+/// `injection_seeds_custom` (scanned alongside the built-in corpus) and the
+/// `redact_injection` flag (carried, not yet read).
+pub fn filter_tool_result(
+    result: &mut ToolCallResult,
+    fail_mode_closed: bool,
+    ctx: &OutputFilterContext,
+) -> FilterOutcome {
     let event_id = uuid::Uuid::new_v4().to_string();
 
     // Concatenate `content[].text` (text items only; others pass through). A NUL
@@ -90,7 +117,13 @@ pub fn filter_tool_result(result: &mut ToolCallResult, fail_mode_closed: bool) -
     }
 
     let start = std::time::Instant::now();
-    let verdict = analyze_output(&joined, OutputContext::default());
+    let verdict = analyze_output(
+        &joined,
+        OutputContext {
+            custom_seeds: ctx.custom_seeds.clone(),
+            ..Default::default()
+        },
+    );
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     let rule_ids: Vec<String> = verdict
@@ -417,7 +450,7 @@ mod tests {
             is_error: false,
             structured_content: None,
         };
-        let outcome = filter_tool_result(&mut result, false);
+        let outcome = filter_tool_result(&mut result, false, &OutputFilterContext::default());
         assert_eq!(outcome.action, Action::Block);
         assert!(result.is_error, "block must set isError=true");
         assert_eq!(
@@ -441,7 +474,7 @@ mod tests {
             structured_content: None,
         };
         let before = result.content[0].text.clone();
-        let outcome = filter_tool_result(&mut result, false);
+        let outcome = filter_tool_result(&mut result, false, &OutputFilterContext::default());
         assert_eq!(outcome.action, Action::Allow);
         assert!(!result.is_error);
         assert_eq!(result.content[0].text, before);
@@ -456,7 +489,7 @@ mod tests {
             is_error: false,
             structured_content: None,
         };
-        let outcome = filter_tool_result(&mut result, false);
+        let outcome = filter_tool_result(&mut result, false, &OutputFilterContext::default());
         assert!(
             matches!(outcome.action, Action::Allow),
             "plain SGR must NOT block; got {:?} (rules: {:?})",
@@ -479,7 +512,7 @@ mod tests {
             is_error: false,
             structured_content: None,
         };
-        let outcome = filter_tool_result(&mut result, false);
+        let outcome = filter_tool_result(&mut result, false, &OutputFilterContext::default());
         // We are not guaranteed Warn here at the verdict level — different
         // severities may apply. Cover the case where it lands at Warn.
         if matches!(outcome.action, Action::Warn) {
@@ -501,7 +534,7 @@ mod tests {
             is_error: false,
             structured_content: None,
         };
-        let outcome = filter_tool_result(&mut result, true);
+        let outcome = filter_tool_result(&mut result, true, &OutputFilterContext::default());
         assert_eq!(
             outcome.action,
             Action::Block,
@@ -520,7 +553,7 @@ mod tests {
             is_error: false,
             structured_content: None,
         };
-        let outcome = filter_tool_result(&mut result, false);
+        let outcome = filter_tool_result(&mut result, false, &OutputFilterContext::default());
         // Open fail-mode: benign content truncated past the cap still passes
         // (rules that fired on the first MAX_SCAN_BYTES are honored; if none
         // fired, the residual passes through).
@@ -549,7 +582,7 @@ mod tests {
             is_error: false,
             structured_content: None,
         };
-        let outcome = filter_tool_result(&mut result, false);
+        let outcome = filter_tool_result(&mut result, false, &OutputFilterContext::default());
         assert_eq!(outcome.action, Action::Block);
         // Block replaces all content with the placeholder — the sibling image
         // (a possible steg vector) is not preserved.
@@ -588,7 +621,7 @@ mod tests {
             is_error: false,
             structured_content: None,
         };
-        let outcome = filter_tool_result(&mut result, false);
+        let outcome = filter_tool_result(&mut result, false, &OutputFilterContext::default());
         // UUID v4 stringified is 36 chars: 8-4-4-4-12
         assert_eq!(outcome.event_id.len(), 36, "{}", outcome.event_id);
         assert_eq!(outcome.event_id.matches('-').count(), 4);
@@ -609,7 +642,7 @@ mod tests {
                 ]
             })),
         };
-        let outcome = filter_tool_result(&mut result, false);
+        let outcome = filter_tool_result(&mut result, false, &OutputFilterContext::default());
         assert_ne!(
             outcome.action,
             Action::Allow,
@@ -637,7 +670,7 @@ mod tests {
                 "nested": { "items": ["plain", "a\x1B[2J\u{FEFF}b"] }
             })),
         };
-        let outcome = filter_tool_result(&mut result, false);
+        let outcome = filter_tool_result(&mut result, false, &OutputFilterContext::default());
         assert_eq!(
             outcome.action,
             Action::Allow,
@@ -689,7 +722,7 @@ mod tests {
             is_error: false,
             structured_content: Some(serde_json::Value::Object(map)),
         };
-        let outcome = filter_tool_result(&mut result, false);
+        let outcome = filter_tool_result(&mut result, false, &OutputFilterContext::default());
         assert_ne!(
             outcome.action,
             Action::Allow,
@@ -719,7 +752,7 @@ mod tests {
             is_error: false,
             structured_content: Some(serde_json::Value::Object(map)),
         };
-        let outcome = filter_tool_result(&mut result, false);
+        let outcome = filter_tool_result(&mut result, false, &OutputFilterContext::default());
         assert_eq!(
             outcome.action,
             Action::Allow,

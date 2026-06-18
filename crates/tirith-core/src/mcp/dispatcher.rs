@@ -40,6 +40,31 @@ pub fn run_with_options(
 ) -> i32 {
     let mut state = State::AwaitingInit;
 
+    // C3a — MCP policy seam. The dispatcher holds no core `Policy`, so discover
+    // one ONCE at server init (OFFLINE: no network, and `discover_local_only`
+    // neutralizes a repo-scoped `mcp_redact_injection`), compile the operator's
+    // `injection_seeds_custom`, and read the redact flag into an
+    // `OutputFilterContext` reused for every `tools/call`. Built only when the
+    // filter is enabled; the default-off path stays allocation-free. A bad custom
+    // seed is surfaced by `tirith policy validate`, so the bad-list is dropped
+    // here (no `eprintln!` on the server's hot path).
+    let filter_ctx: output_filter::OutputFilterContext = if options.sanitize_tool_output {
+        let policy = crate::policy::Policy::discover_local_only(
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .as_deref(),
+        );
+        let (custom_seeds, _bad) =
+            crate::rules::prompt_injection::compile_seeds(&policy.injection_seeds_custom);
+        output_filter::OutputFilterContext {
+            custom_seeds,
+            redact_injection: policy.mcp_redact_injection,
+        }
+    } else {
+        output_filter::OutputFilterContext::default()
+    };
+
     /// Max line size (caps memory from a single huge JSON-RPC message).
     const MAX_LINE_BYTES: usize = 10 * 1024 * 1024;
 
@@ -250,8 +275,11 @@ pub fn run_with_options(
                     if options.sanitize_tool_output {
                         // M7 ch4 — fail closed (deny on truncation), stricter than
                         // the gateway default: the calling agent is the
-                        // highest-privilege consumer of these results.
-                        let outcome = output_filter::filter_tool_result(&mut result, true);
+                        // highest-privilege consumer of these results. C3a — pass
+                        // the once-discovered policy seam (custom seeds + redact
+                        // flag).
+                        let outcome =
+                            output_filter::filter_tool_result(&mut result, true, &filter_ctx);
                         write_filter_audit(&mut log, &outcome);
                     }
                     match serde_json::to_value(result) {

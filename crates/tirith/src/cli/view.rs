@@ -27,7 +27,21 @@ pub const DEFAULT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// analyzer over the bytes in streaming chunks, prints the sanitized content
 /// to stdout, and prints the finding list to stderr (or as JSON when `json`).
 pub fn run(path: Option<&Path>, max_bytes: u64, json: bool) -> i32 {
-    let mut state = OutputAnalyzerState::default();
+    // C3a — honor operator/org `injection_seeds_custom` here too: a coding agent
+    // reading a file back through `tirith view` should be scanned against the same
+    // custom seeds as the paste/MCP paths. Discover OFFLINE (`discover_local_only`,
+    // no network; a repo-scoped weakening flag is neutralized inside) from the
+    // file's parent dir (or cwd for stdin). A bad seed is reported by `tirith
+    // policy validate`, so the bad-list is dropped here.
+    let seed_cwd = path
+        .and_then(|p| p.parent())
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.display().to_string());
+    let policy = tirith_core::policy::Policy::discover_local_only(seed_cwd.as_deref());
+    let (custom_seeds, _bad) =
+        tirith_core::rules::prompt_injection::compile_seeds(&policy.injection_seeds_custom);
+
+    let mut state = OutputAnalyzerState::with_custom_seeds(custom_seeds);
     let mut sanitized = Vec::new();
     let mut total_bytes: u64 = 0;
     let mut truncated = false;
