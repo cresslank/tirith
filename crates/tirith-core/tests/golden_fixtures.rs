@@ -484,6 +484,7 @@ const ALL_FIXTURE_FILES: &[&str] = &[
     "cifile.toml",
     "aifile.toml",
     "threatintel.toml",
+    "injection_evasion.toml",
 ];
 
 /// Output-direction fixtures — NOT in `ALL_FIXTURE_FILES` (those drive
