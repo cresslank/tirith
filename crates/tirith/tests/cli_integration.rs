@@ -3618,8 +3618,8 @@ fn threatdb_sources_lists_all_feeds_with_counts() {
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("sources JSON");
     assert_eq!(v["db_installed"], true);
     let sources = v["sources"].as_array().expect("sources array");
-    // All 11 ThreatSource variants must be listed.
-    assert_eq!(sources.len(), 11, "every threat source must be listed");
+    // All 12 ThreatSource variants must be listed.
+    assert_eq!(sources.len(), 12, "every threat source must be listed");
     // The fixture has 2 OSSF-malicious package records.
     let ossf = sources
         .iter()
@@ -3771,7 +3771,7 @@ fn threatdb_alias_threatdb_still_works() {
         "the `threatdb` alias must still work"
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("sources JSON via alias");
-    assert_eq!(v["sources"].as_array().unwrap().len(), 11);
+    assert_eq!(v["sources"].as_array().unwrap().len(), 12);
 }
 
 // verify-self / update / version --provenance (M2 item 24) These tests run the CLI end-to-end.
