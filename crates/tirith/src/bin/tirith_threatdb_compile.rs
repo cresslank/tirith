@@ -15,8 +15,8 @@ use ed25519_dalek::{Signer, SigningKey};
 
 use tirith_core::threatdb::{Confidence, Ecosystem, ThreatDbWriter, ThreatSource};
 use tirith_core::threatdb_feeds::{
-    parse_domain_blocklist, parse_phishtank_csv, parse_threatfox_zip, parse_tor_exit_list,
-    parse_urlhaus_csv,
+    parse_domain_blocklist, parse_exfil_endpoint_list, parse_phishtank_csv, parse_threatfox_zip,
+    parse_tor_exit_list, parse_urlhaus_csv,
 };
 
 #[derive(Parser)]
@@ -71,6 +71,12 @@ struct Cli {
     /// Tor bulk exit list (Phase B)
     #[arg(long)]
     tor_exit: Option<PathBuf>,
+
+    /// Curated exfiltration-endpoint / webhook-catcher hostname list. Plain
+    /// domain-per-line blocklist; compiled into the signed primary DB under
+    /// ThreatSource::ExfilEndpoint. Optional — skipped if not supplied.
+    #[arg(long)]
+    exfil_endpoints: Option<PathBuf>,
 
     /// Env var name containing Ed25519 private key (base64-encoded)
     #[arg(long)]
@@ -580,6 +586,19 @@ fn parse_blocklist_file(path: &Path) -> Vec<String> {
     }
 }
 
+fn parse_exfil_endpoints_file(path: &Path) -> Vec<String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => parse_exfil_endpoint_list(&contents).hostnames,
+        Err(e) => {
+            eprintln!(
+                "warning: cannot read exfil-endpoint list {}: {e}",
+                path.display()
+            );
+            Vec::new()
+        }
+    }
+}
+
 fn parse_phishtank_file(path: &Path) -> Vec<String> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -1007,6 +1026,15 @@ fn main() {
         Vec::new()
     };
 
+    let exfil_endpoint_hosts = if let Some(ref path) = cli.exfil_endpoints {
+        eprintln!("  parsing exfil endpoints from {}", path.display());
+        let hosts = parse_exfil_endpoints_file(path);
+        eprintln!("    {} hostnames", hosts.len());
+        hosts
+    } else {
+        Vec::new()
+    };
+
     // Load signing key
     let signing_key = load_signing_key(cli.sign_key_env.as_deref(), cli.sign_key_file.as_deref());
 
@@ -1057,6 +1085,10 @@ fn main() {
 
     for host in &phishtank_hosts {
         writer.add_hostname(host, ThreatSource::PhishTank);
+    }
+
+    for host in &exfil_endpoint_hosts {
+        writer.add_hostname(host, ThreatSource::ExfilEndpoint);
     }
 
     for ip in &tor_exit_ips {

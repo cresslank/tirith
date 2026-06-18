@@ -1,0 +1,21 @@
+# Exfiltration-endpoint / webhook-catcher hostname blocklist (TEMPLATE).
+#
+# This file is a FICTIONAL example/template, NOT authoritative threat data. The
+# entries below are reserved example/invalid TLDs (RFC 2606 / RFC 6761) and
+# never resolve. Tirith does not ship a real curated exfil list in-tree; the
+# operator supplies one at CI time and points the compiler at it via:
+#
+#     tirith-threatdb-compile --exfil-endpoints <path-to-real-list> ...
+#
+# Format: one hostname per line. Blank lines and lines starting with `#` are
+# ignored. Hosts-file style lines ("0.0.0.0 host") are tolerated; the last token
+# on the line is taken as the hostname. Parsed by
+# threatdb_feeds::parse_exfil_endpoint_list (a thin wrapper over the shared
+# domain-blocklist parser).
+#
+# Sources to curate from (examples, not bundled): known request-bin / webhook
+# inspector services, paste-and-collect endpoints, and dynamic-DNS C2 hosts
+# observed exfiltrating secrets read back by an agent.
+exfil-sink.example
+webhook-catcher.invalid
+collect.example.test

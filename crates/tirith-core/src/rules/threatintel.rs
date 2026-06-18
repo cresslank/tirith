@@ -635,7 +635,8 @@ fn hostname_rule_for_source(source: threatdb::ThreatSource) -> (RuleId, Severity
         | threatdb::ThreatSource::EcosystemsTyposquat
         | threatdb::ThreatSource::CisaKev
         | threatdb::ThreatSource::FireholIp
-        | threatdb::ThreatSource::TorExit => (
+        | threatdb::ThreatSource::TorExit
+        | threatdb::ThreatSource::ExfilEndpoint => (
             RuleId::ThreatMaliciousUrl,
             Severity::High,
             "malicious hostname",
@@ -660,7 +661,8 @@ fn ip_rule_for_source(source: threatdb::ThreatSource) -> (RuleId, Severity, &'st
         | threatdb::ThreatSource::Urlhaus
         | threatdb::ThreatSource::PhishingArmy
         | threatdb::ThreatSource::PhishTank
-        | threatdb::ThreatSource::FireholIp => {
+        | threatdb::ThreatSource::FireholIp
+        | threatdb::ThreatSource::ExfilEndpoint => {
             (RuleId::ThreatMaliciousIp, Severity::High, "malicious IP")
         }
     }

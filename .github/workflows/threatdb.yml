@@ -61,16 +61,36 @@ jobs:
             exit 1
           fi
 
+      # Optional: materialize the curated exfil-endpoint / webhook-catcher
+      # hostname list from a repo secret. No real list ships in-tree; when the
+      # THREATDB_EXFIL_ENDPOINTS secret is unset the build simply skips the feed.
+      - name: Materialize exfil-endpoint feed
+        env:
+          THREATDB_EXFIL_ENDPOINTS: ${{ secrets.THREATDB_EXFIL_ENDPOINTS }}
+        run: |
+          if [ -n "$THREATDB_EXFIL_ENDPOINTS" ]; then
+            printf '%s\n' "$THREATDB_EXFIL_ENDPOINTS" > /tmp/exfil-endpoints.txt
+            echo "Exfil-endpoint feed provided ($(grep -cve '^\s*#' -e '^\s*$' /tmp/exfil-endpoints.txt) entries)."
+          else
+            echo "No exfil-endpoint secret set; skipping the feed."
+          fi
+
       # Compile + sign
       - name: Compile threat database
         env:
           TIRITH_THREATDB_SIGNING_KEY: ${{ secrets.THREATDB_SIGNING_KEY }}
         run: |
+          # Pass --exfil-endpoints only when the optional feed was materialized.
+          EXFIL_ARG=""
+          if [ -f /tmp/exfil-endpoints.txt ]; then
+            EXFIL_ARG="--exfil-endpoints /tmp/exfil-endpoints.txt"
+          fi
           ./target/release/tirith-threatdb-compile \
             --ossf /tmp/ossf-mp \
             --datadog /tmp/dd-mp \
             --feodo /tmp/feodo.txt \
             --cisa-kev /tmp/cisa-kev.json \
+            $EXFIL_ARG \
             --sequence "${RUN_ID}" \
             --sign-key-env TIRITH_THREATDB_SIGNING_KEY \
             --output "tirith-threatdb-${RUN_ID}-${RUN_ATTEMPT}.dat"
