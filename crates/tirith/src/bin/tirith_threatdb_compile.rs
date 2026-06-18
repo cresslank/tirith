@@ -586,17 +586,15 @@ fn parse_blocklist_file(path: &Path) -> Vec<String> {
     }
 }
 
-fn parse_exfil_endpoints_file(path: &Path) -> Vec<String> {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => parse_exfil_endpoint_list(&contents).hostnames,
-        Err(e) => {
-            eprintln!(
-                "warning: cannot read exfil-endpoint list {}: {e}",
-                path.display()
-            );
-            Vec::new()
-        }
-    }
+/// Parse the explicit exfil-endpoint feed. FALLIBLE on purpose: `--exfil-endpoints
+/// <path>` means the operator INTENDED that primary feed, so an unreadable path
+/// must NOT silently degrade to zero endpoints (which would let CI publish a
+/// weakened, signed threat DB after a transient path/permission failure). The read
+/// error is propagated so the call site can exit non-zero. Contrast: a feed that is
+/// simply not supplied stays a no-op (the call site skips this entirely).
+fn parse_exfil_endpoints_file(path: &Path) -> std::io::Result<Vec<String>> {
+    let contents = std::fs::read_to_string(path)?;
+    Ok(parse_exfil_endpoint_list(&contents).hostnames)
 }
 
 fn parse_phishtank_file(path: &Path) -> Vec<String> {
@@ -1028,7 +1026,15 @@ fn main() {
 
     let exfil_endpoint_hosts = if let Some(ref path) = cli.exfil_endpoints {
         eprintln!("  parsing exfil endpoints from {}", path.display());
-        let hosts = parse_exfil_endpoints_file(path);
+        // Fail closed: an explicitly-supplied feed that cannot be read must abort
+        // rather than sign a DB with zero exfil endpoints (a weakened DB).
+        let hosts = parse_exfil_endpoints_file(path).unwrap_or_else(|e| {
+            eprintln!(
+                "error: cannot read explicitly-supplied exfil-endpoint list {}: {e}",
+                path.display()
+            );
+            std::process::exit(1);
+        });
         eprintln!("    {} hostnames", hosts.len());
         hosts
     } else {
@@ -1369,6 +1375,34 @@ mod tests {
         assert_eq!(entries[0].ecosystem, Ecosystem::PyPI);
         assert_eq!(entries[0].name, "reqeusts");
         assert_eq!(entries[0].target_name, "requests");
+    }
+
+    #[test]
+    fn test_exfil_endpoints_read_error_is_fatal_err() {
+        // An explicitly-supplied feed that cannot be read must surface an Err so the
+        // call site can exit non-zero (fail closed). Previously this logged a warning
+        // and returned an empty Vec, letting CI sign a weakened DB.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.txt");
+        let result = parse_exfil_endpoints_file(&missing);
+        assert!(
+            result.is_err(),
+            "an unreadable explicit exfil feed must return Err, not an empty Vec"
+        );
+
+        // A readable feed still parses to its hostnames (the no-op vs. real-feed
+        // distinction is preserved: a supplied, readable feed yields entries).
+        let path = dir.path().join("exfil.txt");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "# exfil endpoints").unwrap();
+        writeln!(f, "evil-webhook.example").unwrap();
+        writeln!(f, "catcher.example").unwrap();
+        drop(f);
+        let hosts = parse_exfil_endpoints_file(&path).expect("a readable feed must parse");
+        assert!(
+            hosts.iter().any(|h| h == "evil-webhook.example"),
+            "the readable feed's hostnames must be returned, got {hosts:?}"
+        );
     }
 
     #[test]
