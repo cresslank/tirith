@@ -16,6 +16,8 @@
   <img alt="Vercel OSS Program" src="https://vercel.com/oss/program-badge-2026.svg" />
 </a>
 
+<sub>Tirith is part of the Vercel Open Source Program (Spring 2026 Cohort).</sub>
+
 ---
 
 Can you spot the difference?
@@ -32,8 +34,7 @@ Browsers solved this years ago. Terminals still render Unicode, ANSI escapes, an
 **Tirith stands at the gate.** It intercepts commands, pasted content, and scanned files for homograph URLs, obfuscated payloads, credential exfiltration, malicious AI skills/configs, and known-bad packages/domains/IPs from a signed threat intelligence database before they execute.
 
 ```bash
-brew install sheeki03/tap/tirith
-brew trust --formula sheeki03/tap/tirith   # Homebrew 5.1.15+ tap trust
+brew install tirith
 ```
 
 Then activate in your shell profile:
@@ -431,15 +432,8 @@ Beyond single commands, several command groups extend the gate to your operating
 **Homebrew:**
 
 ```bash
-brew install sheeki03/tap/tirith
-brew trust --formula sheeki03/tap/tirith   # Homebrew 5.1.15+ tap trust
+brew install tirith
 ```
-
-Homebrew 5.1.15 and newer treat third-party taps as untrusted until you opt in
-(loading a tap evaluates its Ruby). `brew trust --formula sheeki03/tap/tirith`
-trusts just this formula; `brew trust sheeki03/tap` trusts the whole tap. Without
-it you'll see a "tap is not trusted" warning, and from Homebrew 5.2.0 / 6.0.0
-(whichever lands first) the trust step becomes required.
 
 ### Linux Packages
 
