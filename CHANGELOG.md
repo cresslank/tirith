@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-06-19
+
 ### Added
 
 - **Evasion-resistant prompt-injection detection:** a shared `deobfuscate` text-normalization pass (zero-width / invisible strip, Unicode confusable skeleton, NFKC, inter-character whitespace collapse, bounded leetspeak fold, and short base64 / hex decode behind a printable gate). Prompt-injection and config-file scanning now run against these normalized variants in addition to the raw input; raw scanning is never replaced. Typoglycemia (character transposition) is out of scope for now.
