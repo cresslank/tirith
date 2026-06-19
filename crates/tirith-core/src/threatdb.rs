@@ -185,6 +185,10 @@ pub enum ThreatSource {
     ThreatFoxIoc = 8,
     FireholIp = 9,
     TorExit = 10,
+    /// Known data-exfiltration / webhook-catcher endpoints (hostnames). Curated
+    /// list supplied at CI time; compiled into the signed primary DB. Appended
+    /// as discriminant 11 so older `.dat` files (sources 0-10) still load.
+    ExfilEndpoint = 11,
 }
 
 impl ThreatSource {
@@ -201,12 +205,13 @@ impl ThreatSource {
             8 => Some(Self::ThreatFoxIoc),
             9 => Some(Self::FireholIp),
             10 => Some(Self::TorExit),
+            11 => Some(Self::ExfilEndpoint),
             _ => None,
         }
     }
 
     /// Every threat source variant, in stable declaration order.
-    pub const ALL: [ThreatSource; 11] = [
+    pub const ALL: [ThreatSource; 12] = [
         Self::OssfMalicious,
         Self::DatadogMalicious,
         Self::FeodoTracker,
@@ -218,6 +223,7 @@ impl ThreatSource {
         Self::ThreatFoxIoc,
         Self::FireholIp,
         Self::TorExit,
+        Self::ExfilEndpoint,
     ];
 
     /// Stable machine-readable identifier (snake_case). Used as the key in
@@ -235,6 +241,7 @@ impl ThreatSource {
             Self::ThreatFoxIoc => "threatfox_ioc",
             Self::FireholIp => "firehol_ip",
             Self::TorExit => "tor_exit",
+            Self::ExfilEndpoint => "exfil_endpoint",
         }
     }
 
@@ -246,7 +253,8 @@ impl ThreatSource {
             | Self::DatadogMalicious
             | Self::FeodoTracker
             | Self::EcosystemsTyposquat
-            | Self::CisaKev => SourceTier::Primary,
+            | Self::CisaKev
+            | Self::ExfilEndpoint => SourceTier::Primary,
             Self::Urlhaus
             | Self::PhishingArmy
             | Self::PhishTank
@@ -272,6 +280,8 @@ impl ThreatSource {
             Self::ThreatFoxIoc => "https://threatfox.abuse.ch/",
             Self::FireholIp => "https://iplists.firehol.org/",
             Self::TorExit => "https://www.torproject.org/",
+            // Curated in-tree feed, not a third-party project; point at the repo.
+            Self::ExfilEndpoint => "https://github.com/sheeki03/tirith",
         }
     }
 
@@ -289,6 +299,7 @@ impl ThreatSource {
             Self::ThreatFoxIoc => "ThreatFox IOC",
             Self::FireholIp => "FireHOL IP",
             Self::TorExit => "Tor Exit Node",
+            Self::ExfilEndpoint => "Exfiltration Endpoint",
         }
     }
 
@@ -296,6 +307,8 @@ impl ThreatSource {
     pub fn default_confidence(self) -> Confidence {
         match self {
             Self::TorExit => Confidence::Medium,
+            // Curated exfil destinations are confirmed-bad, like the other
+            // network-indicator hostname feeds.
             Self::OssfMalicious
             | Self::DatadogMalicious
             | Self::FeodoTracker
@@ -305,7 +318,8 @@ impl ThreatSource {
             | Self::PhishingArmy
             | Self::PhishTank
             | Self::ThreatFoxIoc
-            | Self::FireholIp => Confidence::Confirmed,
+            | Self::FireholIp
+            | Self::ExfilEndpoint => Confidence::Confirmed,
         }
     }
 }
@@ -2682,9 +2696,9 @@ mod tests {
         for src in ThreatSource::ALL {
             assert!(seen.insert(src as u8), "ALL has a duplicate: {src:?}");
         }
-        assert_eq!(ThreatSource::ALL.len(), 11);
+        assert_eq!(ThreatSource::ALL.len(), 12);
         assert!(
-            ThreatSource::from_u8(11).is_none(),
+            ThreatSource::from_u8(12).is_none(),
             "from_u8 must reject an out-of-range discriminant"
         );
     }
@@ -2704,13 +2718,15 @@ mod tests {
 
     #[test]
     fn threat_source_tier_split_matches_feed_origin() {
-        // The five feeds compiled into the signed CI DB are Primary.
+        // The feeds compiled into the signed CI DB are Primary (incl. the
+        // curated exfil-endpoint hostname feed).
         for src in [
             ThreatSource::OssfMalicious,
             ThreatSource::DatadogMalicious,
             ThreatSource::FeodoTracker,
             ThreatSource::EcosystemsTyposquat,
             ThreatSource::CisaKev,
+            ThreatSource::ExfilEndpoint,
         ] {
             assert_eq!(src.tier(), SourceTier::Primary, "{src:?} should be primary");
         }

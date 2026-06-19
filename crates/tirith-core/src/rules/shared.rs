@@ -14,7 +14,10 @@ pub const MIN_BASE64_BLOB_LEN: usize = 96;
 /// 4 so the prefix is itself well-formed base64). The detection is preserved for
 /// real embedded secrets, which are far smaller than the cap; a giant blob still
 /// matches (its prefix decodes) but bounds the work.
-const MAX_BASE64_VALIDATE_LEN: usize = 8 * 1024;
+///
+/// `pub(crate)` so `deobfuscate`'s short-blob decoder reuses the same upper bound
+/// (it scans a much lower 16-char floor but must cap decode work identically).
+pub(crate) const MAX_BASE64_VALIDATE_LEN: usize = 8 * 1024;
 
 /// Whether `content` contains a long base64 run that actually decodes (standard
 /// or URL-safe, padded or not): the shape of an encoded payload smuggled into a
@@ -89,6 +92,39 @@ pub const SENSITIVE_KEY_VARS: &[&str] = &[
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "GITHUB_TOKEN",
+];
+
+/// Sensitive filesystem paths (credential directories, runtime sockets, and the
+/// devcontainer `${env:HOME}` / `${localEnv:HOME}` variable forms) that a config
+/// file should not bind-mount. Consumed by `configfile.rs` (bind-mount detection).
+///
+/// NOT shared with `exfil.rs`: the output-side read-and-send directive in
+/// `exfil.rs` maintains its OWN sensitive-path list (a regex path-alternation of a
+/// DIFFERENT shape, `~/.ssh` | `/etc/` | `.env` | `id_rsa` | …) inline in its
+/// rule. The two lists are independent and must be updated together by hand when a
+/// path class changes. They are not merged because their shapes differ (this exact
+/// `&[&str]` of mount targets vs. a regex fragment).
+///
+/// This is ALSO distinct from `command.rs`'s private credential-FILE list
+/// (`/etc/passwd`, `~/.ssh/id_rsa`), which drives the curl-exfil command rule;
+/// those have different shapes on purpose and must not be merged either.
+pub const SENSITIVE_BIND_PATHS: &[&str] = &[
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/var/run/podman/podman.sock",
+    "~/.ssh",
+    "~/.aws",
+    "~/.kube",
+    "~/.docker",
+    "/etc",
+    "/root/.ssh",
+    "/root/.aws",
+    "${env:HOME}/.ssh",
+    "${env:HOME}/.aws",
+    "${env:HOME}/.docker",
+    "${localEnv:HOME}/.ssh",
+    "${localEnv:HOME}/.aws",
+    "${localEnv:HOME}/.docker",
 ];
 
 /// Known URL-shortener hosts. Centralised so `transport.rs` (`ShortenedUrl`) and

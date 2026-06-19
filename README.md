@@ -160,7 +160,7 @@ Nothing. Zero output. You forget tirith is running.
 | **Rendered content** | Hidden CSS/color content, hidden HTML attributes, comment content analysis (prompt injection at High, destructive commands at Medium) |
 | **Cloaking detection** | Server-side cloaking (bot vs browser), clipboard hidden content, PDF hidden text |
 | **Windows / PowerShell** | `Set-ExecutionPolicy Bypass` / `-ep`, Windows Defender exclusions (`Add-MpPreference -Exclusion*`), inline `iex (iwr ...)` download-execute |
-| **Terminal output defense** | OSC 52 clipboard writes, fake prompts, OSC 8 hyperlink and title / clear-screen manipulation, and prompt injection inside command or MCP tool output |
+| **Terminal output defense** | OSC 52 clipboard writes, fake prompts, OSC 8 hyperlink and title / clear-screen manipulation, prompt injection inside command or MCP tool output (scanned both raw and deobfuscated, so invisible-character, confusable, spaced-out, leetspeak, and short base64 / hex evasions are caught too), and output data exfiltration (beacon URLs or "read a secret then send it" directives) |
 | **Operational context** | Destructive commands against labeled-prod cloud / k8s contexts and SSH hosts, Terraform / Pulumi / OpenTofu `apply` without a matching saved plan, risky sudo escalation, privileged `docker run` |
 | **Workstation & persistence** | Loose-permission credential files and plaintext tokens (`~/.ssh`, `~/.aws`, `.npmrc`), persistence footholds (shell rc, `authorized_keys`, crontab, LaunchAgents, git `core.hooksPath`), PATH-hijack ordering, executable provenance, risky aliases, and sensitive env-var lifecycle |
 | **Blast radius & correlation** | Deletes that escape the repo, mass deletions, executing files downloaded from risky sources, and session chains such as secret-write then network or delete then `git push --force` |
@@ -351,7 +351,7 @@ Two policy fields govern which servers and tools are accepted: `scan.trusted_mcp
 
 **What it catches in configs:**
 
-- **Prompt injection** — skill activation triggers, permission bypass attempts, safety dismissal, identity reassignment, cross-tool override instructions
+- **Prompt injection** (skill activation triggers, permission bypass attempts, safety dismissal, identity reassignment, cross-tool override instructions). Each file is scanned both raw and deobfuscated (invisible characters, confusables, inter-character spacing, leetspeak, short base64 / hex), so a seed hidden behind encoding still fires
 - **Invisible Unicode** — zero-width characters (including Mongolian Vowel Separator), bidi controls, soft hyphens, Unicode tags, Hangul fillers, invisible whitespace encoding, math alphanumeric confusables
 - **MCP config issues** — insecure HTTP connections, raw IP servers, shell metacharacters in args, duplicate server names, wildcard tool access
 
@@ -418,7 +418,7 @@ Beyond single commands, several command groups extend the gate to your operating
 
 ## Output, paste & sharing safety
 
-- **Output-direction defense** (`tirith view`, `tirith output`, `gateway run --filter-output`, `mcp-server --sanitize-tool-output`) neutralizes terminal-deception escapes in command and MCP tool output: OSC 52 clipboard writes, fake prompts, OSC 8 hyperlink mismatch, and title / clear-screen manipulation.
+- **Output-direction defense** (`tirith view`, `tirith output`, `gateway run --filter-output`, `mcp-server --sanitize-tool-output`) neutralizes terminal-deception escapes in command and MCP tool output: OSC 52 clipboard writes, fake prompts, OSC 8 hyperlink mismatch, and title / clear-screen manipulation. It also scans output for prompt injection (raw and deobfuscated) and data-exfiltration beacons. Add your own injection seeds with the `injection_seeds_custom` policy field, and opt in to redacting an injection-only MCP block down to a warning (instead of blocking the whole output) with `mcp_redact_injection`.
 - **Audience-aware redaction** (`tirith share`, `tirith redact`, `tirith logs`) strips secrets and customer / tenant IDs before you paste into a GitHub issue, Slack, an LLM, or a public paste.
 - **Paste provenance** (`tirith paste --with-source`, `tirith browser`). With the companion Chrome native-messaging host installed, tirith attributes a pasted command to its source page and flags a paste whose source host differs from where the command runs.
 

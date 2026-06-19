@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Evasion-resistant prompt-injection detection:** a shared `deobfuscate` text-normalization pass (zero-width / invisible strip, Unicode confusable skeleton, NFKC, inter-character whitespace collapse, bounded leetspeak fold, and short base64 / hex decode behind a printable gate). Prompt-injection and config-file scanning now run against these normalized variants in addition to the raw input; raw scanning is never replaced. Typoglycemia (character transposition) is out of scope for now.
+- **`PromptInjectionObfuscated`** (High): a new rule for an injection seed that matches only after deobfuscation, where the obfuscation itself is the signal. Raw matches still fire `IgnorePreviousInstructions` / `PromptInjectionInOutput`.
+- **`OutputDataExfiltration`** (High, MITRE T1041): a new `exfil` rule for markdown / URL beacons carrying a secret-shaped token or canary, secret-shaped URL query values, and "read a sensitive path then send / post / upload" directives (including the "do not tell the user" stealth directive).
+- **`injection_seeds_custom`** policy field: add your own prompt-injection seed regexes via `.tirith/policy.yaml`, user, or org policy. A repo-scoped policy may add seeds (it can only tighten). Invalid regexes are reported by `tirith policy validate` and skipped rather than failing the load.
+- **`mcp_redact_injection`** policy field (default off): opt-in to downgrade an injection-only MCP tool-output block to a redacted warning, blanking the seed spans and forwarding the rest. Only user / org scope can enable it (a repo-scoped policy cannot weaken this), and it refuses to downgrade when any non-injection finding blocks or when structured content is present.
+- **threatdb `ExfilEndpoint` source** (Primary tier): a known-exfiltration-endpoint hostname source, populated from the CI threat feed.
+
+### Fixed
+
+- **`.deb` / `verify-self` byte mismatch (issue #146):** the Debian package now ships the exact canonical release binary instead of a separate rebuild, so an apt-installed tirith passes `tirith verify-self`. A release CI guard asserts the `.deb` binary is byte-identical to the published tarball binary. The `.rpm` is still rebuilt against the target distro's glibc (so it keeps running on RHEL / Rocky 9) and is intentionally not byte-identical.
+- **`verify-self` no longer falsely flags source-built installs:** `cargo install`, AUR, and the distribution `.rpm` are compiled from source or against a different libc, so they cannot be byte-compared to the generic release binary. They now report an honest "unverified" (exit 0) rather than a false "modified or replaced" failure, and AUR installs on Arch and its derivatives are detected as such. Homebrew is handled the same way: the homebrew-core formula builds from source (distributed as a bottle), so a mismatch downgrades to "unverified" naming `brew install sheeki03/tap/tirith`, while the prebuilt tap binary still verifies.
+- **Scoop autoupdate URL:** the release workflow no longer corrupts the manifest's autoupdate template (a loose version-matching pattern was rewriting the literal `v$version` to `v0.3.2$version`).
+
 ## [0.3.2] - 2026-06-16
 
 ### Added

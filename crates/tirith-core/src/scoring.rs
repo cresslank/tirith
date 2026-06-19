@@ -222,6 +222,9 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         // M7 ch5 — prompt-injection seed phrases (text matching), not threat-DB.
         | RuleId::PromptInjectionInOutput
         | RuleId::IgnorePreviousInstructions
+        | RuleId::PromptInjectionObfuscated
+        // C7 — output-side data-exfiltration vector (content match), not threat-DB.
+        | RuleId::OutputDataExfiltration
         // M8 ch1 — operational-context rules (verbs vs operator labels).
         | RuleId::ContextProdDestructiveCommand
         | RuleId::ContextProdWriteOperation

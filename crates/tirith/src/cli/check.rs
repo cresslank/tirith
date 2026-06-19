@@ -325,6 +325,12 @@ pub fn run(
     let policy =
         engine_policy.unwrap_or_else(|| tirith_core::policy::Policy::discover(cwd.as_deref()));
     crate::cli::warn_repo_policy_neutralized(&policy);
+    // Surface an invalid `injection_seeds_custom` regex (compiled and silently
+    // dropped during analysis) to the operator. UNCONDITIONAL by design: on the
+    // local path `policy` is the engine's; on the daemon path it is the client-side
+    // `Policy::discover` resolved just above (the daemon server does NOT surface bad
+    // seeds), so the operator sees the warning on either path. Cheap: few seeds.
+    crate::cli::warn_bad_injection_seeds(&policy);
 
     if ran_locally {
         let runtime_findings = tirith_core::threatdb_api::enrich_command(

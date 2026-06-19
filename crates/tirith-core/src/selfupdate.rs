@@ -156,7 +156,7 @@ pub fn detect_install_method(canonical_path: &Path) -> InstallMethod {
     InstallMethod::Unknown
 }
 
-/// Refine a system-path [`InstallMethod::Unknown`] into `Apt` vs `Dnf` from an
+/// Refine a system-path [`InstallMethod::Unknown`] into `Apt`, `Dnf`, or `Aur` from an
 /// `/etc/os-release` `ID`/`ID_LIKE` token list (passed in so it's testable
 /// without reading `/etc`). Non-`Unknown` methods and unrecognized OS families
 /// are returned unchanged.
@@ -176,6 +176,13 @@ pub fn refine_system_pm(method: InstallMethod, os_release_ids: &[String]) -> Ins
         || is("opensuse")
     {
         return InstallMethod::Dnf;
+    }
+    // Arch family: tirith is not in the official Arch repos, so a system-path
+    // install on Arch or a derivative came from the AUR (compiled from source by
+    // an AUR helper). Derivatives (manjaro/endeavouros/artix) set `ID_LIKE=arch`,
+    // so `is("arch")` catches them; the explicit IDs are belt-and-suspenders.
+    if is("arch") || is("manjaro") || is("endeavouros") || is("artix") {
+        return InstallMethod::Aur;
     }
     InstallMethod::Unknown
 }
@@ -541,6 +548,24 @@ mod tests {
     fn refine_system_pm_fedora_family() {
         let m = refine_system_pm(InstallMethod::Unknown, &["fedora".to_string()]);
         assert_eq!(m, InstallMethod::Dnf);
+    }
+
+    #[test]
+    fn refine_system_pm_arch_family_is_aur() {
+        // Arch ID, and a derivative that only sets ID_LIKE=arch, both refine to
+        // AUR (tirith is not in the official Arch repos, so a /usr/bin install on
+        // Arch came from an AUR helper that compiled it from source).
+        assert_eq!(
+            refine_system_pm(InstallMethod::Unknown, &["arch".to_string()]),
+            InstallMethod::Aur
+        );
+        assert_eq!(
+            refine_system_pm(
+                InstallMethod::Unknown,
+                &["manjaro".to_string(), "arch".to_string()]
+            ),
+            InstallMethod::Aur
+        );
     }
 
     #[test]

@@ -15,8 +15,8 @@ use ed25519_dalek::{Signer, SigningKey};
 
 use tirith_core::threatdb::{Confidence, Ecosystem, ThreatDbWriter, ThreatSource};
 use tirith_core::threatdb_feeds::{
-    parse_domain_blocklist, parse_phishtank_csv, parse_threatfox_zip, parse_tor_exit_list,
-    parse_urlhaus_csv,
+    parse_domain_blocklist, parse_exfil_endpoint_list, parse_phishtank_csv, parse_threatfox_zip,
+    parse_tor_exit_list, parse_urlhaus_csv,
 };
 
 #[derive(Parser)]
@@ -71,6 +71,12 @@ struct Cli {
     /// Tor bulk exit list (Phase B)
     #[arg(long)]
     tor_exit: Option<PathBuf>,
+
+    /// Curated exfiltration-endpoint / webhook-catcher hostname list. Plain
+    /// domain-per-line blocklist; compiled into the signed primary DB under
+    /// ThreatSource::ExfilEndpoint. Optional — skipped if not supplied.
+    #[arg(long)]
+    exfil_endpoints: Option<PathBuf>,
 
     /// Env var name containing Ed25519 private key (base64-encoded)
     #[arg(long)]
@@ -580,6 +586,17 @@ fn parse_blocklist_file(path: &Path) -> Vec<String> {
     }
 }
 
+/// Parse the explicit exfil-endpoint feed. FALLIBLE on purpose: `--exfil-endpoints
+/// <path>` means the operator INTENDED that primary feed, so an unreadable path
+/// must NOT silently degrade to zero endpoints (which would let CI publish a
+/// weakened, signed threat DB after a transient path/permission failure). The read
+/// error is propagated so the call site can exit non-zero. Contrast: a feed that is
+/// simply not supplied stays a no-op (the call site skips this entirely).
+fn parse_exfil_endpoints_file(path: &Path) -> std::io::Result<Vec<String>> {
+    let contents = std::fs::read_to_string(path)?;
+    Ok(parse_exfil_endpoint_list(&contents).hostnames)
+}
+
 fn parse_phishtank_file(path: &Path) -> Vec<String> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -1007,6 +1024,23 @@ fn main() {
         Vec::new()
     };
 
+    let exfil_endpoint_hosts = if let Some(ref path) = cli.exfil_endpoints {
+        eprintln!("  parsing exfil endpoints from {}", path.display());
+        // Fail closed: an explicitly-supplied feed that cannot be read must abort
+        // rather than sign a DB with zero exfil endpoints (a weakened DB).
+        let hosts = parse_exfil_endpoints_file(path).unwrap_or_else(|e| {
+            eprintln!(
+                "error: cannot read explicitly-supplied exfil-endpoint list {}: {e}",
+                path.display()
+            );
+            std::process::exit(1);
+        });
+        eprintln!("    {} hostnames", hosts.len());
+        hosts
+    } else {
+        Vec::new()
+    };
+
     // Load signing key
     let signing_key = load_signing_key(cli.sign_key_env.as_deref(), cli.sign_key_file.as_deref());
 
@@ -1057,6 +1091,10 @@ fn main() {
 
     for host in &phishtank_hosts {
         writer.add_hostname(host, ThreatSource::PhishTank);
+    }
+
+    for host in &exfil_endpoint_hosts {
+        writer.add_hostname(host, ThreatSource::ExfilEndpoint);
     }
 
     for ip in &tor_exit_ips {
@@ -1337,6 +1375,34 @@ mod tests {
         assert_eq!(entries[0].ecosystem, Ecosystem::PyPI);
         assert_eq!(entries[0].name, "reqeusts");
         assert_eq!(entries[0].target_name, "requests");
+    }
+
+    #[test]
+    fn test_exfil_endpoints_read_error_is_fatal_err() {
+        // An explicitly-supplied feed that cannot be read must surface an Err so the
+        // call site can exit non-zero (fail closed). Previously this logged a warning
+        // and returned an empty Vec, letting CI sign a weakened DB.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.txt");
+        let result = parse_exfil_endpoints_file(&missing);
+        assert!(
+            result.is_err(),
+            "an unreadable explicit exfil feed must return Err, not an empty Vec"
+        );
+
+        // A readable feed still parses to its hostnames (the no-op vs. real-feed
+        // distinction is preserved: a supplied, readable feed yields entries).
+        let path = dir.path().join("exfil.txt");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "# exfil endpoints").unwrap();
+        writeln!(f, "evil-webhook.example").unwrap();
+        writeln!(f, "catcher.example").unwrap();
+        drop(f);
+        let hosts = parse_exfil_endpoints_file(&path).expect("a readable feed must parse");
+        assert!(
+            hosts.iter().any(|h| h == "evil-webhook.example"),
+            "the readable feed's hostnames must be returned, got {hosts:?}"
+        );
     }
 
     #[test]

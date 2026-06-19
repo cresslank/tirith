@@ -279,6 +279,70 @@ pub fn verify_self(json: bool) -> i32 {
     verdict_rc.max(emit_rc)
 }
 
+/// For installs whose binary is legitimately NOT byte-identical to the generic
+/// release artifact, the canonical-binary byte-compare in `verify-self` cannot
+/// apply, so return an honest `Unverified` reason instead of a false `Failed`:
+/// `cargo install` and the AUR compile from source, and the `.rpm` is rebuilt
+/// against the target distro's (older) glibc in a separate container. Returns
+/// `None` for installs that DO ship the canonical release binary (`.deb`/apt,
+/// self-managed, Homebrew, npm, Scoop) and must verify normally. Exhaustive (no
+/// `_`) so a new install method forces a deliberate decision here.
+fn source_built_unverified_reason(method: &InstallMethod) -> Option<String> {
+    match method {
+        InstallMethod::Cargo => Some(
+            "installed via `cargo install` (compiled from source) — there is no canonical \
+             release binary to byte-compare against"
+                .to_string(),
+        ),
+        InstallMethod::Aur => Some(
+            "installed from the AUR (compiled from source by your AUR helper) — there is no \
+             canonical release binary to byte-compare against"
+                .to_string(),
+        ),
+        InstallMethod::Dnf => Some(
+            "installed from the distribution .rpm, which is built against the target distro's \
+             glibc and is intentionally not byte-identical to the generic Linux release binary"
+                .to_string(),
+        ),
+        InstallMethod::SelfManaged
+        | InstallMethod::Homebrew
+        | InstallMethod::Npm
+        | InstallMethod::Scoop
+        | InstallMethod::Apt
+        | InstallMethod::Unknown => None,
+    }
+}
+
+/// On a byte-compare MISMATCH (running binary differs from the verified release
+/// artifact), decide whether it is expected-and-benign vs tampering. Only Homebrew
+/// reaches here with a benign mismatch: homebrew-core builds tirith from source
+/// (distributed as a bottle), so its binary is not the prebuilt release artifact,
+/// while the `sheeki03/tap` formula pours the prebuilt binary and matches above
+/// (VERIFIED). Every other method that reaches here ships the canonical prebuilt
+/// binary (.deb/apt, npm, Scoop, self-managed), so for them a mismatch IS tampering
+/// and stays `Failed`; the always-source-built methods (cargo/aur/dnf) are
+/// pre-empted before the network fetch by `source_built_unverified_reason` and
+/// never reach here. Exhaustive (no `_`) so a new method forces a decision.
+fn benign_mismatch_reason(method: &InstallMethod) -> Option<String> {
+    match method {
+        InstallMethod::Homebrew => Some(
+            "installed via Homebrew; the homebrew-core formula builds tirith from source \
+             (distributed as a bottle), so the binary is not byte-identical to the prebuilt \
+             release artifact. `brew install sheeki03/tap/tirith` pours the prebuilt, signed \
+             binary that verifies."
+                .to_string(),
+        ),
+        InstallMethod::SelfManaged
+        | InstallMethod::Npm
+        | InstallMethod::Scoop
+        | InstallMethod::Apt
+        | InstallMethod::Cargo
+        | InstallMethod::Aur
+        | InstallMethod::Dnf
+        | InstallMethod::Unknown => None,
+    }
+}
+
 /// Core of `verify-self`: the networked verification, kept separate so the
 /// emit/exit logic is trivially correct.
 fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
@@ -289,6 +353,16 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
                      release) — there is no release checksum to verify it against"
                 .to_string(),
         });
+    }
+
+    // 1b. Source-/distro-built installs are not byte-identical to the generic
+    //     release binary by design (cargo/AUR compile from source; the .rpm is
+    //     rebuilt against the distro's glibc). Byte-comparing them to the generic
+    //     tarball would falsely report "modified or replaced", so report an honest
+    //     Unverified rather than a false Failed. (.deb/apt ships the canonical
+    //     binary, so it is NOT carved out here and verifies normally.)
+    if let Some(reason) = source_built_unverified_reason(&prov.install_method) {
+        return VerifySelfOutcome::verdict(VerificationStatus::Unverified { reason });
     }
 
     // 2. Need a published target and parseable version — both honest "cannot
@@ -408,6 +482,15 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
     };
 
     if !selfupdate::digest_eq(&extracted_sha, &binary_sha) {
+        // A mismatch is normally tampering. Homebrew is the exception: homebrew-core
+        // builds from source (bottled) so it legitimately mismatches, while the
+        // sheeki03/tap bottle is the prebuilt binary and matches above. Downgrade
+        // only the Homebrew mismatch to an honest Unverified; for every other method
+        // here the binary should be the canonical prebuilt one, so a mismatch stays
+        // Failed.
+        if let Some(reason) = benign_mismatch_reason(&prov.install_method) {
+            return VerifySelfOutcome::verdict(VerificationStatus::Unverified { reason });
+        }
         return VerifySelfOutcome::verdict(VerificationStatus::Failed {
             reason: format!(
                 "the running binary at {} (sha256 {}) does NOT match the official {} release \
@@ -1676,6 +1759,81 @@ mod tests {
         assert!(swap.previous_backup.is_file());
         assert_eq!(std::fs::read(&swap.previous_backup).unwrap(), b"OLD-BINARY");
         assert_eq!(swap.previous_backup, previous_backup_path(&live));
+    }
+
+    #[test]
+    fn source_built_carveout_is_cargo_aur_dnf_only() {
+        // Compiled-from-source / distro-rebuilt installs get an honest Unverified.
+        assert!(source_built_unverified_reason(&InstallMethod::Cargo).is_some());
+        assert!(source_built_unverified_reason(&InstallMethod::Aur).is_some());
+        assert!(source_built_unverified_reason(&InstallMethod::Dnf).is_some());
+        // These ship the canonical binary and MUST verify normally (no carve-out).
+        for m in [
+            InstallMethod::Apt,
+            InstallMethod::SelfManaged,
+            InstallMethod::Homebrew,
+            InstallMethod::Npm,
+            InstallMethod::Scoop,
+            InstallMethod::Unknown,
+        ] {
+            assert!(
+                source_built_unverified_reason(&m).is_none(),
+                "{m:?} must not be carved out"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_self_carves_out_cargo_before_any_network() {
+        // A cargo (source-built) install must short-circuit to Unverified BEFORE
+        // the release download, so this runs with no network and is a benign
+        // "cannot verify" (exit 0), not an operational error or a Failed.
+        let prov = Provenance {
+            version: "0.3.2".to_string(),
+            binary_path: Some(PathBuf::from("/home/u/.cargo/bin/tirith")),
+            binary_sha256: Some("ab".repeat(32)),
+            install_method: InstallMethod::Cargo,
+            target: Some("x86_64-unknown-linux-gnu".to_string()),
+            dev_build: false,
+            path_resolution_failed: false,
+        };
+        let outcome = run_verify_self(&prov);
+        assert!(
+            matches!(outcome.status, VerificationStatus::Unverified { .. }),
+            "cargo install must be Unverified, got {:?}",
+            outcome.status
+        );
+        assert!(
+            !outcome.operational_error,
+            "source-built Unverified is benign and must not exit non-zero"
+        );
+    }
+
+    #[test]
+    fn benign_mismatch_reason_is_homebrew_only() {
+        // Homebrew is the only ship-or-build-ambiguous method: a byte-compare
+        // mismatch there is the source-built homebrew-core formula (bottled), not
+        // tampering, so it downgrades to Unverified with a reason naming the tap.
+        let hb = benign_mismatch_reason(&InstallMethod::Homebrew);
+        assert!(hb.is_some());
+        assert!(hb.unwrap().contains("sheeki03/tap/tirith"));
+        // Every other method ships the canonical prebuilt binary (or is pre-empted
+        // earlier), so a mismatch is tampering and MUST stay Failed.
+        for m in [
+            InstallMethod::SelfManaged,
+            InstallMethod::Npm,
+            InstallMethod::Scoop,
+            InstallMethod::Apt,
+            InstallMethod::Cargo,
+            InstallMethod::Aur,
+            InstallMethod::Dnf,
+            InstallMethod::Unknown,
+        ] {
+            assert!(
+                benign_mismatch_reason(&m).is_none(),
+                "{m:?} mismatch must stay Failed (tampering), not downgrade"
+            );
+        }
     }
 
     /// `--rollback` property: restoring from the backup recovers the original.

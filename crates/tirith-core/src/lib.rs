@@ -17,6 +17,7 @@ pub mod context_detect;
 pub mod custom_rule_dsl;
 pub mod dashboard;
 pub mod data;
+pub mod deobfuscate;
 pub mod dep_confusion;
 pub mod devcontainer_writer;
 pub mod ecosystem_scan;

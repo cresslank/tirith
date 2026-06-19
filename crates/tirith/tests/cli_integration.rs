@@ -3618,8 +3618,8 @@ fn threatdb_sources_lists_all_feeds_with_counts() {
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("sources JSON");
     assert_eq!(v["db_installed"], true);
     let sources = v["sources"].as_array().expect("sources array");
-    // All 11 ThreatSource variants must be listed.
-    assert_eq!(sources.len(), 11, "every threat source must be listed");
+    // All 12 ThreatSource variants must be listed.
+    assert_eq!(sources.len(), 12, "every threat source must be listed");
     // The fixture has 2 OSSF-malicious package records.
     let ossf = sources
         .iter()
@@ -3771,7 +3771,7 @@ fn threatdb_alias_threatdb_still_works() {
         "the `threatdb` alias must still work"
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("sources JSON via alias");
-    assert_eq!(v["sources"].as_array().unwrap().len(), 11);
+    assert_eq!(v["sources"].as_array().unwrap().len(), 12);
 }
 
 // verify-self / update / version --provenance (M2 item 24) These tests run the CLI end-to-end.
@@ -6136,6 +6136,83 @@ fn seed_agent_deny_policy(dir: &std::path::Path, tool: &str) {
     fs::create_dir_all(&tirith_dir).expect("create .tirith dir");
     let policy = format!("agent_rules:\n  deny:\n    - kind: agent\n      name: {tool}\n");
     fs::write(tirith_dir.join("policy.yaml"), policy).expect("write policy");
+}
+
+/// A custom `injection_seeds_custom` regex that passes the lenient policy shape
+/// check but fails the real regex compile must be surfaced to the operator on the
+/// paste CLI path, not silently dropped. The engine compiles + drops it (it is a
+/// library and does not print); the CLI surfaces it via `warn_bad_injection_seeds`.
+#[cfg(unix)]
+#[test]
+fn paste_surfaces_bad_injection_seed_to_stderr() {
+    use std::io::Write;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let policy_root = tmp.path().join("repo");
+    let tirith_dir = policy_root.join(".tirith");
+    fs::create_dir_all(&tirith_dir).expect("create .tirith dir");
+    // `(unclosed` is a valid YAML scalar and a valid policy shape, but an invalid
+    // regex (unbalanced group), so it loads then fails `compile_seeds`.
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "injection_seeds_custom:\n  - \"(unclosed\"\n",
+    )
+    .expect("write policy");
+
+    let mut child = tirith()
+        .env("TIRITH_POLICY_ROOT", &policy_root)
+        .args(["paste", "--shell", "posix", "--non-interactive"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn tirith paste");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello world")
+        .unwrap();
+    let out = child.wait_with_output().expect("wait on tirith paste");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid injection_seeds_custom regex") && stderr.contains("(unclosed"),
+        "paste must surface a bad injection_seeds_custom regex to stderr: {stderr}"
+    );
+}
+
+/// The check CLI (local path) must surface an invalid `injection_seeds_custom`
+/// regex. `--no-daemon` forces local execution for determinism, so this pins the
+/// LOCAL call site only. The `check.rs` warn is unconditional (the daemon client
+/// path runs the same line, with `policy` from the client-side `Policy::discover`),
+/// but the suite has no daemon-spawn harness, so the daemon path is not exercised
+/// end-to-end here.
+#[cfg(unix)]
+#[test]
+fn check_surfaces_bad_injection_seed_to_stderr() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let policy_root = tmp.path().join("repo");
+    let tirith_dir = policy_root.join(".tirith");
+    fs::create_dir_all(&tirith_dir).expect("create .tirith dir");
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "injection_seeds_custom:\n  - \"(unclosed\"\n",
+    )
+    .expect("write policy");
+
+    let out = tirith()
+        .env("TIRITH_POLICY_ROOT", &policy_root)
+        .env("TIRITH_LOG", "0")
+        .args(["check", "--shell", "posix", "--no-daemon", "--", "ls"])
+        .output()
+        .expect("run tirith check");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid injection_seeds_custom regex") && stderr.contains("(unclosed"),
+        "check must surface a bad injection_seeds_custom regex to stderr: {stderr}"
+    );
 }
 
 #[cfg(unix)]

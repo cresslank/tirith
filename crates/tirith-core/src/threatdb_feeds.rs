@@ -206,6 +206,18 @@ pub fn parse_domain_blocklist(contents: &str) -> FeedEntries {
     entries
 }
 
+/// Parse a curated exfiltration-endpoint / webhook-catcher hostname list.
+///
+/// The on-disk format is a plain domain-per-line blocklist (one hostname per
+/// line, `#` comments and blank lines ignored, hosts-file `0.0.0.0 host` lines
+/// tolerated), so this is a thin wrapper over [`parse_domain_blocklist`]. It
+/// exists as a distinct entry point so the compiler call site reads clearly and
+/// the feed can grow its own parsing rules later without disturbing the shared
+/// blocklist parser. Output goes into `FeedEntries.hostnames`.
+pub fn parse_exfil_endpoint_list(contents: &str) -> FeedEntries {
+    parse_domain_blocklist(contents)
+}
+
 pub fn parse_tor_exit_list(contents: &str) -> FeedEntries {
     let mut entries = FeedEntries::default();
     for line in contents.lines() {
@@ -278,6 +290,21 @@ mod tests {
             entries.hostnames,
             vec!["bad.example".to_string(), "phish.example".to_string()]
         );
+    }
+
+    #[test]
+    fn exfil_endpoint_list_parses_hostnames() {
+        // Fictional template entries only (CLAUDE.md: no real domains).
+        let contents = "# curated exfil / webhook-catcher endpoints\nexfil-sink.example\n0.0.0.0 webhook-catcher.invalid\n127.0.0.1 localhost\n";
+        let entries = parse_exfil_endpoint_list(contents);
+        assert_eq!(
+            entries.hostnames,
+            vec![
+                "exfil-sink.example".to_string(),
+                "webhook-catcher.invalid".to_string(),
+            ]
+        );
+        assert!(entries.ips.is_empty());
     }
 
     #[test]

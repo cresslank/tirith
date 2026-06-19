@@ -780,24 +780,8 @@ fn mount_spec_source(spec: &str) -> Option<String> {
 }
 
 fn is_sensitive_bind_source(src: &str) -> bool {
-    let sensitive_exact = [
-        "/var/run/docker.sock",
-        "/run/docker.sock",
-        "/var/run/podman/podman.sock",
-        "~/.ssh",
-        "~/.aws",
-        "~/.kube",
-        "~/.docker",
-        "/etc",
-        "/root/.ssh",
-        "/root/.aws",
-        "${env:HOME}/.ssh",
-        "${env:HOME}/.aws",
-        "${env:HOME}/.docker",
-        "${localEnv:HOME}/.ssh",
-        "${localEnv:HOME}/.aws",
-        "${localEnv:HOME}/.docker",
-    ];
+    // Centralised in `rules::shared` so `exfil.rs` shares the same list (no drift).
+    let sensitive_exact = crate::rules::shared::SENSITIVE_BIND_PATHS;
     if sensitive_exact.contains(&src) {
         return true;
     }
@@ -1341,128 +1325,138 @@ fn is_negated(content: &str, match_start: usize, match_end: usize) -> bool {
     true
 }
 
+/// Which config-injection tier a pattern set belongs to (drives RuleId, title,
+/// and the `is_known` severity ladder).
+#[derive(Clone, Copy)]
+enum ConfigPatternTier {
+    /// Strong / legacy injection patterns -> `ConfigInjection` (High when known,
+    /// else Medium).
+    Injection,
+    /// Weak indicators -> `ConfigSuspiciousIndicator` (Medium when known, else Low).
+    Suspicious,
+}
+
+/// Scan one `content` string against one pattern set, pushing the FIRST
+/// non-negated match as a finding for `tier`. Returns `true` if a finding was
+/// pushed. The `is_negated` post-filter and the context window are both computed
+/// against the SAME `content` that produced the match (so a normalized form is
+/// self-consistent). Iterates every match per pattern so a leading negated match
+/// ("never bypass") does not mask a later malicious one on the same line.
+fn scan_config_patterns(
+    content: &str,
+    patterns: &[(Regex, &'static str)],
+    tier: ConfigPatternTier,
+    is_known: bool,
+    findings: &mut Vec<Finding>,
+) -> bool {
+    for (regex, description) in patterns.iter() {
+        for m in regex.find_iter(content) {
+            if is_negated(content, m.start(), m.end()) {
+                continue;
+            }
+
+            let context_start = floor_char_boundary(content, m.start().saturating_sub(20));
+            let context_end = ceil_char_boundary(content, (m.end() + 20).min(content.len()));
+            let context = &content[context_start..context_end];
+
+            let (rule_id, severity, title, description_text) = match tier {
+                ConfigPatternTier::Injection => (
+                    RuleId::ConfigInjection,
+                    if is_known {
+                        Severity::High
+                    } else {
+                        Severity::Medium
+                    },
+                    format!("Prompt injection pattern: {description}"),
+                    format!(
+                        "File contains a pattern commonly used in prompt injection attacks: '{}'",
+                        m.as_str()
+                    ),
+                ),
+                ConfigPatternTier::Suspicious => (
+                    RuleId::ConfigSuspiciousIndicator,
+                    if is_known {
+                        Severity::Medium
+                    } else {
+                        Severity::Low
+                    },
+                    format!("Suspicious config indicator: {description}"),
+                    format!(
+                        "File contains a pattern that may indicate overreaching config: '{}'",
+                        m.as_str()
+                    ),
+                ),
+            };
+
+            findings.push(Finding {
+                rule_id,
+                severity,
+                title,
+                description: description_text,
+                evidence: vec![Evidence::Text {
+                    detail: format!("Pattern match: ...{context}..."),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+            return true;
+        }
+    }
+    false
+}
+
 /// Check for prompt injection patterns in file content.
 /// Uses strong/weak pattern separation with negation post-filter.
+///
+/// Scans the raw `content` PLUS each deobfuscated form
+/// ([`crate::deobfuscate::normalized_forms`]) so an injection phrase hidden behind
+/// base64/hex encoding, confusables, invisible characters, character-spacing, or
+/// leetspeak is recovered. This rule keeps emitting `ConfigInjection` /
+/// `ConfigSuspiciousIndicator` (the obfuscated `PromptInjectionObfuscated` rule is
+/// owned by `rules::prompt_injection`, not configfile). The strong -> legacy ->
+/// weak tier cascade is preserved: each tier fires at most one finding, and a
+/// higher tier short-circuits the lower ones.
 fn check_prompt_injection(content: &str, is_known: bool, findings: &mut Vec<Finding>) {
-    // Iterate every match per pattern: a leading negated match ("never bypass")
-    // must not suppress a later malicious match on the same line.
-    let mut strong_found = false;
-    for (regex, description) in STRONG_PATTERNS.iter() {
-        for m in regex.find_iter(content) {
-            if is_negated(content, m.start(), m.end()) {
-                continue;
-            }
+    // Candidate texts: raw first, then each normalized variant. `normalized_forms`
+    // is empty for clean input, so a clean config pays only the (cheap) empty-form
+    // probe and scans `content` alone.
+    let forms = crate::deobfuscate::normalized_forms(content);
+    let candidates = std::iter::once(content).chain(forms.iter().map(|f| f.text.as_str()));
 
-            let severity = if is_known {
-                Severity::High
-            } else {
-                Severity::Medium
-            };
-
-            let context_start = floor_char_boundary(content, m.start().saturating_sub(20));
-            let context_end = ceil_char_boundary(content, (m.end() + 20).min(content.len()));
-            let context = &content[context_start..context_end];
-
-            findings.push(Finding {
-                rule_id: RuleId::ConfigInjection,
-                severity,
-                title: format!("Prompt injection pattern: {description}"),
-                description: format!(
-                    "File contains a pattern commonly used in prompt injection attacks: '{}'",
-                    m.as_str()
-                ),
-                evidence: vec![Evidence::Text {
-                    detail: format!("Pattern match: ...{context}..."),
-                }],
-                human_view: None,
-                agent_view: None,
-                mitre_id: None,
-                custom_rule_id: None,
-            });
-            strong_found = true;
-            break;
-        }
-        if strong_found {
-            break;
-        }
-    }
-
-    if strong_found {
-        return;
-    }
-
-    let mut legacy_found = false;
-    for (regex, description) in LEGACY_INJECTION_PATTERNS.iter() {
-        for m in regex.find_iter(content) {
-            if is_negated(content, m.start(), m.end()) {
-                continue;
-            }
-
-            let severity = if is_known {
-                Severity::High
-            } else {
-                Severity::Medium
-            };
-
-            let context_start = floor_char_boundary(content, m.start().saturating_sub(20));
-            let context_end = ceil_char_boundary(content, (m.end() + 20).min(content.len()));
-            let context = &content[context_start..context_end];
-
-            findings.push(Finding {
-                rule_id: RuleId::ConfigInjection,
-                severity,
-                title: format!("Prompt injection pattern: {description}"),
-                description: format!(
-                    "File contains a pattern commonly used in prompt injection attacks: '{}'",
-                    m.as_str()
-                ),
-                evidence: vec![Evidence::Text {
-                    detail: format!("Pattern match: ...{context}..."),
-                }],
-                human_view: None,
-                agent_view: None,
-                mitre_id: None,
-                custom_rule_id: None,
-            });
-            legacy_found = true;
-            break;
-        }
-        if legacy_found {
+    // Strong + legacy share the `Injection` tier and the same short-circuit: the
+    // first candidate to produce an injection match wins, then we stop.
+    for candidate in candidates.clone() {
+        if scan_config_patterns(
+            candidate,
+            &STRONG_PATTERNS,
+            ConfigPatternTier::Injection,
+            is_known,
+            findings,
+        ) {
             return;
         }
     }
-
-    for (regex, description) in WEAK_PATTERNS.iter() {
-        for m in regex.find_iter(content) {
-            if is_negated(content, m.start(), m.end()) {
-                continue;
-            }
-            let severity = if is_known {
-                Severity::Medium
-            } else {
-                Severity::Low
-            };
-
-            let context_start = floor_char_boundary(content, m.start().saturating_sub(20));
-            let context_end = ceil_char_boundary(content, (m.end() + 20).min(content.len()));
-            let context = &content[context_start..context_end];
-
-            findings.push(Finding {
-                rule_id: RuleId::ConfigSuspiciousIndicator,
-                severity,
-                title: format!("Suspicious config indicator: {description}"),
-                description: format!(
-                    "File contains a pattern that may indicate overreaching config: '{}'",
-                    m.as_str()
-                ),
-                evidence: vec![Evidence::Text {
-                    detail: format!("Pattern match: ...{context}..."),
-                }],
-                human_view: None,
-                agent_view: None,
-                mitre_id: None,
-                custom_rule_id: None,
-            });
+    for candidate in candidates.clone() {
+        if scan_config_patterns(
+            candidate,
+            &LEGACY_INJECTION_PATTERNS,
+            ConfigPatternTier::Injection,
+            is_known,
+            findings,
+        ) {
+            return;
+        }
+    }
+    for candidate in candidates {
+        if scan_config_patterns(
+            candidate,
+            &WEAK_PATTERNS,
+            ConfigPatternTier::Suspicious,
+            is_known,
+            findings,
+        ) {
             return;
         }
     }

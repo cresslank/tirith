@@ -711,6 +711,21 @@ const PATTERN_TABLE: &[PatternEntry] = &[
             r"(?i)\bdo\s+anything\s+now\b",
             r"(?i)\bnew\s+instructions\s*:",
             r"(?i)\bfrom\s+now\s+on\b",
+            // OWASP LLM01 (M7 ch5): standalone chat-template / role-override
+            // delimiters. Coarse, low-FP literal gates so the precise seeds in
+            // `rules::prompt_injection` are tier-1-reachable in the Paste context.
+            r"\[INST\]",
+            r"<\|im_start\|>",
+            r"<\|im_end\|>",
+            r"<<SYS>>",
+            // OWASP LLM01 (M7 ch5): system-prompt-extraction leaders. These mirror
+            // the precise seeds in `rules::prompt_injection` (extraction context
+            // only), so a bare `print(...)`, a JSON `"repeat"`, or "reveal the
+            // answer" in a paste does NOT force tier-3. Each fragment is a SUPERSET
+            // of its seed, so the seed stays Paste-reachable.
+            r"(?i)\breveal (?:your |the |your system |the system |system )?(?:prompt|instructions)\b",
+            r"(?i)\bprint (?:your |the )?(?:system )?(?:prompt|instructions)\b",
+            r"(?i)\brepeat (?:the )?(?:words|text) above\b",
         ],
         notes: "Prompt-injection seed phrases — coarse tier-1 gate for the paste context. \
                 The precise multi-word regex lives in `rules::prompt_injection`.",
@@ -1038,6 +1053,9 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     // M7 ch5 — prompt-injection seed phrases.
     ("prompt_injection_in_output", "PromptInjectionInOutput"),
     ("ignore_previous_instructions", "IgnorePreviousInstructions"),
+    ("prompt_injection_obfuscated", "PromptInjectionObfuscated"),
+    // C7 — output-side data-exfiltration rule.
+    ("output_data_exfiltration", "OutputDataExfiltration"),
     // Operational-context rules (M8 ch1).
     (
         "context_prod_destructive_command",

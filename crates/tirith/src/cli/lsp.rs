@@ -237,7 +237,33 @@ pub fn diagnostics_for(path: &Path, text: &str) -> Vec<Diagnostic> {
     // rules fire on. Single pass (no per-context union, so no dedup needed),
     // same `retains` and finding→diagnostic mapping as the `analyze` loop below.
     if lsp_profiles::uses_output_analysis(profile) {
-        let verdict = engine::analyze_output(text, OutputContext::default());
+        // C3a — honor operator/org `injection_seeds_custom` on the LSP output
+        // path too. Discover OFFLINE (`discover_local_only`, no network; a
+        // repo-scoped weakening flag is neutralized inside) from the file's
+        // parent dir, mirroring `analysis_context`'s cwd. Each bad seed is
+        // reported ONCE to stderr (safe: the LSP protocol uses stdout, stderr is
+        // the server's log channel) rather than silently dropped — a seed that
+        // passes `policy validate` but fails the real compile would otherwise
+        // vanish.
+        let seed_cwd = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.display().to_string());
+        let policy = tirith_core::policy::Policy::discover_local_only(seed_cwd.as_deref());
+        let (custom_seeds, bad_seeds) =
+            tirith_core::rules::prompt_injection::compile_seeds(&policy.injection_seeds_custom);
+        for (pattern, error) in &bad_seeds {
+            eprintln!(
+                "tirith lsp: warning: invalid injection_seeds_custom regex {pattern:?}: {error}"
+            );
+        }
+        let verdict = engine::analyze_output(
+            text,
+            OutputContext {
+                custom_seeds,
+                ..Default::default()
+            },
+        );
         return verdict
             .findings
             .into_iter()
