@@ -1,9 +1,12 @@
 [advisories]
 version = 2
 ignore = [
-    # time <0.3.47 DoS via RFC 2822 stack exhaustion. Fix (0.3.47) requires
-    # Rust 1.88 which exceeds our MSRV 1.83. Transitive dep via lopdf/rust-s3;
-    # tirith never parses user-controlled RFC 2822 dates.
+    # time RFC 2822 parsing DoS (stack exhaustion). Cargo.toml pins time to
+    # <0.3.38 (0.3.38+ needs time-core >=0.1.3 / Rust 1.85, above our MSRV 1.83),
+    # so the version we build predates the advisory's 0.3.47 fix and stays in the
+    # affected range. Ignored regardless: that fix requires Rust 1.88 (far above
+    # MSRV 1.83), and tirith never parses user-controlled RFC 2822 dates (the only
+    # trigger). Transitive dep via lopdf/rust-s3. See the time pin note in Cargo.toml.
     "RUSTSEC-2026-0009",
     # rustls-pemfile unmaintained — transitive dep of rust-s3 (license server).
     # No replacement available; rust-s3 hasn't migrated yet.

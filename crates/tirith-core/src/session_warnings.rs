@@ -592,7 +592,10 @@ where
     };
 
     if let Some(parent) = path.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
+        // Create sessions/ and, only if THIS call created it, fsync the grandparent
+        // so a first-time-created dir entry survives a crash. The helper keys off
+        // create_dir's own result, so there is no exists()-then-create TOCTOU.
+        if let Err(e) = crate::util::create_dir_durable(parent) {
             crate::audit::audit_diagnostic(format!(
                 "tirith: session: cannot create state dir {}: {e}",
                 parent.display()

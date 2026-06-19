@@ -651,9 +651,13 @@ pub fn load_snapshot(path: &Path) -> PersistenceSnapshot {
     }
 }
 
-/// Persist `snapshot` to `path` (creating the parent dir), `0600` AT OPEN TIME
-/// (no umask race) and ATOMICALLY (sibling temp + rename). The tracked-surface
-/// set is mildly sensitive, so the 0600 discipline applies; perms failures propagate.
+/// Persist `snapshot` to `path` (creating the parent dir), `0600` and
+/// crash-ATOMICALLY via [`crate::util::write_file_atomic_0600`]: a RANDOMLY named
+/// temp sibling plus rename (and a body+dir fsync). The tracked-surface set is
+/// mildly sensitive, so the 0600 discipline applies. The random temp name removes
+/// the previously predictable `*.json.tmp` (no name to pre-create or race) and
+/// the rename replaces any symlink at `path` without following it; the helper
+/// adds the fsync this path previously lacked.
 pub fn save_snapshot(path: &Path, snapshot: &PersistenceSnapshot) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -661,31 +665,7 @@ pub fn save_snapshot(path: &Path, snapshot: &PersistenceSnapshot) -> std::io::Re
     let json = serde_json::to_string_pretty(snapshot)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    // Sibling temp + rename so a partial write can't leave a corrupt snapshot.
-    let tmp = path.with_extension("json.tmp");
-
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(&tmp)?;
-    use std::io::Write as _;
-    f.write_all(json.as_bytes())?;
-    f.flush()?;
-    // `OpenOptions::mode` only applies on file *creation* — if the temp file
-    // already existed with looser perms, tighten it before the rename.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    drop(f);
-
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    crate::util::write_file_atomic_0600(path, json.as_bytes())
 }
 
 #[cfg(test)]
@@ -989,6 +969,52 @@ mod tests {
         std::fs::write(&path, b"{}").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         save_snapshot(&path, &PersistenceSnapshot::default()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "snapshot must be 0600, got {mode:o}");
+    }
+
+    /// The old fixed-name temp (`persistence_snapshot.json.tmp`) was a predictable
+    /// path an attacker could pre-plant as a symlink to clobber a sensitive file.
+    /// The random-temp atomic writer must sidestep that name entirely: a symlink
+    /// planted there is left untouched, and the snapshot still writes parseable and
+    /// 0600.
+    #[cfg(unix)]
+    #[test]
+    fn save_snapshot_ignores_planted_fixed_name_temp_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("persistence_snapshot.json");
+
+        // A real snapshot (schema_version 1, one entry) so the read-back is a
+        // genuine parse signal, not load_snapshot's parse-failure default.
+        let home = tempdir().unwrap();
+        std::fs::write(home.path().join(".bashrc"), b"alias l=ls\n").unwrap();
+        let snap = PersistenceSnapshot::from_entries(&scan_with_root(home.path(), None));
+
+        // Sentinel the old predictable temp name would have clobbered.
+        let sentinel = dir.path().join("sentinel.txt");
+        std::fs::write(&sentinel, b"do not touch").unwrap();
+        let planted = dir.path().join("persistence_snapshot.json.tmp");
+        std::os::unix::fs::symlink(&sentinel, &planted).unwrap();
+
+        save_snapshot(&path, &snap).unwrap();
+
+        // The sentinel is untouched: the random temp name never opened it.
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"do not touch",
+            "the planted-temp symlink target must be untouched"
+        );
+        // The snapshot parses back faithfully and is 0600. schema_version 1 only
+        // round-trips when the JSON actually parsed (a parse failure would default
+        // load_snapshot to 0), and the entry set must match what we wrote.
+        let loaded = load_snapshot(&path);
+        assert_eq!(loaded.schema_version, 1);
+        assert_eq!(
+            loaded.entries.keys().collect::<Vec<_>>(),
+            snap.entries.keys().collect::<Vec<_>>(),
+            "snapshot must round-trip the same surface keys"
+        );
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "snapshot must be 0600, got {mode:o}");
     }

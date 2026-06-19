@@ -194,7 +194,12 @@ pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<Checkpoin
     }
 
     if manifest.is_empty() {
-        let _ = fs::remove_dir_all(&cp_dir);
+        if let Err(e) = fs::remove_dir_all(&cp_dir) {
+            eprintln!(
+                "tirith: checkpoint: failed to remove empty checkpoint dir {}: {e}",
+                cp_dir.display()
+            );
+        }
         return Err("no files to checkpoint".to_string());
     }
 
@@ -524,6 +529,18 @@ fn reject_symlinked_restore_dest(dst: &Path) -> Result<(), String> {
 /// freshly-created file and an existing-overwritten one (whose pre-existing mode
 /// the create-mode would not change) end up with the blob's mode. On non-unix the
 /// portable `set_permissions` still carries the readonly bit.
+///
+/// No-follow discipline across platforms:
+/// * unix opens the destination with `O_NOFOLLOW`, so a symlink planted at the
+///   final component is refused by the open itself.
+/// * windows opens the reparse point WITHOUT following it
+///   (`FILE_FLAG_OPEN_REPARSE_POINT`) and create-if-absent WITHOUT truncate, then
+///   REJECTS any reparse point (symlink/junction/mount) before mutating anything,
+///   and only calls `set_len(0)` once it has confirmed a regular file. The key
+///   point is that we NEVER truncate before the reparse check, so a planted
+///   reparse point at `dst` is never mutated.
+/// * other non-unix platforms fall back to `File::create` (which truncates) and
+///   rely on the caller's pre-write symlink check.
 fn copy_no_follow_from_reader<R: Read>(
     src: &mut R,
     dst: &Path,
@@ -549,7 +566,31 @@ fn copy_no_follow_from_reader<R: Read>(
         out.set_permissions(perms.clone())?;
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        // Open create-if-absent WITHOUT truncate, NOT following a reparse point.
+        let mut out = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(dst)?;
+        // Reject any reparse point (symlink/junction/mount) BEFORE mutating anything.
+        if out.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "refusing to restore through a reparse point at destination",
+            ));
+        }
+        out.set_len(0)?; // truncate ONLY after confirming it is a regular file
+        std::io::copy(src, &mut out)?;
+        out.sync_all()?;
+        out.set_permissions(perms.clone())?;
+        Ok(())
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         let mut out = fs::File::create(dst)?;
         std::io::copy(src, &mut out)?;
@@ -920,6 +961,26 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
             Ok(p) => p,
             Err(_) => continue,
         };
+        // A path captured as a REGULAR file that is now ANY symlink is drift, and
+        // must be reported as Modified. The shared `sha256_file` helper follows
+        // symlinks (intentional for capture), so reading the live path through it
+        // here would hash the link's TARGET and mask a regular-file -> symlink swap.
+        // `symlink_metadata` does not follow the final component, so we catch the
+        // swap directly. This MUST run before the `exists()` check below: a dangling
+        // symlink returns false from `exists()` and would otherwise be misclassified
+        // as Deleted rather than the Modified drift it is under the no-follow discipline.
+        if let Ok(m) = std::fs::symlink_metadata(&current_path) {
+            if m.file_type().is_symlink() {
+                diffs.push(DiffEntry {
+                    path: entry.original_path.clone(),
+                    status: DiffStatus::Modified,
+                    checkpoint_sha256: entry.sha256.clone(),
+                    current_sha256: None,
+                });
+                classified_paths.insert(entry.original_path.clone());
+                continue;
+            }
+        }
         if !current_path.exists() {
             diffs.push(DiffEntry {
                 path: entry.original_path.clone(),
@@ -2384,6 +2445,128 @@ mod tests {
             DiffStatus::Modified,
             "anchored to the capture root (dir A), the mutated file reads as Modified, \
              not Deleted (which is what resolving against the diff cwd dir B would give): {diffs:?}"
+        );
+    }
+
+    /// M4 (no-follow discipline in diff): a path captured as a REGULAR file that is
+    /// later replaced by a SYMLINK must be reported as `Modified` drift, NOT hashed
+    /// through the link (which would compare the link target's bytes and could mask
+    /// the swap) and NOT misclassified as `Deleted`. `diff()` stats the live path
+    /// with `symlink_metadata` before the `exists()` check, so the symlink is caught
+    /// directly. The symlink here points at a DIFFERENT-content file so that, were
+    /// the guard absent and the link followed, the hash would still differ and the
+    /// test would not silently pass for the wrong reason.
+    #[cfg(unix)]
+    #[test]
+    fn test_diff_regular_file_replaced_by_symlink_is_modified() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        // Canonicalize so the macOS /var -> /private/var symlink does not trip the
+        // symlinked-ancestor guard (same rationale as the other anchoring tests).
+        let base = fs::canonicalize(tmpdir.path()).unwrap();
+        let dir_a = base.join("capture_here");
+        fs::create_dir_all(&dir_a).unwrap();
+
+        let state_dir = base.join("state");
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_log = std::env::var("TIRITH_LOG").ok();
+        let prev_cwd = std::env::current_dir().ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &state_dir);
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let name = "note.txt";
+        let run = || -> Result<Vec<DiffEntry>, String> {
+            std::env::set_current_dir(&dir_a).map_err(|e| format!("chdir A: {e}"))?;
+            // Capture a REGULAR file.
+            fs::write(name, "captured bytes").map_err(|e| format!("write: {e}"))?;
+            let meta = create(&[name], Some("rm -rf ."))?;
+            // Replace the live regular file with a SYMLINK to a different-content
+            // file. A follow-the-link hash would read "other contents" and still
+            // differ, so a passing test here means the symlink itself was detected.
+            fs::remove_file(name).map_err(|e| format!("rm: {e}"))?;
+            let other = dir_a.join("other.txt");
+            fs::write(&other, "other contents").map_err(|e| format!("write other: {e}"))?;
+            std::os::unix::fs::symlink(&other, name).map_err(|e| format!("symlink: {e}"))?;
+            diff(&meta.id)
+        };
+
+        let result = run();
+
+        if let Some(dir) = prev_cwd {
+            let _ = std::env::set_current_dir(dir);
+        }
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("TIRITH_LOG", v),
+                None => std::env::remove_var("TIRITH_LOG"),
+            }
+        }
+
+        let diffs = result.expect("diff should succeed");
+        let entry = diffs
+            .iter()
+            .find(|d| d.path == name)
+            .expect("the entry replaced by a symlink must appear in the diff");
+        assert_eq!(
+            entry.status,
+            DiffStatus::Modified,
+            "a regular file replaced by a symlink must be reported as Modified drift \
+             (caught via symlink_metadata before the exists() check), not Deleted: {diffs:?}"
+        );
+        assert!(
+            entry.current_sha256.is_none(),
+            "a symlinked live path must not carry a current_sha256 (it was not hashed \
+             through the link): {entry:?}"
+        );
+    }
+
+    /// H2 (windows-gated): `copy_no_follow_from_reader` must refuse to restore
+    /// through a reparse point at the destination. On unix this code path is a
+    /// no-op (the unix branch uses `O_NOFOLLOW`); this test only compiles/runs on
+    /// windows. It self-skips (early return) when a windows symlink cannot be
+    /// created due to missing privilege (the default on most CI), so it never
+    /// fails for an environment reason — it only asserts the rejection when a
+    /// reparse point could actually be planted.
+    #[cfg(windows)]
+    #[test]
+    fn test_copy_no_follow_rejects_reparse_point_destination() {
+        use std::io::Cursor;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let outside = tmpdir.path().join("outside_secret.txt");
+        fs::write(&outside, "SENTINEL DO NOT OVERWRITE").unwrap();
+
+        // Plant a symlink (a reparse point) at the destination. Creating a windows
+        // symlink needs the privilege/developer-mode; if it fails, self-skip.
+        let dst = tmpdir.path().join("victim.txt");
+        if std::os::windows::fs::symlink_file(&outside, &dst).is_err() {
+            // Cannot create a reparse point in this environment; nothing to assert.
+            return;
+        }
+
+        let mut src = Cursor::new(b"restored bytes".to_vec());
+        let perms = fs::metadata(&outside).unwrap().permissions();
+        let res = copy_no_follow_from_reader(&mut src, &dst, &perms);
+        assert!(
+            res.is_err(),
+            "restoring through a reparse-point destination must be refused"
+        );
+        // The link target outside the tree must be byte-for-byte untouched.
+        let sentinel_after = fs::read_to_string(&outside).ok();
+        assert_eq!(
+            sentinel_after.as_deref(),
+            Some("SENTINEL DO NOT OVERWRITE"),
+            "the reparse point must not be truncated or written through"
         );
     }
 
