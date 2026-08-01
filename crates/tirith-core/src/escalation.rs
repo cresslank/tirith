@@ -951,6 +951,13 @@ fn delete_path_args<'a>(tool: &str, args: &'a [String]) -> Vec<&'a String> {
             }
             continue;
         }
+        // The command-string tokenizer can retain a shell redirection as an
+        // argument (for example `2>/dev/null`). It is syntax, not a deleted path.
+        // Strip leading file-descriptor digits before testing the operator.
+        let redirection = a.trim_start_matches(|c: char| c.is_ascii_digit());
+        if redirection.starts_with('>') || redirection.starts_with('<') {
+            continue;
+        }
         paths.push(a);
     }
     paths
@@ -3389,6 +3396,32 @@ mod tests {
                 .get(crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY)
                 .map(String::as_str),
             Some("2")
+        );
+    }
+
+    #[test]
+    fn derive_file_delete_ignores_shell_redirection_tokens() {
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let del = derive_typed_events(
+            "rm -f /tmp/hermes-snap-deadbeef.sh.tmp.$BASHPID 2>/dev/null",
+            &v,
+        )
+        .into_iter()
+        .find(|e| e.kind == EventKind::FileDelete)
+        .expect("snapshot cleanup must record a FileDelete");
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("1"),
+            "the stderr redirection is syntax, not a second path"
+        );
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("0"),
+            "Hermes' generated environment snapshot temp is not authored source"
         );
     }
 

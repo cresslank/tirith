@@ -34,7 +34,16 @@ pub fn should_skip_dir(name: &str) -> bool {
 /// directory. Components are split on both `/` and `\` so the check works for
 /// POSIX and Windows-style paths.
 pub fn is_build_artifact_path(path: &str) -> bool {
-    path.split(['/', '\\']).any(should_skip_dir)
+    if path.split(['/', '\\']).any(should_skip_dir) {
+        return true;
+    }
+
+    // Hermes Agent atomically rewrites a per-session environment snapshot after
+    // every terminal command, cleaning a `hermes-snap-*.sh.tmp.$BASHPID` file on
+    // failure. These are generated session artifacts, not authored files, and
+    // must not contribute to the mass-file-deletion correlation.
+    let basename = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    basename.starts_with("hermes-snap-") && basename.contains(".sh.tmp.")
 }
 
 #[cfg(test)]
@@ -75,6 +84,13 @@ mod tests {
     #[test]
     fn build_artifact_path_detection() {
         assert!(is_build_artifact_path("a/dist/b.js"));
+        assert!(is_build_artifact_path(
+            "/tmp/hermes-snap-deadbeef.sh.tmp.$BASHPID"
+        ));
+        assert!(is_build_artifact_path(
+            r"C:\Temp\hermes-snap-deadbeef.sh.tmp.1234"
+        ));
+        assert!(!is_build_artifact_path("src/hermes-snap-not-a-temp.sh"));
         assert!(!is_build_artifact_path("src/main.rs"));
     }
 
