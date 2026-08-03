@@ -38,11 +38,23 @@ pub fn is_build_artifact_path(path: &str) -> bool {
         return true;
     }
 
-    // Hermes Agent atomically rewrites per-session environment snapshots and
-    // creates short-lived execute-code sandboxes. Their cleanup is generated
-    // runtime housekeeping, not authored-file deletion, and must not contribute
-    // to the mass-file-deletion correlation.
-    let mut components = path.split(['/', '\\']);
+    // Hermes Agent creates these generated runtime artifacts under the operating
+    // system's temporary roots. Scope the exemption to those roots so authored
+    // files with similar names remain part of deletion correlation.
+    let normalized = path.replace('\\', "/");
+    let lowercase = normalized.to_ascii_lowercase();
+    let in_temp_root = normalized.starts_with("/tmp/")
+        || normalized.starts_with("/private/tmp/")
+        || normalized.starts_with("/var/tmp/")
+        || normalized.starts_with("/var/folders/")
+        || lowercase
+            .get(1..)
+            .is_some_and(|suffix| suffix.starts_with(":/temp/"));
+    if !in_temp_root {
+        return false;
+    }
+
+    let mut components = normalized.split('/');
     let basename = components.next_back().unwrap_or(path);
     if components.any(|component| {
         component
@@ -106,7 +118,13 @@ mod tests {
             "/tmp/hermes_sandbox_1234567890abcdef/script.py"
         ));
         assert!(is_build_artifact_path(
-            r"C:\\Temp\\hermes_sandbox_deadbeef\\script.py"
+            r"C:\Temp\hermes_sandbox_deadbeef\script.py"
+        ));
+        assert!(!is_build_artifact_path(
+            "/workspace/hermes_sandbox_deadbeef/script.py"
+        ));
+        assert!(!is_build_artifact_path(
+            "/workspace/hermes-snap-deadbeef.sh.tmp.1234"
         ));
         assert!(!is_build_artifact_path("src/hermes-snap-not-a-temp.sh"));
         assert!(!is_build_artifact_path("src/hermes_sandbox_rules.rs"));
