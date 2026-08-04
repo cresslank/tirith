@@ -1044,7 +1044,7 @@ fn generated_hermes_snapshot_cleanup_segment(segments: &[tokenize::Segment]) -> 
     let [(assignment_index, template)] = assignments.as_slice() else {
         return None;
     };
-    let (snapshot_path, _) = template.split_once(".tmp.")?;
+    let snapshot_path = template.strip_suffix(".tmp.XXXXXXXXXX")?;
     if !snapshot_path.ends_with(".sh") {
         return None;
     }
@@ -1079,6 +1079,22 @@ fn generated_hermes_snapshot_cleanup_segment(segments: &[tokenize::Segment]) -> 
         .skip(redirect_index + 1)
         .take(cleanup_index - redirect_index - 1)
         .find_map(|(index, segment)| (segment.raw == expected_mv).then_some(index))?;
+
+    if segments[redirect_index].preceding_separator.as_deref() != Some(";")
+        || segments[mv_index].preceding_separator.as_deref() != Some("&&")
+        || mv_index != redirect_index + 1
+    {
+        return None;
+    }
+
+    let close_index = mv_index + 1;
+    if close_index + 1 != *cleanup_index {
+        return None;
+    }
+    let close = &segments[close_index];
+    if close.preceding_separator.as_deref() != Some(";") || close.raw != "} 2>/dev/null" {
+        return None;
+    }
 
     for (index, segment) in segments
         .iter()
@@ -3560,6 +3576,26 @@ mod tests {
             Some("0"),
             "the generated Hermes snapshot variable resolves only to a temp artifact"
         );
+
+        let command = HERMES_SNAPSHOT_WRAPPER.replace(
+            "/var/folders/ab/cd/T/",
+            "/tmp/hermes-session.tmp.directory/",
+        );
+        let segments = tokenize::tokenize(&command, ShellType::Posix);
+        assert!(
+            generated_hermes_snapshot_cleanup_segment(&segments).is_some(),
+            "a .tmp. component in the parent directory must not truncate the snapshot path"
+        );
+        let del = derive_typed_events(&command, &v)
+            .into_iter()
+            .find(|e| e.kind == EventKind::FileDelete)
+            .expect("snapshot fallback cleanup must record a FileDelete");
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("0")
+        );
     }
 
     #[test]
@@ -3599,6 +3635,25 @@ mod tests {
                 "authored private-variable deletes must remain counted: {prefix}"
             );
         }
+
+        let command = format!("{HERMES_SNAPSHOT_WRAPPER}; rm -f \"$__hermes_snap_tmp\"");
+        let del = derive_typed_events(&command, &v)
+            .into_iter()
+            .find(|e| e.kind == EventKind::FileDelete)
+            .expect("combined command must record a FileDelete");
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("1"),
+            "an authored delete after the generated wrapper must remain counted"
+        );
     }
 
     #[test]
@@ -3679,6 +3734,13 @@ mod tests {
                 "{ { ( export -p; ) || true; } >> \"$__hermes_snap_tmp\" && ",
                 "mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-deadbeef.sh; } ",
                 "2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true",
+            ),
+            concat!(
+                "__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX) && ",
+                "{ { ( export -p; ) || true; } > \"$__hermes_snap_tmp\" && ",
+                "mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-deadbeef.sh; } ",
+                "2>/dev/null; false || ",
+                "rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true",
             ),
         ] {
             let del = derive_typed_events(command, &v)
