@@ -702,6 +702,7 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
 
     // --- Command-shape signals ---------------------------------------------
     let segments = tokenize::tokenize(cmd, ShellType::Posix);
+    let hermes_snapshot_cleanup_segment = generated_hermes_snapshot_cleanup_segment(&segments);
     let mut leader_is_network = false;
     let mut delete_path: Option<String> = None;
     // Path-operand counts accumulated across ALL rm/unlink/shred segments in this
@@ -721,7 +722,7 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
     let mut secret_write_path: Option<String> = None;
     let mut manifest_write_path: Option<String> = None;
 
-    for seg in &segments {
+    for (segment_index, seg) in segments.iter().enumerate() {
         let (leader, args) = resolve_leader_and_args(seg);
         let leader_base = command_base(&leader);
 
@@ -748,7 +749,11 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
                 // is three deletions, and split the total into non-build paths so
                 // the mass-delete correlation never counts `dist/`/`node_modules/`.
                 delete_path_count += count_path_args(leader_base.as_str(), &args);
-                delete_non_build_count += count_non_build_path_args(leader_base.as_str(), &args);
+                delete_non_build_count += count_non_build_path_args(
+                    leader_base.as_str(),
+                    &args,
+                    hermes_snapshot_cleanup_segment == Some(segment_index),
+                );
             }
             "git" if git_is_force_push(&args) => is_force_push = true,
             "npm" | "pnpm" | "yarn" | "pip" | "pip3" | "cargo" | "brew" | "gem" | "go" | "apt"
@@ -986,11 +991,108 @@ fn count_path_args(tool: &str, args: &[String]) -> usize {
 /// `rm -rf src x` -> 2. This is what the mass-deletion correlation sums, so a mixed
 /// delete contributes exactly its real non-build paths instead of all-or-nothing on
 /// one sampled path.
-fn count_non_build_path_args(tool: &str, args: &[String]) -> usize {
+fn count_non_build_path_args(
+    tool: &str,
+    args: &[String],
+    generated_hermes_snapshot_cleanup: bool,
+) -> usize {
     delete_path_args(tool, args)
         .into_iter()
-        .filter(|a| !crate::util_build_dirs::is_build_artifact_path(a))
+        .filter(|a| {
+            !(crate::util_build_dirs::is_build_artifact_path(a)
+                || (generated_hermes_snapshot_cleanup && is_hermes_snapshot_tmp_operand(a)))
+        })
         .count()
+}
+
+fn is_hermes_snapshot_tmp_operand(path: &str) -> bool {
+    path == "\"$__hermes_snap_tmp\""
+}
+
+/// Locate Hermes Agent's generated atomic environment-snapshot fallback.
+///
+/// The exemption is bound to one parsed `|| rm -f "$__hermes_snap_tmp"` segment, not
+/// inferred from substrings elsewhere in the command. The same segment sequence must contain
+/// the exact temp-root `mktemp` assignment, a redirect into that variable, and a matching
+/// atomic rename in that order. Any additional fallback-like segment or unexpected use of the
+/// private variable between assignment and cleanup fails closed.
+fn generated_hermes_snapshot_cleanup_segment(segments: &[tokenize::Segment]) -> Option<usize> {
+    const ASSIGNMENT_PREFIX: &str = "__hermes_snap_tmp=$(mktemp ";
+    const VARIABLE: &str = "\"$__hermes_snap_tmp\"";
+    const CLEANUP: &str = "rm -f \"$__hermes_snap_tmp\" 2>/dev/null";
+
+    let assignments: Vec<(usize, &str)> = segments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, segment)| {
+            let template = segment
+                .raw
+                .strip_prefix(ASSIGNMENT_PREFIX)?
+                .strip_suffix(')')?
+                .trim()
+                .trim_matches(['\'', '"']);
+            if template.split_whitespace().count() == 1
+                && template.ends_with(".sh.tmp.XXXXXXXXXX")
+                && crate::util_build_dirs::is_hermes_temp_artifact_path(template)
+            {
+                Some((index, template))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let [(assignment_index, template)] = assignments.as_slice() else {
+        return None;
+    };
+    let (snapshot_path, _) = template.split_once(".tmp.")?;
+    if !snapshot_path.ends_with(".sh") {
+        return None;
+    }
+
+    let cleanup_candidates: Vec<usize> = segments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, segment)| {
+            (segment.preceding_separator.as_deref() == Some("||") && segment.raw == CLEANUP)
+                .then_some(index)
+        })
+        .collect();
+    let [cleanup_index] = cleanup_candidates.as_slice() else {
+        return None;
+    };
+    if assignment_index >= cleanup_index {
+        return None;
+    }
+
+    let expected_redirect = format!("}} > {VARIABLE}");
+    let redirect_index = segments
+        .iter()
+        .enumerate()
+        .skip(assignment_index + 1)
+        .take(cleanup_index - assignment_index - 1)
+        .find_map(|(index, segment)| (segment.raw == expected_redirect).then_some(index))?;
+
+    let expected_mv = format!("mv -f {VARIABLE} {snapshot_path}");
+    let mv_index = segments
+        .iter()
+        .enumerate()
+        .skip(redirect_index + 1)
+        .take(cleanup_index - redirect_index - 1)
+        .find_map(|(index, segment)| (segment.raw == expected_mv).then_some(index))?;
+
+    for (index, segment) in segments
+        .iter()
+        .enumerate()
+        .skip(assignment_index + 1)
+        .take(cleanup_index - assignment_index - 1)
+    {
+        if segment.raw.contains("__hermes_snap_tmp") && index != redirect_index && index != mv_index
+        {
+            return None;
+        }
+    }
+
+    Some(*cleanup_index)
 }
 
 /// Split a `scheme://rest` argument into its lowercased scheme and the raw host
@@ -3423,6 +3525,174 @@ mod tests {
             Some("0"),
             "Hermes' generated environment snapshot temp is not authored source"
         );
+    }
+
+    const HERMES_SNAPSHOT_WRAPPER: &str = concat!(
+        "true; __hermes_ec=$?; umask 077; ",
+        "__hermes_snap_tmp=$(mktemp ",
+        "/var/folders/ab/cd/T/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX) && ",
+        "{ { ( export -p; ) || true; } > \"$__hermes_snap_tmp\" && ",
+        "mv -f \"$__hermes_snap_tmp\" ",
+        "/var/folders/ab/cd/T/hermes-snap-deadbeef.sh; } ",
+        "2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true",
+    );
+
+    #[test]
+    fn derive_file_delete_ignores_hermes_snapshot_variable_cleanup() {
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let command = HERMES_SNAPSHOT_WRAPPER;
+        let segments = tokenize::tokenize(command, ShellType::Posix);
+        assert!(generated_hermes_snapshot_cleanup_segment(&segments).is_some());
+        let del = derive_typed_events(command, &v)
+            .into_iter()
+            .find(|e| e.kind == EventKind::FileDelete)
+            .expect("snapshot fallback cleanup must record a FileDelete");
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("0"),
+            "the generated Hermes snapshot variable resolves only to a temp artifact"
+        );
+    }
+
+    #[test]
+    fn derive_file_delete_counts_authored_private_variable_deletes_before_wrapper() {
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        for (prefix, expected_total, expected_non_build) in [
+            (
+                concat!(
+                    "printf -v __hermes_snap_tmp /important/a; ",
+                    "rm -f \"$__hermes_snap_tmp\"; ",
+                    "printf -v __hermes_snap_tmp /important/b; ",
+                    "rm -f \"$__hermes_snap_tmp\"",
+                ),
+                "3",
+                "2",
+            ),
+            ("false || rm -f \"$__hermes_snap_tmp\"", "2", "1"),
+            ("rm -f '$__hermes_snap_tmp'", "2", "1"),
+        ] {
+            let command = format!("{prefix}; {HERMES_SNAPSHOT_WRAPPER}");
+            let del = derive_typed_events(&command, &v)
+                .into_iter()
+                .find(|e| e.kind == EventKind::FileDelete)
+                .expect("combined command must record a FileDelete");
+            assert_eq!(
+                del.metadata
+                    .get(crate::event_buffer::DELETE_COUNT_KEY)
+                    .map(String::as_str),
+                Some(expected_total),
+                "all delete segments must remain represented: {prefix}"
+            );
+            assert_eq!(
+                del.metadata
+                    .get(crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY)
+                    .map(String::as_str),
+                Some(expected_non_build),
+                "authored private-variable deletes must remain counted: {prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_file_delete_keeps_unproven_variable_cleanup_authored() {
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        for command in [
+            "rm -f \"$__hermes_snap_tmp\"",
+            "tmp=$(mktemp /tmp/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX); rm -f \"$tmp\"",
+            "__hermes_snap_tmp=/tmp/hermes-snap-deadbeef.sh.tmp.123; rm -f \"$__hermes_snap_tmp\"",
+            "__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX); rm -f \"$__hermes_snap_tmp\"",
+            "__hermes_snap_tmp=$(mktemp /workspace/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX); rm -f \"$__hermes_snap_tmp\"",
+            concat!(
+                "__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX) && ",
+                "{ export -p > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" ",
+                "/tmp/hermes-snap-other.sh; } || rm -f \"$__hermes_snap_tmp\"",
+            ),
+            concat!(
+                "__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-deadbeef.sh.tmp.$BASHPID) && ",
+                "{ export -p > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" ",
+                "/tmp/hermes-snap-deadbeef.sh; } || rm -f \"$__hermes_snap_tmp\"",
+            ),
+            concat!(
+                "__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX) && ",
+                "{ { ( export -p; ) || true; } > \"$__hermes_snap_tmp\" && ",
+                "__hermes_snap_tmp=/important && mv -f \"$__hermes_snap_tmp\" ",
+                "/tmp/hermes-snap-deadbeef.sh; } 2>/dev/null || ",
+                "rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true",
+            ),
+            concat!(
+                "__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX) && ",
+                "{ { ( export -p; ) || true; } > \"$__hermes_snap_tmp\" && ",
+                "printf -v __hermes_snap_tmp /important && ",
+                "mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-deadbeef.sh; } ",
+                "2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true",
+            ),
+            concat!(
+                "__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX) && ",
+                "{ { ( export -p; ) || true; } > \"$__hermes_snap_tmp\" && ",
+                "mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-deadbeef.sh; } ",
+                "2>/dev/null || rm \"$__hermes_snap_tmp\" 2>/dev/null || true",
+            ),
+            concat!(
+                "__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX) && ",
+                "{ { ( export -p; ) || true; } > \"$__hermes_snap_tmp\" && ",
+                "env FOO=bar mv -f \"$__hermes_snap_tmp\" ",
+                "/tmp/hermes-snap-deadbeef.sh; } 2>/dev/null || ",
+                "rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true",
+            ),
+            concat!(
+                "__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX) && ",
+                "{ { ( export -p; ) || true; } > \"$__hermes_snap_tmp\" && ",
+                "FOO=bar mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-deadbeef.sh; } ",
+                "2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true",
+            ),
+            concat!(
+                "__hermes_snap_tmp=$(mktemp ",
+                "/workspace/target/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX) && ",
+                "{ { ( export -p; ) || true; } > \"$__hermes_snap_tmp\" && ",
+                "mv -f \"$__hermes_snap_tmp\" ",
+                "/workspace/target/hermes-snap-deadbeef.sh; } 2>/dev/null || ",
+                "rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true",
+            ),
+            concat!(
+                "__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-first.sh.tmp.XXXXXXXXXX); ",
+                "__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX) && ",
+                "{ { ( export -p; ) || true; } > \"$__hermes_snap_tmp\" && ",
+                "mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-deadbeef.sh; } ",
+                "2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true",
+            ),
+            concat!(
+                "__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX) && ",
+                "mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-deadbeef.sh && ",
+                "} > \"$__hermes_snap_tmp\"; } 2>/dev/null || ",
+                "rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true",
+            ),
+            concat!(
+                "__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX) && ",
+                "{ { ( export -p; ) || true; } >> \"$__hermes_snap_tmp\" && ",
+                "mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-deadbeef.sh; } ",
+                "2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true",
+            ),
+        ] {
+            let del = derive_typed_events(command, &v)
+                .into_iter()
+                .find(|e| e.kind == EventKind::FileDelete)
+                .expect("variable cleanup must record a FileDelete");
+            assert_eq!(
+                del.metadata
+                    .get(crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY)
+                    .map(String::as_str),
+                Some("1"),
+                "unproven variable cleanup must stay authored: {command}"
+            );
+        }
     }
 
     #[test]

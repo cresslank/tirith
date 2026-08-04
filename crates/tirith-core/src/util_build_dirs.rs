@@ -31,16 +31,16 @@ pub fn should_skip_dir(name: &str) -> bool {
 }
 
 /// Returns true if any component of `path` is a built-in build-artifact
-/// directory. Components are split on both `/` and `\` so the check works for
-/// POSIX and Windows-style paths.
+/// directory, or if the path is a generated Hermes runtime artifact under an
+/// operating-system temporary root. Components are split on both `/` and `\`
+/// so the check works for POSIX and Windows-style paths.
 pub fn is_build_artifact_path(path: &str) -> bool {
-    if path.split(['/', '\\']).any(should_skip_dir) {
-        return true;
-    }
+    path.split(['/', '\\']).any(should_skip_dir) || is_hermes_temp_artifact_path(path)
+}
 
-    // Hermes Agent creates these generated runtime artifacts under the operating
-    // system's temporary roots. Scope the exemption to those roots so authored
-    // files with similar names remain part of deletion correlation.
+/// Returns true only for Hermes Agent runtime artifacts beneath known
+/// operating-system temporary roots.
+pub fn is_hermes_temp_artifact_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
     let lowercase = normalized.to_ascii_lowercase();
     let in_temp_root = normalized.starts_with("/tmp/")
@@ -138,6 +138,19 @@ mod tests {
         assert!(!is_build_artifact_path("src/hermes_sandbox_rules.rs"));
         assert!(!is_build_artifact_path("/tmp/hermes_sandbox_/script.py"));
         assert!(!is_build_artifact_path("src/main.rs"));
+    }
+
+    #[test]
+    fn hermes_temp_artifact_excludes_generic_build_directories() {
+        assert!(is_hermes_temp_artifact_path(
+            "/tmp/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX"
+        ));
+        assert!(!is_hermes_temp_artifact_path(
+            "/workspace/target/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX"
+        ));
+        assert!(is_build_artifact_path(
+            "/workspace/target/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX"
+        ));
     }
 
     #[test]
