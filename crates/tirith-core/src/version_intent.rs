@@ -173,10 +173,20 @@ impl VersionIntent {
 
     /// Build an intent from a Ruby Gemfile version requirement (`gem "x", "= 1.0"`,
     /// `gem "x", "~> 1.0"`). Unlike Cargo, a bare `1.0` and an explicit `= 1.0` are BOTH
-    /// exact pins; `~>`, `>=`, `<`, etc. are ranges. Strip a single leading `=` operator,
-    /// then reuse the plain-or-constraint logic (plain -> Exact, sigil -> Constraint).
+    /// exact pins; `~>`, `>=`, `<`, etc. are ranges. A shell-tokenized CLI value may retain
+    /// one matching pair of quotes, so remove that pair before stripping a single leading `=`
+    /// operator, then reuse the plain-or-constraint logic (plain -> Exact, sigil -> Constraint).
     pub fn from_gem_version(token: &str) -> VersionIntent {
         let t = token.trim();
+        let t = t
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| {
+                t.strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })
+            .unwrap_or(t)
+            .trim();
         let stripped = t.strip_prefix('=').map(str::trim).unwrap_or(t);
         Self::from_explicit_version(stripped)
     }
@@ -296,11 +306,9 @@ fn parse_clause(part: &str) -> Option<Clause> {
         (Operator::Ge, r)
     } else if let Some(r) = part.strip_prefix('<') {
         (Operator::Lt, r)
-    } else if let Some(r) = part.strip_prefix('>') {
-        (Operator::Gt, r)
     } else {
         // A bare version, a caret/tilde range, or anything else: not understood.
-        return None;
+        (Operator::Gt, part.strip_prefix('>')?)
     };
 
     let ver = rest.trim();

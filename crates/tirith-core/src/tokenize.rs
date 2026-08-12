@@ -745,7 +745,7 @@ mod tests {
             "Get-Date && Set-ExecutionPolicy Bypass",
             ShellType::PowerShell,
         );
-        assert_eq!(segs.len(), 2, "expected 2 segments, got {:?}", segs);
+        assert_eq!(segs.len(), 2, "expected 2 segments, got {segs:?}");
         assert_eq!(segs[0].command.as_deref(), Some("Get-Date"));
         assert_eq!(segs[1].preceding_separator.as_deref(), Some("&&"));
         assert_eq!(segs[1].command.as_deref(), Some("Set-ExecutionPolicy"));
@@ -757,7 +757,7 @@ mod tests {
             "Get-Date || Set-ExecutionPolicy Bypass",
             ShellType::PowerShell,
         );
-        assert_eq!(segs.len(), 2, "expected 2 segments, got {:?}", segs);
+        assert_eq!(segs.len(), 2, "expected 2 segments, got {segs:?}");
         assert_eq!(segs[0].command.as_deref(), Some("Get-Date"));
         assert_eq!(segs[1].preceding_separator.as_deref(), Some("||"));
         assert_eq!(segs[1].command.as_deref(), Some("Set-ExecutionPolicy"));
@@ -768,7 +768,7 @@ mod tests {
         // Critical precedence check: `||` must be consumed as ONE separator,
         // not two pipes producing three segments.
         let segs = tokenize("a || b", ShellType::PowerShell);
-        assert_eq!(segs.len(), 2, "expected 2 segments (||), got {:?}", segs);
+        assert_eq!(segs.len(), 2, "expected 2 segments (||), got {segs:?}");
         assert_eq!(segs[1].preceding_separator.as_deref(), Some("||"));
     }
 
@@ -789,8 +789,7 @@ mod tests {
         assert_eq!(
             segs.len(),
             1,
-            "expected 1 segment (single & is not a separator), got {:?}",
-            segs
+            "expected 1 segment (single & is not a separator), got {segs:?}"
         );
     }
 
