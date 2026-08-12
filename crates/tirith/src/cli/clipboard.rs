@@ -22,7 +22,7 @@ use tirith_core::extract::ScanContext;
 use tirith_core::output;
 use tirith_core::redact::{redact_for_audience_with_custom, ShareAudience};
 use tirith_core::tokenize::ShellType;
-use tirith_core::verdict::Severity;
+use tirith_core::verdict::{RuleId, Severity};
 
 /// Max file size for `tirith clipboard copy` — matches `tirith paste`'s 1 MiB cap.
 const MAX_COPY_BYTES: u64 = 1024 * 1024;
@@ -81,10 +81,7 @@ pub fn copy(path: &Path, redact: bool, audience: Option<&str>, json: bool) -> i3
     let has_high = has_blocking_findings(&verdict);
 
     if has_high && !redact {
-        // Secret-shaped content has a remedy the operator can act on; other
-        // blockers do not, so name the two cases apart.
         let secret_shaped = verdict.findings.iter().any(|finding| {
-            use tirith_core::verdict::RuleId;
             matches!(
                 finding.rule_id,
                 RuleId::CredentialInText

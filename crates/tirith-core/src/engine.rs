@@ -5852,11 +5852,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exec_guard_on_fires_exec_in_tmp_off_fast_exits() {
-        // A TIRITH_POLICY_ROOT in the environment would override the cwd-based
-        // discovery this test relies on; skip rather than assert falsely.
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _isolated = isolate_state();
         use crate::verdict::RuleId;
 
         // A leader resolving under /tmp. An absolute path is used as-is by
