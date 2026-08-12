@@ -501,10 +501,8 @@ pub enum UnresolvedReason {
     /// The constraint parsed, but at least one affected version in the record
     /// is not a plain release version we can compare against.
     AffectedVersionUnparsed,
-    /// The record is version-specific (not all-versions-malicious) but enumerates
-    /// NO affected versions, so there is nothing to match or exclude against. Distinct
-    /// from `AffectedVersionUnparsed` (versions present but uncomparable) so a JSON
-    /// consumer can tell MISSING version metadata from a malformed version.
+    /// The record is version-specific but enumerates no affected versions, so
+    /// there is nothing to match or exclude against.
     AffectedVersionsMissing,
 }
 
@@ -598,6 +596,35 @@ impl BehaviorTag {
             .copied()
             .filter(|t| bits & t.mask() != 0)
             .collect()
+    }
+
+    /// Stable snake_case identifier for this tag. Used as the token in the
+    /// curated file-hash feed and any machine-readable enrichment output, so it
+    /// must stay stable across releases (the on-disk format keys on the bit
+    /// position, not the name, but the name is a public contract for the feed).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProcessSpawn => "process_spawn",
+            Self::NetworkExfil => "network_exfil",
+            Self::RuntimeLoader => "runtime_loader",
+            Self::DynamicCodeLoad => "dynamic_code_load",
+            Self::StartupHook => "startup_hook",
+            Self::NativeInit => "native_init",
+            Self::CrossRuntime => "cross_runtime",
+            Self::CredentialAccess => "credential_access",
+        }
+    }
+
+    /// Parse a stable snake_case identifier back into a tag. Case-insensitive and
+    /// surrounding-whitespace tolerant. Returns `None` for an unknown token so a
+    /// feed entry carrying a tag this build does not recognize is skipped rather
+    /// than mismapped (the curated-feed parser reports the skip).
+    pub fn from_name(s: &str) -> Option<Self> {
+        let needle = s.trim();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|t| t.as_str().eq_ignore_ascii_case(needle))
     }
 }
 
@@ -1477,7 +1504,7 @@ impl ThreatDb {
     ///
     /// Supplemental precedence (merging this DB with its overlay): an exact
     /// match wins (primary preferred); else if either layer is unresolved the
-    /// result is `Unresolved` with deduplicated affected versions; else a
+    /// result is `Unresolved` with that layer's affected versions; else a
     /// concrete intersection; else a proven exclusion; else `NoRecord`. A
     /// `ConstraintExcludesAffected` is therefore returned only when NO layer is
     /// exact, intersecting, or unresolved.
@@ -1526,9 +1553,6 @@ impl ThreatDb {
             return PackageThreatAssessment::ExactMatch(summary);
         }
 
-        // A malicious record with NO affected versions (and not all-versions-malicious)
-        // gives nothing to match against or exclude, so NO intent can be proven a hit
-        // or an exclusion: it is Unresolved, never a silent NoRecord/clean.
         if rec.versions.is_empty() {
             return PackageThreatAssessment::Unresolved {
                 summary,
@@ -1539,13 +1563,6 @@ impl ThreatDb {
 
         match intent {
             VersionIntent::Exact(v) | VersionIntent::Resolved(v) => {
-                // Match on a literal string equal OR a numeric release equal, so a pin
-                // like `==1.4` still hits a record listing `1.4.0`. A PEP 440 LOCAL
-                // version (`1.0+ubuntu1`) ALSO matches a record for its base (`1.0`): a
-                // local build is a rebuild of the base release, so a malicious upstream
-                // is not missed, while an exact local record (`1.0+ubuntu1`) still
-                // matches via the literal compare. Compare via `cmp` (not `==`): only
-                // `Ord` treats trailing-zero segments as equal, so `1.4` == `1.4.0`.
                 let v_s: &str = v;
                 let base: &str = v_s.split('+').next().unwrap_or(v_s);
                 let matched = rec.versions.iter().any(|rv| {
@@ -1577,15 +1594,6 @@ impl ThreatDb {
             },
             VersionIntent::Constraint { parsed, raw } => {
                 let Some(constraint) = parsed else {
-                    // Raw-token exact fallback: an explicit-but-unparseable token (a Docker
-                    // digest, a dist-tag like `latest`, a non-semver selector) still names a
-                    // concrete identity. If it LITERALLY equals an affected version that is a
-                    // definite malicious hit, not an unresolved guess, so return ExactMatch
-                    // rather than downgrading a known-bad pin to a Medium warning. A raw that
-                    // LOOKS LIKE A PLAIN VERSION is NOT such a token, though: it is a range
-                    // requirement we did not parse (e.g. Cargo's caret default, where
-                    // `1.0.0` means `^1.0.0`), so exact-matching it would wrongly upgrade a
-                    // range request to a confirmed hit. Those stay Unresolved (a warning).
                     if !crate::version_intent::looks_like_plain_version(raw)
                         && rec.versions.iter().any(|rv| rv == raw)
                     {
@@ -2152,9 +2160,8 @@ struct PkgRecord<'a> {
 /// Combine a primary-layer assessment with a supplemental-layer assessment.
 ///
 /// Precedence (`primary` preferred on ties): an exact match wins; else if
-/// either layer is unresolved the result is `Unresolved` with deduplicated
-/// affected versions drawn from every layer that names any (so the warning
-/// lists them all); else a concrete intersection (deduped); else a proven
+/// either layer is unresolved the result is `Unresolved` with affected versions
+/// from the same layer as its summary; else a concrete intersection; else a proven
 /// exclusion; else `NoRecord`. Crucially, `ConstraintExcludesAffected` (which
 /// emits NO warning) survives only when no layer is exact, unresolved, or
 /// intersecting, so the overlay can never silence a primary hit and vice versa.
@@ -2192,12 +2199,8 @@ fn merge_assessments(
             _ => None,
         }
     };
-    // 2. Any unresolved layer makes the result unresolved (primary's reason and
-    // summary preferred). The affected versions come from the SAME layer whose summary
-    // is returned, NOT a union of both: the merged finding phrases the list as flagged by
-    // that one summary's `source_label`, so unioning would misattribute an overlay-only
-    // version to the primary's source. (The package is still flagged regardless; only the
-    // affected-version list is scoped to the reported source.)
+    // Keep affected versions from the same layer as the reported summary so a
+    // version is never attributed to the wrong feed.
     let primary_unresolved = matches!(primary, P::Unresolved { .. });
     let overlay_unresolved = matches!(overlay, P::Unresolved { .. });
     if primary_unresolved || overlay_unresolved {
@@ -2221,13 +2224,12 @@ fn merge_assessments(
         };
     }
 
-    // 3. A concrete intersection in either layer (primary summary preferred). Same
-    // provenance rule: the affected versions come from the layer whose summary is returned.
+    // 3. A concrete intersection in either layer (primary summary preferred).
     let primary_intersects = matches!(primary, P::ConstraintIntersectsAffected { .. });
     let overlay_intersects = matches!(overlay, P::ConstraintIntersectsAffected { .. });
     if primary_intersects || overlay_intersects {
-        let (summary, affected_versions) = if let Some(s) = summary_from(&primary) {
-            (s, affected_from(&primary))
+        let (summary, affected_versions) = if let Some(summary) = summary_from(&primary) {
+            (summary, affected_from(&primary))
         } else {
             (
                 summary_from(&overlay).expect("an intersecting layer carries a summary"),
@@ -2398,8 +2400,6 @@ fn path_mtime_epoch(path: &Path) -> Option<u64> {
 /// extension with `-v2.dat`, falling back to appending `-v2` for any other name.
 fn v2_sibling(path: &Path) -> PathBuf {
     if path.extension().and_then(|e| e.to_str()) == Some("dat") {
-        // Strip the ".dat" extension and append "-v2.dat", operating on the OsStr so
-        // a non-UTF-8 filename is not corrupted by a lossy string conversion.
         if let Some(stem) = path.file_stem() {
             let mut name = stem.to_os_string();
             name.push("-v2.dat");
