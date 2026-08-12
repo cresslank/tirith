@@ -916,7 +916,7 @@ fn print_test_command_human(
     _policy: &Policy,
     trace: &PolicyTrace,
 ) {
-    eprintln!("tirith policy test: command = {:?}", command);
+    eprintln!("tirith policy test: command = {command:?}");
     eprintln!(
         "  policy: {}",
         trace
@@ -951,7 +951,7 @@ fn print_test_command_human(
 
 fn print_test_file_human(file_path: &str, result: &scan::FileScanResult, _policy: &Policy) {
     if result.findings.is_empty() {
-        eprintln!("tirith policy test: {} — no findings", file_path);
+        eprintln!("tirith policy test: {file_path} — no findings");
         return;
     }
 

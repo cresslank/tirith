@@ -176,25 +176,17 @@ fn strip_block(content: &str) -> String {
 fn build_snippet(shell: &str) -> String {
     match shell {
         "fish" => format!(
-            "{begin}\nfunction tirith-output-guard-wrap\n    if test (count $argv) -eq 0\n        echo 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]' >&2\n        return 2\n    end\n    $argv 2>&1 | tirith view --max-bytes 16777216 -\nend\nalias tirith-out 'tirith-output-guard-wrap'\n{end}\n",
-            begin = BEGIN_MARKER,
-            end = END_MARKER,
+            "{BEGIN_MARKER}\nfunction tirith-output-guard-wrap\n    if test (count $argv) -eq 0\n        echo 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]' >&2\n        return 2\n    end\n    $argv 2>&1 | tirith view --max-bytes 16777216 -\nend\nalias tirith-out 'tirith-output-guard-wrap'\n{END_MARKER}\n",
         ),
         "nushell" => format!(
-            "{begin}\ndef tirith-output-guard-wrap [...cmd] {{\n    if ($cmd | length) == 0 {{\n        print --stderr 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]'\n        return 2\n    }}\n    run-external $cmd.0 ...($cmd | skip 1) | tirith view --max-bytes 16777216 -\n}}\nalias tirith-out = tirith-output-guard-wrap\n{end}\n",
-            begin = BEGIN_MARKER,
-            end = END_MARKER,
+            "{BEGIN_MARKER}\ndef tirith-output-guard-wrap [...cmd] {{\n    if ($cmd | length) == 0 {{\n        print --stderr 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]'\n        return 2\n    }}\n    run-external $cmd.0 ...($cmd | skip 1) | tirith view --max-bytes 16777216 -\n}}\nalias tirith-out = tirith-output-guard-wrap\n{END_MARKER}\n",
         ),
         "powershell" => format!(
-            "{begin}\nfunction tirith-output-guard-wrap {{\n    param([Parameter(ValueFromRemainingArguments=$true)]$Args)\n    if ($Args.Count -eq 0) {{\n        Write-Error 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]'\n        return\n    }}\n    & $Args[0] $Args[1..($Args.Count-1)] 2>&1 | & tirith view --max-bytes 16777216 -\n}}\nSet-Alias tirith-out tirith-output-guard-wrap\n{end}\n",
-            begin = BEGIN_MARKER,
-            end = END_MARKER,
+            "{BEGIN_MARKER}\nfunction tirith-output-guard-wrap {{\n    param([Parameter(ValueFromRemainingArguments=$true)]$Args)\n    if ($Args.Count -eq 0) {{\n        Write-Error 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]'\n        return\n    }}\n    & $Args[0] $Args[1..($Args.Count-1)] 2>&1 | & tirith view --max-bytes 16777216 -\n}}\nSet-Alias tirith-out tirith-output-guard-wrap\n{END_MARKER}\n",
         ),
         // zsh / bash / posix sh share one snippet.
         _ => format!(
-            "{begin}\ntirith-output-guard-wrap() {{\n    if [ \"$#\" -eq 0 ]; then\n        echo 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]' >&2\n        return 2\n    fi\n    \"$@\" 2>&1 | command tirith view --max-bytes 16777216 -\n}}\nalias tirith-out='tirith-output-guard-wrap'\n{end}\n",
-            begin = BEGIN_MARKER,
-            end = END_MARKER,
+            "{BEGIN_MARKER}\ntirith-output-guard-wrap() {{\n    if [ \"$#\" -eq 0 ]; then\n        echo 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]' >&2\n        return 2\n    fi\n    \"$@\" 2>&1 | command tirith view --max-bytes 16777216 -\n}}\nalias tirith-out='tirith-output-guard-wrap'\n{END_MARKER}\n",
         ),
     }
 }
@@ -232,11 +224,7 @@ mod tests {
 
     #[test]
     fn strip_block_removes_inserted_section() {
-        let content = format!(
-            "before line\n{begin}\nfunc def\n{end}\nafter line\n",
-            begin = BEGIN_MARKER,
-            end = END_MARKER,
-        );
+        let content = format!("before line\n{BEGIN_MARKER}\nfunc def\n{END_MARKER}\nafter line\n",);
         let out = strip_block(&content);
         assert!(out.contains("before line"));
         assert!(out.contains("after line"));
