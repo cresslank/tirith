@@ -284,17 +284,14 @@ fn parse_npm_package_spec(spec: &str) -> Option<PackageRef> {
 
     let (name, version) = if spec.starts_with('@') {
         // Scoped `@scope/name@version` — find the version `@` after the scope.
-        if let Some(slash_pos) = spec.find('/') {
-            let after_scope = &spec[slash_pos + 1..];
-            if let Some(at_pos) = after_scope.find('@') {
-                let full_name = &spec[..slash_pos + 1 + at_pos];
-                let ver = &after_scope[at_pos + 1..];
-                (full_name, if ver.is_empty() { None } else { Some(ver) })
-            } else {
-                (spec, None)
-            }
+        let slash_pos = spec.find('/')?;
+        let after_scope = &spec[slash_pos + 1..];
+        if let Some(at_pos) = after_scope.find('@') {
+            let full_name = &spec[..slash_pos + 1 + at_pos];
+            let ver = &after_scope[at_pos + 1..];
+            (full_name, if ver.is_empty() { None } else { Some(ver) })
         } else {
-            return None; // invalid scoped package (no slash)
+            (spec, None)
         }
     } else if let Some(at_pos) = spec.find('@') {
         let name = &spec[..at_pos];
@@ -415,7 +412,7 @@ fn extract_gem_packages(args: &[String], packages: &mut Vec<PackageRef>) {
                             if last.ecosystem == Ecosystem::RubyGems
                                 && matches!(last.version, VersionIntent::Unspecified)
                             {
-                                last.version = VersionIntent::from_explicit_version(ver);
+                                last.version = VersionIntent::from_gem_version(ver);
                             }
                         }
                     }
@@ -1264,6 +1261,25 @@ mod tests {
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "rails");
         assert_eq!(pkgs[0].version, VersionIntent::Exact("7.0.0".to_string()));
+    }
+
+    #[test]
+    fn gem_install_with_explicit_equality_version_flag() {
+        let pkgs = tokenize_and_extract(r#"gem install rails --version "= 7.0.0""#);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "rails");
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("7.0.0".to_string()));
+    }
+
+    #[test]
+    fn gem_install_with_quoted_range_stays_a_constraint() {
+        let pkgs = tokenize_and_extract(r#"gem install rails --version "~> 7.0""#);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "rails");
+        assert!(matches!(
+            &pkgs[0].version,
+            VersionIntent::Constraint { raw, .. } if raw == "~> 7.0"
+        ));
     }
 
     #[test]
