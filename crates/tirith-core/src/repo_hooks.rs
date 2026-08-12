@@ -2103,8 +2103,7 @@ mod tests {
             findings
                 .iter()
                 .any(|f| f.severity == Severity::Info && f.detail.contains("unreadable")),
-            "a blocked lefthook.yml must surface the Info unreadable finding under a git leader, got {:?}",
-            findings
+            "a blocked lefthook.yml must surface the Info unreadable finding under a git leader, got {findings:?}"
         );
     }
 

@@ -884,7 +884,7 @@ pub fn check(
                 findings.push(Finding {
                     rule_id,
                     severity,
-                    title: format!("Threat intelligence hostname match: {}", host),
+                    title: format!("Threat intelligence hostname match: {host}"),
                     description: format!(
                         "Hostname '{}' appears in threat intelligence feed ({}).",
                         host,
@@ -911,7 +911,7 @@ pub fn check(
                         findings.push(Finding {
                             rule_id,
                             severity,
-                            title: format!("Threat intelligence IP match in URL: {}", ip),
+                            title: format!("Threat intelligence IP match in URL: {ip}"),
                             description: format!(
                                 "IP address {} (from URL) is flagged by {}.",
                                 ip,
@@ -944,7 +944,7 @@ pub fn check(
                         findings.push(Finding {
                             rule_id,
                             severity,
-                            title: format!("Threat intelligence IP match: {}", ip),
+                            title: format!("Threat intelligence IP match: {ip}"),
                             description: format!(
                                 "IP address {} is flagged by {}.",
                                 ip,
