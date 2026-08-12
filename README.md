@@ -329,11 +329,11 @@ Run `tirith mcp-server` or use `tirith setup <tool> --with-mcp` to register tiri
 
 ### MCP server governance
 
-`tirith mcp lock` captures every MCP server a repository declares, across `.mcp.json` / `mcp.json` / `mcp_settings.json` and the IDE config variants (`.vscode/`, `.cursor/`, `.windsurf/`, `.cline/`, `.amazonq/`, `.continue/`, `.kiro/`), into a deterministic lockfile at `.tirith/mcp.lock`. Each server is recorded with its transport (a remote URL, or a local command + args), declared tools, and a content hash; servers are sorted by name so the lockfile is diff-friendly. Discovery is repo-local only and touches no network. (`tirith mcp` is a separate command group from `tirith mcp-server`, which runs tirith *as* an MCP server.)
+`tirith mcp lock` captures every MCP server a repository declares, across `.mcp.json` / `mcp.json` / `mcp_settings.json` and the IDE config variants (`.vscode/`, `.cursor/`, `.windsurf/`, `.cline/`, `.amazonq/`, `.continue/`, `.kiro/`), into a deterministic lockfile at `.tirith/mcp.lock`. Each server is recorded with its transport (a remote URL, or a local command + args), declared tools, coverage metadata, and a content hash; servers are sorted by name/source so the lockfile is diff-friendly. Ambiguous or credential-bearing declarations are refused instead of copied into source control. Discovery is repo-local only and touches no network. (`tirith mcp` is a separate command group from `tirith mcp-server`, which runs tirith *as* an MCP server.)
 
-`tirith mcp verify` is the gating companion: it rebuilds the current inventory against the committed lockfile and exits 1 on drift (0 match, 2 on usage errors like a missing lockfile). `tirith mcp diff` reports the same drift informationally (always exit 0, 2 only on usage errors, so a consumer can tell "no drift" from "could not check"). Drift also surfaces through `tirith scan` as `mcp_server_drift` (Medium), so a pre-commit hook or CI catches an MCP-surface change the way it catches an un-pinned action. `verify` / `diff` never print env values or URL userinfos, only the names of what changed.
+`tirith mcp verify` is the gating companion: it rebuilds the current inventory against the committed lockfile and exits 1 on drift or incomplete/rejected config coverage (0 match, 2 on usage errors like a missing lockfile). `tirith mcp diff` reports the same drift informationally (always exit 0, 2 only on usage errors, so a consumer can tell "no drift" from "could not check"). Drift also surfaces through `tirith scan` as `mcp_server_drift` (Medium or High), so a pre-commit hook or CI catches an MCP-surface change the way it catches an un-pinned action. `verify` / `diff` never print env values or URL userinfos, only the names of what changed.
 
-Two policy fields govern what is accepted: `scan.trusted_mcp_servers` suppresses a server's config findings and silences its drift, and `scan.mcp_allowed_tools` declares the exact tools each server may expose (a tool outside that set surfaces a High `mcp_server_drift` finding, and drift adding such a tool upgrades Medium to High). `tirith mcp policy init` scaffolds both blocks from the current lockfile into `.tirith/mcp-policy.yaml.example`, every entry commented out so importing never silently widens trust.
+Two policy fields govern what is accepted. Both are keyed by an opaque `mcp:v1:...` identity binding source path, server name, and transport: `scan.trusted_mcp_servers` suppresses that exact server's config findings and drift, while `scan.mcp_allowed_tools` declares the exact tools it may expose. Bare names intentionally match nothing, so a same-named server in another config cannot inherit trust. An explicit tool allow-list also requires an operator-approved live descriptor set and checks both static declarations and live descriptor names. Run `tirith mcp policy init` to scaffold the exact keys into `.tirith/mcp-policy.yaml.example`, then use the gateway's `--mcp-server-identity ... --approve-descriptors` flow to capture an inspected `tools/list` baseline atomically. Every scaffold entry is commented out so importing never silently widens trust.
 
 ### Config file scanning
 
@@ -752,8 +752,17 @@ That is the daily-driver set. tirith ships 74 commands in all, in 8 groups: scan
   can make outbound requests when configured. Core detection never phones home.
 - **Egress guard on fetches.** `tirith run`, `fetch --save`, and `command-card
   fetch` refuse private, loopback, and cloud-metadata hosts by default, and an
-  SSRF guard re-checks every redirect hop. Set `TIRITH_ALLOW_PRIVATE_FETCH=1` to
-  allow them.
+  SSRF guard re-checks DNS at connect time and on every redirect hop. To reach a
+  specific internal service, set `TIRITH_PRIVATE_FETCH_ALLOW` to a comma-separated
+  list of exact hostnames, private IPs, or bounded private CIDRs (for example,
+  `registry.internal,10.42.0.0/24`). The legacy broad
+  `TIRITH_ALLOW_PRIVATE_FETCH=1` switch is not honored. Link-local, special-use,
+  and cloud control-plane/credential endpoints remain blocked even when a host is
+  approved. Note what a *hostname* entry grants: that name is approved for
+  whatever it resolves to inside private-use and loopback space, `127.0.0.1`
+  included, because resolution is not part of the trust decision. Prefer a CIDR
+  entry when you mean a fixed address range, and use a hostname only when the
+  name itself is what you trust.
 
 ---
 

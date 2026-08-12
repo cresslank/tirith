@@ -24,6 +24,27 @@ mod windows;
 #[derive(Debug, Clone)]
 pub struct TrustedExecutable {
     path: PathBuf,
+    #[cfg(unix)]
+    identity: UnixExecutableIdentity,
+    #[cfg(not(unix))]
+    digest: [u8; 32],
+    #[cfg(windows)]
+    source: WindowsExecutableSource,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnixExecutableIdentity {
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
 }
 
 /// How an absolute Windows executable was selected. The source is part of the
@@ -349,27 +370,35 @@ impl TrustedExecutable {
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt as _;
-            let metadata =
-                std::fs::metadata(&canonical).map_err(|e| TrustedExecutableError::InvalidPath {
-                    path: canonical.clone(),
-                    reason: e.to_string(),
-                })?;
-            if metadata.mode() & 0o002 != 0 {
-                return Err(TrustedExecutableError::InvalidPath {
-                    path: canonical,
-                    reason: "file is world-writable".to_string(),
-                });
-            }
+            let identity = validate_unix_executable(&canonical)?;
+            Ok(Self {
+                path: canonical,
+                identity,
+            })
         }
         #[cfg(windows)]
-        windows::validate_executable(&canonical, _source).map_err(|reason| {
-            TrustedExecutableError::InvalidPath {
-                path: canonical.clone(),
-                reason,
-            }
-        })?;
-        Ok(Self { path: canonical })
+        {
+            windows::validate_executable(&canonical, _source).map_err(|reason| {
+                TrustedExecutableError::InvalidPath {
+                    path: canonical.clone(),
+                    reason,
+                }
+            })?;
+            let digest = executable_digest(&canonical)?;
+            Ok(Self {
+                path: canonical,
+                digest,
+                source: _source,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let digest = executable_digest(&canonical)?;
+            Ok(Self {
+                path: canonical,
+                digest,
+            })
+        }
     }
 
     /// Resolve `name` in an explicit PATH value. If the first executable hit is
@@ -456,6 +485,384 @@ impl TrustedExecutable {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Re-check the canonical executable immediately before a security-sensitive
+    /// spawn. This detects replacement, permission/owner drift, and symlink
+    /// retargeting between discovery and execution.
+    pub fn revalidate(&self) -> Result<(), TrustedExecutableError> {
+        let canonical =
+            self.path
+                .canonicalize()
+                .map_err(|e| TrustedExecutableError::InvalidPath {
+                    path: self.path.clone(),
+                    reason: e.to_string(),
+                })?;
+        if canonical != self.path {
+            return Err(TrustedExecutableError::InvalidPath {
+                path: self.path.clone(),
+                reason: format!("canonical identity changed to {}", canonical.display()),
+            });
+        }
+        #[cfg(unix)]
+        {
+            let current = validate_unix_executable(&canonical)?;
+            if current != self.identity {
+                return Err(TrustedExecutableError::InvalidPath {
+                    path: canonical,
+                    reason: "executable identity changed after validation".to_string(),
+                });
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if !crate::path_audit::is_executable_file(&canonical) {
+                return Err(TrustedExecutableError::NotExecutable(canonical));
+            }
+            #[cfg(windows)]
+            windows::validate_executable(&canonical, self.source).map_err(|reason| {
+                TrustedExecutableError::InvalidPath {
+                    path: canonical.clone(),
+                    reason,
+                }
+            })?;
+            if executable_digest(&canonical)? != self.digest {
+                return Err(TrustedExecutableError::InvalidPath {
+                    path: canonical,
+                    reason: "executable contents changed after validation".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Windows does not expose the Unix `(dev, ino, ctime, mode, owner)` identity
+/// used above through stable `std` APIs. Bind the canonical file's bytes instead
+/// so replacement or in-place modification is still detected before spawn.
+#[cfg(not(unix))]
+fn executable_digest(path: &Path) -> Result<[u8; 32], TrustedExecutableError> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+
+    let mut file =
+        std::fs::File::open(path).map_err(|error| TrustedExecutableError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count =
+            file.read(&mut buffer)
+                .map_err(|error| TrustedExecutableError::InvalidPath {
+                    path: path.to_path_buf(),
+                    reason: error.to_string(),
+                })?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+#[cfg(unix)]
+fn validate_unix_executable(
+    canonical: &Path,
+) -> Result<UnixExecutableIdentity, TrustedExecutableError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata =
+        std::fs::metadata(canonical).map_err(|e| TrustedExecutableError::InvalidPath {
+            path: canonical.to_path_buf(),
+            reason: e.to_string(),
+        })?;
+    if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+        return Err(TrustedExecutableError::NotExecutable(
+            canonical.to_path_buf(),
+        ));
+    }
+
+    let effective_uid = unsafe { libc::geteuid() };
+    validate_unix_owner_and_mode(canonical, &metadata, effective_uid, false)?;
+
+    for parent in canonical.ancestors().skip(1) {
+        let parent_metadata =
+            std::fs::metadata(parent).map_err(|e| TrustedExecutableError::InvalidPath {
+                path: parent.to_path_buf(),
+                reason: e.to_string(),
+            })?;
+        validate_unix_owner_and_mode(parent, &parent_metadata, effective_uid, true)?;
+    }
+
+    Ok(UnixExecutableIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: metadata.mode(),
+        len: metadata.len(),
+        mtime: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+    })
+}
+
+#[cfg(unix)]
+fn validate_unix_owner_and_mode(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    effective_uid: u32,
+    directory: bool,
+) -> Result<(), TrustedExecutableError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if metadata.uid() != 0 && metadata.uid() != effective_uid {
+        return Err(TrustedExecutableError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: format!(
+                "owner uid {} is neither root nor the current uid {}",
+                metadata.uid(),
+                effective_uid
+            ),
+        });
+    }
+    let world_writable = metadata.mode() & 0o002 != 0;
+    // Owner identity does not make a group-write bit safe: another member of a
+    // shared group can replace an entry in an euid-owned 0770/0775 directory.
+    // Only root:root group-write is treated as administrative, since ordinary
+    // principals cannot join gid 0. All other group-writable components fail.
+    let root_group_writable = metadata.uid() == 0 && metadata.gid() == 0;
+    let untrusted_group_writable = metadata.mode() & 0o020 != 0 && !root_group_writable;
+    if world_writable || untrusted_group_writable {
+        // A root-owned sticky directory (for example /tmp) protects entries
+        // owned by another user. The resolver separately denies temp roots, but
+        // this exception preserves explicitly selected tools under private temp
+        // subdirectories in tests and other non-ambient callers.
+        let protected_sticky_directory =
+            directory && metadata.uid() == 0 && metadata.mode() & 0o1000 != 0;
+        if !protected_sticky_directory {
+            return Err(TrustedExecutableError::InvalidPath {
+                path: path.to_path_buf(),
+                reason: "path component is writable by an untrusted group or by everyone"
+                    .to_string(),
+            });
+        }
+    }
+    reject_unix_extended_acl(path, directory).map_err(|reason| {
+        TrustedExecutableError::InvalidPath {
+            path: path.to_path_buf(),
+            reason,
+        }
+    })?;
+    Ok(())
+}
+
+/// Reject filesystem ACLs that can grant mutation authority independently of
+/// Unix owner/group/mode bits. Resolver tools and their trust store use this
+/// deliberately conservative rule. Linux parses each POSIX ACL xattr (access,
+/// plus default for directories) and rejects any entry that could hand write
+/// authority to a principal other than root, the current effective user, or
+/// the component owner; named-group write grants always fail and malformed
+/// blobs fail closed. Base and mask entries mirror or restrict the mode bits
+/// that were already validated, so they stay acceptable; this keeps hosts
+/// that seed benign self-grants (GitHub runners place a default
+/// `user:<login>:rwx` entry on /home) usable without admitting foreign
+/// principals. macOS permits deny-only/read-only entries but rejects every
+/// allow entry carrying a mutation right.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn reject_unix_extended_acl(path: &Path, directory: bool) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    const ACL_EA_VERSION: u32 = 0x0002;
+    const ACL_USER_OBJ: u16 = 0x01;
+    const ACL_USER: u16 = 0x02;
+    const ACL_GROUP_OBJ: u16 = 0x04;
+    const ACL_GROUP: u16 = 0x08;
+    const ACL_MASK: u16 = 0x10;
+    const ACL_OTHER: u16 = 0x20;
+    const ACL_WRITE: u16 = 0x02;
+    // One 4-byte header plus 8-byte entries; 64 KiB bounds hostile attribute
+    // sizes far beyond any legitimate ACL.
+    const MAX_ACL_BYTES: usize = 64 * 1024;
+
+    let path_bytes = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| "path contains an interior NUL while checking ACLs".to_string())?;
+    let mut owner_uid = None;
+    let mut names: Vec<&[u8]> = vec![b"system.posix_acl_access\0"];
+    if directory {
+        names.push(b"system.posix_acl_default\0");
+    }
+    for name in names {
+        let label = std::str::from_utf8(&name[..name.len() - 1]).unwrap_or("POSIX ACL");
+        let mut value = vec![0_u8; MAX_ACL_BYTES];
+        // SAFETY: both strings are NUL-terminated and the output buffer is
+        // writable for its full declared length.
+        let size = unsafe {
+            libc::getxattr(
+                path_bytes.as_ptr(),
+                name.as_ptr().cast::<libc::c_char>(),
+                value.as_mut_ptr().cast::<libc::c_void>(),
+                value.len(),
+            )
+        };
+        if size < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENODATA) {
+                continue;
+            }
+            // ERANGE lands here too: an attribute larger than the bound above
+            // is not something this rule will vouch for.
+            return Err(format!(
+                "cannot verify path ACL attributes ({label}): {error}"
+            ));
+        }
+        let value = &value[..size as usize];
+        if value.len() < 4 || !(value.len() - 4).is_multiple_of(8) {
+            return Err(format!("path carries a malformed {label} attribute"));
+        }
+        let version = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+        if version != ACL_EA_VERSION {
+            return Err(format!(
+                "path carries an unsupported {label} version {version}"
+            ));
+        }
+        for entry in value[4..].chunks_exact(8) {
+            let tag = u16::from_le_bytes([entry[0], entry[1]]);
+            let perm = u16::from_le_bytes([entry[2], entry[3]]);
+            let id = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+            let acceptable = match tag {
+                // Base entries restate the validated mode bits and the mask
+                // only narrows named grants further.
+                ACL_USER_OBJ | ACL_GROUP_OBJ | ACL_OTHER | ACL_MASK => true,
+                ACL_USER => {
+                    if perm & ACL_WRITE == 0 {
+                        true
+                    } else {
+                        let owner = match owner_uid {
+                            Some(owner) => owner,
+                            None => {
+                                let owner = std::fs::symlink_metadata(path)
+                                    .map_err(|error| {
+                                        format!("cannot verify path owner for ACL check: {error}")
+                                    })?
+                                    .uid();
+                                owner_uid = Some(owner);
+                                owner
+                            }
+                        };
+                        // SAFETY: geteuid has no preconditions.
+                        let euid = unsafe { libc::geteuid() };
+                        id == 0 || id == euid || id == owner
+                    }
+                }
+                // Named-group write reaches every unknown member of the group.
+                ACL_GROUP => perm & ACL_WRITE == 0,
+                _ => false,
+            };
+            if !acceptable {
+                return Err(format!(
+                    "path carries {label} entry (tag {tag:#x}, id {id}) that could widen \
+                     mutation authority beyond the owner, root, and the current user; \
+                     trusted paths must not grant write access to other principals"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+pub(crate) fn reject_unix_extended_acl(path: &Path, _directory: bool) -> Result<(), String> {
+    use std::ffi::c_void;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+    const ACL_NEXT_ENTRY: libc::c_int = -1;
+    const ACL_EXTENDED_ALLOW: libc::c_int = 1;
+    const MUTATING_PERMISSIONS: u64 =
+        (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 8) | (1 << 10) | (1 << 12) | (1 << 13);
+    unsafe extern "C" {
+        fn acl_get_file(path: *const libc::c_char, acl_type: libc::c_int) -> *mut c_void;
+        fn acl_get_entry(
+            acl: *mut c_void,
+            entry_id: libc::c_int,
+            entry: *mut *mut c_void,
+        ) -> libc::c_int;
+        fn acl_get_tag_type(entry: *mut c_void, tag_type: *mut libc::c_int) -> libc::c_int;
+        fn acl_get_permset_mask_np(entry: *mut c_void, mask: *mut u64) -> libc::c_int;
+        fn acl_free(object: *mut c_void) -> libc::c_int;
+    }
+
+    let path_bytes = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| "path contains an interior NUL while checking ACLs".to_string())?;
+    // SAFETY: path_bytes is NUL-terminated and ACL_TYPE_EXTENDED is the native
+    // macOS ACL type. A successful handle is released exactly once below.
+    let acl = unsafe { acl_get_file(path_bytes.as_ptr(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = std::io::Error::last_os_error();
+        // macOS reports ENOENT when the path exists but has no extended ACL.
+        // That is the ordinary ACL-free case; every other lookup failure stays
+        // fail-closed because it prevents us from ruling out hidden mutation
+        // authority.
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(());
+        }
+        return Err(format!("cannot read path extended ACL: {error}",));
+    }
+    let inspection = (|| {
+        let mut entry_id = ACL_FIRST_ENTRY;
+        loop {
+            let mut entry = std::ptr::null_mut();
+            // SAFETY: acl is live and entry is a valid out-pointer.
+            let status = unsafe { acl_get_entry(acl, entry_id, &mut entry) };
+            if status != 0 {
+                let error = std::io::Error::last_os_error();
+                // Darwin returns zero for an entry and -1/EINVAL after the
+                // final entry (unlike Linux's one/zero iterator convention).
+                if error.raw_os_error() == Some(libc::EINVAL) {
+                    return Ok(());
+                } else {
+                    return Err(format!("cannot enumerate path extended ACL: {error}"));
+                }
+            }
+            let mut tag_type = 0;
+            let mut permissions = 0_u64;
+            // SAFETY: entry was returned by acl_get_entry and both output
+            // pointers remain valid for the duration of each call.
+            if unsafe { acl_get_tag_type(entry, &mut tag_type) } != 0
+                || unsafe { acl_get_permset_mask_np(entry, &mut permissions) } != 0
+            {
+                return Err(format!(
+                    "cannot inspect path extended ACL entry: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if tag_type == ACL_EXTENDED_ALLOW && permissions & MUTATING_PERMISSIONS != 0 {
+                return Err(
+                    "path ACL grants mutation rights outside Unix mode bits; trusted paths must not"
+                        .to_string(),
+                );
+            }
+            entry_id = ACL_NEXT_ENTRY;
+        }
+    })();
+    // SAFETY: acl was returned by acl_get_file and has not been freed yet.
+    unsafe {
+        let _ = acl_free(acl);
+    }
+    inspection
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+pub(crate) fn reject_unix_extended_acl(_path: &Path, _directory: bool) -> Result<(), String> {
+    Err("this Unix platform has no extended-ACL verifier; refusing trusted path".to_string())
 }
 
 /// Resolve a named installed tool without ever passing its bare name to the OS.
@@ -490,11 +897,13 @@ pub fn sanitized_path(path_value: &OsStr, denied_roots: &[PathBuf]) -> OsString 
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt as _;
-            if std::fs::metadata(&canonical)
-                .map(|metadata| metadata.mode() & 0o002 != 0)
-                .unwrap_or(true)
-            {
+            let effective_uid = unsafe { libc::geteuid() };
+            let trusted_hierarchy = canonical.ancestors().all(|component| {
+                std::fs::metadata(component).ok().is_some_and(|metadata| {
+                    validate_unix_owner_and_mode(component, &metadata, effective_uid, true).is_ok()
+                })
+            });
+            if !trusted_hierarchy {
                 continue;
             }
         }
@@ -677,6 +1086,11 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
 /// bounded output, and a wall-clock deadline.
 #[cfg(windows)]
 pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
+    if let Err(error) = executable.revalidate() {
+        return ChildOutcome::SpawnError(format!(
+            "trusted executable failed pre-spawn revalidation: {error}"
+        ));
+    }
     windows::run(executable, spec)
 }
 
@@ -684,6 +1098,11 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
 /// bounded output, and a wall-clock deadline.
 #[cfg(not(windows))]
 pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
+    if let Err(error) = executable.revalidate() {
+        return ChildOutcome::SpawnError(format!(
+            "trusted executable failed pre-spawn revalidation: {error}"
+        ));
+    }
     let mut command = Command::new(executable.path());
     command
         .args(&spec.args)
@@ -771,6 +1190,11 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
         if let Some(exit_status) = status {
             match (stdout.take(), stderr.take()) {
                 (Some(stdout_bytes), Some(stderr_bytes)) => {
+                    if !terminate_tree(&mut child, child_pid, true) {
+                        return ChildOutcome::WaitError(
+                            "child exited but descendant process-group cleanup failed".to_string(),
+                        );
+                    }
                     return ChildOutcome::Completed {
                         status: exit_status,
                         stdout: stdout_bytes,
@@ -792,27 +1216,242 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
 }
 
 #[cfg(not(windows))]
-fn terminate_tree(child: &mut std::process::Child, child_pid: u32, already_reaped: bool) -> bool {
+fn terminate_tree(child: &mut std::process::Child, _child_pid: u32, already_reaped: bool) -> bool {
     let mut cleanup_succeeded = true;
     #[cfg(unix)]
+    let mut process_group_needs_wait = false;
+    #[cfg(unix)]
     {
-        let process_group = -(child_pid as libc::pid_t);
-        // ESRCH is success for cleanup purposes: the group is already gone.
-        if unsafe { libc::kill(process_group, libc::SIGKILL) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                cleanup_succeeded = false;
+        let process_group = -(_child_pid as libc::pid_t);
+        match signal_process_group_with(|| {
+            // SAFETY: the child was placed in its own process group before
+            // exec, and this call targets that group rather than a pathname.
+            let status = unsafe { libc::kill(process_group, libc::SIGKILL) };
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error().raw_os_error())
             }
+        }) {
+            ProcessGroupSignal::Delivered => process_group_needs_wait = true,
+            // ESRCH is success for cleanup purposes: the group is already gone.
+            ProcessGroupSignal::Gone => {}
+            ProcessGroupSignal::Failed => cleanup_succeeded = false,
         }
     }
     #[cfg(all(not(unix), not(windows)))]
     {
-        if child.kill().is_err() {
+        if !already_reaped && child.kill().is_err() {
             cleanup_succeeded = false;
         }
     }
     if !already_reaped && child.wait().is_err() {
         cleanup_succeeded = false;
     }
+    #[cfg(unix)]
+    if process_group_needs_wait && !wait_for_process_group_exit(_child_pid) {
+        cleanup_succeeded = false;
+    }
     cleanup_succeeded
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessGroupSignal {
+    Delivered,
+    Gone,
+    Failed,
+}
+
+/// Deliver the final group signal with a bounded retry for `EINTR`. macOS CI
+/// can interrupt this syscall while the direct child is being reaped; treating
+/// that transient interruption as a cleanup failure makes a successfully
+/// supervised child look unsafe. Other errors remain fail-closed.
+#[cfg(unix)]
+fn signal_process_group_with(
+    mut send: impl FnMut() -> Result<(), Option<i32>>,
+) -> ProcessGroupSignal {
+    const MAX_INTERRUPTED_ATTEMPTS: usize = 32;
+
+    for _ in 0..MAX_INTERRUPTED_ATTEMPTS {
+        match send() {
+            Ok(()) => return ProcessGroupSignal::Delivered,
+            Err(Some(libc::ESRCH)) => return ProcessGroupSignal::Gone,
+            Err(Some(libc::EINTR)) => continue,
+            Err(_) => return ProcessGroupSignal::Failed,
+        }
+    }
+    ProcessGroupSignal::Failed
+}
+
+#[cfg(unix)]
+fn wait_for_process_group_exit(child_pid: u32) -> bool {
+    // SIGKILL is already delivered when this runs; what remains is waiting for
+    // the kernel — and, once the direct child is reaped, the reparenting init —
+    // to finish reaping descendants. A loaded host can take seconds, and timing
+    // out here reports a cleanup failure for a group that WAS killed. This is
+    // reached only when the group still had members at kill time, so a longer
+    // ceiling costs nothing in the common case.
+    const GROUP_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+
+    let process_group = -(child_pid as libc::pid_t);
+    let deadline = Instant::now() + GROUP_EXIT_TIMEOUT;
+    loop {
+        if unsafe { libc::kill(process_group, 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return true;
+            }
+            if error.raw_os_error() != Some(libc::EINTR) {
+                return false;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_process_group_tests {
+    use super::{signal_process_group_with, ProcessGroupSignal};
+
+    #[test]
+    fn interrupted_group_signal_is_retried_but_other_errors_fail_closed() {
+        let mut attempts = 0usize;
+        assert_eq!(
+            signal_process_group_with(|| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(Some(libc::EINTR))
+                } else {
+                    Ok(())
+                }
+            }),
+            ProcessGroupSignal::Delivered
+        );
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            signal_process_group_with(|| Err(Some(libc::EPERM))),
+            ProcessGroupSignal::Failed
+        );
+        assert_eq!(
+            signal_process_group_with(|| Err(Some(libc::ESRCH))),
+            ProcessGroupSignal::Gone
+        );
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod linux_acl_policy_tests {
+    use super::reject_unix_extended_acl;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::Path;
+
+    const ACL_USER_OBJ: u16 = 0x01;
+    const ACL_USER: u16 = 0x02;
+    const ACL_GROUP_OBJ: u16 = 0x04;
+    const ACL_GROUP: u16 = 0x08;
+    const ACL_MASK: u16 = 0x10;
+    const ACL_OTHER: u16 = 0x20;
+
+    fn acl_blob(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut blob = 2_u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in entries {
+            blob.extend_from_slice(&tag.to_le_bytes());
+            blob.extend_from_slice(&perm.to_le_bytes());
+            blob.extend_from_slice(&id.to_le_bytes());
+        }
+        blob
+    }
+
+    fn set_default_acl(path: &Path, blob: &[u8]) {
+        let path_bytes = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: both pointers reference live NUL-terminated / sized buffers.
+        let status = unsafe {
+            libc::setxattr(
+                path_bytes.as_ptr(),
+                c"system.posix_acl_default".as_ptr(),
+                blob.as_ptr().cast(),
+                blob.len(),
+                0,
+            )
+        };
+        assert_eq!(status, 0, "setxattr: {}", std::io::Error::last_os_error());
+    }
+
+    const UNDEFINED_ID: u32 = u32::MAX;
+
+    #[test]
+    fn default_acl_granting_current_user_write_is_accepted() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        // The shape GitHub runners seed on /home: a self-grant plus base entries.
+        set_default_acl(
+            temp.path(),
+            &acl_blob(&[
+                (ACL_USER_OBJ, 7, UNDEFINED_ID),
+                (ACL_USER, 7, euid),
+                (ACL_GROUP_OBJ, 5, UNDEFINED_ID),
+                (ACL_MASK, 7, UNDEFINED_ID),
+                (ACL_OTHER, 5, UNDEFINED_ID),
+            ]),
+        );
+        reject_unix_extended_acl(temp.path(), true).expect("self-grant default ACL is benign");
+    }
+
+    #[test]
+    fn default_acl_granting_foreign_user_write_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: geteuid has no preconditions.
+        let foreign = unsafe { libc::geteuid() }.wrapping_add(31_337);
+        set_default_acl(
+            temp.path(),
+            &acl_blob(&[
+                (ACL_USER_OBJ, 7, UNDEFINED_ID),
+                (ACL_USER, 7, foreign),
+                (ACL_GROUP_OBJ, 5, UNDEFINED_ID),
+                (ACL_MASK, 7, UNDEFINED_ID),
+                (ACL_OTHER, 5, UNDEFINED_ID),
+            ]),
+        );
+        let reason = reject_unix_extended_acl(temp.path(), true)
+            .expect_err("foreign write grant must stay rejected");
+        assert!(reason.contains("mutation authority"), "{reason}");
+    }
+
+    #[test]
+    fn default_acl_read_only_foreign_entries_are_accepted_but_group_write_is_not() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: geteuid has no preconditions.
+        let foreign = unsafe { libc::geteuid() }.wrapping_add(31_337);
+        set_default_acl(
+            temp.path(),
+            &acl_blob(&[
+                (ACL_USER_OBJ, 7, UNDEFINED_ID),
+                (ACL_USER, 5, foreign),
+                (ACL_GROUP_OBJ, 5, UNDEFINED_ID),
+                (ACL_MASK, 7, UNDEFINED_ID),
+                (ACL_OTHER, 5, UNDEFINED_ID),
+            ]),
+        );
+        reject_unix_extended_acl(temp.path(), true)
+            .expect("read-only foreign entries add no mutation authority");
+
+        set_default_acl(
+            temp.path(),
+            &acl_blob(&[
+                (ACL_USER_OBJ, 7, UNDEFINED_ID),
+                (ACL_GROUP_OBJ, 5, UNDEFINED_ID),
+                (ACL_GROUP, 7, 12_345),
+                (ACL_MASK, 7, UNDEFINED_ID),
+                (ACL_OTHER, 5, UNDEFINED_ID),
+            ]),
+        );
+        let reason = reject_unix_extended_acl(temp.path(), true)
+            .expect_err("named-group write must stay rejected");
+        assert!(reason.contains("mutation authority"), "{reason}");
+    }
 }

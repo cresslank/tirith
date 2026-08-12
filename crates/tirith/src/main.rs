@@ -64,8 +64,14 @@ What this is NOT:
   monitor; not a security boundary. Absence of hints does NOT mean no network
   activity occurred.
 
+Execution syntax:
+  Arguments after `--` execute directly with their original boundaries. To use
+  shell syntax such as a pipeline or redirect, pass the complete expression as
+  one quoted argument.
+
 Examples:
   tirith watch -- npm install left-pad
+  tirith watch -- \"npm test | tee test.log\"
   tirith watch --paths ~/.config -- ./install.sh
   tirith watch --with-net-hints -- pip install requests
   tirith watch --json -- cargo build";
@@ -3232,7 +3238,7 @@ mistaken for a real credential (see docs/canary-formats.md).
 
 <kind> is one of: aws-like, github-like, gcp-like, env-line, private-key-shaped.
 
---callback-url is OPT-IN and must be a URL YOU self-host (http/https). On
+--callback-url is OPT-IN and must be a public HTTPS URL YOU self-host. On
 detection, a best-effort POST of {kind, detected_at, context} (NEVER the token
 value) is sent to it; failures are logged and never block. Omit it for the
 local-only default (no network ever).
@@ -3245,7 +3251,7 @@ Examples:
         /// The token kind: aws-like, github-like, gcp-like, env-line, or
         /// private-key-shaped.
         kind: String,
-        /// OPT-IN, user-self-hosted callback URL (http/https). On detection a
+        /// OPT-IN, public user-self-hosted callback URL (HTTPS by default). On detection a
         /// best-effort POST of {kind, detected_at, context} — never the token
         /// value — is sent here. Omit for local-only (the default).
         #[arg(long = "callback-url")]
@@ -5176,6 +5182,10 @@ Examples:
         /// An approved index URL (repeatable); empty means lock-only / `--no-index`.
         #[arg(long = "index-url")]
         index_url: Vec<String>,
+        /// An approved artifact/CDN origin (repeatable). This authorizes broker
+        /// egress only and is never treated as a package index.
+        #[arg(long = "artifact-origin")]
+        artifact_origin: Vec<String>,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -5204,6 +5214,10 @@ Examples:
         /// An approved index URL (repeatable); empty means lock-only / `--no-index`.
         #[arg(long = "index-url")]
         index_url: Vec<String>,
+        /// An approved artifact/CDN origin (repeatable). This authorizes broker
+        /// egress only and is never treated as a package index.
+        #[arg(long = "artifact-origin")]
+        artifact_origin: Vec<String>,
         /// Install without a prior `tirith pkg approve` (unattended). The receipt
         /// still attests the install honestly.
         #[arg(long)]
@@ -5231,6 +5245,18 @@ Examples:
         /// The distribution names to verify (PEP 503 normalized internally).
         #[arg(trailing_var_arg = true)]
         packages: Vec<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Enroll a user-writable uv/python executable by canonical path and SHA-256
+    /// in Tirith's owner-only resolver-tool trust store.
+    TrustTool {
+        /// Absolute path to the executable to enroll.
+        path: std::path::PathBuf,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -5559,6 +5585,18 @@ field-tested.")]
         /// containment even without the flag.
         #[arg(long)]
         capsule: bool,
+
+        /// Exact `mcp:v1:...` identity from `tirith mcp policy init` for the
+        /// configured upstream. Required when approving descriptors and when a
+        /// multi-server lock cannot be inferred safely.
+        #[arg(long)]
+        mcp_server_identity: Option<String>,
+
+        /// Capture the first inspected/sanitized live tools/list response as the
+        /// approved descriptor baseline for --mcp-server-identity, then write the
+        /// lock atomically. The live command/args must exactly match that server.
+        #[arg(long, requires = "mcp_server_identity")]
+        approve_descriptors: bool,
     },
     /// Validate gateway config file
     #[command(after_help = "\
@@ -6237,6 +6275,11 @@ Examples:
   tirith mcp lock
   tirith mcp lock --format json")]
     Lock {
+        /// Record malformed/rejected config coverage explicitly. This is an
+        /// audited escape hatch, not trust: verify remains nonzero while any
+        /// coverage gap exists.
+        #[arg(long)]
+        allow_incomplete_configs: bool,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -6969,6 +7012,7 @@ fn run() {
                     requirements,
                     target,
                     index_url,
+                    artifact_origin,
                     format,
                     json,
                 } => {
@@ -6978,6 +7022,7 @@ fn run() {
                         requirements,
                         target,
                         index_url,
+                        artifact_origin,
                         json,
                     }
                 }
@@ -6986,6 +7031,7 @@ fn run() {
                     requirements,
                     target,
                     index_url,
+                    artifact_origin,
                     yes,
                     allow_degraded,
                     format,
@@ -6997,6 +7043,7 @@ fn run() {
                         requirements,
                         target,
                         index_url,
+                        artifact_origin,
                         yes,
                         allow_degraded,
                         json,
@@ -7014,6 +7061,10 @@ fn run() {
                         packages,
                         json,
                     }
+                }
+                PkgAction::TrustTool { path, format, json } => {
+                    let (_, json) = HumanJsonFormat::resolve(format, json);
+                    cli::pkg::PkgAction::TrustTool { path, json }
                 }
                 PkgAction::Receipt { query } => {
                     let (which, json) = match query {
@@ -7167,9 +7218,13 @@ fn run() {
         } => cli::mcp_server::run(sanitize_tool_output),
 
         Commands::Mcp { action } => match action {
-            McpAction::Lock { format, json } => {
+            McpAction::Lock {
+                allow_incomplete_configs,
+                format,
+                json,
+            } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::mcp::lock(json)
+                cli::mcp::lock(json, allow_incomplete_configs)
             }
             McpAction::Verify { format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
@@ -7260,6 +7315,8 @@ fn run() {
                 config,
                 filter_output,
                 capsule,
+                mcp_server_identity,
+                approve_descriptors,
             } => cli::gateway::run_gateway_with_options(
                 &upstream_bin,
                 &upstream_arg,
@@ -7267,6 +7324,8 @@ fn run() {
                 cli::gateway::GatewayOptions {
                     filter_output,
                     capsule,
+                    mcp_server_identity,
+                    approve_descriptors,
                 },
             ),
             GatewayAction::ValidateConfig { config } => cli::gateway::validate_config(&config),
