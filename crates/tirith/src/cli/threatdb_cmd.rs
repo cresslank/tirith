@@ -347,8 +347,7 @@ fn try_v2_index_update(force: bool) -> Result<UpdateOutcome, String> {
         Some(a) => a,
         None => {
             eprintln!(
-                "tirith: v2 index has no asset compatible with this build (max format {}, tirith {}); using legacy manifest",
-                MAX_FORMAT_VERSION, current_tirith_version
+                "tirith: v2 index has no asset compatible with this build (max format {MAX_FORMAT_VERSION}, tirith {current_tirith_version}); using legacy manifest"
             );
             return Ok(UpdateOutcome::NoCompatibleAsset);
         }
@@ -1346,8 +1345,7 @@ fn download_db(manifest: &Manifest) -> Result<Vec<u8>, String> {
 fn download_url(url: &str, declared_size: u64) -> Result<Vec<u8>, String> {
     if declared_size > MAX_DB_SIZE {
         return Err(format!(
-            "DB file too large: {} bytes (max {})",
-            declared_size, MAX_DB_SIZE
+            "DB file too large: {declared_size} bytes (max {MAX_DB_SIZE})"
         ));
     }
 
@@ -1438,8 +1436,7 @@ fn fetch_index_v2_from(url: &str) -> Result<IndexV2, String> {
     let content_len = resp.content_length().unwrap_or(0);
     if content_len > MAX_MANIFEST_SIZE {
         return Err(format!(
-            "v2 index too large: {} bytes (max {})",
-            content_len, MAX_MANIFEST_SIZE
+            "v2 index too large: {content_len} bytes (max {MAX_MANIFEST_SIZE})"
         ));
     }
     let body = resp
