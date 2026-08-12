@@ -331,8 +331,10 @@ fn persist_salt(salt_file: &Path, salt: &[u8], replace_corrupt: bool) -> std::io
 /// Bounded re-read budget for adopting a concurrently-created salt: the race
 /// winner creates a 0-byte file and only THEN writes the salt, so a loser may
 /// see a short file. Retrying briefly keeps a transient race from disabling
-/// baseline. ~100 ms worst case, only on the rare losing side.
-const SALT_ADOPT_ATTEMPTS: usize = 10;
+/// baseline. Two seconds worst case, only on the rare losing side. The wider
+/// bound accounts for a heavily loaded process scheduler delaying the writer
+/// after it has created the file but before it can publish the 32-byte body.
+const SALT_ADOPT_ATTEMPTS: usize = 200;
 const SALT_ADOPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Read the salt written by the `create_new` race winner, tolerating the brief
