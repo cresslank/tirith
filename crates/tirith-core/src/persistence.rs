@@ -933,8 +933,7 @@ mod tests {
         assert_eq!(added.len(), 1);
         assert!(
             !added[0].contains("AKIAIOSFODNN7EXAMPLE"),
-            "credential must be redacted, got {:?}",
-            added
+            "credential must be redacted, got {added:?}"
         );
         assert!(added[0].contains("[REDACTED"));
     }

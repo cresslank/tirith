@@ -945,8 +945,7 @@ pub fn api_factors(p: &ApiProvenance) -> Vec<RiskFactor> {
                     points: OWNERSHIP_TRANSFER_DIFF_WEIGHT as i32,
                     detail: format!(
                         "Snapshot diff: every previous maintainer is gone and a new set is in \
-                         place. Contributing {} points.",
-                        OWNERSHIP_TRANSFER_DIFF_WEIGHT
+                         place. Contributing {OWNERSHIP_TRANSFER_DIFF_WEIGHT} points."
                     ),
                 });
             }
