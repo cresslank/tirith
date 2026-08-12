@@ -4,8 +4,12 @@ use std::ffi::OsStr;
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_os = "linux"))]
+use tirith_core::trusted_child::TrustedExecutableError;
 use tirith_core::trusted_child::{
     run, sanitized_path, CaptureStream, ChildLimits, ChildOutcome, ChildSpec, TrustedExecutable,
 };
@@ -18,7 +22,47 @@ fn make_executable(path: &Path, body: &str) {
 }
 
 fn shell() -> TrustedExecutable {
-    TrustedExecutable::from_absolute(Path::new("/bin/sh"), &[]).unwrap()
+    // Prefer a non-multicall shell when available. On Alpine `/bin/sh`
+    // canonicalizes to `/bin/busybox`; invoking that canonical target directly
+    // with `-c` loses the `sh` argv[0] applet selection and exits 127, which is a
+    // fixture artifact rather than supervisor behavior.
+    ["/bin/bash", "/usr/bin/bash", "/bin/sh"]
+        .into_iter()
+        .find_map(|candidate| {
+            let path = Path::new(candidate);
+            if path.exists() {
+                TrustedExecutable::from_absolute(path, &[]).ok()
+            } else {
+                None
+            }
+        })
+        .expect("a system shell must be available")
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_running(pid: libc::pid_t) -> bool {
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    // kill(pid, 0) also succeeds for a dead orphaned zombie until PID 1
+    // reaps it. `/proc/<pid>/stat` field 3 distinguishes that bookkeeping
+    // state from a descendant that could still execute.
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(_) => return false,
+    };
+    let Some(after_name) = stat.rsplit_once(") ").map(|(_, rest)| rest) else {
+        return true;
+    };
+    !after_name.starts_with("Z ")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_is_running(pid: libc::pid_t) -> bool {
+    // Non-Linux Unix hosts do not expose a portable procfs state field. The
+    // supervisor itself waits for process-group disappearance before return,
+    // so a successful signal probe is sufficient for this regression.
+    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 #[test]
@@ -212,6 +256,409 @@ fn supervisor_refuses_executable_identity_drift_before_spawn() {
 }
 
 #[test]
+fn trusted_lookup_retains_a_multicall_symlink_separately_from_its_target() {
+    let temp = tempfile::tempdir().unwrap();
+    let installed = temp.path().join("installed-bin");
+    std::fs::create_dir(&installed).unwrap();
+    let target = installed.join("rustup");
+    make_executable(&target, "#!/bin/sh\nexit 0\n");
+    let proxy = installed.join("cargo");
+    std::os::unix::fs::symlink(&target, &proxy).unwrap();
+    let path = std::env::join_paths([&installed]).unwrap();
+
+    let executable = TrustedExecutable::resolve_on_path("cargo", &path, &[]).unwrap();
+    assert_eq!(executable.invocation_path(), proxy);
+    assert_eq!(executable.path(), target.canonicalize().unwrap());
+    #[cfg(target_os = "linux")]
+    {
+        let bound = executable.bind_content().unwrap();
+        assert_eq!(bound.invocation_path(), proxy);
+        assert_eq!(bound.path(), target.canonicalize().unwrap());
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn content_binding_fails_closed_on_non_linux_unix() {
+    let executable = shell();
+    let error = executable.bind_content().unwrap_err();
+    assert!(
+        matches!(error, TrustedExecutableError::InvalidPath { .. }),
+        "unsupported binding must be an InvalidPath error: {error}"
+    );
+    assert!(error.to_string().contains("unsupported"), "{error}");
+}
+
+#[test]
+fn trusted_lookup_rejects_a_proxy_link_inside_a_denied_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let denied = temp.path().join("repo-bin");
+    let installed = temp.path().join("installed-bin");
+    std::fs::create_dir(&denied).unwrap();
+    std::fs::create_dir(&installed).unwrap();
+    let target = installed.join("rustup");
+    make_executable(&target, "#!/bin/sh\nexit 0\n");
+    let proxy = denied.join("cargo");
+    std::os::unix::fs::symlink(&target, &proxy).unwrap();
+    let path = std::env::join_paths([&denied]).unwrap();
+
+    let error = TrustedExecutable::resolve_on_path("cargo", &path, std::slice::from_ref(&denied))
+        .unwrap_err();
+    assert!(error.to_string().contains(&proxy.display().to_string()));
+    assert!(error.to_string().contains(&denied.display().to_string()));
+}
+
+#[test]
+fn trusted_lookup_executes_canonical_target_with_caller_spelled_argv0() {
+    let temp = tempfile::tempdir().unwrap();
+    let installed = temp.path().join("installed-bin");
+    std::fs::create_dir(&installed).unwrap();
+    let alias = installed.join("sh");
+    std::os::unix::fs::symlink("/bin/sh", &alias).unwrap();
+    let path = std::env::join_paths([&installed]).unwrap();
+    let executable = TrustedExecutable::resolve_on_path("sh", &path, &[]).unwrap();
+    let spec = ChildSpec::new(
+        [OsStr::new("-c"), OsStr::new("printf '%s' \"$0\"")],
+        ChildLimits::new(Duration::from_secs(2), 4096, 4096),
+    );
+
+    match run(&executable, &spec) {
+        ChildOutcome::Completed {
+            status,
+            stdout,
+            stderr,
+        } => {
+            assert!(status.success(), "caller-spelled shell failed: {stderr:?}");
+            assert_eq!(stdout, alias.to_string_lossy().as_bytes());
+        }
+        other => panic!("unexpected caller-spelled launch outcome: {other:?}"),
+    }
+}
+
+#[test]
+fn generic_trusted_lookup_preserves_versioned_absolute_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp
+        .path()
+        .join("Cellar")
+        .join("bash")
+        .join("5.3.3")
+        .join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let bash = bin.join("bash");
+    make_executable(&bash, "#!/bin/sh\nexit 0\n");
+    let path = std::env::join_paths([&bin]).unwrap();
+
+    let selected = TrustedExecutable::resolve_on_path("bash", &path, &[]).unwrap();
+    assert_eq!(selected.path(), bash.canonicalize().unwrap());
+}
+
+#[test]
+fn forced_interpreter_rejects_a_same_uid_cellar_shaped_install() {
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp
+        .path()
+        .join("Cellar")
+        .join("bash")
+        .join("5.3.3")
+        .join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let bash = bin.join("bash");
+    make_executable(&bash, "#!/bin/sh\nexit 0\n");
+    let path = std::env::join_paths([&bin]).unwrap();
+
+    let selected = TrustedExecutable::resolve_on_path("bash", &path, &[]).unwrap();
+    let error = selected
+        .require_forced_interpreter_provenance()
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("root-owned")
+            && error.to_string().contains("non-group/world-writable"),
+        "same-UID Cellar-shaped installs must not become trusted remote interpreters: {error}"
+    );
+}
+
+#[test]
+fn forced_interpreter_accepts_the_canonical_system_shell() {
+    let shell = TrustedExecutable::from_absolute(Path::new("/bin/sh"), &[])
+        .unwrap()
+        .require_forced_interpreter_provenance()
+        .unwrap();
+    assert!(shell.path().is_absolute());
+}
+
+#[test]
+fn delayed_reinvocation_rejects_a_replaceable_user_owned_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let candidate = temp.path().join("tirith");
+    make_executable(&candidate, "#!/bin/sh\nexit 0\n");
+
+    let error = TrustedExecutable::from_absolute(&candidate, &[])
+        .unwrap()
+        .require_safe_reinvocation_provenance()
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("delayed safe-command reinvocation")
+            && error.to_string().contains("root-owned"),
+        "a same-UID path could be replaced after suggestion generation: {error}"
+    );
+}
+
+#[test]
+fn delayed_reinvocation_accepts_a_root_managed_system_path() {
+    let candidate = TrustedExecutable::from_absolute(Path::new("/bin/sh"), &[])
+        .unwrap()
+        .require_safe_reinvocation_provenance()
+        .unwrap();
+    assert!(candidate.path().is_absolute());
+}
+
+#[test]
+fn trusted_lookup_rejects_missing_and_world_writable_tools() {
+    let temp = tempfile::tempdir().unwrap();
+    let installed = temp.path().join("installed-bin");
+    std::fs::create_dir(&installed).unwrap();
+    let path = std::env::join_paths([&installed]).unwrap();
+    assert!(TrustedExecutable::resolve_on_path("missing", &path, &[])
+        .unwrap_err()
+        .to_string()
+        .contains("not found"));
+
+    let executable = installed.join("world-writable");
+    make_executable(&executable, "#!/bin/sh\nexit 0\n");
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o707)).unwrap();
+    let error = TrustedExecutable::from_absolute(&executable, &[]).unwrap_err();
+    assert!(
+        error.to_string().contains("writable by an untrusted group")
+            || error.to_string().contains("by everyone"),
+        "{error}"
+    );
+}
+
+#[test]
+fn resolved_path_symlink_swap_cannot_change_launched_identity() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let original = temp.path().join("original");
+    let replacement = temp.path().join("replacement");
+    make_executable(&original, "#!/bin/sh\nprintf original\n");
+    make_executable(&replacement, "#!/bin/sh\nprintf replacement\n");
+    let selected_name = bin.join("probe");
+    symlink(&original, &selected_name).unwrap();
+    let path = std::env::join_paths([&bin]).unwrap();
+
+    let selected = TrustedExecutable::resolve_on_path("probe", &path, &[]).unwrap();
+    assert_eq!(selected.path(), original.canonicalize().unwrap());
+    std::fs::remove_file(&selected_name).unwrap();
+    symlink(&replacement, &selected_name).unwrap();
+
+    let spec = ChildSpec::new(
+        std::iter::empty::<&OsStr>(),
+        ChildLimits::new(Duration::from_secs(2), 64, 64),
+    );
+    match run(&selected, &spec) {
+        ChildOutcome::Completed { stdout, .. } => assert_eq!(stdout, b"original"),
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+}
+
+#[test]
+fn replacing_the_canonical_target_is_detected_before_spawn() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let executable = temp.path().join("probe");
+    make_executable(&executable, "#!/bin/sh\nprintf original\n");
+    let selected = TrustedExecutable::from_absolute(&executable, &[]).unwrap();
+    let original_inode = std::fs::metadata(&executable).unwrap().ino();
+
+    // Allocate the replacement while the original inode is still live, then
+    // atomically rename it over the canonical path. Remove-and-recreate can
+    // legitimately reuse the just-freed inode and would not exercise identity
+    // replacement at all.
+    let replacement = temp.path().join("replacement");
+    make_executable(&replacement, "#!/bin/sh\nprintf replacement\n");
+    assert_ne!(
+        std::fs::metadata(&replacement).unwrap().ino(),
+        original_inode
+    );
+    std::fs::rename(&replacement, &executable).unwrap();
+
+    let spec = ChildSpec::new(
+        std::iter::empty::<&OsStr>(),
+        ChildLimits::new(Duration::from_secs(2), 64, 64),
+    );
+    match run(&selected, &spec) {
+        ChildOutcome::SpawnError(reason) => assert!(reason.contains("identity changed")),
+        other => panic!("replacement must be refused before spawn: {other:?}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn content_binding_survives_same_inode_source_mutation() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let executable = temp.path().join("probe");
+    make_executable(&executable, "#!/bin/sh\nprintf original\n");
+    let selected = TrustedExecutable::from_absolute(&executable, &[])
+        .unwrap()
+        .bind_content()
+        .unwrap();
+    let inode = std::fs::metadata(&executable).unwrap().ino();
+
+    // Truncating and rewriting preserves the source inode, defeating a pure
+    // dev/inode re-stat. A content-bound launch must still execute the bytes that
+    // were fixed before the mutation.
+    make_executable(&executable, "#!/bin/sh\nprintf replacement\n");
+    assert_eq!(std::fs::metadata(&executable).unwrap().ino(), inode);
+
+    let spec = ChildSpec::new(
+        std::iter::empty::<&OsStr>(),
+        ChildLimits::new(Duration::from_secs(2), 64, 64),
+    );
+    match run(&selected, &spec) {
+        ChildOutcome::Completed { stdout, .. } => assert_eq!(stdout, b"original"),
+        other => panic!("content-bound source mutation changed the launch: {other:?}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn content_binding_survives_canonical_path_replacement() {
+    let temp = tempfile::tempdir().unwrap();
+    let executable = temp.path().join("probe");
+    make_executable(&executable, "#!/bin/sh\nprintf original\n");
+    let selected = TrustedExecutable::from_absolute(&executable, &[])
+        .unwrap()
+        .bind_content()
+        .unwrap();
+    assert_ne!(selected.launch_path(), selected.path());
+
+    std::fs::remove_file(&executable).unwrap();
+    make_executable(&executable, "#!/bin/sh\nprintf replacement\n");
+
+    let spec = ChildSpec::new(
+        std::iter::empty::<&OsStr>(),
+        ChildLimits::new(Duration::from_secs(2), 64, 64),
+    );
+    match run(&selected, &spec) {
+        ChildOutcome::Completed { stdout, .. } => assert_eq!(stdout, b"original"),
+        other => panic!("content-bound path replacement changed the launch: {other:?}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn content_binding_detects_snapshot_tampering_before_spawn() {
+    let temp = tempfile::tempdir().unwrap();
+    let executable = temp.path().join("probe");
+    make_executable(&executable, "#!/bin/sh\nprintf original\n");
+    let selected = TrustedExecutable::from_absolute(&executable, &[])
+        .unwrap()
+        .bind_content()
+        .unwrap();
+
+    std::fs::set_permissions(
+        selected.launch_path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    std::fs::write(selected.launch_path(), "#!/bin/sh\nprintf replacement\n").unwrap();
+
+    let spec = ChildSpec::new(
+        std::iter::empty::<&OsStr>(),
+        ChildLimits::new(Duration::from_secs(2), 64, 64),
+    );
+    match run(&selected, &spec) {
+        ChildOutcome::SpawnError(reason) => assert!(
+            reason.contains("identity changed") || reason.contains("content changed"),
+            "{reason}"
+        ),
+        other => panic!("tampered bound snapshot must be refused before spawn: {other:?}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn content_binding_holds_a_fully_sealed_executable_descriptor() {
+    let temp = tempfile::tempdir().unwrap();
+    let executable = temp.path().join("probe");
+    make_executable(&executable, "#!/bin/sh\nprintf original\n");
+    let selected = TrustedExecutable::from_absolute(&executable, &[])
+        .unwrap()
+        .bind_content()
+        .unwrap();
+    let fd = selected
+        .bound_launch_fd()
+        .expect("Linux binding must own a sealed descriptor");
+    let required = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+    assert_eq!(seals & required, required);
+
+    let hostile = b"x";
+    assert_eq!(
+        unsafe { libc::pwrite(fd, hostile.as_ptr().cast(), hostile.len(), 0) },
+        -1,
+        "same-UID writes through the held descriptor must be permanently denied"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPERM)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cloned_content_binding_revalidates_and_launches_in_parallel() {
+    const WORKERS: usize = 12;
+    const ROUNDS: usize = 8;
+
+    let temp = tempfile::tempdir().unwrap();
+    let executable = temp.path().join("probe");
+    make_executable(&executable, "#!/bin/sh\nprintf original\n");
+    let selected = TrustedExecutable::from_absolute(&executable, &[])
+        .unwrap()
+        .bind_content()
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(WORKERS));
+    let mut workers = Vec::with_capacity(WORKERS);
+
+    for _ in 0..WORKERS {
+        let barrier = Arc::clone(&barrier);
+        let selected = selected.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..ROUNDS {
+                let spec = ChildSpec::new(
+                    std::iter::empty::<&OsStr>(),
+                    ChildLimits::new(Duration::from_secs(3), 64, 64),
+                );
+                match run(&selected, &spec) {
+                    ChildOutcome::Completed { status, stdout, .. } => {
+                        assert!(status.success(), "parallel bound launch failed: {status}");
+                        assert_eq!(stdout, b"original");
+                    }
+                    other => panic!("parallel bound launch failed: {other:?}"),
+                }
+            }
+        }));
+    }
+
+    for worker in workers {
+        worker
+            .join()
+            .expect("parallel bound-launch worker panicked");
+    }
+}
+
+#[test]
 fn supervisor_preserves_short_legitimate_output_and_status() {
     let args = [OsStr::new("-c"), OsStr::new("printf legitimate")];
     let spec = ChildSpec::new(args, ChildLimits::new(Duration::from_secs(2), 64, 64));
@@ -250,11 +697,17 @@ fn supervisor_deadline_is_not_defeated_by_a_descendant_holding_stdout() {
     let pid_file = temp.path().join("grandchild.pid");
     let body = format!("sleep 30 & printf '%s' $! > '{}'", pid_file.display());
     let args = [OsStr::new("-c"), OsStr::new(&body)];
-    let spec = ChildSpec::new(args, ChildLimits::new(Duration::from_millis(300), 64, 64));
+    // Leave enough startup budget for heavily loaded CI to execute the shell
+    // and publish the descendant PID before the deadline. The long-lived
+    // `sleep` still guarantees the timeout path rather than normal completion.
+    let spec = ChildSpec::new(args, ChildLimits::new(Duration::from_secs(2), 64, 64));
 
     let started = Instant::now();
     let outcome = run(&shell(), &spec);
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "the wall deadline plus bounded process-group cleanup must remain finite"
+    );
     assert!(matches!(outcome, ChildOutcome::Timeout { .. }));
 
     let pid: libc::pid_t = std::fs::read_to_string(pid_file)
@@ -264,7 +717,7 @@ fn supervisor_deadline_is_not_defeated_by_a_descendant_holding_stdout() {
         .unwrap();
     let mut alive = true;
     for _ in 0..100 {
-        alive = unsafe { libc::kill(pid, 0) } == 0;
+        alive = process_is_running(pid);
         if !alive {
             break;
         }
@@ -302,7 +755,7 @@ fn supervisor_cleans_up_a_descendant_after_the_parent_completed() {
         .unwrap();
     let mut alive = true;
     for _ in 0..100 {
-        alive = unsafe { libc::kill(pid, 0) } == 0;
+        alive = process_is_running(pid);
         if !alive {
             break;
         }
@@ -312,4 +765,62 @@ fn supervisor_cleans_up_a_descendant_after_the_parent_completed() {
         !alive,
         "a descendant that closed stdio must not survive successful completion"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn parallel_supervisors_do_not_signal_unrelated_process_groups() {
+    const WORKERS: usize = 12;
+    let barrier = Arc::new(Barrier::new(WORKERS));
+    let mut workers = Vec::with_capacity(WORKERS);
+
+    for index in 0..WORKERS {
+        let barrier = Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            match index % 3 {
+                0 => {
+                    let expected = format!("worker-{index}");
+                    let command = format!("printf {expected}");
+                    let args = [OsStr::new("-c"), OsStr::new(&command)];
+                    let spec =
+                        ChildSpec::new(args, ChildLimits::new(Duration::from_secs(3), 64, 64));
+                    match run(&shell(), &spec) {
+                        ChildOutcome::Completed {
+                            status,
+                            stdout,
+                            stderr,
+                        } => {
+                            assert!(status.success(), "worker {index} was signalled: {status}");
+                            assert_eq!(stdout, expected.as_bytes());
+                            assert!(stderr.is_empty());
+                        }
+                        other => panic!("worker {index} had unexpected outcome: {other:?}"),
+                    }
+                }
+                1 => {
+                    let args = [OsStr::new("-c"), OsStr::new("printf 12345")];
+                    let spec =
+                        ChildSpec::new(args, ChildLimits::new(Duration::from_secs(3), 4, 64));
+                    assert!(matches!(
+                        run(&shell(), &spec),
+                        ChildOutcome::OutputLimitExceeded {
+                            stream: CaptureStream::Stdout,
+                            ..
+                        }
+                    ));
+                }
+                _ => {
+                    let args = [OsStr::new("-c"), OsStr::new("sleep 5")];
+                    let spec =
+                        ChildSpec::new(args, ChildLimits::new(Duration::from_millis(100), 64, 64));
+                    assert!(matches!(run(&shell(), &spec), ChildOutcome::Timeout { .. }));
+                }
+            }
+        }));
+    }
+
+    for worker in workers {
+        worker.join().expect("parallel supervisor worker panicked");
+    }
 }

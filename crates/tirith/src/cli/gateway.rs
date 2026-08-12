@@ -3,7 +3,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -1176,12 +1176,12 @@ fn mcp_server_capsule_spec(cwd: &Path) -> tirith_core::capsule::CapsuleSpec {
 /// protocol), using the [`mcp_server_capsule_spec`] contained-launch policy.
 /// Enforcing surface: under degraded coverage [`crate::cli::capsule::spawn_piped`]
 /// returns `Err` and we never run the upstream uncontained. Returns the live
-/// [`Child`] for the existing bridge threads.
+/// [`ManagedChild`] for the existing bridge threads.
 fn spawn_upstream_capsuled(
     upstream_bin: &str,
     upstream_args: &[String],
     depth_env: &str,
-) -> Result<Child, String> {
+) -> Result<crate::cli::capsule::ManagedChild, String> {
     let cwd = std::env::current_dir()
         .map_err(|error| format!("cannot resolve gateway working directory: {error}"))?;
     let spec = mcp_server_capsule_spec(&cwd);
@@ -1414,7 +1414,9 @@ impl GatewayLaunchBinding {
     }
 }
 
-fn spawn_bound_upstream(binding: &GatewayLaunchBinding) -> Result<Child, String> {
+fn spawn_bound_upstream(
+    binding: &GatewayLaunchBinding,
+) -> Result<crate::cli::capsule::ManagedChild, String> {
     binding.revalidate()?;
     let program = binding
         .executable
@@ -1449,6 +1451,7 @@ fn spawn_bound_upstream(binding: &GatewayLaunchBinding) -> Result<Child, String>
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
+        .map(crate::cli::capsule::ManagedChild::unmanaged)
         .map_err(|error| format!("failed to spawn exact-bound upstream: {error}"))
 }
 
@@ -1770,7 +1773,7 @@ pub fn run_gateway_with_options(
             .stderr(Stdio::piped())
             .spawn()
         {
-            Ok(c) => c,
+            Ok(c) => crate::cli::capsule::ManagedChild::unmanaged(c),
             Err(e) => {
                 eprintln!("tirith gateway: failed to spawn upstream '{upstream_bin}': {e}");
                 return 1;
@@ -1778,9 +1781,9 @@ pub fn run_gateway_with_options(
         }
     };
 
-    let child_stdin = child.stdin.take().expect("child stdin");
-    let child_stdout = child.stdout.take().expect("child stdout");
-    let child_stderr = child.stderr.take().expect("child stderr");
+    let child_stdin = child.take_stdin().expect("child stdin");
+    let child_stdout = child.take_stdout().expect("child stdout");
+    let child_stderr = child.take_stderr().expect("child stderr");
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let client_done = Arc::new(AtomicBool::new(false));
@@ -2430,10 +2433,10 @@ fn check_tools_list_pagination_request(
     schema_cache: &Mutex<ToolSchemaCache>,
 ) -> SchemaGate {
     if request.get("method").and_then(Value::as_str) != Some("tools/list")
-        || !request
+        || request
             .get("params")
             .and_then(|params| params.get("cursor"))
-            .is_some_and(|cursor| !cursor.is_null())
+            .is_none_or(Value::is_null)
     {
         return SchemaGate::Forward(None);
     }
@@ -5524,7 +5527,7 @@ fn forward(writer: &mut impl Write, line: &[u8]) -> io::Result<()> {
     writer.flush()
 }
 
-fn shutdown_child(child: &mut Child, abnormal: bool) -> i32 {
+fn shutdown_child(child: &mut crate::cli::capsule::ManagedChild, abnormal: bool) -> i32 {
     if let Ok(Some(_)) = child.try_wait() {
         return if abnormal { 1 } else { 0 };
     }
@@ -5563,7 +5566,7 @@ fn shutdown_child(child: &mut Child, abnormal: bool) -> i32 {
     }
 }
 
-fn terminate_completed_approval_child(child: &mut Child) {
+fn terminate_completed_approval_child(child: &mut crate::cli::capsule::ManagedChild) {
     if child.try_wait().ok().flatten().is_some() {
         return;
     }

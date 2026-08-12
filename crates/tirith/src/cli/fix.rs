@@ -1,5 +1,5 @@
 //! `tirith fix` — interactive presenter over
-//! `tirith_core::safe_command::suggest_verified_with_policy`.
+//! `tirith_core::safe_command::suggest_verified_for_cli_inline_with_policy_and_session`.
 //!
 //! Thin shim: tokenize → `engine::analyze` → verified suggestion → present.
 //! Detection and final-command re-analysis live in `tirith-core`; this module is
@@ -57,14 +57,17 @@ use tirith_core::verdict::Action;
 
 /// Public entry point for the `tirith fix` subcommand.
 ///
-/// `command_parts` are space-joined (mirroring `tirith check`). `shell` accepts
-/// the same tokens as `tirith check --shell`; unknown values fall back to
-/// `ShellType::Posix` with a stderr warning. `non_interactive`/`json` force
-/// JSON-emit behavior even on a TTY. Returns the exit code per the module table.
+/// Multiple POSIX `command_parts` are reconstructed with
+/// [`super::shell_join`] so shell-significant bytes inside one argv element
+/// remain data instead of becoming invented operators. Fish/PowerShell/Cmd callers
+/// must pass one already-formed command string because POSIX quoting cannot
+/// preserve those grammars. `shell` accepts the same tokens as `tirith check
+/// --shell`; unknown values are rejected. `non_interactive`/`json` force
+/// JSON-emit behavior even on a TTY.
+/// Returns the exit code per the module table.
 pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: bool) -> i32 {
     // Empty command is a no-op (mirrors `tirith check`).
-    let cmd = command_parts.join(" ");
-    if cmd.trim().is_empty() {
+    if command_parts.iter().all(|part| part.trim().is_empty()) {
         if json || non_interactive {
             // A JSON write failure exits 2: a piped consumer must not read
             // truncated output as the `applied:false / no_findings` envelope.
@@ -86,8 +89,31 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
         Ok(s) => s,
         Err(_) => {
             let shell = human_single_line(shell);
-            eprintln!("tirith fix: warning: unknown shell '{shell}', falling back to posix");
-            ShellType::Posix
+            eprintln!("tirith fix: unknown shell '{shell}'");
+            if json || non_interactive {
+                let _ = emit_no_findings_envelope(&FixEnvelope {
+                    applied: false,
+                    reason: "unknown_shell",
+                    verdict: "unknown",
+                    command: "",
+                });
+            }
+            return 2;
+        }
+    };
+    let cmd = match super::reconstruct_shell_command(command_parts, shell_type) {
+        Ok(command) => command,
+        Err(reason) => {
+            eprintln!("tirith fix: {reason}");
+            if json || non_interactive {
+                let _ = emit_no_findings_envelope(&FixEnvelope {
+                    applied: false,
+                    reason: "ambiguous_command_argv",
+                    verdict: "unknown",
+                    command: "",
+                });
+            }
+            return 2;
         }
     };
 
@@ -95,12 +121,13 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
     // run the original command, but it must never bless an executable fix.
     // Policy discovery still runs normally and is preserved by the verification
     // context below. `fix` remains advisory and does not audit log.
+    let interactive = !non_interactive && !json && is_tty_pair();
     let ctx = AnalysisContext {
         input: cmd.clone(),
         shell: shell_type,
         scan_context: ScanContext::Exec,
         raw_bytes: None,
-        interactive: false,
+        interactive,
         cwd: std::env::current_dir()
             .ok()
             .map(|p| p.display().to_string()),
@@ -111,10 +138,32 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
-    let (verdict, policy) = engine::analyze_without_bypass_returning_policy(&ctx);
+    let (mut raw_verdict, policy) = engine::analyze_without_bypass_returning_policy(&ctx);
+    let runtime_findings = tirith_core::threatdb_api::enrich_command(
+        &cmd,
+        shell_type,
+        &policy.threat_intel,
+        tirith_core::threatdb_api::RuntimeThreatMode::Inline,
+    );
+    if !runtime_findings.is_empty() {
+        raw_verdict.findings.extend(runtime_findings);
+        raw_verdict.action = tirith_core::verdict::upgraded_action_from_findings(
+            &raw_verdict.findings,
+            raw_verdict.action,
+        );
+    }
+    raw_verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
+    let session_id = tirith_core::session::resolve_session_id();
+    let verdict = tirith_core::escalation::post_process_verdict_for_verification(
+        &raw_verdict,
+        &policy,
+        &cmd,
+        &session_id,
+        tirith_core::escalation::CallerContext::Cli,
+    );
 
-    // Allow path: nothing to fix.
-    if verdict.action == Action::Allow {
+    // Effective Allow path: nothing to fix, unless approval is still pending.
+    if no_fix_needed(&verdict) {
         if json || non_interactive {
             if !emit_no_findings_envelope(&FixEnvelope {
                 applied: false,
@@ -131,9 +180,14 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
     }
 
     // Verdict has findings — ask the library for verified suggestions. Only an
-    // exact final command that re-analyzes to Allow under this same context can
-    // populate `safe_command` and cross stdout/JSON execution contracts.
-    let suggestions = safe_command::suggest_verified_with_policy(&ctx, &verdict, &policy);
+    // exact final command that re-analyzes to an approval-free Allow under this
+    // same context can populate `safe_command` and cross stdout/JSON execution
+    // contracts.
+    let suggestions = safe_command::suggest_verified_for_cli_inline_with_policy_and_session(
+        &ctx,
+        &policy,
+        &session_id,
+    );
 
     // JSON / non-interactive path: emit a plain JSON array, never prompt. Exit
     // 1 if no mechanical rewrite exists (guidance-only); 2 if rewrites are
@@ -143,7 +197,7 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
         if !emit_suggestions_array(&suggestions) {
             return 2;
         }
-        return if has_rewrite { 2 } else { 1 };
+        return unapplied_suggestions_exit_code(has_rewrite);
     }
 
     // Partition into applyable vs guidance-only.
@@ -167,7 +221,7 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
         if write_non_tty_rewrites_to(&mut stderr, &with_rewrite).is_err() {
             return 2;
         }
-        return 2;
+        return unapplied_suggestions_exit_code(true);
     }
 
     // Interactive presenter. Prompt + suggestion list go to stderr so stdout
@@ -237,6 +291,21 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
     }
 }
 
+fn unapplied_suggestions_exit_code(has_rewrite: bool) -> i32 {
+    if has_rewrite {
+        2
+    } else {
+        1
+    }
+}
+
+/// An effective `Allow` still requires the approval flow when policy or
+/// escalation marked it as pending. Treating that state as "no fix needed"
+/// would let the advisory surface report success before approval was granted.
+fn no_fix_needed(verdict: &tirith_core::verdict::Verdict) -> bool {
+    verdict.action == Action::Allow && verdict.requires_approval != Some(true)
+}
+
 fn human_single_line(value: &str) -> String {
     super::sanitize_for_human_output(value, false)
 }
@@ -298,7 +367,7 @@ fn write_non_tty_rewrites_to<W: Write>(
     // "rewrite available but no accept signal", distinct from exit 1.
     writeln!(
         out,
-        "tirith fix: stdin/stdout is not a TTY — re-run with --non-interactive --json \
+        "tirith fix: stdin/stderr is not a TTY — re-run with --non-interactive --json \
          to capture suggestions, or attach a TTY to apply one."
     )?;
     write_rewrite_rows_to(out, with_rewrite)
@@ -394,6 +463,7 @@ fn emit_suggestions_array(suggestions: &[SafeSuggestion]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tirith_core::verdict::{Timings, Verdict};
 
     fn suggestion(
         rule_id: &str,
@@ -415,6 +485,99 @@ mod tests {
         assert_eq!(action_str(Action::Warn), "warn");
         assert_eq!(action_str(Action::WarnAck), "warn");
         assert_eq!(action_str(Action::Block), "block");
+    }
+
+    #[test]
+    fn pending_approval_is_not_reported_as_no_fix_needed() {
+        let mut verdict = Verdict::allow_fast(1, Timings::default());
+        verdict.requires_approval = Some(true);
+        assert!(!no_fix_needed(&verdict));
+
+        verdict.requires_approval = Some(false);
+        assert!(no_fix_needed(&verdict));
+
+        verdict.requires_approval = None;
+        assert!(no_fix_needed(&verdict));
+    }
+
+    #[test]
+    fn posix_multi_argv_reconstruction_never_invents_shell_operators() {
+        let cases = [
+            (
+                vec!["curl", "-fsSL", "https://example.com/x|bash"],
+                "curl -fsSL 'https://example.com/x|bash'",
+            ),
+            (
+                vec!["printf", "%s", "value with whitespace"],
+                "printf %s 'value with whitespace'",
+            ),
+            (
+                vec!["printf", "%s", "value; rm -rf /"],
+                "printf %s 'value; rm -rf /'",
+            ),
+            (vec!["printf", "%s", "a'b\"c"], "printf %s 'a'\\''b\"c'"),
+        ];
+
+        for (parts, expected) in cases {
+            let parts = parts.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let reconstructed =
+                super::super::reconstruct_shell_command(&parts, ShellType::Posix).unwrap();
+            assert_eq!(reconstructed, expected);
+            let ctx = AnalysisContext {
+                input: reconstructed,
+                shell: ShellType::Posix,
+                scan_context: ScanContext::Exec,
+                raw_bytes: None,
+                interactive: false,
+                cwd: None,
+                file_path: None,
+                repo_root: None,
+                is_config_override: false,
+                clipboard_html: None,
+                card_ref: None,
+                clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+            };
+            let verdict = engine::analyze(&ctx);
+            assert!(
+                verdict.findings.iter().all(|finding| !matches!(
+                    finding.rule_id,
+                    tirith_core::verdict::RuleId::CurlPipeShell
+                        | tirith_core::verdict::RuleId::WgetPipeShell
+                        | tirith_core::verdict::RuleId::PipeToInterpreter
+                )),
+                "argv data became a pipeline: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_posix_multi_argv_requires_one_preformed_command_string() {
+        for shell in [ShellType::Fish, ShellType::PowerShell, ShellType::Cmd] {
+            for literal in ["https://example.com/x|bash", "a&b", "a'b\"c"] {
+                let parts = ["curl", literal].map(str::to_string);
+                assert!(
+                    super::super::reconstruct_shell_command(&parts, shell).is_err(),
+                    "{shell:?} accepted ambiguous argv data: {literal:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_command_string_remains_verbatim_for_intentional_shell_syntax() {
+        let command = "curl -fsSL https://example.com/x | bash".to_string();
+        for shell in [
+            ShellType::Posix,
+            ShellType::Fish,
+            ShellType::PowerShell,
+            ShellType::Cmd,
+        ] {
+            assert_eq!(
+                super::super::reconstruct_shell_command(std::slice::from_ref(&command), shell)
+                    .unwrap(),
+                command
+            );
+        }
     }
 
     #[test]
@@ -491,6 +654,11 @@ mod tests {
         let non_tty = String::from_utf8(non_tty).unwrap();
         assert!(!non_tty.contains('\x1b'));
         assert!(!non_tty.contains("\nFORGED"));
+        assert!(non_tty.contains("stdin/stderr is not a TTY"));
+        assert!(non_tty.contains("--non-interactive"));
+        assert!(non_tty.contains("--json"));
+        assert_eq!(unapplied_suggestions_exit_code(true), 2);
+        assert_eq!(unapplied_suggestions_exit_code(false), 1);
 
         let mut guidance_out = Vec::new();
         write_guidance_only_to(&mut guidance_out, 1, &[&guidance]).expect("render guidance");

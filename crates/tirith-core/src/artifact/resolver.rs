@@ -894,8 +894,7 @@ fn resolver_tool_digest(path: &Path) -> Result<String, String> {
     {
         crate::util::HashOutcome::Digest(digest) => Ok(digest),
         crate::util::HashOutcome::BudgetExceeded => Err(format!(
-            "resolver tool exceeds the {} byte enrollment cap",
-            RESOLVER_TOOL_MAX_BYTES
+            "resolver tool exceeds the {RESOLVER_TOOL_MAX_BYTES} byte enrollment cap"
         )),
     }
 }

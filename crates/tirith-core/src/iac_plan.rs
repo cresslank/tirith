@@ -523,8 +523,7 @@ fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u8>, 
         ShellTimeoutOutcome::OutputLimitExceeded {
             cleanup_succeeded: true,
         } => Err(format!(
-            "{program} show -json exceeded the {} byte output cap",
-            MAX_PLAN_SIZE_BYTES
+            "{program} show -json exceeded the {MAX_PLAN_SIZE_BYTES} byte output cap"
         )),
         ShellTimeoutOutcome::OutputLimitExceeded {
             cleanup_succeeded: false,

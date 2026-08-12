@@ -74,7 +74,7 @@ fn print_trust_error(subcmd: &str, err: &str, hint_pattern: Option<&str>) {
             let display_pattern = human(pattern);
             let quoted = tirith_core::safe_command::shell_single_quote(&display_pattern)
                 .unwrap_or_else(|| "'[unsafe pattern]'".to_string());
-            eprintln!("  try: tirith trust {subcmd} {} --scope user", quoted);
+            eprintln!("  try: tirith trust {subcmd} {quoted} --scope user");
         } else {
             eprintln!("  try: tirith trust {subcmd} --scope user");
         }
@@ -761,8 +761,7 @@ pub fn list(rule_filter: Option<&str>, json: bool, show_expired: bool, scope: &s
                 any_dangerous = true;
             }
             eprintln!(
-                "{:<max_pat$}  {:<max_rule$}  {:<max_scope$}  {:<max_src$}  {}",
-                pattern_display, rule_display, scope_display, source_display, expires_display
+                "{pattern_display:<max_pat$}  {rule_display:<max_rule$}  {scope_display:<max_scope$}  {source_display:<max_src$}  {expires_display}"
             );
         }
         if any_dangerous {

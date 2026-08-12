@@ -1768,6 +1768,43 @@ fn resolve_segment_command(segment: &Segment) -> Option<ResolvedCommand<'_>> {
 /// length. Exhaustion is unresolved, never a partially trusted inner command.
 const MAX_WRAPPED_COMMAND_DEPTH: usize = 64;
 
+/// Whether a segment nests execution wrappers deeper than
+/// [`MAX_WRAPPED_COMMAND_DEPTH`], counted independently of resolution.
+///
+/// `resolve_wrapped_command` collapses "too deep" into the same `None` it
+/// returns for "no command here", so a caller that skips an unresolvable
+/// segment — `check_network_policy` and the package-threat lookup both do —
+/// cannot tell a 65-wrapper chain from an irrelevant one, and the inner command
+/// escapes those rules. This lets the caller fail closed on the difference.
+pub fn wrapper_chain_exceeds_depth(segment: &Segment) -> bool {
+    let Some(command) = segment.command.as_deref() else {
+        return false;
+    };
+    let mut name = command_base_name(command);
+    let mut args = segment.args.as_slice();
+    for _ in 0..MAX_WRAPPED_COMMAND_DEPTH {
+        // Only the peeling wrappers continue the chain; anything else is the
+        // real command and the chain ended within budget.
+        if !matches!(name.as_str(), "env" | "command" | "time" | "sudo" | "doas") {
+            return false;
+        }
+        let next = match name.as_str() {
+            "env" => env_wrapped_command_index(args),
+            "command" => command_wrapped_command_index(args),
+            "time" => time_wrapped_command_index(args),
+            "sudo" | "doas" => sudo_wrapped_command_index(args),
+            _ => None,
+        };
+        let Some(next) = next else {
+            // A wrapper with no command word is terminal, not over-deep.
+            return false;
+        };
+        name = command_base_name(&args[next]);
+        args = &args[next + 1..];
+    }
+    true
+}
+
 /// Resolve a segment's command through wrappers (`env`, `command`, `time`,
 /// `sudo`/`doas`, `tirith`) and return the resolved name and the wrapped
 /// command's args. Callers outside the extractor (e.g. `check_network_policy`)
@@ -1809,6 +1846,11 @@ fn resolve_named_command_depth<'a>(
 /// Conservative: returns None when the command can't be unambiguously resolved,
 /// so the caller falls back to the literal first token.
 fn resolve_sudo_wrapper(args: &[String], depth: usize) -> Option<ResolvedCommand<'_>> {
+    let i = sudo_wrapped_command_index(args)?;
+    resolve_named_command_depth(&args[i], &args[i + 1..], depth)
+}
+
+fn sudo_wrapped_command_index(args: &[String]) -> Option<usize> {
     // Short sudo(8) flags that take a VALUE. Boolean-only flags (-S -A -B -E -H
     // -K -L -l -n -P -s -V -v, and -h=--help not --host) must NOT be here —
     // treating them as value-taking would eat the next token.
@@ -1858,12 +1900,17 @@ fn resolve_sudo_wrapper(args: &[String], depth: usize) -> Option<ResolvedCommand
             continue;
         }
         // First non-flag, non-assignment argument is the wrapped command.
-        return resolve_named_command_depth(&clean, &args[i + 1..], depth);
+        return Some(i);
     }
     None
 }
 
 fn resolve_env_command(args: &[String], depth: usize) -> Option<ResolvedCommand<'_>> {
+    let i = env_wrapped_command_index(args)?;
+    resolve_named_command_depth(&args[i], &args[i + 1..], depth)
+}
+
+fn env_wrapped_command_index(args: &[String]) -> Option<usize> {
     let mut i = 0;
     while i < args.len() {
         let clean = strip_quotes(&args[i]);
@@ -1891,7 +1938,7 @@ fn resolve_env_command(args: &[String], depth: usize) -> Option<ResolvedCommand<
             i += 1;
             continue;
         }
-        return resolve_named_command_depth(&clean, &args[i + 1..], depth);
+        return Some(i);
     }
 
     while i < args.len() {
@@ -1900,13 +1947,18 @@ fn resolve_env_command(args: &[String], depth: usize) -> Option<ResolvedCommand<
             i += 1;
             continue;
         }
-        return resolve_named_command_depth(&clean, &args[i + 1..], depth);
+        return Some(i);
     }
 
     None
 }
 
 fn resolve_command_wrapper(args: &[String], depth: usize) -> Option<ResolvedCommand<'_>> {
+    let i = command_wrapped_command_index(args)?;
+    resolve_named_command_depth(&args[i], &args[i + 1..], depth)
+}
+
+fn command_wrapped_command_index(args: &[String]) -> Option<usize> {
     let mut i = 0;
     while i < args.len() {
         let clean = strip_quotes(&args[i]);
@@ -1920,11 +1972,15 @@ fn resolve_command_wrapper(args: &[String], depth: usize) -> Option<ResolvedComm
         }
         break;
     }
-    args.get(i)
-        .and_then(|arg| resolve_named_command_depth(arg, &args[i + 1..], depth))
+    args.get(i).map(|_| i)
 }
 
 fn resolve_time_wrapper(args: &[String], depth: usize) -> Option<ResolvedCommand<'_>> {
+    let i = time_wrapped_command_index(args)?;
+    resolve_named_command_depth(&args[i], &args[i + 1..], depth)
+}
+
+fn time_wrapped_command_index(args: &[String]) -> Option<usize> {
     let mut i = 0;
     while i < args.len() {
         let clean = strip_quotes(&args[i]);
@@ -1942,8 +1998,7 @@ fn resolve_time_wrapper(args: &[String], depth: usize) -> Option<ResolvedCommand
         }
         break;
     }
-    args.get(i)
-        .and_then(|arg| resolve_named_command_depth(arg, &args[i + 1..], depth))
+    args.get(i).map(|_| i)
 }
 
 fn resolve_tirith_command(args: &[String]) -> Option<ResolvedCommand<'_>> {
@@ -2821,6 +2876,7 @@ mod tests {
         let input = "command ".repeat(MAX_WRAPPED_COMMAND_DEPTH + 8) + "curl https://example.com";
         let segments = tokenize::tokenize(&input, ShellType::Posix);
         assert_eq!(segments.len(), 1);
+        assert!(wrapper_chain_exceeds_depth(&segments[0]));
         assert!(
             resolve_wrapped_command(&segments[0]).is_none(),
             "an over-deep wrapper chain must be unresolved instead of recursing without bound"
@@ -2830,6 +2886,39 @@ mod tests {
         let resolved = resolve_wrapped_command(&shallow[0]).expect("shallow wrappers resolve");
         assert_eq!(resolved.0, "curl");
         assert_eq!(resolved.1, vec!["https://example.com".to_string()]);
+    }
+
+    #[test]
+    fn wrapped_command_depth_guard_uses_wrapper_option_roles() {
+        for (label, prefix) in [
+            ("sudo", "sudo -u user "),
+            ("env", "env -u TOKEN "),
+            ("time", "time -f %E "),
+        ] {
+            let exhausted = prefix.repeat(MAX_WRAPPED_COMMAND_DEPTH) + "curl https://example.com";
+            let segments = tokenize::tokenize(&exhausted, ShellType::Posix);
+            assert_eq!(segments.len(), 1, "{label}: {segments:?}");
+            assert!(
+                wrapper_chain_exceeds_depth(&segments[0]),
+                "{label}: a value-taking wrapper option must not be mistaken for the command"
+            );
+            assert!(
+                resolve_wrapped_command(&segments[0]).is_none(),
+                "{label}: the guard and resolver must agree at the depth ceiling"
+            );
+
+            let within_budget =
+                prefix.repeat(MAX_WRAPPED_COMMAND_DEPTH - 1) + "curl https://example.com";
+            let segments = tokenize::tokenize(&within_budget, ShellType::Posix);
+            assert_eq!(segments.len(), 1, "{label}: {segments:?}");
+            assert!(
+                !wrapper_chain_exceeds_depth(&segments[0]),
+                "{label}: a chain within the depth budget must remain resolvable"
+            );
+            let resolved = resolve_wrapped_command(&segments[0])
+                .unwrap_or_else(|| panic!("{label}: within-budget wrapper chain must resolve"));
+            assert_eq!(resolved.0, "curl", "{label}");
+        }
     }
 
     #[test]
