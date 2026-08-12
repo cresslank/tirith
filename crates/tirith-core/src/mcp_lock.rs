@@ -2524,6 +2524,9 @@ fn looks_like_secret_literal(value: &str) -> bool {
 /// `reject_userinfo` is true for URLs embedded in stdio arguments (which would
 /// otherwise be serialized verbatim); the top-level URL transport instead
 /// hashes and strips userinfo via `redact_url_userinfo`.
+/// Userinfo in a URL-shaped string `url::Url::parse` refused. Only the authority
+/// segment is inspected, so an ordinary `--mail=a@b.example` argument (no `//`
+/// authority) is not misread as a credential.
 fn raw_authority_has_userinfo(raw: &str) -> bool {
     let after_scheme = match raw.split_once("://") {
         Some((_, rest)) => rest,

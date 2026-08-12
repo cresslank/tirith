@@ -729,6 +729,7 @@ fn npm_lock_identity(
     if let Some((target, target_version)) = raw_version
         .and_then(|version| version.strip_prefix("npm:"))
         .and_then(split_npm_name_version)
+        .filter(|(target, _)| npm_registry_name_is_structurally_safe(target))
     {
         return (
             target.to_string(),
@@ -737,14 +738,15 @@ fn npm_lock_identity(
         );
     }
 
-    let target = meta
-        .get("name")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .unwrap_or(declared_name);
-    let alias = (target != declared_name).then(|| declared_name.to_string());
-    (target.to_string(), alias, raw_version.map(str::to_string))
+    // A v1 `dependencies` entry carries no `name` field: npm keys the install by
+    // the map key alone. Honoring a differing `name` would let a crafted lock
+    // rename a flagged package into a harmless identity, so the key stays
+    // authoritative.
+    (
+        declared_name.to_string(),
+        None,
+        raw_version.map(str::to_string),
+    )
 }
 
 /// Python `requirements.txt`: one PEP 508 specifier per line. Comments, blank
@@ -1865,7 +1867,7 @@ fn policy_findings_for_assessment(
 
     // PackagePolicyNewerThanDays — package_age_days vs thresholds
     if let Some(age_days) = prov.package_age_days {
-        let warn_d = pp.warn_newer_than_days;
+        let warn_d = Some(pp.warn_newer_than_days_effective());
         let block_d = pp.block_newer_than_days;
         let (fired, sev) = match (block_d, warn_d) {
             (Some(b), _) if (age_days as u32) <= b => (true, Severity::High),
