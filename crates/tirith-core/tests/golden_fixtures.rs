@@ -1621,12 +1621,10 @@ fn test_tier1_matches_all_interpreters() {
     use tirith_core::rules::command::INTERPRETERS;
 
     for name in INTERPRETERS {
-        let input = format!("cat /tmp/s.sh | {}", name);
+        let input = format!("cat /tmp/s.sh | {name}");
         assert!(
             tier1_scan(&input, ScanContext::Exec),
-            "Tier-1 scan does not match plain interpreter '{}' in '{}'",
-            name,
-            input
+            "Tier-1 scan does not match plain interpreter '{name}' in '{input}'"
         );
     }
 
