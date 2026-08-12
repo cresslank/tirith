@@ -4,6 +4,14 @@ Status: research spike, go/no-go decision record. No `native-yara` feature, no
 `yara-x` dependency, no scanner is added in this PR. The closure checks below were
 run against throwaway crates in scratch space, never committed.
 
+> **2026-08-12 implementation update.** The workspace MSRV is now 1.88. The
+> 1.83 closure experiments below remain reproducible historical evidence, but
+> the blanket conclusion that every usable `yara-x` line is excluded by the
+> product MSRV is superseded. Adoption is still deferred: the current 1.x line
+> requires a newer compiler, and any older candidate must undergo a fresh
+> dependency, advisory, license, performance, and native-sandbox review against
+> the integrated main branch.
+
 Question under test: can tirith add native YARA scanning (via `yara-x`) on MSRV
 1.83, and where would signature-base, TLSH fuzzy hashing, and capa capability
 definitions plug in if it could?

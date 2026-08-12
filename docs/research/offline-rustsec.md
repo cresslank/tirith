@@ -6,6 +6,15 @@ below lives in `tools/rustsec-probe/` (a standalone crate, detached from the
 tirith workspace by an empty `[workspace]` table, so it never enters the product
 build).
 
+> **2026-08-12 implementation update.** This document preserves the July 2026
+> experiment and its Rust 1.83 reproduction commands. The product workspace has
+> since moved to MSRV 1.88 while remediating RUSTSEC-2026-0187 and now ships
+> lopdf 0.44 with no advisory ignores. Consequently, the statement below that
+> `rustsec` 0.33 is unavailable to the product is historical, not a current
+> constraint. Any implementation decision must re-evaluate the direct-parser
+> route against the now-MSRV-compatible `rustsec` crate, while retaining the
+> offline/no-runtime-network and attribution requirements documented here.
+
 Question under test: should tirith consult a local snapshot of the RustSec
 advisory database so that `Cargo.lock` scans report known-vulnerable crates when
 the machine is offline or the OSV cache is cold?
