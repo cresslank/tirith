@@ -462,8 +462,7 @@ fn emit_exfil_finding(findings: &mut Vec<Finding>, call_snippet: &str, sens_str:
         severity: Severity::Medium,
         title: "Suspicious code exfiltration pattern".to_string(),
         description: format!(
-            "HTTP call passes sensitive data '{}' as argument — potential data exfiltration",
-            sens_str
+            "HTTP call passes sensitive data '{sens_str}' as argument — potential data exfiltration"
         ),
         evidence: vec![Evidence::CommandPattern {
             pattern: "sensitive data inside HTTP call arguments".to_string(),

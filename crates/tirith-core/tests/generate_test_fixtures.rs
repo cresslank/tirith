@@ -93,7 +93,7 @@ fn build_test_db(signing_key: &SigningKey) {
     let dat_path = repo_root().join("tests/fixtures/test-threatdb.dat");
     writer
         .write_to(&dat_path, signing_key)
-        .unwrap_or_else(|e| panic!("Failed to write test DB: {}", e));
+        .unwrap_or_else(|e| panic!("Failed to write test DB: {e}"));
     eprintln!("Wrote test DB to {}", dat_path.display());
 
     // Structural reload only: verify_signature() fails until a rebuild embeds

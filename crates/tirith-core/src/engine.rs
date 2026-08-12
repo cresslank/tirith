@@ -5007,8 +5007,7 @@ mod tests {
         let urls = verdict.urls_extracted_count.unwrap_or(0);
         assert!(
             !verdict.findings.is_empty() || urls > 0,
-            "env-assignment URL must still be extracted/analyzed, got {:?}",
-            verdict
+            "env-assignment URL must still be extracted/analyzed, got {verdict:?}"
         );
     }
 

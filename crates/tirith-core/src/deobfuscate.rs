@@ -348,7 +348,7 @@ fn try_decode_base64(run: &str) -> Option<Vec<u8>> {
 /// malformed pair (defensive: callers only pass validated even-length hex runs).
 fn try_decode_hex(run: &str) -> Option<Vec<u8>> {
     let bytes = run.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let hex_val = |b: u8| -> Option<u8> {
@@ -453,7 +453,7 @@ fn hex_forms(input: &str, record_range: bool) -> Vec<NormalizedForm> {
         }
         let mut end = i;
         // Decode only an even-length prefix (drop a trailing odd nibble).
-        if (end - start) % 2 != 0 {
+        if !(end - start).is_multiple_of(2) {
             end -= 1;
         }
         if end - start < MIN_HEX_CANDIDATE_LEN {
@@ -520,7 +520,7 @@ pub fn has_encoded_blob(input: &str) -> bool {
             i += 1;
         }
         let mut len = i - start;
-        if len % 2 != 0 {
+        if !len.is_multiple_of(2) {
             len -= 1;
         }
         if len >= MIN_HEX_CANDIDATE_LEN {
