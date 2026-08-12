@@ -955,22 +955,31 @@ fn check_workflow_checkout_untrusted_ref(
             if !is_checkout_action(uses) {
                 continue;
             }
-            let Some(ref_val) = get_field(step, "with")
+            let with = get_field(step, "with");
+            let ref_val = with
                 .and_then(|w| get_field(w, "ref"))
-                .and_then(|r| r.as_str())
-            else {
-                continue;
-            };
-            if interpolates_pr_head_ref(ref_val) {
+                .and_then(|r| r.as_str());
+            let repository_val = with
+                .and_then(|w| get_field(w, "repository"))
+                .and_then(|r| r.as_str());
+            let untrusted_ref = ref_val.is_some_and(interpolates_pr_head_ref);
+            let untrusted_repository = repository_val.is_some_and(interpolates_pr_head_ref);
+            if untrusted_ref || untrusted_repository {
+                let source = match (untrusted_repository, untrusted_ref) {
+                    (true, true) => "fork-controlled repository and ref",
+                    (true, false) => "fork-controlled repository",
+                    (false, true) => "fork-controlled ref",
+                    (false, false) => unreachable!("guarded above"),
+                };
                 findings.push(Finding {
                     rule_id: RuleId::WorkflowCheckoutUntrustedRef,
                     severity: Severity::High,
                     title: "Workflow checks out an untrusted PR head with elevated privileges"
                         .to_string(),
                     description:
-                        "An `actions/checkout` step in this workflow checks out a pull-request head \
-                         ref (`github.event.pull_request.head.*` / `github.head_ref`, or the head \
-                         of a `workflow_run`) under a `pull_request_target` or `workflow_run` \
+                        "An `actions/checkout` step in this workflow selects a pull-request head \
+                         repository or ref (`github.event.pull_request.head.*` / `github.head_ref`, \
+                         or the head of a `workflow_run`) under a `pull_request_target` or `workflow_run` \
                          trigger. Those triggers run with the base repository's read/write \
                          `GITHUB_TOKEN` and secrets, so a subsequent build/test/lint step executes \
                          the fork's code with your credentials, the well-known \"pwn request\" \
@@ -979,7 +988,7 @@ fn check_workflow_checkout_untrusted_ref(
                          and never execute the fork's tree."
                             .to_string(),
                     evidence: vec![Evidence::Text {
-                        detail: format!("checkout ref: {}", truncate(ref_val, 160)),
+                        detail: format!("checkout source: {source}"),
                     }],
                     human_view: None,
                     agent_view: None,
@@ -2320,6 +2329,21 @@ mod tests {
              jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      \
              - uses: actions/checkout@{SHA_PIN}\n        with:\n          \
              ref: ${{{{ github.event.workflow_run.head_sha }}}}\n"
+        );
+        assert!(has(
+            &wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCheckoutUntrustedRef
+        ));
+    }
+
+    #[test]
+    fn workflow_checkout_untrusted_repository_without_ref_flagged() {
+        let wf = format!(
+            "on:\n  pull_request_target:\n    types: [opened]\npermissions:\n  contents: read\n\
+             jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      \
+             - uses: actions/checkout@{SHA_PIN}\n        with:\n          \
+             repository: ${{{{ github.event.pull_request.head.repo.full_name }}}}\n      - run: make\n"
         );
         assert!(has(
             &wf,
