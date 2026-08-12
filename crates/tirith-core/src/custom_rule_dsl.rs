@@ -524,7 +524,7 @@ pub fn satisfiable_contexts(clause: &WhenClause) -> ContextSet {
                 k += 1;
                 inner = c.as_ref();
             }
-            let even = k % 2 == 0;
+            let even = k.is_multiple_of(2);
             match inner {
                 // constant-FALSE innermost.
                 WhenClause::Any(cs) if cs.is_empty() => {

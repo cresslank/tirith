@@ -274,7 +274,7 @@ fn emit_check_plan_human(plan_path: &Path, sha: &str, summary: &PlanSummary, pur
     eprintln!("tirith iac check-plan:");
     eprintln!("  plan:        {}", plan_path.display());
     eprintln!("  tool:        {}", summary.tool.as_str());
-    eprintln!("  sha256:      {}", sha);
+    eprintln!("  sha256:      {sha}");
     eprintln!(
         "  changes:     create={} update={} destroy={} (total={})",
         summary.create, summary.update, summary.destroy, summary.total_changes,
@@ -304,7 +304,7 @@ fn emit_check_plan_human(plan_path: &Path, sha: &str, summary: &PlanSummary, pur
         }
     }
     if purged > 0 {
-        eprintln!("  purged {} old plan(s) from the cache", purged);
+        eprintln!("  purged {purged} old plan(s) from the cache");
     }
     eprintln!("  recorded in: {}", iac_plan::iac_plans_dir_display(),);
 }

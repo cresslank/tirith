@@ -2239,7 +2239,7 @@ fn print_human(info: &DoctorInfo) {
             );
         } else if tdb.stale {
             let age_str = match tdb.age_hours {
-                Some(h) if h < 48.0 => format!("{:.0}h old", h),
+                Some(h) if h < 48.0 => format!("{h:.0}h old"),
                 Some(h) => format!("{:.0}d old", h / 24.0),
                 None => "unknown age".to_string(),
             };
@@ -2248,7 +2248,7 @@ fn print_human(info: &DoctorInfo) {
             let path = tdb.path.as_deref().unwrap_or("unknown");
             let age_str = match tdb.age_hours {
                 Some(h) if h < 1.0 => format!("{:.0}m old", h * 60.0),
-                Some(h) if h < 48.0 => format!("{:.0}h old", h),
+                Some(h) if h < 48.0 => format!("{h:.0}h old"),
                 Some(h) => format!("{:.0}d old", h / 24.0),
                 None => "unknown age".to_string(),
             };
@@ -2358,8 +2358,7 @@ fn print_human(info: &DoctorInfo) {
             println!();
             if next_level > gaps.current_paranoia {
                 println!(
-                    "  \u{2192} Set 'paranoia: {}' in .tirith/policy.yaml to surface these detections",
-                    next_level
+                    "  \u{2192} Set 'paranoia: {next_level}' in .tirith/policy.yaml to surface these detections"
                 );
             }
         }
