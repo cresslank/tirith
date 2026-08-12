@@ -1268,7 +1268,18 @@ Regenerate it with: TIRITH_BLESS_CAPABILITY_MATRIX=1 cargo test -p tirith capabi
 
 #[test]
 fn tier1_exit_fast_for_ls() {
-    let out = tirith()
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let project = tmpdir.path().join("project");
+    let home = tmpdir.path().join("home");
+    fs::create_dir_all(project.join(".git")).expect("create isolated project");
+    fs::create_dir_all(&home).expect("create isolated home");
+
+    let mut command = tirith_isolated("tier1-exit-fast", &tmpdir.path().join("state"), &project);
+    scrub_ambient_env(&mut command);
+    let out = command
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
         .args(["check", "--json", "--shell", "posix", "--", "ls -la /tmp"])
         .output()
         .expect("failed to run tirith");

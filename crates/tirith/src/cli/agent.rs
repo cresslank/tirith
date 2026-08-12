@@ -47,22 +47,22 @@ fn label_origin(origin: &AgentOrigin) -> String {
             }
         }
         AgentOrigin::Agent { tool, version } => match version {
-            Some(v) => format!("agent ({:?} {:?})", tool, v),
-            None => format!("agent ({:?})", tool),
+            Some(v) => format!("agent ({tool:?} {v:?})"),
+            None => format!("agent ({tool:?})"),
         },
         AgentOrigin::Mcp {
             client_name,
             client_version,
         } => match client_version {
-            Some(v) => format!("mcp ({:?} {:?})", client_name, v),
-            None => format!("mcp ({:?})", client_name),
+            Some(v) => format!("mcp ({client_name:?} {v:?})"),
+            None => format!("mcp ({client_name:?})"),
         },
         AgentOrigin::Gateway => "gateway".to_string(),
         AgentOrigin::Ci { provider } => match provider {
-            Some(p) => format!("ci ({:?})", p),
+            Some(p) => format!("ci ({p:?})"),
             None => "ci (generic)".to_string(),
         },
-        AgentOrigin::Ide { name } => format!("ide ({:?})", name),
+        AgentOrigin::Ide { name } => format!("ide ({name:?})"),
     }
 }
 
@@ -131,8 +131,8 @@ impl OriginGroupKey {
             ("human", _, None) => "human".to_string(),
             ("gateway", _, _) => "gateway".to_string(),
             ("ci", None, _) => "ci (generic)".to_string(),
-            ("ci", Some(p), _) => format!("ci ({:?})", p),
-            (kind, Some(p), _) => format!("{kind} ({:?})", p),
+            ("ci", Some(p), _) => format!("ci ({p:?})"),
+            (kind, Some(p), _) => format!("{kind} ({p:?})"),
             (kind, None, _) => kind.to_string(),
         }
     }
@@ -420,7 +420,7 @@ pub fn explain(query: &str, log_override: Option<&str>, json: bool) -> i32 {
         report_error(
             json,
             "tirith agent explain",
-            &format!("no matching audit entries for {:?}", query),
+            &format!("no matching audit entries for {query:?}"),
         );
         return 1;
     }
@@ -813,10 +813,7 @@ pub fn allow(kind_str: &str, tool: Option<&str>, json: bool) -> i32 {
         report_error(
             json,
             "tirith agent allow",
-            &format!(
-                "unknown kind {:?} (valid: human, agent, mcp, gateway, ci, ide)",
-                kind_str
-            ),
+            &format!("unknown kind {kind_str:?} (valid: human, agent, mcp, gateway, ci, ide)"),
         );
         return 1;
     };
@@ -910,10 +907,7 @@ pub fn block(kind_str: &str, payload: Option<&str>, command_pattern: &str, json:
         report_error(
             json,
             "tirith agent block",
-            &format!(
-                "unknown kind {:?} (valid: human, agent, mcp, gateway, ci, ide)",
-                kind_str
-            ),
+            &format!("unknown kind {kind_str:?} (valid: human, agent, mcp, gateway, ci, ide)"),
         );
         return 1;
     };

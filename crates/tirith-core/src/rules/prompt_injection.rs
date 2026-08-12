@@ -468,8 +468,7 @@ mod tests {
         let findings = check("This is a normal log line with no injection markers.\n");
         assert!(
             findings.is_empty(),
-            "clean text must not fire: {:?}",
-            findings
+            "clean text must not fire: {findings:?}"
         );
     }
 
@@ -591,8 +590,7 @@ mod tests {
         let findings = check("From now on the build is faster and the tests are green.");
         assert!(
             findings.is_empty(),
-            "benign 'from now on ...' prose must not fire: {:?}",
-            findings
+            "benign 'from now on ...' prose must not fire: {findings:?}"
         );
     }
 
@@ -604,8 +602,7 @@ mod tests {
         let findings = check("From now on your build is faster, and the warning is ignored.");
         assert!(
             findings.is_empty(),
-            "benign 'from now on your/ignored ...' prose must not fire: {:?}",
-            findings
+            "benign 'from now on your/ignored ...' prose must not fire: {findings:?}"
         );
     }
 

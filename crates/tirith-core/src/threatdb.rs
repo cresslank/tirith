@@ -501,6 +501,9 @@ pub enum UnresolvedReason {
     /// The constraint parsed, but at least one affected version in the record
     /// is not a plain release version we can compare against.
     AffectedVersionUnparsed,
+    /// The record is version-specific but enumerates no affected versions, so
+    /// there is nothing to match or exclude against.
+    AffectedVersionsMissing,
 }
 
 /// Outcome of a constraint-aware package threat assessment.
@@ -1501,7 +1504,7 @@ impl ThreatDb {
     ///
     /// Supplemental precedence (merging this DB with its overlay): an exact
     /// match wins (primary preferred); else if either layer is unresolved the
-    /// result is `Unresolved` with deduplicated affected versions; else a
+    /// result is `Unresolved` with that layer's affected versions; else a
     /// concrete intersection; else a proven exclusion; else `NoRecord`. A
     /// `ConstraintExcludesAffected` is therefore returned only when NO layer is
     /// exact, intersecting, or unresolved.
@@ -1550,21 +1553,31 @@ impl ThreatDb {
             return PackageThreatAssessment::ExactMatch(summary);
         }
 
+        if rec.versions.is_empty() {
+            return PackageThreatAssessment::Unresolved {
+                summary,
+                reason: UnresolvedReason::AffectedVersionsMissing,
+                affected_versions: affected,
+            };
+        }
+
         match intent {
             VersionIntent::Exact(v) | VersionIntent::Resolved(v) => {
-                // Match on a literal string equal OR a numeric release equal, so
-                // a pin like `==1.4` still hits a record listing `1.4.0`. The
-                // numeric arm only fires when both sides parse as plain release
-                // versions; anything else (prereleases, locals) relies on the
-                // literal compare and falls through to NoRecord when it differs.
-                // Compare via `cmp` (not `==`): only `Ord` treats trailing-zero
-                // segments as equal, so `1.4` and `1.4.0` match here.
+                let v_s: &str = v;
+                let base: &str = v_s.split('+').next().unwrap_or(v_s);
                 let matched = rec.versions.iter().any(|rv| {
-                    rv == v
+                    let rv: &str = rv;
+                    rv == v_s
                         || matches!(
-                            (ReleaseVersion::parse(rv), ReleaseVersion::parse(v)),
+                            (ReleaseVersion::parse(rv), ReleaseVersion::parse(v_s)),
                             (Some(a), Some(b)) if a.cmp(&b) == std::cmp::Ordering::Equal
                         )
+                        || (base != v_s
+                            && (rv == base
+                                || matches!(
+                                    (ReleaseVersion::parse(rv), ReleaseVersion::parse(base)),
+                                    (Some(a), Some(b)) if a.cmp(&b) == std::cmp::Ordering::Equal
+                                )))
                 });
                 if matched {
                     PackageThreatAssessment::ExactMatch(summary)
@@ -1579,8 +1592,13 @@ impl ThreatDb {
                 reason: UnresolvedReason::UnspecifiedVersion,
                 affected_versions: affected,
             },
-            VersionIntent::Constraint { parsed, .. } => {
+            VersionIntent::Constraint { parsed, raw } => {
                 let Some(constraint) = parsed else {
+                    if !crate::version_intent::looks_like_plain_version(raw)
+                        && rec.versions.iter().any(|rv| rv == raw)
+                    {
+                        return PackageThreatAssessment::ExactMatch(summary);
+                    }
                     return PackageThreatAssessment::Unresolved {
                         summary,
                         reason: UnresolvedReason::ConstraintUnsupported,
@@ -2142,9 +2160,8 @@ struct PkgRecord<'a> {
 /// Combine a primary-layer assessment with a supplemental-layer assessment.
 ///
 /// Precedence (`primary` preferred on ties): an exact match wins; else if
-/// either layer is unresolved the result is `Unresolved` with deduplicated
-/// affected versions drawn from every layer that names any (so the warning
-/// lists them all); else a concrete intersection (deduped); else a proven
+/// either layer is unresolved the result is `Unresolved` with affected versions
+/// from the same layer as its summary; else a concrete intersection; else a proven
 /// exclusion; else `NoRecord`. Crucially, `ConstraintExcludesAffected` (which
 /// emits NO warning) survives only when no layer is exact, unresolved, or
 /// intersecting, so the overlay can never silence a primary hit and vice versa.
@@ -2182,36 +2199,28 @@ fn merge_assessments(
             _ => None,
         }
     };
-    let merge_affected = || {
-        let mut v = affected_from(&primary);
-        v.extend(affected_from(&overlay));
-        v.sort();
-        v.dedup();
-        v
-    };
-
-    // 2. Any unresolved layer makes the result unresolved (primary's reason and
-    // summary preferred), carrying the union of affected versions.
+    // Keep affected versions from the same layer as the reported summary so a
+    // version is never attributed to the wrong feed.
     let primary_unresolved = matches!(primary, P::Unresolved { .. });
     let overlay_unresolved = matches!(overlay, P::Unresolved { .. });
     if primary_unresolved || overlay_unresolved {
-        let (reason, summary) = if let P::Unresolved {
+        let (reason, summary, affected_versions) = if let P::Unresolved {
             reason, summary, ..
         } = &primary
         {
-            (*reason, summary.clone())
+            (*reason, summary.clone(), affected_from(&primary))
         } else if let P::Unresolved {
             reason, summary, ..
         } = &overlay
         {
-            (*reason, summary.clone())
+            (*reason, summary.clone(), affected_from(&overlay))
         } else {
             unreachable!("one layer is Unresolved")
         };
         return P::Unresolved {
             summary,
             reason,
-            affected_versions: merge_affected(),
+            affected_versions,
         };
     }
 
@@ -2219,12 +2228,17 @@ fn merge_assessments(
     let primary_intersects = matches!(primary, P::ConstraintIntersectsAffected { .. });
     let overlay_intersects = matches!(overlay, P::ConstraintIntersectsAffected { .. });
     if primary_intersects || overlay_intersects {
-        let summary = summary_from(&primary)
-            .or_else(|| summary_from(&overlay))
-            .expect("an intersecting layer carries a summary");
+        let (summary, affected_versions) = if let Some(summary) = summary_from(&primary) {
+            (summary, affected_from(&primary))
+        } else {
+            (
+                summary_from(&overlay).expect("an intersecting layer carries a summary"),
+                affected_from(&overlay),
+            )
+        };
         return P::ConstraintIntersectsAffected {
             summary,
-            affected_versions: merge_affected(),
+            affected_versions,
         };
     }
 
@@ -2386,14 +2400,11 @@ fn path_mtime_epoch(path: &Path) -> Option<u64> {
 /// extension with `-v2.dat`, falling back to appending `-v2` for any other name.
 fn v2_sibling(path: &Path) -> PathBuf {
     if path.extension().and_then(|e| e.to_str()) == Some("dat") {
-        let mut s = path.as_os_str().to_os_string();
-        // Strip ".dat" (4 bytes) and append "-v2.dat".
-        let lossy = s.to_string_lossy();
-        if let Some(stem) = lossy.strip_suffix(".dat") {
-            return PathBuf::from(format!("{stem}-v2.dat"));
+        if let Some(stem) = path.file_stem() {
+            let mut name = stem.to_os_string();
+            name.push("-v2.dat");
+            return path.with_file_name(name);
         }
-        s.push("-v2");
-        return PathBuf::from(s);
     }
     let mut s = path.as_os_str().to_os_string();
     s.push("-v2");
@@ -4239,295 +4250,6 @@ mod tests {
         }
     }
 
-    // ── assess_package (A1b) ───────────────────────────────────────────────
-
-    use crate::version_intent::{VersionConstraint, VersionIntent};
-
-    /// A DB whose only record is `pypi/vuln-pkg` affected at 1.4.2 and 1.4.3
-    /// (matching the acceptance-criteria example), version-specific.
-    fn build_constraint_db(signing_key: &SigningKey) -> ThreatDb {
-        let mut writer = ThreatDbWriter::new(1700000000, 7);
-        writer.add_package(
-            Ecosystem::PyPI,
-            "vuln-pkg",
-            &["1.4.2", "1.4.3"],
-            ThreatSource::OssfMalicious,
-            Confidence::Confirmed,
-            false,
-            Some("https://example.com/advisory/vuln"),
-        );
-        let bytes = writer.build(signing_key).expect("build failed");
-        ThreatDb::from_bytes(bytes, 0).expect("load failed")
-    }
-
-    fn constraint_intent(raw: &str) -> VersionIntent {
-        VersionIntent::Constraint {
-            parsed: VersionConstraint::parse(raw),
-            raw: raw.to_string(),
-        }
-    }
-
-    #[test]
-    fn assess_exact_version_in_list_is_exact_match() {
-        let key = SigningKey::generate(&mut OsRng);
-        let db = build_test_db(&key);
-        let a = db.assess_package(
-            Ecosystem::Npm,
-            "evil-package",
-            &VersionIntent::Exact("1.0.0".to_string()),
-        );
-        match a {
-            PackageThreatAssessment::ExactMatch(s) => {
-                assert_eq!(s.name, "evil-package");
-                assert_eq!(s.source_id, "ossf_malicious");
-                assert!(!s.all_versions_malicious);
-            }
-            other => panic!("expected ExactMatch, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn assess_exact_pin_matches_trailing_zero_record() {
-        // The record lists `1.4.0`; a pin of `==1.4` must still hit it. The
-        // literal string compare alone would miss (`"1.4" != "1.4.0"`), so the
-        // numeric-equality fallback is what makes this an ExactMatch.
-        let key = SigningKey::generate(&mut OsRng);
-        let mut writer = ThreatDbWriter::new(1700000000, 11);
-        writer.add_package(
-            Ecosystem::PyPI,
-            "foo",
-            &["1.4.0"],
-            ThreatSource::OssfMalicious,
-            Confidence::Confirmed,
-            false,
-            None,
-        );
-        let bytes = writer.build(&key).expect("build failed");
-        let db = ThreatDb::from_bytes(bytes, 0).expect("load failed");
-
-        let intent = VersionIntent::from_pep440_specifier("==1.4");
-        assert_eq!(intent, VersionIntent::Exact("1.4".to_string()));
-        match db.assess_package(Ecosystem::PyPI, "foo", &intent) {
-            PackageThreatAssessment::ExactMatch(s) => {
-                assert_eq!(s.name, "foo");
-                assert!(!s.all_versions_malicious);
-            }
-            other => panic!("expected ExactMatch for `==1.4` vs `1.4.0`, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn assess_exact_version_not_in_list_is_no_record() {
-        let key = SigningKey::generate(&mut OsRng);
-        let db = build_test_db(&key);
-        let a = db.assess_package(
-            Ecosystem::Npm,
-            "evil-package",
-            &VersionIntent::Exact("2.0.0".to_string()),
-        );
-        assert_eq!(a, PackageThreatAssessment::NoRecord);
-    }
-
-    #[test]
-    fn assess_unspecified_against_version_specific_is_unresolved() {
-        let key = SigningKey::generate(&mut OsRng);
-        let db = build_test_db(&key);
-        let a = db.assess_package(Ecosystem::Npm, "evil-package", &VersionIntent::Unspecified);
-        match a {
-            PackageThreatAssessment::Unresolved {
-                reason,
-                affected_versions,
-                ..
-            } => {
-                assert_eq!(reason, UnresolvedReason::UnspecifiedVersion);
-                assert_eq!(affected_versions, vec!["1.0.0", "1.0.1"]);
-            }
-            other => panic!("expected Unresolved, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn assess_unspecified_against_all_versions_is_exact_match() {
-        let key = SigningKey::generate(&mut OsRng);
-        let db = build_test_db(&key);
-        let a = db.assess_package(Ecosystem::PyPI, "malware-pkg", &VersionIntent::Unspecified);
-        match a {
-            PackageThreatAssessment::ExactMatch(s) => {
-                assert!(s.all_versions_malicious);
-                assert_eq!(s.source_id, "datadog_malicious");
-            }
-            other => panic!("expected ExactMatch for all-versions record, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn assess_no_record_for_unknown_package() {
-        let key = SigningKey::generate(&mut OsRng);
-        let db = build_test_db(&key);
-        let a = db.assess_package(
-            Ecosystem::Npm,
-            "totally-fine",
-            &VersionIntent::Exact("1.0.0".to_string()),
-        );
-        assert_eq!(a, PackageThreatAssessment::NoRecord);
-    }
-
-    #[test]
-    fn assess_constraint_excludes_affected() {
-        let key = SigningKey::generate(&mut OsRng);
-        let db = build_constraint_db(&key);
-        // affected 1.4.2 / 1.4.3; >=1.4.4 excludes both.
-        let a = db.assess_package(Ecosystem::PyPI, "vuln-pkg", &constraint_intent(">=1.4.4"));
-        assert_eq!(a, PackageThreatAssessment::ConstraintExcludesAffected);
-    }
-
-    #[test]
-    fn assess_constraint_intersects_affected() {
-        let key = SigningKey::generate(&mut OsRng);
-        let db = build_constraint_db(&key);
-        // >=1.4.2,<1.4.4 overlaps both affected versions.
-        let a = db.assess_package(
-            Ecosystem::PyPI,
-            "vuln-pkg",
-            &constraint_intent(">=1.4.2,<1.4.4"),
-        );
-        match a {
-            PackageThreatAssessment::ConstraintIntersectsAffected {
-                affected_versions, ..
-            } => {
-                assert_eq!(affected_versions, vec!["1.4.2", "1.4.3"]);
-            }
-            other => panic!("expected ConstraintIntersectsAffected, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn assess_unparsed_constraint_is_unresolved_not_excludes() {
-        let key = SigningKey::generate(&mut OsRng);
-        let db = build_constraint_db(&key);
-        // `===1.4.4` (arbitrary equality) and a marker must never claim exclusion.
-        for raw in ["===1.4.4", ">=1.0 ; python_version < \"3.9\"", "==1.4.*"] {
-            let a = db.assess_package(Ecosystem::PyPI, "vuln-pkg", &constraint_intent(raw));
-            match a {
-                PackageThreatAssessment::Unresolved { reason, .. } => {
-                    assert_eq!(
-                        reason,
-                        UnresolvedReason::ConstraintUnsupported,
-                        "raw `{raw}` should be ConstraintUnsupported"
-                    );
-                }
-                other => panic!("expected Unresolved for `{raw}`, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn assess_affected_version_unparsed_is_unresolved() {
-        // A record whose affected version is not a plain release version cannot
-        // be proven excluded, so a constraint over it stays Unresolved.
-        let key = SigningKey::generate(&mut OsRng);
-        let mut writer = ThreatDbWriter::new(1700000000, 9);
-        writer.add_package(
-            Ecosystem::PyPI,
-            "weird-ver",
-            &["1.0.0rc1"],
-            ThreatSource::OssfMalicious,
-            Confidence::Confirmed,
-            false,
-            None,
-        );
-        let bytes = writer.build(&key).expect("build failed");
-        let db = ThreatDb::from_bytes(bytes, 0).expect("load failed");
-        let a = db.assess_package(Ecosystem::PyPI, "weird-ver", &constraint_intent(">=1.0.0"));
-        match a {
-            PackageThreatAssessment::Unresolved { reason, .. } => {
-                assert_eq!(reason, UnresolvedReason::AffectedVersionUnparsed);
-            }
-            other => panic!("expected Unresolved (AffectedVersionUnparsed), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn assess_supplemental_unresolved_dedups_affected() {
-        // Primary excludes (>=1.4.4 over 1.4.2/1.4.3) but a supplemental overlay
-        // is unresolved for the same name; the merge must surface Unresolved
-        // (never the primary's exclusion) with deduplicated affected versions.
-        let key = SigningKey::generate(&mut OsRng);
-        let primary_bytes = {
-            let mut w = ThreatDbWriter::new(1700000000, 11);
-            w.add_package(
-                Ecosystem::PyPI,
-                "split-pkg",
-                &["1.4.2", "1.4.3"],
-                ThreatSource::OssfMalicious,
-                Confidence::Confirmed,
-                false,
-                None,
-            );
-            w.build(&key).expect("build primary")
-        };
-        let supp_bytes = {
-            let mut w = ThreatDbWriter::new(1700000000, 12);
-            w.add_package(
-                Ecosystem::PyPI,
-                "split-pkg",
-                &["1.4.3", "1.4.9"],
-                ThreatSource::DatadogMalicious,
-                Confidence::Confirmed,
-                false,
-                None,
-            );
-            w.build(&key).expect("build supplemental")
-        };
-        let supplemental = ThreatDb::from_bytes(supp_bytes, 0).expect("load supp");
-        let db = ThreatDb::from_bytes(primary_bytes, 0)
-            .expect("load primary")
-            .with_supplemental(Some(supplemental));
-
-        // >=1.4.4 excludes the primary's {1.4.2,1.4.3}; for the supplemental
-        // {1.4.3,1.4.9} it intersects (1.4.9). The merged result must intersect.
-        let a = db.assess_package(Ecosystem::PyPI, "split-pkg", &constraint_intent(">=1.4.4"));
-        match a {
-            PackageThreatAssessment::ConstraintIntersectsAffected {
-                affected_versions, ..
-            } => {
-                assert_eq!(affected_versions, vec!["1.4.9"]);
-            }
-            other => panic!("expected ConstraintIntersectsAffected from overlay, got {other:?}"),
-        }
-
-        // An Unspecified request is unresolved in both layers; affected versions
-        // are the deduplicated union across both.
-        let a2 = db.assess_package(Ecosystem::PyPI, "split-pkg", &VersionIntent::Unspecified);
-        match a2 {
-            PackageThreatAssessment::Unresolved {
-                affected_versions, ..
-            } => {
-                assert_eq!(affected_versions, vec!["1.4.2", "1.4.3", "1.4.9"]);
-            }
-            other => panic!("expected Unresolved with merged affected, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn check_package_shim_still_matches() {
-        // Regression: the kept `check_package` shim behaves exactly as before.
-        let key = SigningKey::generate(&mut OsRng);
-        let db = build_test_db(&key);
-        assert!(db
-            .check_package(Ecosystem::Npm, "evil-package", Some("1.0.0"))
-            .is_some());
-        assert!(db
-            .check_package(Ecosystem::Npm, "evil-package", Some("2.0.0"))
-            .is_none());
-        assert!(db
-            .check_package(Ecosystem::Npm, "evil-package", None)
-            .is_none());
-        assert!(db
-            .check_package(Ecosystem::PyPI, "malware-pkg", None)
-            .is_some());
-    }
-
     // ------------------------------------------------------------------
     // v2 format (DB-B): writer/reader roundtrip, backward compat, footer/
     // trailer rejection, signature, and per-format cache-filename selection.
@@ -4889,6 +4611,16 @@ mod tests {
             v2_sibling(Path::new("/x/custom.bin")),
             PathBuf::from("/x/custom.bin-v2")
         );
+        // A non-UTF-8 `.dat` filename keeps its raw bytes (no lossy corruption).
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = std::ffi::OsStr::from_bytes(b"/x/\xff-threatdb.dat");
+            assert_eq!(
+                v2_sibling(Path::new(raw)),
+                PathBuf::from(std::ffi::OsStr::from_bytes(b"/x/\xff-threatdb-v2.dat"))
+            );
+        }
     }
 
     #[test]
@@ -4916,6 +4648,14 @@ mod tests {
             .expect("write v2");
         assert_eq!(
             resolve_preferring_v2(Some(v2_path.clone()), Some(v1_path.clone()), false),
+            Some(v2_path.clone())
+        );
+        // v2 present + NO v1 path configured -> v2. A v2-only machine must resolve to the
+        // valid v2 via the early return, NOT fall through to the `_ => v1_path` arm and
+        // report None (which would make the cache treat a present, valid DB as "not
+        // installed").
+        assert_eq!(
+            resolve_preferring_v2(Some(v2_path.clone()), None, false),
             Some(v2_path.clone())
         );
         // v2 corrupt -> falls back to v1 (corrupt v2 never shadows).
@@ -4977,5 +4717,454 @@ mod tests {
         unsafe {
             std::env::remove_var("TIRITH_THREATDB_PATH");
         }
+    }
+
+    // ── assess_package (A1b) ───────────────────────────────────────────────
+
+    use crate::version_intent::{VersionConstraint, VersionIntent};
+
+    /// A DB whose only record is `pypi/vuln-pkg` affected at 1.4.2 and 1.4.3
+    /// (matching the acceptance-criteria example), version-specific.
+    fn build_constraint_db(signing_key: &SigningKey) -> ThreatDb {
+        let mut writer = ThreatDbWriter::new(1700000000, 7);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "vuln-pkg",
+            &["1.4.2", "1.4.3"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            Some("https://example.com/advisory/vuln"),
+        );
+        let bytes = writer.build(signing_key).expect("build failed");
+        ThreatDb::from_bytes(bytes, 0).expect("load failed")
+    }
+
+    fn constraint_intent(raw: &str) -> VersionIntent {
+        VersionIntent::Constraint {
+            parsed: VersionConstraint::parse(raw),
+            raw: raw.to_string(),
+        }
+    }
+
+    #[test]
+    fn assess_exact_version_in_list_is_exact_match() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+        let a = db.assess_package(
+            Ecosystem::Npm,
+            "evil-package",
+            &VersionIntent::Exact("1.0.0".to_string()),
+        );
+        match a {
+            PackageThreatAssessment::ExactMatch(s) => {
+                assert_eq!(s.name, "evil-package");
+                assert_eq!(s.source_id, "ossf_malicious");
+                assert!(!s.all_versions_malicious);
+            }
+            other => panic!("expected ExactMatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_exact_pin_matches_trailing_zero_record() {
+        // The record lists `1.4.0`; a pin of `==1.4` must still hit it. The
+        // literal string compare alone would miss (`"1.4" != "1.4.0"`), so the
+        // numeric-equality fallback is what makes this an ExactMatch.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 11);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "foo",
+            &["1.4.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let bytes = writer.build(&key).expect("build failed");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load failed");
+
+        let intent = VersionIntent::from_pep440_specifier("==1.4");
+        assert_eq!(intent, VersionIntent::Exact("1.4".to_string()));
+        match db.assess_package(Ecosystem::PyPI, "foo", &intent) {
+            PackageThreatAssessment::ExactMatch(s) => {
+                assert_eq!(s.name, "foo");
+                assert!(!s.all_versions_malicious);
+            }
+            other => panic!("expected ExactMatch for `==1.4` vs `1.4.0`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn constraint_unparsed_raw_token_exact_match_is_malicious() {
+        // A non-semver token (a dist-tag like `latest`) is preserved as
+        // Constraint{parsed:None,raw}. If it LITERALLY equals an affected version it
+        // is a definite malicious hit (ExactMatch), not a downgraded warn.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        writer.add_package(
+            Ecosystem::Npm,
+            "tagged-evil",
+            &["latest"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        let hit = crate::version_intent::VersionIntent::Constraint {
+            parsed: None,
+            raw: "latest".to_string(),
+        };
+        assert!(matches!(
+            db.assess_package(Ecosystem::Npm, "tagged-evil", &hit),
+            PackageThreatAssessment::ExactMatch(_)
+        ));
+        let miss = crate::version_intent::VersionIntent::Constraint {
+            parsed: None,
+            raw: "sha256:beef".to_string(),
+        };
+        assert!(matches!(
+            db.assess_package(Ecosystem::Npm, "tagged-evil", &miss),
+            PackageThreatAssessment::Unresolved { .. }
+        ));
+    }
+
+    #[test]
+    fn constraint_against_empty_affected_versions_is_unresolved_not_excluded() {
+        // A version-specific malicious record with NO affected versions (and not
+        // all-versions-malicious) gives nothing to test a constraint against, so it
+        // must stay Unresolved, not be silently treated as a proven exclusion.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        writer.add_package(
+            Ecosystem::Npm,
+            "no-versions-evil",
+            &[],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false, // NOT all-versions-malicious
+            None,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        let constraint = crate::version_intent::VersionIntent::from_pep440_specifier(">=1.0,<2.0");
+        assert!(matches!(
+            db.assess_package(Ecosystem::Npm, "no-versions-evil", &constraint),
+            PackageThreatAssessment::Unresolved { .. }
+        ));
+        // The guard runs BEFORE the intent match, so an Exact request is Unresolved too
+        // (not a silent NoRecord that would drop the malicious finding entirely).
+        let exact = crate::version_intent::VersionIntent::Exact("1.0".to_string());
+        assert!(matches!(
+            db.assess_package(Ecosystem::Npm, "no-versions-evil", &exact),
+            PackageThreatAssessment::Unresolved { .. }
+        ));
+    }
+
+    #[test]
+    fn exact_local_version_matches_base_record() {
+        // A PEP 440 local version (`1.0+ubuntu1`) is a rebuild of its base `1.0`: a
+        // record listing the malicious base must still hard-match the local pin, and an
+        // exact-local record must match literally. Neither may downgrade to Unresolved.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        writer.add_package(
+            Ecosystem::Npm,
+            "base-evil",
+            &["1.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::Npm,
+            "exact-local-evil",
+            &["1.0+ubuntu1"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        let local = crate::version_intent::VersionIntent::Exact("1.0+ubuntu1".to_string());
+        assert!(matches!(
+            db.assess_package(Ecosystem::Npm, "base-evil", &local),
+            PackageThreatAssessment::ExactMatch(_)
+        ));
+        assert!(matches!(
+            db.assess_package(Ecosystem::Npm, "exact-local-evil", &local),
+            PackageThreatAssessment::ExactMatch(_)
+        ));
+    }
+
+    #[test]
+    fn assess_exact_version_not_in_list_is_no_record() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+        let a = db.assess_package(
+            Ecosystem::Npm,
+            "evil-package",
+            &VersionIntent::Exact("2.0.0".to_string()),
+        );
+        assert_eq!(a, PackageThreatAssessment::NoRecord);
+    }
+
+    #[test]
+    fn assess_unspecified_against_version_specific_is_unresolved() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+        let a = db.assess_package(Ecosystem::Npm, "evil-package", &VersionIntent::Unspecified);
+        match a {
+            PackageThreatAssessment::Unresolved {
+                reason,
+                affected_versions,
+                ..
+            } => {
+                assert_eq!(reason, UnresolvedReason::UnspecifiedVersion);
+                assert_eq!(affected_versions, vec!["1.0.0", "1.0.1"]);
+            }
+            other => panic!("expected Unresolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_unspecified_against_all_versions_is_exact_match() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+        let a = db.assess_package(Ecosystem::PyPI, "malware-pkg", &VersionIntent::Unspecified);
+        match a {
+            PackageThreatAssessment::ExactMatch(s) => {
+                assert!(s.all_versions_malicious);
+                assert_eq!(s.source_id, "datadog_malicious");
+            }
+            other => panic!("expected ExactMatch for all-versions record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_no_record_for_unknown_package() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+        let a = db.assess_package(
+            Ecosystem::Npm,
+            "totally-fine",
+            &VersionIntent::Exact("1.0.0".to_string()),
+        );
+        assert_eq!(a, PackageThreatAssessment::NoRecord);
+    }
+
+    #[test]
+    fn assess_constraint_excludes_affected() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_constraint_db(&key);
+        // affected 1.4.2 / 1.4.3; >=1.4.4 excludes both.
+        let a = db.assess_package(Ecosystem::PyPI, "vuln-pkg", &constraint_intent(">=1.4.4"));
+        assert_eq!(a, PackageThreatAssessment::ConstraintExcludesAffected);
+    }
+
+    #[test]
+    fn assess_constraint_intersects_affected() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_constraint_db(&key);
+        // >=1.4.2,<1.4.4 overlaps both affected versions.
+        let a = db.assess_package(
+            Ecosystem::PyPI,
+            "vuln-pkg",
+            &constraint_intent(">=1.4.2,<1.4.4"),
+        );
+        match a {
+            PackageThreatAssessment::ConstraintIntersectsAffected {
+                affected_versions, ..
+            } => {
+                assert_eq!(affected_versions, vec!["1.4.2", "1.4.3"]);
+            }
+            other => panic!("expected ConstraintIntersectsAffected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_unparsed_constraint_is_unresolved_not_excludes() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_constraint_db(&key);
+        // `===1.4.4` (arbitrary equality) and a marker must never claim exclusion.
+        for raw in ["===1.4.4", ">=1.0 ; python_version < \"3.9\"", "==1.4.*"] {
+            let a = db.assess_package(Ecosystem::PyPI, "vuln-pkg", &constraint_intent(raw));
+            match a {
+                PackageThreatAssessment::Unresolved { reason, .. } => {
+                    assert_eq!(
+                        reason,
+                        UnresolvedReason::ConstraintUnsupported,
+                        "raw `{raw}` should be ConstraintUnsupported"
+                    );
+                }
+                other => panic!("expected Unresolved for `{raw}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn assess_affected_version_unparsed_is_unresolved() {
+        // A record whose affected version is not a plain release version cannot
+        // be proven excluded, so a constraint over it stays Unresolved.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 9);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "weird-ver",
+            &["1.0.0rc1"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let bytes = writer.build(&key).expect("build failed");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load failed");
+        let a = db.assess_package(Ecosystem::PyPI, "weird-ver", &constraint_intent(">=1.0.0"));
+        match a {
+            PackageThreatAssessment::Unresolved { reason, .. } => {
+                assert_eq!(reason, UnresolvedReason::AffectedVersionUnparsed);
+            }
+            other => panic!("expected Unresolved (AffectedVersionUnparsed), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_record_with_no_versions_is_missing_not_unparsed() {
+        // A version-specific record (not all-versions-malicious) that enumerates NO affected
+        // versions is AffectedVersionsMissing - distinct from AffectedVersionUnparsed (a
+        // present-but-uncomparable version) - so a JSON consumer can tell the two apart.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 9);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "no-vers",
+            &[],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let bytes = writer.build(&key).expect("build failed");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load failed");
+        let a = db.assess_package(Ecosystem::PyPI, "no-vers", &constraint_intent(">=1.0.0"));
+        match a {
+            PackageThreatAssessment::Unresolved { reason, .. } => {
+                assert_eq!(reason, UnresolvedReason::AffectedVersionsMissing);
+            }
+            other => panic!("expected Unresolved (AffectedVersionsMissing), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cargo_caret_constraint_does_not_become_exact_malicious_hit() {
+        // A Cargo plain version is a caret requirement: from_cargo_version("1.0.0") ->
+        // Constraint{parsed:None, raw:"1.0.0"}. Even though raw LITERALLY equals an affected
+        // version in the DB, it must NOT upgrade to a confirmed ExactMatch - it is a RANGE
+        // request, so it stays Unresolved (an overlap warning). The raw-token exact fallback
+        // is only for opaque concrete tokens (digests/dist-tags), not plain versions.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 9);
+        writer.add_package(
+            Ecosystem::Crates,
+            "evil-crate",
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let bytes = writer.build(&key).expect("build failed");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load failed");
+        let caret = VersionIntent::from_cargo_version("1.0.0");
+        let a = db.assess_package(Ecosystem::Crates, "evil-crate", &caret);
+        assert!(
+            matches!(a, PackageThreatAssessment::Unresolved { .. }),
+            "a cargo caret requirement must stay Unresolved, not become an ExactMatch; got {a:?}"
+        );
+    }
+
+    #[test]
+    fn assess_supplemental_merge_keeps_per_layer_affected() {
+        // Primary excludes (>=1.4.4 over 1.4.2/1.4.3) but a supplemental overlay
+        // is unresolved for the same name; the merge must surface Unresolved (never the
+        // primary's exclusion). Affected versions come from the SAME layer whose summary is
+        // returned - NOT a union - so a version is never misattributed to another source.
+        let key = SigningKey::generate(&mut OsRng);
+        let primary_bytes = {
+            let mut w = ThreatDbWriter::new(1700000000, 11);
+            w.add_package(
+                Ecosystem::PyPI,
+                "split-pkg",
+                &["1.4.2", "1.4.3"],
+                ThreatSource::OssfMalicious,
+                Confidence::Confirmed,
+                false,
+                None,
+            );
+            w.build(&key).expect("build primary")
+        };
+        let supp_bytes = {
+            let mut w = ThreatDbWriter::new(1700000000, 12);
+            w.add_package(
+                Ecosystem::PyPI,
+                "split-pkg",
+                &["1.4.3", "1.4.9"],
+                ThreatSource::DatadogMalicious,
+                Confidence::Confirmed,
+                false,
+                None,
+            );
+            w.build(&key).expect("build supplemental")
+        };
+        let supplemental = ThreatDb::from_bytes(supp_bytes, 0).expect("load supp");
+        let db = ThreatDb::from_bytes(primary_bytes, 0)
+            .expect("load primary")
+            .with_supplemental(Some(supplemental));
+
+        // >=1.4.4 excludes the primary's {1.4.2,1.4.3}; for the supplemental
+        // {1.4.3,1.4.9} it intersects (1.4.9). The merged result must intersect.
+        let a = db.assess_package(Ecosystem::PyPI, "split-pkg", &constraint_intent(">=1.4.4"));
+        match a {
+            PackageThreatAssessment::ConstraintIntersectsAffected {
+                affected_versions, ..
+            } => {
+                assert_eq!(affected_versions, vec!["1.4.9"]);
+            }
+            other => panic!("expected ConstraintIntersectsAffected from overlay, got {other:?}"),
+        }
+
+        // An Unspecified request is unresolved in both layers; the merged result keeps the
+        // PRIMARY layer's summary AND the primary's affected versions (NOT a union), so the
+        // overlay-only version (1.4.9) is not misattributed to the primary's source_label.
+        let a2 = db.assess_package(Ecosystem::PyPI, "split-pkg", &VersionIntent::Unspecified);
+        match a2 {
+            PackageThreatAssessment::Unresolved {
+                affected_versions, ..
+            } => {
+                assert_eq!(affected_versions, vec!["1.4.2", "1.4.3"]);
+            }
+            other => panic!("expected Unresolved with the primary layer's affected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_package_shim_still_matches() {
+        // Regression: the kept `check_package` shim behaves exactly as before.
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+        assert!(db
+            .check_package(Ecosystem::Npm, "evil-package", Some("1.0.0"))
+            .is_some());
+        assert!(db
+            .check_package(Ecosystem::Npm, "evil-package", Some("2.0.0"))
+            .is_none());
+        assert!(db
+            .check_package(Ecosystem::Npm, "evil-package", None)
+            .is_none());
+        assert!(db
+            .check_package(Ecosystem::PyPI, "malware-pkg", None)
+            .is_some());
     }
 }

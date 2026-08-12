@@ -138,8 +138,7 @@ pub fn enrich_command(
                             severity: Severity::High,
                             title: "Google Safe Browsing match".to_string(),
                             description: format!(
-                                "URL '{}' matched Google Safe Browsing threat type '{}'.",
-                                url, match_type
+                                "URL '{url}' matched Google Safe Browsing threat type '{match_type}'."
                             ),
                             evidence: vec![Evidence::ThreatIntel {
                                 source: "Google Safe Browsing".to_string(),
@@ -606,8 +605,7 @@ fn build_kev_finding(ecosystem: Ecosystem, name: &str, version: &str, cve_id: &s
         severity: Severity::High,
         title: format!("Package advisory is in CISA KEV: {name}@{version}"),
         description: format!(
-            "Package '{}' in {} version '{}' is associated with actively exploited CVE '{}'.",
-            name, ecosystem, version, cve_id
+            "Package '{name}' in {ecosystem} version '{version}' is associated with actively exploited CVE '{cve_id}'."
         ),
         evidence: vec![Evidence::ThreatIntel {
             source: "CISA KEV via OSV.dev".to_string(),
@@ -629,10 +627,10 @@ fn build_suspicious_package_finding(
 ) -> Finding {
     let mut parts = Vec::new();
     if let Some(days) = signal.first_release_days {
-        parts.push(format!("first release {} day(s) ago", days));
+        parts.push(format!("first release {days} day(s) ago"));
     }
     if let Some(maintainers) = signal.maintainers {
-        parts.push(format!("{} maintainer(s)", maintainers));
+        parts.push(format!("{maintainers} maintainer(s)"));
     }
 
     Finding {

@@ -517,8 +517,7 @@ fn validate_scan_config(policy: &crate::policy::Policy, issues: &mut Vec<PolicyI
             issues.push(PolicyIssue {
                 level: IssueLevel::Error,
                 message: format!(
-                    "scan.fail_on: invalid severity '{}' (valid: INFO, LOW, MEDIUM, HIGH, CRITICAL)",
-                    fail_on
+                    "scan.fail_on: invalid severity '{fail_on}' (valid: INFO, LOW, MEDIUM, HIGH, CRITICAL)"
                 ),
                 field: Some("scan.fail_on".into()),
             });

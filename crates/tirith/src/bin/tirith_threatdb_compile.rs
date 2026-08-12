@@ -1490,12 +1490,12 @@ fn main() {
     eprintln!("  IPs (Feodo):           {}", ips.len());
     eprintln!("  typosquats:            {}", typosquats.len());
     eprintln!("  popular packages:      {}", popular.len());
-    eprintln!("  CISA KEV CVEs:         {}", kev_count);
+    eprintln!("  CISA KEV CVEs:         {kev_count}");
     eprintln!(
         "  skipped (range-only):  {}",
         ossf_stats.skipped_range_only_count
     );
-    eprintln!("  skipped (corrupt):     {}", total_files_skipped);
+    eprintln!("  skipped (corrupt):     {total_files_skipped}");
     eprintln!(
         "  ecosystems:            {}",
         ecosystems_seen

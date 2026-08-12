@@ -2583,10 +2583,7 @@ impl InstalledIntegrityReport {
     fn distinct_signal_kinds(&self) -> Vec<String> {
         let mut kinds: BTreeSet<String> = BTreeSet::new();
         for s in &self.signals {
-            // The signal kind serializes to its snake_case name.
-            if let Ok(serde_json::Value::String(k)) = serde_json::to_value(s.kind) {
-                kinds.insert(k);
-            }
+            kinds.insert(s.kind.wire_name().to_owned());
         }
         kinds.into_iter().collect()
     }
@@ -2737,9 +2734,7 @@ impl InstalledIntegrityReport {
 fn startup_distinct_kind_strings(signals: &[crate::artifact::ArtifactSignal]) -> Vec<String> {
     let mut kinds: BTreeSet<String> = BTreeSet::new();
     for s in signals {
-        if let Ok(serde_json::Value::String(k)) = serde_json::to_value(s.kind) {
-            kinds.insert(k);
-        }
+        kinds.insert(s.kind.wire_name().to_owned());
     }
     kinds.into_iter().collect()
 }
