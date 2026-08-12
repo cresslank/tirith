@@ -200,8 +200,10 @@ explicit non-goals.
   and active. Hooks can break or silently degrade across shells, shell versions,
   prompt frameworks, and history tools. Run `tirith doctor` to check live state
   and watch for warn-only degradation.
-- **Unix-only features:** daemon mode, `tirith setup`, `tirith run`, and
-  `tirith fetch` are Unix-only today.
+- **Platform-limited features:** daemon mode, `tirith setup`, `tirith run`, and
+  `tirith fetch` are exposed on Unix today. `tirith run --no-exec` remains an
+  inspection workflow there, but live remote-script execution is Linux-only and
+  refuses before download on every other host.
 - **Package-name extraction scope:** covers language ecosystems (pip,
   npm/yarn/pnpm/bun, cargo, gem, go, composer, dotnet, mvn/gradle), not distro
   package managers (`apt`, `dnf`, `yum`, `pacman`).
@@ -667,22 +669,38 @@ Every finding carries a per-rule remediation: a short, accurate "how to make
 this safe" line, shown under each finding (`Fix:`) and in `--format json`.
 `tirith explain --rule <id> --fix` prints that remediation on its own.
 
-When a command is blocked or warned, `tirith check --suggest`
-additionally prints a concrete safer rewrite of the *actual* command, but only
-where a transformation is genuinely safer and correct:
+When a command is blocked or warned, `tirith check --suggest` additionally
+prints remediation for the *actual* command. It includes a concrete executable
+rewrite only for a narrow mechanical transform whose final command is verified
+under the same effective policy:
 
 ```bash
-tirith check --suggest -- 'curl https://example-cli.dev/i.sh | bash'
-# → try: curl -fsSL -o /tmp/tirith-review.sh https://example-cli.dev/i.sh \
-#        && less /tmp/tirith-review.sh && bash /tmp/tirith-review.sh
+tirith check --suggest -- 'curl -fsSL https://example-cli.dev/i.sh | bash'
+# → try: '/usr/local/bin/tirith' run --capsule --script-stdin --interpreter bash \
+#          'https://example-cli.dev/i.sh'
 ```
 
-It rewrites pipe-to-shell into download-review-run, drops insecure-TLS flags
-(`-k` / `--insecure` / `--no-check-certificate`), and switches plain `http://`
-to `https://`. For findings with no safe mechanical rewrite (homograph
-hostnames, archive-extract targets, …) it says so plainly and shows the
-remediation instead, it never emits a bogus suggestion. The flag is advisory:
-it changes neither the verdict nor the exit code.
+On x86_64 Linux, when Tirith is installed at a fixed root-managed system path
+and the command's URL, shell, arguments, and stdin behavior can be decoded
+exactly, the rewrite routes pipe-to-shell through Tirith's bounded, reviewed,
+hash-verified, fail-closed capsule runner. The absolute Tirith path prevents a
+later `PATH` shadow from changing what runs. At execution, the runner also
+requires the selected interpreter's first `PATH` hit to be root-managed, binds
+its bytes before downloading, and preserves that shell instead of trusting the
+remote shebang. Other architectures, platforms, and user-owned Tirith
+installations keep this remediation as guidance. For curl, executable rewrites
+additionally require both
+fail-on-HTTP-error and redirect-following semantics (`-f` and `-L`, including a
+bundle such as `-fsSL`). Dynamic or malformed URL tokens, unsupported
+interpreter arguments, PowerShell, Cmd, and ambiguous pipelines remain
+guidance-only. Executable suggestions are limited to the verified, fail-closed
+pipe runner. Archive, dotfile, TLS-flag removal, HTTP-to-HTTPS changes, sudo
+narrowing, environment scrubbing, and package-name corrections
+are guidance-only because their exact shell, network, privilege, environment,
+or registry semantics are not mechanically provable. For any finding without a
+safe mechanical rewrite, Tirith says so plainly and shows the remediation
+instead; it never emits a guessed command. The flag is advisory: it changes
+neither the verdict nor the exit code.
 
 ### Daemon Mode (Unix)
 
@@ -704,11 +722,11 @@ The everyday commands:
 
 | Command | What it does |
 |---------|-------------|
-| `tirith check -- <cmd>` | Analyze a command without executing it (`--suggest` adds a safer rewrite) |
+| `tirith check -- <cmd>` | Analyze a command without executing it (`--suggest` adds remediation and, when verified, a narrow mechanical rewrite) |
 | `tirith paste` | Check pasted content (called automatically by shell hooks) |
 | `tirith scan [path]` | Scan files, directories, and configs (`--profile`, `--format sarif`, `--ci`) |
-| `tirith run <url>` | Safe `curl \| bash` replacement: download, analyze, review, then execute (Unix) |
-| `tirith fix -- <cmd>` | Interactively rewrite a risky command into a safer form |
+| `tirith run [--capsule] <url>` | Inspect a remote script (`--no-exec` on Unix); live execution is Linux-only, uses the exact reviewed bytes from a sealed anonymous descriptor, and `--capsule` fails closed |
+| `tirith fix -- <cmd>` | Interactively apply a verified fail-closed pipe-runner rewrite when available; otherwise show guidance |
 | `tirith score <url>` / `diff <url>` | Break down a URL's trust signals, or show where suspicious characters hide |
 | `tirith explain --rule <id>` / `why` | Rule docs and remediation, or explain the last trigger |
 | `tirith status` / `doctor` | Are you protected? Diagnose install, hooks, and policy (`--fix`, `--quick`) |

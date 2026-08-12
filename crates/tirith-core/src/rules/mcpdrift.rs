@@ -1565,8 +1565,7 @@ mod tests {
         assert_eq!(
             drift_finding.severity,
             Severity::High,
-            "an Added server has no approved live descriptor baseline yet: {:?}",
-            drift_finding,
+            "an Added server has no approved live descriptor baseline yet: {drift_finding:?}",
         );
     }
 
@@ -1671,8 +1670,7 @@ mod tests {
         assert_eq!(
             drift_finding.severity,
             Severity::High,
-            "an Added server still needs an approved live empty set: {:?}",
-            drift_finding,
+            "an Added server still needs an approved live empty set: {drift_finding:?}",
         );
     }
 

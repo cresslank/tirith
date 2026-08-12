@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::Path;
 
 use serde_json::{json, Value};
@@ -7,6 +6,7 @@ use serde_json::{json, Value};
 /// Skips identical config; errors on drift unless `force`.
 pub fn merge_mcp_json(
     path: &Path,
+    scope_root: &Path,
     server_name: &str,
     server_config: Value,
     force: bool,
@@ -14,6 +14,7 @@ pub fn merge_mcp_json(
 ) -> Result<(), String> {
     merge_mcp_json_with_key(
         path,
+        scope_root,
         server_name,
         server_config,
         "mcpServers",
@@ -25,78 +26,78 @@ pub fn merge_mcp_json(
 /// Like `merge_mcp_json` but with a custom top-level key (e.g. `"servers"` for VS Code).
 pub fn merge_mcp_json_with_key(
     path: &Path,
+    scope_root: &Path,
     server_name: &str,
     server_config: Value,
     server_key: &str,
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
-    let mut config: Value = if path.exists() {
-        let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?
-    } else {
-        json!({})
-    };
+    let outcome = super::fs_helpers::transactional_update(path, scope_root, dry_run, |snapshot| {
+        let mut config: Value = if let Some(raw) = snapshot.text(path)? {
+            serde_json::from_str(raw).map_err(|e| format!("parse {}: {e}", path.display()))?
+        } else {
+            json!({})
+        };
+        let servers = config
+            .as_object_mut()
+            .ok_or_else(|| format!("{} is not a JSON object", path.display()))?
+            .entry(server_key)
+            .or_insert_with(|| json!({}));
+        let servers_obj = servers
+            .as_object_mut()
+            .ok_or_else(|| format!("{server_key} in {} is not an object", path.display()))?;
 
-    let servers = config
-        .as_object_mut()
-        .ok_or_else(|| format!("{} is not a JSON object", path.display()))?
-        .entry(server_key)
-        .or_insert_with(|| json!({}));
-
-    let servers_obj = servers
-        .as_object_mut()
-        .ok_or_else(|| format!("{server_key} in {} is not an object", path.display()))?;
-
-    if let Some(existing) = servers_obj.get(server_name) {
-        if !force {
-            if existing == &server_config {
-                eprintln!(
-                    "tirith: {server_name} already in {}, up to date",
+        let mut backup = false;
+        if let Some(existing) = servers_obj.get(server_name) {
+            if !force {
+                if existing == &server_config {
+                    eprintln!(
+                        "tirith: {server_name} already in {}, up to date",
+                        path.display()
+                    );
+                    return Ok(super::fs_helpers::FileUpdate::unchanged());
+                }
+                if dry_run {
+                    eprintln!(
+                        "[dry-run] would error: {server_name} in {} has different config — use --force to update",
+                        path.display()
+                    );
+                    return Ok(super::fs_helpers::FileUpdate::unchanged());
+                }
+                return Err(format!(
+                    "{server_name} in {} has different config than expected — use --force to update",
                     path.display()
-                );
-                return Ok(());
+                ));
             }
-            if dry_run {
-                eprintln!(
-                    "[dry-run] would error: {server_name} in {} has different config — use --force to update",
-                    path.display()
-                );
-                return Ok(());
-            }
-            return Err(format!(
-                "tirith: {server_name} in {} has different config than expected — use --force to update",
-                path.display()
-            ));
+            backup = true;
         }
-        // force: back up before overwriting user config (not in dry-run).
-        if !dry_run {
-            super::fs_helpers::create_backup(path, true)?;
+        servers_obj.insert(server_name.to_string(), server_config.clone());
+        let content =
+            serde_json::to_string_pretty(&config).map_err(|error| format!("serialize: {error}"))?;
+        if dry_run {
+            eprintln!(
+                "[dry-run] would write {} ({} bytes)",
+                path.display(),
+                content.len()
+            );
         }
+        Ok(super::fs_helpers::FileUpdate::write_text(content, 0o644).with_backup(backup))
+    })?;
+    if let Some(annotation) = outcome.completion_annotation() {
+        eprintln!("tirith: wrote {}{annotation}", path.display());
     }
-
-    servers_obj.insert(server_name.to_string(), server_config);
-
-    let content = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
-
-    if dry_run {
-        eprintln!(
-            "[dry-run] would write {} ({} bytes)",
-            path.display(),
-            content.len()
-        );
-        return Ok(());
-    }
-
-    super::fs_helpers::atomic_write(path, &content, 0o644)?;
-    eprintln!("tirith: wrote {}", path.display());
     Ok(())
 }
 
 /// Merge a hook entry into a hooks.json file (Cursor/Windsurf format).
 /// Detects existing tirith hooks by the `marker` substring in each `command`.
+// The explicit scope root is a security boundary and must not be inferred from
+// the destination path, so retain it even though this makes eight parameters.
+#[allow(clippy::too_many_arguments)]
 pub fn merge_hooks_json(
     path: &Path,
+    scope_root: &Path,
     event_name: &str,
     hook_entry: Value,
     marker: &str,
@@ -104,111 +105,101 @@ pub fn merge_hooks_json(
     dry_run: bool,
     require_version: bool,
 ) -> Result<(), String> {
-    let mut config: Value = if path.exists() {
-        let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?
-    } else if require_version {
-        json!({"version": 1, "hooks": {}})
-    } else {
-        json!({"hooks": {}})
-    };
+    let outcome = super::fs_helpers::transactional_update(path, scope_root, dry_run, |snapshot| {
+        let mut config: Value = if let Some(raw) = snapshot.text(path)? {
+            serde_json::from_str(raw).map_err(|e| format!("parse {}: {e}", path.display()))?
+        } else if require_version {
+            json!({"version": 1, "hooks": {}})
+        } else {
+            json!({"hooks": {}})
+        };
+        let hooks = config
+            .as_object_mut()
+            .ok_or_else(|| format!("{} is not a JSON object", path.display()))?
+            .entry("hooks")
+            .or_insert_with(|| json!({}));
+        let hooks_obj = hooks
+            .as_object_mut()
+            .ok_or_else(|| format!("hooks in {} is not an object", path.display()))?;
+        let event_arr = hooks_obj
+            .entry(event_name)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or_else(|| format!("hooks.{event_name} in {} is not an array", path.display()))?;
+        let matching_indices: Vec<usize> = event_arr
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry
+                    .get("command")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|command| command.contains(marker))
+            })
+            .map(|(index, _)| index)
+            .collect();
 
-    let hooks = config
-        .as_object_mut()
-        .ok_or_else(|| format!("{} is not a JSON object", path.display()))?
-        .entry("hooks")
-        .or_insert_with(|| json!({}));
-
-    let hooks_obj = hooks
-        .as_object_mut()
-        .ok_or_else(|| format!("hooks in {} is not an object", path.display()))?;
-
-    let event_arr = hooks_obj
-        .entry(event_name)
-        .or_insert_with(|| json!([]))
-        .as_array_mut()
-        .ok_or_else(|| format!("hooks.{event_name} in {} is not an array", path.display()))?;
-
-    // All entries whose "command" field contains the marker.
-    let matching_indices: Vec<usize> = event_arr
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| {
-            entry
-                .get("command")
-                .and_then(|v| v.as_str())
-                .map(|cmd| cmd.contains(marker))
-                .unwrap_or(false)
-        })
-        .map(|(i, _)| i)
-        .collect();
-
-    match matching_indices.len() {
-        0 => {
-            event_arr.push(hook_entry);
-        }
-        1 => {
-            let idx = matching_indices[0];
-            if !force {
-                if event_arr[idx] == hook_entry {
-                    eprintln!("tirith: hook in {}, up to date", path.display());
-                    return Ok(());
-                }
-                if dry_run {
-                    eprintln!(
-                        "[dry-run] would error: hook entry in {} has different config — use --force to update",
+        let backup = match matching_indices.len() {
+            0 => {
+                event_arr.push(hook_entry.clone());
+                false
+            }
+            1 => {
+                let index = matching_indices[0];
+                if !force {
+                    if event_arr[index] == hook_entry {
+                        eprintln!("tirith: hook in {}, up to date", path.display());
+                        return Ok(super::fs_helpers::FileUpdate::unchanged());
+                    }
+                    if dry_run {
+                        eprintln!(
+                            "[dry-run] would error: hook entry in {} has different config — use --force to update",
+                            path.display()
+                        );
+                        return Ok(super::fs_helpers::FileUpdate::unchanged());
+                    }
+                    return Err(format!(
+                        "hook entry in {} has different config than expected — use --force to update",
                         path.display()
-                    );
-                    return Ok(());
+                    ));
                 }
-                return Err(format!(
-                    "tirith: hook entry in {} has different config than expected — use --force to update",
-                    path.display()
-                ));
+                event_arr[index] = hook_entry.clone();
+                true
             }
-            if !dry_run {
-                super::fs_helpers::create_backup(path, true)?;
-            }
-            event_arr[idx] = hook_entry;
-        }
-        _ => {
-            if !force {
-                if dry_run {
-                    eprintln!(
-                        "[dry-run] would error: multiple tirith hook entries found in {} — use --force to deduplicate",
+            _ => {
+                if !force {
+                    if dry_run {
+                        eprintln!(
+                            "[dry-run] would error: multiple tirith hook entries found in {} — use --force to deduplicate",
+                            path.display()
+                        );
+                        return Ok(super::fs_helpers::FileUpdate::unchanged());
+                    }
+                    return Err(format!(
+                        "multiple tirith hook entries found in {} — use --force to deduplicate",
                         path.display()
-                    );
-                    return Ok(());
+                    ));
                 }
-                return Err(format!(
-                    "tirith: multiple tirith hook entries found in {} — use --force to deduplicate",
-                    path.display()
-                ));
+                for &index in matching_indices.iter().rev() {
+                    event_arr.remove(index);
+                }
+                event_arr.push(hook_entry.clone());
+                true
             }
-            if !dry_run {
-                super::fs_helpers::create_backup(path, true)?;
-            }
-            // Reverse order so earlier indices stay valid while removing.
-            for &idx in matching_indices.iter().rev() {
-                event_arr.remove(idx);
-            }
-            event_arr.push(hook_entry);
+        };
+        let content =
+            serde_json::to_string_pretty(&config).map_err(|error| format!("serialize: {error}"))?;
+        if dry_run {
+            eprintln!(
+                "[dry-run] would write {} ({} bytes)",
+                path.display(),
+                content.len()
+            );
         }
+        Ok(super::fs_helpers::FileUpdate::write_text(content, 0o644).with_backup(backup))
+    })?;
+    if let Some(annotation) = outcome.completion_annotation() {
+        eprintln!("tirith: wrote {}{annotation}", path.display());
     }
-
-    let content = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
-
-    if dry_run {
-        eprintln!(
-            "[dry-run] would write {} ({} bytes)",
-            path.display(),
-            content.len()
-        );
-        return Ok(());
-    }
-
-    super::fs_helpers::atomic_write(path, &content, 0o644)?;
-    eprintln!("tirith: wrote {}", path.display());
     Ok(())
 }
 
@@ -217,72 +208,68 @@ pub fn merge_hooks_json(
 /// inside an active Claude Code session. Same drift semantics as `merge_mcp_json`.
 pub fn merge_claude_mcp_server(
     path: &Path,
+    scope_root: &Path,
     server_name: &str,
     server_config: Value,
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
-    let mut config: Value = if path.exists() {
-        let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?
-    } else {
-        json!({})
-    };
-
-    let servers = config
-        .as_object_mut()
-        .ok_or_else(|| format!("{} is not a JSON object", path.display()))?
-        .entry("mcpServers")
-        .or_insert_with(|| json!({}));
-
-    let servers_obj = servers
-        .as_object_mut()
-        .ok_or_else(|| format!("mcpServers in {} is not an object", path.display()))?;
-
-    if let Some(existing) = servers_obj.get(server_name) {
-        if !force {
-            if existing == &server_config {
-                eprintln!(
-                    "tirith: {server_name} MCP server already in {}, up to date",
+    let outcome = super::fs_helpers::transactional_update(path, scope_root, dry_run, |snapshot| {
+        let mut config: Value = if let Some(raw) = snapshot.text(path)? {
+            serde_json::from_str(raw).map_err(|e| format!("parse {}: {e}", path.display()))?
+        } else {
+            json!({})
+        };
+        let servers = config
+            .as_object_mut()
+            .ok_or_else(|| format!("{} is not a JSON object", path.display()))?
+            .entry("mcpServers")
+            .or_insert_with(|| json!({}));
+        let servers_obj = servers
+            .as_object_mut()
+            .ok_or_else(|| format!("mcpServers in {} is not an object", path.display()))?;
+        let mut backup = false;
+        if let Some(existing) = servers_obj.get(server_name) {
+            if !force {
+                if existing == &server_config {
+                    eprintln!(
+                        "tirith: {server_name} MCP server already in {}, up to date",
+                        path.display()
+                    );
+                    return Ok(super::fs_helpers::FileUpdate::unchanged());
+                }
+                if dry_run {
+                    eprintln!(
+                        "[dry-run] would error: {server_name} MCP server in {} has different config — use --force to update",
+                        path.display()
+                    );
+                    return Ok(super::fs_helpers::FileUpdate::unchanged());
+                }
+                return Err(format!(
+                    "{server_name} MCP server in {} has different config than expected — use --force to update",
                     path.display()
-                );
-                return Ok(());
+                ));
             }
-            if dry_run {
-                eprintln!(
-                    "[dry-run] would error: {server_name} MCP server in {} has different config — use --force to update",
-                    path.display()
-                );
-                return Ok(());
-            }
-            return Err(format!(
-                "{server_name} MCP server in {} has different config than expected — use --force to update",
-                path.display()
-            ));
+            backup = true;
         }
-        if !dry_run {
-            super::fs_helpers::create_backup(path, true)?;
+        servers_obj.insert(server_name.to_string(), server_config.clone());
+        let content =
+            serde_json::to_string_pretty(&config).map_err(|error| format!("serialize: {error}"))?;
+        if dry_run {
+            eprintln!(
+                "[dry-run] would write {} ({} bytes)",
+                path.display(),
+                content.len()
+            );
         }
-    }
-
-    servers_obj.insert(server_name.to_string(), server_config);
-
-    let content = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
-
-    if dry_run {
+        Ok(super::fs_helpers::FileUpdate::write_text(content, 0o644).with_backup(backup))
+    })?;
+    if let Some(annotation) = outcome.completion_annotation() {
         eprintln!(
-            "[dry-run] would write {} ({} bytes)",
+            "tirith: registered {server_name} MCP server in {}{annotation}",
             path.display(),
-            content.len()
         );
-        return Ok(());
     }
-
-    super::fs_helpers::atomic_write(path, &content, 0o644)?;
-    eprintln!(
-        "tirith: registered {server_name} MCP server in {}",
-        path.display()
-    );
     Ok(())
 }
 
@@ -292,8 +279,12 @@ pub fn merge_claude_mcp_server(
 /// Operates at the individual hook-command level, preserving other hooks and
 /// matchers. `marker` is a tool-specific filename substring used to detect the
 /// existing tirith hook entry.
+// Keep the trusted root explicit at this internal boundary for the same reason
+// as merge_hooks_json.
+#[allow(clippy::too_many_arguments)]
 fn merge_hook_settings_inner(
     path: &Path,
+    scope_root: &Path,
     event_name: &str,
     matcher_name: &str,
     hook_command: &str,
@@ -301,189 +292,191 @@ fn merge_hook_settings_inner(
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
-    let mut config: Value = if path.exists() {
-        let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?
-    } else {
-        json!({})
-    };
+    let outcome = super::fs_helpers::transactional_update(path, scope_root, dry_run, |snapshot| {
+        let mut config: Value = if let Some(raw) = snapshot.text(path)? {
+            serde_json::from_str(raw).map_err(|e| format!("parse {}: {e}", path.display()))?
+        } else {
+            json!({})
+        };
 
-    let root = config
-        .as_object_mut()
-        .ok_or_else(|| format!("{} is not a JSON object", path.display()))?;
+        let root = config
+            .as_object_mut()
+            .ok_or_else(|| format!("{} is not a JSON object", path.display()))?;
 
-    let hooks = root.entry("hooks").or_insert_with(|| json!({}));
-    let hooks_obj = hooks
-        .as_object_mut()
-        .ok_or_else(|| format!("hooks in {} is not an object", path.display()))?;
+        let hooks = root.entry("hooks").or_insert_with(|| json!({}));
+        let hooks_obj = hooks
+            .as_object_mut()
+            .ok_or_else(|| format!("hooks in {} is not an object", path.display()))?;
 
-    let event_arr = hooks_obj.entry(event_name).or_insert_with(|| json!([]));
-    let arr = event_arr
-        .as_array_mut()
-        .ok_or_else(|| format!("hooks.{event_name} in {} is not an array", path.display()))?;
+        let event_arr = hooks_obj.entry(event_name).or_insert_with(|| json!([]));
+        let arr = event_arr
+            .as_array_mut()
+            .ok_or_else(|| format!("hooks.{event_name} in {} is not an array", path.display()))?;
 
-    let new_hook_entry = json!({
-        "type": "command",
-        "command": hook_command
-    });
+        let new_hook_entry = json!({
+            "type": "command",
+            "command": hook_command
+        });
+        let mut backup = false;
 
-    let has_marker = |h: &Value| -> bool {
-        h.get("command")
-            .and_then(|v| v.as_str())
-            .map(|cmd| cmd.contains(marker))
-            .unwrap_or(false)
-    };
-
-    // All matcher indices matching matcher_name.
-    let matcher_indices: Vec<usize> = arr
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| {
-            entry
-                .get("matcher")
+        let has_marker = |h: &Value| -> bool {
+            h.get("command")
                 .and_then(|v| v.as_str())
-                .map(|m| m == matcher_name)
+                .map(|cmd| cmd.contains(marker))
                 .unwrap_or(false)
-        })
-        .map(|(i, _)| i)
-        .collect();
+        };
 
-    match matcher_indices.len() {
-        0 => {
-            arr.push(json!({
-                "matcher": matcher_name,
-                "hooks": [new_hook_entry]
-            }));
-        }
-        1 => {
-            let idx = matcher_indices[0];
+        // All matcher indices matching matcher_name.
+        let matcher_indices: Vec<usize> = arr
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry
+                    .get("matcher")
+                    .and_then(|v| v.as_str())
+                    .map(|m| m == matcher_name)
+                    .unwrap_or(false)
+            })
+            .map(|(i, _)| i)
+            .collect();
 
-            // Marker-matching hook index within the matcher's inner hooks.
-            let marker_hook_idx = arr[idx]
-                .get("hooks")
-                .and_then(|v| v.as_array())
-                .and_then(|inner| inner.iter().position(&has_marker));
+        match matcher_indices.len() {
+            0 => {
+                arr.push(json!({
+                    "matcher": matcher_name,
+                    "hooks": [new_hook_entry]
+                }));
+            }
+            1 => {
+                let idx = matcher_indices[0];
 
-            match marker_hook_idx {
-                Some(hi) => {
-                    let existing = &arr[idx]["hooks"][hi];
-                    if *existing == new_hook_entry {
-                        eprintln!(
-                            "tirith: {event_name} hook in {}, up to date",
-                            path.display()
-                        );
-                        return Ok(());
-                    }
-                    if !force {
-                        if dry_run {
+                // Marker-matching hook index within the matcher's inner hooks.
+                let marker_hook_idx = arr[idx]
+                    .get("hooks")
+                    .and_then(|v| v.as_array())
+                    .and_then(|inner| inner.iter().position(&has_marker));
+
+                match marker_hook_idx {
+                    Some(hi) => {
+                        let existing = &arr[idx]["hooks"][hi];
+                        if *existing == new_hook_entry {
                             eprintln!(
+                                "tirith: {event_name} hook in {}, up to date",
+                                path.display()
+                            );
+                            return Ok(super::fs_helpers::FileUpdate::unchanged());
+                        }
+                        if !force {
+                            if dry_run {
+                                eprintln!(
                                 "[dry-run] would error: {event_name} hook in {} has different config — use --force to update",
                                 path.display()
                             );
-                            return Ok(());
-                        }
-                        return Err(format!(
+                                return Ok(super::fs_helpers::FileUpdate::unchanged());
+                            }
+                            return Err(format!(
                             "{event_name} hook in {} has different config than expected — use --force to update",
                             path.display()
                         ));
+                        }
+                        backup = true;
+                        arr[idx]["hooks"][hi] = new_hook_entry;
                     }
-                    if !dry_run {
-                        super::fs_helpers::create_backup(path, true)?;
+                    None => {
+                        // Matcher exists but has no tirith hook: append to inner
+                        // hooks[], replacing it if missing or non-array (e.g. null).
+                        let obj = arr[idx]
+                            .as_object_mut()
+                            .ok_or_else(|| "matcher entry is not an object".to_string())?;
+                        if !obj.get("hooks").is_some_and(|v| v.is_array()) {
+                            obj.insert("hooks".to_string(), json!([]));
+                        }
+                        let inner_arr = obj["hooks"]
+                            .as_array_mut()
+                            .expect("just ensured hooks is an array");
+                        inner_arr.push(new_hook_entry);
                     }
-                    arr[idx]["hooks"][hi] = new_hook_entry;
-                }
-                None => {
-                    // Matcher exists but has no tirith hook: append to inner
-                    // hooks[], replacing it if missing or non-array (e.g. null).
-                    let obj = arr[idx]
-                        .as_object_mut()
-                        .ok_or_else(|| "matcher entry is not an object".to_string())?;
-                    if !obj.get("hooks").is_some_and(|v| v.is_array()) {
-                        obj.insert("hooks".to_string(), json!([]));
-                    }
-                    let inner_arr = obj["hooks"]
-                        .as_array_mut()
-                        .expect("just ensured hooks is an array");
-                    inner_arr.push(new_hook_entry);
                 }
             }
-        }
-        _ => {
-            if !force {
-                if dry_run {
-                    eprintln!(
+            _ => {
+                if !force {
+                    if dry_run {
+                        eprintln!(
                         "[dry-run] would error: multiple {matcher_name} matcher entries in {} — use --force to deduplicate",
                         path.display()
                     );
-                    return Ok(());
-                }
-                return Err(format!(
+                        return Ok(super::fs_helpers::FileUpdate::unchanged());
+                    }
+                    return Err(format!(
                     "multiple {matcher_name} matcher entries in {} — use --force to deduplicate",
                     path.display()
                 ));
-            }
-            if !dry_run {
-                super::fs_helpers::create_backup(path, true)?;
-            }
+                }
+                backup = true;
 
-            // Remove marker-matching hooks from all matchers; collect the
-            // non-marker hooks from duplicates into the first matcher rather
-            // than silently dropping them.
-            let mut orphan_hooks: Vec<Value> = Vec::new();
-            for (pos, &idx) in matcher_indices.iter().enumerate() {
-                if let Some(inner) = arr[idx]["hooks"].as_array_mut() {
-                    inner.retain(|h| !has_marker(h));
-                    if pos > 0 {
-                        orphan_hooks.append(inner);
+                // Remove marker-matching hooks from all matchers; collect the
+                // non-marker hooks from duplicates into the first matcher rather
+                // than silently dropping them.
+                let mut orphan_hooks: Vec<Value> = Vec::new();
+                for (pos, &idx) in matcher_indices.iter().enumerate() {
+                    if let Some(inner) = arr[idx]["hooks"].as_array_mut() {
+                        inner.retain(|h| !has_marker(h));
+                        if pos > 0 {
+                            orphan_hooks.append(inner);
+                        }
                     }
                 }
-            }
 
-            // Replace `hooks` if missing or non-array (e.g. null).
-            let first = arr[matcher_indices[0]]
-                .as_object_mut()
-                .ok_or_else(|| "matcher entry is not an object".to_string())?;
-            if !first.get("hooks").is_some_and(|v| v.is_array()) {
-                first.insert("hooks".to_string(), json!([]));
-            }
-            let inner_arr = first["hooks"]
-                .as_array_mut()
-                .expect("just ensured hooks is an array");
+                // Replace `hooks` if missing or non-array (e.g. null).
+                let first = arr[matcher_indices[0]]
+                    .as_object_mut()
+                    .ok_or_else(|| "matcher entry is not an object".to_string())?;
+                if !first.get("hooks").is_some_and(|v| v.is_array()) {
+                    first.insert("hooks".to_string(), json!([]));
+                }
+                let inner_arr = first["hooks"]
+                    .as_array_mut()
+                    .expect("just ensured hooks is an array");
 
-            inner_arr.extend(orphan_hooks);
-            inner_arr.push(new_hook_entry);
+                inner_arr.extend(orphan_hooks);
+                inner_arr.push(new_hook_entry);
 
-            for &idx in matcher_indices[1..].iter().rev() {
-                arr.remove(idx);
+                for &idx in matcher_indices[1..].iter().rev() {
+                    arr.remove(idx);
+                }
             }
         }
+
+        let content =
+            serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
+
+        if dry_run {
+            eprintln!(
+                "[dry-run] would write {} ({} bytes)",
+                path.display(),
+                content.len()
+            );
+        }
+
+        Ok(super::fs_helpers::FileUpdate::write_text(content, 0o644).with_backup(backup))
+    })?;
+    if let Some(annotation) = outcome.completion_annotation() {
+        eprintln!("tirith: wrote {}{annotation}", path.display());
     }
-
-    let content = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
-
-    if dry_run {
-        eprintln!(
-            "[dry-run] would write {} ({} bytes)",
-            path.display(),
-            content.len()
-        );
-        return Ok(());
-    }
-
-    super::fs_helpers::atomic_write(path, &content, 0o644)?;
-    eprintln!("tirith: wrote {}", path.display());
     Ok(())
 }
 
 /// Merge a tirith PreToolUse hook into Claude Code's settings.json.
 pub fn merge_claude_settings(
     path: &Path,
+    scope_root: &Path,
     hook_command: &str,
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
     merge_hook_settings_inner(
         path,
+        scope_root,
         "PreToolUse",
         "Bash",
         hook_command,
@@ -496,12 +489,14 @@ pub fn merge_claude_settings(
 /// Merge a tirith BeforeTool hook into Gemini CLI's settings.json.
 pub fn merge_gemini_settings(
     path: &Path,
+    scope_root: &Path,
     hook_command: &str,
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
     merge_hook_settings_inner(
         path,
+        scope_root,
         "BeforeTool",
         "run_shell_command",
         hook_command,
@@ -516,42 +511,33 @@ pub fn merge_gemini_settings(
 /// instructions) if a `"hooks"` key already exists outside the block.
 pub fn merge_vscode_settings(
     path: &Path,
+    scope_root: &Path,
     hook_command: &str,
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
-    let raw = if path.exists() {
-        fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?
-    } else {
-        "{\n}\n".to_string()
-    };
+    let outcome = super::fs_helpers::transactional_update(path, scope_root, dry_run, |snapshot| {
+        let path_existed = snapshot.exists();
+        let raw = snapshot.text(path)?.unwrap_or("{\n}\n").to_string();
 
-    let begin_marker = "// BEGIN tirith-hooks";
-    let end_marker = "// END tirith-hooks";
+        let begin_marker = "// BEGIN tirith-hooks";
+        let end_marker = "// END tirith-hooks";
 
-    let has_begin = raw.contains(begin_marker);
+        let has_begin = raw.contains(begin_marker);
 
-    if has_begin && !force {
-        eprintln!("tirith: VS Code hooks in {}, up to date", path.display());
-        return Ok(());
-    }
-
-    let already_backed_up;
-    let working_text = if has_begin && force {
-        if !dry_run {
-            super::fs_helpers::create_backup(path, true)?;
-            already_backed_up = true;
-        } else {
-            already_backed_up = false;
+        if has_begin && !force {
+            eprintln!("tirith: VS Code hooks in {}, up to date", path.display());
+            return Ok(super::fs_helpers::FileUpdate::unchanged());
         }
-        remove_managed_block(&raw, begin_marker, end_marker)?
-    } else {
-        already_backed_up = false;
-        raw.clone()
-    };
 
-    let managed_block = format!(
-        "\x20\x20{begin_marker}\n\
+        let working_text = if has_begin && force {
+            remove_managed_block(&raw, begin_marker, end_marker)?
+        } else {
+            raw.clone()
+        };
+
+        let managed_block = format!(
+            "\x20\x20{begin_marker}\n\
          \x20\x20\"hooks\": {{\n\
          \x20\x20\x20\x20\"PreToolUse\": [\n\
          \x20\x20\x20\x20\x20\x20{{\n\
@@ -561,124 +547,122 @@ pub fn merge_vscode_settings(
          \x20\x20\x20\x20]\n\
          \x20\x20}},\n\
          \x20\x20{end_marker}"
-    );
+        );
 
-    // Scan for an existing "hooks" key outside the managed block.
-    let hooks_key_re =
-        regex::Regex::new(r#"^\s*"hooks"\s*:"#).map_err(|e| format!("regex compile: {e}"))?;
+        // Scan for an existing "hooks" key outside the managed block.
+        let hooks_key_re =
+            regex::Regex::new(r#"^\s*"hooks"\s*:"#).map_err(|e| format!("regex compile: {e}"))?;
 
-    let mut in_managed_block = false;
-    for line in working_text.lines() {
-        if line.contains(begin_marker) {
-            in_managed_block = true;
-            continue;
-        }
-        if line.contains(end_marker) {
-            in_managed_block = false;
-            continue;
-        }
-        if !in_managed_block && hooks_key_re.is_match(line) {
-            println!(
-                "Add the following to your hooks.PreToolUse array in {}:\n\
+        let mut in_managed_block = false;
+        for line in working_text.lines() {
+            if line.contains(begin_marker) {
+                in_managed_block = true;
+                continue;
+            }
+            if line.contains(end_marker) {
+                in_managed_block = false;
+                continue;
+            }
+            if !in_managed_block && hooks_key_re.is_match(line) {
+                println!(
+                    "Add the following to your hooks.PreToolUse array in {}:\n\
                  {{\n\
                  \x20\x20\"type\": \"command\",\n\
                  \x20\x20\"command\": \"{hook_command}\"\n\
                  }}",
-                path.display()
-            );
-            return Err(format!(
-                "tirith: {} already has a \"hooks\" key — cannot safely merge. \
+                    path.display()
+                );
+                return Err(format!(
+                    "{} already has a \"hooks\" key — cannot safely merge. \
                  Add the hook entry shown above manually.",
-                path.display()
-            ));
-        }
-    }
-
-    // Insert the managed block before the file's closing brace.
-    let insert_pos = working_text.rfind('}').ok_or_else(|| {
-        println!(
-            "Add the following to {}:\n{}",
-            path.display(),
-            managed_block
-        );
-        format!(
-            "tirith: could not locate insertion point in {} — add hook manually",
-            path.display()
-        )
-    })?;
-
-    let before_brace = &working_text[..insert_pos];
-    let mut result = String::new();
-
-    // The last non-empty, non-comment line needs a trailing comma before the
-    // managed block follows it in the same object.
-    let needs_comma = before_brace
-        .lines()
-        .rev()
-        .find(|line| {
-            let trimmed = line.trim();
-            !trimmed.is_empty() && !trimmed.starts_with("//")
-        })
-        .map(|line| {
-            let trimmed = line.trim();
-            !trimmed.ends_with(',') && !trimmed.ends_with('{')
-        })
-        .unwrap_or(false);
-
-    if needs_comma {
-        let lines: Vec<&str> = before_brace.lines().collect();
-        for i in (0..lines.len()).rev() {
-            let trimmed = lines[i].trim();
-            if !trimmed.is_empty() && !trimmed.starts_with("//") {
-                result = lines[..i].join("\n");
-                if !result.is_empty() {
-                    result.push('\n');
-                }
-                result.push_str(lines[i]);
-                result.push(',');
-                result.push('\n');
-                if i + 1 < lines.len() {
-                    result.push_str(&lines[i + 1..].join("\n"));
-                    result.push('\n');
-                }
-                break;
+                    path.display()
+                ));
             }
         }
-        if result.is_empty() {
+
+        // Insert the managed block before the file's closing brace.
+        let insert_pos = working_text.rfind('}').ok_or_else(|| {
+            println!(
+                "Add the following to {}:\n{}",
+                path.display(),
+                managed_block
+            );
+            format!(
+                "tirith: could not locate insertion point in {} — add hook manually",
+                path.display()
+            )
+        })?;
+
+        let before_brace = &working_text[..insert_pos];
+        let mut result = String::new();
+
+        // The last non-empty, non-comment line needs a trailing comma before the
+        // managed block follows it in the same object.
+        let needs_comma = before_brace
+            .lines()
+            .rev()
+            .find(|line| {
+                let trimmed = line.trim();
+                !trimmed.is_empty() && !trimmed.starts_with("//")
+            })
+            .map(|line| {
+                let trimmed = line.trim();
+                !trimmed.ends_with(',') && !trimmed.ends_with('{')
+            })
+            .unwrap_or(false);
+
+        if needs_comma {
+            let lines: Vec<&str> = before_brace.lines().collect();
+            for i in (0..lines.len()).rev() {
+                let trimmed = lines[i].trim();
+                if !trimmed.is_empty() && !trimmed.starts_with("//") {
+                    result = lines[..i].join("\n");
+                    if !result.is_empty() {
+                        result.push('\n');
+                    }
+                    result.push_str(lines[i]);
+                    result.push(',');
+                    result.push('\n');
+                    if i + 1 < lines.len() {
+                        result.push_str(&lines[i + 1..].join("\n"));
+                        result.push('\n');
+                    }
+                    break;
+                }
+            }
+            if result.is_empty() {
+                result = before_brace.to_string();
+            }
+        } else {
             result = before_brace.to_string();
+            if !result.ends_with('\n') {
+                result.push('\n');
+            }
         }
-    } else {
-        result = before_brace.to_string();
+
+        result.push_str(&managed_block);
+        result.push('\n');
+        result.push_str(&working_text[insert_pos..]);
+
         if !result.ends_with('\n') {
             result.push('\n');
         }
+
+        if dry_run {
+            eprintln!(
+                "[dry-run] would write {} ({} bytes)",
+                path.display(),
+                result.len()
+            );
+        }
+
+        // VS Code settings are high-value user content: every modification of
+        // an existing file gets one snapshot-consistent transaction backup.
+        Ok(super::fs_helpers::FileUpdate::write_text(result, 0o644).with_backup(path_existed))
+    })?;
+    if let Some(annotation) = outcome.completion_annotation() {
+        eprintln!("tirith: wrote {}{annotation}", path.display());
     }
-
-    result.push_str(&managed_block);
-    result.push('\n');
-    result.push_str(&working_text[insert_pos..]);
-
-    if !result.ends_with('\n') {
-        result.push('\n');
-    }
-
-    if dry_run {
-        eprintln!(
-            "[dry-run] would write {} ({} bytes)",
-            path.display(),
-            result.len()
-        );
-        return Ok(());
-    }
-
-    // High-value user content: always back up on first-time insertion (skip if
-    // the force+remove path above already backed up this invocation).
-    if path.exists() && !already_backed_up {
-        super::fs_helpers::create_backup_always(path)?;
-    }
-
-    super::fs_helpers::atomic_write(path, &result, 0o644)?;
-    eprintln!("tirith: wrote {}", path.display());
     Ok(())
 }
 
@@ -698,7 +682,7 @@ fn remove_managed_block(
         }
         if line.contains(end_marker) {
             if !suppressing {
-                return Err("tirith: found END marker without BEGIN in managed block".to_string());
+                return Err("found END marker without BEGIN in managed block".to_string());
             }
             suppressing = false;
             continue;
@@ -709,9 +693,7 @@ fn remove_managed_block(
     }
 
     if suppressing {
-        return Err(
-            "tirith: corrupted tirith-hooks block — missing END marker, fix manually".to_string(),
-        );
+        return Err("corrupted tirith-hooks block — missing END marker, fix manually".to_string());
     }
 
     let mut out = result.join("\n");
@@ -725,6 +707,186 @@ fn remove_managed_block(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
+
+    fn merge_mcp_json(
+        path: &Path,
+        server_name: &str,
+        server_config: Value,
+        force: bool,
+        dry_run: bool,
+    ) -> Result<(), String> {
+        super::merge_mcp_json(
+            path,
+            path.parent().expect("test path has parent"),
+            server_name,
+            server_config,
+            force,
+            dry_run,
+        )
+    }
+
+    fn merge_mcp_json_with_key(
+        path: &Path,
+        server_name: &str,
+        server_config: Value,
+        server_key: &str,
+        force: bool,
+        dry_run: bool,
+    ) -> Result<(), String> {
+        super::merge_mcp_json_with_key(
+            path,
+            path.parent().expect("test path has parent"),
+            server_name,
+            server_config,
+            server_key,
+            force,
+            dry_run,
+        )
+    }
+
+    fn merge_hooks_json(
+        path: &Path,
+        event_name: &str,
+        hook_entry: Value,
+        marker: &str,
+        force: bool,
+        dry_run: bool,
+        require_version: bool,
+    ) -> Result<(), String> {
+        super::merge_hooks_json(
+            path,
+            path.parent().expect("test path has parent"),
+            event_name,
+            hook_entry,
+            marker,
+            force,
+            dry_run,
+            require_version,
+        )
+    }
+
+    fn merge_claude_settings(
+        path: &Path,
+        hook_command: &str,
+        force: bool,
+        dry_run: bool,
+    ) -> Result<(), String> {
+        super::merge_claude_settings(
+            path,
+            path.parent().expect("test path has parent"),
+            hook_command,
+            force,
+            dry_run,
+        )
+    }
+
+    fn merge_gemini_settings(
+        path: &Path,
+        hook_command: &str,
+        force: bool,
+        dry_run: bool,
+    ) -> Result<(), String> {
+        super::merge_gemini_settings(
+            path,
+            path.parent().expect("test path has parent"),
+            hook_command,
+            force,
+            dry_run,
+        )
+    }
+
+    fn merge_vscode_settings(
+        path: &Path,
+        hook_command: &str,
+        force: bool,
+        dry_run: bool,
+    ) -> Result<(), String> {
+        super::merge_vscode_settings(
+            path,
+            path.parent().expect("test path has parent"),
+            hook_command,
+            force,
+            dry_run,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_up_to_date_and_dry_run_refuse_symlinked_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let linked = root.path().join("nested");
+        std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
+        let path = linked.join("mcp.json");
+        let expected = json!({"command": "tirith", "args": ["mcp"]});
+        fs::write(
+            outside.path().join("mcp.json"),
+            serde_json::to_string(&json!({"mcpServers": {"tirith": expected}})).unwrap(),
+        )
+        .unwrap();
+
+        for dry_run in [false, true] {
+            let result = super::merge_mcp_json(
+                &path,
+                root.path(),
+                "tirith",
+                expected.clone(),
+                false,
+                dry_run,
+            );
+            assert!(
+                result.is_err(),
+                "dry_run={dry_run} bypassed parent validation"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_force_never_backs_up_or_cleans_through_symlinked_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let linked = root.path().join("nested");
+        std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
+        let path = linked.join("mcp.json");
+        fs::write(
+            outside.path().join("mcp.json"),
+            r#"{"mcpServers":{"tirith":{"command":"old"}}}"#,
+        )
+        .unwrap();
+        for i in 0..7 {
+            fs::write(
+                outside
+                    .path()
+                    .join(format!("mcp.json.tirith-backup-20260101-00000{i}")),
+                "outside-backup",
+            )
+            .unwrap();
+        }
+
+        let result = super::merge_mcp_json(
+            &path,
+            root.path(),
+            "tirith",
+            json!({"command": "new"}),
+            true,
+            false,
+        );
+
+        assert!(result.is_err());
+        let backups = fs::read_dir(outside.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("tirith-backup")
+            })
+            .count();
+        assert_eq!(backups, 7);
+    }
 
     #[test]
     fn mcp_json_creates_new_file() {

@@ -4,7 +4,6 @@
 //! nushell/PowerShell) so the hook installs idempotently and updates/removes
 //! without corrupting user content.
 
-use std::fs;
 use std::path::PathBuf;
 
 const BEGIN_MARKER: &str = "# BEGIN tirith-hook v1";
@@ -57,19 +56,25 @@ pub(crate) fn shell_quote(path: &str, shell: &str) -> String {
 }
 
 /// Detect the user's default shell and return its profile file path.
-fn detect_shell_profile() -> Option<(&'static str, PathBuf)> {
-    let home = home::home_dir()?;
+fn detect_shell_profile() -> Result<Option<(&'static str, PathBuf)>, String> {
+    let Some(home) = home::home_dir() else {
+        return Ok(None);
+    };
     let shell = crate::cli::init::detect_shell();
 
+    Ok(profile_for_shell(shell, &home)?.map(|profile| (shell, profile)))
+}
+
+fn profile_for_shell(shell: &str, home: &std::path::Path) -> Result<Option<PathBuf>, String> {
     let profile = match shell {
         "zsh" => home.join(".zshrc"),
         "bash" => {
             // .bashrc preferred; fall back to .bash_profile, else create .bashrc.
             let bashrc = home.join(".bashrc");
             let bash_profile = home.join(".bash_profile");
-            if bashrc.exists() {
+            if super::fs_helpers::read_to_string_scoped(&bashrc, home)?.is_some() {
                 bashrc
-            } else if bash_profile.exists() {
+            } else if super::fs_helpers::read_to_string_scoped(&bash_profile, home)?.is_some() {
                 bash_profile
             } else {
                 bashrc
@@ -79,10 +84,12 @@ fn detect_shell_profile() -> Option<(&'static str, PathBuf)> {
         "nushell" => {
             let config = home.join(".config").join("nushell").join("config.nu");
             // Only offer if the user already has a nushell config directory.
-            if config.exists() || config.parent().map(|p| p.exists()).unwrap_or(false) {
+            if super::fs_helpers::read_to_string_scoped(&config, home)?.is_some()
+                || super::fs_helpers::parent_exists_scoped(&config, home)?
+            {
                 config
             } else {
-                return None;
+                return Ok(None);
             }
         }
         "powershell" => {
@@ -91,16 +98,33 @@ fn detect_shell_profile() -> Option<(&'static str, PathBuf)> {
                 .join(".config")
                 .join("powershell")
                 .join("Microsoft.PowerShell_profile.ps1");
-            if profile.exists() || profile.parent().map(|p| p.exists()).unwrap_or(false) {
+            if super::fs_helpers::read_to_string_scoped(&profile, home)?.is_some()
+                || super::fs_helpers::parent_exists_scoped(&profile, home)?
+            {
                 profile
             } else {
-                return None;
+                return Ok(None);
             }
         }
-        _ => return None,
+        _ => return Ok(None),
     };
 
-    Some((shell, profile))
+    Ok(Some(profile))
+}
+
+fn revalidate_profile_selection(
+    shell: &str,
+    home: &std::path::Path,
+    expected: &std::path::Path,
+) -> Result<(), String> {
+    let selected = profile_for_shell(shell, home)?;
+    if selected.as_deref() != Some(expected) {
+        return Err(format!(
+            "shell profile selection changed while setup was running; refusing to update {}",
+            expected.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Detect a manually-added `tirith init` (uncommented executable line). Skips
@@ -188,7 +212,7 @@ pub fn install_shell_hook(tirith_bin: &str, force: bool, dry_run: bool) -> Resul
     // scoped to bash users without threading the shell name through the inner fn.
     #[cfg(unix)]
     if result.is_ok() && !dry_run {
-        if let Some(("bash", _)) = detect_shell_profile() {
+        if let Ok(Some(("bash", _))) = detect_shell_profile() {
             let _ = crate::cli::bash_capability::run_and_cache();
         }
     }
@@ -197,7 +221,8 @@ pub fn install_shell_hook(tirith_bin: &str, force: bool, dry_run: bool) -> Resul
 }
 
 fn install_shell_hook_inner(tirith_bin: &str, force: bool, dry_run: bool) -> Result<(), String> {
-    let (shell, profile_path) = detect_shell_profile().ok_or_else(|| {
+    let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
+    let (shell, profile_path) = detect_shell_profile()?.ok_or_else(|| {
         "could not detect shell — add eval \"$(tirith init)\" to your shell profile manually"
             .to_string()
     })?;
@@ -230,42 +255,83 @@ fn install_shell_hook_inner(tirith_bin: &str, force: bool, dry_run: bool) -> Res
     };
 
     let managed_block = format!("{BEGIN_MARKER}\n{hook_line}\n{END_MARKER}\n");
+    let mut completed_verb = "updated";
+    let outcome = super::fs_helpers::transactional_update_checked(
+        &profile_path,
+        &home,
+        dry_run,
+        |snapshot| {
+            let existing = snapshot.text(&profile_path)?.unwrap_or_default();
+            let begin_count = existing
+                .lines()
+                .filter(|line| line.starts_with(BEGIN_PREFIX))
+                .count();
 
-    let existing = if profile_path.exists() {
-        fs::read_to_string(&profile_path)
-            .map_err(|e| format!("read {}: {e}", profile_path.display()))?
-    } else {
-        String::new()
-    };
-
-    let begin_count = existing
-        .lines()
-        .filter(|line| line.starts_with(BEGIN_PREFIX))
-        .count();
-
-    // If the user manually added `tirith init` (no managed block), don't
-    // touch their profile — they opted out of the managed setup.
-    if begin_count == 0 && has_executable_tirith_init(&existing) {
-        eprintln!(
-            "tirith: shell hook already in {} (manually added), skipping",
-            profile_path.display()
-        );
-        return Ok(());
-    }
-
-    validate_marker_pairing(&existing)?;
-
-    match begin_count {
-        0 => {
-            if dry_run {
+            // A manually-added hook is an intentional opt-out from managed
+            // setup and must remain untouched.
+            if begin_count == 0 && has_executable_tirith_init(existing) {
                 eprintln!(
-                    "[dry-run] would append tirith shell hook to {}",
+                    "tirith: shell hook already in {} (manually added), skipping",
                     profile_path.display()
                 );
-                return Ok(());
+                return Ok(super::fs_helpers::FileUpdate::unchanged());
             }
+            validate_marker_pairing(existing)?;
 
-            let mut content = existing;
+            let mut content = match begin_count {
+                0 => {
+                    completed_verb = "added";
+                    if dry_run {
+                        eprintln!(
+                            "[dry-run] would append tirith shell hook to {}",
+                            profile_path.display()
+                        );
+                    }
+                    existing.to_string()
+                }
+                1 => {
+                    let matches = extract_managed_block(existing)
+                        .as_deref()
+                        .is_some_and(|block| block == managed_block);
+                    if matches && !force {
+                        eprintln!(
+                            "tirith: shell hook already in {}, up to date",
+                            profile_path.display()
+                        );
+                        return Ok(super::fs_helpers::FileUpdate::unchanged());
+                    }
+                    if !matches && !force {
+                        return Err(format!(
+                            "shell hook in {} has different content than expected — use --force to update",
+                            profile_path.display()
+                        ));
+                    }
+                    completed_verb = "replaced";
+                    if dry_run {
+                        eprintln!(
+                            "[dry-run] would replace tirith shell hook in {}",
+                            profile_path.display()
+                        );
+                    }
+                    remove_hook_blocks(existing)
+                }
+                _ if !force => {
+                    return Err(format!(
+                        "multiple tirith-hook blocks found in {} — use --force to deduplicate",
+                        profile_path.display()
+                    ));
+                }
+                _ => {
+                    completed_verb = "deduplicated";
+                    if dry_run {
+                        eprintln!(
+                            "[dry-run] would deduplicate tirith-hook blocks in {}",
+                            profile_path.display()
+                        );
+                    }
+                    remove_hook_blocks(existing)
+                }
+            };
             if !content.is_empty() && !content.ends_with('\n') {
                 content.push('\n');
             }
@@ -273,80 +339,15 @@ fn install_shell_hook_inner(tirith_bin: &str, force: bool, dry_run: bool) -> Res
                 content.push('\n');
             }
             content.push_str(&managed_block);
-
-            super::fs_helpers::atomic_write(&profile_path, &content, 0o644)?;
-            eprintln!("tirith: added shell hook to {}", profile_path.display());
-        }
-        1 => {
-            let existing_block = extract_managed_block(&existing);
-            let matches = existing_block
-                .as_deref()
-                .map(|b| b == managed_block)
-                .unwrap_or(false);
-
-            if matches && !force {
-                eprintln!(
-                    "tirith: shell hook already in {}, up to date",
-                    profile_path.display()
-                );
-                return Ok(());
-            }
-
-            if !matches && !force {
-                return Err(format!(
-                    "shell hook in {} has different content than expected — use --force to update",
-                    profile_path.display()
-                ));
-            }
-
-            if dry_run {
-                eprintln!(
-                    "[dry-run] would replace tirith shell hook in {}",
-                    profile_path.display()
-                );
-                return Ok(());
-            }
-
-            let cleaned = remove_hook_blocks(&existing);
-            let mut content = cleaned;
-            if !content.is_empty() && !content.ends_with('\n') {
-                content.push('\n');
-            }
-            content.push('\n');
-            content.push_str(&managed_block);
-
-            super::fs_helpers::atomic_write(&profile_path, &content, 0o644)?;
-            eprintln!("tirith: replaced shell hook in {}", profile_path.display());
-        }
-        _ => {
-            if !force {
-                return Err(format!(
-                    "multiple tirith-hook blocks found in {} — use --force to deduplicate",
-                    profile_path.display()
-                ));
-            }
-            if dry_run {
-                eprintln!(
-                    "[dry-run] would deduplicate tirith-hook blocks in {}",
-                    profile_path.display()
-                );
-                return Ok(());
-            }
-
-            let cleaned = remove_hook_blocks(&existing);
-            let mut content = cleaned;
-            if !content.is_empty() && !content.ends_with('\n') {
-                content.push('\n');
-            }
-            content.push('\n');
-            content.push_str(&managed_block);
-
-            super::fs_helpers::atomic_write(&profile_path, &content, 0o644)?;
-            eprintln!(
-                "tirith: deduplicated tirith-hook blocks in {}",
-                profile_path.display()
-            );
-        }
+            Ok(super::fs_helpers::FileUpdate::write_text(content, 0o644))
+        },
+        || revalidate_profile_selection(shell, &home, &profile_path),
+    )?;
+    if let Some(annotation) = outcome.completion_annotation() {
+        eprintln!(
+            "tirith: {completed_verb} shell hook in {}{annotation}",
+            profile_path.display(),
+        );
     }
 
     Ok(())
@@ -383,6 +384,45 @@ fn remove_hook_blocks(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_discovery_refuses_symlinked_intermediate_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("nushell")).unwrap();
+        std::fs::write(outside.path().join("nushell/config.nu"), "# outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), home.path().join(".config")).unwrap();
+
+        assert!(profile_for_shell("nushell", home.path()).is_err());
+    }
+
+    #[test]
+    fn bash_profile_discovery_preserves_existing_fallback() {
+        let home = tempfile::tempdir().unwrap();
+        let bash_profile = home.path().join(".bash_profile");
+        std::fs::write(&bash_profile, "# existing").unwrap();
+
+        assert_eq!(
+            profile_for_shell("bash", home.path()).unwrap(),
+            Some(bash_profile)
+        );
+    }
+
+    #[test]
+    fn bash_profile_selection_revalidation_detects_new_higher_priority_file() {
+        let home = tempfile::tempdir().unwrap();
+        let bash_profile = home.path().join(".bash_profile");
+        std::fs::write(&bash_profile, "# existing").unwrap();
+        assert_eq!(
+            profile_for_shell("bash", home.path()).unwrap(),
+            Some(bash_profile.clone())
+        );
+
+        std::fs::write(home.path().join(".bashrc"), "# appeared concurrently").unwrap();
+        let error = revalidate_profile_selection("bash", home.path(), &bash_profile).unwrap_err();
+        assert!(error.contains("selection changed"));
+    }
 
     #[test]
     fn quote_simple_name_unchanged() {

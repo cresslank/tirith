@@ -140,32 +140,54 @@ vet_not_configured
 
 When tirith blocks a `curl | bash` pattern, the safest alternatives are:
 
-### Ask tirith for the rewrite
+### Ask tirith for a verified rewrite or guidance
 
-`tirith check --suggest` prints a concrete safer version of the
-exact command you ran:
+`tirith check --suggest` prints remediation for the exact command
+you ran and, when a narrow mechanical transform can be verified, a concrete
+safer version:
 
 ```bash
-tirith check --suggest -- 'curl https://example.com/install.sh | bash'
+tirith check --suggest -- 'curl -fsSL https://example.com/install.sh | bash'
 # tirith: safer alternative
 #   curl_pipe_shell
-#     try: curl -fsSL -o /tmp/tirith-review.sh https://example.com/install.sh \
-#          && less /tmp/tirith-review.sh && bash /tmp/tirith-review.sh
+#     try: '/usr/local/bin/tirith' run --capsule --script-stdin --interpreter bash \
+#          'https://example.com/install.sh'
 ```
 
-It also drops insecure-TLS flags and upgrades `http://` to `https://`. For
-findings with no safe mechanical rewrite it says so plainly instead of guessing.
-The flag is advisory — it never changes the verdict or exit code. Use
-`tirith explain --rule curl_pipe_shell --fix` to see a rule's remediation on its
-own.
+On x86_64 Linux, a fixed root-managed current Tirith binary may emit this
+rewrite. The generated command uses Tirith's absolute path so a later `PATH`
+shadow cannot replace it. At execution, the runner requires the selected
+interpreter's first `PATH` hit to be root-managed, binds its bytes before the
+download, bounds and analyzes the downloaded bytes, asks for confirmation, then
+feeds the reviewed bytes to a hash-verified, sealed interpreter descriptor
+inside a fail-closed capsule. It also ignores a conflicting remote shebang.
+Other architectures, platforms, and user-owned Tirith installations show
+guidance instead of an executable rewrite. Curl rewrites require both
+`-f`/`--fail` and
+`-L`/`--location` semantics;
+plain curl, `-f` alone, or `-L` alone stays guidance-only.
+Literal no-argument `sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`, and
+`ash` are supported, as is the narrow POSIX-shell `-s -- <literal operands...>`
+form. Dynamic or malformed URL tokens, controls, PowerShell, Cmd, `|&`, and
+unsupported downloader/interpreter arguments produce guidance rather than an
+executable rewrite. Executable suggestions are limited to the verified,
+fail-closed pipe runner. Archive, dotfile, insecure-TLS removal, HTTP-to-HTTPS
+changes, sudo narrowing, environment scrubbing, and package-name
+corrections remain guidance-only because Tirith cannot mechanically prove the
+required semantics. The flag is advisory — it never changes the verdict or exit
+code.
 
-### Using tirith run (built-in, Unix only)
+### Using tirith run (inspection on Unix; live execution on Linux)
 
-`tirith run` downloads, inspects, and prompts before executing:
+`tirith run` downloads and analyzes the script. On Linux, live mode prompts and
+executes the exact reviewed bytes from a fully sealed anonymous descriptor; on
+other hosts it refuses live mode before download. A manual invocation uses the
+fully analyzed remote shebang and file semantics;
+use the command emitted by `check --suggest` when preserving an original stdin
+pipeline matters:
 
 ```bash
-# Instead of: curl -fsSL https://example.com/install.sh | bash
-tirith run https://example.com/install.sh
+tirith run --capsule https://example.com/install.sh
 ```
 
 Download and inspect only (no execution):
@@ -179,6 +201,12 @@ Pin to a known hash:
 ```bash
 tirith run --sha256 abc123... https://example.com/install.sh
 ```
+
+There is no pager step in `tirith run`; use `--no-exec` to stop after analysis,
+or `tirith fetch <url> --save <path>` for explicit file review. `--capsule` refuses execution if
+the host backend cannot meet its required coverage. Download and DNS resolution
+happen before the interpreter capsule, so containment is not a separate claim
+about the pre-execution resolver path.
 
 ### Using tirith install (recorded install transaction)
 

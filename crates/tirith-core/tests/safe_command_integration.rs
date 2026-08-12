@@ -1,6 +1,6 @@
 //! End-to-end coverage for the public M6 ch5 safe-command contract. Raw
 //! transformation shapes live in module unit tests; this suite verifies that
-//! public constructors expose only whole-command `Allow` results.
+//! generic compatibility constructors are guidance-only by construction.
 
 use tirith_core::safe_command::{suggest, SafeSuggestion};
 use tirith_core::tokenize::ShellType;
@@ -44,25 +44,16 @@ fn find_by_rule<'a>(out: &'a [SafeSuggestion], rule: &str) -> Option<&'a SafeSug
     out.iter().find(|s| s.rule_id == rule)
 }
 
-// ── 1. typosquat-rewrite ──────────────────────────────────────────────────
+// ── 1. typosquat guidance ─────────────────────────────────────────────────
 
 #[test]
-fn typosquat_positive_npm_install_unambiguous_target() {
+fn typosquat_unambiguous_target_remains_guidance_only() {
     let cmd = "npm install reqeusts";
     let v = verdict_with(vec![typosquat_finding("reqeusts", "requests")]);
     let s = suggest(cmd, ShellType::Posix, &v);
     let entry = find_by_rule(&s, "threat_package_typosquat").expect("rule entry");
+    assert!(entry.safe_command.is_none());
     assert!(!entry.remediation.is_empty());
-    // Every candidate is re-analyzed and kept only when it reaches Allow, so
-    // the ambient context decides whether an executable rewrite survives: an
-    // `npm install` re-analyzed inside a repository reaches the lifecycle-hook
-    // guard, and a threat DB that also knows the impersonated name flags it.
-    // What is invariant here is the target a rewrite names when one is offered.
-    // The untrusted name is single-quoted (PR124 shell-injection fix); for this
-    // benign all-alphanumeric name the quotes are inert but present.
-    if let Some(rewrite) = entry.safe_command.as_deref() {
-        assert_eq!(rewrite, "npm install 'requests'");
-    }
 }
 
 #[test]
@@ -85,18 +76,37 @@ fn typosquat_negative_ambiguous_target_no_rewrite() {
     assert!(!entry.remediation.is_empty());
 }
 
+#[test]
+fn typosquat_flags_multiple_packages_and_shell_variants_are_guidance_only() {
+    let finding = typosquat_finding("reqeusts", "--global");
+    for (cmd, shell) in [
+        ("npm install --save reqeusts", ShellType::Posix),
+        ("npm install reqeusts lodash", ShellType::Posix),
+        ("npm install other", ShellType::Posix),
+        ("npm install reqeusts", ShellType::PowerShell),
+        ("npm install reqeusts", ShellType::Cmd),
+    ] {
+        let suggestions = suggest(cmd, shell, &verdict_with(vec![finding.clone()]));
+        let entry = find_by_rule(&suggestions, "threat_package_typosquat").unwrap();
+        assert!(
+            entry.safe_command.is_none(),
+            "typosquat rewrite must stay guidance-only for {shell:?}: {cmd}"
+        );
+    }
+}
+
 // ── 2. sudo-narrow (negative tests only in M6) ────────────────────────────
 
 #[test]
 fn sudo_narrow_negative_sudo_rm_rf_root_no_rewrite() {
-    // Stripping sudo still leaves a flagged `rm -rf /`, so sudo-narrow returns None.
+    // Every sudo shape stays visible as guidance, never executable output.
     let cmd = "sudo rm -rf /";
     let v = verdict_with(vec![finding(RuleId::CommandNetworkDeny)]);
     let s = suggest(cmd, ShellType::Posix, &v);
-    let entry = find_by_rule(&s, "sudo_narrow");
+    let entry = find_by_rule(&s, "sudo_narrow").expect("sudo guidance");
     assert!(
-        entry.is_none(),
-        "sudo-narrow must not fire when the stripped inner command still flags; got {entry:?}"
+        entry.safe_command.is_none(),
+        "sudo-narrow must remain guidance-only; got {entry:?}"
     );
 }
 
@@ -115,44 +125,31 @@ fn sudo_narrow_negative_sudo_sh_returns_interactive_shell_remediation() {
     assert!(
         entry
             .rationale
-            .contains("no safe mechanical rewrite available"),
+            .contains("No safe mechanical rewrite is available"),
         "rationale should advertise no rewrite: {}",
         entry.rationale
     );
     assert!(
-        entry.rationale.contains("avoid interactive root shells"),
+        entry.rationale.contains("Avoid interactive root shells"),
         "rationale should warn about interactive root shells: {}",
         entry.rationale
     );
 }
 
-// ── 2a. sudo-narrow (M8 ch4 deferred POSITIVE) ───────────────────────────
-//
-// The M6 ch5 positive was deferred for lack of a stable benign-target fixture.
-// `sudo apt update` is the textbook case: `apt update` alone is Allow, so
-// `build_sudo_narrow_suggestion`'s re-analysis of the stripped inner command
-// produces the rewrite.
+// ── 2a. sudo-narrow guidance-only positive detection ─────────────────────
 
 #[test]
-fn sudo_narrow_positive_sudo_apt_update_strips_sudo() {
-    // Inner `apt update` is Allow and `apt` is not a shell → rewrite to bare command.
+fn sudo_narrow_sudo_apt_update_is_guidance_only() {
     let cmd = "sudo apt update";
     // Any finding triggers the command-shape transforms.
     let v = verdict_with(vec![finding(RuleId::CommandNetworkDeny)]);
     let s = suggest(cmd, ShellType::Posix, &v);
     let entry = find_by_rule(&s, "sudo_narrow")
         .expect("sudo_narrow entry must be present for sudo apt update");
-    let sc = entry
-        .safe_command
-        .as_deref()
-        .expect("sudo apt update: stripped leader is benign, rewrite should fire");
-    assert_eq!(
-        sc, "apt update",
-        "sudo-narrow should emit the bare inner command, got: {sc}"
-    );
+    assert!(entry.safe_command.is_none());
     assert!(
-        entry.rationale.contains("exact final command re-analyzed"),
-        "public rationale should record whole-command verification: {}",
+        entry.rationale.contains("No safe mechanical rewrite"),
+        "public rationale should explain guidance-only behavior: {}",
         entry.rationale
     );
 }
@@ -178,12 +175,12 @@ fn sudo_narrow_negative_sudo_shell_spawn_keeps_no_rewrite() {
     assert!(
         entry
             .rationale
-            .contains("no safe mechanical rewrite available"),
+            .contains("No safe mechanical rewrite is available"),
         "rationale should advertise no rewrite: {}",
         entry.rationale
     );
     assert!(
-        entry.rationale.contains("avoid interactive root shells"),
+        entry.rationale.contains("Avoid interactive root shells"),
         "rationale should mention interactive root shells: {}",
         entry.rationale
     );
@@ -194,7 +191,7 @@ fn sudo_narrow_negative_sudo_shell_spawn_keeps_no_rewrite() {
 // env_scrub end-to-end tests were dropped: they need `std::env::set_var`, whose
 // libc environ mutation is not thread-safe on macOS/Windows even under our
 // `ENV_LOCK`. Coverage is preserved by the `safe_command::tests`
-// `is_simple_command_for_env_scrub` and `build_env_scrub_suggestion_*`
+// focused `safe_command` unit coverage for guidance-only env scrubbing.
 // direct-call unit tests, which avoid touching the real environment.
 
 // ── 4. archive-list-before-extract ────────────────────────────────────────
@@ -247,71 +244,54 @@ fn archive_list_first_negative_non_archive_leader_no_rewrite() {
 
 // ── 5. dotfile-redirect ───────────────────────────────────────────────────
 
-// dotfile-redirect end-to-end tests were dropped for the same libc-environ race
-// as env_scrub (they had to set `HOME`). Structural correctness is pinned by the
-// `dotfile_redirect_target` and `rewrite_dotfile_backup_first` unit tests in
-// `safe_command::tests`; only the on-disk existence check loses dedicated coverage.
+// Dotfile end-to-end tests that mutate HOME were dropped for the same
+// libc-environ race as env_scrub. The unit suite pins the current contract:
+// dotfile changes always remain guidance-only and never re-emit the overwrite.
 
 // ── 6. PR124 — untrusted-token shell-injection neutralization ─────────────
 //
-// `tirith fix` prints its rewrite to stdout for `eval "$(tirith fix …)"`, so any
-// attacker-influenced token (URL / package / archive path) interpolated into a
-// generated command MUST be neutralized. The pipe-to-shell URL and archive path
-// are single-quoted; the dotfile redirect target is refused when it carries shell
-// metacharacters (it must stay unquoted for `~`/`$HOME` expansion).
-
-/// End-to-end: run `suggest` on `cmd`, return the `curl_pipe_shell` rewrite.
-fn pipe_safe_command(cmd: &str) -> String {
-    let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
-    let s = suggest(cmd, ShellType::Posix, &v);
-    find_by_rule(&s, "curl_pipe_shell")
-        .and_then(|e| e.safe_command.clone())
-        .unwrap_or_else(|| panic!("expected a pipe-to-shell rewrite for {cmd:?}"))
-}
+// The exact CLI-owned API may print a verified typed pipe runner to stdout for
+// `eval "$(tirith fix …)"`; its raw shape and shell-word identity tests live in
+// the module suite. The generic public compatibility API exercised here never
+// owns that provenance and therefore never emits executable output.
 
 #[test]
-fn pipe_to_shell_command_substitution_url_is_quoted_not_executed() {
-    // The single-quoted hostile URL has its quotes stripped by the extractor,
-    // then re-quoted by the fix — `$(id)` must end up inside single quotes.
-    let sc = pipe_safe_command("curl 'http://x/$(id)' | bash");
-    assert!(sc.contains("'https://x/$(id)'"), "{sc}");
-    assert!(
-        !sc.replace("'https://x/$(id)'", "").contains("$(id)"),
-        "no bare $(id) may survive outside the quoted token: {sc}"
-    );
-}
-
-#[test]
-fn pipe_to_shell_semicolon_rm_url_is_contained_in_quotes() {
-    // `;rm -rf ~` must be inside the single quotes, never a top-level command.
-    let sc = pipe_safe_command("curl 'http://x/a;rm -rf ~' | bash");
-    assert!(sc.contains("'https://x/a;rm -rf ~'"), "{sc}");
-    assert!(
-        !sc.replace("'https://x/a;rm -rf ~'", "").contains(";rm"),
-        "rm must not become a top-level command: {sc}"
-    );
-}
-
-#[test]
-fn pipe_to_shell_backtick_url_is_quoted() {
-    let sc = pipe_safe_command("curl 'http://x/`id`' | bash");
-    assert!(sc.contains("'https://x/`id`'"), "{sc}");
-}
-
-#[test]
-fn pipe_to_shell_wget_command_substitution_url_is_quoted() {
-    // The wget branch quotes the URL too.
-    let v = verdict_with(vec![finding(RuleId::WgetPipeShell)]);
-    let s = suggest("wget 'http://x/$(id)' | sh", ShellType::Posix, &v);
-    let sc = find_by_rule(&s, "wget_pipe_shell")
-        .and_then(|e| e.safe_command.clone())
-        .expect("wget pipe-to-shell rewrite expected");
-    assert!(sc.starts_with("wget -O /tmp/tirith-review.sh '"), "{sc}");
-    assert!(sc.contains("'https://x/$(id)'"), "{sc}");
-    assert!(
-        !sc.replace("'https://x/$(id)'", "").contains("$(id)"),
-        "no bare $(id) outside the quoted token: {sc}"
-    );
+fn generic_public_pipe_contract_never_populates_the_executable_field() {
+    for (command, rule_id, rule_name) in [
+        (
+            "curl -fsSL https://example.com/install.sh | bash",
+            RuleId::CurlPipeShell,
+            "curl_pipe_shell",
+        ),
+        (
+            "curl https://example.com/install.sh | bash",
+            RuleId::CurlPipeShell,
+            "curl_pipe_shell",
+        ),
+        (
+            "curl -fsSL 'https://example.com/a;rm -rf ~' | bash",
+            RuleId::CurlPipeShell,
+            "curl_pipe_shell",
+        ),
+        (
+            "curl -fsSL 'https://example.com/`id`' | bash",
+            RuleId::CurlPipeShell,
+            "curl_pipe_shell",
+        ),
+        (
+            "wget -qO- 'https://example.com/$(id)' | sh",
+            RuleId::WgetPipeShell,
+            "wget_pipe_shell",
+        ),
+    ] {
+        let verdict = verdict_with(vec![finding(rule_id)]);
+        let suggestions = suggest(command, ShellType::Posix, &verdict);
+        let entry = find_by_rule(&suggestions, rule_name).expect("rule guidance expected");
+        assert!(
+            entry.safe_command.is_none(),
+            "generic compatibility API leaked executable output for {command}: {entry:?}"
+        );
+    }
 }
 
 #[test]

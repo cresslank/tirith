@@ -38,8 +38,7 @@ pub(crate) fn load_last_trigger_from(
         }
         Err(tirith_core::util::OpenRegularError::TooLarge) => {
             return Err(format!(
-                "last trigger exceeds the {} byte limit",
-                MAX_LAST_TRIGGER_BYTES
+                "last trigger exceeds the {MAX_LAST_TRIGGER_BYTES} byte limit"
             ))
         }
         Err(tirith_core::util::OpenRegularError::Io(error)) => {

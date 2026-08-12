@@ -2675,12 +2675,10 @@ fn format_age(hours: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
     use std::path::Path;
     use std::sync::atomic::Ordering;
     use tirith_core::threatdb::ThreatDbFormat;
-
-    /// Serialize tests that manipulate environment variables.
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // ---- v2 index (DB-B) -------------------------------------------------
 
@@ -3025,20 +3023,15 @@ mod tests {
         // reads). `install_primary_db`'s own signature check (against the pinned
         // production key) can't be exercised with a self-signed DB, so the path
         // routing is tested directly here.
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let v1_path = tmp.path().join("tirith-threatdb.dat");
-        unsafe {
-            std::env::set_var("TIRITH_THREATDB_PATH", &v1_path);
-        }
+        let _path_guard = EnvGuard::set("TIRITH_THREATDB_PATH", &v1_path);
         let v1_dest = primary_db_dest(1).unwrap();
         let v2_dest = primary_db_dest(2).unwrap();
         assert_eq!(v1_dest, v1_path);
         assert_eq!(v2_dest, tmp.path().join("tirith-threatdb-v2.dat"));
         assert_ne!(v1_dest, v2_dest, "v2 must never resolve to the v1 path");
-        unsafe {
-            std::env::remove_var("TIRITH_THREATDB_PATH");
-        }
     }
 
     #[test]
@@ -3255,7 +3248,7 @@ mod tests {
 
     #[test]
     fn auto_update_hours_zero_disables_background_child() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let policy_dir = tmp.path().join(".tirith");
         std::fs::create_dir_all(&policy_dir).unwrap();
@@ -3265,15 +3258,13 @@ mod tests {
         )
         .unwrap();
 
-        unsafe { std::env::set_var("TIRITH_POLICY_ROOT", tmp.path()) };
+        let _policy_guard = EnvGuard::set("TIRITH_POLICY_ROOT", tmp.path());
 
         let policy = policy::Policy::discover(Some(tmp.path().to_str().unwrap()));
         assert_eq!(
             policy.threat_intel.auto_update_hours, 0,
             "policy should reflect auto_update_hours=0"
         );
-
-        unsafe { std::env::remove_var("TIRITH_POLICY_ROOT") };
     }
 
     #[test]
@@ -4175,7 +4166,7 @@ mod tests {
     #[test]
     fn offline_env_active_recognizes_truthy_values() {
         // `offline_env_active` lives in `cli/mod.rs`; exercised here via the env guard.
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for v in ["1", "true", "TRUE", "yes", "On", " on "] {
             let _e = OfflineEnvGuard::set(v);
             assert!(
@@ -4187,7 +4178,7 @@ mod tests {
 
     #[test]
     fn offline_env_active_rejects_falsey_and_unset() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for v in ["0", "false", "no", "", "off", "garbage"] {
             let _e = OfflineEnvGuard::set(v);
             assert!(
@@ -4206,10 +4197,10 @@ mod tests {
     fn offline_flag_skips_background_update_no_network_attempt() {
         // With `--offline`, `maybe_background_update` must not reach the state
         // dir: no `spawned-at` file, so no child spawned (= zero network).
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _e = OfflineEnvGuard::unset();
         let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
 
         super::maybe_background_update(true);
 
@@ -4218,17 +4209,16 @@ mod tests {
             !spawned_at.exists(),
             "--offline must skip the background update before any state write"
         );
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 
     #[test]
     fn offline_env_skips_background_update_no_network_attempt() {
         // Same guarantee via `TIRITH_OFFLINE` (the path shell hooks and the
         // conformance harness use, lacking CLI flags per `tirith check`).
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _e = OfflineEnvGuard::set("1");
         let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
 
         // `offline_flag = false` here — the env var alone must suffice.
         super::maybe_background_update(false);
@@ -4238,7 +4228,6 @@ mod tests {
             !spawned_at.exists(),
             "TIRITH_OFFLINE=1 must skip the background update before any state write"
         );
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 
     #[test]
@@ -4246,7 +4235,7 @@ mod tests {
         // The offline check is ahead of the once-per-process `UPDATE_ATTEMPTED`
         // latch: an offline call must not consume it, so a later online call can
         // still proceed. Verified on a standalone AtomicBool.
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let latch = AtomicBool::new(false);
         // Simulate the offline early-return: the latch is never swapped.
         let offline = true;
@@ -4468,9 +4457,9 @@ mod tests {
 
     #[test]
     fn record_snapshot_dedups_on_build_sequence() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
 
         let snap = |seq: u64, recorded: u64| DbSnapshot {
             recorded_at: recorded,
@@ -4494,15 +4483,13 @@ mod tests {
         );
         assert_eq!(history[0].build_sequence, 42);
         assert_eq!(history[1].build_sequence, 43);
-
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 
     #[test]
     fn record_snapshot_caps_history_length() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
 
         for seq in 0..(HISTORY_MAX_LINES as u64 + 20) {
             record_snapshot(&DbSnapshot {
@@ -4526,15 +4513,13 @@ mod tests {
             history.last().unwrap().build_sequence,
             HISTORY_MAX_LINES as u64 + 19
         );
-
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 
     #[test]
     fn load_history_skips_corrupt_lines() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
 
         let state = tmp.path().join("tirith");
         std::fs::create_dir_all(&state).unwrap();
@@ -4548,18 +4533,16 @@ mod tests {
         let (history, _) = load_history();
         assert_eq!(history.len(), 1, "only the one valid line should parse");
         assert_eq!(history[0].build_sequence, 1);
-
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 
     #[test]
     fn load_history_missing_file_is_not_an_error() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         // Set the Windows env var alongside the XDG one so the state path is
         // isolated on every platform.
-        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
-        unsafe { std::env::set_var("APPDATA", tmp.path()) };
+        let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
+        let _appdata_guard = EnvGuard::set("APPDATA", tmp.path());
 
         // No history file exists at all — a legitimate "no snapshots yet".
         let (history, read_error) = load_history();
@@ -4568,17 +4551,14 @@ mod tests {
             read_error.is_none(),
             "a missing history file must not surface as a read error"
         );
-
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
-        unsafe { std::env::remove_var("APPDATA") };
     }
 
     #[test]
     fn load_history_unreadable_file_surfaces_a_read_error() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
-        unsafe { std::env::set_var("APPDATA", tmp.path()) };
+        let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
+        let _appdata_guard = EnvGuard::set("APPDATA", tmp.path());
 
         // Create the history *path* as a directory: it exists, but reading it
         // as a file fails with an error that is not NotFound — portably
@@ -4593,9 +4573,6 @@ mod tests {
             "an existing-but-unreadable history file must surface a read error, \
              not be silently treated as 'no snapshots'"
         );
-
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
-        unsafe { std::env::remove_var("APPDATA") };
     }
 
     #[test]

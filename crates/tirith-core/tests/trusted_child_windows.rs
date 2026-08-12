@@ -107,6 +107,19 @@ fn windows_validation_rejects_batch_launchers_without_shell_fallback() {
 }
 
 #[test]
+fn windows_content_binding_fails_closed() {
+    let Some(executable) = trusted_current_exe() else {
+        return;
+    };
+    let error = executable.bind_content().unwrap_err();
+    assert!(
+        matches!(error, TrustedExecutableError::InvalidPath { .. }),
+        "unsupported binding must be an InvalidPath error: {error}"
+    );
+    assert!(error.to_string().contains("unsupported"), "{error}");
+}
+
+#[test]
 fn windows_executable_extension_check_is_case_insensitive() {
     let directory = tempfile::tempdir().unwrap();
     let executable = directory.path().join("CONTROL.EXE");

@@ -32,13 +32,12 @@ pub fn list_checkpoints(json: bool) -> i32 {
                 println!("{}", "-".repeat(100));
                 for e in &entries {
                     let size = format_bytes(e.total_bytes);
-                    let trigger = e
-                        .trigger_command
-                        .as_deref()
-                        .unwrap_or("-")
-                        .chars()
-                        .take(30)
-                        .collect::<String>();
+                    // Trigger commands retain raw argv in checkpoint storage,
+                    // but may contain package-controlled terminal sequences.
+                    // Sanitize before truncating so an escape sequence cannot
+                    // be cut into a dangerous partial form.
+                    let trigger =
+                        checkpoint_trigger_for_human(e.trigger_command.as_deref().unwrap_or("-"));
                     println!(
                         "{:<38} {:<26} {:<8} {:<12} {}",
                         e.id, e.created_at, e.file_count, size, trigger
@@ -53,6 +52,13 @@ pub fn list_checkpoints(json: bool) -> i32 {
             2
         }
     }
+}
+
+fn checkpoint_trigger_for_human(trigger: &str) -> String {
+    super::sanitize_for_human_output(trigger, false)
+        .chars()
+        .take(30)
+        .collect()
 }
 
 pub fn restore_checkpoint(id: &str, json: bool) -> i32 {
@@ -700,12 +706,8 @@ fn emit_watch_json(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
+    use crate::cli::test_harness::ENV_LOCK;
     use tirith_core::checkpoint::{self, ManifestEntry};
-
-    // Local env lock (tirith_core::TEST_ENV_LOCK is pub(crate), unreachable here).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[cfg(unix)]
     #[test]
@@ -764,6 +766,22 @@ mod tests {
     #[test]
     fn run_command_windows_single_argument_is_shell_expression() {
         assert_eq!(super::run_command(&["exit /b 7".to_string()]).unwrap(), 7);
+    }
+
+    #[test]
+    fn checkpoint_trigger_display_strips_terminal_injection_before_truncating() {
+        let rendered = super::checkpoint_trigger_for_human(concat!(
+            "npm install pkgSTART",
+            "\x1b]52;c;aGVsbG8=\x07",
+            "\u{202e}",
+            "\rFORGED\n",
+            "ENDvis",
+        ));
+        for forbidden in ['\x1b', '\x07', '\u{202e}', '\r', '\n'] {
+            assert!(!rendered.contains(forbidden));
+        }
+        assert!(rendered.contains("pkgSTART"));
+        assert!(rendered.chars().count() <= 30);
     }
 
     /// F2: a partial/failed restore (any blob missing/corrupt, or a copy error)

@@ -349,9 +349,9 @@ category = "command"
 severity_rationale = "High — piping to a shell interpreter executes arbitrary remote content without review."
 description = "A command pipes output directly to a shell interpreter (bash, sh, zsh, python, node, etc.). The piped content executes immediately without the user seeing it."
 examples_bad = ["some_command | bash", "generate_script | sudo sh"]
-examples_good = ["some_command > script.sh && cat script.sh && bash script.sh"]
+examples_good = ["tirith check --suggest -- 'curl -fsSL https://example-cli.dev/install.sh | bash'  # emits an absolute typed runner only on x86_64 Linux with root-managed Tirith; execution also requires a root-managed interpreter"]
 false_positive_guidance = "Intentional local pipe chains (e.g., config generators piped to sh) will trigger this. Use TIRITH=0 prefix or add to allowlist."
-remediation = "Write the output to a file first, review it, then execute."
+remediation = "For a remote URL pipeline, run tirith check --suggest on the exact original command. Use the typed capsule rewrite only when one is emitted; otherwise capture into a private location, verify and review the exact bytes, then preserve the intended interpreter semantics manually."
 mitre_id = "T1059.004"
 
 [[rule]]
@@ -361,9 +361,9 @@ category = "command"
 severity_rationale = "High — curl | bash is the most common supply-chain attack vector: arbitrary remote code execution with no review."
 description = "A curl command pipes downloaded content directly to a shell interpreter. The remote server controls what executes on your machine."
 examples_bad = ["curl https://example-cli.dev/install.sh | bash", "curl -sSL https://example-tool.sh/get | sh"]
-examples_good = ["curl -fsSL https://example-cli.dev/install.sh -o install.sh && cat install.sh && bash install.sh", "tirith run https://example-cli.dev/install.sh"]
-false_positive_guidance = "Many legitimate installers use this pattern. Use tirith run for safe download-review-execute."
-remediation = "Download first with curl -o, review the script, then execute. Or use tirith run <url>."
+examples_good = ["'/usr/local/bin/tirith' run --capsule --script-stdin --interpreter bash 'https://example-cli.dev/install.sh'  # generated only from curl -fL forms on x86_64 Linux with root-managed Tirith; execution also validates bash"]
+false_positive_guidance = "Many legitimate installers use this pattern. Run tirith check --suggest on the exact command; it emits a typed capsule rewrite only when curl explicitly has both fail and redirect semantics, the URL/interpreter argv/stdin semantics are provable, and the x86_64 Linux Tirith path is root-managed. At execution, the selected interpreter's first PATH hit must also be root-managed or the runner refuses."
+remediation = "Run tirith check --suggest on the exact original command. On x86_64 Linux, use an emitted absolute --script-stdin/--interpreter capsule command only when Tirith is root-managed and curl supplied both -f/--fail and -L/--location semantics; the runner will fail closed unless the interpreter's first PATH hit is also root-managed. Other architectures, platforms, install paths, and unsupported command shapes remain guidance-only and require manual review."
 mitre_id = "T1059.004"
 
 [[rule]]
@@ -373,9 +373,9 @@ category = "command"
 severity_rationale = "High — wget piped to a shell is equivalent to curl | bash: arbitrary remote code execution."
 description = "A wget command pipes downloaded content directly to a shell interpreter."
 examples_bad = ["wget -qO- https://example-cli.dev/install.sh | bash"]
-examples_good = ["wget https://example-cli.dev/install.sh -O install.sh && cat install.sh && bash install.sh"]
-false_positive_guidance = "Same as curl_pipe_shell. Use tirith run for safe execution."
-remediation = "Download first with wget -O, review the script, then execute."
+examples_good = ["'/usr/local/bin/tirith' run --capsule --script-stdin --interpreter bash 'https://example-cli.dev/install.sh'  # generated on x86_64 Linux with root-managed Tirith for wget stdout-body forms such as -qO-; execution also validates bash"]
+false_positive_guidance = "Same risk as curl_pipe_shell. Run tirith check --suggest on the exact command; wget forms that do not provably stream only the response body remain guidance-only."
+remediation = "Run tirith check --suggest on the exact original command. Use a typed capsule rewrite only if emitted; otherwise keep the downloaded bytes private and execute only the exact reviewed bytes with the intended interpreter semantics."
 mitre_id = "T1059.004"
 
 [[rule]]
@@ -385,9 +385,9 @@ category = "command"
 severity_rationale = "High — HTTPie (http/https CLI) piped to a shell executes arbitrary remote content."
 description = "An HTTPie command (http or https CLI tool) pipes downloaded content to a shell interpreter."
 examples_bad = ["https example-cli.dev/install.sh | bash"]
-examples_good = ["https example-cli.dev/install.sh -o install.sh && cat install.sh && bash install.sh"]
+examples_good = ["Download into a private location, verify and review the exact response bytes, then invoke the intended interpreter explicitly"]
 false_positive_guidance = "Same risk as curl | bash."
-remediation = "Download first, review, then execute."
+remediation = "HTTPie output formatting is not an executable typed-rewrite contract. Keep the response bytes in a private location, verify and review them, then invoke the intended interpreter explicitly inside an available containment boundary."
 mitre_id = "T1059.004"
 
 [[rule]]
@@ -397,9 +397,9 @@ category = "command"
 severity_rationale = "High — xh piped to a shell executes arbitrary remote content."
 description = "An xh command (HTTPie-compatible HTTP client) pipes downloaded content to a shell interpreter."
 examples_bad = ["xh https://example-cli.dev/install.sh | bash"]
-examples_good = ["xh https://example-cli.dev/install.sh -o install.sh && cat install.sh && bash install.sh"]
+examples_good = ["Download into a private location, verify and review the exact response bytes, then invoke the intended interpreter explicitly"]
 false_positive_guidance = "Same risk as curl | bash."
-remediation = "Download first, review, then execute."
+remediation = "xh output formatting is not an executable typed-rewrite contract. Keep the response bytes in a private location, verify and review them, then invoke the intended interpreter explicitly inside an available containment boundary."
 mitre_id = "T1059.004"
 
 [[rule]]
@@ -2262,7 +2262,7 @@ id = "env_sensitive_exposed_to_unknown_script"
 title = "Sensitive env var exposed to an unknown downloaded script"
 category = "environment"
 severity_rationale = "High — when a sensitive environment variable (an AWS key, GitHub/npm/PyPI token, OpenAI/Anthropic/Stripe API key, …) is set in your shell AND you pipe remote content straight into an interpreter (`curl … | bash`), the downloaded script inherits the entire environment and can read and exfiltrate every secret. The combination of a live credential and a sight-unseen script is the canonical supply-chain credential-theft setup."
-description = "`engine::analyze` (with `env_guard_enabled`) found one or more sensitive env vars set while the command pipes a network fetch into a shell. The finding lists the exposed variable NAMES only — never the values. This is the dedicated rule the `--suggest` env-scrub rewrite attaches to, suggesting `env -u VAR … <cmd>` to strip the secrets for that one invocation."
+description = "`engine::analyze` (with `env_guard_enabled`) found one or more sensitive env vars set while the command pipes a network fetch into a shell. The finding lists the exposed variable NAMES only — never the values. `--suggest` provides guidance to use `env -u VAR … <cmd>` for a reviewed local invocation, but never emits environment scrubbing as an executable `safe_command` because shell and process-environment semantics are not mechanically provable."
 examples_bad = ["AWS_SECRET_ACCESS_KEY set, then `curl https://get.example.sh | bash`", "GITHUB_TOKEN exported, then `wget -qO- https://install.example | sh`"]
 examples_good = ["Download to a file, review it, then run it with a scrubbed environment: `env -u AWS_SECRET_ACCESS_KEY bash ./install.sh`"]
 false_positive_guidance = "A trusted vendor install script you have already reviewed will still trip this whenever credentials are in your environment — that is the point. Scrub the secrets for the invocation (`env -u VAR …`) or run the reviewed script from a file rather than a live pipe."

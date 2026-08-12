@@ -220,7 +220,7 @@ pub fn sign(key_path: &str, card_path: &str, json: bool) -> i32 {
         let card_path = human_display_field(card_path);
         let key_id = human_display_field(&sig.key_id);
         let algo = human_display_field(&sig.algo.to_string());
-        println!("Signed {card_path} (key_id {}, algo {}).", key_id, algo);
+        println!("Signed {card_path} (key_id {key_id}, algo {algo}).");
     }
     0
 }
