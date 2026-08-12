@@ -2,11 +2,13 @@
 //!
 //! Security-sensitive callers resolve an executable once, validate its absolute
 //! identity, clear the ambient environment, and run it with explicit capture
-//! limits. On Linux every child owns an anchored process group; on Windows every
+//! limits. On Unix every child owns an anchored process group; on Windows every
 //! child is created suspended, assigned to a kill-on-close Job Object, then
-//! resumed. Other hosts supervise only the direct child. Completion, timeout, or
-//! output-flood cleanup therefore covers descendants where the host provides a
-//! safe complete-tree primitive without risking numeric process-group reuse.
+//! resumed. Completion, timeout, or output-flood cleanup therefore covers the
+//! spawned Unix process group or Windows Job without risking numeric
+//! process-group reuse. A Unix descendant that deliberately creates a new
+//! session leaves that process-group boundary and is outside this trusted-child
+//! contract.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -25,9 +27,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
-use std::time::Duration;
-#[cfg(not(windows))]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 mod windows;
@@ -67,6 +67,8 @@ pub struct TrustedExecutable {
     digest: [u8; 32],
     #[cfg(windows)]
     source: WindowsExecutableSource,
+    #[cfg(windows)]
+    provenance: WindowsTrustProvenance,
     #[cfg(target_os = "linux")]
     bound: Option<Arc<BoundExecutable>>,
 }
@@ -86,6 +88,10 @@ impl PartialEq for TrustedExecutable {
         }
         #[cfg(windows)]
         if self.source != other.source {
+            return false;
+        }
+        #[cfg(windows)]
+        if self.provenance != other.provenance {
             return false;
         }
         bound_state_eq(self, other)
@@ -220,7 +226,7 @@ pub fn evaluate_windows_trust(
         WindowsExecutableSource::ExplicitAbsolute => Ok(WindowsTrustProvenance::ExplicitAbsolute),
         WindowsExecutableSource::CurrentProcess => Ok(WindowsTrustProvenance::CurrentProcess),
         WindowsExecutableSource::SystemCandidate => {
-            if facts.protected_install_root {
+            if facts.protected_install_root && facts.leaf_owner != WindowsOwnerClass::CurrentUser {
                 Ok(WindowsTrustProvenance::SystemCandidate)
             } else if facts.authenticode_trusted {
                 Ok(WindowsTrustProvenance::Authenticode)
@@ -231,7 +237,9 @@ pub fn evaluate_windows_trust(
         WindowsExecutableSource::PathSearch => {
             if facts.authenticode_trusted {
                 Ok(WindowsTrustProvenance::Authenticode)
-            } else if facts.protected_install_root {
+            } else if facts.protected_install_root
+                && facts.leaf_owner != WindowsOwnerClass::CurrentUser
+            {
                 Ok(WindowsTrustProvenance::ProtectedInstall)
             } else if facts.secure_user_install {
                 Ok(WindowsTrustProvenance::SecureUserInstall)
@@ -240,6 +248,21 @@ pub fn evaluate_windows_trust(
             }
         }
     }
+}
+
+/// Whether already-collected Windows executable provenance is strong enough
+/// for a security-sensitive helper selected from `PATH`. Authenticode binds the
+/// image to a trusted publisher; protected-install provenance binds it to an
+/// administrator-owned install root. A merely owner-only current-user install
+/// remains replaceable by the same principal that controls the ambient PATH and
+/// is therefore rejected at this boundary.
+pub fn windows_provenance_is_system_helper_approved(provenance: WindowsTrustProvenance) -> bool {
+    matches!(
+        provenance,
+        WindowsTrustProvenance::SystemCandidate
+            | WindowsTrustProvenance::Authenticode
+            | WindowsTrustProvenance::ProtectedInstall
+    )
 }
 
 /// Pure Windows DACL access-mask classifier used by the platform collector.
@@ -470,18 +493,20 @@ impl TrustedExecutable {
         }
         #[cfg(windows)]
         {
-            windows::validate_executable(&canonical, _source).map_err(|reason| {
-                TrustedExecutableError::InvalidPath {
-                    path: canonical.clone(),
-                    reason,
-                }
-            })?;
+            let provenance =
+                windows::validate_executable(&canonical, _source).map_err(|reason| {
+                    TrustedExecutableError::InvalidPath {
+                        path: canonical.clone(),
+                        reason,
+                    }
+                })?;
             let digest = executable_digest(&canonical)?;
             Ok(Self {
                 invocation_path: path.to_path_buf(),
                 path: canonical,
                 digest,
                 source: _source,
+                provenance,
             })
         }
         #[cfg(not(any(unix, windows)))]
@@ -638,12 +663,21 @@ impl TrustedExecutable {
                 return Err(TrustedExecutableError::NotExecutable(canonical));
             }
             #[cfg(windows)]
-            windows::validate_executable(&canonical, self.source).map_err(|reason| {
-                TrustedExecutableError::InvalidPath {
-                    path: canonical.clone(),
-                    reason,
+            {
+                let provenance =
+                    windows::validate_executable(&canonical, self.source).map_err(|reason| {
+                        TrustedExecutableError::InvalidPath {
+                            path: canonical.clone(),
+                            reason,
+                        }
+                    })?;
+                if provenance != self.provenance {
+                    return Err(TrustedExecutableError::InvalidPath {
+                        path: canonical,
+                        reason: "executable provenance changed after validation".to_string(),
+                    });
                 }
-            })?;
+            }
             if executable_digest(&canonical)? != self.digest {
                 return Err(TrustedExecutableError::InvalidPath {
                     path: canonical,
@@ -830,7 +864,7 @@ impl TrustedExecutable {
     /// explicitly configured tools; forced interpreters have the narrower
     /// root-managed system contract documented by [`resolve_forced_interpreter`].
     pub fn require_forced_interpreter_provenance(self) -> Result<Self, TrustedExecutableError> {
-        if root_managed_system_provenance_is_approved(self.path()) {
+        if root_managed_system_provenance_is_approved(self.invocation_path(), self.path()) {
             Ok(self)
         } else {
             Err(TrustedExecutableError::InvalidPath {
@@ -848,12 +882,48 @@ impl TrustedExecutable {
     /// root-owned system-bin paths whose complete ancestor chain is not
     /// group/world-writable cross this delayed-reinvocation boundary.
     pub fn require_safe_reinvocation_provenance(self) -> Result<Self, TrustedExecutableError> {
-        if root_managed_system_provenance_is_approved(self.path()) {
+        if root_managed_system_provenance_is_approved(self.invocation_path(), self.path()) {
             Ok(self)
         } else {
             Err(TrustedExecutableError::InvalidPath {
                 path: self.path().to_path_buf(),
                 reason: "delayed safe-command reinvocation requires a root-owned, non-group/world-writable system-bin path and ancestor chain"
+                    .to_string(),
+            })
+        }
+    }
+
+    /// Whether this executable carries provenance strong enough for a helper
+    /// that runs while Tirith is still deciding a security verdict.
+    ///
+    /// Unix requires a fixed, root-managed system/package-manager bin origin
+    /// and a root-owned canonical target hierarchy. Windows accepts protected
+    /// administrator installs and Authenticode, but not same-user-only PATH
+    /// provenance. Other platforms fail closed.
+    pub fn has_system_helper_provenance(&self) -> bool {
+        #[cfg(unix)]
+        {
+            root_managed_system_provenance_is_approved(self.invocation_path(), self.path())
+        }
+        #[cfg(windows)]
+        {
+            windows_provenance_is_system_helper_approved(self.provenance)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            false
+        }
+    }
+
+    /// Enforce [`Self::has_system_helper_provenance`] while retaining the
+    /// validated executable identity for the eventual bounded spawn.
+    pub fn require_system_helper_provenance(self) -> Result<Self, TrustedExecutableError> {
+        if self.has_system_helper_provenance() {
+            Ok(self)
+        } else {
+            Err(TrustedExecutableError::InvalidPath {
+                path: self.path().to_path_buf(),
+                reason: "untrusted executable provenance: pre-verdict helpers must be installed in an approved administrator-managed, non-writable system/package-manager bin tree on Unix, or have Authenticode/protected-install provenance on Windows; same-user-only PATH tools are not accepted"
                     .to_string(),
             })
         }
@@ -1451,6 +1521,26 @@ pub fn resolve_ambient(name: &str) -> Result<TrustedExecutable, TrustedExecutabl
     TrustedExecutable::resolve_on_path(name, &path, &ambient_denied_roots())
 }
 
+/// Resolve a helper that may run before Tirith has produced a security verdict.
+/// The first executable PATH hit remains authoritative, but project/temp and
+/// same-user-only installed tools fail closed instead of being executed or
+/// silently skipped in favor of a different program.
+pub fn resolve_system_helper(name: &str) -> Result<TrustedExecutable, TrustedExecutableError> {
+    let path = std::env::var_os("PATH")
+        .ok_or_else(|| TrustedExecutableError::NotFound(format!("{name} (PATH is unset)")))?;
+    resolve_system_helper_on_path(name, &path)
+}
+
+/// Explicit-PATH variant of [`resolve_system_helper`] for deterministic callers
+/// and regression tests.
+pub fn resolve_system_helper_on_path(
+    name: &str,
+    path_value: &OsStr,
+) -> Result<TrustedExecutable, TrustedExecutableError> {
+    TrustedExecutable::resolve_on_path(name, path_value, &ambient_denied_roots())?
+        .require_system_helper_provenance()
+}
+
 /// Resolve a forced remote-script interpreter from ambient `PATH`, but accept
 /// the first hit only when its canonical executable has an approved installed
 /// provenance. Project/temp checks alone are insufficient: a user-owned
@@ -1478,20 +1568,61 @@ pub fn resolve_forced_interpreter_on_path(
 }
 
 #[cfg(unix)]
-fn root_managed_system_provenance_is_approved(path: &Path) -> bool {
-    for configured in [
-        "/bin",
-        "/usr/bin",
-        "/usr/local/bin",
-        "/usr/local/sbin",
-        "/opt/local/bin",
-    ] {
-        let Ok(root) = Path::new(configured).canonicalize() else {
+const ROOT_MANAGED_SYSTEM_HELPER_BINS: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/opt/local/bin",
+    "/opt/local/sbin",
+    "/run/current-system/sw/bin",
+    "/nix/var/nix/profiles/default/bin",
+];
+
+#[cfg(unix)]
+fn root_managed_system_helper_bin_is_allowlisted(path: &Path) -> bool {
+    let path = lexical_normalize(path);
+    ROOT_MANAGED_SYSTEM_HELPER_BINS
+        .iter()
+        .any(|configured_bin| path == lexical_normalize(Path::new(configured_bin)))
+}
+
+#[cfg(unix)]
+fn root_managed_system_provenance_is_approved(
+    invocation_path: &Path,
+    canonical_path: &Path,
+) -> bool {
+    let Some(selected_parent) = invocation_path.parent() else {
+        return false;
+    };
+    let selected_parent_lexical = lexical_normalize(selected_parent);
+    let Ok(invocation_parent) = selected_parent.canonicalize() else {
+        return false;
+    };
+
+    // Package-manager and NixOS origins are included only when both the exact
+    // selected bin directory and the canonical target's complete hierarchy are
+    // root-managed. Ordinary same-UID Homebrew, MacPorts, and per-user Nix
+    // layouts therefore fail closed, while administrator-managed installs
+    // retain legitimate behavior.
+    if !root_managed_system_helper_bin_is_allowlisted(selected_parent) {
+        return false;
+    }
+    for &configured_bin in ROOT_MANAGED_SYSTEM_HELPER_BINS {
+        if selected_parent_lexical != lexical_normalize(Path::new(configured_bin)) {
+            continue;
+        }
+        let Ok(bin) = Path::new(configured_bin).canonicalize() else {
             continue;
         };
-        if path.parent() == Some(root.as_path())
-            && root_managed_chain_is_secure(&root)
-            && root_managed_path_is_secure(path)
+        if invocation_parent == bin
+            && root_managed_selection_chain_is_secure(Path::new(configured_bin))
+            && root_managed_chain_is_secure(&invocation_parent)
+            && root_managed_chain_is_secure(canonical_path)
         {
             return true;
         }
@@ -1501,7 +1632,10 @@ fn root_managed_system_provenance_is_approved(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn root_managed_system_provenance_is_approved(_path: &Path) -> bool {
+fn root_managed_system_provenance_is_approved(
+    _invocation_path: &Path,
+    _canonical_path: &Path,
+) -> bool {
     false
 }
 
@@ -1509,14 +1643,68 @@ fn root_managed_system_provenance_is_approved(_path: &Path) -> bool {
 fn root_managed_path_is_secure(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
 
-    std::fs::metadata(path)
-        .map(|metadata| metadata.uid() == 0 && metadata.mode() & 0o022 == 0)
-        .unwrap_or(false)
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    metadata.uid() == 0
+        && metadata.mode() & 0o022 == 0
+        && reject_unix_extended_acl(path, metadata.is_dir()).is_ok()
 }
 
 #[cfg(unix)]
 fn root_managed_chain_is_secure(path: &Path) -> bool {
     path.ancestors().all(root_managed_path_is_secure)
+}
+
+#[cfg(unix)]
+fn root_managed_selection_chain_is_secure(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    path.ancestors().all(|component| {
+        let Ok(metadata) = std::fs::symlink_metadata(component) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() {
+            // Link replacement is governed by its parent, which is another
+            // element in this same lexical chain. The link itself must still
+            // be administrator-owned; its conventional 0777 mode is not a
+            // mutation grant on Unix.
+            metadata.uid() == 0
+        } else {
+            metadata.uid() == 0
+                && metadata.mode() & 0o022 == 0
+                && reject_unix_extended_acl(component, metadata.is_dir()).is_ok()
+        }
+    })
+}
+
+#[cfg(all(test, unix))]
+mod system_helper_provenance_tests {
+    use super::root_managed_system_helper_bin_is_allowlisted;
+    use std::path::Path;
+
+    #[test]
+    fn global_nix_bins_are_exact_allowlisted_origins() {
+        assert!(root_managed_system_helper_bin_is_allowlisted(Path::new(
+            "/run/current-system/sw/bin"
+        )));
+        assert!(root_managed_system_helper_bin_is_allowlisted(Path::new(
+            "/nix/var/nix/profiles/default/bin"
+        )));
+
+        for rejected in [
+            "/run/current-system/sw/bin/subdir",
+            "/nix/var/nix/profiles/default/bin/subdir",
+            "/home/alice/.nix-profile/bin",
+            "/Users/alice/.nix-profile/bin",
+            "/nix/var/nix/profiles/per-user/alice/profile/bin",
+        ] {
+            assert!(
+                !root_managed_system_helper_bin_is_allowlisted(Path::new(rejected)),
+                "non-global or non-exact Nix bin must not be allowlisted: {rejected}"
+            );
+        }
+    }
 }
 
 /// Construct the PATH value a trusted child may inherit. Relative, denied, and
@@ -1672,6 +1860,14 @@ pub struct ChildSpec {
     env: Vec<(OsString, OsString)>,
     cwd: Option<PathBuf>,
     limits: ChildLimits,
+    /// Additional already-open capabilities that a Linux child must retain.
+    ///
+    /// The caller owns these descriptors and must keep their backing handles live
+    /// until [`run`] returns. `run` validates each descriptor before spawning and
+    /// clears only `FD_CLOEXEC` in the child. This is intentionally narrower than
+    /// ambient descriptor inheritance: callers opt in one exact fd at a time.
+    #[cfg(target_os = "linux")]
+    inherited_fds: Vec<std::os::fd::RawFd>,
 }
 
 impl ChildSpec {
@@ -1688,6 +1884,8 @@ impl ChildSpec {
             env: Vec::new(),
             cwd: None,
             limits,
+            #[cfg(target_os = "linux")]
+            inherited_fds: Vec::new(),
         }
     }
 
@@ -1710,6 +1908,19 @@ impl ChildSpec {
         self.cwd = Some(cwd.into());
         self
     }
+
+    /// Retain one exact Linux descriptor across the child exec boundary.
+    ///
+    /// This supports capability paths such as `/proc/self/fd/N` without asking a
+    /// child to dereference its parent's procfs entries (which Yama, hidepid, or a
+    /// procfs mount policy may forbid). The backing handle must outlive [`run`].
+    #[cfg(target_os = "linux")]
+    pub fn inherit_fd(mut self, fd: std::os::fd::RawFd) -> Self {
+        if !self.inherited_fds.contains(&fd) {
+            self.inherited_fds.push(fd);
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1727,6 +1938,10 @@ pub enum ChildOutcome {
     },
     SpawnError(String),
     WaitError(String),
+    /// The direct child reached a terminal state, but cleanup of its supervised
+    /// process group/Job or capture workers could not be proven within the
+    /// cleanup deadline.
+    CleanupError(String),
     Timeout {
         cleanup_succeeded: bool,
     },
@@ -1747,7 +1962,7 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
     stream: CaptureStream,
     cap: usize,
     sender: mpsc::Sender<ReaderMessage>,
-) {
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut output = Vec::with_capacity(cap.min(64 * 1024));
         let mut chunk = [0u8; 8192];
@@ -1770,7 +1985,7 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
                 }
             }
         }
-    });
+    })
 }
 
 /// Execute a validated absolute program with an empty-by-default environment,
@@ -1791,6 +2006,17 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
 pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
     if let Err(error) = executable.verify_identity() {
         return ChildOutcome::SpawnError(error.to_string());
+    }
+    #[cfg(target_os = "linux")]
+    for fd in &spec.inherited_fds {
+        // SAFETY: F_GETFD only inspects the caller-supplied descriptor number; no
+        // pointer is dereferenced. A negative/closed descriptor is rejected.
+        if *fd < 0 || unsafe { libc::fcntl(*fd, libc::F_GETFD) } < 0 {
+            return ChildOutcome::SpawnError(format!(
+                "inherited capability descriptor {fd} is not open: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
     }
     #[cfg(target_os = "linux")]
     let bound_fd = executable.bound_launch_fd();
@@ -1826,10 +2052,15 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
-        // SAFETY: setpgid/fcntl are async-signal-safe. Every Unix child gets a
-        // private process group. A Linux content-bound launch additionally
-        // clears CLOEXEC on the sealed descriptor so a shebang interpreter can
-        // reopen `/proc/self/fd/N`.
+        // SAFETY: setpgid/fcntl are async-signal-safe. Every Unix child becomes
+        // the leader of a private process group before exec. A Linux
+        // content-bound launch also clears CLOEXEC on the already-sealed
+        // descriptor so a shebang interpreter can reopen `/proc/self/fd/N`;
+        // the child can observe that immutable descriptor but cannot change its
+        // sealed bytes. Explicit capability descriptors use the same narrow
+        // inheritance rule, preserving any descriptor flags other than CLOEXEC.
+        #[cfg(target_os = "linux")]
+        let inherited_fds = spec.inherited_fds.clone();
         unsafe {
             command.pre_exec(move || {
                 if libc::setpgid(0, 0) != 0 {
@@ -1838,6 +2069,13 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
                 #[cfg(target_os = "linux")]
                 if let Some(fd) = bound_fd {
                     if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                for fd in &inherited_fds {
+                    let flags = libc::fcntl(*fd, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
                 }
@@ -1850,89 +2088,173 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
         Ok(child) => child,
         Err(error) => return ChildOutcome::SpawnError(error.to_string()),
     };
+    #[cfg(unix)]
     let child_pid = child.id();
+    #[cfg(unix)]
+    let process_group = match confirm_process_group(child_pid) {
+        Ok(process_group) => process_group,
+        Err(error) => {
+            let cleanup_deadline = Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT;
+            let _ = child.kill();
+            let reaped = matches!(
+                wait_for_direct_exit_and_reap(&mut child, child_pid, cleanup_deadline),
+                Some(Ok(_))
+            );
+            return ChildOutcome::SpawnError(format!(
+                "child process-group confirmation failed: {error}; direct-child cleanup succeeded: {reaped}"
+            ));
+        }
+    };
     let (sender, receiver) = mpsc::channel();
+    #[cfg(unix)]
+    let mut reader_workers = Vec::with_capacity(2);
     if let Some(stdout) = child.stdout.take() {
-        spawn_reader(
+        let worker = spawn_reader(
             stdout,
             CaptureStream::Stdout,
             spec.limits.stdout_bytes,
             sender.clone(),
         );
+        #[cfg(unix)]
+        reader_workers.push((CaptureStream::Stdout, worker));
+        #[cfg(not(unix))]
+        drop(worker);
     }
     if let Some(stderr) = child.stderr.take() {
-        spawn_reader(
+        let worker = spawn_reader(
             stderr,
             CaptureStream::Stderr,
             spec.limits.stderr_bytes,
             sender,
         );
+        #[cfg(unix)]
+        reader_workers.push((CaptureStream::Stderr, worker));
+        #[cfg(not(unix))]
+        drop(worker);
     }
 
     let deadline = Instant::now() + spec.limits.timeout;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     let mut direct_exit_observed = false;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(unix)]
+    let mut capture = CaptureState::default();
+    #[cfg(not(unix))]
     let mut status = None;
+    #[cfg(not(unix))]
     let mut stdout = None;
+    #[cfg(not(unix))]
     let mut stderr = None;
     loop {
         while let Ok(message) = receiver.try_recv() {
-            match message {
-                ReaderMessage::Complete(CaptureStream::Stdout, bytes) => stdout = Some(bytes),
-                ReaderMessage::Complete(CaptureStream::Stderr, bytes) => stderr = Some(bytes),
-                ReaderMessage::Limit(stream) => {
-                    let termination = terminate_tree(&mut child, child_pid, true);
-                    return ChildOutcome::OutputLimitExceeded {
-                        stream,
-                        cleanup_succeeded: termination.cleanup_confirmed(),
-                    };
+            #[cfg(unix)]
+            {
+                let cause = match &message {
+                    ReaderMessage::Complete(..) => None,
+                    ReaderMessage::Limit(stream) => Some(UnixFinishCause::OutputLimit(*stream)),
+                    ReaderMessage::Error(stream, reason) => {
+                        Some(UnixFinishCause::ReaderError(*stream, reason.clone()))
+                    }
+                };
+                if let Err(error) = capture.record(message) {
+                    return finish_unix_run(
+                        UnixFinishContext {
+                            child: &mut child,
+                            child_pid,
+                            process_group,
+                            direct_exit_observed,
+                            receiver: &receiver,
+                            workers: &mut reader_workers,
+                            capture: &mut capture,
+                        },
+                        UnixFinishCause::WaitError(error),
+                    );
                 }
-                ReaderMessage::Error(stream, reason) => {
-                    let _ = terminate_tree(&mut child, child_pid, true);
-                    return ChildOutcome::WaitError(format!("read {stream:?}: {reason}"));
+                if let Some(cause) = cause {
+                    return finish_unix_run(
+                        UnixFinishContext {
+                            child: &mut child,
+                            child_pid,
+                            process_group,
+                            direct_exit_observed,
+                            receiver: &receiver,
+                            workers: &mut reader_workers,
+                            capture: &mut capture,
+                        },
+                        cause,
+                    );
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                match message {
+                    ReaderMessage::Complete(CaptureStream::Stdout, bytes) => stdout = Some(bytes),
+                    ReaderMessage::Complete(CaptureStream::Stderr, bytes) => stderr = Some(bytes),
+                    ReaderMessage::Limit(stream) => {
+                        let killed = child.kill().is_ok();
+                        let reaped = child.wait().is_ok();
+                        return ChildOutcome::OutputLimitExceeded {
+                            stream,
+                            cleanup_succeeded: killed && reaped,
+                        };
+                    }
+                    ReaderMessage::Error(stream, reason) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return ChildOutcome::WaitError(format!("read {stream:?}: {reason}"));
+                    }
                 }
             }
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             if !direct_exit_observed {
                 match observe_child_exit_without_reaping(child_pid, true) {
                     Ok(observed) => direct_exit_observed = observed,
                     Err(error) => {
-                        let _ = terminate_tree(&mut child, child_pid, true);
-                        return ChildOutcome::WaitError(error.to_string());
+                        return finish_unix_run(
+                            UnixFinishContext {
+                                child: &mut child,
+                                child_pid,
+                                process_group,
+                                direct_exit_observed,
+                                receiver: &receiver,
+                                workers: &mut reader_workers,
+                                capture: &mut capture,
+                            },
+                            UnixFinishCause::WaitError(error.to_string()),
+                        );
                     }
                 }
             }
-            if direct_exit_observed && stdout.is_some() && stderr.is_some() {
-                let termination = terminate_tree(&mut child, child_pid, false);
-                if !termination.signal_and_reap_succeeded() {
-                    return ChildOutcome::WaitError(
-                        "child process group could not be safely signalled and reaped".into(),
-                    );
-                }
-                let Some(status) = termination.status else {
-                    return ChildOutcome::WaitError(
-                        "direct child could not be reaped after group termination".into(),
-                    );
-                };
-                return ChildOutcome::Completed {
-                    status,
-                    stdout: stdout.take().expect("stdout completion checked"),
-                    stderr: stderr.take().expect("stderr completion checked"),
-                };
+            if direct_exit_observed {
+                // Do not wait for EOF first. A successful direct child may have
+                // left a descendant holding either captured pipe. Signal the
+                // still-anchored group, then reap and join the readers under one
+                // bounded cleanup deadline.
+                return finish_unix_run(
+                    UnixFinishContext {
+                        child: &mut child,
+                        child_pid,
+                        process_group,
+                        direct_exit_observed: true,
+                        receiver: &receiver,
+                        workers: &mut reader_workers,
+                        capture: &mut capture,
+                    },
+                    UnixFinishCause::DirectExit,
+                );
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         {
             if status.is_none() {
                 match child.try_wait() {
                     Ok(Some(exit)) => status = Some(exit),
                     Ok(None) => {}
                     Err(error) => {
-                        let _ = terminate_tree(&mut child, child_pid, true);
+                        let _ = child.kill();
+                        let _ = child.wait();
                         return ChildOutcome::WaitError(error.to_string());
                     }
                 }
@@ -1964,22 +2286,138 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
             }
         }
         if Instant::now() >= deadline {
-            let termination = terminate_tree(&mut child, child_pid, true);
-            return ChildOutcome::Timeout {
-                cleanup_succeeded: termination.cleanup_confirmed(),
-            };
+            #[cfg(unix)]
+            return finish_unix_run(
+                UnixFinishContext {
+                    child: &mut child,
+                    child_pid,
+                    process_group,
+                    direct_exit_observed,
+                    receiver: &receiver,
+                    workers: &mut reader_workers,
+                    capture: &mut capture,
+                },
+                UnixFinishCause::Timeout,
+            );
+            #[cfg(not(unix))]
+            {
+                let killed = child.kill().is_ok();
+                let reaped = child.wait().is_ok();
+                return ChildOutcome::Timeout {
+                    cleanup_succeeded: killed && reaped,
+                };
+            }
         }
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
 #[cfg(unix)]
-const PROCESS_GROUP_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+const PROCESS_TREE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(unix, windows))]
+const PROCESS_SUPERVISOR_POLL: Duration = Duration::from_millis(10);
+
+#[cfg(any(unix, windows))]
+enum ReaderTerminal {
+    Complete(Vec<u8>),
+    Limit,
+    Error(String),
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Default)]
+struct CaptureState {
+    stdout: Option<ReaderTerminal>,
+    stderr: Option<ReaderTerminal>,
+}
+
+#[cfg(any(unix, windows))]
+impl CaptureState {
+    fn record(&mut self, message: ReaderMessage) -> Result<(), String> {
+        let (stream, terminal) = match message {
+            ReaderMessage::Complete(stream, bytes) => (stream, ReaderTerminal::Complete(bytes)),
+            ReaderMessage::Limit(stream) => (stream, ReaderTerminal::Limit),
+            ReaderMessage::Error(stream, reason) => (stream, ReaderTerminal::Error(reason)),
+        };
+        let slot = match stream {
+            CaptureStream::Stdout => &mut self.stdout,
+            CaptureStream::Stderr => &mut self.stderr,
+        };
+        if slot.is_some() {
+            return Err(format!("capture worker reported {stream:?} more than once"));
+        }
+        *slot = Some(terminal);
+        Ok(())
+    }
+
+    fn all_terminal(&self) -> bool {
+        self.stdout.is_some() && self.stderr.is_some()
+    }
+
+    fn first_limit(&self) -> Option<CaptureStream> {
+        if matches!(self.stdout.as_ref(), Some(ReaderTerminal::Limit)) {
+            Some(CaptureStream::Stdout)
+        } else if matches!(self.stderr.as_ref(), Some(ReaderTerminal::Limit)) {
+            Some(CaptureStream::Stderr)
+        } else {
+            None
+        }
+    }
+
+    fn first_error(&self) -> Option<(CaptureStream, String)> {
+        if let Some(ReaderTerminal::Error(reason)) = &self.stdout {
+            return Some((CaptureStream::Stdout, reason.clone()));
+        }
+        if let Some(ReaderTerminal::Error(reason)) = &self.stderr {
+            return Some((CaptureStream::Stderr, reason.clone()));
+        }
+        None
+    }
+
+    fn take_completed(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        let stdout = match self.stdout.take()? {
+            ReaderTerminal::Complete(bytes) => bytes,
+            other => {
+                self.stdout = Some(other);
+                return None;
+            }
+        };
+        let stderr = match self.stderr.take()? {
+            ReaderTerminal::Complete(bytes) => bytes,
+            other => {
+                self.stdout = Some(ReaderTerminal::Complete(stdout));
+                self.stderr = Some(other);
+                return None;
+            }
+        };
+        Some((stdout, stderr))
+    }
+}
+
+#[cfg(unix)]
+enum UnixFinishCause {
+    DirectExit,
+    Timeout,
+    OutputLimit(CaptureStream),
+    ReaderError(CaptureStream, String),
+    WaitError(String),
+}
+
+#[cfg(unix)]
+struct UnixFinishContext<'a> {
+    child: &'a mut std::process::Child,
+    child_pid: u32,
+    process_group: u32,
+    direct_exit_observed: bool,
+    receiver: &'a mpsc::Receiver<ReaderMessage>,
+    workers: &'a mut Vec<(CaptureStream, std::thread::JoinHandle<()>)>,
+    capture: &'a mut CaptureState,
+}
 
 /// Observe the direct child with `WNOWAIT`. Keeping its zombie unreaped reserves
 /// the numeric PID/PGID until the complete group has received its final signal,
 /// preventing a negative-PID signal from reaching an unrelated reused group.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn observe_child_exit_without_reaping(child_pid: u32, nonblocking: bool) -> std::io::Result<bool> {
     let mut flags = libc::WEXITED | libc::WNOWAIT;
     if nonblocking {
@@ -2001,59 +2439,102 @@ fn observe_child_exit_without_reaping(child_pid: u32, nonblocking: bool) -> std:
 }
 
 #[cfg(unix)]
+fn confirm_process_group(child_pid: u32) -> std::io::Result<u32> {
+    loop {
+        let process_group = unsafe { libc::getpgid(child_pid as libc::pid_t) };
+        if process_group == child_pid as libc::pid_t {
+            return Ok(child_pid);
+        }
+        if process_group >= 0 {
+            return Err(std::io::Error::other(format!(
+                "child {child_pid} joined unexpected process group {process_group}"
+            )));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProcessGroupSignal {
     Delivered,
     Gone,
-    Failed,
 }
 
-/// Deliver the final group signal with a bounded retry for `EINTR`. macOS CI
-/// can interrupt this syscall while the direct child is being reaped; treating
-/// that transient interruption as a cleanup failure makes a successfully
-/// supervised child look unsafe. Other errors remain fail-closed.
+/// Deliver a process-group signal with a bounded retry for `EINTR`. macOS can
+/// interrupt this syscall while the direct child is transitioning to a zombie;
+/// other errors remain fail-closed and retain their original errno.
 #[cfg(unix)]
 fn signal_process_group_with(
-    mut send: impl FnMut() -> Result<(), Option<i32>>,
-) -> ProcessGroupSignal {
+    mut send: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<ProcessGroupSignal> {
     const MAX_INTERRUPTED_ATTEMPTS: usize = 32;
 
     for _ in 0..MAX_INTERRUPTED_ATTEMPTS {
         match send() {
-            Ok(()) => return ProcessGroupSignal::Delivered,
-            Err(Some(libc::ESRCH)) => return ProcessGroupSignal::Gone,
-            Err(Some(libc::EINTR)) => continue,
-            Err(_) => return ProcessGroupSignal::Failed,
+            Ok(()) => return Ok(ProcessGroupSignal::Delivered),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+                return Ok(ProcessGroupSignal::Gone);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
         }
     }
-    ProcessGroupSignal::Failed
+    Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
 }
 
-#[cfg(target_os = "linux")]
-fn signal_process_group(process_group: u32, signal: libc::c_int) -> std::io::Result<()> {
-    match signal_process_group_with(|| {
+#[cfg(unix)]
+fn signal_process_group(
+    process_group: u32,
+    signal: libc::c_int,
+    direct_exit_observed: bool,
+) -> std::io::Result<()> {
+    let outcome = signal_process_group_with(|| {
         // SAFETY: the unreaped direct child anchors this process-group ID.
-        let status = unsafe { libc::kill(-(process_group as libc::pid_t), signal) };
-        if status == 0 {
+        if unsafe { libc::kill(-(process_group as libc::pid_t), signal) } == 0 {
             Ok(())
         } else {
-            Err(std::io::Error::last_os_error().raw_os_error())
+            Err(std::io::Error::last_os_error())
         }
-    }) {
+    })?;
+    // Some Unix kernels do not count an exited, unreaped leader as a signalable
+    // group member. ESRCH after WNOWAIT observation therefore proves there was
+    // no remaining signalable member while the zombie still prevented PGID
+    // reuse. ESRCH while the direct child is live remains an invariant failure.
+    match outcome {
         ProcessGroupSignal::Delivered => Ok(()),
-        // On Linux the direct child remains unreaped here, so ESRCH is an
-        // invariant failure rather than successful cleanup.
+        ProcessGroupSignal::Gone if direct_exit_observed => Ok(()),
         ProcessGroupSignal::Gone => Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
-        ProcessGroupSignal::Failed => Err(std::io::Error::other(
-            "could not signal the retained child process group",
-        )),
     }
 }
 
 #[cfg(unix)]
-fn wait_for_process_group_disappearance(process_group: u32) -> bool {
-    let deadline = Instant::now() + PROCESS_GROUP_EXIT_TIMEOUT;
+fn wait_for_process_group_disappearance(process_group: u32, deadline: Instant) -> bool {
+    let mut consecutive_quiescent_snapshots = 0;
     loop {
+        #[cfg(target_os = "linux")]
+        let live_members = linux_process_group_has_live_members(process_group);
+        #[cfg(target_os = "macos")]
+        let live_members = macos_process_group_has_live_members(process_group);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let live_members: Option<bool> = None;
+
+        match live_members {
+            Some(false) => {
+                // A process snapshot is not atomic with concurrent exit. Require
+                // two complete, quiescent observations before treating only
+                // orphaned zombies as gone. Zombies cannot execute or retain a
+                // capture pipe, so their eventual PID-1 reap is bookkeeping.
+                consecutive_quiescent_snapshots += 1;
+                if consecutive_quiescent_snapshots >= 2 {
+                    return true;
+                }
+            }
+            Some(true) | None => consecutive_quiescent_snapshots = 0,
+        }
         if unsafe { libc::kill(-(process_group as libc::pid_t), 0) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::ESRCH) {
@@ -2066,8 +2547,96 @@ fn wait_for_process_group_disappearance(process_group: u32) -> bool {
         if Instant::now() >= deadline {
             return false;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(PROCESS_SUPERVISOR_POLL);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_has_live_members(process_group: u32) -> Option<bool> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        if name.to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        let (_, fields) = stat.rsplit_once(") ")?;
+        let mut fields = fields.split_whitespace();
+        let state = fields.next()?;
+        let _parent_pid = fields.next()?;
+        let group = fields.next()?.parse::<u32>().ok()?;
+        if group == process_group && !matches!(state, "Z" | "X") {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_group_has_live_members(process_group: u32) -> Option<bool> {
+    const PROCESS_LIST_SLACK: usize = 64;
+    const PROCESS_LIST_ATTEMPTS: usize = 3;
+
+    let process_group_pid = libc::pid_t::try_from(process_group).ok()?;
+    let mut capacity = usize::try_from(unsafe {
+        libc::proc_listpgrppids(process_group_pid, std::ptr::null_mut(), 0)
+    })
+    .ok()?
+    .checked_add(PROCESS_LIST_SLACK)?;
+    for _ in 0..PROCESS_LIST_ATTEMPTS {
+        let mut pids: Vec<libc::pid_t> = vec![0; capacity];
+        let byte_capacity = pids.len().checked_mul(std::mem::size_of::<libc::pid_t>())?;
+        let byte_capacity = libc::c_int::try_from(byte_capacity).ok()?;
+        let count = unsafe {
+            libc::proc_listpgrppids(
+                process_group_pid,
+                pids.as_mut_ptr().cast::<libc::c_void>(),
+                byte_capacity,
+            )
+        };
+        let count = usize::try_from(count).ok()?;
+        if count >= pids.len() {
+            capacity = capacity.checked_mul(2)?;
+            continue;
+        }
+
+        for pid in pids.into_iter().take(count).filter(|pid| *pid > 0) {
+            let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+            let expected = std::mem::size_of::<libc::proc_bsdinfo>();
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    info.as_mut_ptr().cast(),
+                    libc::c_int::try_from(expected).ok()?,
+                )
+            };
+            if read == 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH)
+                    || error.kind() == std::io::ErrorKind::NotFound
+                {
+                    continue;
+                }
+                return None;
+            }
+            if usize::try_from(read).ok()? != expected {
+                return None;
+            }
+            let info = unsafe { info.assume_init() };
+            if info.pbi_pgid == process_group && info.pbi_status != libc::SZOMB {
+                return Some(true);
+            }
+        }
+        return Some(false);
+    }
+    None
 }
 
 #[cfg(all(test, unix))]
@@ -2081,103 +2650,287 @@ mod unix_process_group_tests {
             signal_process_group_with(|| {
                 attempts += 1;
                 if attempts == 1 {
-                    Err(Some(libc::EINTR))
+                    Err(std::io::Error::from_raw_os_error(libc::EINTR))
                 } else {
                     Ok(())
                 }
-            }),
-            ProcessGroupSignal::Delivered
+            })
+            .unwrap(),
+            ProcessGroupSignal::Delivered,
         );
         assert_eq!(attempts, 2);
         assert_eq!(
-            signal_process_group_with(|| Err(Some(libc::EPERM))),
-            ProcessGroupSignal::Failed
+            signal_process_group_with(|| Err(std::io::Error::from_raw_os_error(libc::EPERM)))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM),
         );
         assert_eq!(
-            signal_process_group_with(|| Err(Some(libc::ESRCH))),
-            ProcessGroupSignal::Gone
+            signal_process_group_with(|| Err(std::io::Error::from_raw_os_error(libc::ESRCH)))
+                .unwrap(),
+            ProcessGroupSignal::Gone,
         );
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 struct TreeTermination {
     signal_succeeded: bool,
     status: Option<ExitStatus>,
     group_disappeared: bool,
+    reap_error: Option<String>,
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 impl TreeTermination {
-    fn signal_and_reap_succeeded(&self) -> bool {
-        self.signal_succeeded && self.status.is_some()
+    fn cleanup_confirmed(&self) -> bool {
+        // The security invariant is the final supervised state: the direct
+        // child was reaped and a complete host process snapshot (or ESRCH)
+        // proved that its process group has no live members. On macOS, sending
+        // SIGKILL to a fast-exited, zombie-only group can return EPERM even
+        // though that final state is subsequently proven. Treating the signal
+        // syscall itself as mandatory turns successful bounded commands into
+        // CleanupError without strengthening descendant containment. A failed
+        // signal while any member remains live is still rejected because
+        // `group_disappeared` stays false.
+        self.status.is_some() && self.group_disappeared && self.reap_error.is_none()
     }
 
-    fn cleanup_confirmed(&self) -> bool {
-        self.signal_and_reap_succeeded() && self.group_disappeared
+    fn failure_reason(&self) -> String {
+        let mut reasons = Vec::new();
+        if !self.signal_succeeded {
+            reasons.push("process-group signal failed".to_string());
+        }
+        if self.status.is_none() {
+            reasons.push("direct child was not reaped before the cleanup deadline".to_string());
+        }
+        if !self.group_disappeared {
+            reasons.push("process group remained present at the cleanup deadline".to_string());
+        }
+        if let Some(error) = &self.reap_error {
+            reasons.push(format!("direct-child reap failed: {error}"));
+        }
+        if reasons.is_empty() {
+            "unknown process-tree cleanup failure".to_string()
+        } else {
+            reasons.join("; ")
+        }
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+fn wait_for_direct_exit_and_reap(
+    child: &mut std::process::Child,
+    child_pid: u32,
+    deadline: Instant,
+) -> Option<Result<ExitStatus, String>> {
+    loop {
+        match observe_child_exit_without_reaping(child_pid, true) {
+            Ok(true) => return Some(child.wait().map_err(|error| error.to_string())),
+            Ok(false) => {}
+            Err(error) => return Some(Err(error.to_string())),
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(PROCESS_SUPERVISOR_POLL);
+    }
+}
+
+#[cfg(unix)]
 fn terminate_tree(
     child: &mut std::process::Child,
     child_pid: u32,
-    confirm_disappearance: bool,
+    process_group: u32,
+    direct_exit_observed: bool,
+    deadline: Instant,
 ) -> TreeTermination {
-    #[cfg(target_os = "linux")]
-    {
-        // Signal before reaping. The unreaped direct child anchors the numeric
-        // process-group ID, so this cannot target an unrelated future group.
-        let signalled = signal_process_group(child_pid, libc::SIGKILL).is_ok();
-        // Also address the anchored direct PID. A trusted program normally
-        // remains its group leader, but this prevents an unbounded wait if it
-        // changed session or group before the supervisor's final signal.
-        let _ = child.kill();
-        let status = child.wait().ok();
-        let group_disappeared =
-            confirm_disappearance && wait_for_process_group_disappearance(child_pid);
-        TreeTermination {
-            signal_succeeded: signalled,
-            status,
-            group_disappeared,
+    // Signal before reaping. The unreaped direct child anchors the numeric
+    // process-group ID, so this cannot target an unrelated future group.
+    let signal_succeeded =
+        signal_process_group(process_group, libc::SIGKILL, direct_exit_observed).is_ok();
+    // Also address the anchored direct PID. A trusted program normally remains
+    // its group leader, but this prevents an escaped leader from outliving the
+    // bounded cleanup attempt.
+    let _ = child.kill();
+    let reaped = if direct_exit_observed {
+        Some(child.wait().map_err(|error| error.to_string()))
+    } else {
+        wait_for_direct_exit_and_reap(child, child_pid, deadline)
+    };
+    let (status, reap_error) = match reaped {
+        Some(Ok(status)) => (Some(status), None),
+        Some(Err(error)) => (None, Some(error)),
+        None => (None, None),
+    };
+    let group_disappeared = wait_for_process_group_disappearance(process_group, deadline);
+    TreeTermination {
+        signal_succeeded,
+        status,
+        group_disappeared,
+        reap_error,
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn finish_reader_workers(
+    receiver: &mpsc::Receiver<ReaderMessage>,
+    workers: &mut Vec<(CaptureStream, std::thread::JoinHandle<()>)>,
+    capture: &mut CaptureState,
+    deadline: Instant,
+) -> Result<(), String> {
+    while !capture.all_terminal() {
+        while let Ok(message) = receiver.try_recv() {
+            capture.record(message)?;
+        }
+        if capture.all_terminal() {
+            break;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err("capture pipes did not close before the cleanup deadline".to_string());
+        }
+        match receiver.recv_timeout((deadline - now).min(PROCESS_SUPERVISOR_POLL)) {
+            Ok(message) => capture.record(message)?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("capture workers disconnected before reporting both streams".into());
+            }
         }
     }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        let signal = signal_process_group_with(|| {
-            // SAFETY: `setpgid(0, 0)` ran before exec for this child.
-            let status = unsafe { libc::kill(-(child_pid as libc::pid_t), libc::SIGKILL) };
-            if status == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error().raw_os_error())
+    while workers.iter().any(|(_, worker)| !worker.is_finished()) {
+        if Instant::now() >= deadline {
+            let stuck = workers
+                .iter()
+                .filter_map(|(stream, worker)| {
+                    (!worker.is_finished()).then_some(format!("{stream:?}"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            workers.clear();
+            return Err(format!("capture worker join deadline expired for {stuck}"));
+        }
+        std::thread::sleep(PROCESS_SUPERVISOR_POLL);
+    }
+
+    for (stream, worker) in std::mem::take(workers) {
+        if worker.join().is_err() {
+            return Err(format!("{stream:?} capture worker panicked"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn finish_unix_run(context: UnixFinishContext<'_>, cause: UnixFinishCause) -> ChildOutcome {
+    let cleanup_deadline = Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT;
+    let termination = terminate_tree(
+        context.child,
+        context.child_pid,
+        context.process_group,
+        context.direct_exit_observed,
+        cleanup_deadline,
+    );
+    let reader_cleanup = finish_reader_workers(
+        context.receiver,
+        context.workers,
+        context.capture,
+        cleanup_deadline,
+    );
+    let cleanup_succeeded = termination.cleanup_confirmed() && reader_cleanup.is_ok();
+
+    let output_limit = match &cause {
+        UnixFinishCause::OutputLimit(stream) => Some(*stream),
+        _ => context.capture.first_limit(),
+    };
+    if let Some(stream) = output_limit {
+        return ChildOutcome::OutputLimitExceeded {
+            stream,
+            cleanup_succeeded,
+        };
+    }
+    if matches!(&cause, UnixFinishCause::Timeout) {
+        return ChildOutcome::Timeout { cleanup_succeeded };
+    }
+
+    if !cleanup_succeeded {
+        let mut reasons = Vec::new();
+        match &cause {
+            UnixFinishCause::ReaderError(stream, reason) => {
+                reasons.push(format!("read {stream:?}: {reason}"));
             }
-        });
-        let _ = child.kill();
-        let status = child.wait().ok();
-        let signal_succeeded = matches!(
-            signal,
-            ProcessGroupSignal::Delivered | ProcessGroupSignal::Gone
+            UnixFinishCause::WaitError(reason) => reasons.push(format!("wait failed: {reason}")),
+            UnixFinishCause::DirectExit
+            | UnixFinishCause::Timeout
+            | UnixFinishCause::OutputLimit(_) => {}
+        }
+        if !termination.cleanup_confirmed() {
+            reasons.push(termination.failure_reason());
+        }
+        if let Err(reason) = &reader_cleanup {
+            reasons.push(reason.clone());
+        }
+        return ChildOutcome::CleanupError(reasons.join("; "));
+    }
+
+    match cause {
+        UnixFinishCause::ReaderError(stream, reason) => {
+            return ChildOutcome::WaitError(format!("read {stream:?}: {reason}"));
+        }
+        UnixFinishCause::WaitError(reason) => return ChildOutcome::WaitError(reason),
+        UnixFinishCause::DirectExit
+        | UnixFinishCause::Timeout
+        | UnixFinishCause::OutputLimit(_) => {}
+    }
+    if let Some((stream, reason)) = context.capture.first_error() {
+        return ChildOutcome::WaitError(format!("read {stream:?}: {reason}"));
+    }
+    let Some(status) = termination.status else {
+        return ChildOutcome::CleanupError("direct child was not reaped".to_string());
+    };
+    let Some((stdout, stderr)) = context.capture.take_completed() else {
+        return ChildOutcome::CleanupError(
+            "capture workers completed without two bounded output buffers".to_string(),
         );
-        let group_disappeared = !confirm_disappearance
-            || matches!(signal, ProcessGroupSignal::Gone)
-            || wait_for_process_group_disappearance(child_pid);
+    };
+    ChildOutcome::Completed {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_cleanup_tests {
+    use super::TreeTermination;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    fn exited_child(signal_succeeded: bool, group_disappeared: bool) -> TreeTermination {
         TreeTermination {
             signal_succeeded,
-            status,
+            status: Some(std::process::ExitStatus::from_raw(0)),
             group_disappeared,
+            reap_error: None,
         }
     }
-    #[cfg(all(not(unix), not(windows)))]
-    {
-        let _ = (child_pid, confirm_disappearance);
-        let killed = child.kill().is_ok();
-        let status = child.wait().ok();
-        TreeTermination {
-            signal_succeeded: killed,
-            group_disappeared: status.is_some(),
-            status,
-        }
+
+    #[test]
+    fn cleanup_accepts_failed_signal_after_no_live_group_is_proven() {
+        assert!(exited_child(false, true).cleanup_confirmed());
+    }
+
+    #[test]
+    fn cleanup_still_rejects_a_live_group_or_unreaped_child() {
+        assert!(!exited_child(true, false).cleanup_confirmed());
+        assert!(!exited_child(false, false).cleanup_confirmed());
+
+        let unreaped = TreeTermination {
+            signal_succeeded: true,
+            status: None,
+            group_disappeared: true,
+            reap_error: None,
+        };
+        assert!(!unreaped.cleanup_confirmed());
     }
 }
 

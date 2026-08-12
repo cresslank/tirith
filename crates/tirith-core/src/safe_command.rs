@@ -518,8 +518,7 @@ fn build_suggestion(
 }
 
 /// Shell interpreters whose stdin invocation contract is represented by
-/// [`crate::runner::PipeInterpreter`]. The runner module itself is unix-only
-/// and the rewrite below only builds on linux/x86_64, so gate this with it.
+/// [`crate::runner::PipeInterpreter`].
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn pipe_interpreter(name: &str) -> Option<crate::runner::PipeInterpreter> {
     name.parse().ok()
@@ -592,6 +591,7 @@ fn rewrite_pipe_to_shell(
     }
 
     let encoded_url = encode_shell_literal(&url, shell)?;
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         let path = trusted_runner?.to_str()?;
