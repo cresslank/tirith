@@ -1252,12 +1252,14 @@ pub fn log_verdict_with_raw(
     log_verdict_with_raw_inner(
         verdict,
         command,
-        log_path,
-        event_id,
         custom_dlp_patterns,
-        raw_action,
-        raw_rule_ids,
-        false,
+        VerdictLogOptions {
+            log_path,
+            event_id,
+            raw_action,
+            raw_rule_ids,
+            require_write: false,
+        },
     )
 }
 
@@ -1276,28 +1278,38 @@ pub(crate) fn log_verdict_with_raw_required(
     log_verdict_with_raw_inner(
         verdict,
         command,
-        log_path,
-        event_id,
         custom_dlp_patterns,
-        raw_action,
-        raw_rule_ids,
-        true,
+        VerdictLogOptions {
+            log_path,
+            event_id,
+            raw_action,
+            raw_rule_ids,
+            require_write: true,
+        },
     )
 }
 
-// The public wrappers differ only in these flags; threading them as
-// parameters keeps one implementation instead of duplicating the writer.
-#[allow(clippy::too_many_arguments)]
-fn log_verdict_with_raw_inner(
-    verdict: &Verdict,
-    command: &str,
+struct VerdictLogOptions {
     log_path: Option<PathBuf>,
     event_id: Option<String>,
-    custom_dlp_patterns: &[String],
     raw_action: Option<String>,
     raw_rule_ids: Option<Vec<String>>,
     require_write: bool,
+}
+
+fn log_verdict_with_raw_inner(
+    verdict: &Verdict,
+    command: &str,
+    custom_dlp_patterns: &[String],
+    options: VerdictLogOptions,
 ) -> Result<(), String> {
+    let VerdictLogOptions {
+        log_path,
+        event_id,
+        raw_action,
+        raw_rule_ids,
+        require_write,
+    } = options;
     let entry = AuditEntry {
         timestamp: chrono::Utc::now().to_rfc3339(),
         session_id: crate::session::resolve_session_id(),
