@@ -1,25 +1,6 @@
 [advisories]
 version = 2
-ignore = [
-    # time RFC 2822 parsing DoS (stack exhaustion). Cargo.toml pins time to
-    # <0.3.38 (0.3.38+ needs time-core >=0.1.3 / Rust 1.85, above our MSRV 1.83),
-    # so the version we build predates the advisory's 0.3.47 fix and stays in the
-    # affected range. Ignored regardless: that fix requires Rust 1.88 (far above
-    # MSRV 1.83), and tirith never parses user-controlled RFC 2822 dates (the only
-    # trigger). Transitive dep via lopdf/rust-s3. See the time pin note in Cargo.toml.
-    "RUSTSEC-2026-0009",
-    # rustls-pemfile unmaintained — transitive dep of rust-s3 (license server).
-    # No replacement available; rust-s3 hasn't migrated yet.
-    "RUSTSEC-2025-0134",
-    # rustls-webpki CRL / name-constraint advisories — affect 0.101.7 via
-    # rust-s3 → aws-creds → attohttpc → rustls → rustls-webpki. Transitive
-    # chain pinned until rust-s3 moves forward. tirith does not use CRL
-    # revocation checking or name-constraint validation on this path. The
-    # current 0.103.x copy is kept up to date separately.
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
-    "RUSTSEC-2026-0104",
-]
+ignore = []
 
 [licenses]
 version = 2

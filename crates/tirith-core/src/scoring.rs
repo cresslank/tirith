@@ -80,6 +80,7 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::ThreatMaliciousIp
         | RuleId::ThreatPackageTyposquat
         | RuleId::ThreatPackageSimilarName
+        | RuleId::ThreatUnresolvedMaliciousPackage
         | RuleId::ThreatMaliciousUrl
         | RuleId::ThreatPhishingUrl
         | RuleId::ThreatTorExitNode
@@ -327,7 +328,25 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::SecretWriteThenNetwork
         | RuleId::DependencyChangeThenNetwork
         | RuleId::DeleteThenForcePush
-        | RuleId::MassFileDeletion => false,
+        | RuleId::MassFileDeletion
+        // A2: scan-coverage incompleteness, not a threat-DB indicator.
+        | RuleId::AnalysisIncomplete
+        // B5: installed-distribution integrity, correlated from artifact signals,
+        // not a threat-DB indicator.
+        | RuleId::PythonInstalledIntegrityViolation
+        // B6: Python startup-hook execution, correlated from artifact signals
+        // (structural body analysis), not a threat-DB indicator.
+        | RuleId::PythonStartupHookSuspicious
+        | RuleId::PythonStartupHookCrossRuntime
+        // B7: native import-execution chain, correlated from native-triage signals
+        // (structural object-format analysis), not a threat-DB indicator.
+        | RuleId::NativeImportExecutionChain
+        // B8 + DB-D: artifact/member known-malicious hash match — a structural
+        // artifact verdict (feature-gated), not a reputation/threat-intel score.
+        | RuleId::ArtifactKnownMalicious
+        // B8: a wheel structurally rejected by the hardened reader — a structural
+        // artifact verdict, not a threat-DB indicator.
+        | RuleId::WheelStructurallyRejected => false,
     }
 }
 
@@ -856,6 +875,9 @@ mod tests {
     #[test]
     fn is_threat_intel_rule_classifies_threat_family() {
         assert!(is_threat_intel_rule(RuleId::ThreatMaliciousPackage));
+        assert!(is_threat_intel_rule(
+            RuleId::ThreatUnresolvedMaliciousPackage
+        ));
         assert!(is_threat_intel_rule(RuleId::ThreatCisaKev));
         assert!(is_threat_intel_rule(RuleId::ThreatSafeBrowsing));
         assert!(!is_threat_intel_rule(RuleId::CurlPipeShell));
