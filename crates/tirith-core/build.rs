@@ -378,13 +378,13 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         id: "ps_set_execution_policy",
         tier1_exec_fragments: &[
             r"(?i:Set-ExecutionPolicy)\b",
-            // PR #121 item 12: `-ex` is the shortest unambiguous prefix of
-            // `-ExecutionPolicy`; without it, `powershell -ex Bypass …` fast-exits
-            // at tier-1 before reaching the tier-3 rule.
-            r"-(?i:ExecutionPolicy|ep|ex)\b",
+            // PowerShell accepts every unambiguous `-ex...` prefix of
+            // `-ExecutionPolicy`. Keep tier 1 a conservative superset; tier 3
+            // performs the exact prefix and value validation.
+            r"(?i)-(?:ep|ex[a-z]*)(?:\b|[:=])",
         ],
         tier1_paste_only_fragments: &[],
-        notes: "PowerShell Set-ExecutionPolicy Bypass — cmdlet form and powershell.exe -ExecutionPolicy / -ep / -ex flag form",
+        notes: "PowerShell Set-ExecutionPolicy Bypass — cmdlet form and powershell.exe unambiguous -ExecutionPolicy prefixes / -ep alias",
     },
     PatternEntry {
         id: "ps_defender_exclusion",
@@ -545,13 +545,14 @@ const PATTERN_TABLE: &[PatternEntry] = &[
     PatternEntry {
         id: "package_install",
         tier1_exec_fragments: &[
-            r"(?:pip3?|uv)\s+install\b",
-            r"(?:npm|npx|yarn|pnpm|bun)\s+(?:install|i|add)\b",
-            r"npx\s",
-            r"gem\s+install\b",
-            r"go\s+(?:get|install)\b",
-            r"composer\s+require\b",
-            r"dotnet\s+add\b",
+            r"(?i:\b(?:pip3?|uv)(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+install\b)",
+            r"(?i:\b(?:npm|npx|yarn|pnpm|bun)(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:install|i|add)\b)",
+            r"(?i:\bnpx(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s)",
+            r"(?i:\bgem(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+install\b)",
+            r"(?i:\bgo(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:get|install)\b)",
+            r"(?i:\bcomposer(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+require\b)",
+            r"(?i:\bdotnet(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+add\b)",
+            r"(?i:\b(?:mvnw?|gradlew?)(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+)",
         ],
         tier1_paste_only_fragments: &[],
         notes: "Package manager install commands — trigger threat DB lookup",

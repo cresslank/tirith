@@ -79,28 +79,92 @@ use crate::verdict::{Evidence, Finding, RuleId, Severity};
 mod caps {
     /// Maximum dynamic imports collected.
     pub const MAX_IMPORTS: usize = 4096;
+    /// Maximum PE import descriptors traversed before any thunk/name work. This is
+    /// separate from the import count because a hostile table can contain many
+    /// descriptors whose thunk lists are empty.
+    pub const MAX_IMPORT_DESCRIPTORS: usize = 4096;
+    /// Maximum bytes accepted from one structured import name before lowercasing or
+    /// retaining it. Oversized names make analysis partial instead of allocating.
+    pub const MAX_IMPORT_NAME_LENGTH: usize = 4096;
     /// Maximum exported symbols scanned for `PyInit_*` / constructor names.
     pub const MAX_SYMBOLS: usize = 200_000;
     /// Maximum embedded strings examined from the string scan.
     pub const MAX_STRINGS_SCANNED: usize = 100_000;
     /// Maximum distinct embedded URLs retained.
     pub const MAX_URLS: usize = 256;
+    /// Maximum characters retained from one embedded URL.
+    pub const MAX_URL_LENGTH: usize = 2048;
     /// Maximum distinct sibling executable/script references retained.
     pub const MAX_SIBLING_REFS: usize = 256;
+    /// Maximum bytes retained from one sibling reference.
+    pub const MAX_SIBLING_REF_LENGTH: usize = 1024;
+    /// Maximum attacker-controlled URL/PyInit/sibling token occurrences examined
+    /// across all printable strings in one native member.
+    pub const MAX_STRING_TOKEN_OCCURRENCES: usize = 100_000;
+    /// Maximum characters retained from one `PyInit_*` name discovered in raw
+    /// string data.
+    pub const MAX_PYINIT_NAME_LENGTH: usize = 256;
     /// Maximum sections enumerated (for the constructor/init-section presence
     /// checks); an absurd section count is itself a malformed-binary tell but must
     /// not be unbounded work.
     pub const MAX_SECTIONS: usize = 65_536;
-    /// Maximum bytes of a single section's data read for the in-section string
-    /// scan (e.g. `.rodata`), so a giant section does not force a giant scan.
-    pub const MAX_SECTION_SCAN_BYTES: usize = 8 * 1024 * 1024;
-    /// Maximum bytes scanned across ALL sections of one object, an AGGREGATE cap on
-    /// top of the per-section [`MAX_SECTION_SCAN_BYTES`]. Without it a crafted file
-    /// with [`MAX_SECTIONS`] sections each just under the per-section cap could force
-    /// ~512 GiB of scanning; this bounds the whole-object in-section scan instead.
-    pub const MAX_TOTAL_SECTION_SCAN_BYTES: usize = 64 * 1024 * 1024;
+    /// Maximum bytes retained from one printable run before token analysis. The
+    /// buffered member itself is already capped at 64 MiB by the archive reader;
+    /// this lower cap prevents one giant run from causing a giant lowercase copy.
+    pub const MAX_PRINTABLE_RUN_BYTES: usize = 8 * 1024 * 1024;
     /// Maximum architectures enumerated from a fat/universal Mach-O header.
     pub const MAX_FAT_ARCHES: usize = 64;
+}
+
+/// Remaining traversal work for one native member. A fat Mach-O shares this
+/// budget across every slice, so per-object helper calls cannot multiply the
+/// advertised caps by the architecture count.
+struct ExtractionBudget {
+    imports_remaining: usize,
+    import_descriptors_remaining: usize,
+    symbols_remaining: usize,
+    dynamic_symbols_remaining: usize,
+    sections_remaining: usize,
+    strings_remaining: usize,
+    string_token_occurrences_remaining: usize,
+}
+
+impl Default for ExtractionBudget {
+    fn default() -> Self {
+        Self {
+            imports_remaining: caps::MAX_IMPORTS,
+            import_descriptors_remaining: caps::MAX_IMPORT_DESCRIPTORS,
+            symbols_remaining: caps::MAX_SYMBOLS,
+            dynamic_symbols_remaining: caps::MAX_SYMBOLS,
+            sections_remaining: caps::MAX_SECTIONS,
+            strings_remaining: caps::MAX_STRINGS_SCANNED,
+            string_token_occurrences_remaining: caps::MAX_STRING_TOKEN_OCCURRENCES,
+        }
+    }
+}
+
+impl ExtractionBudget {
+    /// Whether every structured table budget has been exhausted. A fat Mach-O with
+    /// another slice at this point cannot be proved covered without restarting
+    /// attacker-controlled parser work, so slice traversal must stop as Partial.
+    fn structured_exhausted(&self) -> bool {
+        self.imports_remaining == 0
+            && self.import_descriptors_remaining == 0
+            && self.symbols_remaining == 0
+            && self.dynamic_symbols_remaining == 0
+            && self.sections_remaining == 0
+    }
+}
+
+/// Consume one slot from a member-scoped traversal budget. Returning `false`
+/// means the caller has observed a real item beyond the cap; merely reaching zero
+/// after the last in-cap item remains complete.
+fn take_budget_slot(remaining: &mut usize) -> bool {
+    if *remaining == 0 {
+        return false;
+    }
+    *remaining -= 1;
+    true
 }
 
 /// How completely a native member was triaged. A [`Buffered`] member parses in
@@ -122,6 +186,103 @@ pub enum NativeCoverage {
     /// facts value reports partial until a full parse overwrites it.
     #[default]
     Partial,
+}
+
+/// Exact reason a native analysis is partial. This is separate from
+/// [`NativeCoverage`] so callers can fail closed while still explaining which
+/// parser boundary or attacker-controlled cap prevented full coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NativePartialReason {
+    /// The member was provided only as a bounded streaming view.
+    StreamingView,
+    /// The buffered object parser rejected the member.
+    ObjectParseFailed,
+    /// A fat Mach-O header could not be parsed.
+    FatHeaderParseFailed,
+    /// More imports existed than the import traversal cap permits.
+    ImportTableLimit,
+    /// More PE import descriptors existed than the descriptor traversal cap permits.
+    ImportDescriptorLimit,
+    /// A structured import name exceeded its pre-allocation length cap.
+    ImportNameLengthLimit,
+    /// The object import table itself could not be read.
+    ImportTableUnreadable,
+    /// An import name was not valid UTF-8 and could not be classified.
+    InvalidImportName,
+    /// More ordinary symbols existed than the symbol traversal cap permits.
+    SymbolTableLimit,
+    /// An ordinary symbol name could not be read.
+    InvalidSymbolName,
+    /// More dynamic symbols existed than the dynamic-symbol traversal cap permits.
+    DynamicSymbolTableLimit,
+    /// A dynamic symbol name could not be read.
+    InvalidDynamicSymbolName,
+    /// More sections existed than the section traversal cap permits.
+    SectionTableLimit,
+    /// A section name could not be read.
+    InvalidSectionName,
+    /// A fat Mach-O contained more architecture slices than may be traversed.
+    FatArchitectureLimit,
+    /// A fat Mach-O still had slices after every member-wide structured budget was
+    /// exhausted.
+    FatTraversalBudgetExhausted,
+    /// A fat Mach-O architecture slice could not be read.
+    FatSliceUnreadable,
+    /// A fat Mach-O architecture slice could not be parsed as an object.
+    FatSliceParseFailed,
+    /// A printable run exceeded the bounded per-run byte cap.
+    PrintableRunByteLimit,
+    /// More printable strings existed than the string traversal cap permits.
+    PrintableStringCountLimit,
+    /// More distinct sibling payload references existed than may be retained.
+    SiblingReferenceLimit,
+    /// A sibling payload reference exceeded its per-reference length cap.
+    SiblingReferenceLengthLimit,
+    /// More printable token occurrences existed than may be examined safely.
+    PrintableTokenOccurrenceLimit,
+    /// More distinct embedded URLs existed than may be retained.
+    EmbeddedUrlLimit,
+    /// An embedded URL exceeded the bounded per-URL character cap.
+    EmbeddedUrlLengthLimit,
+    /// More distinct `PyInit_*` names existed than may be retained.
+    PyInitExportLimit,
+    /// A string-derived `PyInit_*` name exceeded its character cap.
+    PyInitNameLengthLimit,
+}
+
+impl NativePartialReason {
+    /// Stable human-readable evidence token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StreamingView => "streaming_view",
+            Self::ObjectParseFailed => "object_parse_failed",
+            Self::FatHeaderParseFailed => "fat_header_parse_failed",
+            Self::ImportTableLimit => "import_table_limit",
+            Self::ImportDescriptorLimit => "import_descriptor_limit",
+            Self::ImportNameLengthLimit => "import_name_length_limit",
+            Self::ImportTableUnreadable => "import_table_unreadable",
+            Self::InvalidImportName => "invalid_import_name",
+            Self::SymbolTableLimit => "symbol_table_limit",
+            Self::InvalidSymbolName => "invalid_symbol_name",
+            Self::DynamicSymbolTableLimit => "dynamic_symbol_table_limit",
+            Self::InvalidDynamicSymbolName => "invalid_dynamic_symbol_name",
+            Self::SectionTableLimit => "section_table_limit",
+            Self::InvalidSectionName => "invalid_section_name",
+            Self::FatArchitectureLimit => "fat_architecture_limit",
+            Self::FatTraversalBudgetExhausted => "fat_traversal_budget_exhausted",
+            Self::FatSliceUnreadable => "fat_slice_unreadable",
+            Self::FatSliceParseFailed => "fat_slice_parse_failed",
+            Self::PrintableRunByteLimit => "printable_run_byte_limit",
+            Self::PrintableStringCountLimit => "printable_string_count_limit",
+            Self::SiblingReferenceLimit => "sibling_reference_limit",
+            Self::SiblingReferenceLengthLimit => "sibling_reference_length_limit",
+            Self::PrintableTokenOccurrenceLimit => "printable_token_occurrence_limit",
+            Self::EmbeddedUrlLimit => "embedded_url_limit",
+            Self::EmbeddedUrlLengthLimit => "embedded_url_length_limit",
+            Self::PyInitExportLimit => "py_init_export_limit",
+            Self::PyInitNameLengthLimit => "py_init_name_length_limit",
+        }
+    }
 }
 
 /// The recognized object-file format. `Unknown` covers anything the magic
@@ -165,6 +326,9 @@ pub struct NativeFacts {
     pub arch: Option<String>,
     /// How completely the member was triaged.
     pub coverage: NativeCoverage,
+    /// Precise reasons [`Self::coverage`] is [`NativeCoverage::Partial`]. Empty for
+    /// fully covered extraction and for a freshly defaulted, not-yet-analyzed value.
+    pub partial_reasons: BTreeSet<NativePartialReason>,
     /// Dynamic imports (capped, deduplicated, lowercased).
     pub imports: BTreeSet<String>,
     /// Exported `PyInit_*` symbol names (a CPython extension's init entry, which
@@ -215,6 +379,12 @@ pub struct NativeFacts {
 }
 
 impl NativeFacts {
+    /// Downgrade coverage and retain the precise reason without duplicate noise.
+    fn mark_partial(&mut self, reason: NativePartialReason) {
+        self.coverage = NativeCoverage::Partial;
+        self.partial_reasons.insert(reason);
+    }
+
     /// Whether the member exposes a direct EXECUTION ENTRY: a `PyInit_*` export, an
     /// ELF constructor, a Mach-O module-init, or a PE TLS callback / `DllMain`.
     /// A Python extension can act directly from `PyInit_*` (no separate constructor
@@ -342,6 +512,7 @@ fn extract_from_buffer(bytes: &[u8]) -> NativeFacts {
         coverage: NativeCoverage::Full,
         ..NativeFacts::default()
     };
+    let mut budget = ExtractionBudget::default();
 
     // A fat/universal Mach-O is parsed slice by slice (it has no single object
     // view). Detect it first via the magic classifier; if it is fat, parse arches.
@@ -350,13 +521,13 @@ fn extract_from_buffer(bytes: &[u8]) -> NativeFacts {
         facts.format = Some(NativeFormat::MachOFat);
         // Parse each architecture slice as its own object, accumulating facts. If
         // the fat header itself is malformed we degrade to Partial.
-        if !parse_fat_macho(bytes, &mut facts) {
-            facts.coverage = NativeCoverage::Partial;
+        if !parse_fat_macho(bytes, &mut facts, &mut budget) {
+            facts.mark_partial(NativePartialReason::FatHeaderParseFailed);
         }
         // The string scan over the WHOLE buffer still runs below regardless of slice
         // parse success (strings live in the slices but a whole-buffer scan is a safe
         // superset for the bounded capability/URL/path detection).
-        scan_buffer_strings(bytes, &mut facts);
+        scan_buffer_strings(bytes, &mut facts, &mut budget);
         return facts;
     }
 
@@ -366,19 +537,19 @@ fn extract_from_buffer(bytes: &[u8]) -> NativeFacts {
         Ok(obj) => {
             facts.format = Some(object_format(&obj));
             facts.arch = architecture_label(obj.architecture());
-            extract_from_object(&obj, &mut facts);
+            extract_from_object(&obj, &mut facts, &mut budget);
         }
         Err(_) => {
             // The principal parser declined: fall back to magic/arch only, Partial.
             facts.format = Some(magic);
-            facts.coverage = NativeCoverage::Partial;
+            facts.mark_partial(NativePartialReason::ObjectParseFailed);
         }
     }
 
     // Bounded string scan over the whole buffer for capability / URL / path /
     // runtime / sibling evidence (a superset of symbol/import names; cheap and
     // format-independent). Runs whether or not the structured parse succeeded.
-    scan_buffer_strings(bytes, &mut facts);
+    scan_buffer_strings(bytes, &mut facts, &mut budget);
     facts
 }
 
@@ -392,6 +563,8 @@ fn extract_from_streaming(header_window: &[u8], printable_strings: &[String]) ->
         format: Some(classify_magic(header_window)),
         ..NativeFacts::default()
     };
+    facts.mark_partial(NativePartialReason::StreamingView);
+    let mut budget = ExtractionBudget::default();
     // Arch from the header window only, best-effort (parse just the prefix; a real
     // header is far under 2 MiB, so a prefix parse usually yields the architecture).
     use object::read::Object;
@@ -402,7 +575,11 @@ fn extract_from_streaming(header_window: &[u8], printable_strings: &[String]) ->
     // execution-entry can only be inferred from a `PyInit_*` STRING in the
     // printable scan (a weaker signal than an actual export, but correlation treats
     // it as Partial anyway). The capability scan runs over the collected strings.
-    scan_strings(printable_strings.iter().map(|s| s.as_str()), &mut facts);
+    scan_strings(
+        printable_strings.iter().map(|s| s.as_str()),
+        &mut facts,
+        &mut budget,
+    );
     facts
 }
 
@@ -416,10 +593,120 @@ fn object_format(obj: &object::read::File) -> NativeFormat {
     }
 }
 
+/// Retain and classify one structured import name only after its byte length has
+/// passed the allocation cap.
+fn record_structured_import_name(name: &str, facts: &mut NativeFacts) {
+    if name.len() > caps::MAX_IMPORT_NAME_LENGTH {
+        facts.mark_partial(NativePartialReason::ImportNameLengthLimit);
+        return;
+    }
+    let lower = name.to_ascii_lowercase();
+    classify_capability_import(&lower, facts);
+    facts.imports.insert(lower);
+}
+
+/// Decode one structured import name without allocating attacker-sized storage.
+fn record_structured_import_bytes(name: &[u8], facts: &mut NativeFacts) {
+    if name.len() > caps::MAX_IMPORT_NAME_LENGTH {
+        facts.mark_partial(NativePartialReason::ImportNameLengthLimit);
+        return;
+    }
+    match std::str::from_utf8(name) {
+        Ok(name) => record_structured_import_name(name, facts),
+        Err(_) => facts.mark_partial(NativePartialReason::InvalidImportName),
+    }
+}
+
+/// Walk a PE import table lazily. The generic [`object::read::Object::imports`]
+/// API first constructs a complete `Vec<Import>` and therefore applies Tirith's
+/// cap only after attacker-controlled allocation. This mirrors the same public
+/// low-level parser while consuming descriptor/thunk budgets before reading or
+/// allocating each name.
+fn extract_pe_imports<Pe>(
+    file: &object::read::pe::PeFile<'_, Pe>,
+    facts: &mut NativeFacts,
+    budget: &mut ExtractionBudget,
+) where
+    Pe: object::read::pe::ImageNtHeaders,
+{
+    use object::endian::LittleEndian as LE;
+    use object::read::pe::ImageThunkData as _;
+
+    let table = match file.import_table() {
+        Ok(Some(table)) => table,
+        Ok(None) => return,
+        Err(_) => {
+            facts.mark_partial(NativePartialReason::ImportTableUnreadable);
+            return;
+        }
+    };
+    let mut descriptors = match table.descriptors() {
+        Ok(descriptors) => descriptors,
+        Err(_) => {
+            facts.mark_partial(NativePartialReason::ImportTableUnreadable);
+            return;
+        }
+    };
+
+    loop {
+        let descriptor = match descriptors.next() {
+            Ok(Some(descriptor)) => descriptor,
+            Ok(None) => return,
+            Err(_) => {
+                facts.mark_partial(NativePartialReason::ImportTableUnreadable);
+                return;
+            }
+        };
+        if !take_budget_slot(&mut budget.import_descriptors_remaining) {
+            facts.mark_partial(NativePartialReason::ImportDescriptorLimit);
+            return;
+        }
+
+        let mut first_thunk = descriptor.original_first_thunk.get(LE);
+        if first_thunk == 0 {
+            first_thunk = descriptor.first_thunk.get(LE);
+        }
+        let mut thunks = match table.thunks(first_thunk) {
+            Ok(thunks) => thunks,
+            Err(_) => {
+                facts.mark_partial(NativePartialReason::ImportTableUnreadable);
+                return;
+            }
+        };
+        loop {
+            let thunk = match thunks.next::<Pe>() {
+                Ok(Some(thunk)) => thunk,
+                Ok(None) => break,
+                Err(_) => {
+                    facts.mark_partial(NativePartialReason::ImportTableUnreadable);
+                    return;
+                }
+            };
+            // Count ordinal imports too: they are attacker-controlled traversal
+            // work even though they have no name to classify.
+            if !take_budget_slot(&mut budget.imports_remaining) {
+                facts.mark_partial(NativePartialReason::ImportTableLimit);
+                return;
+            }
+            if thunk.is_ordinal() {
+                continue;
+            }
+            match table.hint_name(thunk.address()) {
+                Ok((_hint, name)) => record_structured_import_bytes(name, facts),
+                Err(_) => facts.mark_partial(NativePartialReason::ImportTableUnreadable),
+            }
+        }
+    }
+}
+
 /// Extract format-specific facts from a parsed single-object file: imports,
 /// `PyInit_*` exports, constructor/init-section presence, and TLS/DllMain. Every
-/// iteration is bounded.
-fn extract_from_object(obj: &object::read::File, facts: &mut NativeFacts) {
+/// iteration is bounded before attacker-derived allocation.
+fn extract_from_object(
+    obj: &object::read::File,
+    facts: &mut NativeFacts,
+    budget: &mut ExtractionBudget,
+) {
     use object::read::{Object, ObjectSection, ObjectSymbol};
 
     // Derive the format from THIS parsed object, not from `facts.format`. For a
@@ -429,63 +716,90 @@ fn extract_from_object(obj: &object::read::File, facts: &mut NativeFacts) {
     // set `has_macho_mod_init` (otherwise the Mach-O arm never matches a fat slice).
     let format = object_format(obj);
 
-    // Dynamic imports (capped). Each import name is classified into the STRONG
-    // capability sets (spawn / dynamic-loader / network) because an import means the
-    // module actually references the API, unlike a `.rodata` string mention.
-    if let Ok(imports) = obj.imports() {
-        for imp in imports.iter().take(caps::MAX_IMPORTS) {
-            if let Ok(name) = std::str::from_utf8(imp.name()) {
-                let lower = name.to_ascii_lowercase();
-                classify_capability_import(&lower, facts);
-                facts.imports.insert(lower);
-            }
-        }
+    // PE imports live in a separate descriptor/thunk table, so walk it through the
+    // bounded lazy helper. ELF and Mach-O imports are undefined symbols and are
+    // folded into their already-bounded symbol loops below. Avoid Object::imports()
+    // entirely: it eagerly materializes an unbounded Vec before the caller sees it.
+    match obj {
+        object::read::File::Pe32(file) => extract_pe_imports(file, facts, budget),
+        object::read::File::Pe64(file) => extract_pe_imports(file, facts, budget),
+        _ => {}
     }
 
     // Exported symbols: collect `PyInit_*` and detect a `DllMain` export (PE) /
     // constructor-shaped names. Bounded by MAX_SYMBOLS.
-    let mut symbol_count = 0usize;
     for sym in obj.symbols() {
-        symbol_count += 1;
-        if symbol_count > caps::MAX_SYMBOLS {
+        if !take_budget_slot(&mut budget.symbols_remaining) {
+            facts.mark_partial(NativePartialReason::SymbolTableLimit);
             break;
         }
-        let Ok(name) = sym.name() else { continue };
+        let Ok(name) = sym.name() else {
+            facts.mark_partial(NativePartialReason::InvalidSymbolName);
+            continue;
+        };
+        let is_import = format == NativeFormat::MachO && sym.is_undefined() && !name.is_empty();
+        if is_import && !take_budget_slot(&mut budget.imports_remaining) {
+            facts.mark_partial(NativePartialReason::ImportTableLimit);
+            break;
+        }
         if name.starts_with("PyInit_") || name.starts_with("_PyInit_") {
-            facts.py_init_exports.insert(name.to_string());
+            if name.len() > caps::MAX_PYINIT_NAME_LENGTH {
+                facts.mark_partial(NativePartialReason::PyInitNameLengthLimit);
+            } else {
+                record_py_init_export(facts, name.to_string(), caps::MAX_SYMBOLS);
+            }
+        }
+        if is_import {
+            record_structured_import_name(name, facts);
         }
         if format == NativeFormat::Pe && name.eq_ignore_ascii_case("DllMain") {
             facts.has_pe_tls_or_dllmain = true;
         }
     }
     // Also scan dynamic symbols (ELF puts exported `PyInit_*` in `.dynsym`, and its
-    // UNDEFINED dynamic symbols are the imports an ELF references — `obj.imports()`
-    // does not enumerate ELF undefined symbols, so classify them here too).
-    let mut dyn_count = 0usize;
+    // UNDEFINED dynamic symbols are the imports an ELF references). Handling them
+    // in this bounded loop avoids the eager allocation performed by `obj.imports()`.
     for sym in obj.dynamic_symbols() {
-        dyn_count += 1;
-        if dyn_count > caps::MAX_SYMBOLS {
+        if !take_budget_slot(&mut budget.dynamic_symbols_remaining) {
+            facts.mark_partial(NativePartialReason::DynamicSymbolTableLimit);
             break;
         }
-        let Ok(name) = sym.name() else { continue };
+        let Ok(name) = sym.name() else {
+            facts.mark_partial(NativePartialReason::InvalidDynamicSymbolName);
+            continue;
+        };
+        let is_import = format == NativeFormat::Elf && sym.is_undefined() && !name.is_empty();
+        if is_import && !take_budget_slot(&mut budget.imports_remaining) {
+            facts.mark_partial(NativePartialReason::ImportTableLimit);
+            break;
+        }
         if name.starts_with("PyInit_") || name.starts_with("_PyInit_") {
-            facts.py_init_exports.insert(name.to_string());
+            if name.len() > caps::MAX_PYINIT_NAME_LENGTH {
+                facts.mark_partial(NativePartialReason::PyInitNameLengthLimit);
+            } else {
+                record_py_init_export(facts, name.to_string(), caps::MAX_SYMBOLS);
+            }
         }
         // An UNDEFINED symbol is an import: the module calls it but does not define
         // it. This is the strong spawn/loader/network signal for ELF.
-        if sym.is_undefined() {
-            classify_capability_import(&name.to_ascii_lowercase(), facts);
+        if is_import {
+            record_structured_import_name(name, facts);
         }
     }
 
     // Section-presence checks for constructors / module-init / TLS, format-aware.
-    let mut section_count = 0usize;
     for sec in obj.sections() {
-        section_count += 1;
-        if section_count > caps::MAX_SECTIONS {
+        if !take_budget_slot(&mut budget.sections_remaining) {
+            facts.mark_partial(NativePartialReason::SectionTableLimit);
             break;
         }
-        let name = sec.name().unwrap_or("");
+        let name = match sec.name() {
+            Ok(name) => name,
+            Err(_) => {
+                facts.mark_partial(NativePartialReason::InvalidSectionName);
+                continue;
+            }
+        };
         // A constructor/init/TLS section only RUNS code when it is non-empty: an
         // empty `.init_array` (which honest toolchains do emit) holds zero function
         // pointers and triggers nothing, so an empty section is not an execution
@@ -520,69 +834,68 @@ fn extract_from_object(obj: &object::read::File, facts: &mut NativeFacts) {
     // cheaper, and a stripped binary that hides `.init_array` is rare and still
     // caught by the string scan's capability evidence).
 
-    // In-section string scan over executable/data sections, bounded per section AND
-    // in aggregate across the whole object, to catch capability/URL/path/runtime/
-    // sibling evidence even when symbol names are stripped. The aggregate cap stops
-    // a crafted file with many large sections from forcing unbounded scanning.
-    let mut scanned_sections = 0usize;
-    let mut scanned_total = 0usize;
-    for sec in obj.sections() {
-        scanned_sections += 1;
-        if scanned_sections > caps::MAX_SECTIONS {
-            break;
-        }
-        if scanned_total >= caps::MAX_TOTAL_SECTION_SCAN_BYTES {
-            break;
-        }
-        if let Ok(data) = sec.data() {
-            // Take at most the per-section cap AND at most what remains of the
-            // aggregate budget, whichever is smaller.
-            let remaining = caps::MAX_TOTAL_SECTION_SCAN_BYTES - scanned_total;
-            let take = data.len().min(caps::MAX_SECTION_SCAN_BYTES).min(remaining);
-            scan_bytes_strings(&data[..take], facts);
-            scanned_total += take;
-        }
-    }
+    // Raw strings are scanned once over the complete bounded member buffer by
+    // `extract_from_buffer`. Re-scanning each section here duplicated attacker work
+    // and reset the string-count cap per section/slice; one whole-buffer pass is a
+    // strict superset and gives the cap honest per-member semantics.
 }
 
 /// Parse a fat/universal Mach-O header and each architecture slice. Returns `true`
 /// if the fat header parsed (slices are best-effort); `false` if the fat header
 /// itself was malformed. Bounded by [`caps::MAX_FAT_ARCHES`].
-fn parse_fat_macho(bytes: &[u8], facts: &mut NativeFacts) -> bool {
+fn parse_fat_macho(bytes: &[u8], facts: &mut NativeFacts, budget: &mut ExtractionBudget) -> bool {
     use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
 
     // Try 64-bit fat first, then 32-bit. (`FileKind` distinguishes them, but trying
     // both is simplest and each parse is bounded.)
     if let Ok(fat) = MachOFatFile64::parse(bytes) {
         let arches = fat.arches();
+        if arches.len() > caps::MAX_FAT_ARCHES {
+            facts.mark_partial(NativePartialReason::FatArchitectureLimit);
+        }
         for (i, arch) in arches.iter().enumerate() {
             if i >= caps::MAX_FAT_ARCHES {
+                break;
+            }
+            if budget.structured_exhausted() {
+                facts.mark_partial(NativePartialReason::FatTraversalBudgetExhausted);
                 break;
             }
             if facts.arch.is_none() {
                 facts.arch = architecture_label(arch.architecture());
             }
-            if let Ok(slice) = arch.data(bytes) {
-                if let Ok(obj) = object::read::File::parse(slice) {
-                    extract_from_object(&obj, facts);
-                }
+            match arch.data(bytes) {
+                Ok(slice) => match object::read::File::parse(slice) {
+                    Ok(obj) => extract_from_object(&obj, facts, budget),
+                    Err(_) => facts.mark_partial(NativePartialReason::FatSliceParseFailed),
+                },
+                Err(_) => facts.mark_partial(NativePartialReason::FatSliceUnreadable),
             }
         }
         return true;
     }
     if let Ok(fat) = MachOFatFile32::parse(bytes) {
         let arches = fat.arches();
+        if arches.len() > caps::MAX_FAT_ARCHES {
+            facts.mark_partial(NativePartialReason::FatArchitectureLimit);
+        }
         for (i, arch) in arches.iter().enumerate() {
             if i >= caps::MAX_FAT_ARCHES {
+                break;
+            }
+            if budget.structured_exhausted() {
+                facts.mark_partial(NativePartialReason::FatTraversalBudgetExhausted);
                 break;
             }
             if facts.arch.is_none() {
                 facts.arch = architecture_label(arch.architecture());
             }
-            if let Ok(slice) = arch.data(bytes) {
-                if let Ok(obj) = object::read::File::parse(slice) {
-                    extract_from_object(&obj, facts);
-                }
+            match arch.data(bytes) {
+                Ok(slice) => match object::read::File::parse(slice) {
+                    Ok(obj) => extract_from_object(&obj, facts, budget),
+                    Err(_) => facts.mark_partial(NativePartialReason::FatSliceParseFailed),
+                },
+                Err(_) => facts.mark_partial(NativePartialReason::FatSliceUnreadable),
             }
         }
         return true;
@@ -773,55 +1086,109 @@ const SIBLING_EXTENSIONS: &[&str] = &[
 
 /// Scan a buffer for printable-ASCII strings (runs >= 4) and feed each to the
 /// capability scanner. Bounded by the number of strings examined.
-fn scan_buffer_strings(bytes: &[u8], facts: &mut NativeFacts) {
-    scan_bytes_strings(bytes, facts);
+fn scan_buffer_strings(bytes: &[u8], facts: &mut NativeFacts, budget: &mut ExtractionBudget) {
+    scan_bytes_strings(bytes, facts, budget);
 }
 
 /// Extract printable-ASCII runs (>= 4 chars) from raw bytes and scan them. Bounded
 /// by [`caps::MAX_STRINGS_SCANNED`] (count) AND by capping each accumulated run at
-/// [`caps::MAX_SECTION_SCAN_BYTES`] (so one giant all-printable run cannot force a
-/// multi-gigabyte `to_ascii_lowercase` + token sweep — the run is truncated, not
-/// buffered unbounded).
-fn scan_bytes_strings(bytes: &[u8], facts: &mut NativeFacts) {
+/// [`caps::MAX_PRINTABLE_RUN_BYTES`] (so one giant all-printable run cannot force a
+/// multi-gigabyte `to_ascii_lowercase` + token sweep — the run is truncated and
+/// records [`NativePartialReason::PrintableRunByteLimit`]).
+fn scan_bytes_strings(bytes: &[u8], facts: &mut NativeFacts, budget: &mut ExtractionBudget) {
     let mut current: Vec<u8> = Vec::new();
-    let mut examined = 0usize;
+    let mut run_truncated = false;
     for &b in bytes {
         if (0x20..0x7f).contains(&b) {
             // Cap the run length: once at the cap, stop appending (the prefix is
             // enough for token detection; an unbounded run is a DoS lever).
-            if current.len() < caps::MAX_SECTION_SCAN_BYTES {
+            if current.len() < caps::MAX_PRINTABLE_RUN_BYTES {
                 current.push(b);
+            } else if !run_truncated {
+                // Prefix-only treatment of a giant run can hide tokens after the
+                // cap. Keep memory bounded but make the result explicitly Partial.
+                facts.mark_partial(NativePartialReason::PrintableRunByteLimit);
+                run_truncated = true;
             }
         } else {
             if current.len() >= 4 {
                 if let Ok(s) = std::str::from_utf8(&current) {
-                    scan_one_string(s, facts);
-                    examined += 1;
-                    if examined >= caps::MAX_STRINGS_SCANNED {
+                    if !take_budget_slot(&mut budget.strings_remaining) {
+                        facts.mark_partial(NativePartialReason::PrintableStringCountLimit);
                         return;
                     }
+                    scan_one_string(s, facts, budget);
                 }
             }
             current.clear();
+            run_truncated = false;
         }
     }
     if current.len() >= 4 {
         if let Ok(s) = std::str::from_utf8(&current) {
-            scan_one_string(s, facts);
+            if !take_budget_slot(&mut budget.strings_remaining) {
+                facts.mark_partial(NativePartialReason::PrintableStringCountLimit);
+            } else {
+                scan_one_string(s, facts, budget);
+            }
         }
     }
 }
 
 /// Scan an iterator of already-extracted strings (the streaming-view path).
-fn scan_strings<'a, I: Iterator<Item = &'a str>>(strings: I, facts: &mut NativeFacts) {
-    let mut examined = 0usize;
+fn scan_strings<'a, I: Iterator<Item = &'a str>>(
+    strings: I,
+    facts: &mut NativeFacts,
+    budget: &mut ExtractionBudget,
+) {
     for s in strings {
-        scan_one_string(s, facts);
-        examined += 1;
-        if examined >= caps::MAX_STRINGS_SCANNED {
-            return;
+        // The loop only reaches this branch after observing an actual next item.
+        // Thus exactly-at-cap input stays complete, while cap + 1 is explicit.
+        if !take_budget_slot(&mut budget.strings_remaining) {
+            facts.mark_partial(NativePartialReason::PrintableStringCountLimit);
+            break;
         }
+        scan_one_string(s, facts, budget);
     }
+}
+
+/// Insert one attacker-derived string into a bounded fact set. An at-cap duplicate
+/// is harmless; only a distinct (cap + 1)th value reports exhaustion.
+fn insert_bounded(set: &mut BTreeSet<String>, value: String, limit: usize) -> bool {
+    if set.contains(&value) {
+        return true;
+    }
+    if set.len() >= limit {
+        return false;
+    }
+    set.insert(value);
+    true
+}
+
+fn record_sibling_reference(facts: &mut NativeFacts, reference: String, limit: usize) {
+    if !insert_bounded(&mut facts.sibling_refs, reference, limit) {
+        facts.mark_partial(NativePartialReason::SiblingReferenceLimit);
+    }
+}
+
+fn record_embedded_url(facts: &mut NativeFacts, url: String, limit: usize) {
+    if !insert_bounded(&mut facts.embedded_urls, url, limit) {
+        facts.mark_partial(NativePartialReason::EmbeddedUrlLimit);
+    }
+}
+
+fn record_py_init_export(facts: &mut NativeFacts, name: String, limit: usize) {
+    if !insert_bounded(&mut facts.py_init_exports, name, limit) {
+        facts.mark_partial(NativePartialReason::PyInitExportLimit);
+    }
+}
+
+/// Collect at most `limit` characters and report whether one more character was
+/// present. The single-item peek makes exact-at-cap input complete.
+fn collect_chars_capped<I: Iterator<Item = char>>(mut chars: I, limit: usize) -> (String, bool) {
+    let value = chars.by_ref().take(limit).collect();
+    let exceeded = chars.next().is_some();
+    (value, exceeded)
 }
 
 /// Classify an IMPORTED symbol name (already lowercase) into the strong capability
@@ -851,7 +1218,7 @@ fn classify_capability_import(name: &str, facts: &mut NativeFacts) {
 /// (which embed libc symbol strings and homepage URLs) from satisfying a Critical
 /// leg: a danger/corroboration leg needs the spawn verb and the runtime/sibling in
 /// the SAME string, not merely both present somewhere in the binary.
-fn scan_one_string(s: &str, facts: &mut NativeFacts) {
+fn scan_one_string(s: &str, facts: &mut NativeFacts, budget: &mut ExtractionBudget) {
     let lower = s.to_ascii_lowercase();
 
     // Does THIS string contain a spawn/exec verb? (used for the co-occurrence legs.)
@@ -874,9 +1241,9 @@ fn scan_one_string(s: &str, facts: &mut NativeFacts) {
     let shell_path_here =
         lower.contains("/bin/sh") || lower.contains("/bin/bash") || lower.contains("/system32/cmd");
     for r in &runtimes_here {
-        if facts.runtime_names.len() < caps::MAX_SIBLING_REFS {
-            facts.runtime_names.insert((*r).to_string());
-        }
+        // This set's universe is the fixed `RUNTIME_TOKENS` table, so it is
+        // inherently bounded without a second, silently truncating storage cap.
+        facts.runtime_names.insert((*r).to_string());
     }
 
     // Sibling script/executable references in this string. `sibling_here` is computed
@@ -887,11 +1254,8 @@ fn scan_one_string(s: &str, facts: &mut NativeFacts) {
     // `execvp("./payload.js", ...)`).
     let mut sibling_here = false;
     for ext in SIBLING_EXTENSIONS {
-        if let Some(reference) = sibling_reference(s, &lower, ext) {
+        if collect_sibling_references(s, &lower, ext, facts, budget) {
             sibling_here = true;
-            if facts.sibling_refs.len() < caps::MAX_SIBLING_REFS {
-                facts.sibling_refs.insert(reference);
-            }
         }
     }
 
@@ -915,46 +1279,57 @@ fn scan_one_string(s: &str, facts: &mut NativeFacts) {
     // `has_suspicious_url` is still set after the storage cap is hit; only the STORAGE is
     // capped. Otherwise a crafted binary could pad 256 benign URLs early to disable the
     // suspicious-URL danger leg for every later string.
-    for scheme in ["http://", "https://", "ftp://"] {
+    'schemes: for scheme in ["http://", "https://", "ftp://"] {
         for (pos, _) in lower.match_indices(scheme) {
+            if !take_budget_slot(&mut budget.string_token_occurrences_remaining) {
+                facts.mark_partial(NativePartialReason::PrintableTokenOccurrenceLimit);
+                break 'schemes;
+            }
             let tail = &s[pos.min(s.len())..];
-            let url: String = tail
-                .chars()
-                .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'' && *c != '`')
-                .take(2048)
-                .collect();
+            let (url, url_truncated) = collect_chars_capped(
+                tail.chars()
+                    .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'' && *c != '`'),
+                caps::MAX_URL_LENGTH,
+            );
+            if url_truncated {
+                facts.mark_partial(NativePartialReason::EmbeddedUrlLengthLimit);
+            }
             if url.len() >= scheme.len() {
                 if is_suspicious_url(&url) {
                     facts.has_suspicious_url = true;
                 }
-                if facts.embedded_urls.len() < caps::MAX_URLS {
-                    facts.embedded_urls.insert(url);
-                }
+                record_embedded_url(facts, url, caps::MAX_URLS);
             }
         }
     }
 
     // A `PyInit_*` substring (the streaming-view path has no symbol table; harmless
     // on the buffered path where the real export is already recorded).
-    if facts.py_init_exports.len() < caps::MAX_SYMBOLS {
-        if let Some(pos) = s.find("PyInit_") {
-            let name: String = s[pos..]
+    for (pos, _) in s.match_indices("PyInit_") {
+        if !take_budget_slot(&mut budget.string_token_occurrences_remaining) {
+            facts.mark_partial(NativePartialReason::PrintableTokenOccurrenceLimit);
+            break;
+        }
+        let (name, name_truncated) = collect_chars_capped(
+            s[pos..]
                 .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .take(256)
-                .collect();
-            if name.len() > "PyInit_".len() {
-                facts.py_init_exports.insert(name);
-            }
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_'),
+            caps::MAX_PYINIT_NAME_LENGTH,
+        );
+        if name_truncated {
+            facts.mark_partial(NativePartialReason::PyInitNameLengthLimit);
+        }
+        if name.len() > "PyInit_".len() {
+            record_py_init_export(facts, name, caps::MAX_SYMBOLS);
         }
     }
 
     // Sensitive-path substrings (a credential path is a corroborator on its own).
-    if facts.sensitive_paths.len() < caps::MAX_SIBLING_REFS {
-        for needle in SENSITIVE_PATH_NEEDLES {
-            if lower.contains(needle) {
-                facts.sensitive_paths.insert((*needle).to_string());
-            }
+    // Like runtime names, this set's universe is a fixed table and needs no second
+    // attacker-reachable storage cap.
+    for needle in SENSITIVE_PATH_NEEDLES {
+        if lower.contains(needle) {
+            facts.sensitive_paths.insert((*needle).to_string());
         }
     }
 }
@@ -1008,16 +1383,29 @@ fn is_suspicious_url(url: &str) -> bool {
         .any(|h| host_l == *h || host_l.ends_with(&format!(".{h}")))
 }
 
-/// If `s` contains a filename-like token ending in `ext`, return that filename
-/// (the basename portion). `lower` is `s` lowercased (for the case-insensitive
-/// extension match). GENERIC: any filename with the extension, not a known name.
-fn sibling_reference(s: &str, lower: &str, ext: &str) -> Option<String> {
+/// Retain every filename-like token in `s` ending in `ext`, and return whether at
+/// least one valid reference existed. `lower` is `s` lowercased for the
+/// case-insensitive extension match. Collection stays globally bounded through
+/// [`record_sibling_reference`], while enumeration continues so a full set cannot
+/// hide the co-located spawn signal.
+fn collect_sibling_references(
+    s: &str,
+    lower: &str,
+    ext: &str,
+    facts: &mut NativeFacts,
+    budget: &mut ExtractionBudget,
+) -> bool {
     // `.js` is a PREFIX of `.json` (likewise `.py`/`.pyc`, `.sh`/`.sha256`,
     // `.bash`/`.bashrc`), so the FIRST occurrence of `ext` may sit inside a longer
     // extension whose boundary check fails - yet a LATER occurrence can be a real sibling.
-    // Iterate EVERY occurrence and return the first that passes the boundary and stem
-    // checks; `find` would stop at the first and silently drop the rest.
+    // Iterate EVERY occurrence; stopping after the first silently loses later
+    // same-extension references in the same string.
+    let mut found = false;
     for (pos, _) in lower.match_indices(ext) {
+        if !take_budget_slot(&mut budget.string_token_occurrences_remaining) {
+            facts.mark_partial(NativePartialReason::PrintableTokenOccurrenceLimit);
+            break;
+        }
         let end = pos + ext.len();
         // The character after the extension must be a path/word boundary (not another
         // identifier char), so `.js` does not fire inside `.jsonp`. `_` counts as a
@@ -1053,9 +1441,14 @@ fn sibling_reference(s: &str, lower: &str, ext: &str) -> Option<String> {
         if candidate.len() <= ext.len() {
             continue;
         }
-        return Some(candidate.to_string());
+        found = true;
+        if candidate.len() > caps::MAX_SIBLING_REF_LENGTH {
+            facts.mark_partial(NativePartialReason::SiblingReferenceLengthLimit);
+            continue;
+        }
+        record_sibling_reference(facts, candidate.to_string(), caps::MAX_SIBLING_REFS);
     }
-    None
+    found
 }
 
 /// `true` if `haystack` contains `word` bounded on both sides by a non-identifier
@@ -1123,6 +1516,11 @@ fn correlate_native(
         });
     } else {
         let fmt_label = facts.format.map(|f| f.label()).unwrap_or("unknown");
+        let coverage_suffix = if facts.coverage == NativeCoverage::Partial {
+            format!(", partial triage: {}", partial_reason_summary(&facts))
+        } else {
+            String::new()
+        };
         signals.push(ArtifactSignal {
             kind: ArtifactSignalKind::NativeExecutionEntry,
             location: location.clone(),
@@ -1134,11 +1532,7 @@ fn correlate_native(
                     .as_deref()
                     .map(|a| format!(", {a}"))
                     .unwrap_or_default(),
-                if facts.coverage == NativeCoverage::Partial {
-                    ", partial triage"
-                } else {
-                    ""
-                }
+                coverage_suffix,
             ),
             // Presence alone is Low: it becomes meaningful only in the conjunction.
             confidence: EdgeConfidence::Low,
@@ -1198,13 +1592,10 @@ fn correlate_native(
 fn execution_entry_evidence(facts: &NativeFacts) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !facts.py_init_exports.is_empty() {
-        let names: Vec<&str> = facts
-            .py_init_exports
-            .iter()
-            .take(4)
-            .map(|s| s.as_str())
-            .collect();
-        parts.push(format!("Python init export(s): {}", names.join(", ")));
+        parts.push(format!(
+            "Python init export(s): {}",
+            joined(&facts.py_init_exports, 4)
+        ));
     }
     if facts.has_elf_constructor {
         parts.push("ELF constructor (.init_array/.ctors)".to_string());
@@ -1359,9 +1750,10 @@ fn build_finding(
     });
     if facts.coverage == NativeCoverage::Partial {
         evidence.push(Evidence::Text {
-            detail: "triage was PARTIAL (member above the native-parse cap or a malformed parse); \
-                     the chain was established from the available evidence"
-                .to_string(),
+            detail: format!(
+                "triage was PARTIAL ({}); the chain was established from the available evidence",
+                partial_reason_summary(facts)
+            ),
         });
     }
 
@@ -1387,6 +1779,21 @@ fn build_finding(
         mitre_id: Some("T1129".to_string()),
         custom_rule_id: None,
     }
+}
+
+/// Render every retained partial-coverage reason for responder-facing evidence.
+/// Manually constructed/default facts may have no reason; keep that state explicit
+/// instead of inventing a parser failure.
+fn partial_reason_summary(facts: &NativeFacts) -> String {
+    if facts.partial_reasons.is_empty() {
+        return "unspecified_incomplete_analysis".to_string();
+    }
+    facts
+        .partial_reasons
+        .iter()
+        .map(|reason| reason.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Join up to `n` items of a set with `, `, appending `…` if truncated.
@@ -1419,6 +1826,13 @@ mod tests {
         }
     }
 
+    /// Scan one standalone test string under a fresh member budget. Tests that
+    /// exercise cross-string exhaustion use `scan_strings` directly with a shared
+    /// budget instead.
+    fn scan_test_string(s: &str, facts: &mut NativeFacts) {
+        scan_one_string(s, facts, &mut ExtractionBudget::default());
+    }
+
     // ------------------------------------------------------------------
     // Minimal ELF64 builder (hand-rolled so the tests pull NO write-side
     // dependency; `object`'s read parser accepts these and our extraction sees the
@@ -1432,26 +1846,39 @@ mod tests {
     /// (where the capability strings live). Section-header driven (no program
     /// headers needed for `object`'s section/symbol reads).
     fn build_elf(exports: &[&str], with_init_array: bool, rodata: &[u8]) -> Vec<u8> {
-        // ---- .dynstr: a NUL byte, then each export name NUL-terminated ----
+        let symbols = exports.iter().map(|name| (*name, true)).collect::<Vec<_>>();
+        build_elf_symbols(&symbols, with_init_array, rodata)
+    }
+
+    /// Variant of [`build_elf`] whose symbols can be defined exports (`true`) or
+    /// undefined imports (`false`).
+    fn build_elf_symbols(
+        symbols: &[(&str, bool)],
+        with_init_array: bool,
+        rodata: &[u8],
+    ) -> Vec<u8> {
+        // ---- .dynstr: a NUL byte, then each symbol name NUL-terminated ----
         let mut dynstr: Vec<u8> = vec![0];
         let mut name_offsets: Vec<u32> = Vec::new();
-        for name in exports {
+        for (name, _) in symbols {
             name_offsets.push(dynstr.len() as u32);
             dynstr.extend_from_slice(name.as_bytes());
             dynstr.push(0);
         }
 
-        // ---- .dynsym: a null symbol, then one GLOBAL FUNC per export ----
+        // ---- .dynsym: a null symbol, then one GLOBAL FUNC per symbol ----
         // Elf64_Sym = { st_name u32, st_info u8, st_other u8, st_shndx u16,
         //               st_value u64, st_size u64 } = 24 bytes.
         let mut dynsym: Vec<u8> = vec![0u8; 24]; // index 0: null symbol
-        for off in &name_offsets {
+        for ((_, defined), off) in symbols.iter().zip(&name_offsets) {
             let mut sym = Vec::new();
             sym.extend_from_slice(&off.to_le_bytes()); // st_name
             sym.push(0x12); // st_info: STB_GLOBAL<<4 | STT_FUNC (1) = 0x12
             sym.push(0); // st_other
-            sym.extend_from_slice(&1u16.to_le_bytes()); // st_shndx (any defined section)
-            sym.extend_from_slice(&0x1000u64.to_le_bytes()); // st_value
+            let section = if *defined { 1u16 } else { 0u16 };
+            sym.extend_from_slice(&section.to_le_bytes()); // SHN_UNDEF or a defined section
+            let value = if *defined { 0x1000u64 } else { 0u64 };
+            sym.extend_from_slice(&value.to_le_bytes()); // st_value
             sym.extend_from_slice(&0u64.to_le_bytes()); // st_size
             dynsym.extend_from_slice(&sym);
         }
@@ -1768,6 +2195,54 @@ mod tests {
     }
 
     #[test]
+    fn elf_import_cap_is_applied_before_name_allocation() {
+        let names = (0..=caps::MAX_IMPORTS)
+            .map(|index| format!("import_{index}"))
+            .collect::<Vec<_>>();
+        let symbols = names
+            .iter()
+            .map(|name| (name.as_str(), false))
+            .collect::<Vec<_>>();
+        let elf = build_elf_symbols(&symbols, false, b"benign\0");
+        let facts = extract_from_buffer(&elf);
+
+        assert_eq!(facts.imports.len(), caps::MAX_IMPORTS);
+        assert_eq!(facts.coverage, NativeCoverage::Partial);
+        assert!(facts
+            .partial_reasons
+            .contains(&NativePartialReason::ImportTableLimit));
+    }
+
+    #[test]
+    fn structured_import_and_pyinit_names_are_bounded_before_copy() {
+        let oversized_import = "i".repeat(caps::MAX_IMPORT_NAME_LENGTH + 1);
+        let oversized_pyinit = format!(
+            "PyInit_{}",
+            "p".repeat(caps::MAX_PYINIT_NAME_LENGTH + 1 - "PyInit_".len())
+        );
+        let symbols = [
+            (oversized_import.as_str(), false),
+            (oversized_pyinit.as_str(), true),
+        ];
+        let elf = build_elf_symbols(&symbols, false, b"benign\0");
+        let facts = extract_from_buffer(&elf);
+
+        assert!(facts.imports.is_empty());
+        assert!(facts
+            .py_init_exports
+            .iter()
+            .all(|name| name.len() <= caps::MAX_PYINIT_NAME_LENGTH));
+        assert!(!facts.py_init_exports.contains(&oversized_pyinit));
+        assert_eq!(facts.coverage, NativeCoverage::Partial);
+        assert!(facts
+            .partial_reasons
+            .contains(&NativePartialReason::ImportNameLengthLimit));
+        assert!(facts
+            .partial_reasons
+            .contains(&NativePartialReason::PyInitNameLengthLimit));
+    }
+
+    #[test]
     fn elf_without_init_array_has_no_constructor() {
         let elf = build_elf(&["PyInit__core"], false, b"\0");
         let facts = extract_from_buffer(&elf);
@@ -1933,7 +2408,7 @@ mod tests {
     #[test]
     fn benign_extension_system_error_string_with_py_sibling_is_clean() {
         let mut facts = NativeFacts::default();
-        scan_one_string("system error: cannot find helper.py", &mut facts);
+        scan_test_string("system error: cannot find helper.py", &mut facts);
         assert!(
             !facts.has_spawn_with_sibling,
             "the English word 'system' must not count as a string spawn verb"
@@ -1945,7 +2420,7 @@ mod tests {
     #[test]
     fn second_suspicious_url_in_one_string_sets_flag() {
         let mut facts = NativeFacts::default();
-        scan_one_string(
+        scan_test_string(
             "http://docs.example.org/ https://198.51.100.1:4444/stage2",
             &mut facts,
         );
@@ -2213,6 +2688,10 @@ mod tests {
         };
         let triage = triage_native(&stream, false, false);
         assert_eq!(triage.facts.coverage, NativeCoverage::Partial);
+        assert!(triage
+            .facts
+            .partial_reasons
+            .contains(&NativePartialReason::StreamingView));
         assert_eq!(
             triage.facts.format,
             Some(NativeFormat::Elf),
@@ -2265,18 +2744,18 @@ mod tests {
     fn sibling_extension_word_boundary() {
         // `.js` must not fire inside `.jsonp`; a real `.js` reference must.
         let mut facts = NativeFacts::default();
-        scan_one_string("config.jsonp", &mut facts);
+        scan_test_string("config.jsonp", &mut facts);
         assert!(
             facts.sibling_refs.is_empty(),
             "'.js' must not match in '.jsonp'"
         );
         let mut facts2 = NativeFacts::default();
-        scan_one_string("./a/run.js", &mut facts2);
+        scan_test_string("./a/run.js", &mut facts2);
         assert!(facts2.sibling_refs.iter().any(|r| r.ends_with("run.js")));
         // `_` is a token continuation: `addon.node_v8` is a `.node_v8` name, NOT a `.node`
         // sibling reference, so it must not fire.
         let mut facts3 = NativeFacts::default();
-        scan_one_string("dlopen(\"addon.node_v8\")", &mut facts3);
+        scan_test_string("dlopen(\"addon.node_v8\")", &mut facts3);
         assert!(
             facts3.sibling_refs.is_empty(),
             "'.node' must not match in '.node_v8': {:?}",
@@ -2291,12 +2770,29 @@ mod tests {
         // (its boundary check failed) and silently dropped the real reference, leaving the
         // spawn+sibling chain undetected.
         let mut facts = NativeFacts::default();
-        scan_one_string("system(\"./config.json ./payload.js\")", &mut facts);
+        scan_test_string("system(\"./config.json ./payload.js\")", &mut facts);
         assert!(
             facts.sibling_refs.iter().any(|r| r.ends_with("payload.js")),
             "the real ./payload.js sibling must be found past the .json occurrence; got {:?}",
             facts.sibling_refs
         );
+    }
+
+    #[test]
+    fn every_same_extension_sibling_in_one_string_is_retained() {
+        let mut facts = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        scan_test_string("execve(\"first.js second.js\")", &mut facts);
+
+        assert_eq!(
+            facts.sibling_refs,
+            BTreeSet::from(["first.js".to_string(), "second.js".to_string()]),
+            "same-extension references must not be silently limited to the first match"
+        );
+        assert!(facts.has_spawn_with_sibling);
+        assert_eq!(facts.coverage, NativeCoverage::Full);
     }
 
     // ------------------------------------------------------------------
@@ -2432,6 +2928,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fat_macho_stops_when_member_wide_structured_budgets_are_exhausted() {
+        let slice = build_macho_mod_init();
+        let fat = build_fat_macho(&[slice.clone(), slice]);
+        let mut facts = NativeFacts {
+            coverage: NativeCoverage::Full,
+            format: Some(NativeFormat::MachOFat),
+            ..NativeFacts::default()
+        };
+        let mut budget = ExtractionBudget {
+            imports_remaining: 0,
+            import_descriptors_remaining: 0,
+            symbols_remaining: 0,
+            dynamic_symbols_remaining: 0,
+            sections_remaining: 0,
+            ..ExtractionBudget::default()
+        };
+
+        assert!(parse_fat_macho(&fat, &mut facts, &mut budget));
+        assert_eq!(facts.coverage, NativeCoverage::Partial);
+        assert!(facts
+            .partial_reasons
+            .contains(&NativePartialReason::FatTraversalBudgetExhausted));
+    }
+
     // ------------------------------------------------------------------
     // Coverage fails closed (T3.19)
     // ------------------------------------------------------------------
@@ -2445,63 +2966,391 @@ mod tests {
         assert_eq!(NativeFacts::default().coverage, NativeCoverage::Partial);
     }
 
-    // ------------------------------------------------------------------
-    // Aggregate section-scan cap (T3.20)
-    // ------------------------------------------------------------------
+    #[test]
+    fn printable_run_cap_edge_marks_only_truncated_run_partial() {
+        let mut at_cap = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        let mut at_cap_budget = ExtractionBudget::default();
+        scan_bytes_strings(
+            &vec![b'A'; caps::MAX_PRINTABLE_RUN_BYTES],
+            &mut at_cap,
+            &mut at_cap_budget,
+        );
+        assert_eq!(
+            at_cap.coverage,
+            NativeCoverage::Full,
+            "a run exactly at the cap was fully inspected"
+        );
+        assert!(at_cap.partial_reasons.is_empty());
+
+        let mut over_cap = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        let mut over_cap_budget = ExtractionBudget::default();
+        scan_bytes_strings(
+            &vec![b'A'; caps::MAX_PRINTABLE_RUN_BYTES + 1],
+            &mut over_cap,
+            &mut over_cap_budget,
+        );
+        assert_eq!(
+            over_cap.coverage,
+            NativeCoverage::Partial,
+            "a single hidden byte beyond the retained run must downgrade coverage"
+        );
+        assert!(over_cap
+            .partial_reasons
+            .contains(&NativePartialReason::PrintableRunByteLimit));
+    }
 
     #[test]
-    fn native_triage_string_scan_total_bounded() {
-        // A crafted ELF with many sections, each carrying a distinct sibling-script
-        // reference, must stop scanning at the AGGREGATE byte cap: not every
-        // section's strings are collected, proving the whole-object scan is bounded
-        // and cannot be driven to ~512 GiB by 65k near-cap sections.
-        //
-        // We size each section just over the per-section limit's fraction so a small
-        // number of sections exceeds the aggregate cap, then assert the scan stopped
-        // before reaching the last section's planted token. Build it directly so the
-        // test stays fast (no multi-GiB allocation): a handful of ~10 MiB sections
-        // already crosses the 64 MiB aggregate cap.
-        let section_fill = 12 * 1024 * 1024usize; // ~12 MiB of filler per section
-        let n_sections = 8; // 8 * 12 MiB = 96 MiB > 64 MiB aggregate cap
-        let mut facts = NativeFacts::default();
-        let mut scanned_total = 0usize;
-        // Mirror the production loop's aggregate bound over synthetic section data:
-        // each "section" is filler + a unique token; we verify the early tokens are
-        // seen and a token past the aggregate cap is NOT.
-        for i in 0..n_sections {
-            if scanned_total >= caps::MAX_TOTAL_SECTION_SCAN_BYTES {
-                break;
+    fn printable_string_count_cap_edge_is_reported() {
+        fn strings(count: usize) -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(count * 5);
+            for _ in 0..count {
+                bytes.extend_from_slice(b"ABCD\0");
             }
-            let mut data = vec![b'.'; section_fill];
-            data.extend_from_slice(format!(" /tmp/marker{i}.js ").as_bytes());
-            let remaining = caps::MAX_TOTAL_SECTION_SCAN_BYTES - scanned_total;
-            let take = data.len().min(caps::MAX_SECTION_SCAN_BYTES).min(remaining);
-            scan_bytes_strings(&data[..take], &mut facts);
-            scanned_total += take;
+            bytes
         }
-        // The aggregate cap is 64 MiB; with 12 MiB sections only the first ~5 fit, so
-        // the later markers are never scanned.
-        assert!(
-            scanned_total <= caps::MAX_TOTAL_SECTION_SCAN_BYTES,
-            "aggregate scan must not exceed the cap"
-        );
-        assert!(
-            !facts.sibling_refs.iter().any(|r| r == "marker7.js"),
-            "a token in a section past the aggregate cap must not be scanned; got {:?}",
-            facts.sibling_refs
-        );
 
-        // And end-to-end through a real object: a single section larger than the
-        // per-section cap is truncated, and the WHOLE-buffer string scan still runs,
-        // so the test object's planted token in .rodata is found regardless (the
-        // aggregate cap bounds the per-SECTION scan, not the cheaper whole-buffer
-        // scan). This confirms the cap does not silently drop in-cap evidence.
-        let elf = build_elf(&["PyInit_x"], true, b"./loader/run.js\0");
-        let facts2 = extract_from_buffer(&elf);
+        let mut at_cap = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        let mut at_cap_budget = ExtractionBudget::default();
+        scan_bytes_strings(
+            &strings(caps::MAX_STRINGS_SCANNED),
+            &mut at_cap,
+            &mut at_cap_budget,
+        );
+        assert_eq!(at_cap.coverage, NativeCoverage::Full);
+        assert!(at_cap.partial_reasons.is_empty());
+
+        let mut over_cap = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        let mut over_cap_budget = ExtractionBudget::default();
+        scan_bytes_strings(
+            &strings(caps::MAX_STRINGS_SCANNED + 1),
+            &mut over_cap,
+            &mut over_cap_budget,
+        );
+        assert_eq!(over_cap.coverage, NativeCoverage::Partial);
+        assert!(over_cap
+            .partial_reasons
+            .contains(&NativePartialReason::PrintableStringCountLimit));
+    }
+
+    #[test]
+    fn extracted_string_cap_peeks_and_is_member_scoped() {
+        let mut at_cap = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        let mut at_cap_budget = ExtractionBudget::default();
+        scan_strings(
+            std::iter::repeat_n("ABCD", caps::MAX_STRINGS_SCANNED),
+            &mut at_cap,
+            &mut at_cap_budget,
+        );
+        assert_eq!(at_cap.coverage, NativeCoverage::Full);
+        assert!(at_cap.partial_reasons.is_empty());
+
+        let mut over_cap = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        let mut over_cap_budget = ExtractionBudget::default();
+        scan_strings(
+            std::iter::repeat_n("ABCD", caps::MAX_STRINGS_SCANNED + 1),
+            &mut over_cap,
+            &mut over_cap_budget,
+        );
+        assert_eq!(over_cap.coverage, NativeCoverage::Partial);
+        assert!(over_cap
+            .partial_reasons
+            .contains(&NativePartialReason::PrintableStringCountLimit));
+
+        // Reusing the same extraction budget across calls models multiple fat
+        // slices/helpers: exact aggregate exhaustion is complete, but one actual
+        // item in a later call proves the member-wide cap was exceeded.
+        let mut split = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        let mut split_budget = ExtractionBudget::default();
+        let first = caps::MAX_STRINGS_SCANNED / 2;
+        scan_strings(
+            std::iter::repeat_n("ABCD", first),
+            &mut split,
+            &mut split_budget,
+        );
+        scan_strings(
+            std::iter::repeat_n("EFGH", caps::MAX_STRINGS_SCANNED - first),
+            &mut split,
+            &mut split_budget,
+        );
+        assert_eq!(split.coverage, NativeCoverage::Full);
+        scan_strings(std::iter::once("IJKL"), &mut split, &mut split_budget);
+        assert_eq!(split.coverage, NativeCoverage::Partial);
+        assert!(split
+            .partial_reasons
+            .contains(&NativePartialReason::PrintableStringCountLimit));
+    }
+
+    #[test]
+    fn sibling_reference_cap_marks_only_distinct_cap_plus_one() {
+        let mut facts = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        for i in 0..caps::MAX_SIBLING_REFS {
+            record_sibling_reference(&mut facts, format!("payload{i}.js"), caps::MAX_SIBLING_REFS);
+        }
+        assert_eq!(facts.sibling_refs.len(), caps::MAX_SIBLING_REFS);
+        assert_eq!(facts.coverage, NativeCoverage::Full);
+
+        // A duplicate at capacity does not mean any evidence was lost.
+        record_sibling_reference(
+            &mut facts,
+            "payload0.js".to_string(),
+            caps::MAX_SIBLING_REFS,
+        );
+        assert_eq!(facts.coverage, NativeCoverage::Full);
+
+        // A distinct overflow is omitted, explained, and cannot suppress the
+        // co-located spawn boolean for a late malicious reference.
+        scan_test_string("execve(\"late-stage.js\")", &mut facts);
+        assert_eq!(facts.coverage, NativeCoverage::Partial);
+        assert!(facts
+            .partial_reasons
+            .contains(&NativePartialReason::SiblingReferenceLimit));
+        assert!(facts.has_spawn_with_sibling);
+    }
+
+    #[test]
+    fn embedded_url_cap_marks_only_distinct_cap_plus_one() {
+        let mut facts = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        for i in 0..caps::MAX_URLS {
+            record_embedded_url(
+                &mut facts,
+                format!("https://example.com/{i}"),
+                caps::MAX_URLS,
+            );
+        }
+        assert_eq!(facts.embedded_urls.len(), caps::MAX_URLS);
+        assert_eq!(facts.coverage, NativeCoverage::Full);
+
+        record_embedded_url(
+            &mut facts,
+            "https://example.com/0".to_string(),
+            caps::MAX_URLS,
+        );
+        assert_eq!(facts.coverage, NativeCoverage::Full);
+
+        scan_test_string("https://198.51.100.1:4444/stage", &mut facts);
+        assert_eq!(facts.coverage, NativeCoverage::Partial);
+        assert!(facts
+            .partial_reasons
+            .contains(&NativePartialReason::EmbeddedUrlLimit));
         assert!(
-            facts2.sibling_refs.iter().any(|r| r.ends_with("run.js")),
+            facts.has_suspicious_url,
+            "a URL beyond the retention cap must still set derived danger facts"
+        );
+    }
+
+    #[test]
+    fn py_init_export_cap_marks_only_distinct_cap_plus_one() {
+        let mut facts = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        for i in 0..caps::MAX_SYMBOLS {
+            record_py_init_export(&mut facts, format!("PyInit_mod{i}"), caps::MAX_SYMBOLS);
+        }
+        assert_eq!(facts.py_init_exports.len(), caps::MAX_SYMBOLS);
+        assert_eq!(facts.coverage, NativeCoverage::Full);
+
+        record_py_init_export(&mut facts, "PyInit_mod0".to_string(), caps::MAX_SYMBOLS);
+        assert_eq!(facts.coverage, NativeCoverage::Full);
+
+        record_py_init_export(
+            &mut facts,
+            "PyInit_actual_overflow".to_string(),
+            caps::MAX_SYMBOLS,
+        );
+        assert_eq!(facts.coverage, NativeCoverage::Partial);
+        assert!(facts
+            .partial_reasons
+            .contains(&NativePartialReason::PyInitExportLimit));
+    }
+
+    #[test]
+    fn url_and_py_init_length_caps_distinguish_exact_from_plus_one() {
+        let exact_url = format!(
+            "https://{}",
+            "a".repeat(caps::MAX_URL_LENGTH - "https://".len())
+        );
+        let mut exact_url_facts = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        scan_test_string(&exact_url, &mut exact_url_facts);
+        assert_eq!(exact_url.chars().count(), caps::MAX_URL_LENGTH);
+        assert_eq!(exact_url_facts.coverage, NativeCoverage::Full);
+
+        let overlong_url = format!("{exact_url}a");
+        let mut overlong_url_facts = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        scan_test_string(&overlong_url, &mut overlong_url_facts);
+        assert_eq!(overlong_url_facts.coverage, NativeCoverage::Partial);
+        assert!(overlong_url_facts
+            .partial_reasons
+            .contains(&NativePartialReason::EmbeddedUrlLengthLimit));
+
+        let exact_py_init = format!(
+            "PyInit_{}",
+            "x".repeat(caps::MAX_PYINIT_NAME_LENGTH - "PyInit_".len())
+        );
+        let mut exact_py_init_facts = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        scan_test_string(&exact_py_init, &mut exact_py_init_facts);
+        assert_eq!(exact_py_init.chars().count(), caps::MAX_PYINIT_NAME_LENGTH);
+        assert_eq!(exact_py_init_facts.coverage, NativeCoverage::Full);
+
+        let overlong_py_init = format!("{exact_py_init}x");
+        let mut overlong_py_init_facts = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        scan_test_string(&overlong_py_init, &mut overlong_py_init_facts);
+        assert_eq!(overlong_py_init_facts.coverage, NativeCoverage::Partial);
+        assert!(overlong_py_init_facts
+            .partial_reasons
+            .contains(&NativePartialReason::PyInitNameLengthLimit));
+    }
+
+    #[test]
+    fn printable_token_occurrences_and_sibling_names_are_bounded() {
+        let exact = ".js ".repeat(caps::MAX_STRING_TOKEN_OCCURRENCES);
+        let mut exact_facts = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        scan_test_string(&exact, &mut exact_facts);
+        assert_eq!(exact_facts.coverage, NativeCoverage::Full);
+
+        let overflow = format!("{exact}.js ");
+        let mut overflow_facts = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        scan_test_string(&overflow, &mut overflow_facts);
+        assert_eq!(overflow_facts.coverage, NativeCoverage::Partial);
+        assert!(overflow_facts
+            .partial_reasons
+            .contains(&NativePartialReason::PrintableTokenOccurrenceLimit));
+
+        let oversized_sibling = format!("{}.js", "s".repeat(caps::MAX_SIBLING_REF_LENGTH + 1));
+        let mut sibling_facts = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        scan_test_string(&oversized_sibling, &mut sibling_facts);
+        assert!(sibling_facts.sibling_refs.is_empty());
+        assert!(sibling_facts
+            .partial_reasons
+            .contains(&NativePartialReason::SiblingReferenceLengthLimit));
+    }
+
+    #[test]
+    fn fixed_runtime_and_sensitive_path_universes_are_fully_retained() {
+        let mut facts = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        for token in RUNTIME_TOKENS {
+            scan_test_string(token, &mut facts);
+        }
+        for needle in SENSITIVE_PATH_NEEDLES {
+            scan_test_string(needle, &mut facts);
+        }
+
+        let expected_runtimes = RUNTIME_TOKENS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<BTreeSet<_>>();
+        let expected_paths = SENSITIVE_PATH_NEEDLES
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(facts.runtime_names, expected_runtimes);
+        assert_eq!(facts.sensitive_paths, expected_paths);
+        assert_eq!(facts.coverage, NativeCoverage::Full);
+        assert!(facts.partial_reasons.is_empty());
+    }
+
+    #[test]
+    fn traversal_budget_marks_only_an_observed_extra_item() {
+        for cap in [
+            caps::MAX_IMPORTS,
+            caps::MAX_SYMBOLS,
+            caps::MAX_SECTIONS,
+            caps::MAX_STRINGS_SCANNED,
+        ] {
+            let mut remaining = cap;
+            for _ in 0..cap {
+                assert!(take_budget_slot(&mut remaining));
+            }
+            assert_eq!(remaining, 0, "exact exhaustion is not overflow");
+            assert!(!take_budget_slot(&mut remaining), "cap + 1 is observable");
+        }
+    }
+
+    #[test]
+    fn partial_reason_and_truncated_pyinit_evidence_are_explicit() {
+        let mut facts = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        for i in 0..5 {
+            facts.py_init_exports.insert(format!("PyInit_mod{i}"));
+        }
+        facts.mark_partial(NativePartialReason::EmbeddedUrlLimit);
+        facts.mark_partial(NativePartialReason::PrintableStringCountLimit);
+
+        assert_eq!(
+            partial_reason_summary(&facts),
+            "printable_string_count_limit, embedded_url_limit"
+        );
+        assert!(
+            execution_entry_evidence(&facts).contains('…'),
+            "five exports must be distinguishable from four in evidence"
+        );
+    }
+
+    #[test]
+    fn whole_buffer_string_scan_retains_in_cap_section_evidence() {
+        // Native section data is a subset of the bounded member buffer. The scanner
+        // now makes one member-wide pass instead of resetting its string budget for
+        // every section and fat slice; ordinary section evidence remains visible.
+        let elf = build_elf(&["PyInit_x"], true, b"./loader/run.js\0");
+        let facts = extract_from_buffer(&elf);
+        assert!(
+            facts.sibling_refs.iter().any(|r| r.ends_with("run.js")),
             "an in-cap .rodata sibling ref is still found via the whole-buffer scan"
         );
+        assert_eq!(facts.coverage, NativeCoverage::Full);
     }
 
     // ------------------------------------------------------------------

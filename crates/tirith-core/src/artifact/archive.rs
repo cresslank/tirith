@@ -124,9 +124,11 @@ pub enum ArchiveViolation {
         /// by the caller for display).
         member: String,
     },
-    /// A member path uses a backslash separator, a drive letter (`C:`), or a UNC
-    /// prefix. Checked host-OS-INDEPENDENTLY on the raw name, because on a Unix
-    /// host `enclosed_name` parses `C:\evil` as one harmless component.
+    /// A member path has Windows-ambiguous extraction semantics: a backslash
+    /// separator, drive/UNC prefix, alternate-data-stream/invalid character,
+    /// trailing dot/space, control byte, or reserved device component. Checked
+    /// host-OS-INDEPENDENTLY on the raw name, because a Unix inspection host does
+    /// not apply Win32 filename canonicalization.
     WindowsPathTraversal {
         /// The offending member name.
         member: String,
@@ -433,6 +435,7 @@ pub fn read_wheel<R: Read + Seek>(
     // ---- Pass 2: stream member content under the budgets ----------------------
     let mut inspection = ArtifactInspection::new(generic_subject(outer_name, outer_sha256));
     inspection.coverage.members_total = total_entries;
+    inspection.coverage.members_enumerated = metas.len();
     if entry_count_capped {
         inspection.coverage.gaps.push(CoverageGap {
             location: SubjectLocation::from_path(outer_name),
@@ -460,7 +463,6 @@ pub fn read_wheel<R: Read + Seek>(
             violations.push(ArchiveViolation::EncryptedMember {
                 member: meta.raw_name.clone(),
             });
-            inspection.coverage.members_inspected += 1;
             continue;
         }
         if meta.is_symlink {
@@ -471,7 +473,6 @@ pub fn read_wheel<R: Read + Seek>(
                 member: meta.raw_name.clone(),
                 target,
             });
-            inspection.coverage.members_inspected += 1;
             continue;
         }
 
@@ -603,7 +604,6 @@ pub fn read_wheel<R: Read + Seek>(
                 violations.push(ArchiveViolation::CrcMismatch {
                     member: meta.raw_name.clone(),
                 });
-                inspection.coverage.members_inspected += 1;
             }
             MemberStream::RatioExceeded { consumed } => {
                 total_uncompressed = total_uncompressed.saturating_add(consumed);
@@ -615,8 +615,9 @@ pub fn read_wheel<R: Read + Seek>(
                     kind: CoverageGapKind::CompressionRatioExceeded,
                     sha256: None,
                 });
-                // Count it as inspected-with-a-gap; the consumed bytes were debited
-                // above so the abort cannot reset the total budget.
+                // The consumed bytes were debited above so the abort cannot reset
+                // the total budget. This member remains uninspected because its
+                // decompressed body was not seen in full.
             }
             MemberStream::BudgetExceeded { kind, consumed } => {
                 total_uncompressed = total_uncompressed.saturating_add(consumed);
@@ -680,7 +681,6 @@ pub fn read_wheel<R: Read + Seek>(
                     kind: CoverageGapKind::Unreadable,
                     sha256: None,
                 });
-                inspection.coverage.members_inspected += 1;
             }
         }
     }
@@ -745,14 +745,15 @@ pub fn wheel_distribution_name(filename: &str) -> Option<String> {
     Some(normalize_project_name(&parsed.name))
 }
 
-/// The structural check for traversal / Windows-path members. `enclosed_name`
+/// The structural check for traversal / Windows-ambiguous members. `enclosed_name`
 /// fail-closes absolute / `..` / non-UTF-8 paths, so a `None` enclosed name is a
 /// traversal violation; we ALSO scan the raw name for backslash / drive-letter /
-/// UNC (host-OS-independent, because on Unix `enclosed_name` treats `C:\x` as one
-/// safe component) and for a literal `..` segment that normalization might erase.
+/// UNC / Win32 alias spelling (host-OS-independent, because on Unix
+/// `enclosed_name` treats these as ordinary components) and for a literal `..`
+/// segment that normalization might erase.
 fn check_member_paths(metas: &[MemberMeta], violations: &mut Vec<ArchiveViolation>) {
     for meta in metas {
-        // Windows-style traversal is checked on the RAW name regardless of host OS.
+        // Windows extraction aliases are checked on the RAW name regardless of host OS.
         if has_windows_path(&meta.raw_name) {
             violations.push(ArchiveViolation::WindowsPathTraversal {
                 member: meta.raw_name.clone(),
@@ -772,10 +773,11 @@ fn check_member_paths(metas: &[MemberMeta], violations: &mut Vec<ArchiveViolatio
 /// the platform's path semantics. We normalize for BOTH a case-sensitive and a
 /// case-insensitive target, and additionally apply Unicode NFC, so a case-fold or
 /// Unicode-normalization collision (one member would overwrite the other on
-/// extraction) is caught. Only members with a safe (enclosed) name participate;
+/// extraction) is caught. The key also applies Win32's trailing-dot/space
+/// canonicalization as defense in depth; those aliases are independently rejected
+/// by `check_member_paths`. Only members with a safe (enclosed) name participate;
 /// an unsafe member is already a traversal violation.
 fn check_path_collisions(metas: &[MemberMeta], violations: &mut Vec<ArchiveViolation>) {
-    use unicode_normalization::UnicodeNormalization;
     // normalized key -> (index, raw name) of the FIRST member seen for that key.
     // We key the "already seen" decision on the member INDEX, not the raw name, so
     // two SEPARATE members with a byte-identical path are still flagged (an exact
@@ -792,7 +794,7 @@ fn check_path_collisions(metas: &[MemberMeta], violations: &mut Vec<ArchiveViola
         // Case-fold AND Unicode-normalize for the collision key: this catches a
         // plain duplicate, a case-only difference (relevant on a case-insensitive
         // target like macOS/Windows), and a Unicode-normalization difference.
-        let key: String = enclosed.nfc().collect::<String>().to_lowercase();
+        let key = windows_collision_key(enclosed);
         if let Some((first_index, first_name)) = seen.get(&key) {
             // A DIFFERENT member (different index) collided on this normalized path.
             if *first_index != meta.index {
@@ -986,17 +988,11 @@ fn is_supported_compression(method: zip::CompressionMethod) -> bool {
     )
 }
 
-/// Whether a raw member name uses a backslash separator, a drive-letter prefix
-/// (`C:`), or a UNC prefix (`\\` or `//` lead). Checked host-OS-independently.
+/// Whether a raw member name has Windows-ambiguous extraction semantics. Wheels
+/// are portable artifacts, so these spellings are rejected on every inspection
+/// host rather than classified using the current host's filesystem rules.
 fn has_windows_path(name: &str) -> bool {
     if name.contains('\\') {
-        return true;
-    }
-    // Drive letter like `C:` or `c:` as the first two chars followed by a sep or
-    // end. Also any `:` is suspicious in a member path (a wheel member never has
-    // a colon), so flag a drive-letter-shaped prefix.
-    let bytes = name.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         return true;
     }
     // A UNC path like `\\server\share` is already caught by the backslash check
@@ -1005,7 +1001,97 @@ fn has_windows_path(name: &str) -> bool {
     if name.starts_with("//") {
         return true;
     }
-    false
+    name.split('/').any(windows_component_is_ambiguous)
+}
+
+/// A single path component that Win32 would reject, reinterpret, or alias to a
+/// different effective filename. In particular, `evil.pth.`, `evil.pth `, and
+/// `evil.pth::$DATA` must never bypass startup-hook classification by resolving to
+/// `evil.pth` only after inspection.
+fn windows_component_is_ambiguous(component: &str) -> bool {
+    if component.is_empty() {
+        return false; // leading/doubled separators are handled by enclosed_name/UNC checks
+    }
+    if component.ends_with(['.', ' ']) {
+        return true;
+    }
+    if component
+        .chars()
+        .any(|ch| ch <= '\u{1f}' || matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+    {
+        return true;
+    }
+    // NTFS may assign a DOS 8.3 short-name alias to a long filename. A later
+    // archive member using that alias addresses the same file on volumes where
+    // 8.3 creation is enabled, even though literal-name classification and the
+    // collision key see a different component. The exact alias-generation
+    // algorithm is volume/order dependent, so do not try to predict it: reject
+    // every component shaped like a generated 8.3 alias on every host.
+    if looks_like_windows_short_name_alias(component) {
+        return true;
+    }
+
+    // Win32 device names alias regardless of case and even when followed by an
+    // extension (`NUL.txt`, `COM1.py`). Trailing dots/spaces were rejected above,
+    // so comparing the stem is sufficient and deterministic.
+    let stem = component.split('.').next().unwrap_or(component);
+    let upper = stem.to_ascii_uppercase();
+    let reserved_port_suffix = |suffix: &str| {
+        matches!(
+            suffix,
+            "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
+    };
+    matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+    ) || upper.strip_prefix("COM").is_some_and(reserved_port_suffix)
+        || upper.strip_prefix("LPT").is_some_and(reserved_port_suffix)
+}
+
+/// Whether `component` has the portable shape of a generated DOS 8.3 alias:
+/// an at-most-eight-character stem ending in `~<digits>`, plus an optional
+/// at-most-three-character extension. This intentionally accepts a wider prefix
+/// alphabet than the generator: false negatives would preserve an overwrite
+/// primitive, while the conservative false-positive surface is limited to explicit
+/// short-alias-shaped wheel members such as `SITECU~1.PY`.
+fn looks_like_windows_short_name_alias(component: &str) -> bool {
+    let (stem, extension) = match component.split_once('.') {
+        Some((stem, extension)) if !extension.contains('.') => (stem, Some(extension)),
+        Some(_) => return false,
+        None => (component, None),
+    };
+    if stem.is_empty()
+        || stem.chars().count() > 8
+        || extension.is_some_and(|extension| extension.chars().count() > 3)
+    {
+        return false;
+    }
+    let Some((prefix, generation)) = stem.rsplit_once('~') else {
+        return false;
+    };
+    !prefix.is_empty()
+        && !generation.is_empty()
+        && generation.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Collision key under the broad portable extraction semantics the reader
+/// enforces: Unicode NFC, case-insensitive path components, and Win32's removal
+/// of trailing dots/spaces. Alias spellings are rejected separately, but keeping
+/// this canonicalization here makes collision evidence honest as well.
+fn windows_collision_key(path: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+
+    path.split('/')
+        .map(|component| {
+            component
+                .trim_end_matches(['.', ' '])
+                .nfc()
+                .collect::<String>()
+                .to_lowercase()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Whether a raw member name contains a `..` PATH SEGMENT (between separators, or
@@ -1766,6 +1852,66 @@ mod tests {
     }
 
     #[test]
+    fn windows_filename_aliases_are_rejected_on_every_host() {
+        // Each spelling is either reinterpreted by Win32 (trailing dot/space,
+        // ADS, reserved device) or is not a portable Windows component. In
+        // particular the first two resolve/classify differently from `evil.pth`
+        // if validation is deferred until extraction.
+        for member in [
+            "demo/evil.pth.",
+            "demo/evil.pth ",
+            "demo/evil.pth::$DATA",
+            "demo/SITECU~1.PY",
+            "demo/EVILP~42.PTH",
+            "demo/ÉVILP~1.PTH",
+            "demo/NUL.py",
+            "demo/com1.txt",
+            "demo/COM¹.txt",
+            "demo/CONOUT$",
+            "demo/bad?.pth",
+        ] {
+            let bytes = ZipBuilder::new()
+                .stored(member, b"import os; os.system('id')")
+                .build();
+            let outcome = read_bytes(&bytes, "demo-1.0-py3-none-any.whl");
+            assert_rejected_with(
+                &outcome,
+                member,
+                |v| matches!(v, ArchiveViolation::WindowsPathTraversal { member: found } if found == member),
+            );
+        }
+    }
+
+    #[test]
+    fn windows_short_name_alias_cannot_overwrite_a_startup_hook() {
+        // On an NTFS volume with 8.3-name creation enabled, creating the long name
+        // can assign `SITECU~1.PY` as its short alias. A later member using that
+        // spelling would address the same file while literal-name classification
+        // sees only an ordinary `.py` source. Reject the archive independently of
+        // the inspection host so extraction order can never turn this pair into an
+        // analyzed-benign then overwritten startup hook.
+        let bytes = ZipBuilder::new()
+            .stored("sitecustomize.py", b"# benign prefix inspected by Tirith\n")
+            .stored("SITECU~1.PY", b"import os; os.system('id')\n")
+            .build();
+        let outcome = read_bytes(&bytes, "demo-1.0-py3-none-any.whl");
+        assert_rejected_with(
+            &outcome,
+            "DOS 8.3 overwrite alias",
+            |v| matches!(v, ArchiveViolation::WindowsPathTraversal { member } if member == "SITECU~1.PY"),
+        );
+    }
+
+    #[test]
+    fn windows_alias_collision_key_matches_effective_startup_hook_name() {
+        assert_eq!(
+            windows_collision_key("Demo/EVIL.PTH. "),
+            windows_collision_key("demo/evil.pth"),
+            "collision evidence must use the effective Win32 filename"
+        );
+    }
+
+    #[test]
     fn encrypted_member_is_rejected() {
         // The public write API can only produce an encrypted member with the
         // `aes-crypto` feature (not enabled here). Instead, build a plain member
@@ -1978,6 +2124,10 @@ mod tests {
             .gaps
             .iter()
             .any(|g| g.kind == CoverageGapKind::EntryCountCapped));
+        assert_eq!(inspection.coverage.members_total, 10);
+        assert_eq!(inspection.coverage.members_enumerated, 3);
+        assert_eq!(inspection.coverage.members_inspected, 3);
+        assert!(!inspection.coverage.is_complete());
     }
 
     #[test]
@@ -2008,6 +2158,9 @@ mod tests {
             .gaps
             .iter()
             .any(|g| g.kind == CoverageGapKind::MemberTooLarge));
+        assert_eq!(inspection.coverage.members_total, 1);
+        assert_eq!(inspection.coverage.members_enumerated, 1);
+        assert_eq!(inspection.coverage.members_inspected, 0);
     }
 
     #[test]
@@ -2642,6 +2795,11 @@ mod tests {
         assert!(has_windows_path("//server/share"));
         assert!(!has_windows_path("a/b/c"));
         assert!(!has_windows_path("demo/__init__.py"));
+        // A literal tilde without a numeric generation and a long extension are
+        // not possible generated 8.3 aliases, so ordinary portable names remain
+        // accepted.
+        assert!(!has_windows_path("demo/module~beta.py"));
+        assert!(!has_windows_path("demo/module~1.long"));
     }
 
     #[test]

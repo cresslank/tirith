@@ -63,6 +63,7 @@ fn tirith() -> Command {
         "TIRITH_OFFLINE",
         "TIRITH_ALLOW_HTTP",
         "TIRITH_ALLOW_PRIVATE_FETCH",
+        "TIRITH_PRIVATE_FETCH_ALLOW",
         "TIRITH_CANARY_TOKEN",
         "TIRITH_SESSION_ID",
         "TIRITH_INTEGRATION",
@@ -4215,6 +4216,46 @@ fn threatdb_explain_known_malicious_package() {
 }
 
 #[test]
+fn check_bare_npm_protocol_scores_target_identity_end_to_end() {
+    // npm accepts a registry alias protocol as the whole install spec. The
+    // real CLI must score the target (`evil-package`), not the fictitious
+    // protocol-prefixed name (`npm:evil-package`).
+    let out = tirith()
+        .env("TIRITH_OFFLINE", "1")
+        .env("TIRITH_THREATDB_PATH", test_threatdb_fixture())
+        .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH")
+        .args([
+            "check",
+            "--json",
+            "--shell",
+            "posix",
+            "--",
+            "npm install npm:evil-package@1.0.0",
+        ])
+        .output()
+        .expect("run the real tirith check command");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the malicious npm target must block; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("check output is JSON");
+    assert_eq!(json["action"], "block");
+    assert!(
+        json["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .any(|finding| finding["rule_id"] == "threat_malicious_package"),
+        "the block must come from target-package threat intelligence: {json}"
+    );
+}
+
+#[test]
 fn threatdb_explain_absent_indicator_says_so() {
     let state = tempfile::tempdir().unwrap();
     let (stdout, _err, code) =
@@ -5898,7 +5939,10 @@ fn mcp_lock_writes_lockfile_for_planted_config() {
     let lock: serde_json::Value = serde_json::from_str(&contents).expect("lockfile must be JSON");
     // format_version 6 — adds the live `tools/list` descriptor lock (captured at
     // runtime; empty for a config-only `mcp lock`) atop v5's `tools_declared` hash.
-    assert_eq!(lock["format_version"], 6);
+    assert_eq!(
+        lock["format_version"],
+        tirith_core::mcp_lock::MCP_LOCK_FORMAT_VERSION
+    );
     let servers = lock["servers"].as_array().expect("servers array");
     assert_eq!(servers.len(), 2);
     assert_eq!(servers[0]["name"], "filesystem");
@@ -5995,16 +6039,38 @@ fn mcp_lock_is_deterministic_across_runs() {
 }
 
 #[test]
-fn mcp_lock_malformed_config_is_recorded_not_fatal() {
-    // A malformed MCP config contributes no servers and is reported as
-    // unparseable — it is never an error.
+fn mcp_lock_malformed_config_requires_explicit_incomplete_override() {
+    // A malformed MCP config must not silently become a trusted partial
+    // baseline. The explicit audit override may record the gap, but verify will
+    // continue to treat that baseline as incomplete.
     let repo = tempfile::tempdir().unwrap();
     let iso = tempfile::tempdir().unwrap();
     fs::create_dir_all(repo.path().join(".git")).unwrap();
     fs::write(repo.path().join("mcp.json"), "{ not valid json at all").unwrap();
 
-    let (stdout, _err, code) = run_mcp_lock(repo.path(), iso.path(), &["--format", "json"]);
-    assert_eq!(code, 0, "a malformed config is not fatal");
+    let lock_path = repo.path().join(".tirith").join("mcp.lock");
+    let (stdout, stderr, code) = run_mcp_lock(repo.path(), iso.path(), &["--format", "json"]);
+    assert_eq!(code, 1, "a malformed config must refuse an ordinary lock");
+    let refusal = format!("{stdout}{stderr}");
+    assert!(
+        refusal.contains("incomplete MCP baseline")
+            && refusal.contains("--allow-incomplete-configs"),
+        "the refusal must explain the explicit audit override: {refusal}"
+    );
+    assert!(
+        !lock_path.exists(),
+        "default refusal must not publish a partial MCP baseline"
+    );
+
+    let (stdout, _err, code) = run_mcp_lock(
+        repo.path(),
+        iso.path(),
+        &["--allow-incomplete-configs", "--format", "json"],
+    );
+    assert_eq!(
+        code, 0,
+        "the explicit incomplete-baseline override may record the gap"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("mcp lock JSON");
     // The file is discovered (counts as a config) but yields no servers.
     assert_eq!(v["configs_found"], 1);
@@ -6012,6 +6078,7 @@ fn mcp_lock_malformed_config_is_recorded_not_fatal() {
     let malformed = v["malformed_configs"].as_array().unwrap();
     assert_eq!(malformed.len(), 1);
     assert_eq!(malformed[0], "mcp.json");
+    assert_eq!(v["incomplete_override_used"], true);
 }
 
 #[test]
@@ -6058,7 +6125,10 @@ fn mcp_lock_does_not_leak_url_userinfo_into_committed_file() {
     // The schema is at format_version 6 (which adds the live `tools/list` descriptor lock);
     // v4's URL userinfo redaction is preserved through the bumps.
     let lock: serde_json::Value = serde_json::from_str(lock_text).expect("lockfile must be JSON");
-    assert_eq!(lock["format_version"], 6);
+    assert_eq!(
+        lock["format_version"],
+        tirith_core::mcp_lock::MCP_LOCK_FORMAT_VERSION
+    );
 
     // The URL transport stores the redacted URL and carries the `userinfo_hash` field; it does
     // NOT carry a plaintext userinfo / credential / token field.
@@ -6287,7 +6357,10 @@ fn mcp_verify_json_emits_envelope() {
     assert_eq!(v["in_sync"], true);
     assert_eq!(v["drift_count"], 0);
     assert_eq!(v["command"], "tirith mcp verify");
-    assert_eq!(v["lockfile_format_version"], 6);
+    assert_eq!(
+        v["lockfile_format_version"],
+        tirith_core::mcp_lock::MCP_LOCK_FORMAT_VERSION
+    );
 }
 
 #[test]
@@ -8532,6 +8605,65 @@ fn share_public_paste_redacts_private_ip_in_context() {
         stdout.contains("server "),
         "keyword 'server' must survive, got: {stdout}"
     );
+}
+
+#[test]
+fn share_public_paste_redacts_truncated_private_key_through_eof() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("truncated-key.pem");
+    fs::write(
+        &fixture,
+        "prefix\n-----BEGIN RSA PRIVATE KEY-----\nMIIErecoverable-private-body",
+    )
+    .unwrap();
+
+    let out = tirith()
+        .args([
+            "share",
+            "--target",
+            "public-paste",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run tirith share");
+    assert_eq!(out.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("prefix\n[REDACTED]"), "got: {stdout}");
+    assert!(!stdout.contains("MIIErecoverable-private-body"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("private_key"), "got: {stderr}");
+}
+
+#[test]
+fn redact_stdin_scrubs_sendgrid_and_truncated_pgp_key() {
+    let sendgrid = format!("SG.{}.{}", "A".repeat(22), "b".repeat(43));
+    let mut child = tirith()
+        .args(["redact", "--audience", "public-paste"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn tirith redact");
+
+    {
+        use std::io::Write as _;
+        let stdin = child.stdin.as_mut().expect("stdin pipe");
+        write!(
+            stdin,
+            "SENDGRID_API_KEY={sendgrid}\n-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQdGrecoverable-private-body"
+        )
+        .unwrap();
+    }
+
+    let out = child.wait_with_output().expect("wait");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains(&sendgrid), "got: {stdout}");
+    assert!(!stdout.contains("lQdGrecoverable-private-body"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("sendgrid_api_key"), "got: {stderr}");
+    assert!(stderr.contains("pgp_private_key"), "got: {stderr}");
 }
 
 /// `tirith share --json` emits a `{ redacted_content, redactions }` envelope.
@@ -11292,9 +11424,9 @@ fn command_card_mismatch_is_high_and_other_findings_fire() {
 }
 
 /// F6 first-hop SSRF guard: a private/loopback fetch must be REJECTED by DEFAULT
-/// (no opt-in). The sibling `command_card_fetch_rejects_unreachable_url` sets
-/// `TIRITH_ALLOW_PRIVATE_FETCH=1` which DISABLES the guard; this pins that without
-/// the opt-in the guard blocks the request before any connection is attempted.
+/// (no exception). The sibling `command_card_fetch_rejects_unreachable_url` adds
+/// an exact loopback exception; this pins that without one the guard blocks the
+/// request before any connection is attempted.
 #[cfg(unix)]
 #[test]
 fn command_card_fetch_blocks_private_url_without_opt_in() {
@@ -11302,7 +11434,9 @@ fn command_card_fetch_blocks_private_url_without_opt_in() {
     let out = tirith()
         .args(["command-card", "fetch", "http://127.0.0.1:9/nope.json"])
         .env("HOME", home.path())
-        .env_remove("TIRITH_ALLOW_PRIVATE_FETCH")
+        // The retired broad switch must not weaken the guard.
+        .env("TIRITH_ALLOW_PRIVATE_FETCH", "1")
+        .env_remove("TIRITH_PRIVATE_FETCH_ALLOW")
         .output()
         .expect("fetch");
     assert_eq!(
@@ -11327,9 +11461,9 @@ fn command_card_fetch_rejects_unreachable_url() {
     let out = tirith()
         .args(["command-card", "fetch", "http://127.0.0.1:9/nope.json"])
         .env("HOME", home.path())
-        // The localhost test endpoint is reachable only with the explicit
-        // private-fetch opt-in; the SSRF guard blocks 127.0.0.1 by default.
-        .env("TIRITH_ALLOW_PRIVATE_FETCH", "1")
+        // The localhost test endpoint is reachable only with an exact
+        // private-fetch exception; the SSRF guard blocks it by default.
+        .env("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32")
         .output()
         .expect("fetch");
     assert_eq!(
@@ -11422,8 +11556,8 @@ fn command_card_fetch_is_idempotent_for_identical_bytes() {
             .args(["command-card", "fetch", &url])
             .env("HOME", home.path())
             .env("XDG_CACHE_HOME", cache.path())
-            // Reach the 127.0.0.1 test server past the default SSRF guard.
-            .env("TIRITH_ALLOW_PRIVATE_FETCH", "1")
+            // Reach only this loopback IP past the default SSRF guard.
+            .env("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32")
             .output()
             .expect("fetch")
     };
@@ -11524,8 +11658,8 @@ fn command_card_fetch_rejects_card_over_read_cap() {
         .args(["command-card", "fetch", &url])
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", cache.path())
-        // Reach the 127.0.0.1 test server past the default SSRF guard.
-        .env("TIRITH_ALLOW_PRIVATE_FETCH", "1")
+        // Reach only this loopback IP past the default SSRF guard.
+        .env("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32")
         .output()
         .expect("fetch");
 
@@ -12322,7 +12456,7 @@ fn canary_create_persists_trimmed_callback_url() {
     let state = tempfile::tempdir().expect("tempdir");
 
     // A callback URL padded with surrounding whitespace.
-    let padded = "  https://my-host.example/hit  ";
+    let padded = "  https://93.184.216.34/hit  ";
     let create = canary_tirith(state.path())
         .args([
             "canary",
@@ -12337,7 +12471,7 @@ fn canary_create_persists_trimmed_callback_url() {
     assert_eq!(create.status.code(), Some(0), "create exits 0");
     let cjson: serde_json::Value = serde_json::from_slice(&create.stdout).unwrap();
     assert_eq!(
-        cjson["callback_url"], "https://my-host.example/hit",
+        cjson["callback_url"], "https://93.184.216.34/hit",
         "the created entry must carry the trimmed callback URL"
     );
 
@@ -12352,7 +12486,7 @@ fn canary_create_persists_trimmed_callback_url() {
     let entries = ljson.as_array().expect("list --json is an array");
     assert_eq!(entries.len(), 1, "exactly one canary registered");
     assert_eq!(
-        entries[0]["callback_url"], "https://my-host.example/hit",
+        entries[0]["callback_url"], "https://93.184.216.34/hit",
         "the stored callback URL must be trimmed, not whitespace-padded"
     );
 }
@@ -12397,8 +12531,8 @@ fn canary_json_validation_errors_are_machine_readable() {
     assert!(
         v.get("error")
             .and_then(|e| e.as_str())
-            .is_some_and(|s| s.contains("http(s)")),
-        "JSON error must explain the http(s) requirement, got: {v}"
+            .is_some_and(|s| s.contains("invalid callback URL") && s.contains("HTTPS")),
+        "JSON error must explain the HTTPS destination requirement, got: {v}"
     );
 
     // prune --json without --yes → parseable JSON error, exit 2.
@@ -17387,7 +17521,7 @@ fn package_inspect_cross_distribution_attaches_to_loader_names_payload() {
 }
 
 #[test]
-fn package_inspect_sdist_is_unsupported_gap_exit_0() {
+fn package_inspect_sdist_unsupported_gap_blocks() {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path();
     // A gzip-magic file named `.whl` would still sniff as gzip → Unsupported; here
@@ -17399,19 +17533,27 @@ fn package_inspect_sdist_is_unsupported_gap_exit_0() {
         .arg(&sdist)
         .output()
         .expect("run package inspect sdist");
-    // An sdist is Unsupported (a coverage gap), not a finding: clean exit 0.
+    // An sdist is Unsupported. On the enforcing artifact surface that coverage
+    // gap is material and therefore fails closed.
     assert_eq!(
         out.status.code(),
-        Some(0),
-        "an unsupported sdist is a coverage gap, not a block; stderr:\n{}",
+        Some(1),
+        "an unsupported sdist must fail closed; stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(json["action"], "block");
     assert!(
         json["coverage_gaps"]
             .as_array()
-            .is_some_and(|g| !g.is_empty()),
+            .is_some_and(|gaps| gaps.iter().any(|gap| gap["kind"] == "unsupported")),
         "the sdist must be recorded as a coverage gap: {json}"
+    );
+    assert!(
+        json["findings"].as_array().is_some_and(|findings| findings
+            .iter()
+            .any(|finding| finding["rule_id"] == "analysis_incomplete")),
+        "the unresolved artifact coverage must produce analysis_incomplete: {json}"
     );
 }
 
@@ -17626,6 +17768,39 @@ fn pkg_install_pip_fails_closed_when_toolchain_absent() {
                 .map(|mut d| d.next().is_none())
                 .unwrap_or(true),
         "a refused install must not populate the target environment"
+    );
+}
+
+/// Invalid requirement syntax/policy is rejected before PATH discovery or the
+/// real quarantine store is opened. This pins the production ordering, not just
+/// the resolver unit's "no child executed" property.
+#[test]
+fn pkg_install_rejects_direct_url_before_tool_or_quarantine_effects() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let data = home.path().join("must-not-create-data");
+    let out = tirith()
+        .env("PATH", empty_path_dir(home.path()))
+        .env("XDG_DATA_HOME", &data)
+        .env("APPDATA", &data)
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .args([
+            "pkg",
+            "install",
+            "pip",
+            "examplepkg@https://unapproved.example/pkg-1.0-py3-none-any.whl",
+        ])
+        .output()
+        .expect("failed to run tirith pkg install");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("direct-URL requirements") && !stderr.contains("tool not found"),
+        "input rejection must precede resolver discovery: {stderr}"
+    );
+    assert!(
+        !data.join("tirith/quarantine").exists(),
+        "invalid input must not open or create quarantine state"
     );
 }
 
