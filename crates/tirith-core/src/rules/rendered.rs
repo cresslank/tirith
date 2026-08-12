@@ -563,21 +563,24 @@ fn check_markdown_comments(
     }
 }
 
-/// Maximum PDF object-nesting depth we will hand to `lopdf::Document::load_mem`.
+/// Maximum PDF object-nesting depth accepted by Tirith.
 ///
-/// lopdf 0.34 parses arrays/dictionaries with unbounded recursion, so a PDF that
-/// nests `[`/`<<` thousands deep overflows the stack and aborts the whole process
-/// with SIGABRT during parse, NOT a catchable `Result`/panic (RUSTSEC-2026-0187).
-/// The patched lopdf (>=0.42) needs Rust 1.85, above tirith's MSRV 1.83, so we
-/// cannot simply upgrade. Instead we reject pathological nesting BEFORE parsing.
+/// The current lopdf release bounds parser recursion, fixing RUSTSEC-2026-0187.
+/// Tirith keeps a slightly lower defense-in-depth ceiling and checks both raw
+/// syntax before parsing and the decoded object model afterwards. The latter is
+/// load-bearing because object streams can hide nested objects from a raw scan.
 ///
 /// The cap is deliberately conservative: real-world PDFs nest only a few dozen
 /// levels deep (a page tree, an annotation array, a nested resource dict), while
-/// the advisory's crash needs on the order of 10,000 levels. 256 sits an order of
-/// magnitude above any legitimate document yet two orders of magnitude below the
-/// crash threshold, leaving generous headroom on both sides. Remove this guard
-/// (and the matching deny.toml / .cargo/audit.toml ignores) once MSRV/lopdf move.
-const PDF_NESTING_DEPTH_CAP: usize = 256;
+/// the historical crash payload needs thousands of levels. 96 is below lopdf's
+/// own parser ceiling while remaining far above ordinary document structure.
+const PDF_NESTING_DEPTH_CAP: usize = 96;
+
+/// Bound eager object/xref-stream inflation while loading an untrusted PDF.
+const PDF_STREAM_DECOMPRESSED_BYTES_CAP: usize = 16 * 1024 * 1024;
+
+/// Bound the iterative decoded-object traversal independently of byte size.
+const PDF_STRUCTURE_NODE_CAP: usize = 262_144;
 
 /// Single-pass lexical scan of raw PDF bytes returning the maximum object-nesting
 /// depth, where every `[` (array) and `<<` (dictionary) opens a level and every
@@ -593,13 +596,8 @@ const PDF_NESTING_DEPTH_CAP: usize = 256;
 /// no special case: its body is only hex digits and whitespace, so scanning
 /// through it counts nothing.
 ///
-/// Known limitation (acceptable for this guard): bytes inside a binary `stream`
-/// are scanned too, and could in theory contain enough unbalanced `[`/`<<` to
-/// register depth. In practice the literal-string skip swallows most binary runs
-/// (a stray `(` starts a skip to the next `)`), and a depth that climbs past 256
-/// without ever unwinding is itself anomalous. A compressed object stream can hide
-/// nested objects from this byte scan entirely; defending that needs the deferred
-/// child-process isolation, out of scope for this preflight.
+/// Bytes inside binary streams are scanned too, so this pass is deliberately
+/// paired with the decoded-object check below rather than treated as a parser.
 fn pdf_max_nesting_depth(raw: &[u8]) -> usize {
     let mut depth: usize = 0;
     let mut max_depth: usize = 0;
@@ -662,6 +660,96 @@ fn pdf_max_nesting_depth(raw: &[u8]) -> usize {
     max_depth
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PdfStructureStatus {
+    Complete,
+    DepthExceeded,
+    WorkBudgetExceeded,
+}
+
+/// Inspect the decoded object graph without recursion. Object-stream members are
+/// materialized in `Document::objects` by lopdf, so this closes the raw-preflight
+/// blind spot while retaining a strict node budget.
+fn pdf_structure_status(doc: &lopdf::Document) -> PdfStructureStatus {
+    let mut stack: Vec<(&lopdf::Object, usize)> =
+        doc.objects.values().map(|object| (object, 0)).collect();
+    // The trailer itself is a dictionary and therefore contributes one level.
+    stack.extend(doc.trailer.iter().map(|(_, object)| (object, 1)));
+
+    let mut visited = 0usize;
+    while let Some((object, parent_depth)) = stack.pop() {
+        visited = visited.saturating_add(1);
+        if visited > PDF_STRUCTURE_NODE_CAP {
+            return PdfStructureStatus::WorkBudgetExceeded;
+        }
+
+        let (children, depth): (Vec<&lopdf::Object>, usize) = match object {
+            lopdf::Object::Array(values) => {
+                (values.iter().collect(), parent_depth.saturating_add(1))
+            }
+            lopdf::Object::Dictionary(dictionary) => (
+                dictionary.iter().map(|(_, value)| value).collect(),
+                parent_depth.saturating_add(1),
+            ),
+            lopdf::Object::Stream(stream) => (
+                stream.dict.iter().map(|(_, value)| value).collect(),
+                parent_depth.saturating_add(1),
+            ),
+            _ => continue,
+        };
+
+        if depth > PDF_NESTING_DEPTH_CAP {
+            return PdfStructureStatus::DepthExceeded;
+        }
+        if stack.len().saturating_add(children.len()) > PDF_STRUCTURE_NODE_CAP {
+            return PdfStructureStatus::WorkBudgetExceeded;
+        }
+        stack.extend(children.into_iter().map(|child| (child, depth)));
+    }
+
+    PdfStructureStatus::Complete
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PdfIncompleteReason {
+    RawNestingLimit,
+    ParseRejected,
+    DecodedNestingLimit,
+    StructureBudget,
+    PageContentLimit,
+    ContentDecode,
+}
+
+impl PdfIncompleteReason {
+    const fn token(self) -> &'static str {
+        match self {
+            Self::RawNestingLimit => "raw_nesting_limit",
+            Self::ParseRejected => "parse_rejected",
+            Self::DecodedNestingLimit => "decoded_nesting_limit",
+            Self::StructureBudget => "structure_budget",
+            Self::PageContentLimit => "page_content_limit",
+            Self::ContentDecode => "content_decode",
+        }
+    }
+}
+
+fn pdf_analysis_incomplete(reason: PdfIncompleteReason) -> Finding {
+    Finding {
+        rule_id: RuleId::AnalysisIncomplete,
+        severity: Severity::High,
+        title: "PDF analysis incomplete".to_string(),
+        description: "The PDF was rejected or could not be analyzed within bounded safety limits; it is not provably clean."
+            .to_string(),
+        evidence: vec![Evidence::Text {
+            detail: format!("pdf_analysis={}", reason.token()),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    }
+}
+
 /// Check PDF bytes for hidden text via sub-pixel scale transforms: font-size 0
 /// or scales that render text below 1px — invisible to humans but extracted by
 /// AI tools. Detection is free (ADR-13).
@@ -674,31 +762,55 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
     // handing the bytes to lopdf, whose recursive parser would stack-overflow and
     // abort the process (uncatchable SIGABRT). See PDF_NESTING_DEPTH_CAP.
     if pdf_max_nesting_depth(raw_bytes) > PDF_NESTING_DEPTH_CAP {
-        eprintln!(
-            "tirith: scan: PDF rejected: object nesting exceeds safe limit (possible RUSTSEC-2026-0187 DoS)"
-        );
-        return findings;
+        eprintln!("tirith: scan: PDF rejected: object nesting exceeds safe limit");
+        return vec![pdf_analysis_incomplete(
+            PdfIncompleteReason::RawNestingLimit,
+        )];
     }
 
-    let doc = match lopdf::Document::load_mem(raw_bytes) {
+    let doc = match lopdf::Document::load_mem_with_options(
+        raw_bytes,
+        lopdf::LoadOptions::with_max_decompressed_size(PDF_STREAM_DECOMPRESSED_BYTES_CAP),
+    ) {
         Ok(d) => d,
-        Err(e) => {
-            eprintln!("tirith: scan: PDF parse failed: {e}");
-            return findings;
+        Err(_) => {
+            eprintln!("tirith: scan: PDF parse failed");
+            return vec![pdf_analysis_incomplete(PdfIncompleteReason::ParseRejected)];
         }
     };
 
+    match pdf_structure_status(&doc) {
+        PdfStructureStatus::Complete => {}
+        PdfStructureStatus::DepthExceeded => {
+            return vec![pdf_analysis_incomplete(
+                PdfIncompleteReason::DecodedNestingLimit,
+            )];
+        }
+        PdfStructureStatus::WorkBudgetExceeded => {
+            return vec![pdf_analysis_incomplete(
+                PdfIncompleteReason::StructureBudget,
+            )];
+        }
+    }
+
     let mut hidden_texts: Vec<(u32, String)> = Vec::new();
+    let mut incomplete_reason = None;
 
     for (page_num, page_id) in doc.get_pages() {
         let content = match doc.get_page_content_with_limit(page_id, PDF_PAGE_CONTENT_BYTES_CAP) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(_) => {
+                incomplete_reason.get_or_insert(PdfIncompleteReason::PageContentLimit);
+                continue;
+            }
         };
 
         let ops = match lopdf::content::Content::decode(&content) {
             Ok(c) => c.operations,
-            Err(_) => continue,
+            Err(_) => {
+                incomplete_reason.get_or_insert(PdfIncompleteReason::ContentDecode);
+                continue;
+            }
         };
 
         // PDF default font size when `Tf` is never seen.
@@ -784,6 +896,10 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
             mitre_id: None,
             custom_rule_id: None,
         });
+    }
+
+    if let Some(reason) = incomplete_reason {
+        findings.push(pdf_analysis_incomplete(reason));
     }
 
     findings
@@ -1121,11 +1237,13 @@ mod tests {
 
     #[test]
     fn test_pdf_invalid_bytes_no_panic() {
-        // Garbage in → empty findings, never a panic.
+        // Garbage is never reported as clean and never panics.
         let findings = check_pdf(b"not a pdf");
         assert!(
-            findings.is_empty(),
-            "invalid PDF should produce no findings"
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+            "invalid PDF should fail closed as incomplete"
         );
     }
 
@@ -1208,8 +1326,50 @@ mod tests {
         // safe: it returns early via the guard and never reaches `load_mem`.
         let findings = check_pdf(&deep);
         assert!(
-            findings.is_empty(),
-            "rejected PDF yields no findings (guard short-circuits before parse)"
+            findings.iter().any(|finding| {
+                finding.rule_id == RuleId::AnalysisIncomplete && finding.severity == Severity::High
+            }),
+            "rejected PDF must fail closed instead of appearing clean"
+        );
+    }
+
+    #[test]
+    fn test_pdf_preflight_rejects_nested_object_hidden_in_compressed_stream() {
+        use lopdf::{Document, Object};
+
+        let mut doc = Document::load_mem(&build_pdf(12, "ordinary visible text"))
+            .expect("load generated control PDF");
+        let mut nested = Object::Null;
+        for _ in 0..=PDF_NESTING_DEPTH_CAP {
+            nested = Object::Array(vec![nested]);
+        }
+        doc.add_object(nested);
+
+        let mut compressed = Vec::new();
+        doc.save_modern(&mut compressed)
+            .expect("save nested object in a compressed object stream");
+        assert!(
+            pdf_max_nesting_depth(&compressed) <= PDF_NESTING_DEPTH_CAP,
+            "raw scan should not see structure hidden inside the compressed object stream"
+        );
+
+        let decoded = Document::load_mem_with_options(
+            &compressed,
+            lopdf::LoadOptions::with_max_decompressed_size(PDF_STREAM_DECOMPRESSED_BYTES_CAP),
+        )
+        .expect("patched lopdf safely parses bounded compressed nesting");
+        assert_eq!(
+            pdf_structure_status(&decoded),
+            PdfStructureStatus::DepthExceeded,
+            "decoded object traversal must expose compressed nesting"
+        );
+
+        let findings = check_pdf(&compressed);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+            "compressed nesting must fail closed instead of appearing clean"
         );
     }
 
