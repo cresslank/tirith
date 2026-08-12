@@ -352,26 +352,15 @@ async fn upload_to_r2(
     backup_path: &str,
     date_str: &str,
 ) {
-    use s3::creds::Credentials;
-    use s3::Bucket;
-    use s3::Region;
-
-    let region = Region::Custom {
-        region: "auto".to_string(),
-        endpoint: endpoint.to_string(),
-    };
-    let credentials = match Credentials::new(Some(access_key), Some(secret_key), None, None, None) {
-        Ok(c) => c,
+    let client = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
         Err(e) => {
-            error!("R2 credentials error: {e}");
-            return;
-        }
-    };
-
-    let bucket = match Bucket::new(bucket_name, region, credentials) {
-        Ok(b) => b,
-        Err(e) => {
-            error!("R2 bucket init error: {e}");
+            error!("failed to build R2 HTTP client: {e}");
             return;
         }
     };
@@ -385,12 +374,22 @@ async fn upload_to_r2(
     };
 
     let key = format!("backups/tirith-license-{date_str}.db");
-    match bucket.put_object(&key, &data).await {
-        Ok(resp) if resp.status_code() < 300 => {
+    match put_r2_object(
+        &client,
+        endpoint,
+        bucket_name,
+        access_key,
+        secret_key,
+        &key,
+        data,
+    )
+    .await
+    {
+        Ok(status) if status.is_success() => {
             info!(key = %key, "backup uploaded to R2");
         }
-        Ok(resp) => {
-            error!(status = resp.status_code(), "R2 upload returned error");
+        Ok(status) => {
+            error!(%status, "R2 upload returned error");
         }
         Err(e) => {
             error!("R2 upload failed: {e}");
@@ -400,8 +399,255 @@ async fn upload_to_r2(
     let checksum_path = format!("{backup_path}.sha256");
     if let Ok(checksum_data) = tokio::fs::read(&checksum_path).await {
         let checksum_key = format!("backups/tirith-license-{date_str}.db.sha256");
-        if let Err(e) = bucket.put_object(&checksum_key, &checksum_data).await {
-            error!("R2 checksum upload failed: {e}");
+        match put_r2_object(
+            &client,
+            endpoint,
+            bucket_name,
+            access_key,
+            secret_key,
+            &checksum_key,
+            checksum_data,
+        )
+        .await
+        {
+            Ok(status) if status.is_success() => {}
+            Ok(status) => error!(%status, "R2 checksum upload returned error"),
+            Err(e) => error!("R2 checksum upload failed: {e}"),
         }
+    }
+}
+
+const R2_REGION: &str = "auto";
+const S3_SERVICE: &str = "s3";
+const SIGV4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
+const SIGV4_SIGNED_HEADERS: &str = "host;x-amz-content-sha256;x-amz-date";
+
+struct SignedR2Put {
+    url: reqwest::Url,
+    host: String,
+    amz_date: String,
+    payload_hash: String,
+    authorization: String,
+}
+
+fn hmac_sha256(key: &[u8], input: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+        .expect("HMAC-SHA256 accepts keys of every length");
+    mac.update(input);
+    let bytes = mac.finalize().into_bytes();
+    let mut output = [0_u8; 32];
+    output.copy_from_slice(&bytes);
+    output
+}
+
+/// Build a path-style R2 PUT request signed with AWS Signature Version 4.
+///
+/// R2 uses the standard S3 SigV4 protocol with the fixed `auto` region. The
+/// endpoint is deployment configuration, but it still has to be an HTTPS origin
+/// with no credentials, query, or fragment so Authorization can never be sent to
+/// a redirected or ambiguous target.
+fn sign_r2_put(
+    endpoint: &str,
+    bucket_name: &str,
+    access_key: &str,
+    secret_key: &str,
+    key: &str,
+    body: &[u8],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<SignedR2Put, &'static str> {
+    use sha2::{Digest, Sha256};
+
+    if bucket_name.is_empty()
+        || access_key.is_empty()
+        || secret_key.is_empty()
+        || key.is_empty()
+        || key.split('/').any(str::is_empty)
+    {
+        return Err("R2 signing inputs are incomplete");
+    }
+
+    let mut url = reqwest::Url::parse(endpoint).map_err(|_| "R2 endpoint is not a valid URL")?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("R2 endpoint must be a credential-free HTTPS origin");
+    }
+
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| "R2 endpoint cannot be used as a URL base")?;
+        segments.pop_if_empty().push(bucket_name);
+        for segment in key.split('/') {
+            segments.push(segment);
+        }
+    }
+
+    let hostname = url.host_str().ok_or("R2 endpoint has no host")?;
+    let host = match url.port() {
+        Some(port) => format!("{hostname}:{port}"),
+        None => hostname.to_string(),
+    };
+    let canonical_uri = url.path();
+    let payload_hash = hex::encode(Sha256::digest(body));
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let date = now.format("%Y%m%d").to_string();
+    let canonical_headers =
+        format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
+    let canonical_request = format!(
+        "PUT\n{canonical_uri}\n\n{canonical_headers}\n{SIGV4_SIGNED_HEADERS}\n{payload_hash}"
+    );
+    let scope = format!("{date}/{R2_REGION}/{S3_SERVICE}/aws4_request");
+    let string_to_sign = format!(
+        "{SIGV4_ALGORITHM}\n{amz_date}\n{scope}\n{}",
+        hex::encode(Sha256::digest(canonical_request.as_bytes()))
+    );
+
+    let date_key = hmac_sha256(format!("AWS4{secret_key}").as_bytes(), date.as_bytes());
+    let region_key = hmac_sha256(&date_key, R2_REGION.as_bytes());
+    let service_key = hmac_sha256(&region_key, S3_SERVICE.as_bytes());
+    let signing_key = hmac_sha256(&service_key, b"aws4_request");
+    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+    let authorization = format!(
+        "{SIGV4_ALGORITHM} Credential={access_key}/{scope}, SignedHeaders={SIGV4_SIGNED_HEADERS}, Signature={signature}"
+    );
+
+    Ok(SignedR2Put {
+        url,
+        host,
+        amz_date,
+        payload_hash,
+        authorization,
+    })
+}
+
+async fn put_r2_object(
+    client: &reqwest::Client,
+    endpoint: &str,
+    bucket_name: &str,
+    access_key: &str,
+    secret_key: &str,
+    key: &str,
+    body: Vec<u8>,
+) -> Result<reqwest::StatusCode, &'static str> {
+    use reqwest::header::{AUTHORIZATION, HOST};
+
+    let signed = sign_r2_put(
+        endpoint,
+        bucket_name,
+        access_key,
+        secret_key,
+        key,
+        &body,
+        chrono::Utc::now(),
+    )?;
+    client
+        .put(signed.url)
+        .header(HOST, signed.host)
+        .header("x-amz-content-sha256", signed.payload_hash)
+        .header("x-amz-date", signed.amz_date)
+        .header(AUTHORIZATION, signed.authorization)
+        .body(body)
+        .send()
+        .await
+        .map(|response| response.status())
+        .map_err(|_| "R2 upload request failed")
+}
+
+#[cfg(test)]
+mod r2_signing_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn test_time() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc
+            .with_ymd_and_hms(2026, 8, 12, 3, 4, 5)
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn r2_signature_matches_fixed_independent_vector() {
+        let signed = sign_r2_put(
+            "https://account.r2.cloudflarestorage.com",
+            "tirith-backups",
+            "AKIAEXAMPLE",
+            "very-secret-test-key",
+            "backups/tirith-license-2026-08-12.db",
+            b"abc",
+            test_time(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            signed.url.as_str(),
+            "https://account.r2.cloudflarestorage.com/tirith-backups/backups/tirith-license-2026-08-12.db"
+        );
+        assert_eq!(
+            signed.payload_hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            signed.authorization,
+            "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20260812/auto/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=8640f3028fe5b7c57a6d90c4da75539c28984c62d1a593b334d90f5a96cf8ab9"
+        );
+        assert!(!signed.authorization.contains("very-secret-test-key"));
+    }
+
+    #[test]
+    fn r2_signer_rejects_ambiguous_or_insecure_endpoints() {
+        for endpoint in [
+            "http://account.r2.cloudflarestorage.com",
+            "https://user@account.r2.cloudflarestorage.com",
+            "https://account.r2.cloudflarestorage.com/api/",
+            "https://account.r2.cloudflarestorage.com?redirect=1",
+            "https://account.r2.cloudflarestorage.com#fragment",
+        ] {
+            assert!(sign_r2_put(
+                endpoint,
+                "bucket",
+                "key",
+                "secret",
+                "backup.db",
+                b"x",
+                test_time()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn r2_signature_binds_payload_and_percent_encoded_path() {
+        let first = sign_r2_put(
+            "https://account.r2.cloudflarestorage.com",
+            "backup bucket",
+            "key",
+            "secret",
+            "daily/backup file.db",
+            b"first",
+            test_time(),
+        )
+        .unwrap();
+        let second = sign_r2_put(
+            "https://account.r2.cloudflarestorage.com",
+            "backup bucket",
+            "key",
+            "secret",
+            "daily/backup file.db",
+            b"second",
+            test_time(),
+        )
+        .unwrap();
+
+        assert_eq!(first.url.path(), "/backup%20bucket/daily/backup%20file.db");
+        assert_ne!(first.payload_hash, second.payload_hash);
+        assert_ne!(first.authorization, second.authorization);
     }
 }
