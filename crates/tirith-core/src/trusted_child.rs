@@ -2451,6 +2451,16 @@ fn confirm_process_group(child_pid: u32) -> std::io::Result<u32> {
             )));
         }
         let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH)
+            && observe_child_exit_without_reaping(child_pid, true)?
+        {
+            // The successful pre-exec hook established this private group before
+            // exec. Darwin can stop exposing a very short-lived group leader to
+            // getpgid before its still-unreaped exit becomes observable here.
+            // Retaining the zombie keeps the numeric PID/PGID reserved, so the
+            // normal bounded group cleanup remains safe for any descendants.
+            return Ok(child_pid);
+        }
         if error.kind() != std::io::ErrorKind::Interrupted {
             return Err(error);
         }
