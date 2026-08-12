@@ -38,5 +38,6 @@ uuid = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Backup (optional R2/S3)
-rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"] }
+# R2 backup uses the existing reqwest/HMAC/SHA-256 stack and a small,
+# deterministic AWS SigV4 signer in `main.rs`. Keeping the one PUT operation
+# in-tree avoids pulling the vulnerable rust-s3 -> aws-creds -> quick-xml chain.

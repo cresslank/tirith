@@ -974,7 +974,7 @@ fn print_status_human(info: &ThreatDbStatus) {
     let path = info.path.as_deref().unwrap_or("unknown");
     let age_str = match info.age_hours {
         Some(h) if h < 1.0 => format!("{:.0}m old", h * 60.0),
-        Some(h) if h < 48.0 => format!("{:.0}h old", h),
+        Some(h) if h < 48.0 => format!("{h:.0}h old"),
         Some(h) => format!("{:.0}d old", h / 24.0),
         None => "unknown age".to_string(),
     };
@@ -1215,8 +1215,7 @@ fn fetch_manifest_from_with_state(
         let content_len = resp.content_length().unwrap_or(0);
         if content_len > MAX_MANIFEST_SIZE {
             return Err(format!(
-                "manifest too large: {} bytes (max {})",
-                content_len, MAX_MANIFEST_SIZE
+                "manifest too large: {content_len} bytes (max {MAX_MANIFEST_SIZE})"
             ));
         }
         let body = resp
@@ -1283,8 +1282,7 @@ fn fetch_manifest_from_with_state(
             let retry_content_len = retry_resp.content_length().unwrap_or(0);
             if retry_content_len > MAX_MANIFEST_SIZE {
                 return Err(format!(
-                    "manifest too large on retry: {} bytes (max {})",
-                    retry_content_len, MAX_MANIFEST_SIZE
+                    "manifest too large on retry: {retry_content_len} bytes (max {MAX_MANIFEST_SIZE})"
                 ));
             }
             let retry_etag = retry_resp
@@ -1925,9 +1923,8 @@ fn explain_package(
             source_label: None,
             confidence: None,
             detail: format!(
-                "{} package '{}' is edit-distance {} from the popular package '{}' \
-                 — a possible slopsquat/typo. Not itself listed as malicious.",
-                eco, name, distance, popular
+                "{eco} package '{name}' is edit-distance {distance} from the popular package '{popular}' \
+                 — a possible slopsquat/typo. Not itself listed as malicious."
             ),
             reference_url: None,
         });
@@ -2374,7 +2371,7 @@ const MONTH_DAYS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
 /// Proleptic Gregorian leap-year test, shared by the date parser and formatter.
 fn is_leap_year(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    (y.rem_euclid(4) == 0 && y.rem_euclid(100) != 0) || y.rem_euclid(400) == 0
 }
 
 /// Parse `YYYY-MM-DD` (or `...THH:MM:SS`) to a Unix epoch. Dependency-free;
@@ -3433,8 +3430,7 @@ mod tests {
         let diff = written_ts.saturating_sub(now);
         assert_eq!(
             diff, BACKOFF_SECS,
-            "backoff should set next-check-at to now + {} seconds, got diff={}",
-            BACKOFF_SECS, diff
+            "backoff should set next-check-at to now + {BACKOFF_SECS} seconds, got diff={diff}"
         );
         assert_eq!(
             BACKOFF_SECS, 3600,

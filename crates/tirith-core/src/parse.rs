@@ -167,11 +167,8 @@ impl UrlLike {
 /// `Url::parse` IDNA-normalizes the host, hiding the homograph/punycode signals
 /// the hostname rules depend on.
 pub fn extract_raw_host(url_str: &str) -> Option<String> {
-    let after_scheme = if let Some(idx) = url_str.find("://") {
-        &url_str[idx + 3..]
-    } else {
-        return None;
-    };
+    let idx = url_str.find("://")?;
+    let after_scheme = &url_str[idx + 3..];
 
     let authority_end = after_scheme
         .find(['/', '?', '#'])
