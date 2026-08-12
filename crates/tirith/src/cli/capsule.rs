@@ -7,10 +7,11 @@
 //! - **Linux**: re-exec `tirith __capsule-child <spec-json> -- <prog> <args>`;
 //!   the launcher ([`crate::cli::capsule_child`]) applies the full containment
 //!   sequence in a single-threaded child and `execve`s the target.
-//! - **macOS**: [`tirith_core::capsule::macos::sandbox_exec_argv`] builds a
-//!   `sandbox-exec -p <profile> -- <prog> <args>` argv; this wrapper additionally
-//!   scrubs the environment and applies the rlimits/handle closure the SBPL
-//!   profile alone does not.
+//! - **macOS**: re-exec `tirith __capsule-child <spec-json> -- <prog> <args>`;
+//!   the launcher closes inherited handles and applies rlimits before it `execve`s
+//!   the `sandbox-exec -p <profile> -- <prog> <args>` argv built by
+//!   [`tirith_core::capsule::macos::sandbox_exec_argv`]. The parent scrubs the
+//!   launcher's environment before the first exec.
 //! - **Windows**: [`crate::cli::capsule_windows::launch_contained`] creates the
 //!   AppContainer, ACLs the roots, and runs the child in a kill-on-close Job.
 //!
@@ -42,6 +43,7 @@
 //! degraded run that policy permitted is flagged `degraded = true`; an enforcing
 //! caller that did not permit degradation never reaches a spawn at all.
 
+use std::ffi::{OsStr, OsString};
 use std::process::{Child, Command, Stdio};
 
 #[cfg_attr(
@@ -296,6 +298,28 @@ pub fn run_to_completion(
     extra_env: &[(String, String)],
     degraded: DegradedPolicy,
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
+    let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
+    run_to_completion_os(
+        spec,
+        OsStr::new(program),
+        &args_os,
+        cwd,
+        extra_env,
+        degraded,
+    )
+}
+
+/// OS-native variant of [`run_to_completion`]. This is the authoritative launch
+/// path for callers such as `temp-run` that must preserve argument boundaries and
+/// non-UTF8 Unix bytes exactly. No component is joined or reparsed by a shell.
+pub fn run_to_completion_os(
+    spec: &CapsuleSpec,
+    program: &OsStr,
+    args: &[OsString],
+    cwd: Option<&std::path::Path>,
+    extra_env: &[(String, String)],
+    degraded: DegradedPolicy,
+) -> Result<CapsuleOutcome, CapsuleRefused> {
     let sel = select_backend(spec);
     let is_degraded = sel.is_degraded();
 
@@ -310,12 +334,12 @@ pub fn run_to_completion(
     #[cfg(target_os = "windows")]
     {
         if !is_degraded {
-            return windows_run_to_completion(spec, program, args, &sel);
+            return windows_run_to_completion_os(spec, program, args, &sel);
         }
         // Degraded + AllowDegraded on Windows: run uncontained via a plain Command.
         // An enforcing surface would have failed closed above; assert it here.
         assert_degraded_run_is_permitted(degraded);
-        return uncontained_run(program, args, cwd, extra_env, &sel, true);
+        return uncontained_run_os(program, args, cwd, extra_env, &sel, true);
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -324,9 +348,9 @@ pub fn run_to_completion(
             // AllowDegraded: run uncontained but honestly flagged. An enforcing
             // surface would have failed closed above; assert it here.
             assert_degraded_run_is_permitted(degraded);
-            return uncontained_run(program, args, cwd, extra_env, &sel, true);
+            return uncontained_run_os(program, args, cwd, extra_env, &sel, true);
         }
-        let mut cmd = build_contained_command(spec, program, args, &sel)?;
+        let mut cmd = build_contained_command_os(spec, program, args, &sel)?;
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
@@ -346,12 +370,11 @@ pub fn run_to_completion(
     }
 }
 
-/// Run uncontained (degraded path) via a plain `Command`, inheriting stdio. Only
-/// reached under [`DegradedPolicy::AllowDegraded`]; the outcome is flagged
-/// `degraded`.
-fn uncontained_run(
-    program: &str,
-    args: &[String],
+/// OS-native degraded launch. It uses `Command` directly, so shell metacharacters
+/// remain ordinary argument data and Unix non-UTF8 bytes survive unchanged.
+fn uncontained_run_os(
+    program: &OsStr,
+    args: &[OsString],
     cwd: Option<&std::path::Path>,
     extra_env: &[(String, String)],
     sel: &SelectedBackend,
@@ -375,6 +398,33 @@ fn uncontained_run(
         coverage: sel.coverage,
         degraded,
     })
+}
+
+/// OS-native counterpart to [`build_contained_command`], used when the original
+/// process argv must reach the contained child without UTF-8 conversion.
+#[cfg(not(target_os = "windows"))]
+fn build_contained_command_os(
+    spec: &CapsuleSpec,
+    program: &OsStr,
+    args: &[OsString],
+    sel: &SelectedBackend,
+) -> Result<Command, CapsuleRefused> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_contained_command_os(spec, program, args, sel)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_contained_command_os(spec, program, args, sel)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (spec, program, args);
+        Err(CapsuleRefused {
+            backend_id: sel.backend_id,
+            reason: "no containment backend on this target".to_string(),
+        })
+    }
 }
 
 /// Spawn `program` + `args` inside a capsule with **piped** stdin/stdout/stderr and
@@ -470,10 +520,11 @@ fn spawn_uncontained_piped(
 }
 
 /// Build the `Command` that launches `program` + `args` contained, for the Unix
-/// backends. Linux re-execs the `__capsule-child` launcher (which applies
-/// containment then `execve`s); macOS wraps in `sandbox-exec` and additionally
-/// scrubs the environment + applies rlimits/fd-closure that the SBPL profile alone
-/// does not.
+/// backends. Linux and macOS re-exec the `__capsule-child` launcher; Linux applies
+/// its full containment there, while macOS closes inherited descriptors, applies
+/// rlimits, and then `execve`s `sandbox-exec`. The extra macOS exec boundary is
+/// deliberate: Rust's private child-to-parent exec-error pipe must survive until
+/// the first exec, so descriptor closure cannot safely run in `Command::pre_exec`.
 ///
 /// The returned `Command` has had its environment/argv set up; the caller adds
 /// `cwd`/`extra_env`/stdio. NOT used on Windows (which has its own launcher).
@@ -484,36 +535,15 @@ fn build_contained_command(
     args: &[String],
     sel: &SelectedBackend,
 ) -> Result<Command, CapsuleRefused> {
-    #[cfg(target_os = "linux")]
-    {
-        linux_contained_command(spec, program, args, sel)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        macos_contained_command(spec, program, args, sel)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        // No Unix backend on this target; the select_backend probe would have been
-        // NoOp and the degraded gate already handled it. Reaching here means the
-        // caller bypassed the gate, so fail closed.
-        let _ = (spec, program, args);
-        Err(CapsuleRefused {
-            backend_id: sel.backend_id,
-            reason: "no containment backend on this target".to_string(),
-        })
-    }
+    let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
+    build_contained_command_os(spec, OsStr::new(program), &args_os, sel)
 }
 
-/// Linux: re-exec `tirith __capsule-child <spec-json> -- <program> <args>`. The
-/// launcher applies the full containment sequence in a single-threaded child and
-/// `execve`s the target, so the parent only has to spawn the current executable
-/// with the right argv. The spec travels as JSON.
 #[cfg(target_os = "linux")]
-fn linux_contained_command(
+fn linux_contained_command_os(
     spec: &CapsuleSpec,
-    program: &str,
-    args: &[String],
+    program: &OsStr,
+    args: &[OsString],
     sel: &SelectedBackend,
 ) -> Result<Command, CapsuleRefused> {
     let exe = std::env::current_exe().map_err(|e| CapsuleRefused {
@@ -533,29 +563,48 @@ fn linux_contained_command(
     Ok(cmd)
 }
 
-/// macOS: wrap in `sandbox-exec -p <profile> -- <program> <args>` (built by the E3
-/// backend) and, in a `pre_exec` hook, apply the environment scrub + handle-closure
-/// + rlimits that the SBPL profile alone does not — closing the env/resource/handle
-///   coverage the E5 probe only claims because this wrapper applies them.
+/// macOS: re-exec the internal capsule launcher, which closes inherited handles,
+/// applies rlimits, and then execs `sandbox-exec -p <profile> -- <program> <args>`.
+///
+/// Descriptor closure MUST NOT happen in `Command::pre_exec`: `Command::spawn`
+/// creates a private child-to-parent pipe after this command is built and uses it
+/// to report exec failures. The pipe is intentionally not part of the capsule
+/// handle allow-list, but closing it in `pre_exec` makes Rust abort before either
+/// `sandbox-exec` or the target can execute. Re-execing the trusted, single-threaded
+/// launcher first lets the pipe's own `FD_CLOEXEC` semantics complete normally;
+/// the launcher then closes every unrelated inherited descriptor before the
+/// second exec, preserving the handle-isolation boundary.
 #[cfg(target_os = "macos")]
-fn macos_contained_command(
+fn macos_contained_command_os(
     spec: &CapsuleSpec,
-    program: &str,
-    args: &[String],
+    program: &OsStr,
+    args: &[OsString],
     sel: &SelectedBackend,
 ) -> Result<Command, CapsuleRefused> {
-    use std::os::unix::process::CommandExt;
+    // Validate the final sandbox argv before spawning. The launcher reconstructs
+    // it after the first exec so a direct invocation of the hidden subcommand
+    // cannot substitute an uncontained program for sandbox-exec.
+    tirith_core::capsule::macos::sandbox_exec_argv_os(spec, program, args).map_err(|e| {
+        CapsuleRefused {
+            backend_id: sel.backend_id,
+            reason: format!("cannot build sandbox-exec invocation: {e}"),
+        }
+    })?;
 
-    let argv =
-        tirith_core::capsule::macos::sandbox_exec_argv(spec, program, args).map_err(|e| {
-            CapsuleRefused {
-                backend_id: sel.backend_id,
-                reason: format!("cannot build sandbox-exec invocation: {e}"),
-            }
-        })?;
-    // argv[0] is the sandbox-exec path; the rest are its args.
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..]);
+    let exe = std::env::current_exe().map_err(|e| CapsuleRefused {
+        backend_id: sel.backend_id,
+        reason: format!("cannot resolve current executable for capsule re-exec: {e}"),
+    })?;
+    let spec_json = serde_json::to_string(spec).map_err(|e| CapsuleRefused {
+        backend_id: sel.backend_id,
+        reason: format!("cannot serialize capsule spec: {e}"),
+    })?;
+    let mut cmd = Command::new(exe);
+    cmd.arg(crate::cli::capsule_child::SUBCOMMAND)
+        .arg(spec_json)
+        .arg("--")
+        .arg(program)
+        .args(args);
 
     // Environment scrub: clear, then re-add the surviving names from the current
     // environment, and (when temporary_home) point HOME/TMPDIR/XDG_* at a fresh
@@ -568,26 +617,6 @@ fn macos_contained_command(
         backend_id: sel.backend_id,
         reason,
     })?;
-
-    // rlimits + fd closure run in the child just before exec (pre_exec), so they
-    // affect the sandbox-exec process and, by inheritance, the target.
-    let resources = spec.resources.clone();
-    let handles = spec.handles.clone();
-    // SAFETY: the closure only calls async-signal-safe libc functions (getrlimit,
-    // setrlimit, close) on values captured by move; it allocates nothing and
-    // touches no shared state of the parent.
-    //
-    // Order matters: close inherited fds FIRST, while `RLIMIT_NOFILE` still reflects
-    // the inherited (higher) ceiling, so a high-numbered inherited fd is found and
-    // closed. Lowering `RLIMIT_NOFILE` does not close already-open fds, so applying
-    // rlimits first would shrink the scan ceiling and let a high fd survive.
-    unsafe {
-        cmd.pre_exec(move || {
-            close_extra_fds(&handles);
-            apply_macos_rlimits(&resources)?;
-            Ok(())
-        });
-    }
     Ok(cmd)
 }
 
@@ -666,11 +695,13 @@ where
 }
 
 /// Apply the rlimit dimensions of [`tirith_core::capsule::ResourceLimits`] via
-/// `setrlimit`, async-signal-safe for a `pre_exec` hook (macOS). Mirrors the Linux
-/// launcher's `apply_rlimits` but lives here because macOS containment is applied
-/// by this wrapper, not a re-exec launcher.
+/// `setrlimit` in the re-execed macOS capsule launcher. Mirrors the Linux
+/// launcher's `apply_rlimits` but lives here because the macOS launcher delegates
+/// the actual sandbox policy to `sandbox-exec`.
 #[cfg(target_os = "macos")]
-fn apply_macos_rlimits(limits: &tirith_core::capsule::ResourceLimits) -> std::io::Result<()> {
+pub(crate) fn apply_macos_rlimits(
+    limits: &tirith_core::capsule::ResourceLimits,
+) -> std::io::Result<()> {
     fn set_one(resource: libc::c_int, value: u64) -> std::io::Result<()> {
         let rl = libc::rlimit {
             rlim_cur: value as libc::rlim_t,
@@ -697,18 +728,18 @@ fn apply_macos_rlimits(limits: &tirith_core::capsule::ResourceLimits) -> std::io
     // `max_processes` is intentionally NOT applied: RLIMIT_NPROC is per real UID on
     // macOS, so it would cap the whole user (and could deny the user's own shell a
     // fork) without bounding the contained child's subtree, a false fork-bomb cap.
-    // The honesty contract handles this by EXCLUDING max_processes from the macOS
-    // `resource_limits_enforced` claim (see `tirith_core::capsule::macos::
-    // derive_coverage`), so a spec that relies on it degrades rather than trusting a
-    // cap that is not here. `wall_clock`/`max_output` are launcher-enforced, not
-    // rlimits.
+    // The honesty contract handles this by marking aggregate resource coverage
+    // false whenever max_processes is requested (see
+    // `tirith_core::capsule::macos::derive_coverage`), so a spec that relies on it
+    // degrades rather than trusting a cap that is not here. `wall_clock` and
+    // `max_output` are also not enforced by this wrapper and have the same effect.
     Ok(())
 }
 
 /// Close every inherited file descriptor above stdio that is not in the handle
-/// allow-list (macOS, `pre_exec`). Best-effort and async-signal-safe: it walks the
-/// fd range up to the process `RLIMIT_NOFILE` ceiling and `close()`s anything not
-/// permitted. Stdio (0/1/2) and the explicit extras survive.
+/// allow-list in the re-execed macOS capsule launcher. It walks the fd range up to
+/// the process `RLIMIT_NOFILE` ceiling and `close()`s anything not permitted.
+/// Stdio (0/1/2) and the explicit extras survive.
 ///
 /// The upper bound is the current `RLIMIT_NOFILE` soft limit (an fd can never be
 /// numbered at or above it), so an inherited descriptor numbered above a hardcoded
@@ -716,9 +747,9 @@ fn apply_macos_rlimits(limits: &tirith_core::capsule::ResourceLimits) -> std::io
 /// `RLIMIT_NOFILE`, so the ceiling reflects the inherited (higher) limit and a
 /// high-numbered inherited fd is still found. It is clamped to [`MAX_FD_SCAN`] so a
 /// process that raised `RLIMIT_NOFILE` to a huge value (or `RLIM_INFINITY`) does
-/// not make the `pre_exec` walk run unboundedly.
+/// not make the launcher walk run unboundedly.
 #[cfg(target_os = "macos")]
-fn close_extra_fds(handles: &tirith_core::capsule::HandlePolicy) {
+pub(crate) fn close_extra_fds(handles: &tirith_core::capsule::HandlePolicy) {
     let allowed = handles.allowed_unix_fds();
     let max_fd = fd_scan_ceiling();
     for fd in 3..max_fd {
@@ -733,8 +764,8 @@ fn close_extra_fds(handles: &tirith_core::capsule::HandlePolicy) {
 }
 
 /// A hard upper bound on the fd-closure walk so a pathological `RLIMIT_NOFILE`
-/// (e.g. `RLIM_INFINITY`) cannot make the async-signal-safe `pre_exec` loop run
-/// effectively forever. 1 MiB of fds is far more than any real inherited set.
+/// (e.g. `RLIM_INFINITY`) cannot make the launcher loop run effectively forever.
+/// 1 MiB of fds is far more than any real inherited set.
 #[cfg(target_os = "macos")]
 const MAX_FD_SCAN: i32 = 1 << 20;
 
@@ -763,7 +794,7 @@ fn fd_scan_ceiling() -> i32 {
 /// are unit-testable without `getrlimit`.
 ///
 /// - `RLIM_INFINITY`, or any value above [`MAX_FD_SCAN`], clamps DOWN to
-///   `MAX_FD_SCAN` so the async-signal-safe `pre_exec` loop is always bounded.
+///   `MAX_FD_SCAN` so the launcher loop is always bounded.
 /// - Anything below the historical hardcoded floor of 1024 is raised UP to 1024, so
 ///   the walk is never narrower than it used to be (a low `RLIMIT_NOFILE` must not
 ///   let a higher-numbered inherited fd survive the closure).
@@ -779,14 +810,14 @@ fn clamp_fd_ceiling(rlim_cur: libc::rlim_t) -> i32 {
 /// Windows run-to-completion: apply the AppContainer + Job launcher and wait. Only
 /// reached on a non-degraded Windows backend (the degraded gate is checked first).
 #[cfg(target_os = "windows")]
-fn windows_run_to_completion(
+fn windows_run_to_completion_os(
     spec: &CapsuleSpec,
-    program: &str,
-    args: &[String],
+    program: &OsStr,
+    args: &[OsString],
     sel: &SelectedBackend,
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
     let mut child =
-        crate::cli::capsule_windows::launch_contained(spec, program, args).map_err(|e| {
+        crate::cli::capsule_windows::launch_contained_os(spec, program, args).map_err(|e| {
             CapsuleRefused {
                 backend_id: sel.backend_id,
                 reason: format!("contained launch failed: {e}"),
@@ -924,6 +955,8 @@ pub fn gather_doctor_info() -> CapsuleDoctorInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
     use tirith_core::capsule::NetworkPolicy;
 
     #[test]
@@ -954,6 +987,75 @@ mod tests {
         assert_degraded_run_is_permitted(DegradedPolicy::AllowDegraded);
     }
 
+    /// The uncontained AllowDegraded branch itself already uses `Command` argv.
+    /// Pin that property so widening the API for temp-run cannot regress the
+    /// fallback into a shell string.
+    #[cfg(unix)]
+    #[test]
+    fn degraded_uncontained_run_keeps_shell_metacharacters_as_data() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let marker = temp.path().join("degraded-shell-injection");
+        let script = format!("test \"$1\" = 'safe; touch {}'", marker.display());
+        let args = vec![
+            "-c".to_string(),
+            script,
+            "probe".to_string(),
+            format!("safe; touch {}", marker.display()),
+        ];
+        let selected = SelectedBackend {
+            backend_id: "noop",
+            coverage: CapsuleCoverage::NONE,
+            required: CapsuleCoverage::NONE,
+        };
+
+        let args_os: Vec<OsString> = args.into_iter().map(OsString::from).collect();
+        let outcome = uncontained_run_os(
+            OsStr::new("/bin/sh"),
+            &args_os,
+            Some(temp.path()),
+            &[],
+            &selected,
+            true,
+        )
+        .expect("degraded direct run");
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome.degraded);
+        assert!(!marker.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_contained_command_os_preserves_argv() {
+        use std::os::unix::ffi::OsStringExt;
+
+        // The production builder creates a temporary HOME from process-global
+        // TMPDIR. Serialize with the tests that deliberately mutate TMPDIR so
+        // this legitimate control cannot inherit their failure fixture.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let spec = CapsuleSpec::locked_down();
+        let selected = SelectedBackend {
+            backend_id: "seatbelt",
+            coverage: spec.required_coverage(),
+            required: spec.required_coverage(),
+        };
+        let raw = b"raw-\xff; $(touch marker) > *.txt".to_vec();
+        let argument = OsString::from_vec(raw.clone());
+        let command = macos_contained_command_os(
+            &spec,
+            OsStr::new("/usr/bin/printf"),
+            std::slice::from_ref(&argument),
+            &selected,
+        )
+        .expect("build native Seatbelt argv");
+        let argv: Vec<OsString> = command.get_args().map(OsStr::to_os_string).collect();
+        let separator = argv
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("sandbox-exec separator");
+        assert_eq!(argv[separator + 1], OsString::from("/usr/bin/printf"));
+        assert_eq!(argv[separator + 2].as_encoded_bytes(), raw);
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "enforcing capsule surface")]
@@ -965,17 +1067,14 @@ mod tests {
         assert_degraded_run_is_permitted(DegradedPolicy::FailClosed);
     }
 
-    // ── C4: macOS contained launch honestly delivers env/handle/rlimit coverage ──
+    // ── macOS locked-down coverage fails closed on unsupported resource caps ──
 
-    /// On macOS with a usable `sandbox-exec`, a locked-down (deny-all) spec must NOT
-    /// be degraded: the Seatbelt backend + this wrapper together supply FS/exec/
-    /// raw-net-deny AND the env/handle/rlimit coverage the wrapper applies. Before
-    /// the C4 fix the backend hard-coded env/handle/rlimit to false, so every
-    /// enforcing surface (`pkg install`, `gateway --capsule`, `run --capsule`)
-    /// refused on macOS. This asserts the live coverage on the host.
+    /// Even with a usable `sandbox-exec`, locked_down requests process-count,
+    /// output, and wall-clock caps this wrapper does not apply. The live backend
+    /// selection must expose that aggregate resource gap and fail closed.
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_locked_down_is_not_degraded_when_sandbox_exec_present() {
+    fn macos_locked_down_is_degraded_on_unsupported_resource_limits() {
         // Only meaningful where sandbox-exec is actually usable (the macOS CI runner
         // and dev hosts). If it is somehow missing, the honest answer IS degraded;
         // skip rather than assert a false expectation.
@@ -987,16 +1086,17 @@ mod tests {
         let sel = select_backend(&spec);
         assert_eq!(sel.backend_id, "seatbelt");
         assert!(
-            !sel.is_degraded(),
-            "locked-down macOS capsule must not be degraded with sandbox-exec present: \
+            sel.is_degraded(),
+            "locked-down macOS capsule must expose unsupported resource limits: \
              coverage={:?} required={:?}",
             sel.coverage,
             sel.required
         );
-        // The wrapper-supplied flags are honestly reported.
+        // Wrapper-supplied env/handle coverage remains true; the aggregate
+        // resource claim is false because only some requested limits are applied.
         assert!(sel.coverage.env_isolated);
         assert!(sel.coverage.handles_isolated);
-        assert!(sel.coverage.resource_limits_enforced);
+        assert!(!sel.coverage.resource_limits_enforced);
     }
 
     /// C4 env-scrub proof on macOS: the contained `Command` the wrapper builds has
@@ -1045,18 +1145,31 @@ mod tests {
                 temporary_home: false,
             },
             handles: HandlePolicy::default(),
-            resources: ResourceLimits::conservative(),
+            // Keep this env-focused spec fully enforceable on macOS: request only
+            // the dimensions `apply_macos_rlimits` actually applies.
+            resources: ResourceLimits {
+                cpu_seconds: Some(30),
+                memory_bytes: Some(512 * 1024 * 1024),
+                max_open_files: Some(64),
+                ..ResourceLimits::default()
+            },
         };
 
         let sel = select_backend(&spec);
         assert_eq!(sel.backend_id, "seatbelt");
-        assert!(!sel.is_degraded(), "spec must be enforceable: {sel:?}");
+        if sel.is_degraded() {
+            // Same host-capability gate as the sandbox-exec probe above: a
+            // runner whose Seatbelt cannot carry this spec's resource limits
+            // cannot exercise the scrubbing path under full enforcement.
+            eprintln!("skipping: this host cannot enforce the spec: {sel:?}");
+            return;
+        }
 
-        // Plant the vars, build the command (which snapshots the env via env_clear +
-        // surviving_vars), then immediately remove them — keeping the global-env
-        // window minimal so parallel tests are unaffected.
-        std::env::set_var(secret_name, secret_val);
-        std::env::set_var(marker_name, marker_val);
+        // Plant the vars while holding the crate-wide environment lock. RAII
+        // guards restore both values even if an assertion panics.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _secret = EnvGuard::set(secret_name, std::path::Path::new(secret_val));
+        let _marker = EnvGuard::set(marker_name, std::path::Path::new(marker_val));
         let cmd = build_contained_command(&spec, "/usr/bin/printenv", &[], &sel)
             .expect("build contained command");
         // The env the child WILL receive: the Command's explicit env overrides.
@@ -1069,9 +1182,6 @@ mod tests {
                 )
             })
             .collect();
-        std::env::remove_var(secret_name);
-        std::env::remove_var(marker_name);
-
         // The sensitive var must be ABSENT from the child's environment (env_clear
         // dropped the inherited copy and surviving_vars refused to re-add it).
         assert!(
@@ -1092,6 +1202,31 @@ mod tests {
                 .as_deref(),
             Some(marker_val),
             "benign allow-listed marker should survive into the child: {child_env:?}"
+        );
+
+        // The first process is the trusted Tirith launcher, not sandbox-exec.
+        // This extra exec is what lets Rust's private exec-status pipe close via
+        // FD_CLOEXEC before the launcher performs descriptor isolation.
+        assert_eq!(
+            cmd.get_program(),
+            std::env::current_exe().expect("resolve current test executable")
+        );
+        let child_args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            child_args.first().map(String::as_str),
+            Some(crate::cli::capsule_child::SUBCOMMAND)
+        );
+        assert_eq!(
+            child_args.iter().position(|arg| arg == "--"),
+            Some(2),
+            "launcher argv must keep the spec and target separated: {child_args:?}"
+        );
+        assert_eq!(
+            child_args.get(3).map(String::as_str),
+            Some("/usr/bin/printenv")
         );
     }
 
@@ -1158,22 +1293,12 @@ mod tests {
         let sel = select_backend(&spec);
         assert_eq!(sel.backend_id, "seatbelt");
 
-        // Save and repoint TMPDIR at a path that cannot be created (a component is a
-        // non-existent file), so the production tempfile factory errors. Restored in
-        // the guard's Drop so a panic still cleans up.
-        struct TmpdirGuard(Option<std::ffi::OsString>);
-        impl Drop for TmpdirGuard {
-            fn drop(&mut self) {
-                match &self.0 {
-                    Some(v) => std::env::set_var("TMPDIR", v),
-                    None => std::env::remove_var("TMPDIR"),
-                }
-            }
-        }
-        let _guard = TmpdirGuard(std::env::var_os("TMPDIR"));
-        std::env::set_var(
+        // Repoint TMPDIR at a path that cannot be created, serialized against
+        // every test that reads or mutates process-global environment state.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tmpdir = EnvGuard::set(
             "TMPDIR",
-            "/tirith-im5-nonexistent-base-xyz/deeper/still-missing",
+            std::path::Path::new("/tirith-im5-nonexistent-base-xyz/deeper/still-missing"),
         );
 
         let result = build_contained_command(&spec, "/usr/bin/true", &[], &sel);
@@ -1207,6 +1332,36 @@ mod tests {
         // The shortfall names concrete missing capabilities, not secrets.
         assert!(reason.contains("fs_read"));
         assert!(reason.contains("network_raw_denied"));
+    }
+
+    #[test]
+    fn aggregate_resource_gap_reaches_cli_summary_and_refusal() {
+        let spec = CapsuleSpec::locked_down();
+        let coverage = CapsuleCoverage {
+            fs_read_enforced: true,
+            fs_write_enforced: true,
+            exec_limited: true,
+            network_raw_denied: true,
+            domain_proxy_enforced: false,
+            resource_limits_enforced: false,
+            env_isolated: true,
+            handles_isolated: true,
+        };
+        let outcome = CapsuleOutcome {
+            exit_code: 0,
+            backend_id: "test",
+            coverage,
+            degraded: true,
+        };
+        assert!(outcome.coverage_summary().contains("rlimits=false"));
+
+        let selected = SelectedBackend {
+            backend_id: "test",
+            coverage,
+            required: spec.required_coverage(),
+        };
+        assert!(selected.is_degraded());
+        assert!(shortfall_reason(selected.backend_id, &selected).contains("resource_limits"));
     }
 
     #[test]
@@ -1267,8 +1422,16 @@ mod tests {
             assert!(info.network_raw_denied);
         }
         // It serializes (doctor --format json).
-        let json = serde_json::to_string(&info).expect("serialize");
-        assert!(json.contains("backend_id"));
+        // Every current backend leaves at least one locked_down resource
+        // dimension unsupported, and doctor must carry that false aggregate bit
+        // through instead of recomputing it from ResourceLimits::any_set().
+        assert!(!info.resource_limits_enforced);
+        assert!(!info.deny_all_enforceable);
+        let json = serde_json::to_value(&info).expect("serialize");
+        assert_eq!(
+            json["resource_limits_enforced"],
+            serde_json::Value::Bool(false)
+        );
     }
 
     #[test]

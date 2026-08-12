@@ -18,7 +18,6 @@
 //! `plan_hash_recorded` directly with the plan file's bytes.
 
 use std::path::Path;
-use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -410,12 +409,46 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Render the exact saved-plan bytes through `terraform/tofu show -json` with a
+/// hard timeout.
+///
+/// The renderer is deliberately given a private temporary snapshot rather than
+/// the caller-controlled pathname. This binds the JSON summary to the same bytes
+/// the caller hashes even if the original path or one of its symlinks is replaced
+/// after the initial read.
+pub fn run_terraform_show_json_bytes(plan_bytes: &[u8], tool: PlanTool) -> Result<Vec<u8>, String> {
+    with_private_plan_snapshot(plan_bytes, |snapshot_path| {
+        run_terraform_show_json(snapshot_path, tool)
+    })
+}
+
+fn with_private_plan_snapshot<T>(
+    plan_bytes: &[u8],
+    render: impl FnOnce(&Path) -> Result<T, String>,
+) -> Result<T, String> {
+    use std::io::Write as _;
+
+    let mut snapshot = tempfile::Builder::new()
+        .prefix("tirith-iac-plan-")
+        .tempfile()
+        .map_err(|e| format!("create private plan snapshot: {e}"))?;
+    snapshot
+        .write_all(plan_bytes)
+        .map_err(|e| format!("write private plan snapshot: {e}"))?;
+    snapshot
+        .as_file()
+        .sync_all()
+        .map_err(|e| format!("sync private plan snapshot: {e}"))?;
+
+    render(snapshot.path())
+}
+
 /// Shell out to `terraform/tofu show -json <plan_path>` with a hard timeout.
 ///
 /// Hot-path warning: MUST NOT be called from `engine::analyze` — the only
 /// caller is the interactive `tirith iac check-plan`.
-pub fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u8>, String> {
-    use crate::util::{run_shell_with_timeout, ShellTimeoutOutcome};
+fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u8>, String> {
+    use crate::util::{run_trusted_with_timeout, ShellTimeoutOutcome};
 
     let program = match tool {
         PlanTool::Terraform => "terraform",
@@ -428,15 +461,31 @@ pub fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u
         }
     };
 
+    #[cfg(windows)]
+    let plan_path_string = plan_path
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve plan path {}: {error}", plan_path.display()))?
+        .to_string_lossy()
+        .into_owned();
+    #[cfg(not(windows))]
     let plan_path_string = plan_path.to_string_lossy().into_owned();
-    // Stderr is discarded, not piped — piping without draining could deadlock
-    // the child on ≥64KiB of stderr (PR-127 CodeRabbit).
-    let outcome = run_shell_with_timeout(
-        program,
+    // The supervisor drains and caps stderr independently from the plan JSON.
+    let executable =
+        crate::trusted_child::resolve_ambient(program).map_err(|error| error.to_string())?;
+    let outcome = run_trusted_with_timeout(
+        &executable,
         &["show", "-json", plan_path_string.as_str()],
         TERRAFORM_SHOW_TIMEOUT,
-        Duration::from_millis(50),
-        Stdio::null(),
+        MAX_PLAN_SIZE_BYTES as usize,
+        &[
+            "HOME",
+            "USERPROFILE",
+            "XDG_CONFIG_HOME",
+            "TF_CLI_CONFIG_FILE",
+            "TF_PLUGIN_CACHE_DIR",
+            "APPDATA",
+            "LOCALAPPDATA",
+        ],
     );
     match outcome {
         ShellTimeoutOutcome::Completed { status, stdout } => {
@@ -460,9 +509,27 @@ pub fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u
         ShellTimeoutOutcome::NotFound => Err(format!("{program}: binary not found on PATH")),
         ShellTimeoutOutcome::SpawnError(reason) => Err(reason),
         ShellTimeoutOutcome::WaitError(reason) => Err(reason),
-        ShellTimeoutOutcome::Timeout => Err(format!(
+        ShellTimeoutOutcome::Timeout {
+            cleanup_succeeded: true,
+        } => Err(format!(
             "{program} show -json exceeded {}s timeout",
             TERRAFORM_SHOW_TIMEOUT.as_secs()
+        )),
+        ShellTimeoutOutcome::Timeout {
+            cleanup_succeeded: false,
+        } => Err(format!(
+            "{program} show -json timed out and process-tree cleanup failed"
+        )),
+        ShellTimeoutOutcome::OutputLimitExceeded {
+            cleanup_succeeded: true,
+        } => Err(format!(
+            "{program} show -json exceeded the {} byte output cap",
+            MAX_PLAN_SIZE_BYTES
+        )),
+        ShellTimeoutOutcome::OutputLimitExceeded {
+            cleanup_succeeded: false,
+        } => Err(format!(
+            "{program} show -json exceeded its output cap and process-tree cleanup failed"
         )),
     }
 }
@@ -637,6 +704,37 @@ mod tests {
     fn looks_like_json_rejects_binary() {
         // Any non-`{`/`[` first non-whitespace byte rejects.
         assert!(!looks_like_json(&[0x50, 0x4b, 0x03, 0x04]));
+    }
+
+    #[test]
+    fn renderer_snapshot_is_bound_to_the_original_bytes() {
+        let original_dir = tempfile::tempdir().unwrap();
+        let original = original_dir.path().join("plan.tfplan");
+        std::fs::write(&original, b"approved plan bytes").unwrap();
+        let bytes = std::fs::read(&original).unwrap();
+
+        with_private_plan_snapshot(&bytes, |snapshot| {
+            // Model the reported race: the caller-controlled pathname changes after
+            // Tirith read it but before the external renderer opens its input.
+            std::fs::write(&original, b"different replacement bytes").unwrap();
+
+            assert_ne!(snapshot, original.as_path());
+            assert_eq!(std::fs::read(snapshot).unwrap(), b"approved plan bytes");
+            assert_eq!(
+                std::fs::read(&original).unwrap(),
+                b"different replacement bytes"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    std::fs::metadata(snapshot).unwrap().permissions().mode() & 0o777,
+                    0o600,
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

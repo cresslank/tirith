@@ -141,6 +141,23 @@ pub fn tier1_scan(input: &str, context: ScanContext) -> bool {
     }
 }
 
+/// Decode exactly one UTF-8 scalar from the start of `input`.
+///
+/// Decoding only the scalar's declared width prevents malformed bytes later in
+/// the buffer from hiding an otherwise-valid control character at the cursor.
+fn decode_utf8_scalar_prefix(input: &[u8]) -> Option<char> {
+    let width = match *input.first()? {
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return None,
+    };
+    std::str::from_utf8(input.get(..width)?)
+        .ok()?
+        .chars()
+        .next()
+}
+
 /// Scan raw bytes for control characters (paste-time, Tier 1 step 1).
 pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
     let mut result = ByteScanResult {
@@ -239,11 +256,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
         // invisible/confusable class in one pass.
         if b >= 0xc0 {
             let remaining = &input[i..];
-            if let Some(ch) = std::str::from_utf8(remaining)
-                .ok()
-                .or_else(|| std::str::from_utf8(&remaining[..remaining.len().min(4)]).ok())
-                .and_then(|s| s.chars().next())
-            {
+            if let Some(ch) = decode_utf8_scalar_prefix(remaining) {
                 if is_bidi_control(ch) {
                     result.has_bidi_controls = true;
                     result.details.push(ByteFinding {
@@ -382,6 +395,14 @@ pub struct OutputScanState {
     osc_buf: Vec<u8>,
     /// OSC introducer (`0`, `2`, `52`, `8`): accumulate digits, dispatch on `;`.
     osc_introducer: Vec<u8>,
+    /// Parsed operation code captured as soon as the introducer's first `;` is
+    /// seen. Retained even after payload buffering overflows.
+    osc_operation: Option<String>,
+    /// Absolute offset of the opening ESC for the current OSC sequence.
+    osc_start_offset: usize,
+    /// Payload retention exceeded [`OUTPUT_OSC_CAP`]. Bytes are discarded until
+    /// the real terminator, but the phase and operation remain authoritative.
+    osc_discarding: bool,
     sgr_buf: Vec<u8>,
     /// Reserved (unused): the chunk-boundary lone-`\e` case is already handled
     /// via `OutputPhase::AfterEsc` carrying across chunks. Kept to preserve
@@ -398,8 +419,9 @@ pub struct OutputScanState {
     osc8_uri_start_offset: usize,
 }
 
-/// Hard cap on payload bytes buffered inside one escape sequence; a larger
-/// sequence is aborted back to copy-through mode (legit OSC 8 URIs are KiB-sized).
+/// Hard cap on payload bytes retained inside one escape sequence. A larger
+/// sequence remains in discard-until-terminator mode and records an explicit
+/// overflow hit; it never falls back to copy-through mode.
 const OUTPUT_OSC_CAP: usize = 16 * 1024;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -432,6 +454,9 @@ pub struct OutputScanResult {
     pub sgr: Vec<OutputSgrHit>,
     /// Runs of zero-width characters longer than the v1 threshold (8 chars).
     pub zero_width_runs: Vec<OutputZeroWidthRun>,
+    /// OSC sequences whose payload or introducer exceeded the analysis cap.
+    /// The operation is captured before payload retention starts when possible.
+    pub osc_overflow: Vec<OutputOscOverflowHit>,
 }
 
 /// One generic OSC hit (file-wide offset + decoded payload).
@@ -441,11 +466,54 @@ pub struct OutputOscHit {
     pub payload: String,
 }
 
+/// An OSC sequence that exceeded bounded analysis retention. The scanner stays
+/// in a discard state until BEL/ST, so the remainder cannot be reinterpreted as
+/// clean output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputOscOverflowHit {
+    pub offset: usize,
+    pub operation: Option<String>,
+    pub retained_cap: usize,
+}
+
 /// A run of >8 consecutive zero-width characters detected by the output scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputZeroWidthRun {
     pub offset: usize,
     pub count: usize,
+}
+
+fn parse_osc_operation(introducer: &[u8]) -> Option<String> {
+    let separator = introducer.iter().position(|byte| *byte == b';')?;
+    let operation = std::str::from_utf8(&introducer[..separator]).ok()?.trim();
+    if operation.is_empty() {
+        None
+    } else {
+        Some(operation.to_string())
+    }
+}
+
+fn record_osc_overflow(state: &mut OutputScanState, result: &mut OutputScanResult) {
+    if state.osc_discarding {
+        return;
+    }
+    result.osc_overflow.push(OutputOscOverflowHit {
+        offset: state.osc_start_offset,
+        operation: state.osc_operation.clone(),
+        retained_cap: OUTPUT_OSC_CAP,
+    });
+    state.osc_discarding = true;
+    state.osc_buf.clear();
+}
+
+fn reset_osc_state(state: &mut OutputScanState, phase: OutputPhase) {
+    state.phase = phase;
+    state.osc_buf.clear();
+    state.osc_introducer.clear();
+    state.osc_operation = None;
+    state.osc_discarding = false;
+    state.osc_pending_st = false;
+    state.osc_start_offset = 0;
 }
 
 /// Streaming output scanner — drive with 64 KiB chunks; `state` carries across
@@ -493,6 +561,10 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
                         state.phase = OutputPhase::InOsc;
                         state.osc_introducer.clear();
                         state.osc_buf.clear();
+                        state.osc_operation = None;
+                        state.osc_discarding = false;
+                        state.osc_pending_st = false;
+                        state.osc_start_offset = (chunk_start_offset + byte_idx).saturating_sub(1);
                     }
                     b'\\' => {
                         // Standalone `\e\\` (ST in idle context) — no-op.
@@ -577,20 +649,26 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
                     byte_idx += 1;
                     continue;
                 }
+                if state.osc_discarding {
+                    // Retention overflowed, but remaining in InOsc is the
+                    // security boundary: discard every byte until BEL/ST so the
+                    // terminator and tail can never be reinterpreted as clean.
+                    byte_idx += 1;
+                    continue;
+                }
                 if state.osc_introducer.contains(&b';') {
                     // Past the introducer separator — accumulate payload.
                     state.osc_buf.push(b);
                     if state.osc_buf.len() > OUTPUT_OSC_CAP {
-                        state.phase = OutputPhase::Idle;
-                        state.osc_buf.clear();
-                        state.osc_introducer.clear();
+                        record_osc_overflow(state, result);
                     }
                 } else {
                     state.osc_introducer.push(b);
+                    if b == b';' {
+                        state.osc_operation = parse_osc_operation(&state.osc_introducer);
+                    }
                     if state.osc_introducer.len() > 32 {
-                        state.phase = OutputPhase::Idle;
-                        state.osc_buf.clear();
-                        state.osc_introducer.clear();
+                        record_osc_overflow(state, result);
                     }
                 }
                 byte_idx += 1;
@@ -601,11 +679,7 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
         // Idle-mode zero-width tracking (multi-byte chars).
         if state.phase == OutputPhase::Idle && b >= 0xc0 {
             let remaining = &chunk[byte_idx..];
-            if let Some(ch) = std::str::from_utf8(remaining)
-                .ok()
-                .or_else(|| std::str::from_utf8(&remaining[..remaining.len().min(4)]).ok())
-                .and_then(|s| s.chars().next())
-            {
+            if let Some(ch) = decode_utf8_scalar_prefix(remaining) {
                 if is_zero_width(ch) || is_unicode_tag(ch) {
                     if zw_run_start.is_none() {
                         zw_run_start = Some(chunk_start_offset + byte_idx);
@@ -681,24 +755,26 @@ pub fn finalize_scan_state(state: &mut OutputScanState) -> OutputScanFinalize {
     let mut out = OutputScanFinalize::default();
     let in_flight = !matches!(state.phase, OutputPhase::Idle);
     if in_flight {
-        out.truncated_escape = true;
+        // A bounded-retention overflow was already emitted synchronously into
+        // `OutputScanResult`; do not duplicate it as a second EOF finding.
+        let overflow_already_reported =
+            matches!(state.phase, OutputPhase::InOsc) && state.osc_discarding;
+        out.truncated_escape = !overflow_already_reported;
         // The introducer accumulates digits until the first `;`, so a leading
         // "52" is a definitive clipboard-write signal even mid-payload.
-        if matches!(state.phase, OutputPhase::InOsc) {
-            let head: Vec<u8> = state
-                .osc_introducer
-                .iter()
-                .copied()
-                .take_while(|b| *b != b';')
-                .collect();
-            if head.starts_with(b"52") {
-                out.truncated_osc52 = true;
-            }
+        if !overflow_already_reported
+            && matches!(state.phase, OutputPhase::InOsc)
+            && (state.osc_operation.as_deref() == Some("52")
+                || state.osc_introducer.starts_with(b"52;"))
+        {
+            out.truncated_osc52 = true;
         }
         // Reset transient state so re-use of `state` is safe.
         state.phase = OutputPhase::Idle;
         state.osc_buf.clear();
         state.osc_introducer.clear();
+        state.osc_operation = None;
+        state.osc_discarding = false;
         state.sgr_buf.clear();
         state.saw_lone_esc = false;
         state.osc_pending_st = false;
@@ -723,14 +799,22 @@ fn parse_sgr_params(buf: &[u8]) -> Vec<u32> {
 fn finalize_osc(
     state: &mut OutputScanState,
     result: &mut OutputScanResult,
-    chunk_start_offset: usize,
-    byte_idx: usize,
+    _chunk_start_offset: usize,
+    _byte_idx: usize,
 ) {
     state.osc_pending_st = false;
+    if state.osc_discarding {
+        // The explicit overflow hit was recorded at the exact point bounded
+        // retention stopped. The terminator only closes discard mode; never
+        // synthesize a partial normal OSC hit from the retained prefix.
+        reset_osc_state(state, OutputPhase::Idle);
+        state.osc8_active_uri = None;
+        state.osc8_visible_buf.clear();
+        return;
+    }
     // Offset of the introducing `\e]`: subtract the bytes consumed since it.
     // saturating_sub handles the cross-chunk case (opener in N, terminator in N+1).
-    let consumed = state.osc_introducer.len() + state.osc_buf.len() + 2; // +2 for `\e]`
-    let abs_offset = (chunk_start_offset + byte_idx).saturating_sub(consumed);
+    let abs_offset = state.osc_start_offset;
 
     // Split introducer on the first `;` into numeric head + payload params.
     let mut head_buf: Vec<u8> = Vec::new();
@@ -760,18 +844,14 @@ fn finalize_osc(
                 offset: abs_offset,
                 payload: format!("{rest_str}{payload_str}"),
             });
-            state.phase = OutputPhase::Idle;
-            state.osc_introducer.clear();
-            state.osc_buf.clear();
+            reset_osc_state(state, OutputPhase::Idle);
         }
         "52" => {
             result.osc52.push(OutputOscHit {
                 offset: abs_offset,
                 payload: payload_str,
             });
-            state.phase = OutputPhase::Idle;
-            state.osc_introducer.clear();
-            state.osc_buf.clear();
+            reset_osc_state(state, OutputPhase::Idle);
         }
         "8" => {
             // OSC 8 shape: `\e]8;params;uri\e\\<visible>\e]8;;\e\\`. Our
@@ -805,12 +885,13 @@ fn finalize_osc(
             }
             state.osc_introducer.clear();
             state.osc_buf.clear();
+            state.osc_operation = None;
+            state.osc_discarding = false;
+            state.osc_pending_st = false;
         }
         _ => {
             // Unknown OSC code — ignore (no finding) but reset state.
-            state.phase = OutputPhase::Idle;
-            state.osc_introducer.clear();
-            state.osc_buf.clear();
+            reset_osc_state(state, OutputPhase::Idle);
         }
     }
 }
@@ -879,6 +960,65 @@ mod output_scan_tests {
     }
 
     #[test]
+    fn oversized_osc52_records_overflow_and_discards_until_terminator() {
+        let mut state = OutputScanState::default();
+        let mut result = OutputScanResult::default();
+        scan_output_chunk(b"prefix\x1b]52;", &mut state, &mut result);
+
+        let oversized = vec![b'A'; OUTPUT_OSC_CAP + 1];
+        for chunk in oversized.chunks(257) {
+            scan_output_chunk(chunk, &mut state, &mut result);
+        }
+
+        assert_eq!(result.osc_overflow.len(), 1);
+        assert_eq!(result.osc_overflow[0].operation.as_deref(), Some("52"));
+        assert_eq!(result.osc_overflow[0].retained_cap, OUTPUT_OSC_CAP);
+        assert!(result.osc52.is_empty());
+        assert_eq!(state.phase, OutputPhase::InOsc);
+        assert!(state.osc_discarding);
+        assert!(
+            state.osc_buf.is_empty(),
+            "overflow bytes must not be retained"
+        );
+
+        scan_output_chunk(
+            b"discarded-tail\x07safe\x1b]52;c;second\x07",
+            &mut state,
+            &mut result,
+        );
+        assert_eq!(state.phase, OutputPhase::Idle);
+        assert_eq!(result.osc_overflow.len(), 1, "record overflow exactly once");
+        assert_eq!(result.osc52.len(), 1, "scanner must recover after BEL");
+        assert_eq!(result.osc52[0].payload, "c;second");
+    }
+
+    #[test]
+    fn exact_osc_cap_remains_analyzable_without_overflow() {
+        let mut input = b"\x1b]52;".to_vec();
+        input.extend(std::iter::repeat_n(b'A', OUTPUT_OSC_CAP));
+        input.push(0x07);
+        let result = scan_output_bytes(&input);
+        assert!(result.osc_overflow.is_empty());
+        assert_eq!(result.osc52.len(), 1);
+        assert_eq!(result.osc52[0].payload.len(), OUTPUT_OSC_CAP);
+    }
+
+    #[test]
+    fn overflowing_unterminated_osc_is_not_double_reported_as_truncated() {
+        let mut input = b"\x1b]52;".to_vec();
+        input.extend(std::iter::repeat_n(b'A', OUTPUT_OSC_CAP + 1));
+        let mut state = OutputScanState::default();
+        let mut result = OutputScanResult::default();
+        scan_output_chunk(&input, &mut state, &mut result);
+        let finalized = finalize_scan_state(&mut state);
+
+        assert_eq!(result.osc_overflow.len(), 1);
+        assert!(!finalized.truncated_escape);
+        assert!(!finalized.truncated_osc52);
+        assert_eq!(state.phase, OutputPhase::Idle);
+    }
+
+    #[test]
     fn finalize_flags_truncated_osc52() {
         // Sev-5 silent-failure regression: a `\e]52;…` that ends mid-payload
         // (no BEL / no ST) used to leave `phase=InOsc` and produce no
@@ -935,6 +1075,28 @@ mod output_scan_tests {
         let result = scan_output_bytes(&input);
         assert_eq!(result.zero_width_runs.len(), 1);
         assert_eq!(result.zero_width_runs[0].count, 10);
+    }
+
+    #[test]
+    fn recovers_zero_width_run_immediately_before_invalid_utf8() {
+        let mut input = b"abc".to_vec();
+        for _ in 0..9 {
+            input.extend_from_slice("\u{200B}".as_bytes());
+        }
+        input.push(0xff);
+
+        let result = scan_output_bytes(&input);
+        assert_eq!(result.zero_width_runs.len(), 1);
+        assert_eq!(result.zero_width_runs[0].count, 9);
+    }
+
+    #[test]
+    fn valid_visible_scalar_before_invalid_utf8_is_not_zero_width() {
+        let mut input = "visible ☃".as_bytes().to_vec();
+        input.push(0xff);
+
+        let result = scan_output_bytes(&input);
+        assert!(result.zero_width_runs.is_empty());
     }
 
     #[test]
@@ -2287,6 +2449,39 @@ mod tests {
         let input = "hello\u{202E}dlrow".as_bytes();
         let result = scan_bytes(input);
         assert!(result.has_bidi_controls);
+    }
+
+    #[test]
+    fn test_byte_scan_recovers_bidi_immediately_before_invalid_utf8() {
+        // repo-0045: a valid three-byte RLO followed by an invalid octet must not
+        // make the scanner discard the valid control's leading byte.
+        let mut input = b"safe".to_vec();
+        let bidi_offset = input.len();
+        input.extend_from_slice("\u{202E}".as_bytes());
+        input.push(0xff);
+
+        let result = scan_bytes(&input);
+        assert!(
+            result.has_invalid_utf8,
+            "the malformed octet must be recorded"
+        );
+        assert!(
+            result.has_bidi_controls,
+            "a later malformed octet must not hide the preceding bidi control"
+        );
+        assert!(result.details.iter().any(|detail| {
+            detail.offset == bidi_offset && detail.codepoint == Some('\u{202E}' as u32)
+        }));
+    }
+
+    #[test]
+    fn test_byte_scan_invalid_utf8_does_not_invent_unicode_controls() {
+        // Legitimate control: malformed bytes alone still mark invalid UTF-8,
+        // but must not manufacture a bidi/zero-width finding.
+        let result = scan_bytes(b"plain\xfftext");
+        assert!(result.has_invalid_utf8);
+        assert!(!result.has_bidi_controls);
+        assert!(!result.has_zero_width);
     }
 
     #[test]

@@ -69,14 +69,26 @@
 //! `DenyAll` spec is satisfied natively (no networking capability granted == no raw
 //! egress).
 
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 use super::{
-    CapabilityLevel, Capsule, CapsuleCoverage, CapsuleSpec, FilesystemPolicy, ResourceLimits,
+    CapabilityLevel, Capsule, CapsuleCoverage, CapsuleSpec, FilesystemPolicy, ResourceLimitSupport,
+    ResourceLimits,
 };
 
 /// The stable backend identifier reported in receipts and `tirith doctor`.
 pub const BACKEND_ID: &str = "appcontainer";
+
+/// Resource dimensions mapped into the Job Object by `job_object_limits`.
+const RESOURCE_LIMIT_SUPPORT: ResourceLimitSupport = ResourceLimitSupport {
+    cpu_seconds: true,
+    memory_bytes: true,
+    max_processes: true,
+    max_open_files: false,
+    max_output_bytes: false,
+    wall_clock_seconds: false,
+};
 
 /// The display name handed to `CreateAppContainerProfile` for tirith's containers.
 /// Cosmetic (shown in some diagnostics); the security identity is the derived SID,
@@ -164,8 +176,10 @@ pub fn probe_appcontainer() -> WindowsProbe {
 ///     is routed by E5), so E4 cannot claim end-to-end domain enforcement
 ///     (invariant 3). An allow-list spec is therefore degraded on this flag and the
 ///     enforcing surface fails closed.
-///   - `resource_limits_enforced`: true when the spec sets any Job-Object-able
-///     dimension (CPU / memory / process count / open files); the Job applies them.
+///   - `resource_limits_enforced`: true only when at least one limit is requested
+///     and every requested dimension maps to the Job Object (CPU / memory /
+///     process count). Open-files, output, and wall-clock requests keep the
+///     aggregate bit false.
 ///   - `env_isolated` / `handles_isolated`: true — the executor builds the child's
 ///     environment from the surviving-vars policy (sensitive set stripped, isolated
 ///     HOME/TEMP) and calls `CreateProcessW` with `bInheritHandles = FALSE`.
@@ -182,20 +196,12 @@ pub fn derive_coverage(spec: &CapsuleSpec, probe: &WindowsProbe) -> CapsuleCover
         network_raw_denied: true,
         // E4 ships no verified broker-pinned egress path of its own.
         domain_proxy_enforced: false,
-        resource_limits_enforced: job_limitable(&spec.resources),
+        resource_limits_enforced: spec
+            .resources
+            .all_requested_enforced_by(RESOURCE_LIMIT_SUPPORT),
         env_isolated: true,
         handles_isolated: true,
     }
-}
-
-/// Whether `limits` populates any dimension a Job Object can enforce. Wall-clock
-/// and output-byte caps are NOT Job Object limits (the spawning wrapper enforces
-/// those), so they do not, on their own, set `resource_limits_enforced`.
-fn job_limitable(limits: &ResourceLimits) -> bool {
-    limits.cpu_seconds.is_some()
-        || limits.memory_bytes.is_some()
-        || limits.max_processes.is_some()
-        || limits.max_open_files.is_some()
 }
 
 /// An error from building (or, in the CLI executor, applying) a Windows capsule
@@ -404,10 +410,9 @@ pub struct JobObjectLimits {
 /// 100-ns ticks (the unit `PerJobUserTimeLimit` expects: `seconds * 10_000_000`),
 /// saturating so an absurd value cannot overflow. `max_open_files` has no direct
 /// per-Job equivalent on Windows (handle limits are per-process via other
-/// mechanisms), so it does not appear here; it still contributes to
-/// `resource_limits_enforced` via [`job_limitable`] only when one of the mapped
-/// dimensions is also set — see the note in [`derive_coverage`]. Wall-clock and
-/// output caps are the wrapper's job, not the Job Object's.
+/// mechanisms), so it does not appear here and prevents an aggregate resource
+/// coverage claim. Wall-clock and output caps are also not applied by this
+/// backend or its wrapper.
 pub fn job_object_limits(limits: &ResourceLimits) -> JobObjectLimits {
     JobObjectLimits {
         kill_on_close: true,
@@ -430,10 +435,10 @@ pub struct WindowsLaunchPlan {
     /// The Job Object limits to apply.
     pub job_limits: JobObjectLimits,
     /// The target program (the executable path / `lpApplicationName`).
-    pub program: String,
+    pub program: OsString,
     /// The target program's arguments (appended after the program in the
     /// `lpCommandLine`).
-    pub program_args: Vec<String>,
+    pub program_args: Vec<OsString>,
     /// Whether `CreateProcessW` must inherit handles. **Always false** in E4 (the
     /// honest handle closure); the field is explicit so a future stdio-forwarding
     /// path cannot flip it implicitly.
@@ -458,6 +463,18 @@ pub fn windows_launch_plan(
     program: &str,
     program_args: &[String],
 ) -> Result<WindowsLaunchPlan, WindowsCapsuleError> {
+    let args_os: Vec<OsString> = program_args.iter().map(OsString::from).collect();
+    windows_launch_plan_os(spec, OsStr::new(program), &args_os)
+}
+
+/// OS-native counterpart to [`windows_launch_plan`]. Keeping the program and
+/// arguments as [`OsString`] preserves Windows' native UTF-16/WTF-16 values until
+/// the executor constructs the `CreateProcessW` buffers.
+pub fn windows_launch_plan_os(
+    spec: &CapsuleSpec,
+    program: &OsStr,
+    program_args: &[OsString],
+) -> Result<WindowsLaunchPlan, WindowsCapsuleError> {
     // Fail closed on a level we cannot honestly enforce, before building anything.
     if spec.capability_level() == CapabilityLevel::AllowListedDomains {
         return Err(WindowsCapsuleError::Unsupported(
@@ -466,14 +483,17 @@ pub fn windows_launch_plan(
                 .to_string(),
         ));
     }
-    if program.contains('\0') {
+    if os_contains_nul(program) {
         return Err(WindowsCapsuleError::NulInArgument(format!(
-            "program path: {program}"
+            "program path: {}",
+            program.to_string_lossy()
         )));
     }
     for a in program_args {
-        if a.contains('\0') {
-            return Err(WindowsCapsuleError::NulInArgument(a.clone()));
+        if os_contains_nul(a) {
+            return Err(WindowsCapsuleError::NulInArgument(
+                a.to_string_lossy().into_owned(),
+            ));
         }
     }
 
@@ -482,11 +502,23 @@ pub fn windows_launch_plan(
         profile: app_container_profile(spec)?,
         acl_grants: grants,
         job_limits: job_object_limits(&spec.resources),
-        program: program.to_string(),
+        program: program.to_os_string(),
         program_args: program_args.to_vec(),
         // Honest handle closure: never inherit parent handles.
         inherit_handles: false,
     })
+}
+
+fn os_contains_nul(value: &OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        value.encode_wide().any(|unit| unit == 0)
+    }
+    #[cfg(not(windows))]
+    {
+        value.as_encoded_bytes().contains(&0)
+    }
 }
 
 /// Quote one argument for a `CreateProcessW` `lpCommandLine` following the
@@ -502,7 +534,7 @@ pub fn windows_launch_plan(
 /// bypasses because it needs `STARTUPINFOEXW`) so the assembled command line cannot
 /// be mis-split by the child.
 pub fn quote_arg_for_command_line(arg: &str) -> String {
-    if !arg.is_empty() && !arg.chars().any(|c| c == ' ' || c == '\t' || c == '"') {
+    if !arg.is_empty() && !arg.chars().any(command_line_char_needs_quotes) {
         return arg.to_string();
     }
     let mut out = String::with_capacity(arg.len() + 2);
@@ -538,19 +570,100 @@ pub fn quote_arg_for_command_line(arg: &str) -> String {
     out
 }
 
-/// Assemble the full `lpCommandLine` string for the plan: the (quoted) program
-/// followed by each (quoted) argument, space-separated, exactly as
-/// `CreateProcessW` parses it. **Pure.** The executor passes the program path as
-/// `lpApplicationName` *and* as argv[0] here so the child sees a conventional
-/// command line; `CreateProcessW` resolves the executable from `lpApplicationName`,
-/// not from this string, which closes the search-path ambiguity.
+fn command_line_char_needs_quotes(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '"')
+}
+
+/// Assemble a UTF-8 display/test form of the plan's command line. The Windows
+/// executor uses [`command_line_wide_for`] so native values are never converted
+/// lossily. Both builders apply the same CRT quoting algorithm and include the
+/// program as argv[0]; `CreateProcessW` resolves the executable separately from
+/// `lpApplicationName`, closing the search-path ambiguity.
 pub fn command_line_for(plan: &WindowsLaunchPlan) -> String {
     let mut parts = Vec::with_capacity(plan.program_args.len() + 1);
-    parts.push(quote_arg_for_command_line(&plan.program));
+    parts.push(quote_arg_for_command_line(&plan.program.to_string_lossy()));
     for a in &plan.program_args {
+        parts.push(quote_arg_for_command_line(&a.to_string_lossy()));
+    }
+    parts.join(" ")
+}
+
+/// Assemble a CRT-compatible Windows command line from an explicitly selected
+/// application path and argument vector. Shared by the AppContainer launcher and
+/// host-platform tests. Windows execution uses [`command_line_wide_from_parts`]
+/// so native values are never narrowed to UTF-8.
+pub fn command_line_from_parts(program: &str, args: &[String]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(quote_arg_for_command_line(program));
+    for a in args {
         parts.push(quote_arg_for_command_line(a));
     }
     parts.join(" ")
+}
+
+/// Assemble the exact native UTF-16 `lpCommandLine` buffer, excluding the final
+/// NUL terminator. Unlike [`command_line_for`], this never performs a lossy text
+/// conversion on Windows and therefore preserves unpaired surrogate code units.
+pub fn command_line_wide_for(plan: &WindowsLaunchPlan) -> Vec<u16> {
+    command_line_wide_from_parts(&plan.program, &plan.program_args)
+}
+
+/// Assemble the exact native UTF-16 command line for an arbitrary executable
+/// and argv. This is the shared execution boundary for AppContainer and trusted
+/// child launches; unpaired surrogate code units remain byte-for-byte native.
+pub fn command_line_wide_from_parts(program: &OsStr, args: &[OsString]) -> Vec<u16> {
+    let mut out = Vec::new();
+    for (index, arg) in std::iter::once(program)
+        .chain(args.iter().map(OsString::as_os_str))
+        .enumerate()
+    {
+        if index != 0 {
+            out.push(u16::from(b' '));
+        }
+        out.extend(quote_wide_arg(&os_wide(arg)));
+    }
+    out
+}
+
+fn os_wide(value: &OsStr) -> Vec<u16> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        value.encode_wide().collect()
+    }
+    #[cfg(not(windows))]
+    {
+        value.to_string_lossy().encode_utf16().collect()
+    }
+}
+
+fn quote_wide_arg(arg: &[u16]) -> Vec<u16> {
+    let needs_quotes = arg.is_empty() || arg.iter().any(|unit| matches!(*unit, 0x20 | 0x09 | 0x22));
+    if !needs_quotes {
+        return arg.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(arg.len() + 2);
+    out.push(u16::from(b'"'));
+    let mut backslashes = 0usize;
+    for unit in arg {
+        match *unit {
+            0x5c => backslashes += 1,
+            0x22 => {
+                out.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2 + 1));
+                out.push(u16::from(b'"'));
+                backslashes = 0;
+            }
+            other => {
+                out.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes));
+                backslashes = 0;
+                out.push(other);
+            }
+        }
+    }
+    out.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2));
+    out.push(u16::from(b'"'));
+    out
 }
 
 #[cfg(test)]
@@ -582,9 +695,10 @@ mod tests {
 
     #[test]
     fn derive_coverage_denyall_with_appcontainer() {
-        // AppContainer supported + a deny-all spec with rlimits -> FS enforced,
-        // raw-net denied (no networking capability), exec limited, limits + env +
-        // handles set, and NEVER egress.
+        // AppContainer supported + locked_down -> FS enforced, raw-net denied,
+        // exec limited, env + handles set, and NEVER egress. The resource bit
+        // stays false because locked_down requests open-files/output/wall limits
+        // the Job Object does not apply.
         let spec = CapsuleSpec::locked_down();
         let probe = WindowsProbe {
             appcontainer_supported: true,
@@ -596,11 +710,12 @@ mod tests {
         assert!(cov.network_raw_denied);
         // The single most important honesty property of E4's backend.
         assert!(!cov.domain_proxy_enforced);
-        assert!(cov.resource_limits_enforced);
+        assert!(!cov.resource_limits_enforced);
         assert!(cov.env_isolated);
         assert!(cov.handles_isolated);
         // The ledger is internally coherent (no egress claim without raw-deny).
         assert!(cov.egress_claim_is_coherent());
+        assert!(cov.is_degraded_against(&spec.required_coverage()));
     }
 
     #[test]
@@ -649,13 +764,50 @@ mod tests {
         };
         assert!(derive_coverage(&spec, &probe).resource_limits_enforced);
 
-        // open-files alone (no per-Job equivalent here) still counts as
-        // Job-limitable for the coverage flag (job_limitable includes it).
+        // Open-files alone has no per-Job equivalent -> not claimed.
         spec.resources = ResourceLimits {
             max_open_files: Some(64),
             ..ResourceLimits::default()
         };
-        assert!(derive_coverage(&spec, &probe).resource_limits_enforced);
+        assert!(!derive_coverage(&spec, &probe).resource_limits_enforced);
+    }
+
+    #[test]
+    fn mixed_memory_and_open_files_does_not_claim_all_resource_limits() {
+        let probe = WindowsProbe {
+            appcontainer_supported: true,
+        };
+        let mut spec = CapsuleSpec::locked_down();
+        spec.resources = ResourceLimits {
+            memory_bytes: Some(512 * 1024 * 1024),
+            max_open_files: Some(64),
+            ..ResourceLimits::default()
+        };
+
+        let coverage = derive_coverage(&spec, &probe);
+        assert!(
+            !coverage.resource_limits_enforced,
+            "a mapped Job memory limit must not hide the unmapped open-files limit"
+        );
+        assert!(coverage.is_degraded_against(&spec.required_coverage()));
+    }
+
+    #[test]
+    fn windows_supported_only_resource_limits_are_reported_enforced() {
+        let probe = WindowsProbe {
+            appcontainer_supported: true,
+        };
+        let mut spec = CapsuleSpec::locked_down();
+        spec.resources = ResourceLimits {
+            cpu_seconds: Some(30),
+            memory_bytes: Some(512 * 1024 * 1024),
+            max_processes: Some(32),
+            ..ResourceLimits::default()
+        };
+
+        let coverage = derive_coverage(&spec, &probe);
+        assert!(coverage.resource_limits_enforced);
+        assert!(!coverage.is_degraded_against(&spec.required_coverage()));
     }
 
     #[test]
@@ -794,7 +946,10 @@ mod tests {
         let plan = windows_launch_plan(&spec, "C:/python/python.exe", &["-m".into(), "pip".into()])
             .expect("plan");
         assert_eq!(plan.program, "C:/python/python.exe");
-        assert_eq!(plan.program_args, vec!["-m".to_string(), "pip".to_string()]);
+        assert_eq!(
+            plan.program_args,
+            vec![OsString::from("-m"), OsString::from("pip")]
+        );
         // Honest handle closure.
         assert!(!plan.inherit_handles);
         // No network capability.
@@ -903,5 +1058,70 @@ mod tests {
         let cmd = command_line_for(&plan);
         // The program (with a space) is quoted; the plain args are not.
         assert_eq!(cmd, "\"C:/Program Files/Python/python.exe\" -m pip");
+    }
+
+    #[test]
+    fn windows_quoting_keeps_shell_metacharacter_classes_inside_arguments() {
+        for arg in [
+            "two words",
+            "safe; touch marker",
+            "$(touch marker)",
+            "safe > marker",
+            "a'\"b",
+            "*.txt",
+        ] {
+            let quoted = quote_arg_for_command_line(arg);
+            if arg.chars().any(command_line_char_needs_quotes) {
+                assert!(quoted.starts_with('"') && quoted.ends_with('"'), "{arg:?}");
+            } else {
+                assert_eq!(quoted, arg, "a single token needs no extra quoting");
+            }
+
+            let plan = windows_launch_plan(
+                &CapsuleSpec::locked_down(),
+                "C:/Program Files/probe.exe",
+                &[arg.to_string()],
+            )
+            .expect("plan");
+            let command_line = command_line_for(&plan);
+            assert!(
+                command_line.ends_with(&quoted),
+                "argument must remain one CRT-quoted element: {command_line:?}"
+            );
+            assert_eq!(
+                String::from_utf16(&command_line_wide_for(&plan)).expect("valid fixture UTF-16"),
+                command_line,
+                "the native CreateProcessW buffer must apply the same argv quoting"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_command_line_preserves_unpaired_surrogates() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let program = OsString::from_wide(&[u16::from(b'p'), 0xd800]);
+        let args = vec![
+            OsString::from_wide(&[0xdc00]),
+            OsString::from_wide(&[0xd801, u16::from(b' '), 0xdfff]),
+        ];
+
+        assert_eq!(
+            command_line_wide_from_parts(&program, &args),
+            vec![
+                u16::from(b'p'),
+                0xd800,
+                u16::from(b' '),
+                0xdc00,
+                u16::from(b' '),
+                u16::from(b'"'),
+                0xd801,
+                u16::from(b' '),
+                0xdfff,
+                u16::from(b'"'),
+            ],
+            "native quoting must preserve lone UTF-16 surrogates without replacement"
+        );
     }
 }

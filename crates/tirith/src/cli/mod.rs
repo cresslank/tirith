@@ -293,6 +293,67 @@ mod write_json_tests {
             .collect();
         assert_eq!(entries.len(), 1, "no temp file left behind: {entries:?}");
     }
+
+    #[test]
+    fn contained_atomic_write_stays_beneath_root() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join(".tirith");
+        std::fs::create_dir(&config).unwrap();
+        let path = config.join("policy.yaml");
+
+        super::write_file_atomic_contained(root.path(), &path, b"safe: true\n", true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"safe: true\n");
+
+        let outside = tempfile::tempdir().unwrap();
+        let escaped = root.path().join("..").join(
+            outside
+                .path()
+                .file_name()
+                .expect("temp directory has a name"),
+        );
+        let err = super::write_file_atomic_contained(root.path(), &escaped, b"escape", true)
+            .expect_err("a destination outside the anchored root must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_atomic_write_rejects_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join(".tirith");
+        std::fs::create_dir(&config).unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"outside").unwrap();
+        let path = config.join("policy.yaml");
+        symlink(outside.path(), &path).unwrap();
+
+        super::write_file_atomic_contained(root.path(), &path, b"attacker", true)
+            .expect_err("a repo-contained writer must refuse a final symlink");
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"outside");
+        assert!(std::fs::symlink_metadata(path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_atomic_write_rejects_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let config = root.path().join(".tirith");
+        symlink(outside.path(), &config).unwrap();
+        let path = config.join("policy.yaml");
+
+        let err = super::write_file_atomic_contained(root.path(), &path, b"attacker", true)
+            .expect_err("a repo-contained writer must refuse an escaping parent link");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!outside.path().join("policy.yaml").exists());
+    }
 }
 
 /// Write `contents` to `path` atomically: a sibling temp file is written,
@@ -318,6 +379,66 @@ pub(crate) fn write_file_atomic(
     // Resolve a symlinked destination so we write THROUGH the link;
     // non-symlinks resolve to themselves.
     let dest = resolve_atomic_dest(path);
+    write_file_atomic_to_dest(&dest, contents, overwrite)
+}
+
+/// Atomically write a repository-owned file while proving the effective parent
+/// remains beneath `root`. Unlike [`write_file_atomic`], this variant never
+/// follows a final-component symlink: profile compatibility and repository
+/// containment are distinct policies.
+pub(crate) fn write_file_atomic_contained(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    contents: &[u8],
+    overwrite: bool,
+) -> std::io::Result<()> {
+    let canonical_root = std::fs::canonicalize(root)?;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "contained atomic destination has no parent",
+        )
+    })?;
+    let canonical_parent = std::fs::canonicalize(parent)?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "atomic destination parent {} escapes contained root {}",
+                canonical_parent.display(),
+                canonical_root.display()
+            ),
+        ));
+    }
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "contained atomic destination has no file name",
+        )
+    })?;
+    let dest = canonical_parent.join(file_name);
+    match std::fs::symlink_metadata(&dest) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to replace symlinked contained destination {}",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    write_file_atomic_to_dest(&dest, contents, overwrite)
+}
+
+fn write_file_atomic_to_dest(
+    dest: &std::path::Path,
+    contents: &[u8],
+    overwrite: bool,
+) -> std::io::Result<()> {
     let dir = dest
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -331,14 +452,14 @@ pub(crate) fn write_file_atomic(
     tmp.flush()?;
     tmp.as_file().sync_all()?;
     if overwrite {
-        tmp.persist(&dest).map_err(|e| e.error)?;
+        tmp.persist(dest).map_err(|e| e.error)?;
     } else {
-        tmp.persist_noclobber(&dest).map_err(|e| e.error)?;
+        tmp.persist_noclobber(dest).map_err(|e| e.error)?;
     }
     // fsync the parent so the new name→inode entry survives a crash. persist
     // already succeeded, so a dir-fsync failure is LOGGED, not propagated
     // (R13 #5). No-op on non-Unix.
-    tirith_core::util::fsync_parent_dir_logged(&dest, "atomic file write");
+    tirith_core::util::fsync_parent_dir_logged(dest, "atomic file write");
     Ok(())
 }
 
@@ -672,34 +793,17 @@ pub fn tirith_path_lookup_command() -> &'static str {
     }
 }
 
-/// Resolve all `tirith` executables on PATH via the shell's own resolution —
-/// the paths the shell would actually execute, not just filesystem entries.
+/// Resolve all `tirith` executables on PATH without executing a PATH-selected
+/// shell or lookup utility.
 pub fn resolve_tirith_on_path() -> Vec<std::path::PathBuf> {
-    let output = {
-        #[cfg(unix)]
-        {
-            std::process::Command::new("sh")
-                .args(["-c", "which -a tirith 2>/dev/null"])
-                .output()
-        }
-        #[cfg(not(unix))]
-        {
-            std::process::Command::new("where.exe")
-                .arg("tirith")
-                .output()
-        }
+    let Some(path) = std::env::var_os("PATH") else {
+        return Vec::new();
     };
+    resolve_tirith_on_path_from(&path)
+}
 
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
-
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(std::path::PathBuf::from)
-        .collect()
+fn resolve_tirith_on_path_from(path: &std::ffi::OsStr) -> Vec<std::path::PathBuf> {
+    tirith_core::path_audit::which_all_os("tirith", path)
 }
 
 /// Find `tirith` executables on PATH that aren't the current binary, deduped by
@@ -856,12 +960,34 @@ pub fn warn_repo_policy_neutralized(policy: &tirith_core::policy::Policy) {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_shim_target, quiet_from_env, resolve_shim_target, sanitize_for_human_output,
-        shell_join, should_warn_neutralized,
+        parse_shim_target, quiet_from_env, resolve_shim_target, resolve_tirith_on_path_from,
+        sanitize_for_human_output, shell_join, should_warn_neutralized,
     };
     use std::fs;
     use std::path::PathBuf;
     use tirith_core::policy::PolicyScope;
+
+    #[cfg(unix)]
+    #[test]
+    fn tirith_path_lookup_is_in_process_and_preserves_order() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for directory in [first.path(), second.path()] {
+            let executable = directory.join("tirith");
+            fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut permissions = fs::metadata(&executable).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(executable, permissions).unwrap();
+        }
+        let path = std::env::join_paths([first.path(), second.path()]).unwrap();
+        let hits = resolve_tirith_on_path_from(&path);
+        assert_eq!(
+            hits,
+            vec![first.path().join("tirith"), second.path().join("tirith")]
+        );
+    }
 
     #[test]
     fn shell_join_preserves_argv_boundaries() {

@@ -89,6 +89,11 @@ What this does:
   new / modified files → prompt to delete or keep (default keep + print the
   path when non-interactive).
 
+  Arguments after `--` are executed directly as program + argv. They are never
+  joined and reparsed by an implicit shell. To request shell syntax explicitly,
+  name the shell yourself: `/bin/sh -c '<command>'` on Unix or `cmd /C <command>`
+  on Windows.
+
   --copy-repo   Seed the temp dir with a copy of the current repo, EXCLUDING
                 .git/. Off by default (copying a large tree is slow); the
                 default is an empty temp dir. Pure walkdir + fs::copy — no
@@ -115,6 +120,7 @@ Examples:
   tirith temp-run --copy-repo -- make build
   tirith temp-run --strip-env -- ./untrusted-installer.sh
   tirith temp-run --capsule -- ./untrusted-installer.sh
+  tirith temp-run -- /bin/sh -c 'printf done > result.txt'
   tirith temp-run --json -- npm install left-pad";
 
 #[derive(Subcommand)]
@@ -834,16 +840,17 @@ Examples:
 
     /// Suggest a concrete safer rewrite for a command and (interactively) apply one
     #[command(after_help = "\
-Thin presenter over `tirith_core::safe_command::suggest()` — the same engine
-backing `tirith check --suggest-safe-command`. Pick a numbered rewrite at the
-prompt and `fix` prints exactly that command on stdout, so you can wrap with
-`$(tirith fix -- '<cmd>')` and feed it straight into your shell.
+Thin presenter over `tirith_core::safe_command::suggest_verified_with_policy()`
+— the same verified engine backing `tirith check --suggest`. Compatible
+remediations are composed and the exact final command is re-analyzed under the
+same shell, context, and policy. Only an Allow result is exposed as
+`safe_command` or printed on stdout, so you can wrap `$(tirith fix -- '<cmd>')`
+and feed it straight into your shell.
 
-When no mechanical rewrite is possible (homograph hostnames, threat-DB hits)
-`fix` prints the honest per-rule remediation instead of fabricating a
-command. Detection lives in the engine; `fix` adds zero heuristics of its
-own. Dotfile-overwrite DOES have a mechanical rewrite (`cp <target>
-<target>.bak && <original>`) when the target file exists.
+When no complete Allow rewrite is possible (homograph hostnames, threat-DB
+hits, or a partial transform that still triggers another rule), `fix` prints
+the honest per-rule remediation instead of fabricating an executable command.
+Detection lives in the engine; `fix` adds zero heuristics of its own.
 
 Exit codes (deliberately distinct from `tirith check`):
   0  no fix needed (verdict was Allow) OR user accepted a rewrite
@@ -857,7 +864,8 @@ are deliberately different.
 JSON shape (`--json` / `--non-interactive`):
   - No findings → object: {applied, reason, verdict, command}
   - Findings present → plain array of SafeSuggestion (matches the
-    `safe_suggestions` array embedded in `tirith check --suggest --json`)
+    `safe_suggestions` array embedded in `tirith check --suggest --json`);
+    `safe_command` is omitted for guidance-only or partial transforms
 
 Examples:
   tirith fix -- 'curl https://example.com/install.sh | bash'
@@ -1627,8 +1635,9 @@ Honesty on prompt injection:
   agent output as untrusted regardless of whether the rule fired.
 
 Streaming:
-  `summarize` and `redact` stream line-by-line and have no input size
-  cap. `scan` reads up to 64 MiB (above that, use `summarize` first).
+  `summarize --safe-for-agent` and `redact` use fixed-size reads and
+  bounded cross-line private-key state. A logical line or private-key
+  block over 1 MiB fails closed. `scan` reads up to 64 MiB.
 
 Examples:
   tirith logs scan ./error.log
@@ -2046,7 +2055,7 @@ What it protects:
   When `guard` is ON, the exec hot path flags (i) a sensitive env var set while
   a command pipes remote content into a shell (curl|bash), and (ii) printenv/env
   piped into a network sink (curl/nc). The sensitive list is the same one the
-  `--suggest-safe-command` env-scrub rewrite uses; extend it via
+  `--suggest` env-scrub rewrite uses; extend it via
   policy.env_guard_sensitive_vars.
 
 Value safety (load-bearing):
@@ -2165,7 +2174,7 @@ Examples:
 What this does:
   Simulates the filesystem impact of a destructive command (rm / mv / chmod -R /
   find … -delete / rsync --delete) WITHOUT running it. Walks the target tree
-  (depth <= 5, <= 100k files), expands globs against the current directory, and
+  (depth <= 5, <= 100k charged operations), expands globs against the current directory, and
   reports file / dir / symlink counts, the largest file, whether any target
   escapes the repo, and whether it writes a system path.
 
@@ -2267,9 +2276,9 @@ Examples:
         #[arg(long)]
         json: bool,
 
-        /// The command to run in the temp dir (everything after `--`)
+        /// Program and exact argv to run in the temp dir (everything after `--`)
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
-        command: Vec<String>,
+        command: Vec<std::ffi::OsString>,
     },
 
     /// Hidden alias for `temp-run` (the spec's `sandbox-dir` word). The
@@ -2295,9 +2304,9 @@ Examples:
         #[arg(long)]
         json: bool,
 
-        /// The command to run in the temp dir (everything after `--`)
+        /// Program and exact argv to run in the temp dir (everything after `--`)
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
-        command: Vec<String>,
+        command: Vec<std::ffi::OsString>,
     },
 
     /// Track files downloaded from risky sources (tainted-content) (M10 ch3)
@@ -4028,14 +4037,15 @@ operational-context findings (cloud CLI, SSH, IaC, sudo, container).")]
     /// Inject the tirith hook into devcontainer.json (idempotent)
     #[command(after_help = "\
 What it writes:
-  Adds a `postCreateCommand` that runs `tirith init --shell auto || true`
+  Adds a dedicated `postCreateCommand` entry that runs
+  `[\"tirith\", \"init\", \"--shell\", \"auto\"]`
   AND sets `containerEnv.TIRITH_DEVCONTAINER=1` so commands inside the
   container know they are inside a tirith-wired devcontainer.
 
 Idempotency:
-  Re-running with the hook already in place is a no-op. The existing
-  `postCreateCommand` (if any) is preserved — tirith joins its command
-  with `&&` so the user's setup still runs.
+  Re-running with the exact managed hook already in place is a no-op. Existing
+  string, argv, and multi-command lifecycle entries are preserved and Tirith
+  runs as an independent lifecycle command.
 
 JSONC:
   devcontainer.json is JSONC: comments and trailing commas are accepted.
@@ -4728,8 +4738,8 @@ Examples:
 
     /// Compress a log file: dedup lines, optionally redact and strip ANSI
     #[command(after_help = "\
-Streams the file via `BufReader::lines()` so large logs (1 GiB+) do not
-balloon memory. Pipeline:
+Streams the file without loading the entire log. With `--safe-for-agent`,
+fixed-size reads feed a bounded cross-line private-key redactor. Pipeline:
 
   1. (when --safe-for-agent) redact secrets / internal hostnames /
      customer IDs via `redact_for_audience(input, llm)`.
@@ -4770,8 +4780,10 @@ Examples:
     /// Stream a log file through the audience-aware share-engine
     #[command(after_help = "\
 Identical audience semantics to `tirith share --target`. Streams the file
-line-by-line, applies `redact_for_audience_with_custom`, and writes the
-sanitized content to stdout. Per-label counts go to stderr.
+in fixed-size chunks, carries bounded private-key state across lines,
+applies `redact_for_audience_with_custom` to non-key content, and writes
+the sanitized content to stdout. Per-label counts go to stderr. A logical
+line or private-key block over 1 MiB fails closed.
 
 Examples:
   tirith logs redact --audience llm ./error.log
@@ -6792,7 +6804,7 @@ fn main() {
     // single-threaded main thread. `run_on_main_thread` never returns on success
     // (it `execve`s the contained target) and exits non-zero on failure; it never
     // falls through to running the target uncontained.
-    let raw_args: Vec<String> = std::env::args().collect();
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if cli::capsule_child::is_invocation(&raw_args) {
         cli::capsule_child::run_on_main_thread(&raw_args);
     }

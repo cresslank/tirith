@@ -887,6 +887,7 @@ pub fn analyze_output(input: &str, ctx: OutputContext) -> Verdict {
 /// translates only the NEW hits into findings.
 struct ScanSnapshot {
     osc52: usize,
+    osc_overflow: usize,
     title_set: usize,
     screen_clear: usize,
     hyperlinks: usize,
@@ -898,6 +899,7 @@ impl ScanSnapshot {
     fn take(r: &extract::OutputScanResult) -> Self {
         Self {
             osc52: r.osc52.len(),
+            osc_overflow: r.osc_overflow.len(),
             title_set: r.title_set.len(),
             screen_clear: r.screen_clear.len(),
             hyperlinks: r.hyperlinks.len(),
@@ -910,6 +912,9 @@ impl ScanSnapshot {
         // A fresh scan slice over only the newly-appended hits.
         let mut slice = extract::OutputScanResult::default();
         slice.osc52.extend_from_slice(&r.osc52[self.osc52..]);
+        slice
+            .osc_overflow
+            .extend_from_slice(&r.osc_overflow[self.osc_overflow..]);
         slice
             .title_set
             .extend_from_slice(&r.title_set[self.title_set..]);
@@ -1807,17 +1812,49 @@ fn tmp_roots() -> Vec<std::path::PathBuf> {
 /// (ch5): forces `fail_mode=Closed`, disables the bypass, elevates
 /// [`crate::incident::INCIDENT_ELEVATED_RULES`]. A corrupt flag fails SAFE.
 pub fn analyze(ctx: &AnalysisContext) -> Verdict {
-    analyze_inner(ctx).0
+    analyze_inner(ctx, true).0
 }
 
 /// Like [`analyze`] but also returns the loaded policy, for enforcement callers
 /// (check/gateway/MCP) that need it — avoids a redundant `Policy::discover()`.
 pub fn analyze_returning_policy(ctx: &AnalysisContext) -> (Verdict, Policy) {
-    analyze_inner(ctx)
+    analyze_inner(ctx, true)
+}
+
+/// Analyze without applying the process/inline bypass, while returning the one
+/// policy snapshot used for detection. Enforcement surfaces that must retain
+/// raw findings for an audited bypass use this entry point and decide whether
+/// that already-detected verdict may be bypassed afterwards.
+pub fn analyze_without_bypass_returning_policy(ctx: &AnalysisContext) -> (Verdict, Policy) {
+    analyze_inner(ctx, false)
+}
+
+/// Re-analyze with one already-resolved policy snapshot and without honoring a
+/// process/inline bypass.
+///
+/// This is intentionally crate-private: safe-command verification is the only
+/// caller that must bind several candidate analyses to the exact policy object
+/// used for the original verdict. Reusing the snapshot also avoids re-reading a
+/// policy file between candidates. Context-dependent runtime inputs (command,
+/// cwd, card, clipboard state) still come from `ctx`; only policy discovery and
+/// its user/org/trust overlays are frozen.
+pub(crate) fn analyze_with_policy_without_bypass(
+    ctx: &AnalysisContext,
+    policy_snapshot: &Policy,
+) -> Verdict {
+    analyze_inner_with_policy(ctx, false, Some(policy_snapshot)).0
 }
 
 /// Shared implementation for `analyze()` and `analyze_returning_policy()`.
-fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
+fn analyze_inner(ctx: &AnalysisContext, honor_bypass: bool) -> (Verdict, Policy) {
+    analyze_inner_with_policy(ctx, honor_bypass, None)
+}
+
+fn analyze_inner_with_policy(
+    ctx: &AnalysisContext,
+    honor_bypass: bool,
+    policy_snapshot: Option<&Policy>,
+) -> (Verdict, Policy) {
     let start = Instant::now();
 
     let tier0_start = Instant::now();
@@ -1832,7 +1869,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             &crate::command_card::strip_card_comment_lines_cow(&ctx.input),
             ctx.shell,
         );
-    let bypass_requested = bypass_env || bypass_inline;
+    let bypass_requested = honor_bypass && (bypass_env || bypass_inline);
     let tier0_ms = tier0_start.elapsed().as_secs_f64() * 1000.0;
 
     let tier1_start = Instant::now();
@@ -1896,11 +1933,16 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
 
     // The LOCAL partial policy, discovered ONCE for the gate + reused by every
     // flag below and by the fast-exit's return value (single `discover_partial`).
-    // Only for Exec/Paste — FileScan never fast-exits, so skip the discover (which
-    // walks to `.git` + parses `.tirith/policy.yaml`; local-only, no network).
+    // Exact-snapshot verification supplies the already-resolved full policy
+    // instead, so the gate and the later rule pass cannot observe different
+    // policy bytes. Only for Exec/Paste — FileScan never fast-exits.
     let gate_partial: Option<Policy> =
         if matches!(ctx.scan_context, ScanContext::Exec | ScanContext::Paste) {
-            Some(Policy::discover_partial(ctx.cwd.as_deref()))
+            Some(
+                policy_snapshot
+                    .cloned()
+                    .unwrap_or_else(|| Policy::discover_partial(ctx.cwd.as_deref())),
+            )
         } else {
             None
         };
@@ -2033,15 +2075,15 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
                     total_ms,
                 },
             ),
-            // Reuse the gate's partial (Exec/Paste); FileScan never reaches this
-            // fast-exit, so the `None` branch is a safe fallback.
+            // Reuse the gate policy (the supplied exact snapshot during
+            // safe-command verification, otherwise the local partial). FileScan
+            // never reaches this fast-exit, so the `None` branch is a fallback.
             //
-            // BY DESIGN returns the PARTIAL, not fully-resolved, policy (CodeRabbit
-            // M13 PR #132). On the ALLOW path the verdict has zero findings, so the
-            // only fields callers read are no-ops or already in the partial
-            // (`dlp_custom_patterns`/`threat_intel` for redaction). The partial
-            // omits only a remote-fetched policy (the network cost this fast-exit
-            // avoids) and the user/org/trust overlays (irrelevant with no findings).
+            // Normal analysis BY DESIGN returns the PARTIAL, not fully-resolved,
+            // policy (CodeRabbit M13 PR #132). On the ALLOW path the verdict has
+            // zero findings, so the omitted remote/user/org/trust overlays are
+            // irrelevant to its existing callers. Snapshot verification already
+            // owns the fully-resolved policy and returns its clone here.
             gate_partial.unwrap_or_else(|| Policy::discover_partial(ctx.cwd.as_deref())),
         );
     }
@@ -2049,7 +2091,9 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     let tier2_start = Instant::now();
 
     if bypass_requested {
-        let policy = Policy::discover_partial(ctx.cwd.as_deref());
+        let policy = policy_snapshot
+            .cloned()
+            .unwrap_or_else(|| Policy::discover_partial(ctx.cwd.as_deref()));
         let allow_bypass = if ctx.interactive {
             policy.allow_bypass_env
         } else {
@@ -2081,14 +2125,19 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         }
     }
 
-    let mut policy = Policy::discover(ctx.cwd.as_deref());
-    policy.load_user_lists();
-    policy.load_org_lists(ctx.cwd.as_deref());
-    policy.load_trust_entries(ctx.cwd.as_deref());
-    // M8 ch1/ch2 — context-labels + SSH host-labels files (NOT policy.yaml),
-    // each merging a user-scope and a repo-scope file.
-    policy.load_context_labels(ctx.cwd.as_deref());
-    policy.load_ssh_host_labels(ctx.cwd.as_deref());
+    let policy = if let Some(snapshot) = policy_snapshot {
+        snapshot.clone()
+    } else {
+        let mut discovered = Policy::discover(ctx.cwd.as_deref());
+        discovered.load_user_lists();
+        discovered.load_org_lists(ctx.cwd.as_deref());
+        discovered.load_trust_entries(ctx.cwd.as_deref());
+        // M8 ch1/ch2 — context-labels + SSH host-labels files (NOT policy.yaml),
+        // each merging a user-scope and a repo-scope file.
+        discovered.load_context_labels(ctx.cwd.as_deref());
+        discovered.load_ssh_host_labels(ctx.cwd.as_deref());
+        discovered
+    };
 
     // Fail-open: None when the DB is unavailable.
     let threat_db: Option<std::sync::Arc<crate::threatdb::ThreatDb>> =
@@ -5116,6 +5165,22 @@ mod tests {
             "set TIRITH=1 & curl evil.com",
             ShellType::Cmd
         ));
+    }
+
+    #[test]
+    fn analyze_output_blocks_oversized_osc52_instead_of_failing_open() {
+        let mut output = String::from("prefix\u{1b}]52;");
+        output.push_str(&"A".repeat(16 * 1024 + 1));
+        output.push('\u{7}');
+        output.push_str("benign tail");
+
+        let verdict = analyze_output(&output, OutputContext::default());
+        assert_eq!(verdict.action, crate::verdict::Action::Block);
+        assert!(verdict.findings.iter().any(|finding| {
+            finding.rule_id == crate::verdict::RuleId::OutputTruncatedEscapeSequence
+                && finding.severity == crate::verdict::Severity::High
+                && finding.title.contains("exceeded")
+        }));
     }
 
     #[test]

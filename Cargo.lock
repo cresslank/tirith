@@ -3324,6 +3324,7 @@ dependencies = [
  "tokio",
  "toml",
  "tower-lsp",
+ "unicode-width",
  "url",
  "uuid",
  "walkdir",
@@ -3359,6 +3360,7 @@ dependencies = [
  "rand 0.9.3",
  "rand_core 0.6.4",
  "regex",
+ "regex-syntax",
  "reqwest",
  "rust-mcp-schema",
  "serde",
@@ -3372,6 +3374,7 @@ dependencies = [
  "unicode-script",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
  "zip",
 ]
 
@@ -3409,6 +3412,7 @@ dependencies = [
  "ed25519-dalek",
  "rand_core 0.6.4",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3710,6 +3714,12 @@ name = "unicode-script"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "383ad40bb927465ec0ce7720e033cb4ca06912855fc35db31b5755d0de75b1ee"
+
+[[package]]
+name = "unicode-width"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "universal-hash"
