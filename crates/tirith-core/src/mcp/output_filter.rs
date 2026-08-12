@@ -333,6 +333,7 @@ fn is_injection_seed_rule(rule_id: RuleId) -> bool {
         | RuleId::ThreatMaliciousIp
         | RuleId::ThreatPackageTyposquat
         | RuleId::ThreatPackageSimilarName
+        | RuleId::ThreatUnresolvedMaliciousPackage
         | RuleId::ThreatMaliciousUrl
         | RuleId::ThreatPhishingUrl
         | RuleId::ThreatTorExitNode
@@ -1563,7 +1564,7 @@ mod tests {
         blank_spans(&mut text, &[2..4, 6..8]);
         assert_eq!(
             text,
-            format!("01{p}45{p}89", p = REDACTION_PLACEHOLDER),
+            format!("01{REDACTION_PLACEHOLDER}45{REDACTION_PLACEHOLDER}89"),
             "two disjoint spans replaced in place"
         );
 

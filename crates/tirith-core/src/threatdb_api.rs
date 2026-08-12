@@ -55,8 +55,12 @@ pub fn enrich_command(
     let urls = extract::extract_urls(input, shell);
 
     for package in packages {
-        let effective_version = if let Some(version) = package.version.clone() {
-            Some(version)
+        // Only a CONCRETE version (Exact/Resolved) is a valid OSV `version`; a range
+        // or constraint must NOT be sent as one (OSV would treat the range text as a
+        // literal version, degrading matching and skipping deps.dev fallback). A
+        // non-concrete intent falls through to resolution instead.
+        let effective_version = if let Some(version) = package.version.exact_version() {
+            Some(version.to_string())
         } else if config.deps_dev_enabled {
             resolve_default_version(package.ecosystem, &package.name, deadline)
         } else {
@@ -134,8 +138,7 @@ pub fn enrich_command(
                             severity: Severity::High,
                             title: "Google Safe Browsing match".to_string(),
                             description: format!(
-                                "URL '{}' matched Google Safe Browsing threat type '{}'.",
-                                url, match_type
+                                "URL '{url}' matched Google Safe Browsing threat type '{match_type}'."
                             ),
                             evidence: vec![Evidence::ThreatIntel {
                                 source: "Google Safe Browsing".to_string(),
@@ -602,8 +605,7 @@ fn build_kev_finding(ecosystem: Ecosystem, name: &str, version: &str, cve_id: &s
         severity: Severity::High,
         title: format!("Package advisory is in CISA KEV: {name}@{version}"),
         description: format!(
-            "Package '{}' in {} version '{}' is associated with actively exploited CVE '{}'.",
-            name, ecosystem, version, cve_id
+            "Package '{name}' in {ecosystem} version '{version}' is associated with actively exploited CVE '{cve_id}'."
         ),
         evidence: vec![Evidence::ThreatIntel {
             source: "CISA KEV via OSV.dev".to_string(),
@@ -625,10 +627,10 @@ fn build_suspicious_package_finding(
 ) -> Finding {
     let mut parts = Vec::new();
     if let Some(days) = signal.first_release_days {
-        parts.push(format!("first release {} day(s) ago", days));
+        parts.push(format!("first release {days} day(s) ago"));
     }
     if let Some(maintainers) = signal.maintainers {
-        parts.push(format!("{} maintainer(s)", maintainers));
+        parts.push(format!("{maintainers} maintainer(s)"));
     }
 
     Finding {

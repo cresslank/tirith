@@ -566,6 +566,8 @@ fn check_markdown_comments(
 /// Check PDF bytes for hidden text via sub-pixel scale transforms: font-size 0
 /// or scales that render text below 1px — invisible to humans but extracted by
 /// AI tools. Detection is free (ADR-13).
+const PDF_PAGE_CONTENT_BYTES_CAP: usize = 16 * 1024 * 1024;
+
 pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
     let mut findings = Vec::new();
 
@@ -580,7 +582,7 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
     let mut hidden_texts: Vec<(u32, String)> = Vec::new();
 
     for (page_num, page_id) in doc.get_pages() {
-        let content = match doc.get_page_content(page_id) {
+        let content = match doc.get_page_content_with_limit(page_id, PDF_PAGE_CONTENT_BYTES_CAP) {
             Ok(c) => c,
             Err(_) => continue,
         };
