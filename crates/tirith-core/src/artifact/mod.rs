@@ -344,6 +344,32 @@ pub enum ArtifactSignalKind {
     NativeCorroboration,
 }
 
+impl ArtifactSignalKind {
+    /// Stable public token used in categorical evidence and serialized reports.
+    ///
+    /// Keep this explicit instead of deriving evidence text through Serde so a
+    /// serialization-format refactor cannot silently change security evidence.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::PthExecutableLine => "pth_executable_line",
+            Self::PthNetworkDownload => "pth_network_download",
+            Self::PthSubprocessSpawn => "pth_subprocess_spawn",
+            Self::PthSysPathSearch => "pth_sys_path_search",
+            Self::PthUntrustedPathAddition => "pth_untrusted_path_addition",
+            Self::StartupHookObfuscated => "startup_hook_obfuscated",
+            Self::RecordHashMismatch => "record_hash_mismatch",
+            Self::RecordMissingFile => "record_missing_file",
+            Self::UnlistedInstalledFile => "unlisted_installed_file",
+            Self::DuplicateOwnedFile => "duplicate_owned_file",
+            Self::SitecustomizeUnowned => "sitecustomize_unowned",
+            Self::EditableInstallUnverified => "editable_install_unverified",
+            Self::NativeExecutionEntry => "native_execution_entry",
+            Self::NativeDangerCapability => "native_danger_capability",
+            Self::NativeCorroboration => "native_corroboration",
+        }
+    }
+}
+
 /// A file the subject carries, with its location, size, content hash, and a
 /// coarse kind used by correlation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -502,6 +528,34 @@ mod tests {
             filename: "demo-1.2.3-py3-none-any.whl".to_string(),
             sha256: "a".repeat(64),
         })
+    }
+
+    #[test]
+    fn artifact_signal_wire_names_are_explicit_and_serde_compatible() {
+        let variants = [
+            ArtifactSignalKind::PthExecutableLine,
+            ArtifactSignalKind::PthNetworkDownload,
+            ArtifactSignalKind::PthSubprocessSpawn,
+            ArtifactSignalKind::PthSysPathSearch,
+            ArtifactSignalKind::PthUntrustedPathAddition,
+            ArtifactSignalKind::StartupHookObfuscated,
+            ArtifactSignalKind::RecordHashMismatch,
+            ArtifactSignalKind::RecordMissingFile,
+            ArtifactSignalKind::UnlistedInstalledFile,
+            ArtifactSignalKind::DuplicateOwnedFile,
+            ArtifactSignalKind::SitecustomizeUnowned,
+            ArtifactSignalKind::EditableInstallUnverified,
+            ArtifactSignalKind::NativeExecutionEntry,
+            ArtifactSignalKind::NativeDangerCapability,
+            ArtifactSignalKind::NativeCorroboration,
+        ];
+
+        for kind in variants {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::Value::String(kind.wire_name().to_owned())
+            );
+        }
     }
 
     #[test]
