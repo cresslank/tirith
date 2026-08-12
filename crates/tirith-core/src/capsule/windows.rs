@@ -81,7 +81,12 @@ use super::{
 /// The stable backend identifier reported in receipts and `tirith doctor`.
 pub const BACKEND_ID: &str = "appcontainer";
 
-/// Resource dimensions mapped into the Job Object by `job_object_limits`.
+/// Resource dimensions enforced by the traced launch path: CPU time, job
+/// memory, and active-process count are mapped into the Job Object by
+/// `job_object_limits`. The current CLI executor waits indefinitely, so a
+/// wall-clock deadline is not claimed until that wait becomes bounded and
+/// terminates the Job on expiry. Open handles have no per-Job mechanism and
+/// output bytes are not captured by this launcher either.
 const RESOURCE_LIMIT_SUPPORT: ResourceLimitSupport = ResourceLimitSupport {
     cpu_seconds: true,
     memory_bytes: true,
@@ -829,7 +834,16 @@ mod tests {
         spec.resources = ResourceLimits::default();
         assert!(!derive_coverage(&spec, &probe).resource_limits_enforced);
 
-        // Only wall-clock / output (NOT Job-Object-able) -> still not claimed.
+        // Wall-clock alone is not claimed while the CLI executor waits without
+        // a deadline.
+        spec.resources = ResourceLimits {
+            wall_clock_seconds: Some(60),
+            ..ResourceLimits::default()
+        };
+        assert!(!derive_coverage(&spec, &probe).resource_limits_enforced);
+
+        // Wall-clock + output are both unsupported, so the combination remains
+        // unclaimed as well.
         spec.resources = ResourceLimits {
             wall_clock_seconds: Some(60),
             max_output_bytes: Some(1024),
