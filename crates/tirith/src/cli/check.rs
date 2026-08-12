@@ -201,8 +201,11 @@ pub fn run(
     let origin = tirith_core::agent_origin::resolve_cli_origin(interactive);
 
     // M11 ch1 — a `--card <path>` sidecar is daemon-unsupported (v1), so it forces
-    // the local analysis path just like `--no-daemon`.
-    let use_daemon = !approval_check && !no_daemon && card.is_none();
+    // the local analysis path just like `--no-daemon`. Safe-command suggestions
+    // also force local analysis: candidate verification must reuse the exact
+    // policy snapshot returned with the original verdict, never combine a daemon
+    // verdict with a separately discovered client policy.
+    let use_daemon = !approval_check && !no_daemon && card.is_none() && !suggest_safe_command;
 
     // Local paths return the engine's policy to avoid a redundant
     // Policy::discover(); the daemon path returns None (analysis was server-side).
@@ -362,6 +365,9 @@ pub fn run(
         &session_id,
         CallerContext::Cli,
     );
+    // `tirith check` is a preflight/diagnostic boundary: a zero exit only permits
+    // the shell or caller to execute later, and this process never observes that
+    // outcome. Do not call `record_executed_verdict_events` here.
 
     let event_id = uuid::Uuid::new_v4().to_string();
     // Best-effort audit: a write failure must not change the exit code.
@@ -507,7 +513,25 @@ pub fn run(
     // verdict flagged something; they never influence the action or exit code.
     let safe_suggestions: Vec<tirith_core::safe_command::SafeSuggestion> =
         if suggest_safe_command && effective.action != Action::Allow {
-            tirith_core::safe_command::suggest(cmd, shell_type, &effective)
+            let suggestion_ctx = AnalysisContext {
+                input: cmd.to_string(),
+                shell: shell_type,
+                scan_context: ScanContext::Exec,
+                raw_bytes: None,
+                interactive,
+                cwd: cwd.clone(),
+                file_path: None,
+                repo_root: None,
+                is_config_override: false,
+                clipboard_html: None,
+                card_ref: card.clone(),
+                clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+            };
+            tirith_core::safe_command::suggest_verified_with_policy(
+                &suggestion_ctx,
+                &effective,
+                &policy,
+            )
         } else {
             Vec::new()
         };

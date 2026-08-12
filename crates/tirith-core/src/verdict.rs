@@ -286,9 +286,9 @@ pub enum RuleId {
     /// M7 ch1 — screen-clear sequences (`\e[2J` / `\e[H`) mid-stream. Info —
     /// scrolls prior output off-screen so a fake banner can take its place.
     OutputClearScreen,
-    /// M7 ch1 — an OSC/CSI escape open at end-of-stream without a terminator.
-    /// Truncated `\e]52;<base64>` was silently dropped; emit Medium so a
-    /// fail-closed caller can DENY (Sev-5).
+    /// M7 ch1 — an OSC/CSI escape open at EOF, or an OSC payload exceeding
+    /// bounded analysis retention. Truncated/oversized `\e]52;<base64>` must
+    /// remain High and fail closed instead of being silently dropped.
     OutputTruncatedEscapeSequence,
 
     // Prompt-injection rules (M7 ch5) — fire from `rules::prompt_injection` when
@@ -738,10 +738,10 @@ pub enum RuleId {
     /// silently widening the agent's blast radius. Only ADDED lines fire.
     AiConfigToolUseEscalation,
 
-    // Cross-event correlation rules (W7). Fire from `correlate_session` over a
-    // bounded per-session ring of typed events recorded AFTER each verdict is
-    // finalized (`crate::event_buffer`, `crate::session_warnings`), NOT from the
-    // `analyze` hot path. They reason about "A THEN B within a window" sequences,
+    // Cross-event correlation rules (W7). Fire over a bounded per-session ring of
+    // confirmed executed events plus a provisional current event
+    // (`crate::event_buffer`, `crate::session_warnings`), NOT from the `analyze`
+    // hot path. They reason about "A THEN B within a window" sequences,
     // so no single input ever triggers them; like the M11/M12/M13 rules above they
     // have NO PATTERN_TABLE entry and live in `EXTERNALLY_TRIGGERED_RULES`.
     // Unit-tested in `event_buffer.rs`.

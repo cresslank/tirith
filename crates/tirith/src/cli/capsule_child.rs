@@ -12,11 +12,15 @@
 //!
 //! This process then:
 //! 1. Parses its own simple argv (the spec JSON, then everything after `--`).
-//! 2. (Linux) creates the temporary HOME the env policy points at, applies the
+//! 2. On Linux, creates the temporary HOME the env policy points at, applies the
 //!    full containment sequence via [`tirith_core::capsule::linux::apply_containment`]
 //!    (rlimits -> no-new-privs -> Landlock -> seccomp -> env cleanup), verifies the
 //!    achieved coverage is not degraded against the spec's requirement, and only
 //!    then `execve`s the target.
+//! 3. On macOS, builds the native `sandbox-exec` argv, closes unrelated inherited
+//!    descriptors, applies supported rlimits, and `execve`s `sandbox-exec`. This
+//!    second exec occurs only after Rust's private parent/child exec-status pipe
+//!    has closed normally on the first exec.
 //!
 //! ## Single-threaded invariant
 //!
@@ -31,6 +35,8 @@
 //! image); on any failure it prints to stderr and exits non-zero. It MUST NOT
 //! fall through to running the target uncontained (fail-closed).
 
+use std::ffi::{OsStr, OsString};
+
 /// The hidden subcommand name. A double-underscore prefix marks it internal and
 /// keeps it clear of any real command.
 pub const SUBCOMMAND: &str = "__capsule-child";
@@ -38,8 +44,9 @@ pub const SUBCOMMAND: &str = "__capsule-child";
 /// Whether `args` (typically `std::env::args().collect()`) is a `__capsule-child`
 /// invocation. Checked at the top of `main()` so the launcher runs before the
 /// worker-thread spawn (single-threaded invariant). Pure, so it is unit-testable.
-pub fn is_invocation(args: &[String]) -> bool {
-    args.get(1).map(|a| a == SUBCOMMAND).unwrap_or(false)
+pub fn is_invocation(args: &[OsString]) -> bool {
+    args.get(1)
+        .is_some_and(|arg| arg.as_os_str() == OsStr::new(SUBCOMMAND))
 }
 
 /// The parsed launcher argv: the spec JSON and the target program + args (the part
@@ -49,28 +56,30 @@ pub struct ParsedArgs {
     /// The serialized [`CapsuleSpec`] JSON.
     pub spec_json: String,
     /// The target program (argv[0] of the contained child).
-    pub program: String,
+    pub program: OsString,
     /// The target program's arguments.
-    pub program_args: Vec<String>,
+    pub program_args: Vec<OsString>,
 }
 
 /// Parse `tirith __capsule-child <spec-json> -- <prog> <arg>...` from the full
 /// process argv. Requires the subcommand token, then exactly one spec-JSON
 /// argument, then a literal `--`, then a non-empty program. Pure and
 /// platform-independent, so the argv grammar is unit-testable everywhere.
-pub fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
+pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     // args[0] = "tirith", args[1] = SUBCOMMAND.
-    if args.get(1).map(String::as_str) != Some(SUBCOMMAND) {
+    if args.get(1).map(OsString::as_os_str) != Some(OsStr::new(SUBCOMMAND)) {
         return Err("not a __capsule-child invocation".to_string());
     }
     let spec_json = args
         .get(2)
         .ok_or_else(|| "missing capsule spec JSON".to_string())?
-        .clone();
+        .clone()
+        .into_string()
+        .map_err(|_| "capsule spec JSON is not valid UTF-8".to_string())?;
     // Find the `--` separator.
     let sep = args
         .iter()
-        .position(|a| a == "--")
+        .position(|a| a.as_os_str() == OsStr::new("--"))
         .ok_or_else(|| "missing `--` separator before the program".to_string())?;
     // The spec must be BEFORE the separator (index 2 < sep).
     if sep < 3 {
@@ -94,10 +103,11 @@ pub fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
 /// process non-zero on any failure. Call this at the top of `main()` only when
 /// [`is_invocation`] is true and the process is still single-threaded.
 ///
-/// On a non-Linux host this exits non-zero: the launcher is the Linux backend's
-/// entry point; macOS/Windows use their own containment mechanisms (E3/E4), not a
-/// re-exec launcher.
-pub fn run_on_main_thread(args: &[String]) -> ! {
+/// On Windows and other non-Unix hosts this exits non-zero; those platforms use a
+/// different containment backend. macOS deliberately uses this re-exec launcher
+/// so descriptor closure happens after Rust has finished using its private
+/// exec-status pipe, but before `sandbox-exec` and the target run.
+pub fn run_on_main_thread(args: &[OsString]) -> ! {
     let parsed = match parse_args(args) {
         Ok(p) => p,
         Err(e) => {
@@ -109,15 +119,91 @@ pub fn run_on_main_thread(args: &[String]) -> ! {
     {
         linux_launch(&parsed)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_launch(&parsed)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = &parsed;
         eprintln!(
-            "tirith __capsule-child: the re-exec launcher is Linux-only; this platform uses a \
+            "tirith __capsule-child: the re-exec launcher is Unix-only; this platform uses a \
              different containment backend"
         );
         std::process::exit(2);
     }
+}
+
+/// macOS launch path: construct the native `sandbox-exec` argv, close every
+/// inherited descriptor outside the policy allow-list, apply the supported
+/// rlimits, and replace this launcher with `sandbox-exec`.
+///
+/// This function runs after a successful exec of the Tirith binary. Consequently,
+/// the `std::process::Command` exec-status pipe used by the original parent has
+/// already observed EOF via `FD_CLOEXEC`; descriptor closure here cannot corrupt
+/// Rust's spawn protocol. The process is still single-threaded because `main`
+/// dispatches this hidden invocation before creating its worker thread.
+#[cfg(target_os = "macos")]
+fn macos_launch(parsed: &ParsedArgs) -> ! {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use tirith_core::capsule::CapsuleSpec;
+
+    let spec: CapsuleSpec = match serde_json::from_str(&parsed.spec_json) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("tirith __capsule-child: invalid capsule spec JSON: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    // Build and validate every CString before descriptor closure so no fallible
+    // string conversion or allocation is needed after the isolation boundary is
+    // applied. `sandbox_exec_argv_os` also refuses unsupported egress profiles
+    // while preserving non-UTF-8 Unix argument bytes exactly.
+    let sandbox_argv = match tirith_core::capsule::macos::sandbox_exec_argv_os(
+        &spec,
+        &parsed.program,
+        &parsed.program_args,
+    ) {
+        Ok(argv) => argv,
+        Err(e) => {
+            eprintln!("tirith __capsule-child: cannot build sandbox-exec invocation: {e}");
+            std::process::exit(2);
+        }
+    };
+    let argv: Vec<CString> = match sandbox_argv
+        .iter()
+        .map(|arg| CString::new(arg.as_os_str().as_bytes()))
+        .collect()
+    {
+        Ok(argv) => argv,
+        Err(_) => {
+            eprintln!("tirith __capsule-child: sandbox-exec argument contains NUL");
+            std::process::exit(2);
+        }
+    };
+
+    // Order matters: close inherited fds while RLIMIT_NOFILE still reflects the
+    // inherited (higher) ceiling. Lowering it first would not close an already-open
+    // high fd and would shrink the scan range, allowing that fd to survive.
+    crate::cli::capsule::close_extra_fds(&spec.handles);
+    if let Err(e) = crate::cli::capsule::apply_macos_rlimits(&spec.resources) {
+        eprintln!("tirith __capsule-child: applying macOS resource limits failed: {e}");
+        std::process::exit(2);
+    }
+
+    let prog_c = argv[0].clone();
+    let mut ptrs: Vec<*const libc::c_char> = argv.iter().map(|arg| arg.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    // SAFETY: `prog_c` and every pointer in `ptrs` are valid, NUL-terminated C
+    // strings that outlive the call, and `ptrs` has a final null pointer.
+    unsafe {
+        libc::execv(prog_c.as_ptr(), ptrs.as_ptr());
+    }
+    let err = std::io::Error::last_os_error();
+    eprintln!("tirith __capsule-child: exec of sandbox-exec failed: {err}");
+    std::process::exit(127);
 }
 
 /// Linux launch path: deserialize the spec, create the temporary HOME, apply
@@ -317,8 +403,8 @@ pub fn parse_num_threads_from_stat(stat: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
-    fn argv(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| s.to_string()).collect()
+    fn argv(parts: &[&str]) -> Vec<OsString> {
+        parts.iter().map(OsString::from).collect()
     }
 
     #[test]
@@ -349,7 +435,10 @@ mod tests {
         let p = parse_args(&a).expect("parse");
         assert_eq!(p.spec_json, "{\"network\":{\"mode\":\"deny_all\"}}");
         assert_eq!(p.program, "/usr/bin/python3");
-        assert_eq!(p.program_args, vec!["-m".to_string(), "pip".to_string()]);
+        assert_eq!(
+            p.program_args,
+            vec![OsString::from("-m"), OsString::from("pip")]
+        );
     }
 
     #[test]

@@ -142,11 +142,11 @@ When tirith blocks a `curl | bash` pattern, the safest alternatives are:
 
 ### Ask tirith for the rewrite
 
-`tirith check --suggest-safe-command` prints a concrete safer version of the
+`tirith check --suggest` prints a concrete safer version of the
 exact command you ran:
 
 ```bash
-tirith check --suggest-safe-command -- 'curl https://example.com/install.sh | bash'
+tirith check --suggest -- 'curl https://example.com/install.sh | bash'
 # tirith: safer alternative
 #   curl_pipe_shell
 #     try: curl -fsSL -o /tmp/tirith-review.sh https://example.com/install.sh \
@@ -249,7 +249,8 @@ as-is; trusting a whole domain is broad and must be opted into with `--broad`.
 Entries expire after 30 days by default, so a temporary allow does not linger.
 
 ```bash
-# Narrow: trust one exact resource. Expires in 30 days.
+# Narrow: trust one exact HTTPS resource. Expires in 30 days.
+# Schemeless host/path patterns are normalized as HTTPS.
 tirith trust add raw.githubusercontent.com/org/repo/main/get.sh
 
 # Broad: trust a whole domain for one rule only. --broad is required.
