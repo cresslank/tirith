@@ -1043,19 +1043,23 @@ pub(crate) fn policy_init_for_root(repo_root: &Path, json: bool, force: bool) ->
     // Both forms (human YAML, JSON preview) derive from this same shape.
     let scaffold = build_policy_scaffold(lockfile_opt.as_ref());
 
-    if let Some(parent) = example_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            report_error_for(
-                json,
-                "tirith mcp policy init",
-                &format!("failed to create {}: {e}", parent.display()),
-            );
-            return 1;
-        }
-    }
-
     let yaml_body = render_policy_scaffold_yaml(&scaffold);
-    if let Err(e) = std::fs::write(&example_path, &yaml_body) {
+    // repo-0395: the scaffold lives under the repo's `.tirith/`, which a
+    // malicious checkout can make a symlink. Write through the contained,
+    // no-follow atomic helper so the write can never land outside the repo.
+    let destination =
+        match tirith_core::util::ContainedAtomicFile::prepare(repo_root, &example_path, true) {
+            Ok(destination) => destination,
+            Err(e) => {
+                report_error_for(
+                    json,
+                    "tirith mcp policy init",
+                    &format!("failed to prepare {}: {e}", example_path.display()),
+                );
+                return 1;
+            }
+        };
+    if let Err(e) = destination.write_atomic(yaml_body.as_bytes(), force) {
         report_error_for(
             json,
             "tirith mcp policy init",

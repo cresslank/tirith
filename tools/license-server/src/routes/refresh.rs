@@ -56,10 +56,21 @@ pub async fn refresh(
         }
     }
 
+    // repo-0449: per-subscription issuance interval. Every refresh signs a new
+    // Ed25519 token and INSERTs a row retained ~90 days past expiry, so an
+    // unthrottled loop could exhaust disk and contend on the DB mutex. 60s is
+    // far below any legitimate CLI refresh cadence.
+    const MIN_REFRESH_INTERVAL_SECS: i64 = 60;
     let exp_ts = chrono::Utc::now().timestamp() + (state.config.token_ttl_days * 86400);
     let token = state.signer.sign_token(&sub.tier, exp_ts);
 
-    state.db.insert_token(&sub.id, &token, exp_ts).await?;
+    if !state
+        .db
+        .insert_token_if_interval_elapsed(&sub.id, &token, exp_ts, MIN_REFRESH_INTERVAL_SECS)
+        .await?
+    {
+        return Err(AppError::RateLimited);
+    }
 
     Ok((
         StatusCode::OK,

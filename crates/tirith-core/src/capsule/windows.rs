@@ -83,28 +83,27 @@ pub const BACKEND_ID: &str = "appcontainer";
 
 /// Resource dimensions enforced by the traced launch path: CPU time, job
 /// memory, and active-process count are mapped into the Job Object by
-/// `job_object_limits`. The current CLI executor waits indefinitely, so a
-/// wall-clock deadline is not claimed until that wait becomes bounded and
-/// terminates the Job on expiry. Open handles have no per-Job mechanism and
-/// output bytes are not captured by this launcher either.
+/// `job_object_limits`. The CLI executor enforces wall-clock deadlines with a
+/// finite wait and terminates the Job on expiry. Open handles have no per-Job
+/// mechanism and output bytes are not captured by this launcher either.
 const RESOURCE_LIMIT_SUPPORT: ResourceLimitSupport = ResourceLimitSupport {
     cpu_seconds: true,
     memory_bytes: true,
     max_processes: true,
     max_open_files: false,
     max_output_bytes: false,
-    wall_clock_seconds: false,
+    wall_clock_seconds: true,
 };
 
 /// The display name handed to `CreateAppContainerProfile` for tirith's containers.
-/// Cosmetic (shown in some diagnostics); the security identity is the derived SID,
-/// not this string.
+/// Cosmetic (shown in some diagnostics); the security identity is the per-launch
+/// SID, not this string.
 pub const APP_CONTAINER_DISPLAY_NAME: &str = "Tirith contained child";
 
-/// The stable prefix every tirith AppContainer moniker (the
-/// `CreateAppContainerProfile` "AppContainerName") starts with. The per-spec
-/// suffix is a deterministic digest so repeated runs of the same spec reuse the
-/// same profile and a `DeleteAppContainerProfile` cleanup is unambiguous.
+/// The stable prefix every tirith AppContainer moniker base starts with. The core
+/// plan adds a deterministic per-spec digest; the Windows executor appends a
+/// per-launch suffix before `CreateAppContainerProfile` so overlapping runs do not
+/// share a SID or temporary ACL grants.
 pub const APP_CONTAINER_NAME_PREFIX: &str = "tirith.capsule.";
 
 /// The maximum length of an AppContainer moniker. Windows caps the
@@ -184,9 +183,9 @@ pub fn probe_appcontainer() -> WindowsProbe {
 ///     (invariant 3). An allow-list spec is therefore degraded on this flag and the
 ///     enforcing surface fails closed.
 ///   - `resource_limits_enforced`: true only when at least one limit is requested
-///     and every requested dimension maps to the Job Object (CPU / memory /
-///     process count). Open-files, output, and wall-clock requests keep the
-///     aggregate bit false.
+///     and every requested dimension maps to the Job Object or the traced launch
+///     wrapper (CPU / memory / process count / wall clock). Open-files and output
+///     requests keep the aggregate bit false.
 ///   - `env_isolated` / `handles_isolated`: true — the executor builds the child's
 ///     environment from the surviving-vars policy (sensitive set stripped, isolated
 ///     HOME/TEMP) and calls `CreateProcessW` with `bInheritHandles = FALSE`.
@@ -249,19 +248,18 @@ impl std::fmt::Display for WindowsCapsuleError {
 
 impl std::error::Error for WindowsCapsuleError {}
 
-/// The AppContainer identity the executor materializes via
-/// `CreateAppContainerProfile` / `DeriveAppContainerSidFromAppContainerName`.
-/// **Pure data** — the executor turns `name` into a real package SID.
+/// The AppContainer identity base the executor materializes via
+/// `CreateAppContainerProfile`. **Pure data** — the executor appends a per-launch
+/// suffix to `name` and turns that unique profile name into a real package SID.
 ///
-/// `name` is a deterministic, host-independent moniker derived from the spec so
-/// repeated runs reuse one profile and cleanup is unambiguous;
+/// `name` is a deterministic, host-independent base derived from the spec;
 /// `networking_capabilities` is empty for `DenyAll` (the whole point — no socket
 /// access) and stays empty in E4 even for an allow-list (which is reported
 /// degraded), so the descriptor never silently grants egress.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppContainerProfile {
-    /// The `AppContainerName` (moniker) for `CreateAppContainerProfile`. Stable per
-    /// spec, `<= APP_CONTAINER_NAME_MAX` UTF-16 units, and a valid profile name.
+    /// Stable per-spec base for the executor's `AppContainerName` (moniker),
+    /// `<= APP_CONTAINER_NAME_MAX` UTF-16 units and valid as a profile-name prefix.
     pub name: String,
     /// The human-readable display name (`CreateAppContainerProfile`'s
     /// `DisplayName` / `Description`).
@@ -272,11 +270,12 @@ pub struct AppContainerProfile {
     pub networking_capabilities: Vec<&'static str>,
 }
 
-/// Derive the deterministic AppContainer moniker for `spec`. The suffix is a
+/// Derive the deterministic AppContainer moniker base for `spec`. The suffix is a
 /// 64-bit FNV-1a digest of the spec's serialized JSON rendered as 16 lowercase hex
-/// chars, so two identical specs map to the same profile (idempotent create /
-/// unambiguous delete) and different specs do not collide in practice. **Pure** and
-/// platform-independent.
+/// chars, so two identical specs map to the same base and different specs do not
+/// collide in practice. The executor adds a per-launch suffix before creating the
+/// profile, which prevents overlapping runs from sharing an ACL identity. **Pure**
+/// and platform-independent.
 ///
 /// The moniker is `APP_CONTAINER_NAME_PREFIX` + 16 hex chars = 30 chars, safely
 /// under `APP_CONTAINER_NAME_MAX` (64). It contains only `[a-z0-9.]`, all valid in
@@ -457,8 +456,8 @@ pub struct JobObjectLimits {
 /// saturating so an absurd value cannot overflow. `max_open_files` has no direct
 /// per-Job equivalent on Windows (handle limits are per-process via other
 /// mechanisms), so it does not appear here and prevents an aggregate resource
-/// coverage claim. Wall-clock and output caps are also not applied by this
-/// backend or its wrapper.
+/// coverage claim. Wall-clock is enforced by the CLI launch wrapper rather than
+/// encoded into the Job Object; output caps remain unsupported.
 pub fn job_object_limits(limits: &ResourceLimits) -> JobObjectLimits {
     JobObjectLimits {
         kill_on_close: true,
@@ -834,13 +833,13 @@ mod tests {
         spec.resources = ResourceLimits::default();
         assert!(!derive_coverage(&spec, &probe).resource_limits_enforced);
 
-        // Wall-clock alone is not claimed while the CLI executor waits without
-        // a deadline.
+        // Wall-clock alone is enforced by the CLI executor's finite wait and
+        // whole-Job termination on expiry.
         spec.resources = ResourceLimits {
             wall_clock_seconds: Some(60),
             ..ResourceLimits::default()
         };
-        assert!(!derive_coverage(&spec, &probe).resource_limits_enforced);
+        assert!(derive_coverage(&spec, &probe).resource_limits_enforced);
 
         // Wall-clock + output are both unsupported, so the combination remains
         // unclaimed as well.

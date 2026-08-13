@@ -14,7 +14,6 @@
 //! - `_snapshot` (hidden): the shell hook execs this child once per session; it
 //!   reads its OWN environment and stores NAMES + 8-char value-hash prefixes.
 
-use std::io::Write;
 use std::path::PathBuf;
 
 use tirith_core::env_guard::{self, EnvSnapshot};
@@ -130,13 +129,53 @@ fn resolve_policy_path_for_guard() -> Result<PathBuf, i32> {
     Ok(user.join("policy.yaml"))
 }
 
+/// Largest policy file we will read-modify-write for a guard toggle. A policy
+/// YAML is hand-authored and tiny; 1 MiB bounds a hostile or symlinked-to-huge
+/// target so the read cannot be turned into an unbounded slurp.
+const MAX_POLICY_SIZE: u64 = 1024 * 1024;
+
 /// Idempotently append-or-rewrite the `env_guard_enabled` line in a policy YAML,
 /// never touching other lines (mirrors `cli::context::update_policy_guard_key`).
+///
+/// Symlink-hardened (repo-0383, mirrors the F16 pattern in
+/// `cli::exec::update_policy_guard_key`): the policy path is a repo-discovered
+/// `<repo>/.tirith/policy.yaml` (or `<config>/tirith/policy.yaml`), so an
+/// attacker who can plant a symlink there could otherwise redirect this
+/// truncating write onto an arbitrary file. A retained directory capability is
+/// traversed from the trusted grandparent without following repo-controlled
+/// symlinks, then used for both the bounded read and atomic 0600 publication.
+///
+/// The grandparent is the right containment root because the policy path is
+/// always at least three components deep (`<root>/.tirith/policy.yaml`); a
+/// malformed path with no grandparent is rejected rather than written.
 fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    // The containment root is the grandparent: <repo>/.tirith/policy.yaml →
+    // <repo>, <config>/tirith/policy.yaml → <config>. A policy path is always
+    // at least three components deep; refuse a malformed shallower path rather
+    // than guess.
+    let containment_root = path.parent().and_then(|p| p.parent()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "policy path must be <root>/<dir>/policy.yaml",
+        )
+    })?;
+
+    let contained = tirith_core::util::ContainedAtomicFile::prepare(containment_root, path, true)?;
+
+    // Read the current contents WITHOUT following a symlinked final component.
+    // An absent file is an empty baseline (the key is then appended); any other
+    // read failure (symlinked, oversized, I/O) aborts rather than clobbering
+    // blind.
+    let existing = match contained.read_capped(MAX_POLICY_SIZE) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "policy file is not UTF-8; refusing to rewrite it",
+            )
+        })?,
+        Err(tirith_core::util::OpenRegularError::NotFound) => String::new(),
+        Err(e) => return Err(open_regular_io_error(e)),
+    };
     let new_line = format!("env_guard_enabled: {enable}");
 
     let mut out = String::new();
@@ -159,15 +198,26 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
         out.push('\n');
     }
 
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+    contained.write_atomic(out.as_bytes(), true)
+}
+
+/// Map an `OpenRegularError` from the no-follow policy read onto an `io::Error`
+/// so the guard read-modify-write surfaces a single failure type to the caller.
+fn open_regular_io_error(e: tirith_core::util::OpenRegularError) -> std::io::Error {
+    match e {
+        tirith_core::util::OpenRegularError::Io(io) => io,
+        tirith_core::util::OpenRegularError::NotRegularFile => std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "policy path is not a regular file (symlink or special file)",
+        ),
+        tirith_core::util::OpenRegularError::TooLarge => std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "policy file exceeds the size cap",
+        ),
+        tirith_core::util::OpenRegularError::NotFound => {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "policy file not found")
+        }
     }
-    let mut f = opts.open(path)?;
-    f.write_all(out.as_bytes())
 }
 
 /// `tirith env diff [--reset]` — show sensitive vars set/changed since shell
@@ -382,5 +432,63 @@ mod tests {
     #[test]
     fn guard_unknown_action_returns_2() {
         assert_eq!(guard("bogus", false), 2);
+    }
+
+    /// repo-0383: a symlinked containing directory (planted `.tirith`) that
+    /// escapes the repo must abort the update BEFORE any read/write, and the
+    /// external target must stay untouched.
+    #[cfg(unix)]
+    #[test]
+    fn update_policy_guard_key_refuses_symlinked_containing_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.join(".tirith")).unwrap();
+
+        let path = repo.join(".tirith").join("policy.yaml");
+        let err = update_policy_guard_key(&path, true).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        assert!(
+            !outside.path().join("policy.yaml").exists(),
+            "no policy file may be created outside the repo"
+        );
+    }
+
+    /// repo-0383: a symlinked FINAL component must be refused on both the read
+    /// and the write; the link target's bytes must be preserved.
+    #[cfg(unix)]
+    #[test]
+    fn update_policy_guard_key_refuses_symlinked_final_component() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.yaml");
+        std::fs::write(&victim, "SENTINEL: do not truncate\n").unwrap();
+        let dir = root.path().join("repo").join(".tirith");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.yaml");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        assert!(update_policy_guard_key(&path, true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "SENTINEL: do not truncate\n",
+            "symlink target must not be read-modify-written"
+        );
+    }
+
+    /// repo-0383: a non-regular target (a directory named `policy.yaml`)
+    /// surfaces a read error other than NotFound, so the update must abort
+    /// rather than truncate-through an empty baseline.
+    #[cfg(unix)]
+    #[test]
+    fn update_policy_guard_key_aborts_on_non_regular_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("repo").join(".tirith");
+        let path = dir.join("policy.yaml");
+        std::fs::create_dir_all(&path).unwrap();
+
+        assert!(update_policy_guard_key(&path, true).is_err());
+        assert!(path.is_dir(), "the directory must remain, not be replaced");
     }
 }
