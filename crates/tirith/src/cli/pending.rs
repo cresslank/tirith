@@ -51,7 +51,12 @@ pub fn list(format_json: bool) -> i32 {
         println!("{}", "-".repeat(90));
         for e in &entries {
             let source = format!("{:?}", e.source).to_lowercase();
-            let command = e.command_redacted.chars().take(32).collect::<String>();
+            // repo-0405: the persisted preview is attacker-derived — redaction
+            // strips secrets, not ANSI/OSC/bidi/newlines. Sanitize before print.
+            let command = super::sanitize_for_human_output(
+                &e.command_redacted.chars().take(32).collect::<String>(),
+                false,
+            );
             println!(
                 "{:<10} {:<26} {:<11} {:<9} {}",
                 e.id, e.created_at, source, e.severity, command
@@ -156,10 +161,15 @@ pub fn export(output: Option<PathBuf>) -> i32 {
                     return 2;
                 }
             };
-            // Write atomically (temp + fsync + rename) so a crash/ENOSPC mid-write
-            // cannot leave a half-written export at `path`; a reader sees either the
-            // old file or the complete new one. `overwrite = true`: export replaces.
-            match super::write_file_atomic(&path, json.as_bytes(), true) {
+            // repo-0406: retain the destination's parent capability from secure
+            // traversal through publication. A final or intermediate symlink
+            // cannot redirect the export, including one swapped after binding.
+            let root = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            match super::write_file_atomic_contained(&root, &path, json.as_bytes(), true) {
                 Ok(()) => {
                     println!(
                         "Wrote {} pending decision(s) to {}",

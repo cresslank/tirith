@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::error::AppError;
 
@@ -91,6 +91,22 @@ CREATE INDEX IF NOT EXISTS idx_sub_customer ON subscriptions(customer_id);
 CREATE INDEX IF NOT EXISTS idx_tokens_sub ON tokens(subscription_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_sub ON api_keys(subscription_id);
 "#;
+
+/// repo-0445: `last_event_at` participates in SQLite `MAX()` over TEXT, which
+/// only matches chronological order when every value shares one fixed-width
+/// UTC encoding. Normalize RFC3339 inputs (any offset/fraction) to
+/// `...T..:..:.. .mmmZ`; unparseable values pass through unchanged (the stale
+/// guards treat them conservatively).
+fn normalize_event_ts(raw: Option<&str>) -> Option<String> {
+    raw.map(|value| {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .map(|ts| {
+                ts.to_utc()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            })
+            .unwrap_or_else(|_| value.to_string())
+    })
+}
 
 impl Db {
     pub fn open(path: &str) -> Result<Self, AppError> {
@@ -195,7 +211,7 @@ impl Db {
                     data.email,
                     data.tier,
                     data.product_id,
-                    data.occurred_at,
+                    normalize_event_ts(data.occurred_at.as_deref()),
                 ],
             )
             .map_err(|e| AppError::Internal(format!("db upsert sub: {e}")))?;
@@ -356,7 +372,7 @@ impl Db {
                     data.email.as_deref().unwrap_or("unknown"),
                     data.tier.as_deref().unwrap_or("unknown"),
                     data.product_id.as_deref().unwrap_or("unknown"),
-                    data.occurred_at,
+                    normalize_event_ts(data.occurred_at.as_deref()),
                 ],
             )
             .map_err(|e| AppError::Internal(format!("db upsert canceled: {e}")))?;
@@ -413,7 +429,7 @@ impl Db {
                     data.email.as_deref().unwrap_or("unknown"),
                     data.tier.as_deref().unwrap_or("unknown"),
                     data.product_id.as_deref().unwrap_or("unknown"),
-                    data.occurred_at,
+                    normalize_event_ts(data.occurred_at.as_deref()),
                 ],
             )
             .map_err(|e| AppError::Internal(format!("db upsert revoked: {e}")))?;
@@ -584,7 +600,7 @@ impl Db {
                     data.tier.as_deref().unwrap_or("unknown"),
                     data.new_status,
                     data.product_id.as_deref().unwrap_or("unknown"),
-                    data.occurred_at,
+                    normalize_event_ts(data.occurred_at.as_deref()),
                 ],
             )
             .map_err(|e| AppError::Internal(format!("db upsert updated: {e}")))?;
@@ -763,23 +779,46 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 
-    pub async fn insert_token(
+    /// Insert a refreshed token only when this subscription has not received one
+    /// within `min_interval_secs`. The age check and insert share one IMMEDIATE
+    /// transaction, so concurrent requests (including separate server processes
+    /// using the same SQLite database) cannot all pass a split check before any
+    /// token becomes visible.
+    pub async fn insert_token_if_interval_elapsed(
         &self,
         sub_id: &str,
         token: &str,
         expires_at: i64,
-    ) -> Result<(), AppError> {
+        min_interval_secs: i64,
+    ) -> Result<bool, AppError> {
         let conn = self.conn.clone();
         let sid = sub_id.to_string();
         let tok = token.to_string();
         tokio::task::spawn_blocking(move || {
-            let conn = acquire_db(&conn);
-            conn.execute(
+            let mut conn = acquire_db(&conn);
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|e| AppError::Internal(format!("db token tx: {e}")))?;
+            let age = tx
+                .query_row(
+                    "SELECT CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s', MAX(created_at)) AS INTEGER) FROM tokens WHERE subscription_id=?1",
+                    params![sid],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .map_err(|e| AppError::Internal(format!("db token age: {e}")))?;
+            if age.is_some_and(|seconds| seconds < min_interval_secs) {
+                tx.commit()
+                    .map_err(|e| AppError::Internal(format!("db token tx commit: {e}")))?;
+                return Ok(false);
+            }
+            tx.execute(
                 "INSERT INTO tokens (subscription_id, token, expires_at) VALUES (?1, ?2, ?3)",
                 params![sid, tok, expires_at],
             )
             .map_err(|e| AppError::Internal(format!("db insert token: {e}")))?;
-            Ok(())
+            tx.commit()
+                .map_err(|e| AppError::Internal(format!("db token tx commit: {e}")))?;
+            Ok(true)
         })
         .await
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
@@ -859,6 +898,7 @@ impl Db {
         sub_id: &str,
         new_tier: &str,
         new_product_id: &str,
+        expected_last_event_at: Option<String>,
     ) -> Result<(), AppError> {
         let conn = self.conn.clone();
         let sid = sub_id.to_string();
@@ -866,9 +906,12 @@ impl Db {
         let pid = new_product_id.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = acquire_db(&conn);
+            // repo-0448: compare-and-swap on the version observed when the
+            // Polar request STARTED. A plan transition landing mid-flight must
+            // not be overwritten by the stale response.
             conn.execute(
-                "UPDATE subscriptions SET tier=?1, product_id=?2, updated_at=datetime('now') WHERE id=?3 AND tier='unknown'",
-                params![tier, pid, sid],
+                "UPDATE subscriptions SET tier=?1, product_id=?2, updated_at=datetime('now') WHERE id=?3 AND tier='unknown' AND last_event_at IS ?4",
+                params![tier, pid, sid, expected_last_event_at],
             )
             .map_err(|e| AppError::Internal(format!("db retry tier fix: {e}")))?;
             conn.execute(
@@ -1114,6 +1157,50 @@ mod tests {
         let (status, revoked) = read_state(&db, "sub_1");
         assert_eq!(status, "active");
         assert_eq!(revoked, Some(false));
+    }
+
+    #[tokio::test]
+    async fn refreshed_token_interval_check_and_insert_are_atomic() {
+        let db = test_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO subscriptions (id, tier, status) VALUES ('sub_refresh', 'team', 'active')",
+                [],
+            )
+            .unwrap();
+        }
+
+        const REQUESTS: usize = 8;
+        let barrier = Arc::new(tokio::sync::Barrier::new(REQUESTS));
+        let mut tasks = Vec::with_capacity(REQUESTS);
+        for index in 0..REQUESTS {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                let token = format!("refresh-token-{index}");
+                barrier.wait().await;
+                db.insert_token_if_interval_elapsed("sub_refresh", &token, 9_999_999_999, 60)
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        let mut admitted = 0;
+        for task in tasks {
+            admitted += usize::from(task.await.unwrap());
+        }
+        assert_eq!(admitted, 1, "only one concurrent refresh may issue");
+
+        let conn = db.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tokens WHERE subscription_id='sub_refresh'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]

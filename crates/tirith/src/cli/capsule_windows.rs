@@ -6,16 +6,17 @@
 //! refused if it cannot be honestly enforced) and materializes it with the Win32
 //! AppContainer / ACL / Job Object / process-creation APIs:
 //!
-//! 1. **AppContainer profile + package SID** — `CreateAppContainerProfile`
-//!    (idempotent; an already-existing profile is reused) then
-//!    `DeriveAppContainerSidFromAppContainerName` for the package SID the child runs
-//!    under. No networking capability is ever passed (the plan grants none), so the
-//!    container has no outbound socket access.
+//! 1. **AppContainer profile + package SID** — `CreateAppContainerProfile` with a
+//!    per-launch name derived from the plan's stable base. Concurrent launches
+//!    therefore never share the package SID whose temporary ACL grants are later
+//!    revoked. The profile is deleted after the run. No networking capability is
+//!    ever passed (the plan grants none), so the container has no outbound socket
+//!    access.
 //! 2. **ACL grants (tracked + revoked)** — for each [`AclGrant`], add an
 //!    `EXPLICIT_ACCESS_W` ACE granting the container package SID the requested
 //!    access to the path's DACL via `SetEntriesInAclW` + `SetNamedSecurityInfoW`.
-//!    Each grant is recorded so it can be **revoked** after the child exits (a
-//!    [`AclGuard`] restores the original DACL).
+//!    Each grant is recorded so it can be **revoked** after the child exits (an
+//!    [`AclGuard`] removes exactly its own ACE from the path's live DACL).
 //! 3. **STARTUPINFOEXW with SECURITY_CAPABILITIES** — an attribute list carrying
 //!    `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` so the child is created *inside*
 //!    the AppContainer (the package SID + capabilities are bound at creation, not
@@ -61,30 +62,32 @@
 
 use std::ffi::{c_void, OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::core::{Error as WinError, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, GENERIC_EXECUTE, GENERIC_READ,
-    GENERIC_WRITE, HANDLE, HLOCAL, WAIT_OBJECT_0, WIN32_ERROR,
+    CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER,
+    ERROR_NOT_ENOUGH_MEMORY, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL,
+    WAIT_OBJECT_0, WAIT_TIMEOUT, WIN32_ERROR,
 };
 use windows::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
     GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
     TRUSTEE_W,
 };
-use windows::Win32::Security::Isolation::{
-    CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
-};
+use windows::Win32::Security::Isolation::{CreateAppContainerProfile, DeleteAppContainerProfile};
 use windows::Win32::Security::{
-    FreeSid, ACE_FLAGS, ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_CAPABILITIES,
+    CopySid, DeleteAce, EqualSid, FreeSid, GetAce, GetLengthSid, ACCESS_ALLOWED_ACE, ACE_FLAGS,
+    ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
 };
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
+use windows::Win32::System::Memory::{LocalAlloc, LPTR};
+use windows::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 use windows::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
     InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
@@ -94,7 +97,7 @@ use windows::Win32::System::Threading::{
 };
 
 use tirith_core::capsule::windows::{
-    command_line_wide_for, AclAccess, AclGrant, WindowsLaunchPlan,
+    command_line_wide_for, AclAccess, AclGrant, WindowsLaunchPlan, APP_CONTAINER_NAME_MAX,
 };
 use tirith_core::capsule::{CapsuleSpec, EnvironmentPolicy};
 
@@ -103,7 +106,7 @@ use tirith_core::capsule::{CapsuleSpec, EnvironmentPolicy};
 /// fail-closed denial without leaking secrets.
 #[derive(Debug)]
 pub enum WindowsLaunchError {
-    /// Creating or deriving the AppContainer identity failed.
+    /// Creating or deleting the AppContainer identity failed.
     AppContainer(String, WinError),
     /// Applying or reverting an ACL grant failed.
     Acl(String, WIN32_ERROR),
@@ -120,6 +123,11 @@ pub enum WindowsLaunchError {
     /// Encoding a string for a Win32 wide-string argument failed (interior NUL).
     Encoding(String),
 }
+
+/// Monotonic per-process component for ephemeral AppContainer profile names.
+/// The process id supplies cross-process separation while this counter supplies
+/// thread-safe separation between overlapping launches in one process.
+static NEXT_PROFILE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl std::fmt::Display for WindowsLaunchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -152,12 +160,32 @@ pub struct ContainedChild {
     /// The ACL grants to revoke when the run is done. Held so the grants outlive
     /// the child but are reverted afterward.
     acl_guards: Vec<AclGuard>,
+    /// The spec-requested wall-clock deadline (seconds), enforced by
+    /// [`wait_for`] as a finite wait plus Job termination on expiry. `None`
+    /// waits indefinitely (the spec requested no deadline).
+    wall_clock_seconds: Option<u64>,
+    /// Deletes this launch's unique AppContainer profile after the ACL grants
+    /// and process lifetime end. Kept last so ordinary field drop closes the Job
+    /// and process handles before profile cleanup.
+    profile: ProfileGuard,
 }
 
 impl ContainedChild {
     /// The raw child process handle, for the caller to wait on / read an exit code.
     pub fn process_handle(&self) -> HANDLE {
         self.process.0
+    }
+
+    /// The raw Job Object handle, for enforcing the wall-clock deadline.
+    fn job_handle(&self) -> HANDLE {
+        self.job.0
+    }
+
+    /// The finite wait timeout (ms) derived from the spec's wall-clock deadline,
+    /// or `INFINITE` when no deadline was requested. Saturates at just under
+    /// `INFINITE` so a huge requested value cannot alias the infinite sentinel.
+    fn wait_timeout_ms(&self) -> u32 {
+        wall_clock_timeout_ms(self.wall_clock_seconds)
     }
 
     /// Revert every ACL grant now (the child has exited). Idempotent: each guard
@@ -171,11 +199,25 @@ impl ContainedChild {
                 }
             }
         }
+        if let Err(e) = self.profile.delete_now() {
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
         }
     }
+}
+
+/// Convert a policy wall-clock limit into the finite Win32 wait used by
+/// [`wait_for`]. Kept separate from the handle-owning child so the boundary and
+/// saturation behavior remain unit-testable without launching a process.
+fn wall_clock_timeout_ms(wall_clock_seconds: Option<u64>) -> u32 {
+    wall_clock_seconds
+        .map(|s| s.saturating_mul(1000).min(u32::MAX as u64 - 1) as u32)
+        .unwrap_or(INFINITE)
 }
 
 /// Launch `program` + `args` contained per `spec`, on the current Windows host.
@@ -210,25 +252,44 @@ pub fn launch_contained_os(
 ) -> Result<ContainedChild, WindowsLaunchError> {
     let plan = tirith_core::capsule::windows::windows_launch_plan_os(spec, program, args)
         .map_err(|e| WindowsLaunchError::Encoding(e.to_string()))?;
-    apply_plan(&plan, &spec.environment)
+    apply_plan(&plan, &spec.environment, spec.resources.wall_clock_seconds)
 }
 
 /// Wait for a contained child to exit and return its process exit code (E5
-/// run-to-completion). Blocks on the process handle, then reads the exit code via
+/// run-to-completion). Blocks on the process handle — finitely when the spec
+/// requested a wall-clock deadline — then reads the exit code via
 /// `GetExitCodeProcess`. A code that does not fit `i32` is clamped (a child that
 /// exits with a huge unsigned code is reported as the low 31 bits, non-negative);
 /// callers only use this for the consumer "child's code, else non-zero" convention.
+///
+/// Wall-clock enforcement (repo-0363): when the spec carries
+/// `wall_clock_seconds`, the wait uses that deadline instead of `INFINITE` and
+/// an expiry terminates the whole Job (every process in the confined tree)
+/// before failing the run — a contained child can no longer sleep forever under
+/// a policy that promised a deadline.
 pub fn wait_for(child: &ContainedChild) -> Result<i32, WindowsLaunchError> {
     let handle = child.process_handle();
+    let timeout_ms = child.wait_timeout_ms();
     // SAFETY: `handle` is the valid child process handle owned by `child` for the
     // duration of the call; WaitForSingleObject does not consume it.
-    let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
-    // Only `WAIT_OBJECT_0` means the process actually exited. WAIT_TIMEOUT (can't
-    // happen with INFINITE, but be exhaustive), WAIT_ABANDONED, or WAIT_FAILED mean
-    // the process is NOT known to have terminated, so `GetExitCodeProcess` would
-    // return `STILL_ACTIVE` (259) and we would otherwise report that as a clean exit
-    // code. Fail closed instead: the caller must treat this as a launch failure, not
-    // a successful run with exit 259.
+    let wait = unsafe { WaitForSingleObject(handle, timeout_ms) };
+    if wait == WAIT_TIMEOUT {
+        // The deadline expired: kill the entire Job (the child and anything it
+        // spawned) and fail closed. Best-effort: the error below is returned
+        // regardless of the termination result.
+        // SAFETY: `child.job_handle()` is a valid Job handle owned by `child`.
+        let _ = unsafe { TerminateJobObject(child.job_handle(), 137) };
+        return Err(WindowsLaunchError::Wait(format!(
+            "contained child exceeded its wall-clock deadline ({timeout_ms} ms); \
+             the Job was terminated",
+        )));
+    }
+    // Only `WAIT_OBJECT_0` means the process actually exited. WAIT_ABANDONED or
+    // WAIT_FAILED mean the process is NOT known to have terminated, so
+    // `GetExitCodeProcess` would return `STILL_ACTIVE` (259) and we would
+    // otherwise report that as a clean exit code. Fail closed instead: the
+    // caller must treat this as a launch failure, not a successful run with
+    // exit 259.
     if wait != WAIT_OBJECT_0 {
         return Err(WindowsLaunchError::Wait(format!(
             "WaitForSingleObject did not report the child as exited (returned {:#x}); \
@@ -250,9 +311,10 @@ pub fn wait_for(child: &ContainedChild) -> Result<i32, WindowsLaunchError> {
 fn apply_plan(
     plan: &WindowsLaunchPlan,
     env: &EnvironmentPolicy,
+    wall_clock_seconds: Option<u64>,
 ) -> Result<ContainedChild, WindowsLaunchError> {
     // 1. AppContainer profile (idempotent) + package SID.
-    let container_sid = create_or_open_appcontainer(plan)?;
+    let (container_sid, profile) = create_unique_appcontainer(plan)?;
     // `container_sid` owns the PSID and frees it on drop.
 
     // 2. ACL grants — tracked so they are reverted on any later failure or when the
@@ -328,6 +390,8 @@ fn apply_plan(
         process: launched.process,
         thread: launched.thread,
         acl_guards,
+        wall_clock_seconds,
+        profile,
     })
 }
 
@@ -355,112 +419,270 @@ impl Drop for OwnedSid {
     }
 }
 
-/// Create the AppContainer profile (or reuse an existing one) and return its package
-/// SID. `CreateAppContainerProfile` returns the SID directly; if the profile already
-/// exists it fails with `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)`, in which case we
-/// derive the SID from the name instead (idempotent reuse). No capabilities are ever
-/// passed (the plan grants none), so the container has no networking capability.
-fn create_or_open_appcontainer(plan: &WindowsLaunchPlan) -> Result<OwnedSid, WindowsLaunchError> {
-    let name = wide_nul(&plan.profile.name)
+/// Build a per-launch AppContainer profile name from the pure plan's stable base.
+/// Reusing the base SID would let one overlapping run's cleanup revoke the other
+/// run's ACL grants. The process id plus a checked atomic sequence keeps live
+/// launches distinct across and within processes while remaining under Windows'
+/// 64-code-unit profile-name limit.
+fn unique_profile_name(base: &str) -> Result<String, WindowsLaunchError> {
+    let sequence = NEXT_PROFILE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| {
+            WindowsLaunchError::Encoding(
+                "appcontainer launch sequence exhausted; refusing SID reuse".to_string(),
+            )
+        })?;
+    let name = format!("{base}.{:08x}.{sequence:016x}", std::process::id());
+    if name.encode_utf16().count() > APP_CONTAINER_NAME_MAX {
+        return Err(WindowsLaunchError::Encoding(format!(
+            "per-launch appcontainer name exceeds {APP_CONTAINER_NAME_MAX} UTF-16 units"
+        )));
+    }
+    Ok(name)
+}
+
+/// Create a unique AppContainer profile for this launch and return both its package
+/// SID and a guard that deletes the profile after the contained run. No capabilities
+/// are ever passed (the plan grants none), so the container has no networking
+/// capability. Any unexpected name collision fails closed instead of sharing a SID.
+fn create_unique_appcontainer(
+    plan: &WindowsLaunchPlan,
+) -> Result<(OwnedSid, ProfileGuard), WindowsLaunchError> {
+    let profile_name = unique_profile_name(&plan.profile.name)?;
+    let name = wide_nul(&profile_name)
         .map_err(|_| WindowsLaunchError::Encoding("appcontainer name has NUL".to_string()))?;
     let display = wide_nul(&plan.profile.display_name)
         .map_err(|_| WindowsLaunchError::Encoding("display name has NUL".to_string()))?;
 
     // First try to create. `pcapabilities = None` -> no capabilities, so no network.
     // SAFETY: the wide strings are NUL-terminated and outlive the call.
-    let created = unsafe {
+    let sid = unsafe {
         CreateAppContainerProfile(
             PCWSTR(name.as_ptr()),
             PCWSTR(display.as_ptr()),
             PCWSTR(display.as_ptr()),
             None,
         )
-    };
-    match created {
-        Ok(psid) => Ok(OwnedSid(psid)),
-        Err(_) => {
-            // Most likely ERROR_ALREADY_EXISTS: derive the SID from the existing
-            // profile. (Any other error surfaces here too, with a derive failure.)
-            // SAFETY: `name` is NUL-terminated. The windows-crate binding returns the
-            // derived PSID directly (no out-param).
-            let derived =
-                unsafe { DeriveAppContainerSidFromAppContainerName(PCWSTR(name.as_ptr())) };
-            match derived {
-                Ok(psid) => Ok(OwnedSid(psid)),
-                Err(e) => Err(WindowsLaunchError::AppContainer(
-                    "create and derive both failed".to_string(),
-                    e,
-                )),
-            }
+    }
+    .map_err(|e| {
+        WindowsLaunchError::AppContainer("create unique per-launch profile failed".to_string(), e)
+    })?;
+    Ok((
+        OwnedSid(sid),
+        ProfileGuard {
+            name_wide: name,
+            deleted: false,
+        },
+    ))
+}
+
+/// Owns one per-launch AppContainer profile and removes it once the contained
+/// process and its temporary ACL grants are finished. A failed explicit deletion
+/// remains retryable from `Drop`.
+struct ProfileGuard {
+    name_wide: Vec<u16>,
+    deleted: bool,
+}
+
+impl ProfileGuard {
+    fn delete_now(&mut self) -> Result<(), WindowsLaunchError> {
+        if self.deleted {
+            return Ok(());
         }
+        // SAFETY: `name_wide` is a live NUL-terminated string naming the profile
+        // created for this guard; the API borrows it only for this call.
+        unsafe { DeleteAppContainerProfile(PCWSTR(self.name_wide.as_ptr())) }.map_err(|e| {
+            WindowsLaunchError::AppContainer(
+                "delete unique per-launch profile failed".to_string(),
+                e,
+            )
+        })?;
+        self.deleted = true;
+        Ok(())
     }
 }
 
-/// An ACL grant that has been applied to a path's DACL and remembers how to revert
-/// it. On revert it re-installs the path's **original** DACL (the one we read before
-/// adding our ACE), so the grant leaves no residue.
+impl Drop for ProfileGuard {
+    fn drop(&mut self) {
+        let _ = self.delete_now();
+    }
+}
+
+/// An ACL grant that has been applied to a path's DACL and remembers how to
+/// revert it. On revert it re-reads the path's **current** DACL and removes
+/// only the access-allowed ACEs naming the container package SID — the ACEs
+/// this capsule added — instead of restoring a whole-DACL snapshot taken at
+/// grant time (repo-0364). A snapshot restore would silently discard
+/// legitimate ACL changes made between grant and revert, and could clobber an
+/// overlapping capsule run's own grant.
 ///
-/// **Ownership:** `security_descriptor` is the `PSECURITY_DESCRIPTOR` that
-/// `GetNamedSecurityInfoW` allocated; `original_dacl` points *inside* it. The guard
-/// therefore owns the descriptor and `LocalFree`s it only after the final revert, so
-/// `original_dacl` is never dangled (the use-after-free that would result from
-/// freeing the descriptor while the guard still holds the inner DACL pointer).
+/// **Ownership:** `container_sid` is a `LocalAlloc`/`CopySid` duplicate of the
+/// AppContainer package SID (the original `OwnedSid` is freed when `apply_plan`
+/// returns, while the guard lives on inside [`ContainedChild`]); it is freed
+/// with `LocalFree` on drop, after the final revert.
 struct AclGuard {
     /// The path whose DACL we modified (NUL-terminated wide string).
     path_wide: Vec<u16>,
-    /// The security descriptor backing `original_dacl` (owned; `LocalFree`d on drop).
-    security_descriptor: PSECURITY_DESCRIPTOR,
-    /// The original DACL to restore on revert (points into `security_descriptor`;
-    /// may be null == "no explicit DACL").
-    original_dacl: *const ACL,
+    /// Owned duplicate of the container package SID our ACE was granted to;
+    /// matched against the live DACL at revert time.
+    container_sid: OwnedLocalSid,
     /// Whether this guard has already reverted.
     reverted: bool,
 }
 
 impl AclGuard {
-    /// Revert the grant now (restore the original DACL). Idempotent.
+    /// Revert the grant now: remove our own ACE from the path's live DACL.
+    /// Idempotent — and marked reverted only AFTER the revocation actually
+    /// succeeded, so a transient failure is retried by [`Drop`] instead of
+    /// leaking the container's ACE (repo-0364).
     fn revert_now(&mut self) -> Result<(), WindowsLaunchError> {
         if self.reverted {
             return Ok(());
         }
-        self.reverted = true;
-        // SAFETY: `path_wide` is NUL-terminated; `original_dacl` points into the
-        // still-live `security_descriptor` (freed only in Drop, after this revert).
-        let rc = unsafe {
-            SetNamedSecurityInfoW(
+        // Read the path's CURRENT DACL (not a grant-time snapshot).
+        let mut current_dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: `path_wide` is NUL-terminated; out-pointers are valid.
+        let get_rc = unsafe {
+            GetNamedSecurityInfoW(
                 PCWSTR(self.path_wide.as_ptr()),
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 None,
                 None,
-                Some(self.original_dacl),
+                Some(&mut current_dacl as *mut *mut ACL),
                 None,
+                &mut sd,
             )
         };
-        if rc.is_ok() {
-            Ok(())
-        } else {
-            Err(WindowsLaunchError::Acl(
-                "restore original DACL".to_string(),
-                rc,
-            ))
+        if get_rc.is_err() {
+            return Err(WindowsLaunchError::Acl(
+                "read current DACL for revert".to_string(),
+                get_rc,
+            ));
         }
+        // `result` is computed while `sd` is still owned here: `current_dacl`
+        // points inside it and must not outlive the `LocalFree` below.
+        let result = (|| -> Result<(), WindowsLaunchError> {
+            if current_dacl.is_null() {
+                // The object now has no explicit DACL, so our ACE cannot be
+                // present (someone replaced the DACL wholesale). Nothing to
+                // remove — and installing a null DACL would OPEN the object,
+                // so we must not write one.
+                return Ok(());
+            }
+            let ace_count = unsafe { (*current_dacl).AceCount } as u32;
+            // Walk BACKWARD so in-place deletions cannot shift unvisited
+            // entries past the cursor.
+            for i in (0..ace_count).rev() {
+                let mut pace: *mut core::ffi::c_void = std::ptr::null_mut();
+                // SAFETY: `current_dacl` is a live DACL and `i < AceCount`.
+                if let Err(error) = unsafe { GetAce(current_dacl, i, &mut pace) } {
+                    return Err(WindowsLaunchError::Acl(
+                        "read ACE while reverting capsule grant".to_string(),
+                        WIN32_ERROR::from_error(&error).unwrap_or(ERROR_INVALID_PARAMETER),
+                    ));
+                }
+                if pace.is_null() {
+                    return Err(WindowsLaunchError::Acl(
+                        "read ACE while reverting capsule grant returned a null pointer"
+                            .to_string(),
+                        ERROR_INVALID_PARAMETER,
+                    ));
+                }
+                // SAFETY: `pace` names a live ACE inside the DACL for the
+                // duration of this iteration.
+                let header = unsafe { &*(pace as *const ACE_HEADER) };
+                if header.AceType != ACCESS_ALLOWED_ACE_TYPE as u8 {
+                    // Never touch deny/audit entries — only the allow ACEs we
+                    // added are candidates for removal.
+                    continue;
+                }
+                let ace = pace as *mut ACCESS_ALLOWED_ACE;
+                // The ACE's SID begins in-line at `SidStart`.
+                // SAFETY: `ace` names a live allow ACE inside the DACL, so
+                // taking the address of its in-line Sid field reads no memory
+                // and stays inside that allocation.
+                let ace_sid =
+                    PSID(unsafe { std::ptr::addr_of_mut!((*ace).SidStart) }
+                        as *mut core::ffi::c_void);
+                // SAFETY: both SIDs are valid; EqualSid reads only.
+                let is_ours = unsafe { EqualSid(ace_sid, self.container_sid.psid()) }.is_ok();
+                if is_ours {
+                    // SAFETY: `i` indexes a live ACE in `current_dacl`;
+                    // DeleteAce shrinks the ACL in place, which is safe inside
+                    // the owning descriptor buffer.
+                    if let Err(error) = unsafe { DeleteAce(current_dacl, i) } {
+                        return Err(WindowsLaunchError::Acl(
+                            "delete capsule ACE from DACL".to_string(),
+                            WIN32_ERROR::from_error(&error).unwrap_or(ERROR_INVALID_PARAMETER),
+                        ));
+                    }
+                }
+            }
+            // SAFETY: `path_wide` is NUL-terminated; `current_dacl` is the
+            // pruned live DACL.
+            let set_rc = unsafe {
+                SetNamedSecurityInfoW(
+                    PCWSTR(self.path_wide.as_ptr()),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    None,
+                    None,
+                    Some(current_dacl as *const ACL),
+                    None,
+                )
+            };
+            if set_rc.is_err() {
+                return Err(WindowsLaunchError::Acl(
+                    "remove capsule ACE from DACL".to_string(),
+                    set_rc,
+                ));
+            }
+            Ok(())
+        })();
+        // Free the descriptor we read (current_dacl points into it), exactly
+        // once, before returning.
+        // SAFETY: `sd` was allocated by GetNamedSecurityInfoW above.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
+        }
+        result?;
+        self.reverted = true;
+        Ok(())
     }
 }
 
 impl Drop for AclGuard {
     fn drop(&mut self) {
-        // Best-effort revert on drop; an explicit `finish()` reports errors. The
-        // revert reads `original_dacl`, so it MUST happen before we free the backing
-        // descriptor.
+        // Best-effort revert on drop; an explicit `finish()` reports errors. A
+        // FAILED earlier revert left `reverted` clear, so this retries the
+        // revocation instead of leaking the ACE.
         let _ = self.revert_now();
-        if !self.security_descriptor.0.is_null() {
-            // SAFETY: `security_descriptor` was allocated by GetNamedSecurityInfoW and
-            // is freed exactly once here; `original_dacl` is not used after this.
+    }
+}
+
+/// A copied SID whose storage came from `LocalAlloc`. Unlike the SID returned by
+/// `CreateAppContainerProfile`, this allocation must be paired with `LocalFree`,
+/// not `FreeSid` (which is documented for `AllocateAndInitializeSid` results).
+struct OwnedLocalSid(HLOCAL);
+
+impl OwnedLocalSid {
+    fn psid(&self) -> PSID {
+        PSID(self.0 .0)
+    }
+}
+
+impl Drop for OwnedLocalSid {
+    fn drop(&mut self) {
+        if !self.0 .0.is_null() {
+            // SAFETY: this handle was returned by `LocalAlloc` and is freed once.
             unsafe {
-                let _ = LocalFree(Some(HLOCAL(self.security_descriptor.0)));
+                let _ = LocalFree(Some(self.0));
             }
-            self.security_descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+            self.0 = HLOCAL(std::ptr::null_mut());
         }
     }
 }
@@ -487,7 +709,8 @@ fn access_mask(access: AclAccess) -> u32 {
 
 /// Apply one ACL grant: read the path's current DACL, add an ACE granting the
 /// container SID the requested access (inheriting to sub-objects), and write the new
-/// DACL back. Returns an [`AclGuard`] that restores the original DACL on revert.
+/// DACL back. Returns an [`AclGuard`] that removes exactly this ACE from the
+/// path's live DACL on revert.
 ///
 /// We use `GetNamedSecurityInfoW` to fetch the existing DACL so the grant is
 /// ADDITIVE (we never clobber existing permissions); `SetEntriesInAclW` merges our
@@ -499,6 +722,28 @@ fn apply_acl_grant(grant: &AclGrant, container_sid: PSID) -> Result<AclGuard, Wi
         .ok_or_else(|| WindowsLaunchError::Encoding(format!("non-UTF-8 path: {:?}", grant.path)))?;
     let path_wide =
         wide_nul(path_str).map_err(|_| WindowsLaunchError::Encoding("path has NUL".to_string()))?;
+
+    // Build the guard's independent SID copy BEFORE modifying the path. If
+    // allocation or copying fails, no ACE has been installed and therefore no
+    // cleanup state can be lost.
+    // SAFETY: `container_sid` came from CreateAppContainerProfile and is valid.
+    let sid_len = unsafe { GetLengthSid(container_sid) };
+    // SAFETY: allocate exactly the byte length reported for the source SID.
+    let sid_buf = unsafe { LocalAlloc(LPTR, sid_len as usize) }.map_err(|error| {
+        WindowsLaunchError::Acl(
+            "allocate container SID copy".to_string(),
+            WIN32_ERROR::from_error(&error).unwrap_or(ERROR_NOT_ENOUGH_MEMORY),
+        )
+    })?;
+    let sid_copy = OwnedLocalSid(sid_buf);
+    // SAFETY: `sid_copy` owns `sid_len` writable bytes and `container_sid` is a
+    // valid source SID. The RAII owner frees the buffer on failure.
+    if let Err(error) = unsafe { CopySid(sid_len, sid_copy.psid(), container_sid) } {
+        return Err(WindowsLaunchError::Acl(
+            "copy container SID for revert".to_string(),
+            WIN32_ERROR::from_error(&error).unwrap_or(ERROR_INVALID_PARAMETER),
+        ));
+    }
 
     // Read the existing DACL (so our grant is additive).
     let mut existing_dacl: *mut ACL = std::ptr::null_mut();
@@ -591,12 +836,17 @@ fn apply_acl_grant(grant: &AclGrant, container_sid: PSID) -> Result<AclGuard, Wi
         ));
     }
 
+    // The grant is installed; the grant-time snapshot descriptor is no longer
+    // needed (the revert removes our ACE from the LIVE DACL instead of
+    // restoring a stale snapshot).
+    // SAFETY: `sd` was allocated by GetNamedSecurityInfoW; freed exactly once.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+    }
+
     Ok(AclGuard {
         path_wide,
-        // The guard OWNS `sd` and frees it on drop (after the final revert);
-        // `existing_dacl` points into it and is the original DACL to restore.
-        security_descriptor: sd,
-        original_dacl: existing_dacl as *const ACL,
+        container_sid: sid_copy,
         reverted: false,
     })
 }
@@ -950,6 +1200,26 @@ mod tests {
     #[test]
     fn wide_nul_rejects_interior_nul() {
         assert!(wide_nul("a\0b").is_err());
+    }
+
+    #[test]
+    fn wall_clock_timeout_is_finite_and_saturates_below_infinite() {
+        assert_eq!(wall_clock_timeout_ms(None), INFINITE);
+        assert_eq!(wall_clock_timeout_ms(Some(0)), 0);
+        assert_eq!(wall_clock_timeout_ms(Some(60)), 60_000);
+        assert_eq!(wall_clock_timeout_ms(Some(u64::MAX)), INFINITE - 1);
+    }
+
+    #[test]
+    fn appcontainer_profile_names_are_unique_and_bounded_per_launch() {
+        let base = "tirith.capsule.0123456789abcdef";
+        let first = unique_profile_name(base).expect("first name");
+        let second = unique_profile_name(base).expect("second name");
+        assert_ne!(first, second);
+        assert!(first.starts_with(base));
+        assert!(second.starts_with(base));
+        assert!(first.encode_utf16().count() <= APP_CONTAINER_NAME_MAX);
+        assert!(second.encode_utf16().count() <= APP_CONTAINER_NAME_MAX);
     }
 
     #[test]
