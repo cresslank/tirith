@@ -232,12 +232,33 @@ impl InstallExecutableBinding {
     }
 
     fn resolve_on_path(program: &str, path_value: &OsStr) -> std::io::Result<Self> {
-        let trusted = tirith_core::trusted_child::TrustedExecutable::resolve_on_path(
+        let trusted = match tirith_core::trusted_child::TrustedExecutable::resolve_on_path(
             program,
             path_value,
             &tirith_core::trusted_child::ambient_denied_roots(),
-        )
-        .map_err(std::io::Error::other)?;
+        ) {
+            Ok(trusted) => trusted,
+            Err(error) => {
+                // Preserve the public PermissionDenied classification for a
+                // writable PATH shadow even when the lower-level trust check
+                // rejects the same candidate first (notably on macOS ACLs).
+                // Other trust failures retain their existing error shape.
+                if !matches!(
+                    &error,
+                    tirith_core::trusted_child::TrustedExecutableError::Untrusted { .. }
+                        | tirith_core::trusted_child::TrustedExecutableError::NotFound(_)
+                ) {
+                    if let Some(first_hit) = Self::first_executable_path(program, path_value) {
+                        if let Err(path_error) =
+                            Self::reject_unsafe_path_selection(&first_hit, path_value)
+                        {
+                            return Err(path_error);
+                        }
+                    }
+                }
+                return Err(std::io::Error::other(error));
+            }
+        };
         // Reject a writable first hit that actually shadows the same command in
         // a later system directory. A user-managed installation with no such
         // collision remains valid because its exact bytes/path identity are
@@ -245,6 +266,15 @@ impl InstallExecutableBinding {
         // TrustedExecutable.
         Self::reject_unsafe_path_selection(trusted.invocation_path(), path_value)?;
         Self::from_trusted(trusted)
+    }
+
+    fn first_executable_path(program: &str, path_value: &OsStr) -> Option<PathBuf> {
+        std::env::split_paths(path_value)
+            .filter(|directory| !directory.as_os_str().is_empty())
+            .map(|directory| directory.join(program))
+            .find(|candidate| {
+                candidate.is_absolute() && tirith_core::path_audit::is_executable_file(candidate)
+            })
     }
 
     fn from_trusted(
