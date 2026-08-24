@@ -1311,6 +1311,17 @@ fn generated_hermes_snapshot_cleanup_segment(segments: &[tokenize::Segment]) -> 
         return None;
     }
 
+    let expected_body = format!(
+        "{{ {{ ( export -p; ) || true; }} > {VARIABLE} && mv -f {VARIABLE} {snapshot_path}; }} 2>/dev/null"
+    );
+    if segments.iter().enumerate().any(|(index, segment)| {
+        index > *assignment_index
+            && index + 1 == *cleanup_index
+            && segment.preceding_separator.as_deref() == Some("&&")
+            && segment.raw == expected_body
+    }) {
+        return Some(*cleanup_index);
+    }
     let expected_redirect = format!("}} > {VARIABLE}");
     let redirect_index = segments
         .iter()
