@@ -3458,10 +3458,11 @@ fn analyze_inner_with_policy_and_pdf_coverage(
             // so the detector stays pure (PR #125). The filesystem-walking
             // simulator runs ONLY under `tirith preview`.
             let blast_env = crate::blast_radius::env_snapshot();
-            findings.extend(crate::blast_radius::cheap_check(
+            findings.extend(crate::blast_radius::cheap_check_with_gap_action(
                 &analyzed_input,
                 ctx.shell,
                 &blast_env,
+                policy.scan.command_gap_action(),
             ));
 
             // M10 ch3 — taint check. Always-on but near-noop on an empty store
@@ -9473,5 +9474,32 @@ mod tests {
         assert_eq!(baseline_ecosystem_for_leader("cargo"), Some("crates"));
         assert_eq!(baseline_ecosystem_for_leader("kubectl"), Some("k8s"));
         assert_eq!(baseline_ecosystem_for_leader("ls"), None);
+    }
+
+    #[test]
+    fn hermes_snapshot_wrapper_coverage_gap_uses_command_policy() {
+        let wrapper = concat!(
+            "true; __hermes_ec=$?; umask 077; ",
+            "__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX) && ",
+            "{ { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} ",
+            "${!HERMES_BROWSER_CONTROL_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID ",
+            "2>/dev/null; export -p; ) || true; } > \\\"$__hermes_snap_tmp\\\" && ",
+            "mv -f \\\"$__hermes_snap_tmp\\\" /tmp/hermes-snap-deadbeef.sh; } ",
+            "2>/dev/null || rm -f \\\"$__hermes_snap_tmp\\\" 2>/dev/null || true; ",
+            "printf ok",
+        );
+        let mut policy = Policy::default();
+        policy.scan.command_gap_action = Some(crate::policy::GapAction::Warn);
+
+        let verdict = analyze_inner_with_policy(&exec_ctx(wrapper), false, Some(&policy), false).0;
+
+        assert!(
+            verdict.findings.iter().all(|finding| {
+                finding.rule_id != crate::verdict::RuleId::AnalysisIncomplete
+                    || finding.severity == crate::verdict::Severity::Medium
+            }),
+            "the operator gap policy must cover command and blast-radius paths: {:?}",
+            verdict.findings
+        );
     }
 }

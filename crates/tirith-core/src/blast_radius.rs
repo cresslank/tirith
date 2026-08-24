@@ -15,6 +15,7 @@
 //! detector, so tests avoid the libc `setenv` race (PR #125). Production callers
 //! pass a `std::env::vars_os()` snapshot via [`env_snapshot`].
 
+use crate::policy::GapAction;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 use std::collections::HashMap;
@@ -397,6 +398,31 @@ pub fn cheap_check(
     }
 
     dedup_findings(findings)
+}
+
+/// Run the hot-path blast-radius checks with an explicit action for unresolved
+/// command-analysis coverage gaps. Concrete blast findings are never changed.
+pub fn cheap_check_with_gap_action(
+    input: &str,
+    shell: ShellType,
+    env_map: &HashMap<String, String>,
+    gap_action: GapAction,
+) -> Vec<Finding> {
+    let mut findings = cheap_check(input, shell, env_map);
+    match gap_action {
+        GapAction::Ignore => {
+            findings.retain(|finding| finding.rule_id != RuleId::AnalysisIncomplete)
+        }
+        GapAction::Warn => {
+            for finding in &mut findings {
+                if finding.rule_id == RuleId::AnalysisIncomplete {
+                    finding.severity = Severity::Medium;
+                }
+            }
+        }
+        GapAction::Fail => {}
+    }
+    findings
 }
 
 /// Full filesystem simulation for `tirith preview`: walks cwd-relative targets
@@ -2513,5 +2539,71 @@ mod tests {
                 "{command} must still block: {findings:?}"
             );
         }
+    }
+
+    #[test]
+    fn hermes_snapshot_cleanup_coverage_action_does_not_suppress_concrete_blast_findings() {
+        let wrapper = concat!(
+            "true; __hermes_ec=$?; umask 077; ",
+            "__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX) && ",
+            "{ { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} ",
+            "${!HERMES_BROWSER_CONTROL_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID ",
+            "2>/dev/null; export -p; ) || true; } > \\\"$__hermes_snap_tmp\\\" && ",
+            "mv -f \\\"$__hermes_snap_tmp\\\" /tmp/hermes-snap-deadbeef.sh; } ",
+            "2>/dev/null || rm -f \\\"$__hermes_snap_tmp\\\" 2>/dev/null || true",
+        );
+
+        let failed = cheap_check_with_gap_action(
+            wrapper,
+            ShellType::Posix,
+            &empty_env(),
+            crate::policy::GapAction::Fail,
+        );
+        assert!(
+            failed.iter().any(|finding| {
+                finding.rule_id == RuleId::AnalysisIncomplete && finding.severity == Severity::High
+            }),
+            "fail preserves the fail-closed blast gap: {failed:?}"
+        );
+
+        let warned = cheap_check_with_gap_action(
+            wrapper,
+            ShellType::Posix,
+            &empty_env(),
+            crate::policy::GapAction::Warn,
+        );
+        assert!(
+            warned.iter().all(|finding| {
+                finding.rule_id != RuleId::AnalysisIncomplete
+                    || finding.severity == Severity::Medium
+            }),
+            "coverage gaps must be warnings: {warned:?}"
+        );
+
+        let ignored = cheap_check_with_gap_action(
+            wrapper,
+            ShellType::Posix,
+            &empty_env(),
+            crate::policy::GapAction::Ignore,
+        );
+        assert!(
+            ignored
+                .iter()
+                .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete),
+            "ignore removes only coverage gaps: {ignored:?}"
+        );
+
+        let concrete = cheap_check_with_gap_action(
+            "rm -rf /",
+            ShellType::Posix,
+            &empty_env(),
+            crate::policy::GapAction::Ignore,
+        );
+        assert!(
+            concrete
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::BlastWritesSystemPath),
+            "ignore must not suppress concrete blast findings: {concrete:?}"
+        );
     }
 }
