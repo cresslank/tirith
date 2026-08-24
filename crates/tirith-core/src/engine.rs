@@ -3284,11 +3284,12 @@ fn analyze_inner_with_policy_and_pdf_coverage(
         );
         findings.extend(threat_findings);
 
-        let command_findings = crate::rules::command::check(
+        let command_findings = crate::rules::command::check_with_gap_action(
             &analyzed_input,
             ctx.shell,
             ctx.cwd.as_deref(),
             ctx.scan_context,
+            policy.scan.command_gap_action(),
         );
         findings.extend(command_findings);
 
