@@ -48,6 +48,11 @@ scan:
   # Per-server allowed tools — see `tirith mcp policy init` to scaffold.
   # mcp_allowed_tools: {}
 
+  # Treatment for unresolved nested shell bodies. `warn` preserves the
+  # coverage finding without blocking; `ignore` suppresses only that gap.
+  # Recoverable nested bodies and concrete dangerous findings remain enforced.
+  # command_gap_action: warn
+
 # Per-agent governance (enforcement).
 # `tirith agent sessions` shows which AgentOrigin variants you see in
 # practice; `tirith agent policy init` scaffolds this block. A `deny`

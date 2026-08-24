@@ -52,6 +52,11 @@ scan:
   # Glob patterns to ignore during scan
   ignore_patterns: []
 
+  # Operator-only control for unresolved nested shell bodies. The built-in
+  # default is fail; use warn or ignore only when the coverage tradeoff is
+  # intentional. Concrete findings remain enforced.
+  # command_gap_action: warn
+
   # Exact MCP server identities you trust. Each mcp:v1 key binds source path,
   # name, and transport; bare names intentionally match nothing. Trust suppresses
   # per-server config findings and ordinary drift, but never structural ambiguity
