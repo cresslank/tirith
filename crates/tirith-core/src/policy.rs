@@ -2521,7 +2521,6 @@ impl Policy {
                 "ignore_patterns_sha256": hashed_sorted(&scan.ignore_patterns),
                 "fail_on": scan.fail_on,
                 "require_complete": scan.require_complete,
-                "command_gap_action": scan.command_gap_action,
             }),
         );
         put(
@@ -2576,6 +2575,14 @@ impl Policy {
         let serde_json::Value::Object(mut projection) = self.security_projection() else {
             unreachable!("security projection is always an object")
         };
+        let scan = projection
+            .get_mut("scan")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("security projection always contains a scan object");
+        scan.insert(
+            "command_gap_action".to_string(),
+            serde_json::json!(self.scan.command_gap_action()),
+        );
         projection.insert("projection_version".to_string(), serde_json::json!(4));
         projection.insert(
             "web3_guard_sha256".to_string(),
@@ -6660,6 +6667,18 @@ custom_rules:
         let mut task = base.clone();
         task.task_gate.mode = crate::web3_policy::TaskGateMode::Enforce;
         assert_changed("task_gate", &task);
+
+        let mut command_gap_warn = base.clone();
+        command_gap_warn.scan.command_gap_action = Some(GapAction::Warn);
+        assert_changed("scan.command_gap_action", &command_gap_warn);
+
+        let mut explicit_command_gap_fail = base.clone();
+        explicit_command_gap_fail.scan.command_gap_action = Some(GapAction::Fail);
+        assert_eq!(
+            base.execution_identity_hash().unwrap(),
+            explicit_command_gap_fail.execution_identity_hash().unwrap(),
+            "an explicit command-gap fail action is semantically identical to the fail-closed default"
+        );
 
         let projection = serde_json::to_string(&signer_keys.enforcement_projection()).unwrap();
         assert!(!projection.contains("0123456789abcdef"));
