@@ -866,7 +866,7 @@ pub fn check_with_gap_action(
     scan_context: ScanContext,
     gap_action: GapAction,
 ) -> Vec<Finding> {
-    let mut findings = check_depth(input, shell, cwd, scan_context, 0);
+    let mut findings = check_depth(input, shell, cwd, scan_context, 0, true);
     match gap_action {
         GapAction::Ignore => {
             findings.retain(|finding| finding.rule_id != RuleId::AnalysisIncomplete)
