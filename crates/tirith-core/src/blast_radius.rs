@@ -400,8 +400,9 @@ pub fn cheap_check(
     dedup_findings(findings)
 }
 
-/// Run the hot-path blast-radius checks with an explicit action for unresolved
-/// command-analysis coverage gaps. Concrete blast findings are never changed.
+/// Run the hot-path blast-radius checks with an explicit action for the generic
+/// nested-command coverage gap. Work-budget, destructive-wrapper, and
+/// destructive-target findings remain fail closed.
 pub fn cheap_check_with_gap_action(
     input: &str,
     shell: ShellType,
@@ -409,13 +410,21 @@ pub fn cheap_check_with_gap_action(
     gap_action: GapAction,
 ) -> Vec<Finding> {
     let mut findings = cheap_check(input, shell, env_map);
+    let is_relaxable_nested_gap = |finding: &Finding| {
+        finding.rule_id == RuleId::AnalysisIncomplete
+            && finding.evidence.iter().any(|evidence| {
+                matches!(
+                    evidence,
+                    Evidence::CommandPattern { pattern, .. }
+                        if pattern == "nested shell execution coverage gap"
+                )
+            })
+    };
     match gap_action {
-        GapAction::Ignore => {
-            findings.retain(|finding| finding.rule_id != RuleId::AnalysisIncomplete)
-        }
+        GapAction::Ignore => findings.retain(|finding| !is_relaxable_nested_gap(finding)),
         GapAction::Warn => {
             for finding in &mut findings {
-                if finding.rule_id == RuleId::AnalysisIncomplete {
+                if is_relaxable_nested_gap(finding) {
                     finding.severity = Severity::Medium;
                 }
             }
@@ -2573,11 +2582,18 @@ mod tests {
             crate::policy::GapAction::Warn,
         );
         assert!(
-            warned.iter().all(|finding| {
-                finding.rule_id != RuleId::AnalysisIncomplete
-                    || finding.severity == Severity::Medium
+            warned.iter().any(|finding| {
+                finding.title == "nested command analysis was incomplete"
+                    && finding.severity == Severity::Medium
             }),
-            "coverage gaps must be warnings: {warned:?}"
+            "the generic nested gap must be a warning: {warned:?}"
+        );
+        assert!(
+            warned.iter().any(|finding| {
+                finding.title == "could not resolve destructive command wrapper"
+                    && finding.severity == Severity::High
+            }),
+            "the destructive-wrapper gap must remain fail closed: {warned:?}"
         );
 
         let ignored = cheap_check_with_gap_action(
@@ -2589,8 +2605,15 @@ mod tests {
         assert!(
             ignored
                 .iter()
-                .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete),
-            "ignore removes only coverage gaps: {ignored:?}"
+                .all(|finding| finding.title != "nested command analysis was incomplete"),
+            "ignore removes only the generic nested gap: {ignored:?}"
+        );
+        assert!(
+            ignored.iter().any(|finding| {
+                finding.title == "could not resolve destructive command wrapper"
+                    && finding.severity == Severity::High
+            }),
+            "ignore must retain the destructive-wrapper gap: {ignored:?}"
         );
 
         let concrete = cheap_check_with_gap_action(
@@ -2605,5 +2628,39 @@ mod tests {
                 .any(|finding| finding.rule_id == RuleId::BlastWritesSystemPath),
             "ignore must not suppress concrete blast findings: {concrete:?}"
         );
+
+        for action in [
+            crate::policy::GapAction::Warn,
+            crate::policy::GapAction::Ignore,
+        ] {
+            let work_budget = format!(
+                "rm -rf {}",
+                "x".repeat(crate::rules::command::MAX_COMMAND_NORMALIZED_TOKEN_BYTES + 1)
+            );
+            let findings =
+                cheap_check_with_gap_action(&work_budget, ShellType::Posix, &empty_env(), action);
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::AnalysisIncomplete
+                        && finding.severity == Severity::High
+                        && finding.title == "destructive command analysis exceeded its work budget"
+                }),
+                "{action:?} must not relax destructive work-budget exhaustion: {findings:?}"
+            );
+
+            for command in ["rm -rf ${TARGET:-/}", "rm -rf ~someone/build"] {
+                let findings =
+                    cheap_check_with_gap_action(command, ShellType::Posix, &empty_env(), action);
+                assert!(
+                    findings.iter().any(|finding| {
+                        finding.rule_id == RuleId::AnalysisIncomplete
+                            && finding.severity == Severity::High
+                            && finding.title
+                                == "destructive target expansion could not be resolved"
+                    }),
+                    "{action:?} must not relax unresolved destructive target {command}: {findings:?}"
+                );
+            }
+        }
     }
 }

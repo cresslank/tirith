@@ -9477,7 +9477,7 @@ mod tests {
     }
 
     #[test]
-    fn hermes_snapshot_wrapper_coverage_gap_uses_command_policy() {
+    fn hermes_snapshot_wrapper_relaxes_only_generic_command_gaps() {
         let wrapper = concat!(
             "true; __hermes_ec=$?; umask 077; ",
             "__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-deadbeef.sh.tmp.XXXXXXXXXX) && ",
@@ -9494,11 +9494,26 @@ mod tests {
         let verdict = analyze_inner_with_policy(&exec_ctx(wrapper), false, Some(&policy), false).0;
 
         assert!(
-            verdict.findings.iter().all(|finding| {
-                finding.rule_id != crate::verdict::RuleId::AnalysisIncomplete
-                    || finding.severity == crate::verdict::Severity::Medium
+            verdict.findings.iter().any(|finding| {
+                finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
+                    && finding.severity == crate::verdict::Severity::Medium
+                    && matches!(
+                        finding.evidence.first(),
+                        Some(crate::verdict::Evidence::CommandPattern { pattern, .. })
+                            if pattern == "nested shell execution coverage gap"
+                                || pattern == "incomplete shell group or substitution"
+                    )
             }),
-            "the operator gap policy must cover command and blast-radius paths: {:?}",
+            "the generic command gap must honor warn mode: {:?}",
+            verdict.findings
+        );
+        assert!(
+            verdict.findings.iter().any(|finding| {
+                finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
+                    && finding.severity == crate::verdict::Severity::High
+                    && finding.title == "could not resolve destructive command wrapper"
+            }),
+            "destructive-wrapper uncertainty must remain fail closed: {:?}",
             verdict.findings
         );
     }
