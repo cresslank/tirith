@@ -113,7 +113,14 @@ while (( $# > 0 )); do
 done
 test -n "$output"
 retrieved_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-printf '{"schema_version":1,"ossf_commit":"1ea2762d5fb415aef003a244d5aa83c5fc48cc6e","retrieved_at":"%s","packages":[]}\n' "$retrieved_at" > "$output"
+# Two representative entries so the fetch script's per-package validator rules
+# (media type per ecosystem/status, resolution consistency) actually execute.
+cat > "$output" <<JSON
+{"schema_version":2,"ossf_commit":"1ea2762d5fb415aef003a244d5aa83c5fc48cc6e","retrieved_at":"$retrieved_at","packages":[
+{"ecosystem":"npm","name":"fake-live","source_url":"https://registry.npmjs.org/fake-live","media_type":"application/vnd.npm.install-v1+json","http_status":200,"resolution":"registry_versions","response_sha256":"1111111111111111111111111111111111111111111111111111111111111111","response_bytes":64,"versions":["1.0.0","1.0.1"]},
+{"ecosystem":"npm","name":"fake-gone","source_url":"https://registry.npmjs.org/fake-gone","media_type":"application/json","http_status":404,"resolution":"package_not_found","response_sha256":"2222222222222222222222222222222222222222222222222222222222222222","response_bytes":21,"versions":[]}
+]}
+JSON
 EOF
 
 cat > "$FAKE_BIN/curl" <<'EOF'
@@ -200,7 +207,9 @@ child=$!
 (
   sleep "$duration"
   kill -TERM "$child" 2>/dev/null || exit 0
-  sleep 0.2
+  # Give the fake worker's TERM trap time to record graceful termination even
+  # on loaded macOS runners before exercising the hard-kill fallback.
+  sleep 1
   kill -KILL "$child" 2>/dev/null || true
 ) &
 watchdog=$!
@@ -251,6 +260,30 @@ if [ -e "$compile_reached" ] || [ -e "$OUTPUT_ROOT/tirith-threatdb-sources" ]; t
 fi
 if compgen -G "$OUTPUT_ROOT/.tirith-threatdb-fetch.*" >/dev/null; then
   echo "invalid fetch timeout left private staging state" >&2
+  exit 1
+fi
+
+status=0
+if PATH="$FAKE_BIN:$PATH" \
+   THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
+   THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
+   THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
+   THREATDB_REGISTRY_TIMEOUT_SECONDS=0 \
+   bash "$FETCH_SCRIPT"; then
+  touch "$compile_reached"
+else
+  status=$?
+fi
+if (( status == 0 )); then
+  echo "expected an invalid registry timeout to fail preflight" >&2
+  exit 1
+fi
+if [ -e "$compile_reached" ] || [ -e "$OUTPUT_ROOT/tirith-threatdb-sources" ]; then
+  echo "invalid registry timeout reached compile/publication" >&2
+  exit 1
+fi
+if compgen -G "$OUTPUT_ROOT/.tirith-threatdb-fetch.*" >/dev/null; then
+  echo "invalid registry timeout left private staging state" >&2
   exit 1
 fi
 
@@ -389,6 +422,9 @@ else
   status=$?
 fi
 if (( status == 0 )) || [ ! -s "$sparse_started" ] || [ ! -s "$sparse_terminated" ]; then
+  printf 'status=%s started=%s terminated=%s\n' "$status" \
+    "$([ -s "$sparse_started" ] && echo yes || echo no)" \
+    "$([ -s "$sparse_terminated" ] && echo yes || echo no)" >&2
   echo "expected per-source timeout to start and terminate sparse materialization" >&2
   exit 1
 fi
@@ -505,6 +541,43 @@ if [ -e "$compile_reached" ] || [ -e "$OUTPUT_ROOT/tirith-threatdb-sources" ]; t
 fi
 if compgen -G "$OUTPUT_ROOT/.tirith-threatdb-fetch.*" >/dev/null; then
   echo "hung registry snapshot compiler left private staging state" >&2
+  exit 1
+fi
+
+# The registry step has its own ceiling. With a generous per-fetch bound and
+# transaction deadline, a 1 s registry ceiling must still terminate a hung
+# compiler promptly: this proves the registry step is bounded by
+# THREATDB_REGISTRY_TIMEOUT_SECONDS rather than by the other two knobs.
+status=0
+registry_started=$(date +%s)
+if PATH="$FAKE_BIN:$PATH" \
+   THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
+   THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
+   THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
+   THREATDB_FETCH_TIMEOUT_SECONDS=60 \
+   THREATDB_TRANSACTION_TIMEOUT_SECONDS=120 \
+   THREATDB_REGISTRY_TIMEOUT_SECONDS=1 \
+   FAKE_COMPILER_HANG=1 \
+   bash "$FETCH_SCRIPT"; then
+  touch "$compile_reached"
+else
+  status=$?
+fi
+registry_elapsed=$(( $(date +%s) - registry_started ))
+if (( status == 0 )); then
+  echo "expected the registry ceiling to time out a hung compiler" >&2
+  exit 1
+fi
+if (( registry_elapsed >= 30 )); then
+  echo "registry ceiling did not bound the hung compiler (took ${registry_elapsed}s)" >&2
+  exit 1
+fi
+if [ -e "$compile_reached" ] || [ -e "$OUTPUT_ROOT/tirith-threatdb-sources" ]; then
+  echo "registry ceiling timeout exposed publication state" >&2
+  exit 1
+fi
+if compgen -G "$OUTPUT_ROOT/.tirith-threatdb-fetch.*" >/dev/null; then
+  echo "registry ceiling timeout left private staging state" >&2
   exit 1
 fi
 

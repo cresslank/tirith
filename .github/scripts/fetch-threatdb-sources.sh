@@ -70,15 +70,28 @@ PINS_FILE="$STAGED_SOURCES/source-provenance.json"
 
 FETCH_TIMEOUT_SECONDS=${THREATDB_FETCH_TIMEOUT_SECONDS:-180}
 case "$FETCH_TIMEOUT_SECONDS" in
-  ''|*[!0-9]*|0)
+  ''|*[!0-9]*|0*)
     echo "::error::THREATDB_FETCH_TIMEOUT_SECONDS must be a positive integer" >&2
     exit 1
     ;;
 esac
 TRANSACTION_TIMEOUT_SECONDS=${THREATDB_TRANSACTION_TIMEOUT_SECONDS:-600}
 case "$TRANSACTION_TIMEOUT_SECONDS" in
-  ''|*[!0-9]*|0)
+  ''|*[!0-9]*|0*)
     echo "::error::THREATDB_TRANSACTION_TIMEOUT_SECONDS must be a positive integer" >&2
+    exit 1
+    ;;
+esac
+# The bounded registry snapshot is the last networked step and, unlike one git
+# or curl fetch, it is a sequence of up to 1,000 metadata requests: the
+# reviewed 156-package pinned set measured 148 s end to end on a residential
+# link. Give that step its own ceiling inside the transaction deadline instead
+# of the per-fetch bound, so one slow registry day cannot fail publication by
+# itself. The transaction deadline still fail-closes it.
+REGISTRY_TIMEOUT_SECONDS=${THREATDB_REGISTRY_TIMEOUT_SECONDS:-420}
+case "$REGISTRY_TIMEOUT_SECONDS" in
+  ''|*[!0-9]*|0*)
+    echo "::error::THREATDB_REGISTRY_TIMEOUT_SECONDS must be a positive integer" >&2
     exit 1
     ;;
 esac
@@ -98,22 +111,29 @@ fi
 # fetch child, which then keeps writing into a staging tree cleanup just removed.
 # `$!` set here is visible to the caller.
 remaining_timeout_seconds() {
+  local ceiling=${1:-$FETCH_TIMEOUT_SECONDS}
   local remaining
   remaining=$((THREATDB_TRANSACTION_DEADLINE_EPOCH - $(date +%s)))
   if (( remaining <= 0 )); then
     echo "::error::threatdb source transaction exceeded ${TRANSACTION_TIMEOUT_SECONDS}s deadline" >&2
     return 1
   fi
-  if (( remaining < FETCH_TIMEOUT_SECONDS )); then
+  if (( remaining < ceiling )); then
     printf '%s\n' "$remaining"
   else
-    printf '%s\n' "$FETCH_TIMEOUT_SECONDS"
+    printf '%s\n' "$ceiling"
   fi
 }
 
 run_bounded() {
   local timeout_seconds
   timeout_seconds=$(remaining_timeout_seconds) || return 1
+  "$TIMEOUT_BIN" --signal=TERM --kill-after=10s "${timeout_seconds}s" "$@"
+}
+
+run_bounded_registry() {
+  local timeout_seconds
+  timeout_seconds=$(remaining_timeout_seconds "$REGISTRY_TIMEOUT_SECONDS") || return 1
   "$TIMEOUT_BIN" --signal=TERM --kill-after=10s "${timeout_seconds}s" "$@"
 }
 
@@ -316,8 +336,10 @@ fi
 
 # The compiler owns OSV shape classification. It requests registry versions only
 # for unique bounded claims and writes one atomic capped snapshot; direct
-# introduced:0-without-close claims never trigger a request.
-run_bounded "$COMPILER_BIN" fetch-registry-snapshots \
+# introduced:0-without-close claims never trigger a request. This step runs
+# under the registry ceiling (see REGISTRY_TIMEOUT_SECONDS), not the per-fetch
+# bound.
+run_bounded_registry "$COMPILER_BIN" fetch-registry-snapshots \
   --ossf "$STAGED_SOURCES/ossf-mp" \
   --ossf-commit "$OSSF_MP_SHA" \
   --output "$STAGED_SOURCES/registry-versions.json"
@@ -327,19 +349,40 @@ import json
 import pathlib
 import sys
 document = json.loads(pathlib.Path(sys.argv[1]).read_text())
-assert document.get("schema_version") == 1
+assert document.get("schema_version") == 2
 assert document.get("ossf_commit") == sys.argv[2]
 packages = document.get("packages")
-assert isinstance(packages, list) and len(packages) <= 1000
+assert isinstance(packages, list) and len(packages) <= 2000
+# The recorded media type is what the registry served (Content-Type essence).
+# npm serves the abbreviated form for 200s but may ignore Accept and serve the
+# full document; a 404 and everything from PyPI is plain application/json.
+allowed_media_types = {
+    ("npm", 200): {"application/vnd.npm.install-v1+json", "application/json"},
+    ("npm", 404): {"application/json"},
+    ("pypi", 200): {"application/json"},
+    ("pypi", 404): {"application/json"},
+}
 for package in packages:
     assert package.get("ecosystem") in {"npm", "pypi"}
     assert isinstance(package.get("name"), str) and package["name"]
     assert isinstance(package.get("source_url"), str) and package["source_url"].startswith("https://")
+    assert package.get("media_type") in allowed_media_types.get((package["ecosystem"], package.get("http_status")), set())
     assert isinstance(package.get("response_sha256"), str) and len(package["response_sha256"]) == 64
     assert package["response_sha256"] != "0" * 64
-    assert isinstance(package.get("response_bytes"), int) and 0 < package["response_bytes"] <= 8 * 1024 * 1024
-    assert isinstance(package.get("versions"), list) and package["versions"]
-    assert len(package["versions"]) <= 20000
+    assert isinstance(package.get("response_bytes"), int) and 0 <= package["response_bytes"] <= 16 * 1024 * 1024
+    versions = package.get("versions")
+    assert isinstance(versions, list) and len(versions) <= 20000
+    resolution = package.get("resolution")
+    status = package.get("http_status")
+    if resolution == "registry_versions":
+        assert status == 200 and package["response_bytes"] > 0 and versions
+    elif resolution == "package_unpublished":
+        assert package["ecosystem"] == "npm"
+        assert status == 200 and package["response_bytes"] > 0 and not versions
+    else:
+        assert resolution == "package_not_found"
+        assert status == 404 and package["response_bytes"] > 0 and not versions
+assert sum(package["response_bytes"] for package in packages) <= 128 * 1024 * 1024
 PY
 
 FEODO_SHA=$(sha256sum "$STAGED_SOURCES/feodo.txt" | cut -d' ' -f1)
