@@ -1,8 +1,10 @@
 # Compatibility and Stability
 
-This matrix describes Tirith 0.4.0. The
-[0.4.0 release notes](release-notes-0.4.0.md) summarize the published
-capabilities, compatibility boundaries, and remaining limitations.
+This matrix describes Tirith 0.4.1. The
+[0.4.1 release notes](release-notes-0.4.1.md) cover what that patch release
+changes, and the [0.4.0 release notes](release-notes-0.4.0.md) summarize the
+0.4 line's published capabilities, compatibility boundaries, and remaining
+limitations.
 
 ## Stability Tiers
 
@@ -26,7 +28,7 @@ what an experimental command must satisfy to move to stable.
 | `score` | Stable | Risk-score a URL (`--explain` shows the deterministic factor breakdown). |
 | `diff` | Stable | Compare a URL against known-good patterns. |
 | `why` | Stable | Explain the last triggered rule. |
-| `receipt` | Stable | Manage execution receipts. |
+| `receipt` | Stable | Manage download receipts recorded by `tirith run`. |
 | `init` | Stable | Initialize shell hooks. |
 | `scan` | Experimental | File/directory scanning for hidden content and config poisoning. Integration-critical (CI, MCP). |
 | `doctor` | Experimental | Installation and configuration diagnostics. Integration-critical. |

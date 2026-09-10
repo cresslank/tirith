@@ -733,8 +733,11 @@ Examples:
         json: bool,
     },
 
-    /// Manage execution receipts
+    /// Manage download receipts recorded by `tirith run`
     #[command(after_help = "\
+Shows receipts for downloads performed via `tirith run` (URL, redirects,
+SHA-256). Shell execution receipts are a separate store with no CLI viewer.
+
 Examples:
   tirith receipt last
   tirith receipt list
@@ -1601,10 +1604,10 @@ Updates tirith to the latest release. tirith detects how it was installed:
 
   * Package-manager installs (Homebrew, cargo, npm, Scoop, AUR, apt/dnf) are
     NEVER self-modified — tirith prints the exact command to run instead.
-  * A self-managed install (the install.sh tarball or a standalone binary) is
-    updated in place: tirith downloads the release, verifies its cosign
-    signature, then performs an atomic swap, keeping the previous binary so
-    --rollback can revert.
+  * A self-replaceable install (the install.sh tarball, a standalone binary, or
+    a securely owned Hermes-cached release) is updated in place: tirith
+    downloads the release, verifies its cosign signature, then performs an
+    atomic swap, keeping the previous binary so --rollback can revert.
 
 By default the release's cosign signature is REQUIRED: if it cannot be verified
 (cosign missing, or the release published no signature) the update aborts. Pass
@@ -1626,7 +1629,7 @@ Examples:
         #[arg(long)]
         allow_unsigned: bool,
 
-        /// Revert to the previously-installed binary (self-managed installs
+        /// Revert to the previously-installed binary (self-replaceable installs
         /// only). Conflicts with --allow-unsigned.
         #[arg(long, conflicts_with = "allow_unsigned")]
         rollback: bool,

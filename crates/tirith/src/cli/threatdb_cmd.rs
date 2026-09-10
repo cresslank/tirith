@@ -167,6 +167,17 @@ struct IndexV2 {
 /// manifest while publishers move to schema v2.
 const SIGNED_MANIFEST_VERSION: u64 = 2;
 
+/// Interpret the local fork identity by its canonical upstream compatibility
+/// base for ThreatDB asset floors only. Keep every other prerelease/build
+/// suffix unparseable so signed minimum-version gates remain fail closed.
+fn parse_threatdb_compat_version(version: &str) -> Option<SemVer> {
+    SemVer::parse(version).or_else(|| {
+        version
+            .strip_suffix("-local-hardened")
+            .and_then(SemVer::parse)
+    })
+}
+
 impl IndexV2 {
     /// Validate the signed document as one complete immutable generation. Signed
     /// schema v2 requires exactly one legacy asset and one v2 asset; accepting a partial
@@ -308,7 +319,7 @@ impl IndexV2 {
     /// (an ambiguous index): in both cases the caller falls back to legacy v1
     /// rather than picking an asset arbitrarily.
     fn select_asset(&self, current_version: &str) -> Option<&IndexAsset> {
-        let current = SemVer::parse(current_version);
+        let current = parse_threatdb_compat_version(current_version);
         let mut compatible = self
             .assets
             .iter()
@@ -3600,6 +3611,25 @@ mod tests {
         );
         // Bumping the client to 0.4.0 makes v2 eligible.
         assert_eq!(idx.select_asset("0.4.0").unwrap().format, 2);
+    }
+
+    #[test]
+    fn local_hardened_build_uses_its_base_version_for_threatdb_compatibility() {
+        let key = SigningKey::from_bytes(&[1u8; 32]);
+        let idx = signed_index_v2(1, vec![asset(1, None), asset(2, Some("0.4.0"))], &key);
+
+        assert_eq!(
+            idx.select_asset("0.4.1-local-hardened")
+                .map(|asset| asset.format),
+            Some(2),
+            "the local 0.4.1 fork must retain ThreatDB v2 eligibility"
+        );
+        assert_eq!(
+            idx.select_asset("0.4.1-other-build")
+                .map(|asset| asset.format),
+            Some(1),
+            "unknown prerelease identities must remain fail closed"
+        );
     }
 
     #[test]

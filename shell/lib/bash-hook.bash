@@ -79,7 +79,8 @@ for _tirith_inherited_state in \
   _tirith_last_key _tirith_last_rc _tirith_last_cmd \
   _TIRITH_PREV_DEBUG_TRAP \
   _TIRITH_DEGRADE_WARNED _TIRITH_OFF_WARNED _TIRITH_PREEXEC_WARNED _TIRITH_RECEIPT_DEGRADE_WARNED \
-  _TIRITH_BINDS_INSTALLED _TIRITH_PREEXEC_PROMPT_STATUS
+  _TIRITH_BINDS_INSTALLED _TIRITH_PREEXEC_PROMPT_STATUS \
+  _TIRITH_PROTECTED_KEYMAPS _TIRITH_SAVED_CTRL_O_KINDS _TIRITH_SAVED_CTRL_O_BINDINGS
 do
   unset "$_tirith_inherited_state"
 done
@@ -293,17 +294,20 @@ _tirith_receipt_parent_context_is_valid() {
 }
 
 _tirith_receipt_capture_file=""
+_tirith_receipt_error_file=""
+_TIRITH_RECEIPT_REGISTER_ERROR=""
 if [[ $- == *i* ]]; then
   _tirith_receipt_capture_file="$(_tirith_new_capture_file 2>/dev/null)" || _tirith_receipt_capture_file=""
-  if [[ -n "$_tirith_receipt_capture_file" ]] \
+  _tirith_receipt_error_file="$(_tirith_new_capture_file 2>/dev/null)" || _tirith_receipt_error_file=""
+  if [[ -n "$_tirith_receipt_capture_file" && -n "$_tirith_receipt_error_file" ]] \
      && builtin command "$_TIRITH_BIN" __execution-receipt capability \
-          >"$_tirith_receipt_capture_file" 2>/dev/null \
+          >|"$_tirith_receipt_capture_file" 2>/dev/null \
      && _tirith_read_single_capture_line "$_tirith_receipt_capture_file" \
      && [[ "$_TIRITH_CAPTURE_LINE" == "TIRITH_EXECUTION_RECEIPT_PROTOCOL=3" ]]; then
-    : > "$_tirith_receipt_capture_file"
+    : >| "$_tirith_receipt_capture_file"
     if builtin command "$_TIRITH_BIN" __execution-receipt register \
          --family bash --shell-pid "$_TIRITH_RECEIPT_SHELL_PID" \
-         >"$_tirith_receipt_capture_file" 2>/dev/null \
+         >|"$_tirith_receipt_capture_file" 2>|"$_tirith_receipt_error_file" \
        && _tirith_read_single_capture_line "$_tirith_receipt_capture_file"; then
       _TIRITH_RECEIPT_INSTANCE="$_TIRITH_CAPTURE_LINE"
     fi
@@ -311,12 +315,18 @@ if [[ $- == *i* ]]; then
       _TIRITH_RECEIPT_PROTOCOL=3
     else
       _TIRITH_RECEIPT_INSTANCE=""
+      # Keep the first line of the rejection so the one-shot degrade warning
+      # can say WHY instead of silently downgrading (issue #221).
+      IFS= read -r _TIRITH_RECEIPT_REGISTER_ERROR \
+        < "$_tirith_receipt_error_file" 2>/dev/null || :
     fi
   fi
   [[ -n "$_tirith_receipt_capture_file" ]] \
     && _tirith_remove_capture_file "$_tirith_receipt_capture_file" >/dev/null 2>&1
+  [[ -n "$_tirith_receipt_error_file" ]] \
+    && _tirith_remove_capture_file "$_tirith_receipt_error_file" >/dev/null 2>&1
 fi
-unset _tirith_receipt_capture_file _TIRITH_CAPTURE_LINE
+unset _tirith_receipt_capture_file _tirith_receipt_error_file _TIRITH_CAPTURE_LINE
 
 # M8 ch2 — surface "this shell is on the remote side of an SSH session" to
 # `tirith prompt-status` (planned for M8 ch6) and any other downstream
@@ -493,13 +503,16 @@ _tirith_persist_safe_mode() {
   fi
 }
 
-# --- Enter-mode capability cache (issue #111) -------------------------------
+# --- Enter-mode capability cache (issues #111, #224) ------------------------
 #
-# `bind -x` on Enter runs the bound function but, in many environments, does
-# NOT then accept the line — bash never returns to its command loop, the
-# pending command is never delivered, and it is silently eaten. Whether this
-# happens is a property of the running bash/readline build, not the version
-# number, so it cannot be decided by a version gate.
+# A bare `bind -x` on Enter runs the bound function but does NOT then accept the
+# line on stock bash, so the pending command was never delivered and was
+# silently eaten (#111). Enter mode now binds Enter to a MACRO that runs the
+# checker and then a guarded accept-line (see the install block below), which
+# delivers and blocks on every stock bash tested (5.2, 5.3). The self-test is
+# retained as a fail-closed gate: if the macro mechanism ever fails to deliver
+# or block on some exotic build, the probe records that and the hook falls back
+# to preexec rather than risk eating a command.
 #
 # `tirith setup` / `tirith doctor` run a PTY self-test that PROVES whether
 # enter-mode delivery works, and write the verdict to a cache file. This hook
@@ -1264,7 +1277,7 @@ _tirith_preexec_receipt_check() {
     _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
     builtin command "$_TIRITH_BIN" check --approval-check --execution-receipt bash-preexec \
     --non-interactive --interactive --shell posix "${render_args[@]}" -- "$scan_target" \
-    >"$stdout_file"
+    >|"$stdout_file"
   rc=$?
 
   local parse_rc token
@@ -1582,6 +1595,8 @@ _tirith_preexec() {
         if [[ -z "${_TIRITH_RECEIPT_DEGRADE_WARNED:-}" ]]; then
           _TIRITH_RECEIPT_DEGRADE_WARNED=1
           _tirith_output "tirith: execution receipts unavailable; legacy checks remain active but session execution evidence is degraded"
+          [[ -n "${_TIRITH_RECEIPT_REGISTER_ERROR:-}" ]] \
+            && _tirith_output "$_TIRITH_RECEIPT_REGISTER_ERROR"
         fi
       fi
     else
@@ -1599,6 +1614,116 @@ _tirith_preexec() {
 }
 
 
+# Enter mode has to cover every primary Readline keymap a session can switch
+# to after the hook is loaded. Preserve Ctrl-O separately for each map because
+# it is an accept-line equivalent that must be disabled only while enter mode
+# owns command delivery.
+_TIRITH_PROTECTED_KEYMAPS=(emacs-standard vi-insert vi-command)
+_TIRITH_SAVED_CTRL_O_KINDS=()
+_TIRITH_SAVED_CTRL_O_BINDINGS=()
+
+_tirith_bind_x_record_is_ctrl_o() {
+  local key="${1%%[[:space:]]*}"
+  # Bash releases have emitted both `"\C-o" command` and
+  # `"\C-o": command` forms from `bind -X`.
+  key="${key%:}"
+  [[ "$key" == '"\C-o"' ]]
+}
+
+_tirith_bind_output_has_ctrl_o() {
+  local output="$1" line
+  while IFS= read -r line; do
+    _tirith_bind_x_record_is_ctrl_o "$line" && return 0
+  done <<< "$output"
+  return 1
+}
+
+_tirith_bind_x_has_exact_binding() {
+  local output="$1"
+  local key="$2"
+  local command="$3"
+  local line
+  # Bash 5.2 prints inputrc-style `"key": "command"` records, while 5.3
+  # omits the colon. Match complete records in either reusable format so a
+  # substring or a similarly named callback cannot satisfy the health gate.
+  while IFS= read -r line; do
+    if [[ "$line" == "\"${key}\" \"${command}\"" \
+       || "$line" == "\"${key}\": \"${command}\"" ]]; then
+      return 0
+    fi
+  done <<< "$output"
+  return 1
+}
+
+_tirith_capture_ctrl_o_bindings() {
+  local map output line index
+  # Bash versions that cannot enumerate bind-x entries cannot safely preserve
+  # an existing shell-command binding. They already fail the enter-mode health
+  # gate, so refuse before changing any bindings and use preexec instead.
+  builtin bind -X >/dev/null 2>&1 || return 1
+  _TIRITH_SAVED_CTRL_O_KINDS=()
+  _TIRITH_SAVED_CTRL_O_BINDINGS=()
+
+  for ((index = 0; index < ${#_TIRITH_PROTECTED_KEYMAPS[@]}; index++)); do
+    map="${_TIRITH_PROTECTED_KEYMAPS[index]}"
+    _TIRITH_SAVED_CTRL_O_KINDS[index]="unbound"
+    _TIRITH_SAVED_CTRL_O_BINDINGS[index]=""
+
+    output="$(builtin bind -m "$map" -X 2>/dev/null)" || return 1
+    while IFS= read -r line; do
+      if _tirith_bind_x_record_is_ctrl_o "$line"; then
+        _TIRITH_SAVED_CTRL_O_KINDS[index]="bind-x"
+        _TIRITH_SAVED_CTRL_O_BINDINGS[index]="$line"
+        break
+      fi
+    done <<< "$output"
+    [[ "${_TIRITH_SAVED_CTRL_O_KINDS[index]}" == "bind-x" ]] && continue
+
+    output="$(builtin bind -m "$map" -s 2>/dev/null)" || return 1
+    while IFS= read -r line; do
+      if [[ "${line%%:*}" == '"\C-o"' ]]; then
+        _TIRITH_SAVED_CTRL_O_KINDS[index]="binding"
+        _TIRITH_SAVED_CTRL_O_BINDINGS[index]="$line"
+        break
+      fi
+    done <<< "$output"
+    [[ "${_TIRITH_SAVED_CTRL_O_KINDS[index]}" == "binding" ]] && continue
+
+    output="$(builtin bind -m "$map" -p 2>/dev/null)" || return 1
+    while IFS= read -r line; do
+      if [[ "${line%%:*}" == '"\C-o"' ]]; then
+        _TIRITH_SAVED_CTRL_O_KINDS[index]="binding"
+        _TIRITH_SAVED_CTRL_O_BINDINGS[index]="$line"
+        break
+      fi
+    done <<< "$output"
+  done
+  return 0
+}
+
+_tirith_restore_ctrl_o_bindings() {
+  local map kind binding index restore_rc=0
+  for ((index = 0; index < ${#_TIRITH_PROTECTED_KEYMAPS[@]}; index++)); do
+    map="${_TIRITH_PROTECTED_KEYMAPS[index]}"
+    kind="${_TIRITH_SAVED_CTRL_O_KINDS[index]:-unbound}"
+    binding="${_TIRITH_SAVED_CTRL_O_BINDINGS[index]:-}"
+    case "$kind" in
+      bind-x)
+        builtin bind -m "$map" -x "$binding" 2>/dev/null || restore_rc=1
+        ;;
+      binding)
+        builtin bind -m "$map" "$binding" 2>/dev/null || restore_rc=1
+        ;;
+      *)
+        builtin bind -m "$map" -r '\C-o' 2>/dev/null || restore_rc=1
+        ;;
+    esac
+  done
+  unset _TIRITH_SAVED_CTRL_O_KINDS _TIRITH_SAVED_CTRL_O_BINDINGS
+  return "$restore_rc"
+}
+
+
 _tirith_degrade_to_preexec() {
   local reason="${1:-unknown}"
 
@@ -1606,10 +1731,19 @@ _tirith_degrade_to_preexec() {
   # Custom bindings from .inputrc/.bashrc return on next shell (safe mode persisted,
   # so tirith won't install bind-x on restart).
   if [[ "${_TIRITH_BINDS_INSTALLED:-0}" == "1" ]]; then
-    bind '"\C-m": accept-line' 2>/dev/null || true
-    bind '"\C-j": accept-line' 2>/dev/null || true
-    # Restore bracketed paste to readline default if available, otherwise unbind
-    bind '"\e[200~": bracketed-paste-begin' 2>/dev/null || bind -r '"\e[200~"' 2>/dev/null || true
+    local _tirith_keymap
+    for _tirith_keymap in "${_TIRITH_PROTECTED_KEYMAPS[@]}"; do
+      builtin bind -m "$_tirith_keymap" '"\C-m": accept-line' 2>/dev/null || true
+      builtin bind -m "$_tirith_keymap" '"\C-j": accept-line' 2>/dev/null || true
+      # Unbind the macro-dispatch helper sequences (checker + guarded accept)
+      # so no stale binding survives the degrade in any switchable keymap.
+      builtin bind -m "$_tirith_keymap" -r "$_TIRITH_ENTER_CHECK_KEYS" 2>/dev/null || true
+      builtin bind -m "$_tirith_keymap" -r "$_TIRITH_ENTER_ACCEPT_KEYS" 2>/dev/null || true
+      # Restore bracketed paste to the Readline default if available.
+      builtin bind -m "$_tirith_keymap" '"\e[200~": bracketed-paste-begin' \
+        2>/dev/null || builtin bind -m "$_tirith_keymap" -r '\e[200~' 2>/dev/null || true
+    done
+    _tirith_restore_ctrl_o_bindings || true
     _TIRITH_BINDS_INSTALLED=0
   fi
 
@@ -1681,6 +1815,21 @@ _tirith_degrade_to_preexec() {
 
 
 _tirith_prompt_hook() {
+  # Re-disarm the guarded accept-line every prompt. Arming leaves it bound to
+  # accept-line until this runs, so disarming here closes the window in which
+  # an injected accept sequence could accept a line the checker never approved.
+  if declare -F _tirith_enter_disarm_accept >/dev/null 2>&1; then
+    if ! _tirith_enter_disarm_accept; then
+      local failed_pending_receipt="${_TIRITH_PENDING_RECEIPT:-}"
+      unset _TIRITH_PENDING_EVAL
+      unset _TIRITH_PENDING_RECEIPT _TIRITH_PENDING_COMMAND
+      if [[ -n "$failed_pending_receipt" ]]; then
+        _tirith_receipt_discard bash-enter "$failed_pending_receipt" || true
+      fi
+      _tirith_degrade_to_preexec "could not disarm guarded accept-line" || true
+      return
+    fi
+  fi
   local pending_eval="${_TIRITH_PENDING_EVAL:-}"
   local pending_receipt="${_TIRITH_PENDING_RECEIPT:-}"
   local pending_command="${_TIRITH_PENDING_COMMAND:-}"
@@ -1734,8 +1883,18 @@ _tirith_is_prompt_hook_attached() {
 _tirith_ensure_prompt_hook() {
   _tirith_is_prompt_hook_attached && return 0
 
-  local pc_decl
+  local pc_decl pc_attrs
   pc_decl="$(declare -p PROMPT_COMMAND 2>/dev/null)" || pc_decl=""
+  pc_attrs="${pc_decl#declare }"
+  pc_attrs="${pc_attrs%% *}"
+  # Never attempt the assignment when PROMPT_COMMAND is readonly (or otherwise
+  # unwrappable): assigning to a readonly variable is a FATAL error that aborts
+  # this whole function before it can report failure, so the caller would never
+  # see a return value and never degrade. Refuse cleanly instead, and let the
+  # caller degrade (the preexec-guard install refuses the same attributes).
+  if [[ -n "$pc_decl" ]]; then
+    _tirith_prompt_command_attrs_safe "$pc_attrs" || return 1
+  fi
 
   if [[ "$pc_decl" == "declare -a"* ]]; then
     PROMPT_COMMAND=(_tirith_prompt_hook "${PROMPT_COMMAND[@]}") 2>/dev/null || return 1
@@ -1744,7 +1903,8 @@ _tirith_ensure_prompt_hook() {
   else
     PROMPT_COMMAND="_tirith_prompt_hook" 2>/dev/null || return 1
   fi
-  return 0
+  # Confirm the reattachment actually took effect.
+  _tirith_is_prompt_hook_attached
 }
 
 
@@ -1759,7 +1919,7 @@ _TIRITH_DEBUG_CAPTURE_FILE=""
 _TIRITH_DEBUG_OWNERSHIP_FILE=""
 _TIRITH_DEBUG_TRAP_OWNERSHIP_OK=0
 _TIRITH_PREEXEC_ENFORCE_PENDING=0
-_TIRITH_PREEXEC_BOOTSTRAP_COMMAND='if [[ "${_TIRITH_DEBUG_TRAP_CAPTURE_READY:-0}" == "0" ]]; then builtin trap -p DEBUG >"$_TIRITH_DEBUG_CAPTURE_FILE" 2>/dev/null; _tirith_finalize_debug_trap_capture; fi; if [[ "${_TIRITH_DEBUG_TRAP_INSTALLED:-0}" == "1" ]]; then builtin trap -p DEBUG >"$_TIRITH_DEBUG_OWNERSHIP_FILE" 2>/dev/null; _tirith_verify_debug_trap_ownership; fi; _tirith_restore_prompt_status'
+_TIRITH_PREEXEC_BOOTSTRAP_COMMAND='if [[ "${_TIRITH_DEBUG_TRAP_CAPTURE_READY:-0}" == "0" ]]; then builtin trap -p DEBUG >|"$_TIRITH_DEBUG_CAPTURE_FILE" 2>/dev/null; _tirith_finalize_debug_trap_capture; fi; if [[ "${_TIRITH_DEBUG_TRAP_INSTALLED:-0}" == "1" ]]; then builtin trap -p DEBUG >|"$_TIRITH_DEBUG_OWNERSHIP_FILE" 2>/dev/null; _tirith_verify_debug_trap_ownership; fi; _tirith_restore_prompt_status'
 
 
 if [[ -n "${TIRITH_BASH_MODE:-}" ]]; then
@@ -1944,6 +2104,8 @@ if [[ $- == *i* ]] && [[ $_TIRITH_RECEIPT_PROTOCOL -ne 3 ]]; then
   if [[ -z "${_TIRITH_RECEIPT_DEGRADE_WARNED:-}" ]]; then
     _TIRITH_RECEIPT_DEGRADE_WARNED=1
     _tirith_output "tirith: execution receipts unavailable; legacy checks remain active but session execution evidence is degraded"
+    [[ -n "${_TIRITH_RECEIPT_REGISTER_ERROR:-}" ]] \
+      && _tirith_output "$_TIRITH_RECEIPT_REGISTER_ERROR"
   fi
 fi
 
@@ -1987,16 +2149,58 @@ _tirith_unsafe_to_eval() {
 }
 
 
+_tirith_queue_enter_delivery() {
+  local cmd="$1" receipt_token="$2"
+  _TIRITH_PENDING_EVAL="$cmd"
+  _TIRITH_PENDING_COMMAND="$cmd"
+  # Commit marker: publish only after both command copies are complete.
+  if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 ]]; then
+    _TIRITH_PENDING_RECEIPT="$receipt_token"
+  fi
+
+  # The accept sub-sequence is processed only after this bind-x callback
+  # returns. If any keymap cannot be armed, roll the delivery back while the
+  # command can still be put visibly into Readline for a safe retry.
+  if ! _tirith_enter_arm_accept; then
+    unset _TIRITH_PENDING_EVAL _TIRITH_PENDING_COMMAND _TIRITH_PENDING_RECEIPT
+    _tirith_receipt_discard bash-enter "$receipt_token" || true
+    READLINE_LINE="$cmd"
+    READLINE_POINT=${#cmd}
+    _tirith_degrade_to_preexec "could not arm guarded accept-line" || true
+    return 1
+  fi
+
+  history -s -- "$cmd"
+  return 0
+}
+
+
 _tirith_startup_health_check() {
   # Test-only override: bypass startup gate to reach runtime failure paths in PTY tests.
   [[ "${_TIRITH_TEST_SKIP_HEALTH:-}" == "1" ]] && return 0
   # Test-only override for CI (avoids needing PTY)
   [[ "${_TIRITH_TEST_FAIL_HEALTH:-}" == "1" ]] && return 1
-  # Verify both \C-m and \C-j are bound to _tirith_enter
-  local binds
-  binds="$(bind -X 2>/dev/null)" || return 1
-  [[ "$binds" =~ \\C-m.*_tirith_enter ]] || return 1
-  [[ "$binds" =~ \\C-j.*_tirith_enter ]] || return 1
+  # The checker must be installed as a bind -x function.
+  local map xbinds sbinds pbinds
+  # Both \C-m and \C-j must map to the checker+accept Enter macro in every
+  # primary keymap. A later `set -o vi` must not expose an unguarded accept-line.
+  local macro="$_TIRITH_ENTER_CHECK_KEYS$_TIRITH_ENTER_ACCEPT_KEYS"
+  local cm_needle="\"\\C-m\": \"$macro\""
+  local cj_needle="\"\\C-j\": \"$macro\""
+  for map in "${_TIRITH_PROTECTED_KEYMAPS[@]}"; do
+    xbinds="$(builtin bind -m "$map" -X 2>/dev/null)" || return 1
+    _tirith_bind_x_has_exact_binding \
+      "$xbinds" "$_TIRITH_ENTER_CHECK_KEYS" "_tirith_enter" || return 1
+    _tirith_bind_x_has_exact_binding \
+      "$xbinds" "$_TIRITH_ENTER_ACCEPT_KEYS" "_tirith_enter_accept_noop" || return 1
+    _tirith_bind_output_has_ctrl_o "$xbinds" && return 1
+    sbinds="$(builtin bind -m "$map" -s 2>/dev/null)" || return 1
+    [[ "$sbinds" == *"$cm_needle"* ]] || return 1
+    [[ "$sbinds" == *"$cj_needle"* ]] || return 1
+    _tirith_bind_output_has_ctrl_o "$sbinds" && return 1
+    pbinds="$(builtin bind -m "$map" -p 2>/dev/null)" || return 1
+    _tirith_bind_output_has_ctrl_o "$pbinds" && return 1
+  done
   # Verify prompt hook is still attached
   _tirith_is_prompt_hook_attached || return 1
   return 0
@@ -2041,10 +2245,13 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         return  # READLINE_LINE stays intact
       fi
 
-      # Empty input: just return (shows new prompt)
+      # Empty input: accept the empty line so a fresh prompt is shown.
       if [[ -z "$READLINE_LINE" ]]; then
         READLINE_LINE=""
         READLINE_POINT=0
+        if ! _tirith_enter_arm_accept; then
+          _tirith_degrade_to_preexec "could not arm guarded accept-line" || true
+        fi
         return
       fi
 
@@ -2083,7 +2290,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
         _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
         builtin command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive --shell posix \
-        "${receipt_args[@]}" -- "$READLINE_LINE" >"$stdout_file" 2>"$errfile"
+        "${receipt_args[@]}" -- "$READLINE_LINE" >|"$stdout_file" 2>|"$errfile"
       rc=$?
       _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
       local output
@@ -2275,24 +2482,12 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       # one quoted argument to the builtin preserves multiline/heredoc/compound
       # syntax without a source file, process-substitution race, or disk copy.
       if _tirith_unsafe_to_eval "$cmd"; then
-        history -s -- "$cmd"
-        _TIRITH_PENDING_EVAL="$cmd"
-        _TIRITH_PENDING_COMMAND="$cmd"
-        # Commit marker: publish only after both command copies are complete.
-        if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 ]]; then
-          _TIRITH_PENDING_RECEIPT="$receipt_token"
-        fi
-        return 0
+        _tirith_queue_enter_delivery "$cmd" "$receipt_token"
+        return $?
       fi
 
-      history -s -- "$cmd"
-      _TIRITH_PENDING_EVAL="$cmd"
-      _TIRITH_PENDING_COMMAND="$cmd"
-      # Commit marker: publish only after both command copies are complete.
-      if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 ]]; then
-        _TIRITH_PENDING_RECEIPT="$receipt_token"
-      fi
-      return 0
+      _tirith_queue_enter_delivery "$cmd" "$receipt_token"
+      return $?
     }
 
     # Bracketed paste interception
@@ -2326,7 +2521,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         }
         local _tirith_prev_internal="${_TIRITH_BASH_INTERNAL:-0}"
         _TIRITH_BASH_INTERNAL=1
-        printf '%s' "$pasted" | builtin command "$_TIRITH_BIN" paste --shell posix --interactive >"$tmpfile" 2>&1
+        printf '%s' "$pasted" | builtin command "$_TIRITH_BIN" paste --shell posix --interactive >|"$tmpfile" 2>&1
         local rc=$?
         _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
         local output=$(<"$tmpfile")
@@ -2355,15 +2550,66 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       READLINE_POINT=$((READLINE_POINT + ${#pasted}))
     }
 
-    # Install key bindings
-    bind -x '"\C-m": _tirith_enter' || true
-    bind -x '"\C-j": _tirith_enter' || true
-    bind -x '"\e[200~": _tirith_paste' || true
-    _TIRITH_BINDS_INSTALLED=1
+    # Macro-dispatch delivery (issues #111, #224). A bare `bind -x` on Enter
+    # runs the checker but does NOT then accept the line on stock bash, so the
+    # stashed command was silently eaten and the hook degraded to preexec. Bind
+    # Enter to a MACRO that runs the checker and then a GUARDED accept-line: the
+    # accept sub-sequence is a no-op until `_tirith_enter` arms it, so a line is
+    # only accepted once the checker has decided to deliver it (the prompt hook
+    # then evaluates the stashed command, exactly as before). A raw injection of
+    # the accept bytes hits the disarmed no-op, and every prompt re-disarms it,
+    # so possession of the accept sequence alone can never accept a line.
+    _TIRITH_ENTER_CHECK_KEYS='\C-x\C-t7'
+    _TIRITH_ENTER_ACCEPT_KEYS='\C-x\C-r7'
+    _tirith_enter_accept_noop() { :; }
+    _tirith_enter_arm_accept() {
+      local _tirith_keymap _tirith_bind_rc=0
+      for _tirith_keymap in "${_TIRITH_PROTECTED_KEYMAPS[@]}"; do
+        builtin bind -m "$_tirith_keymap" \
+          "\"$_TIRITH_ENTER_ACCEPT_KEYS\": accept-line" 2>/dev/null \
+          || _tirith_bind_rc=1
+      done
+      return "$_tirith_bind_rc"
+    }
+    _tirith_enter_disarm_accept() {
+      local _tirith_keymap _tirith_bind_rc=0
+      for _tirith_keymap in "${_TIRITH_PROTECTED_KEYMAPS[@]}"; do
+        builtin bind -m "$_tirith_keymap" -x \
+          "\"$_TIRITH_ENTER_ACCEPT_KEYS\": _tirith_enter_accept_noop" 2>/dev/null \
+          || _tirith_bind_rc=1
+      done
+      return "$_tirith_bind_rc"
+    }
 
-    # Startup health gate: verify bind-x took effect for BOTH keys
-    if ! _tirith_startup_health_check; then
-      _tirith_degrade_to_preexec "startup health check failed (bind-x or PROMPT_COMMAND)"
+    if ! _tirith_capture_ctrl_o_bindings; then
+      _tirith_degrade_to_preexec "could not preserve existing Ctrl-O bindings"
+    else
+      # Install checker, guarded accept, Enter macros, paste interception, and
+      # Ctrl-O closure in every keymap a live session can switch to.
+      _tirith_bind_install_ok=1
+      for _tirith_keymap in "${_TIRITH_PROTECTED_KEYMAPS[@]}"; do
+        builtin bind -m "$_tirith_keymap" -x \
+          "\"$_TIRITH_ENTER_CHECK_KEYS\": _tirith_enter" || _tirith_bind_install_ok=0
+        builtin bind -m "$_tirith_keymap" \
+          "\"\C-m\": \"$_TIRITH_ENTER_CHECK_KEYS$_TIRITH_ENTER_ACCEPT_KEYS\"" \
+          || _tirith_bind_install_ok=0
+        builtin bind -m "$_tirith_keymap" \
+          "\"\C-j\": \"$_TIRITH_ENTER_CHECK_KEYS$_TIRITH_ENTER_ACCEPT_KEYS\"" \
+          || _tirith_bind_install_ok=0
+        builtin bind -m "$_tirith_keymap" -x '"\e[200~": _tirith_paste' \
+          || _tirith_bind_install_ok=0
+        # operate-and-get-next accepts the current line without the checker.
+        builtin bind -m "$_tirith_keymap" -r '\C-o' 2>/dev/null \
+          || _tirith_bind_install_ok=0
+      done
+      _tirith_enter_disarm_accept || _tirith_bind_install_ok=0
+      _TIRITH_BINDS_INSTALLED=1
+
+      # Startup health gate: verify every protected keymap took effect.
+      if [[ "$_tirith_bind_install_ok" != "1" ]] || ! _tirith_startup_health_check; then
+        _tirith_degrade_to_preexec "startup health check failed (enter macro or PROMPT_COMMAND)"
+      fi
+      unset _tirith_keymap _tirith_bind_install_ok
     fi
   fi
 
