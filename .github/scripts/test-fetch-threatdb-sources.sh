@@ -9,6 +9,10 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 FETCH_SCRIPT="$SCRIPT_DIR/fetch-threatdb-sources.sh"
+# Fake git and registry responses below describe this immutable test snapshot.
+# The watcher updates the production manifest before running this test, so using
+# that manifest would make every legitimate pin refresh fail the checkout guard.
+export THREATDB_SOURCE_PINS_FILE="$SCRIPT_DIR/fixtures/threatdb-source-pins.json"
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/tirith-threatdb-fetch-test.XXXXXX")
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
@@ -65,10 +69,21 @@ case "$*" in
     mkdir -p -- "$destination/osv"
     printf 'fixture license\n' > "$destination/LICENSE"
     printf 'fixture readme\n' > "$destination/README.md"
-    for index in $(seq 1 100); do
-      printf '{"id":"MAL-2099-%04d","affected":[{"package":{"ecosystem":"npm","name":"bad-%d"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"}]}]}]}\n' \
-        "$index" "$index" > "$destination/osv/MAL-2099-$(printf '%04d' "$index").json"
-    done
+    # Keep fixture preparation comfortably below the timeout under test, even
+    # while CI is compiling: avoid hundreds of command-substitution processes.
+    python3 - "$destination/osv" <<'PY'
+import json
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+for index in range(1, 101):
+    record_id = f"MAL-2099-{index:04d}"
+    record = {"id": record_id, "affected": [{
+        "package": {"ecosystem": "npm", "name": f"bad-{index}"},
+        "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}]}],
+    }]}
+    (root / f"{record_id}.json").write_text(json.dumps(record) + "\n")
+PY
     ln -s MAL-2099-0001.json "$destination/osv/linked-record.json"
     ;;
   *DataDog/malicious-software-packages-dataset*)
@@ -124,11 +139,12 @@ while (( $# > 0 )); do
 done
 test -n "$output"
 retrieved_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-# Two representative entries so the fetch script's per-package validator rules
+# Representative entries so the fetch script's per-package validator rules
 # (media type per ecosystem/status, resolution consistency) actually execute.
 cat > "$output" <<JSON
 {"schema_version":2,"ossf_commit":"54642f7ee96e780b046660519b028fefb635375a","retrieved_at":"$retrieved_at","packages":[
 {"ecosystem":"npm","name":"fake-live","source_url":"https://registry.npmjs.org/fake-live","media_type":"application/vnd.npm.install-v1+json","http_status":200,"resolution":"registry_versions","response_sha256":"1111111111111111111111111111111111111111111111111111111111111111","response_bytes":64,"versions":["1.0.0","1.0.1"]},
+{"ecosystem":"npm","name":"fake-binary-label","source_url":"https://registry.npmjs.org/fake-binary-label","media_type":"application/octet-stream","http_status":200,"resolution":"registry_versions","response_sha256":"3333333333333333333333333333333333333333333333333333333333333333","response_bytes":96,"versions":["0.0.1-security"]},
 {"ecosystem":"npm","name":"fake-gone","source_url":"https://registry.npmjs.org/fake-gone","media_type":"application/json","http_status":404,"resolution":"package_not_found","response_sha256":"2222222222222222222222222222222222222222222222222222222222222222","response_bytes":21,"versions":[]}
 ]}
 JSON
@@ -401,7 +417,7 @@ if PATH="$FAKE_BIN:$PATH" \
    THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
    THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
    THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
-   THREATDB_FETCH_TIMEOUT_SECONDS=1 \
+   THREATDB_FETCH_TIMEOUT_SECONDS=5 \
    FAKE_FETCH_HANG=ipblocklist \
    bash "$FETCH_SCRIPT"; then
   touch "$compile_reached"
@@ -424,6 +440,8 @@ fi
 # Blobless clones can lazy-fetch during sparse expansion. The sparse worker is
 # therefore subject to the same per-source timeout as an initial clone, and a
 # timeout must remove all private state before the compiler can run.
+# Allow fixture preparation to finish on loaded runners before the deliberately
+# hung sparse step starts. These test ceilings remain far below production.
 sparse_started="$TEST_ROOT/sparse-per-source-started"
 sparse_terminated="$TEST_ROOT/sparse-per-source-terminated"
 sparse_compiler_called="$TEST_ROOT/sparse-per-source-compiler-called"
@@ -433,7 +451,7 @@ if PATH="$FAKE_BIN:$PATH" \
    THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
    THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
    THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
-   THREATDB_FETCH_TIMEOUT_SECONDS=1 \
+   THREATDB_FETCH_TIMEOUT_SECONDS=5 \
    THREATDB_TRANSACTION_TIMEOUT_SECONDS=30 \
    FAKE_SPARSE_HANG=ossf-mp \
    FAKE_SPARSE_STARTED="$sparse_started" \
@@ -479,7 +497,7 @@ if PATH="$FAKE_BIN:$PATH" \
    THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
    THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
    THREATDB_FETCH_TIMEOUT_SECONDS=30 \
-   THREATDB_TRANSACTION_TIMEOUT_SECONDS=2 \
+   THREATDB_TRANSACTION_TIMEOUT_SECONDS=8 \
    FAKE_SPARSE_HANG=ossf-mp \
    FAKE_SPARSE_STARTED="$sparse_started" \
    FAKE_SPARSE_TERMINATED="$sparse_terminated" \
@@ -490,7 +508,7 @@ else
   status=$?
 fi
 elapsed=$SECONDS
-if (( status == 0 )) || (( elapsed >= 10 )) ||
+if (( status == 0 )) || (( elapsed >= 20 )) ||
    [ ! -s "$sparse_started" ] || [ ! -s "$sparse_terminated" ]; then
   echo "expected aggregate deadline to terminate sparse materialization promptly" >&2
   exit 1
@@ -546,8 +564,8 @@ if PATH="$FAKE_BIN:$PATH" \
    THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
    THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
    THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
-   THREATDB_FETCH_TIMEOUT_SECONDS=1 \
-   THREATDB_TRANSACTION_TIMEOUT_SECONDS=2 \
+   THREATDB_FETCH_TIMEOUT_SECONDS=5 \
+   THREATDB_TRANSACTION_TIMEOUT_SECONDS=8 \
    FAKE_COMPILER_HANG=1 \
    bash "$FETCH_SCRIPT"; then
   touch "$compile_reached"

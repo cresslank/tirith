@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2-local-hardened]
+
+### Changed
+
+- Integrate upstream 0.4.2 as `0.4.2-local-hardened`, preserving local
+  command-gap policy, security-specific fail-closed analysis, flow analysis,
+  legacy policy projection, and pre-effect updater/verify-self refusal.
+- Add scan-only build-job-count regression coverage. Compact `-j2` and shell
+  redirection stay clean; spaced `-j 2` remains a known raw-IP/schemeless warning.
+  No network rule, severity, or policy exception is weakened to hide it.
+
 ## [0.4.1-local-hardened] - 2026-09-09
 
 ### Changed
@@ -16,6 +27,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tirith verify-self` and `tirith update` fail closed before network or file
   effects for this build. The fixed `sheeki03/tirith` release channel cannot
   attest this source build and must never replace its local hardening.
+
+## [Unreleased]
+
+## [0.4.2] - 2026-09-11
+
+### Fixed
+
+- Shell hooks resolve and pin trusted helpers on NixOS and other systems without standard FHS helper paths instead of discarding ordinary commands (#239).
+- `doctor` recognizes mise shims that resolve to the current executable instead of warning that they shadow it (#240).
+- Shell and paste analysis no longer misclassify Go `./...` package patterns, ordinary home-directory paths, or Codex zsh environment snapshots using `[[` and `alias -L` as incomplete analysis (#235, #236, #237).
+- ThreatDB updates quietly use the supported v1 channel when a dual-mode deployment has not published its v2 index. Authentication, integrity, and other server failures still surface (#238).
+- ThreatDB source fetching accepts npm metadata served as `application/octet-stream` only after strict JSON-object and exact package-name validation, preventing a legitimate registry response from stopping publication.
+- ThreatDB provenance compares timestamps as instants, accepting equivalent timezone offsets from Git while retaining canonical UTC provenance and chronological checks.
+- The source-pin watcher isolates write permissions, supports the repository workflow token, finds existing proposal PRs reliably, and rejects stale generated manifest transitions.
+- On Unix, shell initialization binds Bash, zsh, and fish hooks to the running native executable, so npm and other process-spawning launchers no longer prevent strict receipt registration. Other platforms retain shell PATH resolution. The npm launcher also preserves signal termination instead of reporting success.
+- Sourcing `shell/tirith.sh` locates its own directory correctly in Bash and zsh, including installations with spaces or apostrophes in the path.
+- Long-running processes detect ThreatDB replacements within the same second and changes to the selected database path. Reloads retain signature verification and rollback protection.
+- Trial subscriptions can refresh license tokens, consistently with the database's authorization checks.
+- Daemon enrichment uses the same resolved policy as initial analysis, avoiding inconsistent decisions when configuration changes during a request.
+- Recent-log diagnostics report when older history was not searched. `explain` provides usable guidance for finding entries outside that window.
+
+### Performance
+
+- Legacy ThreatDB lookups for npm, RubyGems, Go, and Maven use the sorted package index directly. Registries with spelling aliases retain canonical lookup behavior.
+- Command analysis compiles custom rules once per request and only redacts diagnostic rule IDs when a warning is emitted. The per-thread DSL regex cache has a bounded number of retained entries.
+- Recent-log commands seek backward through a bounded suffix instead of parsing the entire audit history. Both the inspected bytes and individual line lengths are capped.
+- Bash prompt callbacks avoid unnecessary history capture subprocesses while preserving typed-command and history-change checks.
+- Legacy session correlation reuses one privacy-projected event window when expiring warning markers, avoiding repeated redaction of every event for each retained signature.
+- Fuzz and packaging workflows cancel superseded pull-request checks so current changes reach runners sooner. Release-tag and other non-PR runs remain independent.
+
+### Maintenance
+
+- Refresh the reviewed OpenSSF and DataDog source snapshots to September 11 revisions and synchronize their `NOTICE` attribution entries (#245).
+- Update pinned QEMU setup, GitHub release, and SARIF upload actions to their reviewed upstream patch/minor releases (#242).
 
 ## [0.4.1] - 2026-09-02
 

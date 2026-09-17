@@ -101,7 +101,16 @@ case "$_TIRITH_BASH_BIN" in
   /*) [[ -x "$_TIRITH_BASH_BIN" ]] || _TIRITH_BASH_BIN="" ;;
   *) _TIRITH_BASH_BIN="" ;;
 esac
-_tirith_resolved_bin="$(type -P tirith 2>/dev/null || true)"
+if [[ "$#" -eq 2 && "$1" == "--tirith-executable" ]]; then
+  # `tirith init` supplies its native executable as source arguments, so npm
+  # and version-manager launchers do not become receipt-operation parents.
+  # Source arguments are temporary and do not trust an inherited env override.
+  _tirith_resolved_bin="$2"
+  [[ "$_tirith_resolved_bin" == /* && -f "$_tirith_resolved_bin" && -x "$_tirith_resolved_bin" ]] \
+    || _tirith_resolved_bin=""
+else
+  _tirith_resolved_bin="$(type -P tirith 2>/dev/null || true)"
+fi
 _TIRITH_BIN=""
 if [[ -n "$_tirith_resolved_bin" ]]; then
   _tirith_bin_name="${_tirith_resolved_bin##*/}"
@@ -125,21 +134,40 @@ fi
 # long-lived interactive shell) Tirith's parent. Capture Tirith stdout in a
 # private temporary file instead: Tirith remains a direct child, parsing happens
 # in this shell, and every caller removes the file immediately.
-_TIRITH_MKTEMP_BIN=""
-[[ -f /usr/bin/mktemp && -x /usr/bin/mktemp ]] && _TIRITH_MKTEMP_BIN=/usr/bin/mktemp
-[[ -z "$_TIRITH_MKTEMP_BIN" && -f /bin/mktemp && -x /bin/mktemp ]] && _TIRITH_MKTEMP_BIN=/bin/mktemp
-_TIRITH_RM_BIN=""
-[[ -f /bin/rm && -x /bin/rm ]] && _TIRITH_RM_BIN=/bin/rm
-[[ -z "$_TIRITH_RM_BIN" && -f /usr/bin/rm && -x /usr/bin/rm ]] && _TIRITH_RM_BIN=/usr/bin/rm
-_TIRITH_MKDIR_BIN=""
-[[ -f /bin/mkdir && -x /bin/mkdir ]] && _TIRITH_MKDIR_BIN=/bin/mkdir
-[[ -z "$_TIRITH_MKDIR_BIN" && -f /usr/bin/mkdir && -x /usr/bin/mkdir ]] && _TIRITH_MKDIR_BIN=/usr/bin/mkdir
-_TIRITH_WC_BIN=""
-[[ -f /usr/bin/wc && -x /usr/bin/wc ]] && _TIRITH_WC_BIN=/usr/bin/wc
-[[ -z "$_TIRITH_WC_BIN" && -f /bin/wc && -x /bin/wc ]] && _TIRITH_WC_BIN=/bin/wc
-_TIRITH_STTY_BIN=""
-[[ -f /bin/stty && -x /bin/stty ]] && _TIRITH_STTY_BIN=/bin/stty
-[[ -z "$_TIRITH_STTY_BIN" && -f /usr/bin/stty && -x /usr/bin/stty ]] && _TIRITH_STTY_BIN=/usr/bin/stty
+# Prefer system helpers, then search the PATH present when this hook is sourced
+# for non-FHS systems (NixOS/Guix). Inspect files directly to ignore command
+# hashes, aliases and functions. Skip relative/empty entries so changing cwd or
+# PATH later cannot redirect a pinned helper to a repository executable.
+_tirith_resolve_helper() {
+  local name="$1" candidate directory remaining="${PATH-}"
+  shift
+  for candidate in "$@"; do
+    if [[ "$candidate" == /* && -f "$candidate" && -x "$candidate" ]]; then
+      builtin printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  while [[ -n "$remaining" ]]; do
+    directory="${remaining%%:*}"
+    case "$remaining" in
+      *:*) remaining="${remaining#*:}" ;;
+      *) remaining="" ;;
+    esac
+    [[ "$directory" == /* ]] || continue
+    candidate="${directory%/}/$name"
+    if [[ -f "$candidate" && -x "$candidate" ]]; then
+      builtin printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+_TIRITH_MKTEMP_BIN="$(_tirith_resolve_helper mktemp /usr/bin/mktemp /bin/mktemp)" || _TIRITH_MKTEMP_BIN=""
+_TIRITH_RM_BIN="$(_tirith_resolve_helper rm /bin/rm /usr/bin/rm)" || _TIRITH_RM_BIN=""
+_TIRITH_MKDIR_BIN="$(_tirith_resolve_helper mkdir /bin/mkdir /usr/bin/mkdir)" || _TIRITH_MKDIR_BIN=""
+_TIRITH_WC_BIN="$(_tirith_resolve_helper wc /usr/bin/wc /bin/wc)" || _TIRITH_WC_BIN=""
+_TIRITH_STTY_BIN="$(_tirith_resolve_helper stty /bin/stty /usr/bin/stty)" || _TIRITH_STTY_BIN=""
 
 _tirith_new_capture_file() {
   [[ -n "$_TIRITH_MKTEMP_BIN" && -n "$_TIRITH_RM_BIN" ]] || return 1
@@ -1332,10 +1360,19 @@ _tirith_preexec() {
   [[ "${_TIRITH_BASH_INTERNAL:-0}" == "1" ]] && return 0
   local bash_cmd="${3:-$BASH_COMMAND}"
   local entry history_index="" history_line=""
-  if entry="$(_tirith_read_history_entry)"; then
-    history_index="${entry%%|*}"
-    history_line="${entry#*|}"
-  fi
+  # Startup and bracketed prompt callbacks never inspect a typed history line.
+  # Avoid two command-substitution forks on every automatic DEBUG fire. Keep
+  # reading in user/unbracketed phases, including typed prompt-sentinel names,
+  # so the origin and history-drift checks below retain their exact inputs.
+  case "${_TIRITH_PREEXEC_PHASE:-startup}" in
+    startup|prompt|off) ;;
+    *)
+      if entry="$(_tirith_read_history_entry)"; then
+        history_index="${entry%%|*}"
+        history_line="${entry#*|}"
+      fi
+      ;;
+  esac
 
   # Exact prompt sentinels are internal only when Bash reached them through the
   # installed prompt bracket. A user who types the private function name gets a
