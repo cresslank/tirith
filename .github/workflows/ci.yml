@@ -97,7 +97,9 @@ jobs:
 
   test:
     name: Test (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
+    # Opt-in only; FORK_MACOS_EXCLUDE is a JSON list of job keys.
+    # Unset FORK_MACOS_RUNNER to retain the original hosted runners.
+    runs-on: ${{ vars.FORK_MACOS_RUNNER && matrix.os == 'macos-latest' && !contains(fromJSON(vars.FORK_MACOS_EXCLUDE || '[]'), 'test') && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.FORK_MACOS_RUNNER) || matrix.os }}
     # A wedge detector, not a capacity budget. The suite has grown past what
     # this comment used to assume: `Test (Linux)` measures 10min on the base of
     # this stack and 19min at its head, so a 20min cap left about a minute of
@@ -264,7 +266,7 @@ jobs:
 
   install-script:
     name: Install script (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.FORK_MACOS_RUNNER && matrix.os == 'macos-latest' && !contains(fromJSON(vars.FORK_MACOS_EXCLUDE || '[]'), 'install-script') && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.FORK_MACOS_RUNNER) || matrix.os }}
     strategy:
       fail-fast: false
       matrix:
